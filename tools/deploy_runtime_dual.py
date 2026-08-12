@@ -4069,7 +4069,7 @@ def rollback_url(
 
 
 
-def preflight_url(
+def _preflight_source_topology(
     repo: Path,
     runtime: Path,
     profile_path: Path,
@@ -4089,6 +4089,111 @@ def preflight_url(
     runtime = core.require_runtime_replaceable(runtime)
     topology = profile_topology(profile_path, runtime)
     require_topology_matches_contract(topology, runtime, snapshot.contract)
+    return snapshot, runtime, topology
+
+
+def _bootstrap_recovery_service_units(
+    topology: ProfileTopology,
+) -> tuple[str, ...]:
+    if topology.kind != "url":
+        core.fail(
+            "Bootstrap recovery requires the URL runtime topology",
+            phase="bootstrap-recovery-topology",
+        )
+    units = [OPERATOR_SERVICE]
+    if topology.server_url_port == TRANSPORT_INGRESS_LISTENER_PORT:
+        units.append(TRANSPORT_INGRESS_SERVICE)
+    units.append(TUNNEL_SERVICE)
+    return tuple(units)
+
+
+def _bootstrap_recovery_service_observations(
+    topology: ProfileTopology,
+) -> tuple[tuple[str, ...], dict[str, core.ServiceObservation]]:
+    units = _bootstrap_recovery_service_units(topology)
+    observations = {unit: observe_service(unit) for unit in units}
+    ambiguous = {
+        unit: observation.to_dict()
+        for unit, observation in observations.items()
+        if not (observation.confirmed_active or observation.confirmed_inactive)
+    }
+    if ambiguous:
+        core.fail(
+            "Bootstrap recovery predecessor service state is not safely observable",
+            phase="bootstrap-recovery-predecessor-state",
+            details={"services": ambiguous},
+        )
+    return units, observations
+
+
+def bootstrap_recovery_predecessor_state(
+    topology: ProfileTopology,
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    units, observations = _bootstrap_recovery_service_observations(topology)
+    if all(observation.confirmed_active for observation in observations.values()):
+        state = "active"
+    elif observations[OPERATOR_SERVICE].confirmed_inactive:
+        # Once the operator is authoritatively down it cannot admit new Grabowski
+        # effects. Residual transport services are quiesced by the out-of-release
+        # recovery path itself before pointer activation.
+        state = "operator-inactive"
+    else:
+        core.fail(
+            "Bootstrap recovery refuses a mixed predecessor while the operator remains active",
+            phase="bootstrap-recovery-predecessor-state",
+            details={
+                "services": {
+                    unit: observations[unit].to_dict() for unit in units
+                }
+            },
+        )
+    return state, {
+        unit: observations[unit].to_dict() for unit in units
+    }
+
+
+def _require_bootstrap_recovery_predecessor_inactive(
+    topology: ProfileTopology,
+) -> dict[str, dict[str, Any]]:
+    units, observations = _bootstrap_recovery_service_observations(topology)
+    if not all(observation.confirmed_inactive for observation in observations.values()):
+        core.fail(
+            "Bootstrap recovery predecessor runtime is not fully inactive before cutover",
+            phase="bootstrap-recovery-predecessor-final-guard",
+            details={
+                "services": {
+                    unit: observations[unit].to_dict() for unit in units
+                }
+            },
+        )
+    return {unit: observations[unit].to_dict() for unit in units}
+
+
+def quiesce_bootstrap_recovery_predecessor(
+    topology: ProfileTopology,
+) -> dict[str, dict[str, Any]]:
+    state, observations = bootstrap_recovery_predecessor_state(topology)
+    if state != "operator-inactive":
+        core.fail(
+            "Bootstrap recovery predecessor no longer requires out-of-band quiescence",
+            phase="bootstrap-recovery-quiesce",
+            details={"services": observations},
+        )
+    for unit in reversed(_bootstrap_recovery_service_units(topology)):
+        stop_service(unit)
+    return _require_bootstrap_recovery_predecessor_inactive(topology)
+
+
+def preflight_url(
+    repo: Path,
+    runtime: Path,
+    profile_path: Path,
+    *,
+    expected_head: str | None = None,
+) -> tuple[core.Snapshot, Path, ProfileTopology]:
+    snapshot, runtime, topology = _preflight_source_topology(
+        repo, runtime, profile_path, expected_head=expected_head
+    )
     if topology.kind != "url":
         return snapshot, runtime, topology
     require_service_active(OPERATOR_SERVICE)
@@ -4099,6 +4204,30 @@ def preflight_url(
     return snapshot, runtime, topology
 
 
+def preflight_bootstrap_recovery_url(
+    repo: Path,
+    runtime: Path,
+    profile_path: Path,
+    *,
+    expected_head: str,
+) -> tuple[
+    core.Snapshot,
+    Path,
+    ProfileTopology,
+    str,
+    dict[str, dict[str, Any]],
+]:
+    snapshot, runtime, topology = _preflight_source_topology(
+        repo, runtime, profile_path, expected_head=expected_head
+    )
+    predecessor_state, observations = bootstrap_recovery_predecessor_state(topology)
+    if predecessor_state == "active":
+        verify_operator_process(runtime, snapshot.contract)
+        require_operator_listener()
+        verify_tunnel_process()
+    return snapshot, runtime, topology, predecessor_state, observations
+
+
 def deploy_url(
     repo: Path,
     runtime: Path,
@@ -4106,13 +4235,36 @@ def deploy_url(
     *,
     timeout_seconds: int,
     expected_head: str | None = None,
+    bootstrap_recovery: bool = False,
 ) -> None:
-    snapshot, runtime, topology = preflight_url(
-        repo,
-        runtime,
-        profile_path,
-        expected_head=expected_head,
-    )
+    if bootstrap_recovery:
+        if expected_head is None:
+            core.fail(
+                "Bootstrap recovery requires expected_head",
+                phase="bootstrap-recovery-contract",
+            )
+        (
+            snapshot,
+            runtime,
+            topology,
+            predecessor_mode,
+            bootstrap_predecessor,
+        ) = preflight_bootstrap_recovery_url(
+            repo,
+            runtime,
+            profile_path,
+            expected_head=expected_head,
+        )
+    else:
+        snapshot, runtime, topology = preflight_url(
+            repo,
+            runtime,
+            profile_path,
+            expected_head=expected_head,
+        )
+        predecessor_mode = "active"
+        bootstrap_predecessor = {}
+    bootstrap_full_down = bootstrap_recovery and predecessor_mode == "operator-inactive"
     profile_cutover = (
         capture_tunnel_profile_cutover(profile_path, runtime)
         if topology.kind == "url" and topology.server_url_port in TUNNEL_TARGET_PORTS
@@ -4163,38 +4315,45 @@ def deploy_url(
     phase = "post-host-assets-snapshot-revalidation"
     admission_marker: dict[str, Any] | None = None
     admission_proof: dict[str, Any] = {"supported": False}
+    drain_proof: dict[str, Any] = {}
+    final_drain_metrics: dict[str, float] = {}
+    activation_attempted = False
     try:
         core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
-        phase = "operator-admission-engage"
-        admission_marker = engage_operator_deployment_admission(
-            snapshot, timeout_seconds=timeout_seconds
-        )
-        phase = "operator-admission-drain"
-        admission_proof = wait_for_operator_deployment_admission(
-            admission_marker, timeout_seconds=timeout_seconds
-        )
-        admission_active = admission_proof.get("supported") is True
-        phase = "tunnel-drain-pre-stop"
-        drain_proof = wait_for_tunnel_dispatcher_idle(
-            timeout_seconds=timeout_seconds, admission_active=admission_active
-        )
-        if admission_active:
-            phase = "operator-admission-final-guard"
-            verify_operator_deployment_admission(admission_marker)
-        phase = "tunnel-drain-final-guard"
-        final_drain_metrics = verify_tunnel_drain_final_guard(
-            drain_proof["stability"], admission_active=admission_active
-        )
-        if admission_active:
-            phase = "operator-admission-final-guard"
-            verify_operator_deployment_admission(admission_marker)
-        phase = "stop-tunnel"
-        stop_service(TUNNEL_SERVICE)
-        if profile_cutover is not None:
-            phase = "stop-transport-ingress"
-            stop_service(TRANSPORT_INGRESS_SERVICE)
-        phase = "stop-operator"
-        stop_service(OPERATOR_SERVICE)
+        if bootstrap_full_down:
+            phase = "bootstrap-recovery-quiesce"
+            bootstrap_predecessor = quiesce_bootstrap_recovery_predecessor(topology)
+        else:
+            phase = "operator-admission-engage"
+            admission_marker = engage_operator_deployment_admission(
+                snapshot, timeout_seconds=timeout_seconds
+            )
+            phase = "operator-admission-drain"
+            admission_proof = wait_for_operator_deployment_admission(
+                admission_marker, timeout_seconds=timeout_seconds
+            )
+            admission_active = admission_proof.get("supported") is True
+            phase = "tunnel-drain-pre-stop"
+            drain_proof = wait_for_tunnel_dispatcher_idle(
+                timeout_seconds=timeout_seconds, admission_active=admission_active
+            )
+            if admission_active:
+                phase = "operator-admission-final-guard"
+                verify_operator_deployment_admission(admission_marker)
+            phase = "tunnel-drain-final-guard"
+            final_drain_metrics = verify_tunnel_drain_final_guard(
+                drain_proof["stability"], admission_active=admission_active
+            )
+            if admission_active:
+                phase = "operator-admission-final-guard"
+                verify_operator_deployment_admission(admission_marker)
+            phase = "stop-tunnel"
+            stop_service(TUNNEL_SERVICE)
+            if profile_cutover is not None:
+                phase = "stop-transport-ingress"
+                stop_service(TRANSPORT_INGRESS_SERVICE)
+            phase = "stop-operator"
+            stop_service(OPERATOR_SERVICE)
 
         phase = "pre-activation-revalidation"
         core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
@@ -4206,8 +4365,14 @@ def deploy_url(
             runtime,
             snapshot.contract,
         )
+        if bootstrap_full_down:
+            phase = "bootstrap-recovery-predecessor-final-guard"
+            bootstrap_predecessor = _require_bootstrap_recovery_predecessor_inactive(
+                topology
+            )
 
         phase = "activate-pointer"
+        activation_attempted = True
         core.activate_pointer(activation)
 
         phase = "start-operator"
@@ -4219,8 +4384,9 @@ def deploy_url(
         )
         phase = "operator-listener"
         require_operator_listener(timeout_seconds=timeout_seconds)
-        phase = "operator-admission-replacement-guard"
-        verify_operator_deployment_admission(admission_marker)
+        if admission_marker is not None:
+            phase = "operator-admission-replacement-guard"
+            verify_operator_deployment_admission(admission_marker)
 
         if profile_cutover is not None:
             phase = "start-transport-ingress"
@@ -4237,8 +4403,9 @@ def deploy_url(
         phase = "start-tunnel"
         start_service(TUNNEL_SERVICE)
         verify_tunnel_process()
-        phase = "operator-admission-post-tunnel-guard"
-        verify_operator_deployment_admission(admission_marker)
+        if admission_marker is not None:
+            phase = "operator-admission-post-tunnel-guard"
+            verify_operator_deployment_admission(admission_marker)
 
         phase = "readiness"
         readiness = wait_until_ready(timeout_seconds)
@@ -4257,9 +4424,10 @@ def deploy_url(
             snapshot=snapshot,
             agent_instructions=build.agent_instructions,
         )
-        phase = "operator-admission-release"
-        release_operator_deployment_admission(admission_marker)
-        admission_marker = None
+        if admission_marker is not None:
+            phase = "operator-admission-release"
+            release_operator_deployment_admission(admission_marker)
+            admission_marker = None
 
         print("PASS: Zwei-Dienste-Deployment erfolgreich")
         print(f"Repo-HEAD:       {snapshot.repo_head}")
@@ -4272,15 +4440,22 @@ def deploy_url(
         print(f"Runtime:         {runtime}")
         print(f"Release:         {build.release_path}")
         print(f"Watchdog-Assets: {watchdog_projection.asset_set_sha256}")
-        print(
-            "Tunnel-Drain:    "
-            f"attempts={drain_proof['attempts']} "
-            f"stable={drain_proof['consecutive_idle_samples']} "
-            f"admission={admission_proof.get('supported')} "
-            f"final_queue={final_drain_metrics['commands_queue_length']:g} "
-            f"final_responses={final_drain_metrics[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]:g} "
-            f"workers_observed={final_drain_metrics['dispatcher_worker_pool_occupancy']:g}"
-        )
+        if bootstrap_full_down:
+            print("Bootstrap:       predecessor=operator-inactive; transport-quiesced")
+            print(
+                "Bootstrap-Units: "
+                + ",".join(sorted(bootstrap_predecessor))
+            )
+        else:
+            print(
+                "Tunnel-Drain:    "
+                f"attempts={drain_proof['attempts']} "
+                f"stable={drain_proof['consecutive_idle_samples']} "
+                f"admission={admission_proof.get('supported')} "
+                f"final_queue={final_drain_metrics['commands_queue_length']:g} "
+                f"final_responses={final_drain_metrics[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]:g} "
+                f"workers_observed={final_drain_metrics['dispatcher_worker_pool_occupancy']:g}"
+            )
         print(f"Legacy-Backup:   {activation.legacy_backup}")
     except Exception as original:
         watchdog_rollback_error: Exception | None = None
@@ -4329,6 +4504,13 @@ def deploy_url(
                 "Deployment und Watchdog-Host-Asset-Rücksicherung fehlgeschlagen: "
                 f"{original}; watchdog rollback: {watchdog_rollback_error}"
             )
+        if bootstrap_full_down and not activation_attempted:
+            if admission_marker is not None:
+                release_operator_deployment_admission(admission_marker)
+                admission_marker = None
+            if watchdog_rollback_error is not None:
+                raise rollback_original from original
+            raise original
         pre_stop_phases = {
             "operator-admission-engage",
             "operator-admission-drain",
@@ -4387,6 +4569,15 @@ def parse_args() -> argparse.Namespace:
         "--expected-head",
         help="Require this exact source HEAD at the apply snapshot boundary.",
     )
+    parser.add_argument(
+        "--bootstrap-recovery",
+        action="store_true",
+        help=(
+            "Allow exact-head recovery when the predecessor operator is confirmed "
+            "inactive; residual transport services are quiesced fail-closed. "
+            "Requires --apply and --expected-head."
+        ),
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--preflight", action="store_true")
@@ -4402,11 +4593,16 @@ def main() -> int:
     lock_file = core.absolute_no_resolve(args.lock_file)
     try:
         expected_head = getattr(args, "expected_head", None)
+        bootstrap_recovery = bool(getattr(args, "bootstrap_recovery", False))
         if expected_head is not None:
             if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None:
                 raise ValueError("--expected-head must be a lowercase Git object ID")
             if not args.apply:
                 raise ValueError("--expected-head is only valid with --apply")
+        if bootstrap_recovery and (not args.apply or expected_head is None):
+            raise ValueError(
+                "--bootstrap-recovery requires --apply and --expected-head"
+            )
         if args.check:
             core.check(repo, runtime)
         elif args.preflight:
@@ -4416,12 +4612,13 @@ def main() -> int:
             print(f"Topologie:       {topology.kind}")
             print(f"Entry-Point:     {snapshot.contract.describe()}")
         else:
-            preflight_url(
-                repo,
-                runtime,
-                profile_path,
-                expected_head=expected_head,
-            )
+            if not bootstrap_recovery:
+                preflight_url(
+                    repo,
+                    runtime,
+                    profile_path,
+                    expected_head=expected_head,
+                )
             with core.deployment_lock(lock_file):
                 deploy_url(
                     repo,
@@ -4429,6 +4626,7 @@ def main() -> int:
                     profile_path,
                     timeout_seconds=args.timeout,
                     expected_head=expected_head,
+                    bootstrap_recovery=bootstrap_recovery,
                 )
     except core.DeployError as exc:
         print(
