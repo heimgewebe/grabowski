@@ -7,6 +7,7 @@ import math
 import os
 import re
 import stat
+import sys
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -1203,7 +1204,7 @@ def coding_memory_configuration() -> dict[str, Any]:
     runtime_python = Path(
         os.environ.get(
             CODING_MEMORY_PYTHON_ENV,
-            str(Path.home() / "repos" / "chronik" / ".venv" / "bin" / "python"),
+            sys.executable,
         )
     ).expanduser()
     repository = _resolve_coding_memory_repository(configured_repository)
