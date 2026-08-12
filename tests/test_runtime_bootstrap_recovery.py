@@ -5,7 +5,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
+import threading
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -93,6 +95,42 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             DEPLOY_UID=os.getuid(),
             DEPLOY_GID=os.getgid(),
         )
+
+    def test_submit_reference_accepts_path_socket_and_round_trips_response(self) -> None:
+        socket_path = self.root / "broker.sock"
+        response = {
+            "request_id": "b" * 32,
+            "action": "runtime_bootstrap_recover",
+            "returncode": 0,
+        }
+        received: list[dict[str, object]] = []
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(os.fspath(socket_path))
+            server.listen(1)
+
+            def serve() -> None:
+                connection, _ = server.accept()
+                with connection:
+                    chunks: list[bytes] = []
+                    while True:
+                        chunk = connection.recv(64 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    received.append(json.loads(b"".join(chunks).decode("utf-8")))
+                    connection.sendall(json.dumps(response).encode("utf-8"))
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            observed = helper.submit_reference(self.head, socket_path=socket_path)
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(observed, response)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["action"], "runtime_bootstrap_recover")
+        target = json.loads(str(received[0]["target"]))
+        self.assertEqual(target["expected_head"], self.head)
 
     def test_reference_is_release_independent_and_has_no_source_path_authority(self) -> None:
         with mock.patch.object(helper.secrets, "token_hex", return_value="a" * 32):

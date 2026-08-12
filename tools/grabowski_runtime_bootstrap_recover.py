@@ -646,7 +646,7 @@ def submit_reference(
     payload = (json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(3660)
-        client.connect(socket_path)
+        client.connect(os.fspath(socket_path))
         client.sendall(payload)
         client.shutdown(socket.SHUT_WR)
         chunks: list[bytes] = []
