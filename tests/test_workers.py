@@ -599,6 +599,72 @@ globalThis.fetch = async () => ({
         self.assertIsNone(workers.resources.inspect_resource("port:9223"))
         self.assertFalse(profile.exists())
 
+    def test_planned_runtime_limit_is_completed_and_releases_ephemeral_profile(self) -> None:
+        with patch.object(workers, "_now", return_value=1000), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(str(self.binary), port=9224, runtime_seconds=60)
+        worker = started["worker"]
+        profile = Path(worker["profile_path"])
+        timeout_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "Result=timeout\nExecMainStatus=0\n"
+                "ActiveEnterTimestampMonotonic=1000000\n"
+                "ActiveExitTimestampMonotonic=61000000\n"
+            )
+        )
+        with patch.object(workers, "_now", return_value=1060), patch.object(
+            workers.operator, "_run", return_value=timeout_probe
+        ):
+            status = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["last_observation"]["properties"]["Result"], "timeout")
+        self.assertIsNone(workers.resources.inspect_resource("port:9224"))
+        self.assertFalse(profile.exists())
+
+    def test_timeout_before_planned_runtime_limit_is_failed(self) -> None:
+        with patch.object(workers, "_now", return_value=1000), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(str(self.binary), port=9228, runtime_seconds=60)
+        timeout_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "Result=timeout\nExecMainStatus=0\n"
+                "ActiveEnterTimestampMonotonic=1000000\n"
+                "ActiveExitTimestampMonotonic=60000000\n"
+            )
+        )
+        with patch.object(workers, "_now", return_value=1100), patch.object(
+            workers.operator, "_run", return_value=timeout_probe
+        ):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "failed")
+
+    def test_timeout_with_nonzero_exit_is_failed_after_runtime_limit(self) -> None:
+        with patch.object(workers, "_now", return_value=1000), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(str(self.binary), port=9229, runtime_seconds=60)
+        timeout_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "Result=timeout\nExecMainStatus=1\n"
+                "ActiveEnterTimestampMonotonic=1000000\n"
+                "ActiveExitTimestampMonotonic=61000000\n"
+            )
+        )
+        with patch.object(workers, "_now", return_value=1060), patch.object(
+            workers.operator, "_run", return_value=timeout_probe
+        ):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "failed")
+
     def test_collected_successful_unit_is_completed(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()

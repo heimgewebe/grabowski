@@ -732,6 +732,20 @@ def _reconcile_record(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     return stored, observation
 
 
+def _planned_runtime_limit_reached(
+    record: dict[str, Any], properties: dict[str, str]
+) -> bool:
+    try:
+        runtime_seconds = int(record["runtime_seconds"])
+        active_enter_us = int(properties["ActiveEnterTimestampMonotonic"])
+        active_exit_us = int(properties["ActiveExitTimestampMonotonic"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if runtime_seconds <= 0 or active_enter_us <= 0 or active_exit_us <= active_enter_us:
+        return False
+    return active_exit_us - active_enter_us >= runtime_seconds * 1_000_000
+
+
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
     result = operator._run(
         [
@@ -745,6 +759,8 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
             "--property=SubState",
             "--property=Result",
             "--property=ExecMainStatus",
+            "--property=ActiveEnterTimestampMonotonic",
+            "--property=ActiveExitTimestampMonotonic",
         ],
         cwd=operator.HOME,
         timeout_seconds=30,
@@ -759,10 +775,16 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
     load = properties.get("LoadState")
     unit_result = properties.get("Result")
     exec_main_status = properties.get("ExecMainStatus")
+    observed_at_unix = _now()
+    planned_runtime_limit = bool(
+        unit_result == "timeout"
+        and exec_main_status == "0"
+        and _planned_runtime_limit_reached(record, properties)
+    )
     if result["returncode"] != 0:
         state = "interrupted"
     elif load in {None, "not-found"}:
-        if unit_result == "success" and exec_main_status == "0":
+        if (unit_result == "success" and exec_main_status == "0") or planned_runtime_limit:
             state = "completed"
         elif (
             unit_result not in {None, "", "success"}
@@ -773,7 +795,13 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
             state = "interrupted"
     elif active in {"active", "activating", "reloading"}:
         state = "running"
-    elif active == "failed" or unit_result not in {None, "", "success"}:
+    elif planned_runtime_limit:
+        state = "completed"
+    elif (
+        active == "failed"
+        or unit_result not in {None, "", "success"}
+        or exec_main_status not in {None, "", "0"}
+    ):
         state = "failed"
     elif active in {"inactive", "deactivating"}:
         state = "completed" if unit_result in {None, "", "success"} else "failed"
@@ -783,7 +811,7 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         "state": state,
         "properties": properties,
         "probe": result,
-        "observed_at_unix": _now(),
+        "observed_at_unix": observed_at_unix,
     }
 
 
