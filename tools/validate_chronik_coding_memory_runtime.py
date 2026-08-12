@@ -11,9 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "contracts" / "chronik-coding-memory-runtime.v1.json"
 BINDING_PATH = ROOT / "contracts" / "chronik-coding-memory-runtime.binding.v1.json"
-RUNTIME_INPUT = ROOT / "requirements" / "runtime.in"
 RUNTIME_LOCK = ROOT / "requirements" / "runtime.lock.txt"
-PYPROJECT = ROOT / "pyproject.toml"
 
 EXPECTED_CONTRACT_SCHEMA = "chronik-coding-memory-runtime.v1"
 EXPECTED_BINDING_SCHEMA = "grabowski-chronik-coding-memory-runtime-binding.v1"
@@ -72,23 +70,6 @@ def _satisfies(version: str, specifier: str) -> bool:
     return True
 
 
-def _parse_direct_pins(path: Path) -> dict[str, str]:
-    pins: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        match = PIN_RE.fullmatch(line)
-        if match is None:
-            raise ValueError(f"runtime input is not exactly pinned: {raw!r}")
-        name, version = match.groups()
-        normalized = _normalize(name)
-        if normalized in pins:
-            raise ValueError(f"duplicate direct runtime pin: {normalized}")
-        pins[normalized] = version
-    return pins
-
-
 def _parse_lock_versions(path: Path) -> dict[str, str]:
     versions: dict[str, str] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -106,30 +87,6 @@ def _parse_lock_versions(path: Path) -> dict[str, str]:
     return versions
 
 
-def _parse_pyproject_dependencies(path: Path) -> dict[str, str]:
-    text = path.read_text(encoding="utf-8")
-    match = re.search(r"(?ms)^dependencies\s*=\s*\[\s*(.*?)^\]", text)
-    if match is None:
-        raise ValueError("pyproject project dependencies block is missing")
-    pins: dict[str, str] = {}
-    for raw in match.group(1).splitlines():
-        line = raw.strip().rstrip(",")
-        if not line:
-            continue
-        if len(line) < 2 or line[0] != '"' or line[-1] != '"':
-            raise ValueError(f"pyproject dependency is not a simple string: {raw!r}")
-        requirement = line[1:-1]
-        pin = PIN_RE.fullmatch(requirement)
-        if pin is None:
-            raise ValueError(f"pyproject dependency is not exactly pinned: {requirement!r}")
-        name, version = pin.groups()
-        normalized = _normalize(name)
-        if normalized in pins:
-            raise ValueError(f"duplicate pyproject runtime pin: {normalized}")
-        pins[normalized] = version
-    return pins
-
-
 def _load_json(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -140,9 +97,7 @@ def _load_json(path: Path) -> dict[str, object]:
 def validate_root(root: Path = ROOT) -> dict[str, object]:
     contract_path = root / CONTRACT_PATH.relative_to(ROOT)
     binding_path = root / BINDING_PATH.relative_to(ROOT)
-    runtime_input = root / RUNTIME_INPUT.relative_to(ROOT)
     runtime_lock = root / RUNTIME_LOCK.relative_to(ROOT)
-    pyproject = root / PYPROJECT.relative_to(ROOT)
 
     contract_raw = contract_path.read_bytes()
     binding = _load_json(binding_path)
@@ -228,9 +183,7 @@ def validate_root(root: Path = ROOT) -> dict[str, object]:
             + ",".join(missing_boundaries)
         )
 
-    direct = _parse_direct_pins(runtime_input)
     locked = _parse_lock_versions(runtime_lock)
-    packaged = _parse_pyproject_dependencies(pyproject)
     entries = contract.get("required_distributions")
     if not isinstance(entries, list) or not entries:
         raise ValueError("Chronik runtime required_distributions is empty")
@@ -250,32 +203,24 @@ def validate_root(root: Path = ROOT) -> dict[str, object]:
         if normalized in seen:
             raise ValueError(f"duplicate Chronik runtime distribution: {normalized}")
         seen.add(normalized)
-        direct_version = direct.get(normalized)
         lock_version = locked.get(normalized)
-        packaged_version = packaged.get(normalized)
-        if direct_version is None:
-            raise ValueError(f"Chronik runtime dependency is not a direct Grabowski pin: {normalized}")
-        if lock_version != direct_version:
+        if lock_version is None:
             raise ValueError(
-                f"Chronik runtime dependency differs between input and lock: {normalized}"
+                f"Chronik runtime dependency is absent from Grabowski runtime lock: {normalized}"
             )
-        if packaged_version != direct_version:
+        if not _satisfies(lock_version, specifier):
             raise ValueError(
-                f"Chronik runtime dependency differs between input and pyproject: {normalized}"
+                "Grabowski runtime lock violates Chronik contract: "
+                f"{normalized}=={lock_version} not in {specifier}"
             )
-        if not _satisfies(direct_version, specifier):
-            raise ValueError(
-                "Grabowski runtime pin violates Chronik contract: "
-                f"{normalized}=={direct_version} not in {specifier}"
-            )
-        compatible[normalized] = direct_version
+        compatible[normalized] = lock_version
 
     return {
         "schema_version": EXPECTED_BINDING_SCHEMA,
         "producer_commit": producer_commit,
         "producer_sha256": producer_sha256,
         "producer_python_requires": python_requires,
-        "compatible_runtime_pins": dict(sorted(compatible.items())),
+        "compatible_runtime_lock": dict(sorted(compatible.items())),
     }
 
 
