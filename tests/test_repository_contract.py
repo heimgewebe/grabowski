@@ -518,12 +518,19 @@ class RepositoryContractTests(unittest.TestCase):
         runtime_lock = ROOT / "requirements" / "runtime.lock.txt"
         self.assertTrue(runtime_input.is_file())
         self.assertTrue(runtime_lock.is_file())
-        self.assertEqual(
-            runtime_input.read_text(encoding="utf-8").strip(),
-            "mcp==1.27.2",
-        )
+        runtime_lines = [
+            line
+            for line in runtime_input.read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith("#")
+        ]
+        self.assertIn("mcp==1.27.2", runtime_lines)
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8").lower()
+        for requirement in ("filelock==3.32.2", "jsonschema==4.26.0", "pyyaml==6.0.3"):
+            self.assertIn(requirement, runtime_lines)
+            self.assertIn(f'"{requirement}', pyproject)
         lock_text = runtime_lock.read_text(encoding="utf-8")
-        self.assertIn("mcp==1.27.2", lock_text)
+        for package in ("filelock", "jsonschema", "mcp", "pyyaml"):
+            self.assertIn(f"{package}==", lock_text)
         self.assertIn("--hash=sha256:", lock_text)
 
     def test_deploy_tooling_lock_contract_exists(self) -> None:
