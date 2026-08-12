@@ -50,16 +50,25 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertTrue(report["valid"], report)
         self.assertTrue(report["schema_valid"])
         self.assertEqual(report["baseline_tool_count"], 125)
-        self.assertEqual(report["current_tool_count"], 192)
-        self.assertEqual(report["growth"], 75)
-        self.assertEqual(report["accepted_addition_count"], 75)
+        self.assertEqual(report["current_tool_count"], 194)
+        self.assertEqual(report["growth"], 77)
+        self.assertEqual(report["accepted_addition_count"], 77)
         self.assertEqual(report["operation_count"], 3)
         self.assertEqual(report["retired_tool_count"], 8)
 
     def test_runtime_tool_projection_accepts_schema_two_without_assets(self) -> None:
+        # Projection validates the whole contract, so the fixture must be a
+        # complete schema-2 contract rather than a fragment.
         self.assertEqual(
             budget._runtime_tools(
-                {"schema_version": 2, "expected_tools": ["grabowski_status"]}
+                {
+                    "schema_version": 2,
+                    "mode": "module",
+                    "module": "grabowski_operator",
+                    "source": "src/grabowski_runtime.py",
+                    "supporting_sources": [],
+                    "expected_tools": ["grabowski_status"],
+                }
             ),
             ["grabowski_status"],
         )
@@ -71,12 +80,17 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
 
         invalid = copy.deepcopy(runtime)
         invalid["spawn_dependencies"][0]["spawned_module"] = "grabowski_missing"
-        with self.assertRaisesRegex(budget.ToolSurfaceBudgetError, "deployment-closed"):
+        with self.assertRaisesRegex(
+            budget.ToolSurfaceBudgetError, "spawned_module is not deployed"
+        ):
             budget._runtime_tools(invalid)
 
         invalid = copy.deepcopy(runtime)
         del invalid["spawn_dependencies"]
-        with self.assertRaisesRegex(budget.ToolSurfaceBudgetError, "requires spawn_dependencies"):
+        with self.assertRaisesRegex(
+            budget.ToolSurfaceBudgetError,
+            r"missing required field\(s\): spawn_dependencies",
+        ):
             budget._runtime_tools(invalid)
 
     def test_runtime_tool_projection_rejects_malformed_schema_three_assets(self) -> None:

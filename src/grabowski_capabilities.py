@@ -662,6 +662,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["recovery-marker-write"],
         "reversibility": "new-snapshot-retained",
     },
+    "grabowski_recovery_provenance_assess": {
+        "category": "recovery",
+        "purpose": "Assess the fail-closed lane for repairing invalid deployment provenance.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_recovery_provenance_repair": {
+        "category": "recovery",
+        "purpose": "Rebuild and activate the runtime from an exact verified commit when deployment provenance is invalid.",
+        "risk_class": "high",
+        "effects": ["runtime-deployment", "durable-job-start", "audit-record"],
+        "reversibility": "previous-release-retained",
+    },
     "grabowski_operator_blockade_status": {
         "category": "recovery",
         "purpose": "Evaluate scoped typed, legacy and environment blockades for one action context.",
