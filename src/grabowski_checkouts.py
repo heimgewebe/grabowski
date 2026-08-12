@@ -1267,15 +1267,248 @@ def _worktree_status(
     }
 
 
+def _github_repository_slug_from_remote_url(value: str) -> str | None:
+    """Return owner/repository only for one strict GitHub SSH/HTTPS URL."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text != value.strip("\r\n") or "\x00" in text:
+        return None
+    if text.startswith("git@github.com:"):
+        path = text.removeprefix("git@github.com:")
+    else:
+        try:
+            parsed = urllib.parse.urlsplit(text)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.query or parsed.fragment or port not in {None, 22}:
+            return None
+        if parsed.scheme == "https":
+            if (
+                parsed.hostname != "github.com"
+                or parsed.username is not None
+                or parsed.password is not None
+                or port is not None
+            ):
+                return None
+        elif parsed.scheme == "ssh":
+            if (
+                parsed.hostname != "github.com"
+                or parsed.username != "git"
+                or parsed.password is not None
+            ):
+                return None
+        else:
+            return None
+        path = parsed.path.lstrip("/")
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not path or "%" in path or "\\" in path:
+        return None
+    parts = path.split("/")
+    if len(parts) != 2:
+        return None
+    if any(
+        part in {".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", part) is None
+        for part in parts
+    ):
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _github_pull_ref_secured_observation(
+    repo: Path,
+    *,
+    branch: Any,
+    head: str,
+    timeout_seconds: int | float,
+) -> dict[str, Any]:
+    """Verify an exact merged GitHub PR head without trusting Git remote helpers."""
+    if (
+        not isinstance(branch, str)
+        or not branch
+        or branch != branch.strip()
+        or branch.startswith("-")
+        or len(branch.encode("utf-8")) > 1024
+        or any(ord(character) < 32 or ord(character) == 127 for character in branch)
+    ):
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": None,
+        }
+    try:
+        origin = _git_read(
+            repo,
+            ["config", "--get-all", "remote.origin.url"],
+            check=False,
+            timeout_seconds=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": "origin identity query timed out",
+        }
+    if origin.returncode not in {0, 1}:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": (origin.stderr or origin.stdout).strip() or "origin identity query failed",
+        }
+    urls = [line.strip() for line in origin.stdout.splitlines() if line.strip()]
+    if not urls:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": None,
+        }
+    if len(urls) != 1:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": "origin remote identity is ambiguous",
+        }
+    github_repo = _github_repository_slug_from_remote_url(urls[0])
+    if github_repo is None:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": None,
+        }
+
+    timeout_value = _git_timeout_seconds(timeout_seconds)
+    deadline = time.monotonic() + timeout_value
+
+    def github_read(arguments: list[str]) -> dict[str, Any] | None:
+        remaining = deadline - time.monotonic()
+        if remaining < 1.0:
+            return None
+        return operator._run(
+            ["gh", *arguments],
+            cwd=repo,
+            timeout_seconds=max(1, min(30, int(remaining))),
+            max_output_bytes=64 * 1024,
+        )
+
+    listed = github_read(
+        [
+            "pr",
+            "list",
+            "--repo",
+            f"github.com/{github_repo}",
+            "--state",
+            "merged",
+            "--head",
+            branch,
+            "--limit",
+            "20",
+            "--json",
+            "number,state,headRefName,headRefOid",
+        ]
+    )
+    if listed is None or listed.get("timed_out") is True:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": "GitHub pull request query timed out",
+        }
+    if listed.get("returncode") != 0 or listed.get("stdout_truncated"):
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": str(listed.get("stderr") or listed.get("stdout") or "GitHub pull request query failed")[:256],
+        }
+    try:
+        payload = json.loads(str(listed.get("stdout") or ""))
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, list):
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": "GitHub pull request query returned invalid JSON",
+        }
+    matches = sorted(
+        (
+            item
+            for item in payload
+            if isinstance(item, dict)
+            and item.get("state") == "MERGED"
+            and item.get("headRefName") == branch
+            and item.get("headRefOid") == head
+            and isinstance(item.get("number"), int)
+            and not isinstance(item.get("number"), bool)
+            and int(item["number"]) > 0
+        ),
+        key=lambda item: int(item["number"]),
+        reverse=True,
+    )
+    if not matches:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": None,
+        }
+    if len(matches) > 4:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": "too many exact merged pull requests for bounded ref verification",
+        }
+
+    last_error: str | None = None
+    for item in matches:
+        number = int(item["number"])
+        remote_ref = f"refs/pull/{number}/head"
+        verified = github_read(
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                f"repos/{github_repo}/git/ref/pull/{number}/head",
+                "--jq",
+                ".object.sha",
+            ]
+        )
+        if verified is None or verified.get("timed_out") is True:
+            last_error = "GitHub pull head ref query timed out"
+            break
+        if verified.get("returncode") != 0 or verified.get("stdout_truncated"):
+            last_error = str(
+                verified.get("stderr")
+                or verified.get("stdout")
+                or "GitHub pull head ref query failed"
+            )[:256]
+            continue
+        remote_head = str(verified.get("stdout") or "").strip()
+        if remote_head == head:
+            return {
+                "remote_secured": True,
+                "remote_secured_refs": [f"github:{github_repo}:{remote_ref}"],
+                "error": None,
+            }
+    return {
+        "remote_secured": False,
+        "remote_secured_refs": [],
+        "error": last_error,
+    }
+
+
 def _remote_secured_observation(
     record: dict[str, Any],
     *,
     timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+    verify_github_pull_ref: bool = False,
 ) -> dict[str, Any]:
-    """Observe whether the checkout head is already present on a remote-tracking ref.
+    """Observe durable remote evidence for the exact checkout head.
 
-    This uses only local remote-tracking refs. It never fetches and never treats
-    dirty or unpushed exclusive work as obsolete.
+    Local remote-tracking refs remain the bounded fast path. Cleanup may opt in
+    to a GitHub PR-head verification when a squash-merged source branch is no
+    longer represented by a local remote-tracking ref. No fetch is performed.
     """
     path = Path(record["path"])
     head = record.get("head")
@@ -1321,11 +1554,18 @@ def _remote_secured_observation(
         for line in completed.stdout.splitlines()
         if line.strip().startswith("refs/remotes/")
     ][:32]
-    return {
-        "remote_secured": bool(refs),
-        "remote_secured_refs": sorted(refs),
-        "error": None,
-    }
+    if refs or not verify_github_pull_ref:
+        return {
+            "remote_secured": bool(refs),
+            "remote_secured_refs": sorted(refs),
+            "error": None,
+        }
+    return _github_pull_ref_secured_observation(
+        repo_for_refs,
+        branch=record.get("branch"),
+        head=head,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _read_resource_leases() -> list[dict[str, Any]]:
@@ -2631,7 +2871,7 @@ def _cleanup_plan(
         include_tasks=True,
         include_resources=True,
     )
-    remote = _remote_secured_observation(record)
+    remote = _remote_secured_observation(record, verify_github_pull_ref=True)
     remote_secured = bool(remote.get("remote_secured"))
     dirty = status.get("dirty") is not False
     command = ["git", "-C", str(top_level), "worktree", "remove", str(checkout)]
