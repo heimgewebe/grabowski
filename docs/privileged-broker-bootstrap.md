@@ -6,6 +6,7 @@ Dieser Bootstrap ist die einzige absichtlich externe Root-Stufe. Vorher bleibt d
 
 | Repository | Root-eigenes Ziel | Modus |
 |---|---|---:|
+| `src/grabowski_runtime_contract.py` | `/etc/grabowski/runtime-contract-schema.py` | `0644` |
 | `src/grabowski_privileged_broker.py` | `/usr/local/lib/grabowski/grabowski_privileged_broker.py` | `0644` |
 | `src/grabowski_command_identity.py` | `/usr/local/lib/grabowski/grabowski_command_identity.py` | `0644` |
 | `tools/grabowski_privileged_broker.py` | `/usr/local/libexec/grabowski-privileged-broker` | `0755` |
@@ -23,7 +24,9 @@ Das Recovery-Source-Drop-in hält das Home-Verzeichnis mit `ProtectHome=tmpfs` v
 
 ## Bestehende Installation auf den kanonischen Publisher migrieren
 
-Eine bereits aktive Rootbroker-Installation wird nicht durch Kopieren der Beispielkonfiguration ersetzt. Dafür existiert ausschließlich `tools/grabowski_rootbroker_cutover.py`. Der Helper bindet sich an einen ausdrücklich angegebenen vollständigen Commit, liest Broker, Client, Helper, Recovery-Source-Drop-in und Publishervertrag direkt aus dessen Git-Objekten und lehnt einen abweichenden Checkout-HEAD ab. Ein veränderter Arbeitsbaum ist damit keine Installationsquelle.
+Eine bereits aktive Rootbroker-Installation wird nicht durch Kopieren der Beispielkonfiguration ersetzt. Dafür existiert ausschließlich `tools/grabowski_rootbroker_cutover.py`. Der Helper bindet sich an einen ausdrücklich angegebenen vollständigen Commit, liest Broker, Client, Helper, **den kanonischen Runtime-Contract-Validator als unabhängigen Trust-Anchor**, Recovery-Source-Drop-in und Publishervertrag direkt aus dessen Git-Objekten und lehnt einen abweichenden Checkout-HEAD ab. Ein veränderter Arbeitsbaum ist damit keine Installationsquelle.
+
+Der Trust-Anchor `/etc/grabowski/runtime-contract-schema.py` ist absichtlich weder Teil des zu prüfenden Releases noch eine Datei aus dem veränderbaren Benutzercheckout. Recovery-Lane und Watchdog akzeptieren ihn nur als root-eigene, reguläre Single-Link-Datei unter vollständig root-eigenen, nicht gruppen- oder weltbeschreibbaren Elternpfaden. Ein normaler Runtime-Deploy verweigert einen Schemawechsel, solange dieser exakte Validator nicht zuvor über den commitgebundenen Rootbroker-Cutover verankert wurde. So kann ein Deploy den unabhängigen Prüfer nicht hinter seinem Rücken austauschen.
 
 Ohne `--apply` erzeugt der Helper nur einen Plan. Dieser vergleicht installierte und gewünschte SHA-256-Werte und beweist, welche Konfigurationsanteile erhalten bleiben. Mit `--apply` verlangt der Helper UID 0, einen bereits aktiven Rootbroker-Socket und einen exklusiven root-eigenen Lock unter `/run/grabowski/rootbroker-cutover.lock`. Ein inaktiver oder nicht eindeutig prüfbarer Socket blockiert vor Backup und Mutation; der Helper aktiviert keinen zuvor inaktiven Rootbroker.
 
