@@ -48,7 +48,7 @@ Cleanup remains blocked by:
 - live processes inside those scopes;
 - relevant path or repository resource leases;
 - retention ownership;
-- head not present on local remote-tracking refs (`remote_secured=false`);
+- head neither present on local remote-tracking refs nor, during an explicit cleanup dry-run, verified as the exact `headRefOid` and `refs/pull/<n>/head` of a merged pull request on the strictly bound GitHub `origin` (`remote_secured=false`);
 - head, branch, archive or dry-run drift.
 
 Cleanup inventory and dry-run therefore require terminal + clean + remote-secured + lease/process/retention-free evidence together. Disjoint source-path leases do not globally block an unrelated checkout. No cleanup is automatic; archive creation, dry-run and apply remain separate evidenced actions.
