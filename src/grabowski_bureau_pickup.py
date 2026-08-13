@@ -2723,7 +2723,7 @@ def _persisted_resource_lease(resource_key: str) -> dict[str, Any] | None:
     """
     key = resources.normalize_resource_key(resource_key)
     try:
-        with resources._resource_inventory_readonly_sqlite(
+        with resources._resource_readonly_sqlite(
             resources.RESOURCE_DB
         ) as connection:
             if (

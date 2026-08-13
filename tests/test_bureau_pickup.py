@@ -3314,6 +3314,36 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual([key], receipt["resource_keys"])
         self.assertEqual("same-owner-rebind", receipt["groups"][0]["method"])
 
+    def test_persisted_resource_lease_uses_stable_readonly_store(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        purpose = f"Bureau coordinated pickup {intent['run_id']} group other"
+        request = pickup._normalize_request(self.request())
+        group = pickup._acquisition_groups(intent, request)[0]
+        resource_db = self.root / "resources-history-read.sqlite3"
+        with mock.patch.object(pickup.resources, "RESOURCE_DB", resource_db):
+            with mock.patch.object(pickup.resources, "_now", return_value=100):
+                original = pickup.resources.acquire_resources(
+                    intent["lease_owner_id"],
+                    [key],
+                    purpose=purpose,
+                    ttl_seconds=120,
+                    metadata=group["metadata"],
+                    nonconflict_proof=None,
+                )["leases"][0]
+            with mock.patch.object(
+                pickup.resources,
+                "_resource_inventory_readonly_sqlite",
+                side_effect=AssertionError("schema inventory is not lease readback"),
+            ) as inventory:
+                observed = pickup._persisted_resource_lease(key)
+        inventory.assert_not_called()
+        self.assertEqual(key, observed["resource_key"])
+        self.assertEqual(intent["lease_owner_id"], observed["owner_id"])
+        self.assertEqual(purpose, observed["purpose"])
+        self.assertEqual(original["metadata_sha256"], observed["metadata_sha256"])
+        self.assertEqual(original["expires_at_unix"], observed["expires_at_unix"])
+
     def test_expired_recovery_cas_rejects_concurrent_foreign_takeover(self) -> None:
         request = pickup._normalize_request(self.request())
         intent = self.intent()
