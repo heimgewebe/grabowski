@@ -3606,6 +3606,8 @@ def wait_for_operator_deployment_admission(
             "attempts": attempts,
             "drain_timeout_seconds": drain_timeout_seconds,
             "bootstrap_mode": not initial_counts["effect_aware"],
+            "initial_blocking_tool_calls": initial_blocking_tool_calls,
+            "extended_existing_call_drain": extended_existing_call_drain,
             "last_observation": last,
         },
     )
