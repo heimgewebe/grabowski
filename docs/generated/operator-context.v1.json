@@ -3466,7 +3466,7 @@
       "src/grabowski_bureau_intake.py": "98f622cf1fbec11d7708254aa6f1794ed66c511cba0d7c7a12edb63c50a7b284",
       "src/grabowski_bureau_launcher_contract.py": "091908c70502dddd0bbe5582a3412b30cd92f5736801f76279bfd061ad141435",
       "src/grabowski_bureau_leases.py": "25965a1d91d8386103b8da033a09488005e943b5b575579a9722ce7e580fc378",
-      "src/grabowski_bureau_pickup.py": "a10a8510de105f2a800d8bdd73c96061e49ea44e2f90a8c1e26bf23b1b989413",
+      "src/grabowski_bureau_pickup.py": "da5e5ebad67fc3a82318a6c6acb217c94b63868bcb7b11b221354a20cac1c7cb",
       "src/grabowski_capabilities.py": "11d619d1a11cbd050a5385e2cec490b989c133e8716ab0f25c62bbdf6065b19f",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
@@ -3548,7 +3548,7 @@
       "src/grabowski_work_acquire.py": "f630eafc26a70dcd523140792baeecefe316eaa598dc70564f4621237128f1b1",
       "src/grabowski_work_admission.py": "adf3d330a95f64381589f5d48261faeb49fe7001639f43305ed918bcbe133c6a",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
-      "src/grabowski_workers.py": "846287da4d3fe2da6d24dbbbd3f63a57b8302cd8051a9e88027fafd214722e44",
+      "src/grabowski_workers.py": "c57dc1f8208a3c37fc86271df6bef69e8e83e406564517238ddc8cd7ea9de9e2",
       "src/grabowski_worktree_ensure.py": "bd6c477a1faf409fa094424329744dc30f8e96d56aa909927dde1d91a3e211a1"
     }
   }

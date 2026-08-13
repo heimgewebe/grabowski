@@ -2058,6 +2058,7 @@ BROWSER_SEMANTIC_OUTCOME_CODES = {
     "effect_not_implemented",
     "target_unavailable",
     "element_contract",
+    "fresh_worker_required",
     "protocol",
 }
 _BROWSER_NODE_RESULT_TO_OUTCOME = {
@@ -2313,6 +2314,10 @@ class _BrowserSemanticError(RuntimeError):
         self.result_code = result_code
 
 
+class _BrowserSemanticFreshWorkerRequired(RuntimeError):
+    """The worker predates semantic handles and must be restarted."""
+
+
 def _run_node_browser_semantic(
     record: dict[str, Any],
     request: dict[str, Any],
@@ -2442,7 +2447,7 @@ def _browser_semantic_handle_key(record: dict[str, Any]) -> bytes:
     try:
         descriptor = os.open(key_path, flags)
     except FileNotFoundError as exc:
-        raise RuntimeError(
+        raise _BrowserSemanticFreshWorkerRequired(
             "browser worker predates semantic handle keys; start a fresh browser worker"
         ) from exc
     except OSError as exc:
@@ -3074,6 +3079,21 @@ def browser_semantic_gateway(
             observation = browser_semantic_observe(
                 identifier, timeout_seconds=timeout_seconds
             )
+        except _BrowserSemanticFreshWorkerRequired:
+            result = _browser_semantic_public_result(
+                semantic_operation="observe",
+                worker_id=identifier,
+                intent="observe",
+                effect_class="read",
+                ok=False,
+                result_code="fresh_worker_required",
+                effect_state="not_applicable",
+                requested_snapshot_id=None,
+                requested_element_id=None,
+                pre_action_snapshot_id=None,
+                post_action_snapshot_id=None,
+                observation=None,
+            )
         except _BrowserSemanticError as exc:
             result = _browser_semantic_public_result(
                 semantic_operation="observe",
@@ -3179,6 +3199,21 @@ def browser_semantic_gateway(
             action_kind,
             element_id=element_id,
             timeout_seconds=timeout_seconds,
+        )
+    except _BrowserSemanticFreshWorkerRequired:
+        result = _browser_semantic_public_result(
+            semantic_operation="act",
+            worker_id=identifier,
+            intent=action_kind,
+            effect_class=effect_class,
+            ok=False,
+            result_code="fresh_worker_required",
+            effect_state="not_started",
+            requested_snapshot_id=snapshot_id,
+            requested_element_id=element_id,
+            pre_action_snapshot_id=None,
+            post_action_snapshot_id=None,
+            observation=None,
         )
     except Exception:
         possible_effect = (
