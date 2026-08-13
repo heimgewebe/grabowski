@@ -326,6 +326,82 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertTrue(Path(str(first["target_path"])).is_dir())
         self.assertFalse(Path(str(second["target_path"])).exists())
 
+    def test_expired_missing_active_binding_does_not_consume_creation_capacity(self) -> None:
+        missing = self.worktree_root / "expired-missing"
+        common_dir = checkouts._git_common_dir(self.repo)
+        checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=missing,
+            owner_id=self.owner,
+            purpose="retain missing lifecycle evidence",
+            source_kind="bureau_task",
+            source_id="STORAGE-LIFECYCLE-V1-T003",
+            artifact_class="operator_worktree",
+            retention_until_unix=self.retention_until,
+            expected_head=self.head,
+            expected_branch="feat/expired-missing",
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (int(time.time()) - 1, checkouts._checkout_key(common_dir, missing)),
+            )
+            connection.commit()
+
+        second = self._parameters(
+            key="limit-after-expired-missing",
+            branch="feat/limit-after-expired-missing",
+            target=self.worktree_root / "limit-after-expired-missing",
+        )
+        with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1):
+            created = self._ensure(
+                second,
+                assess_admission=lambda **_kwargs: {"decision": "allow", "blocker_codes": []},
+            )
+
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertTrue(Path(str(second["target_path"])).is_dir())
+
+    def test_expired_existing_active_binding_still_consumes_creation_capacity(self) -> None:
+        existing = self.worktree_root / "expired-existing"
+        common_dir = checkouts._git_common_dir(self.repo)
+        checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=existing,
+            owner_id=self.owner,
+            purpose="retain existing lifecycle evidence",
+            source_kind="bureau_task",
+            source_id="STORAGE-LIFECYCLE-V1-T003",
+            artifact_class="operator_worktree",
+            retention_until_unix=self.retention_until,
+            expected_head=self.head,
+            expected_branch="feat/expired-existing",
+        )
+        existing.mkdir()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (int(time.time()) - 1, checkouts._checkout_key(common_dir, existing)),
+            )
+            connection.commit()
+
+        second = self._parameters(
+            key="limit-after-expired-existing",
+            branch="feat/limit-after-expired-existing",
+            target=self.worktree_root / "limit-after-expired-existing",
+        )
+        with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1):
+            blocked = self._ensure(
+                second,
+                assess_admission=lambda **_kwargs: {"decision": "allow", "blocker_codes": []},
+            )
+
+        self.assertEqual(blocked["result_state"], "NOT_ACCEPTED")
+        self.assertIn("active checkout limit", blocked["error"])
+        self.assertFalse(Path(str(second["target_path"])).exists())
+
     def test_creates_and_replays_same_durable_result(self) -> None:
         parameters = self._parameters()
         created = self._ensure(parameters)
