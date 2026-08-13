@@ -75,8 +75,13 @@ def dispatch(action: str, request: dict[str, Any]) -> dict[str, Any]:
     except provider.N8nProviderError as exc:
         raise N8nRuntimeError(str(exc)) from exc
 
+    # The verify grip is published as read-only. Its receipt already binds the
+    # provider response, so it must not create local transaction or audit state.
+    if action == "verify":
+        return output
+
     transaction_id, transaction_dir = runtime._new_transaction_dir(
-        f"n8n-provider-{action}", source
+        "n8n-provider-apply", source
     )
     evidence = {
         "schema_version": 1,

@@ -3518,7 +3518,7 @@
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "6bb5772e2f54017c367d9c13d63579e0e7a45bfbd8116a035ee0a1da058cf012",
       "src/grabowski_n8n_provider.py": "44f3557584b2002fb048e760a894f71d922da8be647fcd889c9a48e97395e876",
-      "src/grabowski_n8n_runtime.py": "078787ef92112d891a97c2213df957ab0b108a6903faaef0ed72c5c8770c4400",
+      "src/grabowski_n8n_runtime.py": "bd4b4c0e6600aefd663aa45ca2ddbf788be5754ab07cff42df9b6632b6a339aa",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "982bc06d4e4be7823fcc7613df01d39294ebb2b76d2ed378f412e762191dfbc5",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
