@@ -32,6 +32,7 @@ PLATFORM_SNAPSHOT_SCHEMA_VERSION = 1
 PLATFORM_SNAPSHOT_KIND = "grabowski_platform_connector_snapshot"
 PLATFORM_SNAPSHOT_PATH = Path("/run/grabowski/platform-connector-snapshot.json")
 PLATFORM_SNAPSHOT_TRUSTED_UID = 0
+PLATFORM_SNAPSHOT_MODE = 0o644
 PLATFORM_SNAPSHOT_TTL_SECONDS = 3_600
 MAX_PLATFORM_SNAPSHOT_BYTES = 64 * 1024
 PLATFORM_SOURCE_KIND = "chatgpt_connector_catalog"
@@ -1933,8 +1934,8 @@ def _persist_platform_snapshot(document: dict[str, Any]) -> None:
         flags |= os.O_NOFOLLOW
     descriptor: int | None = None
     try:
-        descriptor = os.open(temporary, flags, 0o600)
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(temporary, flags, PLATFORM_SNAPSHOT_MODE)
+        os.fchmod(descriptor, PLATFORM_SNAPSHOT_MODE)
         written = 0
         while written < len(encoded):
             count = os.write(descriptor, encoded[written:])
