@@ -739,6 +739,8 @@ class ClientSnapshotTests(unittest.TestCase):
 
         declarations: list[dict[str, object]] = []
         request_metas: list[dict[str, object] | None] = []
+        transport_headers: list[dict[str, str] | None] = []
+        connector_capability = "C" * 43
 
         class Client:
             async def initialize(self) -> None:
@@ -812,7 +814,10 @@ class ClientSnapshotTests(unittest.TestCase):
         client_module.__path__ = []
         streamable_http_module = types.ModuleType("mcp.client.streamable_http")
         streamable_http_module.streamablehttp_client = (
-            lambda _url: AsyncContext((object(), object(), None))
+            lambda _url, *, headers=None: (
+                transport_headers.append(headers)
+                or AsyncContext((object(), object(), None))
+            )
         )
 
         with (
@@ -828,13 +833,25 @@ class ClientSnapshotTests(unittest.TestCase):
         ):
             result = asyncio.run(
                 snapshot._observe_and_bind_snapshot(
-                    mcp_url="http://127.0.0.1:1/mcp",
+                    mcp_url="http://127.0.0.1:18181/mcp",
                     session_id="session-schema",
+                    connector_capability=connector_capability,
                     timeout_seconds=1.0,
                 )
             )
             self.assertTrue(result["schema_contract_matches"])
             self.assertEqual(result["schema_coverage_count"], 4)
+            self.assertEqual(
+                transport_headers,
+                [
+                    {
+                        snapshot.TRANSPORT_CONNECTOR_CAPABILITY_HEADER: (
+                            connector_capability
+                        )
+                    }
+                ],
+            )
+            self.assertNotIn(connector_capability, json.dumps(result))
             self.assertEqual(
                 result["transport_verification_receipt_sha256"],
                 "f" * 64,
@@ -875,11 +892,102 @@ class ClientSnapshotTests(unittest.TestCase):
             ):
                 asyncio.run(
                     snapshot._observe_and_bind_snapshot(
-                        mcp_url="http://127.0.0.1:1/mcp",
+                        mcp_url="http://127.0.0.1:18181/mcp",
                         session_id="session-schema-failed",
+                        connector_capability=connector_capability,
                         timeout_seconds=1.0,
                     )
                 )
+
+    def test_auto_refresh_capability_is_bound_to_operator_endpoint(self) -> None:
+        self.assertEqual(
+            snapshot._validate_loopback_mcp_url("http://127.0.0.1:18181/mcp"),
+            snapshot.AUTO_REFRESH_MCP_URL,
+        )
+        for url in (
+            "http://127.0.0.1:18180/mcp",
+            "http://127.0.0.1:1/mcp",
+            "http://localhost:18181/mcp",
+        ):
+            with self.subTest(url=url), self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "bound loopback operator endpoint"
+            ):
+                snapshot._validate_loopback_mcp_url(url)
+
+    def test_auto_refresh_connector_capability_reader_is_private_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "primary.token"
+            token = "D" * 43
+            target.write_text(token + "\r\n", encoding="ascii")
+            target.chmod(0o600)
+            self.assertEqual(
+                snapshot._read_transport_connector_capability(target),
+                token,
+            )
+
+            linked = target.lstat()
+            stale_linked = mock.Mock(
+                st_mode=linked.st_mode,
+                st_uid=linked.st_uid,
+                st_nlink=linked.st_nlink,
+                st_size=linked.st_size,
+                st_dev=linked.st_dev,
+                st_ino=linked.st_ino,
+                st_mtime_ns=linked.st_mtime_ns + 1,
+                st_ctime_ns=linked.st_ctime_ns,
+            )
+            with mock.patch.object(Path, "lstat", return_value=stale_linked):
+                with self.assertRaisesRegex(
+                    snapshot.ClientSnapshotError, "changed during open"
+                ):
+                    snapshot._read_transport_connector_capability(target)
+
+            target.chmod(0o644)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+            target.unlink()
+            real = root / "real.token"
+            real.write_text(token, encoding="ascii")
+            real.chmod(0o600)
+            target.symlink_to(real)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+            target.unlink()
+            os.link(real, target)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
+            target.unlink()
+            real.unlink()
+
+            target.write_bytes(b"D" * (snapshot.MAX_TRANSPORT_CONNECTOR_TOKEN_BYTES + 1))
+            target.chmod(0o600)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+            target.write_bytes(b"D" * 42 + b"\xff")
+            target.chmod(0o600)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "must be ASCII"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+            target.write_text("!" * 43, encoding="ascii")
+            target.chmod(0o600)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability is invalid"
+            ):
+                snapshot._read_transport_connector_capability(target)
 
     def test_mcp_tool_payload_accepts_json_safe_embedded_result(self) -> None:
         payload = snapshot._mcp_tool_payload(

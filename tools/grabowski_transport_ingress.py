@@ -54,6 +54,8 @@ REQUEST_AUDIENCE_HEADER = "X-Grabowski-Request-Audience"
 REQUEST_BODY_SHA256_HEADER = "X-Grabowski-Request-Body-Sha256"
 RUNTIME_BINDING_SHA256_HEADER = "X-Grabowski-Runtime-Binding-Sha256"
 REQUEST_MAC_HEADER = "X-Grabowski-Request-Mac"
+OAUTH_PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
+OAUTH_PROTECTED_RESOURCE_MCP_PATH = "/.well-known/oauth-protected-resource/mcp"
 
 
 class IngressConfigurationError(RuntimeError):
@@ -337,6 +339,15 @@ async def _read_bounded_request_body(request: Any) -> bytes:
     return b"".join(chunks)
 
 
+def _oauth_protected_resource_metadata(base_url: object) -> dict[str, object]:
+    return {
+        "resource": f"{str(base_url).rstrip('/')}/mcp",
+        "resource_name": "Grabowski MCP",
+        "authorization_servers": [],
+        "bearer_methods_supported": [],
+    }
+
+
 class TransportIngress:
     def __init__(
         self, *, token: str, upstream: str, runtime_binding_sha256: str
@@ -359,6 +370,14 @@ class TransportIngress:
                 "runtime_binding_sha256": self._runtime_binding_sha256,
                 "upstream": "loopback-operator",
             }
+        )
+
+    async def oauth_resource(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        return JSONResponse(
+            _oauth_protected_resource_metadata(request.base_url),
+            headers={"Cache-Control": "no-store"},
         )
 
     async def proxy(self, request: Any) -> Any:
@@ -447,6 +466,16 @@ def build_app(*, token: str, upstream: str, runtime_binding_sha256: str) -> Any:
     return Starlette(
         routes=[
             Route("/_grabowski/transport-ingress", ingress.health, methods=["GET"]),
+            Route(
+                OAUTH_PROTECTED_RESOURCE_PATH,
+                ingress.oauth_resource,
+                methods=["GET"],
+            ),
+            Route(
+                OAUTH_PROTECTED_RESOURCE_MCP_PATH,
+                ingress.oauth_resource,
+                methods=["GET"],
+            ),
             Route("/mcp", ingress.proxy, methods=["GET", "POST", "DELETE"]),
         ]
     )
