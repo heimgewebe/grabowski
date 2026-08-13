@@ -39,11 +39,17 @@ AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
 OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
 OBSERVATION_SCOPE_SERVER_LOOPBACK = "server_loopback_watchdog"
 AUTO_REFRESH_MCP_URL = "http://127.0.0.1:18181/mcp"
+AUTO_REFRESH_CONNECTOR_TOKEN_PATH = (
+    Path.home() / ".local/state/grabowski/transport-connectors/primary.token"
+)
+TRANSPORT_CONNECTOR_CAPABILITY_HEADER = "X-Grabowski-Connector-Capability"
 AUTO_REFRESH_RENEW_MARGIN_SECONDS = 900
 AUTO_REFRESH_TIMEOUT_SECONDS = 8.0
 MAX_DEPLOYMENT_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_TRANSPORT_CONNECTOR_TOKEN_BYTES = 256
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_TRANSPORT_CONNECTOR_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 
 
 class ClientSnapshotError(RuntimeError):
@@ -113,6 +119,82 @@ def _validate_private_file(metadata: os.stat_result, *, label: str) -> None:
         or metadata.st_nlink != 1
     ):
         raise ClientSnapshotError(f"{label} is not a private regular file")
+
+
+def _read_transport_connector_capability(path: Path) -> str:
+    target = Path(path).expanduser()
+    try:
+        linked = target.lstat()
+    except OSError as exc:
+        raise ClientSnapshotError(
+            "transport connector capability is unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.getuid()
+        or stat.S_IMODE(linked.st_mode) & 0o077
+        or linked.st_nlink != 1
+        or linked.st_size <= 0
+        or linked.st_size > MAX_TRANSPORT_CONNECTOR_TOKEN_BYTES
+    ):
+        raise ClientSnapshotError("transport connector capability file is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as exc:
+        raise ClientSnapshotError(
+            "transport connector capability cannot be opened safely"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            before.st_dev != linked.st_dev
+            or before.st_ino != linked.st_ino
+            or before.st_mode != linked.st_mode
+            or before.st_uid != linked.st_uid
+            or before.st_nlink != linked.st_nlink
+            or before.st_size != linked.st_size
+            or before.st_mtime_ns != linked.st_mtime_ns
+            or before.st_ctime_ns != linked.st_ctime_ns
+        ):
+            raise ClientSnapshotError(
+                "transport connector capability changed during open"
+            )
+        payload = os.read(descriptor, MAX_TRANSPORT_CONNECTOR_TOKEN_BYTES + 1)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ClientSnapshotError(
+                "transport connector capability changed while reading"
+            )
+    finally:
+        os.close(descriptor)
+    if len(payload) > MAX_TRANSPORT_CONNECTOR_TOKEN_BYTES:
+        raise ClientSnapshotError("transport connector capability exceeds size limit")
+    try:
+        token = payload.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ClientSnapshotError(
+            "transport connector capability must be ASCII"
+        ) from exc
+    token = token.rstrip("\r\n")
+    if _TRANSPORT_CONNECTOR_TOKEN_RE.fullmatch(token) is None:
+        raise ClientSnapshotError("transport connector capability is invalid")
+    return token
 
 
 @contextmanager
@@ -1323,15 +1405,18 @@ def _validate_loopback_mcp_url(url: str) -> str:
     parsed = urlsplit(url)
     if (
         parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port != 18181
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
         or parsed.path != "/mcp"
     ):
-        raise ClientSnapshotError("MCP snapshot observer requires the exact loopback /mcp endpoint")
-    return url
+        raise ClientSnapshotError(
+            "MCP snapshot observer requires the bound loopback operator endpoint"
+        )
+    return AUTO_REFRESH_MCP_URL
 
 
 async def _list_all_tools(client: Any) -> list[Any]:
@@ -1382,6 +1467,7 @@ async def _observe_and_bind_snapshot(
     *,
     mcp_url: str,
     session_id: str,
+    connector_capability: str,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     try:
@@ -1390,8 +1476,20 @@ async def _observe_and_bind_snapshot(
     except ImportError as exc:
         raise ClientSnapshotError("MCP client runtime is unavailable") from exc
 
+    mcp_url = _validate_loopback_mcp_url(mcp_url)
+    if (
+        not isinstance(connector_capability, str)
+        or _TRANSPORT_CONNECTOR_TOKEN_RE.fullmatch(connector_capability) is None
+    ):
+        raise ClientSnapshotError("transport connector capability is invalid")
+
     async def observe() -> dict[str, Any]:
-        async with streamablehttp_client(mcp_url) as (read_stream, write_stream, _):
+        async with streamablehttp_client(
+            mcp_url,
+            headers={
+                TRANSPORT_CONNECTOR_CAPABILITY_HEADER: connector_capability,
+            },
+        ) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as client:
                 await client.initialize()
                 tools = await _list_all_tools(client)
@@ -1608,6 +1706,7 @@ def refresh_connector_snapshot_if_needed(
     mcp_url: str,
     connector_pid: int,
     connector_start_ticks: int,
+    connector_token_path: Path = AUTO_REFRESH_CONNECTOR_TOKEN_PATH,
     renewal_margin_seconds: int = AUTO_REFRESH_RENEW_MARGIN_SECONDS,
     timeout_seconds: float = AUTO_REFRESH_TIMEOUT_SECONDS,
     now_unix: int | None = None,
@@ -1635,10 +1734,14 @@ def refresh_connector_snapshot_if_needed(
             "state": "not_due",
             "session_id_sha256": hashlib.sha256(session_id.encode("utf-8")).hexdigest(),
         }
+    connector_capability = _read_transport_connector_capability(
+        connector_token_path
+    )
     result = asyncio.run(
         _observe_and_bind_snapshot(
             mcp_url=_validate_loopback_mcp_url(mcp_url),
             session_id=session_id,
+            connector_capability=connector_capability,
             timeout_seconds=timeout_seconds,
         )
     )
@@ -1917,6 +2020,11 @@ def _auto_refresh_parser() -> argparse.ArgumentParser:
     refresh = subparsers.add_parser("refresh-if-needed")
     refresh.add_argument("--runtime-root", type=Path, required=True)
     refresh.add_argument("--mcp-url", default=AUTO_REFRESH_MCP_URL)
+    refresh.add_argument(
+        "--connector-token-file",
+        type=Path,
+        default=AUTO_REFRESH_CONNECTOR_TOKEN_PATH,
+    )
     refresh.add_argument("--connector-pid", type=int, required=True)
     refresh.add_argument("--connector-start-ticks", type=int, required=True)
     refresh.add_argument(
@@ -1942,6 +2050,7 @@ def main(argv: list[str] | None = None) -> int:
                 mcp_url=args.mcp_url,
                 connector_pid=args.connector_pid,
                 connector_start_ticks=args.connector_start_ticks,
+                connector_token_path=args.connector_token_file,
                 renewal_margin_seconds=args.renewal_margin_seconds,
                 timeout_seconds=args.timeout_seconds,
             )
