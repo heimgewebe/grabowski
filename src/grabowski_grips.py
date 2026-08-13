@@ -875,8 +875,9 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
         "exact worktree atomically in one call",
     ),
     "work-acquire": (
-        "source_kind must be one of bureau_task, github_issue, operator_obligation, thread_focus; "
-        "other source kinds have no immutable terminal evidence observer and are rejected before checkout creation",
+        "source_kind may be bureau_task, github_issue, operator_obligation, thread_focus, work_lane, direct or direct-user; "
+        "direct and direct-user are rebound server-side to durable work_lane lifecycle evidence, while unsupported "
+        "source kinds fail closed before checkout creation",
     ),
     "n8n-workflow-edge-verify": (
         "provider_profile must be a server-known fixed target; expected_state must be isolated or final; "

@@ -586,6 +586,47 @@ def _phase_count(
     return int(row["total"] if row is not None else 0)
 
 
+def _active_lifecycle_consumes_capacity(
+    lifecycle: sqlite3.Row,
+    *,
+    now: int,
+) -> bool:
+    """Return whether an active lifecycle binding still reserves creation capacity."""
+    if int(lifecycle["retention_until_unix"]) > now:
+        return True
+    try:
+        Path(str(lifecycle["checkout_path"])).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A filesystem observation failure must not open creation capacity.
+        return True
+    return True
+
+
+def _active_creation_count(
+    connection: sqlite3.Connection,
+    *,
+    repo_common_dir: Path,
+    exclude_checkout_key: str,
+    now: int,
+) -> int:
+    """Count active bindings that still reserve capacity for checkout creation."""
+    rows = connection.execute(
+        """
+        SELECT checkout_path, retention_until_unix
+        FROM lifecycle_bindings
+        WHERE repo_common_dir=? AND phase='active' AND checkout_key<>?
+        """,
+        (str(repo_common_dir), exclude_checkout_key),
+    ).fetchall()
+    total = 0
+    for row in rows:
+        if _active_lifecycle_consumes_capacity(row, now=now):
+            total += 1
+    return total
+
+
 def _reserve_checkout_lifecycle(
     *,
     repo_common_dir: Path,
@@ -651,14 +692,18 @@ def _reserve_checkout_lifecycle(
             )
             if observed_contract != expected_contract:
                 raise RuntimeError("Checkout lifecycle source or identity binding conflicts")
-        count = _phase_count(
+        count = _active_creation_count(
             connection,
             repo_common_dir=common_dir,
-            phase="active",
             exclude_checkout_key=checkout_key,
+            now=now,
         )
         limit = _phase_limit("active")
-        if count >= limit and existing is None:
+        existing_consumes_capacity = (
+            existing is not None
+            and _active_lifecycle_consumes_capacity(existing, now=now)
+        )
+        if count >= limit and not existing_consumes_capacity:
             raise RuntimeError(
                 f"Per-repository active checkout limit reached: active={count} limit={limit}"
             )
