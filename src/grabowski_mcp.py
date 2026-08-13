@@ -2484,6 +2484,16 @@ def _resolve_secret_existing(raw_path: str) -> Path:
     return _resolve_rooted_existing(raw_path, _secret_roots(), "secret")
 
 
+def _resolve_secret_use_source(raw_path: str) -> Path:
+    if _trusted_owner_enabled():
+        return _resolve_rooted_existing(
+            raw_path,
+            [*_secret_roots(), *_roots("read")],
+            "secret-use",
+        )
+    return _resolve_secret_existing(raw_path)
+
+
 def _resolve_browser_profile_existing(raw_path: str) -> Path:
     return _resolve_rooted_existing(
         raw_path,
@@ -6121,7 +6131,7 @@ def grabowski_secret_use(
     """Run one argv-only command with a secret exposed only through an fd/path."""
     _require_mutations_enabled("secret_use")
     _validate_sha256(expected_source_sha256, "expected_source_sha256")
-    source = _resolve_secret_existing(source_path)
+    source = _resolve_secret_use_source(source_path)
     policy = _load_policy()
     snapshot = _read_bound_regular_bytes(
         source,
