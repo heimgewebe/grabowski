@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -484,6 +486,21 @@ def _write_config(directory: Path, config: dict[str, Any]) -> Path:
     return target
 
 
+def _write_browser_semantic_handle_key(directory: Path) -> None:
+    target = directory / ".semantic-handle-key"
+    payload = (secrets.token_hex(32) + "\n").encode("ascii")
+    descriptor = os.open(
+        target,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _launch_argv(record: dict[str, Any], writable_paths: list[Path]) -> list[str]:
     argv_hash = operator._argv_hash(json.loads(record["argv_json"]))
     argv = [
@@ -832,7 +849,17 @@ def _start(
     worker_id = config.pop("worker_id")
     directory = _worker_directory(worker_id)
     ephemeral_paths.append(directory)
-    config_path = _write_config(directory, config)
+    try:
+        if kind == "browser":
+            _write_browser_semantic_handle_key(directory)
+        config_path = _write_config(directory, config)
+    except Exception:
+        for path in reversed(ephemeral_paths):
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+        raise
     now = _now()
     record = {
         "worker_id": worker_id,
@@ -1929,15 +1956,14 @@ def browser_stored_form_action(
 # --- Browser semantic contract (observe -> snapshot -> act -> verify) ------
 #
 # This is a backend-neutral foundation layered on top of the Chrome/CDP
-# adapter helpers above. It never surfaces raw CDP method names to callers,
-# binds every action to worker_id + an opaque, immutable snapshot_id, and
-# fails closed with a stable "stale_snapshot" outcome whenever the
-# authoritative re-observation performed immediately before an effect
-# disagrees with the snapshot the caller reasoned about. This slice
-# implements only the read/local_ui effect classes; reversible_external,
-# external_mutation and high_impact are named for the vocabulary but always
-# resolve to "effect_not_implemented" here. See
-# docs/browser-control-plane-v1.md for the full contract and non-claims.
+# adapter helpers above. It never surfaces raw CDP method names, selectors,
+# backend node ids, or other backend-specific element locators to callers.
+# Every action is bound to worker_id + an opaque immutable snapshot_id;
+# element-targeted actions additionally require an opaque element_id derived
+# from that exact snapshot. The adapter re-observes semantic DOM state before
+# every effect and revalidates the selected node again immediately before the
+# effect. This slice still implements only read/local_ui. External effect
+# classes remain named but fail closed. See docs/browser-control-plane-v1.md.
 
 BROWSER_EFFECT_CLASSES = (
     "read",
@@ -1948,10 +1974,14 @@ BROWSER_EFFECT_CLASSES = (
 )
 BROWSER_EFFECT_CLASSES_IMPLEMENTED = frozenset({"read", "local_ui"})
 BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
-    "read_state": {"effect_class": "read", "requires_selector": False},
-    "scroll_into_view": {"effect_class": "local_ui", "requires_selector": True},
+    "read_state": {"effect_class": "read", "requires_element": False},
+    "scroll_into_view": {"effect_class": "local_ui", "requires_element": True},
 }
-BROWSER_SNAPSHOT_ID_PREFIX = "bsid1_"
+BROWSER_SNAPSHOT_ID_PREFIX = "bsid2_"
+BROWSER_ELEMENT_ID_PREFIX = "beid1_"
+BROWSER_MAX_ELEMENTS = 80
+BROWSER_ELEMENT_ROLE_MAX = 64
+BROWSER_ELEMENT_NAME_MAX = 160
 BROWSER_SEMANTIC_RESULT_CODES = {
     "ok",
     "transport",
@@ -1984,6 +2014,11 @@ const request = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 let ws = null;
 let nextId = 1;
 const pending = new Map();
+const semanticRoles = new Set([
+  'button', 'link', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
+  'option', 'slider', 'spinbutton', 'switch', 'tab', 'menuitem', 'treeitem',
+  'heading',
+]);
 
 function emit(payload, status = 0) {
   const line = JSON.stringify(payload) + '\n';
@@ -2034,14 +2069,28 @@ async function call(method, params = {}) {
   });
 }
 
-async function evaluate(source) {
-  const response = await call('Runtime.evaluate', {
-    expression: source,
-    returnByValue: true,
-    awaitPromise: true,
-  });
-  if (response.exceptionDetails) throw new Error('protocol');
-  return response.result ? response.result.value : undefined;
+function boundedText(value, limit) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+async function readElements() {
+  const tree = await call('Accessibility.getFullAXTree');
+  const elements = [];
+  const seen = new Set();
+  for (const node of Array.isArray(tree.nodes) ? tree.nodes : []) {
+    if (elements.length >= 80) break;
+    if (!node || node.ignored === true || !Number.isInteger(node.backendDOMNodeId)) continue;
+    if (node.backendDOMNodeId <= 0 || seen.has(node.backendDOMNodeId)) continue;
+    const role = boundedText(node.role && node.role.value, 64);
+    if (!semanticRoles.has(role)) continue;
+    seen.add(node.backendDOMNodeId);
+    elements.push({
+      backend_node_id: String(node.backendDOMNodeId),
+      role,
+      name: boundedText(node.name && node.name.value, 160),
+    });
+  }
+  return elements;
 }
 
 async function readState() {
@@ -2052,11 +2101,17 @@ async function readState() {
   const loaderId = mainFrame && typeof mainFrame.loaderId === 'string'
     ? mainFrame.loaderId : null;
   if (!mainFrameId || !loaderId) throw new Error('protocol');
-  const state = await evaluate(`({
-    origin: location.origin,
-    ready_state: document.readyState,
-    title: (document.title || '').slice(0, 200),
-  })`);
+  const stateResponse = await call('Runtime.evaluate', {
+    expression: `({
+      origin: location.origin,
+      ready_state: document.readyState,
+      title: (document.title || '').slice(0, 200),
+    })`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (stateResponse.exceptionDetails) throw new Error('protocol');
+  const state = stateResponse.result ? stateResponse.result.value : undefined;
   if (!state || typeof state.origin !== 'string') throw new Error('protocol');
   return {
     origin: state.origin,
@@ -2064,7 +2119,58 @@ async function readState() {
     title: String(state.title || ''),
     main_frame_id: mainFrameId,
     loader_id: loaderId,
+    elements: await readElements(),
   };
+}
+
+function sameElements(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+  return left.every((element, index) => {
+    const expected = right[index];
+    return expected &&
+      element.backend_node_id === expected.backend_node_id &&
+      element.role === expected.role &&
+      element.name === expected.name;
+  });
+}
+
+function sameState(left, right) {
+  if (!left || !right) return false;
+  for (const key of ['origin', 'ready_state', 'title', 'main_frame_id', 'loader_id']) {
+    if (left[key] !== right[key]) return false;
+  }
+  return sameElements(left.elements, right.elements);
+}
+
+async function verifyElementImmediately(expected) {
+  if (!expected || !/^[1-9][0-9]{0,19}$/.test(String(expected.backend_node_id || ''))) {
+    throw new Error('element-contract');
+  }
+  const backendNodeId = Number(expected.backend_node_id);
+  if (!Number.isSafeInteger(backendNodeId) || backendNodeId <= 0) {
+    throw new Error('element-contract');
+  }
+  let partial;
+  try {
+    partial = await call('Accessibility.getPartialAXTree', {backendNodeId, fetchRelatives: false});
+  } catch {
+    throw new Error('stale-snapshot');
+  }
+  const nodes = Array.isArray(partial.nodes) ? partial.nodes : [];
+  const node = nodes.find((item) => item && item.backendDOMNodeId === backendNodeId);
+  if (!node || node.ignored === true) throw new Error('stale-snapshot');
+  const role = boundedText(node.role && node.role.value, 64);
+  const name = boundedText(node.name && node.name.value, 160);
+  if (role !== expected.role || name !== expected.name) throw new Error('stale-snapshot');
+  let resolved;
+  try {
+    resolved = await call('DOM.resolveNode', {backendNodeId});
+  } catch {
+    throw new Error('stale-snapshot');
+  }
+  const objectId = resolved && resolved.object && resolved.object.objectId;
+  if (typeof objectId !== 'string' || !objectId) throw new Error('stale-snapshot');
+  return objectId;
 }
 
 try {
@@ -2088,25 +2194,45 @@ try {
   await connect(matches[0].webSocketDebuggerUrl);
   await call('Runtime.enable');
   await call('Page.enable');
+  await call('DOM.enable');
+  await call('Accessibility.enable');
 
   if (request.op === 'read_state') {
     const state = await readState();
     emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
   } else if (request.op === 'scroll_into_view') {
     const before = await readState();
-    const expected = request.expected_state;
-    const stateKeys = ['origin', 'ready_state', 'title', 'main_frame_id', 'loader_id'];
-    if (!expected || stateKeys.some((key) => before[key] !== expected[key])) {
+    if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
+    const expectedElement = request.expected_element;
+    const selected = before.elements.find((element) =>
+      expectedElement && element.backend_node_id === expectedElement.backend_node_id &&
+      element.role === expectedElement.role && element.name === expectedElement.name
+    );
+    if (!selected) throw new Error('element-contract');
+
+    // Re-resolve and re-check the exact AX node immediately before the effect.
+    // This closes the Python -> adapter gap without exposing backend ids publicly.
+    const objectId = await verifyElementImmediately(expectedElement);
+    let effect;
+    try {
+      effect = await call('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function () {
+          if (!this || !this.isConnected) return false;
+          this.scrollIntoView({block: 'center', inline: 'nearest'});
+          return true;
+        }`,
+        returnByValue: true,
+        awaitPromise: false,
+      });
+    } finally {
+      try {
+        await call('Runtime.releaseObject', {objectId});
+      } catch {}
+    }
+    if (effect.exceptionDetails || !effect.result || effect.result.value !== true) {
       throw new Error('stale-snapshot');
     }
-    const found = await evaluate(`(() => {
-      let element = null;
-      try { element = document.querySelector(${JSON.stringify(request.selector)}); } catch { return false; }
-      if (!element || !element.isConnected) return false;
-      element.scrollIntoView({block: 'center', inline: 'nearest'});
-      return true;
-    })()`);
-    if (!found) throw new Error('element-contract');
     const state = await readState();
     emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
   } else {
@@ -2194,18 +2320,113 @@ def _run_node_browser_semantic(
     return payload
 
 
+def _bounded_semantic_text(value: Any, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _bounded_browser_elements(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    bounded: list[dict[str, str]] = []
+    seen_backend_ids: set[str] = set()
+    for entry in raw:
+        if len(bounded) >= BROWSER_MAX_ELEMENTS:
+            break
+        if not isinstance(entry, dict):
+            continue
+        backend_node_id = str(entry.get("backend_node_id") or "")
+        if re.fullmatch(r"[1-9][0-9]{0,19}", backend_node_id) is None:
+            continue
+        if backend_node_id in seen_backend_ids:
+            continue
+        role = _bounded_semantic_text(entry.get("role"), BROWSER_ELEMENT_ROLE_MAX)
+        if not role:
+            continue
+        seen_backend_ids.add(backend_node_id)
+        bounded.append(
+            {
+                "backend_node_id": backend_node_id,
+                "role": role,
+                "name": _bounded_semantic_text(
+                    entry.get("name"), BROWSER_ELEMENT_NAME_MAX
+                ),
+            }
+        )
+    return bounded
+
+
 def _bounded_browser_state(raw: dict[str, Any]) -> dict[str, Any]:
-    """Trim a raw CDP-sourced readback to the bounded fields the contract hashes."""
+    """Trim CDP-sourced readback to the private bounded material we hash."""
     return {
         "origin": str(raw.get("origin") or "")[:512],
         "ready_state": str(raw.get("ready_state") or "")[:32],
         "title": str(raw.get("title") or "")[:200],
         "main_frame_id": str(raw.get("main_frame_id") or "")[:128],
         "loader_id": str(raw.get("loader_id") or "")[:128],
+        "elements": _bounded_browser_elements(raw.get("elements")),
     }
 
 
-def _browser_snapshot_id(worker_id: str, state: dict[str, Any]) -> str:
+def _browser_semantic_handle_key(record: dict[str, Any]) -> bytes:
+    directory = Path(record["config_path"]).parent
+    if directory.is_symlink() or WORKER_STATE not in directory.parents:
+        raise PermissionError("browser semantic key directory is outside worker state")
+    key_path = directory / ".semantic-handle-key"
+    if key_path.is_symlink():
+        raise PermissionError("browser semantic handle key may not be a symlink")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(key_path, flags)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "browser worker predates semantic handle keys; start a fresh browser worker"
+        ) from exc
+    except OSError as exc:
+        raise PermissionError(
+            "browser semantic handle key could not be opened safely"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 128
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise PermissionError("browser semantic handle key metadata is unsafe")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            raw = handle.read(129)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > 128:
+        raise PermissionError("browser semantic handle key metadata is unsafe")
+    try:
+        value = raw.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("browser semantic handle key is invalid") from exc
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise RuntimeError("browser worker lacks a valid semantic handle key")
+    return bytes.fromhex(value)
+
+
+def _browser_mac(prefix: str, handle_key: bytes, payload: dict[str, Any]) -> str:
+    digest = hmac.new(
+        handle_key,
+        _canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return prefix + digest
+
+
+def _browser_snapshot_id(
+    worker_id: str, state: dict[str, Any], handle_key: bytes
+) -> str:
     payload = {
         "worker_id": worker_id,
         "origin": state["origin"],
@@ -2213,8 +2434,9 @@ def _browser_snapshot_id(worker_id: str, state: dict[str, Any]) -> str:
         "title": state["title"],
         "main_frame_id": state["main_frame_id"],
         "loader_id": state["loader_id"],
+        "elements": state["elements"],
     }
-    return BROWSER_SNAPSHOT_ID_PREFIX + _sha256_text(_canonical_json(payload))
+    return _browser_mac(BROWSER_SNAPSHOT_ID_PREFIX, handle_key, payload)
 
 
 def _is_browser_snapshot_id(value: Any) -> bool:
@@ -2228,16 +2450,72 @@ def _is_browser_snapshot_id(value: Any) -> bool:
     )
 
 
-def _browser_observation(worker_id: str, state: dict[str, Any]) -> dict[str, Any]:
-    """The public BrowserObservation projection: semantic, no raw CDP terms."""
+def _browser_element_id(
+    worker_id: str,
+    snapshot_id: str,
+    element: dict[str, str],
+    handle_key: bytes,
+) -> str:
+    payload = {
+        "worker_id": worker_id,
+        "snapshot_id": snapshot_id,
+        "backend_node_id": element["backend_node_id"],
+        "role": element["role"],
+        "name": element["name"],
+    }
+    return _browser_mac(BROWSER_ELEMENT_ID_PREFIX, handle_key, payload)
+
+
+def _is_browser_element_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(BROWSER_ELEMENT_ID_PREFIX)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", value[len(BROWSER_ELEMENT_ID_PREFIX):]
+        )
+        is not None
+    )
+
+
+def _browser_element_for_id(
+    worker_id: str,
+    snapshot_id: str,
+    state: dict[str, Any],
+    element_id: str,
+    handle_key: bytes,
+) -> dict[str, str] | None:
+    for element in state["elements"]:
+        candidate = _browser_element_id(
+            worker_id, snapshot_id, element, handle_key
+        )
+        if hmac.compare_digest(candidate, element_id):
+            return element
+    return None
+
+
+def _browser_observation(
+    worker_id: str, state: dict[str, Any], handle_key: bytes
+) -> dict[str, Any]:
+    """Public BrowserObservation: semantic and bounded, with opaque handles only."""
+    snapshot_id = _browser_snapshot_id(worker_id, state, handle_key)
     return {
         "schema_version": 1,
         "worker_id": worker_id,
-        "snapshot_id": _browser_snapshot_id(worker_id, state),
+        "snapshot_id": snapshot_id,
         "observed_at_unix": _now(),
         "origin": state["origin"],
         "ready_state": state["ready_state"],
         "title": state["title"],
+        "elements": [
+            {
+                "element_id": _browser_element_id(
+                    worker_id, snapshot_id, element, handle_key
+                ),
+                "role": element["role"],
+                "name": element["name"],
+            }
+            for element in state["elements"]
+        ],
     }
 
 
@@ -2250,7 +2528,6 @@ def _browser_observed_state(
             "schema_version": 1,
             "port": record["port"],
             "op": "read_state",
-            "selector": None,
             "timeout_ms": timeout_seconds * 1000,
         },
         timeout_seconds=timeout_seconds,
@@ -2265,6 +2542,7 @@ def _browser_local_ui_effect(
     intent: dict[str, Any],
     *,
     expected_state: dict[str, Any],
+    expected_element: dict[str, str],
     timeout_seconds: int,
 ) -> dict[str, Any]:
     payload = _run_node_browser_semantic(
@@ -2273,8 +2551,8 @@ def _browser_local_ui_effect(
             "schema_version": 1,
             "port": record["port"],
             "op": intent["action_kind"],
-            "selector": intent["selector"],
             "expected_state": expected_state,
+            "expected_element": expected_element,
             "timeout_ms": timeout_seconds * 1000,
         },
         timeout_seconds=timeout_seconds,
@@ -2288,38 +2566,41 @@ def _browser_outcome_code_from_node(result_code: str) -> str:
     return _BROWSER_NODE_RESULT_TO_OUTCOME.get(result_code, "protocol")
 
 
-def _browser_intent(action_kind: str, *, selector: str | None) -> dict[str, Any]:
-    """The internal BrowserIntent: an abstract action kind, never a CDP method."""
+def _browser_intent(
+    action_kind: str, *, element_id: str | None
+) -> dict[str, Any]:
+    """Internal BrowserIntent: abstract action kind, never a CDP method or selector."""
     if not isinstance(action_kind, str):
         raise ValueError("action_kind must be text")
     spec = BROWSER_ACTION_CATALOG.get(action_kind)
     if spec is None:
         raise ValueError("unsupported browser action kind")
-    if spec["requires_selector"]:
-        if selector is None:
-            raise ValueError(f"browser action {action_kind!r} requires a selector")
-        selector = _validate_form_selector(selector, "selector")
-    elif selector is not None:
-        raise ValueError(f"browser action {action_kind!r} does not accept a selector")
+    if spec["requires_element"]:
+        if element_id is None:
+            raise ValueError(f"browser action {action_kind!r} requires an element_id")
+        if not _is_browser_element_id(element_id):
+            raise ValueError("element_id is not a recognized opaque browser element id")
+    elif element_id is not None:
+        raise ValueError(f"browser action {action_kind!r} does not accept an element_id")
     return {
         "schema_version": 1,
         "action_kind": action_kind,
         "effect_class": spec["effect_class"],
-        "selector": selector,
+        "element_id": element_id,
     }
 
 
 def _browser_action(
     worker_id: str, snapshot_id: str, intent: dict[str, Any]
 ) -> dict[str, Any]:
-    """The internal BrowserAction: an intent bound to worker_id + snapshot_id."""
+    """Internal BrowserAction: intent bound to worker + snapshot + opaque element."""
     return {
         "schema_version": 1,
         "worker_id": worker_id,
         "snapshot_id": snapshot_id,
         "action_kind": intent["action_kind"],
         "effect_class": intent["effect_class"],
-        "selector": intent["selector"],
+        "element_id": intent["element_id"],
     }
 
 
@@ -2341,6 +2622,7 @@ def _browser_outcome(
         "action_kind": action["action_kind"],
         "effect_class": action["effect_class"],
         "requested_snapshot_id": action["snapshot_id"],
+        "requested_element_id": action["element_id"],
         "pre_action_snapshot_id": pre_observation["snapshot_id"] if pre_observation else None,
         "post_action_snapshot_id": post_observation["snapshot_id"] if post_observation else None,
         "observation": post_observation if post_observation is not None else pre_observation,
@@ -2380,12 +2662,13 @@ def _validate_browser_semantic_timeout(timeout_seconds: int) -> int:
 def browser_semantic_observe(
     worker_id: str, *, timeout_seconds: int = 10
 ) -> dict[str, Any]:
-    """Produce a fresh BrowserObservation with its immutable, opaque snapshot_id."""
+    """Produce a fresh BrowserObservation with snapshot-bound opaque elements."""
     identifier = _validate_worker_id(worker_id)
     timeout_seconds = _validate_browser_semantic_timeout(timeout_seconds)
     record = _browser_semantic_preflight(identifier)
+    handle_key = _browser_semantic_handle_key(record)
     state = _browser_observed_state(record, timeout_seconds=timeout_seconds)
-    return _browser_observation(identifier, state)
+    return _browser_observation(identifier, state, handle_key)
 
 
 def browser_semantic_act(
@@ -2393,23 +2676,23 @@ def browser_semantic_act(
     snapshot_id: str,
     action_kind: str,
     *,
-    selector: str | None = None,
+    element_id: str | None = None,
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
-    """Execute a state-bound BrowserAction and return an authoritative BrowserOutcome.
+    """Execute a state-bound BrowserAction and return an authoritative outcome.
 
-    Binds worker_id + snapshot_id. Immediately before any effect, the worker is
-    re-observed; if the freshly observed snapshot_id disagrees with the one the
-    caller reasoned about, this fails closed with result_code="stale_snapshot"
-    and performs no effect. Only the read and local_ui effect classes are
-    implemented in this slice.
+    Every effect is bound to worker_id + snapshot_id. Element-targeted actions
+    additionally require an opaque element_id from that exact observation. A
+    fresh semantic DOM observation must still match immediately before effect;
+    the adapter then revalidates the internal node fingerprint once more.
     """
     identifier = _validate_worker_id(worker_id)
     if not _is_browser_snapshot_id(snapshot_id):
         raise ValueError("snapshot_id is not a recognized opaque browser snapshot id")
     timeout_seconds = _validate_browser_semantic_timeout(timeout_seconds)
-    intent = _browser_intent(action_kind, selector=selector)
+    intent = _browser_intent(action_kind, element_id=element_id)
     record = _browser_semantic_preflight(identifier)
+    handle_key = _browser_semantic_handle_key(record)
     action = _browser_action(identifier, snapshot_id, intent)
 
     try:
@@ -2422,7 +2705,7 @@ def browser_semantic_act(
             pre_observation=None,
             post_observation=None,
         )
-    pre_observation = _browser_observation(identifier, fresh_state)
+    pre_observation = _browser_observation(identifier, fresh_state, handle_key)
     if pre_observation["snapshot_id"] != snapshot_id:
         return _browser_outcome(
             action,
@@ -2431,6 +2714,21 @@ def browser_semantic_act(
             pre_observation=pre_observation,
             post_observation=None,
         )
+
+    expected_element: dict[str, str] | None = None
+    if intent["element_id"] is not None:
+        expected_element = _browser_element_for_id(
+            identifier, snapshot_id, fresh_state, intent["element_id"], handle_key
+        )
+        if expected_element is None:
+            return _browser_outcome(
+                action,
+                ok=False,
+                result_code="element_contract",
+                pre_observation=pre_observation,
+                post_observation=None,
+            )
+
     if intent["effect_class"] not in BROWSER_EFFECT_CLASSES_IMPLEMENTED:
         return _browser_outcome(
             action,
@@ -2442,11 +2740,14 @@ def browser_semantic_act(
     if intent["action_kind"] == "read_state":
         post_state = fresh_state
     else:
+        if expected_element is None:
+            raise RuntimeError("element-targeted browser action lost its element binding")
         try:
             post_state = _browser_local_ui_effect(
                 record,
                 intent,
                 expected_state=fresh_state,
+                expected_element=expected_element,
                 timeout_seconds=timeout_seconds,
             )
         except _BrowserSemanticError as exc:
@@ -2462,7 +2763,7 @@ def browser_semantic_act(
         ok=True,
         result_code="ok",
         pre_observation=pre_observation,
-        post_observation=_browser_observation(identifier, post_state),
+        post_observation=_browser_observation(identifier, post_state, handle_key),
     )
 
 
