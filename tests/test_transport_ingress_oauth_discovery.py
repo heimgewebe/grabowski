@@ -29,9 +29,16 @@ RUNTIME_BINDING_SHA256 = "b" * 64
 
 
 class _FakeJSONResponse:
-    def __init__(self, content: object, *, status_code: int = 200) -> None:
+    def __init__(
+        self,
+        content: object,
+        *,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self.body = json.dumps(content, separators=(",", ":")).encode("utf-8")
+        self.headers = {} if headers is None else dict(headers)
 
 
 class _FakeRoute:
@@ -105,10 +112,12 @@ class TransportIngressOAuthDiscoveryTests(unittest.TestCase):
             json.loads(response.body),
             {
                 "resource": "http://127.0.0.1:18180/mcp",
-                "authorization_servers": ["https://auth.openai.com"],
-                "scopes_supported": ["mcp:invoke"],
+                "resource_name": "Grabowski MCP",
+                "authorization_servers": [],
+                "bearer_methods_supported": [],
             },
         )
+        self.assertEqual(response.headers, {"Cache-Control": "no-store"})
 
 
 if __name__ == "__main__":

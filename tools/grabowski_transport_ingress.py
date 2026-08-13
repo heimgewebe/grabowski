@@ -56,8 +56,6 @@ RUNTIME_BINDING_SHA256_HEADER = "X-Grabowski-Runtime-Binding-Sha256"
 REQUEST_MAC_HEADER = "X-Grabowski-Request-Mac"
 OAUTH_PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
 OAUTH_PROTECTED_RESOURCE_MCP_PATH = "/.well-known/oauth-protected-resource/mcp"
-OAUTH_AUTHORIZATION_SERVER = "https://auth.openai.com"
-OAUTH_SCOPE = "mcp:invoke"
 
 
 class IngressConfigurationError(RuntimeError):
@@ -371,9 +369,11 @@ class TransportIngress:
         return JSONResponse(
             {
                 "resource": f"{str(request.base_url).rstrip('/')}/mcp",
-                "authorization_servers": [OAUTH_AUTHORIZATION_SERVER],
-                "scopes_supported": [OAUTH_SCOPE],
-            }
+                "resource_name": "Grabowski MCP",
+                "authorization_servers": [],
+                "bearer_methods_supported": [],
+            },
+            headers={"Cache-Control": "no-store"},
         )
 
     async def proxy(self, request: Any) -> Any:
