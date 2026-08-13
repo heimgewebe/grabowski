@@ -4806,6 +4806,52 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual("no-op", release_result["status"])
         self.assertEqual([key], release_result["preserved_resource_keys"])
 
+    def test_orphan_reconcile_retry_preserves_successor_keys_in_receipt(
+        self,
+    ) -> None:
+        intent, run_dir, acquisition, coordination, request, _lease, key = (
+            self._orphan_setup()
+        )
+        original = acquisition["leases"][0]
+        reacquired_at = original["expires_at_unix"] + 1
+        foreign = {
+            **self.lease(key, "controller:foreign-successor"),
+            "acquired_at_unix": reacquired_at,
+            "updated_at_unix": reacquired_at,
+            "expires_at_unix": reacquired_at + 300,
+        }
+        saved_release = {
+            "schema_version": pickup.SCHEMA_VERSION,
+            "status": "no-op",
+            "owner_id": intent["lease_owner_id"],
+            "released": [],
+            "released_resource_keys": [],
+            "preserved_resource_keys": [key],
+        }
+        pickup._write_bound_json(run_dir / "release-result.json", saved_release)
+        terminal = self.coordinated_status(intent, state="failed")
+        fail_result = {
+            "run_id": intent["run_id"],
+            "state": "failed",
+            "error": pickup.ORPHAN_RECONCILE_ERROR,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, fail_result, terminal],
+            ),
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=foreign
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("reconciled", result["status"])
+        self.assertEqual([key], result["release"]["preserved_resource_keys"])
+        self.assertEqual([key], result["receipt"]["preserved_resource_keys"])
+        release.assert_not_called()
+
     def test_orphan_reconcile_rejects_ambiguous_foreign_lease_lineage(
         self,
     ) -> None:
@@ -4833,7 +4879,12 @@ class BureauPickupTests(unittest.TestCase):
         bool_expiry = dict(valid)
         bool_expiry["expires_at_unix"] = False
         cases["boolean-expiry"] = bool_expiry
-
+        updated_at_expiry = dict(valid)
+        updated_at_expiry["updated_at_unix"] = updated_at_expiry["expires_at_unix"]
+        cases["updated-at-expiry"] = updated_at_expiry
+        updated_after_expiry = dict(valid)
+        updated_after_expiry["updated_at_unix"] = updated_after_expiry["expires_at_unix"] + 1
+        cases["updated-after-expiry"] = updated_after_expiry
         for label, foreign in cases.items():
             with self.subTest(label=label):
                 with (
@@ -4856,6 +4907,40 @@ class BureauPickupTests(unittest.TestCase):
                 for call in invoke.call_args_list:
                     self.assertNotIn("fail", call.args[0])
                 release.assert_not_called()
+
+    def test_orphan_reconcile_rejects_historical_update_at_expiry(
+        self,
+    ) -> None:
+        intent, run_dir, acquisition, coordination, request, _lease, key = (
+            self._orphan_setup()
+        )
+        historical = acquisition["leases"][0]
+        historical["updated_at_unix"] = historical["expires_at_unix"]
+        acquisition.pop("acquisition_sha256")
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        request["expected_lease_sha256"] = acquisition["acquisition_sha256"]
+        (run_dir / "acquisition.json").write_bytes(pickup._canonical_json(acquisition))
+        reacquired_at = historical["expires_at_unix"] + 1
+        foreign = {
+            **self.lease(key, "controller:foreign-successor"),
+            "acquired_at_unix": reacquired_at,
+            "updated_at_unix": reacquired_at,
+            "expires_at_unix": reacquired_at + 300,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=coordination
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=foreign
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("orphan-reconcile-foreign-lease", raised.exception.code)
+        self.assertEqual(1, invoke.call_count)
+        release.assert_not_called()
 
     def test_orphan_reconcile_preserves_dirty_state(self) -> None:
         intent, _run_dir, _acq, coordination, request, lease, _key = (

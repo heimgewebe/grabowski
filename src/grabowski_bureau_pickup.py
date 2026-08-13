@@ -2297,9 +2297,17 @@ def _foreign_lease_is_strict_successor(
     assert observed_acquired is not None
     assert observed_updated is not None
     assert observed_expires is not None
-    if expected_updated < expected_acquired or expected_expires <= expected_acquired:
+    if (
+        expected_updated < expected_acquired
+        or expected_updated >= expected_expires
+        or expected_expires <= expected_acquired
+    ):
         return False
-    if observed_updated < observed_acquired or observed_expires <= observed_acquired:
+    if (
+        observed_updated < observed_acquired
+        or observed_updated >= observed_expires
+        or observed_expires <= observed_acquired
+    ):
         return False
     return observed_acquired > expected_expires
 
@@ -3622,6 +3630,19 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
             ]:
                 remaining_existing[key] = observed
         if not remaining_existing:
+            saved_release = _read_bound_json(
+                existing_release_path, label="release-result"
+            )
+            preserved_keys = saved_release.get("preserved_resource_keys", [])
+            released_keys = saved_release.get("released_resource_keys", [])
+            if not isinstance(preserved_keys, list) or not all(
+                isinstance(key, str) for key in preserved_keys
+            ):
+                raise BureauPickupError("lease-release-result-invalid")
+            if not isinstance(released_keys, list) or not all(
+                isinstance(key, str) for key in released_keys
+            ):
+                raise BureauPickupError("lease-release-result-invalid")
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "grabowski_bureau_pickup_release",
@@ -3635,9 +3656,9 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
                 ],
                 "owner_id": acquisition["owner_id"],
                 "resource_keys": acquisition["resource_keys"],
-                "release": _read_bound_json(
-                    existing_release_path, label="release-result"
-                ),
+                "released_resource_keys": released_keys,
+                "preserved_resource_keys": preserved_keys,
+                "release": saved_release,
                 "journal": str(run_dir),
             }
     status, effective_binding = _coordination_status_for_binding(
@@ -3650,13 +3671,18 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         run_dir / "terminal-readback.json", status
     )
     if keys:
-        result = resources.release_resources(owner_id, keys)
+        result = {
+            **resources.release_resources(owner_id, keys),
+            "released_resource_keys": keys,
+            "preserved_resource_keys": preserved_keys,
+        }
     else:
         result = {
             "schema_version": SCHEMA_VERSION,
             "status": "no-op",
             "owner_id": owner_id,
             "released": [],
+            "released_resource_keys": [],
             "preserved_resource_keys": preserved_keys,
         }
     _write_bound_json(run_dir / "release-result.json", result)
