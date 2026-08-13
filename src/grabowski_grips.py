@@ -3850,7 +3850,11 @@ def _run_work_acquire(
 
     state = str(output.get("state") or "unknown")
     decision = str(output.get("decision") or "unknown")
-    ready = state == "ready" and decision in {"EXECUTE", "AUTO_PREPARE_AND_EXECUTE"}
+    ready = state == "ready" and decision in {
+        "EXECUTE",
+        "AUTO_PREPARE_AND_EXECUTE",
+        "ISOLATE_AND_EXECUTE",
+    }
     _check(receipt, "source_and_controller_bound", "pass" if isinstance(output.get("inputs"), dict) else "fail", state)
     _check(receipt, "lease_and_worktree_bound", "pass" if ready and output.get("lease_receipt") and output.get("worktree_receipt") else ("skip" if not ready else "fail"), state)
     _check(receipt, "decision_explicit", "pass" if decision != "unknown" else "fail", decision)

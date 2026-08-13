@@ -99,6 +99,13 @@ SCOPED_CHECKOUT_OPERATIONS = frozenset(
         "task_existing_checkout",
     }
 )
+ISOLATABLE_OPERATIONS = frozenset({"worktree_create"})
+ISOLATION_SIGNAL_CODES = frozenset(
+    {
+        "unrelated-dirty-worktree",
+        "unrelated-foreign-live-coordination",
+    }
+)
 
 
 class WorkAdmissionBlocked(RuntimeError):
@@ -114,6 +121,65 @@ def _canonical_json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def has_verified_isolation_evidence(assessment: Any) -> bool:
+    """Verify isolation evidence integrity without granting mutation authority."""
+    if not isinstance(assessment, dict):
+        return False
+    if (
+        assessment.get("decision") != "isolate_and_execute"
+        or assessment.get("scope_mode") != "exact_checkout"
+        or assessment.get("blockers") != []
+        or assessment.get("blocker_codes") != []
+    ):
+        return False
+    assessment_sha256 = assessment.get("assessment_sha256")
+    if not _is_sha256(assessment_sha256):
+        return False
+    material = {
+        key: value
+        for key, value in assessment.items()
+        if key != "assessment_sha256"
+    }
+    try:
+        if assessment_sha256 != _digest(material):
+            return False
+    except (TypeError, ValueError):
+        return False
+    evidence = assessment.get("isolation_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("kind") != "grabowski.repository_work_isolation_evidence"
+        or evidence.get("scope_identity") != assessment.get("scope_identity")
+        or evidence.get("nonconflict_verified") is not True
+    ):
+        return False
+    signals = evidence.get("signals")
+    if not isinstance(signals, list) or not signals:
+        return False
+    for signal in signals:
+        if not isinstance(signal, dict):
+            return False
+        if signal.get("code") not in ISOLATION_SIGNAL_CODES:
+            return False
+        path = signal.get("path")
+        if not isinstance(path, str) or not path:
+            return False
+    evidence_sha256 = evidence.get("evidence_sha256")
+    if not _is_sha256(evidence_sha256):
+        return False
+    evidence_material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    try:
+        return evidence_sha256 == _digest(evidence_material)
+    except (TypeError, ValueError):
+        return False
 
 
 def plan_system_convergence(
@@ -984,6 +1050,7 @@ def assess_repository_admission(
     worktrees = inventory.get("worktrees") if isinstance(inventory, dict) else None
     bindings = reconciliation.get("bindings") if isinstance(reconciliation, dict) else None
     blockers: list[dict[str, Any]] = []
+    isolation_signals: list[dict[str, Any]] = []
     inventory_complete = False
     inventory_completeness_reported = bool(
         isinstance(inventory, dict)
@@ -1133,17 +1200,30 @@ def assess_repository_admission(
                         "observed_head": item.get("head"),
                     }
                 )
+        foreign = _foreign_coordination(item, owner_id)
         if scope_relevant:
             if dirty is True:
                 blockers.append({"code": "dirty-worktree", "path": path})
             elif dirty is not False:
                 blockers.append({"code": "dirty-state-unobservable", "path": path})
 
-            foreign = _foreign_coordination(item, owner_id)
             if foreign:
                 blockers.append(
                     {
                         "code": "foreign-live-coordination",
+                        "path": path,
+                        "coordination": foreign[:16],
+                    }
+                )
+        elif operation in ISOLATABLE_OPERATIONS and exact_checkout_scope is not None:
+            if dirty is True:
+                isolation_signals.append(
+                    {"code": "unrelated-dirty-worktree", "path": path}
+                )
+            if foreign:
+                isolation_signals.append(
+                    {
+                        "code": "unrelated-foreign-live-coordination",
                         "path": path,
                         "coordination": foreign[:16],
                     }
@@ -1284,7 +1364,42 @@ def assess_repository_admission(
 
     blocker_codes = sorted({str(item["code"]) for item in blockers})
     hard_blocked = any(code in HARD_BLOCK_CODES or code.startswith("foreign-") for code in blocker_codes)
-    decision = "blocked" if hard_blocked else "converge_first" if blockers else "allow"
+    isolation_required = bool(
+        not blockers
+        and exact_checkout_scope is not None
+        and operation in ISOLATABLE_OPERATIONS
+        and isolation_signals
+    )
+    decision = (
+        "blocked"
+        if hard_blocked
+        else "converge_first"
+        if blockers
+        else "isolate_and_execute"
+        if isolation_required
+        else "allow"
+    )
+    isolation_evidence: dict[str, Any] | None = None
+    if isolation_required:
+        isolation_material = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_isolation_evidence",
+            "scope_identity": exact_checkout_scope,
+            "signals": isolation_signals,
+            "signal_codes": sorted(
+                {str(item["code"]) for item in isolation_signals}
+            ),
+            "nonconflict_verified": True,
+            "does_not_establish": [
+                "mutation authority",
+                "cleanup authority over unrelated work",
+                "absence of later semantic or merge conflicts",
+            ],
+        }
+        isolation_evidence = {
+            **isolation_material,
+            "evidence_sha256": _digest(isolation_material),
+        }
     material = {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski.repository_work_admission",
@@ -1303,16 +1418,21 @@ def assess_repository_admission(
         "decision": decision,
         "blocker_codes": blocker_codes,
         "blockers": blockers,
+        "isolation_signals": isolation_signals,
+        "isolation_evidence": isolation_evidence,
         "inventory_sha256": inventory.get("inventory_sha256") if isinstance(inventory, dict) else None,
         "reconciliation_sha256": reconciliation.get("snapshot_sha256") if isinstance(reconciliation, dict) else None,
         "read_only": True,
         "next_action": (
             "resolve target, branch or source overlap before retry"
-            if exact_checkout_scope is not None and decision != "allow"
+            if exact_checkout_scope is not None
+            and decision in {"blocked", "converge_first"}
             else "run bounded worktree lifecycle convergence before opening the broad lane"
             if decision == "converge_first"
             else "resolve dirty, unobservable or foreign live overlap before retry"
             if decision == "blocked"
+            else "execute only inside the exact isolated lane; unrelated live work remains protected"
+            if decision == "isolate_and_execute"
             else "exact checkout scope is disjoint; unrelated repository hygiene remains outside this lane"
             if exact_checkout_scope is not None
             else "admission preflight passed"
@@ -1321,6 +1441,7 @@ def assess_repository_admission(
             "mutation authority",
             "cleanup authority",
             "permission to override foreign ownership",
+            "permission to alter unrelated isolation signals",
             "global one-lane serialization for exact disjoint resource keys",
             "absence of later semantic or merge conflicts between isolated branches",
             "systemic convergence completion",

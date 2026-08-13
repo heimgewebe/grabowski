@@ -189,7 +189,12 @@ def _metadata(metadata: dict[str, Any] | None) -> tuple[str, str]:
 def _work_admission_metadata(
     assessments: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    decisions = {"allow": 0, "blocked": 0, "converge_first": 0}
+    decisions = {
+        "allow": 0,
+        "blocked": 0,
+        "converge_first": 0,
+        "isolate_and_execute": 0,
+    }
     blocker_count = 0
     blocker_codes: set[str] = set()
     for assessment in assessments:
