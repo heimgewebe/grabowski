@@ -1388,15 +1388,18 @@ def _validate_loopback_mcp_url(url: str) -> str:
     parsed = urlsplit(url)
     if (
         parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port != 18181
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
         or parsed.path != "/mcp"
     ):
-        raise ClientSnapshotError("MCP snapshot observer requires the exact loopback /mcp endpoint")
-    return url
+        raise ClientSnapshotError(
+            "MCP snapshot observer requires the bound loopback operator endpoint"
+        )
+    return AUTO_REFRESH_MCP_URL
 
 
 async def _list_all_tools(client: Any) -> list[Any]:
@@ -1456,6 +1459,7 @@ async def _observe_and_bind_snapshot(
     except ImportError as exc:
         raise ClientSnapshotError("MCP client runtime is unavailable") from exc
 
+    mcp_url = _validate_loopback_mcp_url(mcp_url)
     if (
         not isinstance(connector_capability, str)
         or _TRANSPORT_CONNECTOR_TOKEN_RE.fullmatch(connector_capability) is None

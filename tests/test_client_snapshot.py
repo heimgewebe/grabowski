@@ -831,7 +831,7 @@ class ClientSnapshotTests(unittest.TestCase):
         ):
             result = asyncio.run(
                 snapshot._observe_and_bind_snapshot(
-                    mcp_url="http://127.0.0.1:1/mcp",
+                    mcp_url="http://127.0.0.1:18181/mcp",
                     session_id="session-schema",
                     connector_capability=connector_capability,
                     timeout_seconds=1.0,
@@ -893,12 +893,27 @@ class ClientSnapshotTests(unittest.TestCase):
             ):
                 asyncio.run(
                     snapshot._observe_and_bind_snapshot(
-                        mcp_url="http://127.0.0.1:1/mcp",
+                        mcp_url="http://127.0.0.1:18181/mcp",
                         session_id="session-schema-failed",
                         connector_capability=connector_capability,
                         timeout_seconds=1.0,
                     )
                 )
+
+    def test_auto_refresh_capability_is_bound_to_operator_endpoint(self) -> None:
+        self.assertEqual(
+            snapshot._validate_loopback_mcp_url("http://127.0.0.1:18181/mcp"),
+            snapshot.AUTO_REFRESH_MCP_URL,
+        )
+        for url in (
+            "http://127.0.0.1:18180/mcp",
+            "http://127.0.0.1:1/mcp",
+            "http://localhost:18181/mcp",
+        ):
+            with self.subTest(url=url), self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "bound loopback operator endpoint"
+            ):
+                snapshot._validate_loopback_mcp_url(url)
 
     def test_auto_refresh_connector_capability_reader_is_private_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
