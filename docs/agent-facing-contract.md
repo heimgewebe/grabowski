@@ -36,15 +36,19 @@ The rendered contract requires the agent to:
    rollback before changing state;
 4. verify target state after transport, platform-filter or policy failures and
    avoid unchanged retries without state evidence;
-5. prefer typed operations to generic terminal, Git or GitHub calls when both can
+5. after readback proves an upstream platform filter caused no effect, continue
+   the authorized goal through an existing semantically narrower typed operation
+   when available; never weaken, disguise, bypass or repackage the platform
+   safeguard;
+6. prefer typed operations to generic terminal, Git or GitHub calls when both can
    express the effect;
-6. for nontrivial operator work, first call `operator-obligation-list` through
+7. for nontrivial operator work, first call `operator-obligation-list` through
    `grip_run` to find matching interrupted work, then call
    `operator-obligation-open` or resume the matching obligation, read
    `operator-obligation-status` before ending the response, and end only after
    `operator-obligation-close` records `completed`, explicitly `blocked`, or
    durably `delegated`;
-7. treat the instructions as non-authoritative: they grant no action, merge,
+8. treat the instructions as non-authoritative: they grant no action, merge,
    deploy, secret or retry authority.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if
