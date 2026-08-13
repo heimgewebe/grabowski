@@ -739,6 +739,8 @@ class ClientSnapshotTests(unittest.TestCase):
 
         declarations: list[dict[str, object]] = []
         request_metas: list[dict[str, object] | None] = []
+        transport_headers: list[dict[str, str] | None] = []
+        connector_capability = "C" * 43
 
         class Client:
             async def initialize(self) -> None:
@@ -810,7 +812,10 @@ class ClientSnapshotTests(unittest.TestCase):
         client_module.__path__ = []
         streamable_http_module = types.ModuleType("mcp.client.streamable_http")
         streamable_http_module.streamablehttp_client = (
-            lambda _url: AsyncContext((object(), object(), None))
+            lambda _url, *, headers=None: (
+                transport_headers.append(headers)
+                or AsyncContext((object(), object(), None))
+            )
         )
 
         with (
@@ -828,11 +833,23 @@ class ClientSnapshotTests(unittest.TestCase):
                 snapshot._observe_and_bind_snapshot(
                     mcp_url="http://127.0.0.1:1/mcp",
                     session_id="session-schema",
+                    connector_capability=connector_capability,
                     timeout_seconds=1.0,
                 )
             )
             self.assertTrue(result["schema_contract_matches"])
             self.assertEqual(result["schema_coverage_count"], 4)
+            self.assertEqual(
+                transport_headers,
+                [
+                    {
+                        snapshot.TRANSPORT_CONNECTOR_CAPABILITY_HEADER: (
+                            connector_capability
+                        )
+                    }
+                ],
+            )
+            self.assertNotIn(connector_capability, json.dumps(result))
             self.assertEqual(
                 result["transport_verification_receipt_sha256"],
                 "f" * 64,
@@ -878,9 +895,38 @@ class ClientSnapshotTests(unittest.TestCase):
                     snapshot._observe_and_bind_snapshot(
                         mcp_url="http://127.0.0.1:1/mcp",
                         session_id="session-schema-failed",
+                        connector_capability=connector_capability,
                         timeout_seconds=1.0,
                     )
                 )
+
+    def test_auto_refresh_connector_capability_reader_is_private_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "primary.token"
+            token = "D" * 43
+            target.write_text(token + "\n", encoding="ascii")
+            target.chmod(0o600)
+            self.assertEqual(
+                snapshot._read_transport_connector_capability(target),
+                token,
+            )
+
+            target.chmod(0o644)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+            target.unlink()
+            real = root / "real.token"
+            real.write_text(token, encoding="ascii")
+            real.chmod(0o600)
+            target.symlink_to(real)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
 
     def test_tool_name_hash_matches_runtime_contract_encoding(self) -> None:
         expected = snapshot.hashlib.sha256(b'["a","b"]').hexdigest()
