@@ -363,6 +363,57 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(created["result_state"], "CREATED")
         self.assertTrue(Path(str(second["target_path"])).is_dir())
 
+    def test_expired_missing_binding_cannot_reactivate_when_capacity_is_full(self) -> None:
+        first = self.worktree_root / "expired-first"
+        second = self.worktree_root / "active-second"
+        common_dir = checkouts._git_common_dir(self.repo)
+        first_contract = {
+            "repo_common_dir": common_dir,
+            "repo_path": self.repo,
+            "checkout_path": first,
+            "owner_id": self.owner,
+            "purpose": "retain missing lifecycle evidence",
+            "source_kind": "bureau_task",
+            "source_id": "STORAGE-LIFECYCLE-V1-T003",
+            "artifact_class": "operator_worktree",
+            "retention_until_unix": self.retention_until,
+            "expected_head": self.head,
+            "expected_branch": "feat/expired-first",
+        }
+        checkouts._reserve_checkout_lifecycle(**first_contract)
+        first.mkdir()
+        first.rmdir()
+        first_key = checkouts._checkout_key(common_dir, first)
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (int(time.time()) - 1, first_key),
+            )
+            connection.commit()
+
+        with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1):
+            checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=second,
+                owner_id=self.owner,
+                purpose="retain second lifecycle evidence",
+                source_kind="bureau_task",
+                source_id="STORAGE-LIFECYCLE-V1-T004",
+                artifact_class="operator_worktree",
+                retention_until_unix=self.retention_until,
+                expected_head=self.head,
+                expected_branch="feat/active-second",
+            )
+            with self.assertRaisesRegex(RuntimeError, "active checkout limit"):
+                checkouts._reserve_checkout_lifecycle(**first_contract)
+
+        bindings = checkouts._lifecycle_bindings(
+            [checkouts._checkout_key(common_dir, second)]
+        )
+        self.assertEqual(bindings[checkouts._checkout_key(common_dir, second)]["phase"], "active")
+        self.assertTrue(first_key in checkouts._lifecycle_bindings([first_key]))
+
     def test_expired_existing_active_binding_still_consumes_creation_capacity(self) -> None:
         existing = self.worktree_root / "expired-existing"
         common_dir = checkouts._git_common_dir(self.repo)

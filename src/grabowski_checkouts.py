@@ -586,6 +586,24 @@ def _phase_count(
     return int(row["total"] if row is not None else 0)
 
 
+def _active_lifecycle_consumes_capacity(
+    lifecycle: sqlite3.Row,
+    *,
+    now: int,
+) -> bool:
+    """Return whether an active lifecycle binding still reserves creation capacity."""
+    if int(lifecycle["retention_until_unix"]) > now:
+        return True
+    try:
+        Path(str(lifecycle["checkout_path"])).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A filesystem observation failure must not open creation capacity.
+        return True
+    return True
+
+
 def _active_creation_count(
     connection: sqlite3.Connection,
     *,
@@ -604,17 +622,7 @@ def _active_creation_count(
     ).fetchall()
     total = 0
     for row in rows:
-        if int(row["retention_until_unix"]) > now:
-            total += 1
-            continue
-        try:
-            Path(str(row["checkout_path"])).lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            # A filesystem observation failure must not open creation capacity.
-            total += 1
-        else:
+        if _active_lifecycle_consumes_capacity(row, now=now):
             total += 1
     return total
 
@@ -691,7 +699,11 @@ def _reserve_checkout_lifecycle(
             now=now,
         )
         limit = _phase_limit("active")
-        if count >= limit and existing is None:
+        existing_consumes_capacity = (
+            existing is not None
+            and _active_lifecycle_consumes_capacity(existing, now=now)
+        )
+        if count >= limit and not existing_consumes_capacity:
             raise RuntimeError(
                 f"Per-repository active checkout limit reached: active={count} limit={limit}"
             )
