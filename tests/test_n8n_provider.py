@@ -124,7 +124,7 @@ class N8nProviderTests(unittest.TestCase):
         before_raw = raw(before)
         after = workflow(version="v2", final=True)
         after_raw = raw(after)
-        opener = ScriptedOpen([(200, before_raw), (200, b"{}"), (200, after_raw)])
+        opener = ScriptedOpen([(200, before_raw), (200, before_raw), (200, b"{}"), (200, after_raw)])
         result = provider.apply(
             provider_profile=PROFILE.name,
             secret_data=b"n8n-secret-value\n",
@@ -134,9 +134,11 @@ class N8nProviderTests(unittest.TestCase):
         )
         self.assertTrue(result["providerMutationPerformed"])
         self.assertEqual("v1", result["pre"]["versionId"])
+        self.assertEqual(result["pre"], result["preWrite"])
+        self.assertEqual("exact-preconditions-revalidated-before-put-no-atomic-provider-cas", result["concurrencyContract"])
         self.assertEqual("v2", result["post"]["versionId"])
-        self.assertEqual(["GET", "PUT", "GET"], [item["method"] for item in opener.requests])
-        put = json.loads(opener.requests[1]["data"])
+        self.assertEqual(["GET", "GET", "PUT", "GET"], [item["method"] for item in opener.requests])
+        put = json.loads(opener.requests[2]["data"])
         self.assertEqual(
             [[{"node": PROFILE.downstream_node_name, "type": "main", "index": 0}]],
             put["connections"][PROFILE.source_node_name]["main"],
@@ -146,6 +148,23 @@ class N8nProviderTests(unittest.TestCase):
         comparison["connections"] = baseline["connections"]
         self.assertEqual(baseline, comparison)
         self.assertNotIn("n8n-secret-value", json.dumps(result, sort_keys=True))
+
+    def test_apply_revalidates_exact_snapshot_immediately_before_put(self) -> None:
+        before = workflow(version="v1")
+        before_raw = raw(before)
+        concurrent = workflow(version="v1")
+        concurrent["description"] = "concurrent external edit"
+        concurrent_raw = raw(concurrent)
+        opener = ScriptedOpen([(200, before_raw), (200, concurrent_raw)])
+        with self.assertRaisesRegex(provider.N8nProviderError, "SHA-256 mismatch"):
+            provider.apply(
+                provider_profile=PROFILE.name,
+                secret_data=b"n8n-secret-value\n",
+                expected_version_id="v1",
+                expected_response_sha256=hashlib.sha256(before_raw).hexdigest(),
+                urlopen=opener,
+            )
+        self.assertEqual(["GET", "GET"], [item["method"] for item in opener.requests])
 
     def test_apply_revision_mismatch_stops_before_put(self) -> None:
         before_raw = raw(workflow(version="v1"))

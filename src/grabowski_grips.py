@@ -510,10 +510,10 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "n8n-workflow-edge-apply": GripSpec(
         name="n8n-workflow-edge-apply",
-        version="1.0",
+        version="1.1",
         summary=(
-            "CAS-apply exactly one fixed-profile isolated-source n8n edge and immediately "
-            "read the provider back under the same secret-safe runtime boundary."
+            "Precondition-apply exactly one fixed-profile isolated-source n8n edge, revalidate "
+            "the exact provider snapshot immediately before PUT, and read the provider back."
         ),
         effect=MUTATING,
         required_parameters=(
@@ -526,7 +526,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=(
             "provider-profile-bound",
             "secret-hash-bound",
-            "revision-cas-bound",
+            "revision-precondition-bound",
+            "provider-prewrite-revalidated",
+            "provider-concurrency-contract-explicit",
             "single-edge-only",
             "provider-post-readback",
             "receipt-bound-effect",
@@ -790,7 +792,7 @@ GRIP_SURFACE_TARGETS = {
     "browser-semantic-act": "one snapshot-bound canonical semantic browser action",
     "connector-snapshot-bind": "one connector client snapshot receipt",
     "n8n-workflow-edge-verify": "one fixed-profile n8n workflow edge readback",
-    "n8n-workflow-edge-apply": "one revision-bound fixed-profile n8n single-edge mutation",
+    "n8n-workflow-edge-apply": "one precondition-bound fixed-profile n8n single-edge mutation",
     "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
@@ -883,8 +885,10 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     ),
     "n8n-workflow-edge-apply": (
         "provider_profile must be a server-known fixed target; the current provider workflow must be inactive, "
-        "semantically isolated and match expected_version_id plus expected_response_sha256; only the named "
-        "single edge may be added; post-readback is mandatory",
+        "semantically isolated and match expected_version_id plus expected_response_sha256 on both the initial "
+        "read and an immediate pre-write re-read; only the named single edge may be added; post-readback is mandatory",
+        "the n8n Public API update path is not treated as an atomic external-writer CAS boundary; a concurrent "
+        "provider write after the final pre-write read remains outside this grip's guarantee",
     ),
     "browser-semantic-observe": (
         "the operation is fixed to observe; only worker_id and optional timeout_seconds are forwarded "
@@ -3557,7 +3561,7 @@ def _run_n8n_workflow_edge_apply(
     _check(receipt, "secret-hash-bound", "pass", request["expected_secret_sha256"])
     _check(
         receipt,
-        "revision-cas-bound",
+        "revision-precondition-bound",
         "pass",
         f"version={request['expected_version_id']} response={request['expected_response_sha256']}",
     )
@@ -3571,15 +3575,21 @@ def _run_n8n_workflow_edge_apply(
         raise GripActionError("n8n provider apply returned invalid output")
     effect = output.get("effect")
     pre = output.get("pre")
+    prewrite = output.get("preWrite")
     post = output.get("post")
+    concurrency_contract = output.get("concurrencyContract")
+    concurrency_valid = concurrency_contract == "exact-preconditions-revalidated-before-put-no-atomic-provider-cas"
     effect_valid = isinstance(effect, dict) and effect.get("kind") == "n8n-workflow-single-edge-add"
     pre_valid = isinstance(pre, dict) and pre.get("state") == "isolated" and pre.get("versionId") == request["expected_version_id"] and pre.get("responseSha256") == request["expected_response_sha256"]
+    prewrite_valid = isinstance(prewrite, dict) and prewrite.get("state") == "isolated" and prewrite.get("versionId") == request["expected_version_id"] and prewrite.get("responseSha256") == request["expected_response_sha256"]
     post_valid = isinstance(post, dict) and post.get("state") == "final" and post.get("versionId") != request["expected_version_id"]
     mutation_valid = output.get("providerMutationPerformed") is True
+    _check(receipt, "provider-prewrite-revalidated", "pass" if prewrite_valid else "fail", str(prewrite.get("responseSha256")) if isinstance(prewrite, dict) else "missing")
+    _check(receipt, "provider-concurrency-contract-explicit", "pass" if concurrency_valid else "fail", str(concurrency_contract or "missing"))
     _check(receipt, "single-edge-only", "pass" if effect_valid else "fail", "exact-single-edge")
     _check(receipt, "provider-post-readback", "pass" if post_valid else "fail", str(post.get("responseSha256")) if isinstance(post, dict) else "missing")
-    _check(receipt, "receipt-bound-effect", "pass" if mutation_valid and pre_valid and post_valid else "fail", "pre/post-bound")
-    if not effect_valid or not pre_valid or not post_valid or not mutation_valid:
+    _check(receipt, "receipt-bound-effect", "pass" if mutation_valid and pre_valid and prewrite_valid and post_valid and concurrency_valid else "fail", "pre/prewrite/post/concurrency-bound")
+    if not effect_valid or not pre_valid or not prewrite_valid or not post_valid or not mutation_valid or not concurrency_valid:
         return {
             "receipt_status": "failed",
             "error": "n8n provider apply violated its published contract",

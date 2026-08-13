@@ -419,6 +419,19 @@ def apply(
     payload = build_single_edge_payload(profile, workflow)
     payload_sha256 = _sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
+    prewrite_status, prewrite_raw = _request(profile, key, method="GET", urlopen=urlopen)
+    if prewrite_status != 200:
+        raise N8nProviderError("n8n workflow pre-write re-read did not return HTTP 200")
+    prewrite_workflow = _parse_workflow(prewrite_raw)
+    prewrite = validate_workflow(
+        profile,
+        prewrite_workflow,
+        prewrite_raw,
+        expected_state="isolated",
+        expected_version_id=expected_version_id,
+        expected_response_sha256=expected_response_sha256,
+    )
+
     write_status, _ = _request(profile, key, method="PUT", payload=payload, urlopen=urlopen)
     if write_status not in {200, 201}:
         raise N8nProviderError("n8n workflow update did not return a success status")
@@ -445,5 +458,7 @@ def apply(
             "payloadSha256": payload_sha256,
         },
         "pre": pre,
+        "preWrite": prewrite,
         "post": post,
+        "concurrencyContract": "exact-preconditions-revalidated-before-put-no-atomic-provider-cas",
     }
