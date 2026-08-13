@@ -1974,17 +1974,69 @@ def browser_stored_form_action(
 # effect. This slice still implements only read/local_ui. External effect
 # classes remain named but fail closed. See docs/browser-control-plane-v1.md.
 
-BROWSER_EFFECT_CLASSES = (
-    "read",
-    "local_ui",
-    "reversible_external",
-    "external_mutation",
-    "high_impact",
+BROWSER_EFFECT_CONTRACTS: dict[str, dict[str, Any]] = {
+    "read": {
+        "admission": "implemented",
+        "requires_operator_mutation": False,
+        "ambiguous_outcome": {
+            "retry_authorized": False,
+            "authoritative_readback_required": True,
+            "readback_grants_retry_authority": False,
+        },
+    },
+    "local_ui": {
+        "admission": "implemented",
+        "requires_operator_mutation": True,
+        "ambiguous_outcome": {
+            "retry_authorized": False,
+            "authoritative_readback_required": True,
+            "readback_grants_retry_authority": False,
+        },
+    },
+    "reversible_external": {
+        "admission": "fail_closed",
+        "requires_operator_mutation": True,
+        "ambiguous_outcome": {
+            "retry_authorized": False,
+            "authoritative_readback_required": True,
+            "readback_grants_retry_authority": False,
+        },
+    },
+    "external_mutation": {
+        "admission": "fail_closed",
+        "requires_operator_mutation": True,
+        "ambiguous_outcome": {
+            "retry_authorized": False,
+            "authoritative_readback_required": True,
+            "readback_grants_retry_authority": False,
+        },
+    },
+    "high_impact": {
+        "admission": "fail_closed",
+        "requires_operator_mutation": True,
+        "ambiguous_outcome": {
+            "retry_authorized": False,
+            "authoritative_readback_required": True,
+            "readback_grants_retry_authority": False,
+        },
+    },
+}
+BROWSER_EFFECT_CLASSES = tuple(BROWSER_EFFECT_CONTRACTS)
+BROWSER_EFFECT_CLASSES_IMPLEMENTED = frozenset(
+    effect_class
+    for effect_class, contract in BROWSER_EFFECT_CONTRACTS.items()
+    if contract["admission"] == "implemented"
 )
-BROWSER_EFFECT_CLASSES_IMPLEMENTED = frozenset({"read", "local_ui"})
 BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
     "read_state": {"effect_class": "read", "requires_element": False},
     "scroll_into_view": {"effect_class": "local_ui", "requires_element": True},
+}
+BROWSER_SEMANTIC_GATEWAY_OPERATIONS = ("observe", "act")
+BROWSER_SEMANTIC_EFFECT_STATES = {
+    "not_started",
+    "not_applicable",
+    "observed",
+    "unknown",
 }
 BROWSER_SNAPSHOT_ID_PREFIX = "bsid2_"
 BROWSER_ELEMENT_ID_PREFIX = "beid1_"
@@ -2618,15 +2670,19 @@ def _browser_outcome(
     *,
     ok: bool,
     result_code: str,
+    effect_state: str,
     pre_observation: dict[str, Any] | None,
     post_observation: dict[str, Any] | None,
 ) -> dict[str, Any]:
     if result_code not in BROWSER_SEMANTIC_OUTCOME_CODES:
         raise ValueError("unsupported browser outcome result code")
+    if effect_state not in BROWSER_SEMANTIC_EFFECT_STATES:
+        raise ValueError("unsupported browser outcome effect state")
     return {
         "schema_version": 1,
         "ok": ok,
         "result_code": result_code,
+        "effect_state": effect_state,
         "worker_id": action["worker_id"],
         "action_kind": action["action_kind"],
         "effect_class": action["effect_class"],
@@ -2711,6 +2767,7 @@ def browser_semantic_act(
             action,
             ok=False,
             result_code=_browser_outcome_code_from_node(exc.result_code),
+            effect_state="not_started",
             pre_observation=None,
             post_observation=None,
         )
@@ -2720,6 +2777,7 @@ def browser_semantic_act(
             action,
             ok=False,
             result_code="stale_snapshot",
+            effect_state="not_started",
             pre_observation=pre_observation,
             post_observation=None,
         )
@@ -2734,6 +2792,7 @@ def browser_semantic_act(
                 action,
                 ok=False,
                 result_code="element_contract",
+                effect_state="not_started",
                 pre_observation=pre_observation,
                 post_observation=None,
             )
@@ -2743,11 +2802,13 @@ def browser_semantic_act(
             action,
             ok=False,
             result_code="effect_not_implemented",
+            effect_state="not_started",
             pre_observation=pre_observation,
             post_observation=None,
         )
     if intent["action_kind"] == "read_state":
         post_state = fresh_state
+        effect_state = "not_applicable"
     else:
         if expected_element is None:
             raise RuntimeError("element-targeted browser action lost its element binding")
@@ -2764,16 +2825,400 @@ def browser_semantic_act(
                 action,
                 ok=False,
                 result_code=_browser_outcome_code_from_node(exc.result_code),
+                effect_state="unknown",
                 pre_observation=pre_observation,
                 post_observation=None,
             )
+        effect_state = "observed"
     return _browser_outcome(
         action,
         ok=True,
         result_code="ok",
+        effect_state=effect_state,
         pre_observation=pre_observation,
         post_observation=_browser_observation(identifier, post_state, handle_key),
     )
+
+
+def _browser_public_observation(
+    observation: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return public handles with bounded semantic role/name labels."""
+    if observation is None:
+        return None
+    return {
+        "schema_version": 1,
+        "worker_id": observation["worker_id"],
+        "snapshot_id": observation["snapshot_id"],
+        "observed_at_unix": observation["observed_at_unix"],
+        "ready_state": observation["ready_state"],
+        "elements": [
+            {
+                "element_id": element["element_id"],
+                "role": element["role"],
+                "name": element["name"],
+            }
+            for element in observation["elements"]
+        ],
+    }
+
+
+def _browser_effect_contract(effect_class: str) -> dict[str, Any]:
+    contract = BROWSER_EFFECT_CONTRACTS[effect_class]
+    return {
+        "effect_class": effect_class,
+        "admission": contract["admission"],
+        "requires_operator_mutation": contract["requires_operator_mutation"],
+        "ambiguous_outcome": dict(contract["ambiguous_outcome"]),
+    }
+
+
+def _browser_semantic_catalog() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "operations": list(BROWSER_SEMANTIC_GATEWAY_OPERATIONS),
+        "intents": {
+            action_kind: {
+                "effect_class": spec["effect_class"],
+                "requires_element": spec["requires_element"],
+                "admission": BROWSER_EFFECT_CONTRACTS[spec["effect_class"]][
+                    "admission"
+                ],
+            }
+            for action_kind, spec in sorted(BROWSER_ACTION_CATALOG.items())
+        },
+        "effect_classes": {
+            effect_class: _browser_effect_contract(effect_class)
+            for effect_class in BROWSER_EFFECT_CLASSES
+        },
+    }
+
+
+def _browser_retry_readback_contract(
+    *, effect_state: str, readback_state: str
+) -> dict[str, Any]:
+    return {
+        "retry_authorized": False,
+        "retry_authority": "not_granted",
+        "effect_state": effect_state,
+        "authoritative_readback_state": readback_state,
+        "authoritative_readback_required": effect_state == "unknown",
+        "readback_grants_retry_authority": False,
+        "next_action_after_ambiguous_effect": (
+            "perform_authoritative_readback_then_form_a_new_explicit_intent"
+            if effect_state == "unknown"
+            else "none"
+        ),
+    }
+
+
+def _browser_semantic_public_result(
+    *,
+    semantic_operation: str,
+    worker_id: str,
+    intent: str,
+    effect_class: str,
+    ok: bool,
+    result_code: str,
+    effect_state: str,
+    requested_snapshot_id: str | None,
+    requested_element_id: str | None,
+    pre_action_snapshot_id: str | None,
+    post_action_snapshot_id: str | None,
+    observation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if post_action_snapshot_id is not None:
+        readback_state = "authoritative_post_action_observation"
+    elif semantic_operation == "observe" and observation is not None:
+        readback_state = "authoritative_fresh_observation"
+    elif pre_action_snapshot_id is not None:
+        readback_state = "pre_action_observation_only"
+    else:
+        readback_state = "unavailable"
+    return {
+        "schema_version": 1,
+        "operation": semantic_operation,
+        "intent": intent,
+        "ok": ok,
+        "result_code": result_code,
+        "worker_id": worker_id,
+        "effect_class": effect_class,
+        "effect_state": effect_state,
+        "requested_snapshot_id": requested_snapshot_id,
+        "requested_element_id": requested_element_id,
+        "pre_action_snapshot_id": pre_action_snapshot_id,
+        "post_action_snapshot_id": post_action_snapshot_id,
+        "observation": _browser_public_observation(observation),
+        "effect_contract": _browser_effect_contract(effect_class),
+        "retry_readback": _browser_retry_readback_contract(
+            effect_state=effect_state,
+            readback_state=readback_state,
+        ),
+        "does_not_establish": [
+            "retry_authority",
+            "external_effect_completion_without_target_specific_readback",
+            "permission_for_reversible_external_external_mutation_or_high_impact",
+        ],
+    }
+
+
+def _browser_semantic_audit_record(
+    result: dict[str, Any], *, phase: str
+) -> dict[str, Any]:
+    observation = result.get("observation")
+    observation_snapshot_id = (
+        observation.get("snapshot_id") if isinstance(observation, dict) else None
+    )
+    return {
+        "timestamp_unix": _now(),
+        "operation": f"browser-semantic-{phase}",
+        "semantic_operation": result["operation"],
+        "worker_id": result["worker_id"],
+        "intent": result["intent"],
+        "effect_class": result["effect_class"],
+        "ok": result["ok"],
+        "result_code": result["result_code"],
+        "effect_state": result["effect_state"],
+        "requested_snapshot_id": result["requested_snapshot_id"],
+        "requested_element_id": result["requested_element_id"],
+        "pre_action_snapshot_id": result["pre_action_snapshot_id"],
+        "post_action_snapshot_id": result["post_action_snapshot_id"],
+        "observation_snapshot_id": observation_snapshot_id,
+        "retry_authorized": result["retry_readback"]["retry_authorized"],
+        "authoritative_readback_state": result["retry_readback"][
+            "authoritative_readback_state"
+        ],
+        "authoritative_readback_required": result["retry_readback"][
+            "authoritative_readback_required"
+        ],
+        "readback_grants_retry_authority": result["retry_readback"][
+            "readback_grants_retry_authority"
+        ],
+    }
+
+
+def _browser_semantic_append_audit(
+    result: dict[str, Any], *, phase: str
+) -> dict[str, Any]:
+    try:
+        digest = base._append_audit_with_digest(
+            _browser_semantic_audit_record(result, phase=phase)
+        )
+    except Exception:
+        return {
+            "recorded": False,
+            "result_code": "audit_unavailable",
+            "record_sha256": None,
+        }
+    return {
+        "recorded": True,
+        "result_code": "ok",
+        "record_sha256": digest,
+    }
+
+
+def _browser_semantic_audit_unavailable_result(
+    *,
+    worker_id: str,
+    action_kind: str,
+    effect_class: str,
+    snapshot_id: str,
+    element_id: str | None,
+    intent_audit: dict[str, Any],
+) -> dict[str, Any]:
+    result = _browser_semantic_public_result(
+        semantic_operation="act",
+        worker_id=worker_id,
+        intent=action_kind,
+        effect_class=effect_class,
+        ok=False,
+        result_code="audit_unavailable",
+        effect_state="not_started",
+        requested_snapshot_id=snapshot_id,
+        requested_element_id=element_id,
+        pre_action_snapshot_id=None,
+        post_action_snapshot_id=None,
+        observation=None,
+    )
+    result["audit"] = {
+        "intent": intent_audit,
+        "outcome": {
+            "recorded": False,
+            "result_code": "not_attempted",
+            "record_sha256": None,
+        },
+    }
+    return result
+
+
+def browser_semantic_gateway(
+    worker_id: str,
+    operation: str,
+    *,
+    snapshot_id: str | None = None,
+    action_kind: str | None = None,
+    element_id: str | None = None,
+    timeout_seconds: int = 10,
+) -> dict[str, Any]:
+    """Dispatch one bounded semantic operation with content-free audit records."""
+    identifier = _validate_worker_id(worker_id)
+    if operation not in BROWSER_SEMANTIC_GATEWAY_OPERATIONS:
+        raise ValueError("unsupported browser semantic operation")
+    timeout_seconds = _validate_browser_semantic_timeout(timeout_seconds)
+    operator._require_operator_capability("browser_worker")
+
+    if operation == "observe":
+        if any(value is not None for value in (snapshot_id, action_kind, element_id)):
+            raise ValueError("observe does not accept snapshot, action or element handles")
+        try:
+            observation = browser_semantic_observe(
+                identifier, timeout_seconds=timeout_seconds
+            )
+        except _BrowserSemanticError as exc:
+            result = _browser_semantic_public_result(
+                semantic_operation="observe",
+                worker_id=identifier,
+                intent="observe",
+                effect_class="read",
+                ok=False,
+                result_code=_browser_outcome_code_from_node(exc.result_code),
+                effect_state="not_applicable",
+                requested_snapshot_id=None,
+                requested_element_id=None,
+                pre_action_snapshot_id=None,
+                post_action_snapshot_id=None,
+                observation=None,
+            )
+        except Exception:
+            result = _browser_semantic_public_result(
+                semantic_operation="observe",
+                worker_id=identifier,
+                intent="observe",
+                effect_class="read",
+                ok=False,
+                result_code="protocol",
+                effect_state="not_applicable",
+                requested_snapshot_id=None,
+                requested_element_id=None,
+                pre_action_snapshot_id=None,
+                post_action_snapshot_id=None,
+                observation=None,
+            )
+        else:
+            result = _browser_semantic_public_result(
+                semantic_operation="observe",
+                worker_id=identifier,
+                intent="observe",
+                effect_class="read",
+                ok=True,
+                result_code="ok",
+                effect_state="not_applicable",
+                requested_snapshot_id=None,
+                requested_element_id=None,
+                pre_action_snapshot_id=None,
+                post_action_snapshot_id=None,
+                observation=observation,
+            )
+            result["semantic_catalog"] = _browser_semantic_catalog()
+        result["audit"] = {
+            "intent": {
+                "recorded": False,
+                "result_code": "not_required_for_read",
+                "record_sha256": None,
+            },
+            "outcome": _browser_semantic_append_audit(result, phase="outcome"),
+        }
+        return result
+
+    if snapshot_id is None or action_kind is None:
+        raise ValueError("act requires snapshot_id and action_kind")
+    if not _is_browser_snapshot_id(snapshot_id):
+        raise ValueError("snapshot_id is not a recognized opaque browser snapshot id")
+    intent = _browser_intent(action_kind, element_id=element_id)
+    effect_class = intent["effect_class"]
+    effect_contract = BROWSER_EFFECT_CONTRACTS[effect_class]
+    if effect_contract["admission"] == "implemented" and effect_contract[
+        "requires_operator_mutation"
+    ]:
+        operator._require_operator_mutation("browser_worker")
+        intent_result = _browser_semantic_public_result(
+            semantic_operation="act",
+            worker_id=identifier,
+            intent=action_kind,
+            effect_class=effect_class,
+            ok=False,
+            result_code="intent_recorded",
+            effect_state="not_started",
+            requested_snapshot_id=snapshot_id,
+            requested_element_id=element_id,
+            pre_action_snapshot_id=None,
+            post_action_snapshot_id=None,
+            observation=None,
+        )
+        intent_audit = _browser_semantic_append_audit(intent_result, phase="intent")
+        if intent_audit["recorded"] is not True:
+            return _browser_semantic_audit_unavailable_result(
+                worker_id=identifier,
+                action_kind=action_kind,
+                effect_class=effect_class,
+                snapshot_id=snapshot_id,
+                element_id=element_id,
+                intent_audit=intent_audit,
+            )
+    else:
+        intent_audit = {
+            "recorded": False,
+            "result_code": "not_required_without_implemented_effect",
+            "record_sha256": None,
+        }
+
+    try:
+        outcome = browser_semantic_act(
+            identifier,
+            snapshot_id,
+            action_kind,
+            element_id=element_id,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        possible_effect = (
+            effect_contract["admission"] == "implemented"
+            and effect_contract["requires_operator_mutation"] is True
+        )
+        result = _browser_semantic_public_result(
+            semantic_operation="act",
+            worker_id=identifier,
+            intent=action_kind,
+            effect_class=effect_class,
+            ok=False,
+            result_code="outcome_unknown" if possible_effect else "protocol",
+            effect_state="unknown" if possible_effect else "not_started",
+            requested_snapshot_id=snapshot_id,
+            requested_element_id=element_id,
+            pre_action_snapshot_id=None,
+            post_action_snapshot_id=None,
+            observation=None,
+        )
+    else:
+        result = _browser_semantic_public_result(
+            semantic_operation="act",
+            worker_id=identifier,
+            intent=action_kind,
+            effect_class=effect_class,
+            ok=outcome["ok"],
+            result_code=outcome["result_code"],
+            effect_state=outcome["effect_state"],
+            requested_snapshot_id=outcome["requested_snapshot_id"],
+            requested_element_id=outcome["requested_element_id"],
+            pre_action_snapshot_id=outcome["pre_action_snapshot_id"],
+            post_action_snapshot_id=outcome["post_action_snapshot_id"],
+            observation=outcome["observation"],
+        )
+    result["audit"] = {
+        "intent": intent_audit,
+        "outcome": _browser_semantic_append_audit(result, phase="outcome"),
+    }
+    return result
 
 
 # --- End browser semantic contract ------------------------------------------
@@ -3301,6 +3746,34 @@ def grabowski_browser_worker_stored_form_action(
         confirmation=confirmation,
         identity_choice=identity_choice,
         action_mode=action_mode,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+@mcp.tool(name="grabowski_browser_worker_semantic", annotations=MUTATING)
+def grabowski_browser_worker_semantic(
+    worker_id: str,
+    operation: str,
+    snapshot_id: str | None = None,
+    action_kind: str | None = None,
+    element_id: str | None = None,
+    timeout_seconds: int = 10,
+) -> dict[str, Any]:
+    """Observe or act through semantic snapshot and element handles only.
+
+    ``operation`` is either ``observe`` or ``act``. Element observations expose
+    only opaque element ids plus bounded Accessibility roles and names; origins,
+    titles, selectors, browser backend identifiers and protocol method names stay
+    private. Effect class and retry/readback authority come from the server-owned
+    semantic catalog.
+    """
+    operator._require_operator_capability("browser_worker")
+    return browser_semantic_gateway(
+        worker_id,
+        operation,
+        snapshot_id=snapshot_id,
+        action_kind=action_kind,
+        element_id=element_id,
         timeout_seconds=timeout_seconds,
     )
 

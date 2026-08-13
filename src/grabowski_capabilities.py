@@ -1032,6 +1032,13 @@ TOOL_PROFILES.update(
             "effects": ["browser-input", "form-submit", "local-device-state-change"],
             "reversibility": "target-dependent; fields cleared on failed or unobserved submission",
         },
+        "grabowski_browser_worker_semantic": {
+            "category": "browser-worker",
+            "purpose": "Observe or act through snapshot-bound semantic browser handles with bounded Accessibility labels and no raw browser locators.",
+            "risk_class": "medium",
+            "effects": ["audit-create", "browser-read", "browser-local-ui"],
+            "reversibility": "read-not-applicable; local-ui-state-dependent",
+        },
         "grabowski_browser_worker_status": {
             "category": "browser-worker",
             "purpose": "Observe one isolated browser worker and reconcile "
