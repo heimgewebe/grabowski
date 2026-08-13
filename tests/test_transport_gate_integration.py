@@ -1434,6 +1434,19 @@ class CentralTransportGateTests(unittest.TestCase):
         self.assertTrue(result["called"])
         consume_verified.assert_not_called()
 
+    def test_browser_semantic_grip_transport_classification_is_not_widened(self) -> None:
+        operator = self.configured_operator()
+        self.assertTrue(
+            operator._transport_roundtrip_exempt_call(
+                "grip_run", {"name": "browser-semantic-observe"}
+            )
+        )
+        self.assertFalse(
+            operator._transport_roundtrip_exempt_call(
+                "grip_run", {"name": "browser-semantic-act"}
+            )
+        )
+
     def test_registered_mutating_grip_still_requires_exact_roundtrip(self) -> None:
         operator = self.configured_operator()
         context = types.SimpleNamespace(client_id=None)

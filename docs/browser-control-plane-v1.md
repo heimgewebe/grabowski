@@ -122,6 +122,12 @@ Zusätzlich zur bestehenden Control-Plane-Projektion und zum bestehenden `grabow
 
 Das bestehende `grabowski_operation_*`-Gateway ist dafür absichtlich nicht wiederverwendet: Es modelliert konfigurationsgetriebene argv-Rezepte mit Stringparametern, `terminal_execute`-Autorität und command-abhängigem Rollback. Snapshot-/Elementhandles und browserinterne TOCTOU-Revalidierung dort einzubauen würde Terminal- und Browserautorität vermischen. Das einzelne Browser-Gateway verhindert zugleich eine Tool-pro-Intent-Explosion.
 
+### Stabile Publikation über die bestehende Grip-Surface
+
+Ein Connector kann einen neuen MCP-Toolnamen später sehen als die bereits deployte Grabowski-Runtime. Dafür existieren nun zwei **Publikationsadapter innerhalb der schon stabilen `grip_run`-Surface**: `browser-semantic-observe` und `browser-semantic-act`. Sie sind keine zweite Browser-API. Beide importieren den Browsercode erst beim Aufruf und delegieren unmittelbar an dieselbe Funktion `browser_semantic_gateway()`. `browser-semantic-observe` fixiert die Operation auf `observe` und bleibt als Grip read-only; `browser-semantic-act` fixiert die Operation auf `act` und bleibt als Grip mutating.
+
+Der Adapter führt keine eigene Effektklassifikation ein. Insbesondere kann der Aufrufer kein `effect_class` übergeben; unbekannte Adapterfelder werden vor der Delegation abgewiesen. Snapshot-, Element-, TOCTOU-, Audit-, Outcome- und Retry-Semantik bleiben vollständig Eigentum des kanonischen Browser-Gateways. Damit kann ein bereits veröffentlichter `grip_run` einen neuen semantischen Browservertrag konsumieren, ohne einen neuen Plattform-Toolnamen abzuwarten, ohne CDP nach außen zu spiegeln und ohne einen zweiten Lifecycle- oder Browservertrag zu schaffen. Der direkte Toolname `grabowski_browser_worker_semantic` bleibt der kanonische MCP-Einstieg, sobald der jeweilige Connector-Katalog ihn tatsächlich publiziert.
+
 Die Vertragskonzepte:
 
 - **Interne BrowserObservation**: Ergebnis von `browser_semantic_observe()`. Sie enthält für Härtung und Adapterauflösung weiterhin den begrenzten Origin-/Titel-/Accessibility-Fingerprint, gibt aber weder Formwerte noch AX-`value`, HTML, Selektoren, Backend-Knoten-IDs, Frame-/Loader-IDs, Cookies oder Credentials aus.

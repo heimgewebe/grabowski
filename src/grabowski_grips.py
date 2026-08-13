@@ -417,6 +417,44 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="bureau_pickup_orphan_reconcile",
     ),
+    "browser-semantic-observe": GripSpec(
+        name="browser-semantic-observe",
+        version="1.0",
+        summary=(
+            "Observe one isolated browser worker through the canonical semantic "
+            "gateway without introducing a second browser contract."
+        ),
+        effect=READ_ONLY,
+        required_parameters=("worker_id",),
+        acceptance_ids=(
+            "canonical-semantic-gateway",
+            "read-only-publication",
+            "semantic-receipt-preserved",
+            "no-second-browser-contract",
+        ),
+        runner="browser_semantic_observe",
+        operation_effect_class="browser_semantic",
+        operation_class="browser-semantic-observe",
+    ),
+    "browser-semantic-act": GripSpec(
+        name="browser-semantic-act",
+        version="1.0",
+        summary=(
+            "Act on one snapshot-bound browser intent through the canonical semantic "
+            "gateway under the mutating grip envelope."
+        ),
+        effect=MUTATING,
+        required_parameters=("worker_id", "snapshot_id", "action_kind"),
+        acceptance_ids=(
+            "canonical-semantic-gateway",
+            "mutation-envelope",
+            "semantic-outcome-preserved",
+            "retry-authority-not-widened",
+        ),
+        runner="browser_semantic_act",
+        operation_effect_class="browser_semantic",
+        operation_class="browser-semantic-act",
+    ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
         version="1.1",
@@ -647,6 +685,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "bureau-pickup-status",
         "bureau-pickup-release",
         "bureau-pickup-orphan-reconcile",
+        "browser-semantic-observe",
+        "browser-semantic-act",
         "connector-snapshot-bind",
         "transport-roundtrip",
         "convergence-assess",
@@ -688,6 +728,8 @@ GRIP_SURFACE_TARGETS = {
     "bureau-pickup-status": "one coordinated Bureau pickup status and lease projection",
     "bureau-pickup-release": "one terminal coordinated pickup lease release",
     "bureau-pickup-orphan-reconcile": "one exact unbound coordinated pickup reconciliation",
+    "browser-semantic-observe": "one canonical semantic browser observation",
+    "browser-semantic-act": "one snapshot-bound canonical semantic browser action",
     "connector-snapshot-bind": "one connector client snapshot receipt",
     "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
@@ -737,6 +779,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "read bureau-pickup-status for the exact run; on outcome_unknown perform the named "
         "required readback before any retry; never substitute generic fail, release or force-release"
     ),
+    "browser-semantic-act": (
+        "honor the canonical gateway retry_readback contract; after outcome_unknown perform "
+        "authoritative browser readback and form a new explicit intent instead of retrying "
+        "the lost action"
+    ),
     "transport-roundtrip": (
         "invoke the mutating MCP target normally; for shared_unlabeled callers, continue "
         "with action=execute and the returned challenge only while the server-retained "
@@ -763,6 +810,15 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "work-acquire": (
         "source_kind must be one of bureau_task, github_issue, operator_obligation, thread_focus; "
         "other source kinds have no immutable terminal evidence observer and are rejected before checkout creation",
+    ),
+    "browser-semantic-observe": (
+        "the operation is fixed to observe; only worker_id and optional timeout_seconds are forwarded "
+        "to the canonical browser_semantic_gateway",
+    ),
+    "browser-semantic-act": (
+        "the operation is fixed to act; effect_class remains server-owned and cannot be supplied by the caller",
+        "element_id and timeout_seconds are optional; snapshot and element validity remain exclusively "
+        "the canonical browser_semantic_gateway contract",
     ),
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
@@ -3167,6 +3223,135 @@ def _run_bureau_pickup_orphan_reconcile(
             "adapter_output": output,
         }
     return {**output, "receipt_status": "passed"}
+
+
+_BROWSER_SEMANTIC_OBSERVE_FIELDS = frozenset({"worker_id", "timeout_seconds"})
+_BROWSER_SEMANTIC_ACT_FIELDS = frozenset(
+    {"worker_id", "snapshot_id", "action_kind", "element_id", "timeout_seconds"}
+)
+
+
+def _browser_semantic_gateway_call(
+    parameters: dict[str, Any], *, operation: str
+) -> dict[str, Any]:
+    allowed = (
+        _BROWSER_SEMANTIC_OBSERVE_FIELDS
+        if operation == "observe"
+        else _BROWSER_SEMANTIC_ACT_FIELDS
+    )
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError(
+            "unknown browser semantic field(s): " + ", ".join(unknown)
+        )
+    workers = __import__("grabowski_workers")
+    kwargs: dict[str, Any] = {}
+    if "timeout_seconds" in parameters:
+        kwargs["timeout_seconds"] = parameters["timeout_seconds"]
+    if operation == "act":
+        kwargs["snapshot_id"] = parameters["snapshot_id"]
+        kwargs["action_kind"] = parameters["action_kind"]
+        if "element_id" in parameters:
+            kwargs["element_id"] = parameters["element_id"]
+    output = workers.browser_semantic_gateway(
+        parameters["worker_id"], operation, **kwargs
+    )
+    if not isinstance(output, dict):
+        raise GripActionError("canonical browser semantic gateway returned a non-object")
+    return output
+
+
+def _run_browser_semantic_observe(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    try:
+        output = _browser_semantic_gateway_call(parameters, operation="observe")
+    except (TypeError, ValueError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except (OSError, PermissionError, RuntimeError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", type(exc).__name__)
+        raise GripActionError("canonical browser semantic observe failed") from exc
+    _check(receipt, "canonical-semantic-gateway", "pass", "operation=observe")
+    _check(receipt, "read-only-publication", "pass", "grip=read_only; operation=observe")
+    audit = output.get("audit")
+    audit_preserved = (
+        isinstance(audit, dict)
+        and isinstance(audit.get("outcome"), dict)
+        and audit["outcome"].get("recorded") is True
+    )
+    _check(
+        receipt,
+        "semantic-receipt-preserved",
+        "pass" if audit_preserved else "fail",
+        str(output.get("result_code") or "missing"),
+    )
+    _check(
+        receipt,
+        "no-second-browser-contract",
+        "pass",
+        "delegates=browser_semantic_gateway",
+    )
+    return {
+        **output,
+        "receipt_status": (
+            "passed" if output.get("ok") is True and audit_preserved else "failed"
+        ),
+    }
+
+
+def _run_browser_semantic_act(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    try:
+        output = _browser_semantic_gateway_call(parameters, operation="act")
+    except (TypeError, ValueError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except (OSError, PermissionError, RuntimeError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", type(exc).__name__)
+        raise GripActionError("canonical browser semantic act failed") from exc
+    retry_readback = output.get("retry_readback")
+    retry_not_widened = (
+        isinstance(retry_readback, dict)
+        and retry_readback.get("retry_authorized") is False
+    )
+    audit = output.get("audit")
+    audit_preserved = (
+        isinstance(audit, dict)
+        and isinstance(audit.get("outcome"), dict)
+        and audit["outcome"].get("recorded") is True
+    )
+    _check(receipt, "canonical-semantic-gateway", "pass", "operation=act")
+    _check(receipt, "mutation-envelope", "pass", "grip=mutating; operation=act")
+    _check(
+        receipt,
+        "semantic-outcome-preserved",
+        "pass" if output.get("result_code") and audit_preserved else "fail",
+        str(output.get("result_code") or "missing"),
+    )
+    _check(
+        receipt,
+        "retry-authority-not-widened",
+        "pass" if retry_not_widened else "fail",
+        "retry_authorized=false" if retry_not_widened else "missing canonical retry prohibition",
+    )
+    return {
+        **output,
+        "receipt_status": (
+            "passed"
+            if output.get("ok") is True and retry_not_widened and audit_preserved
+            else "failed"
+        ),
+    }
 
 
 def _run_connector_snapshot_bind(
@@ -9107,6 +9292,8 @@ _RUNNERS = {
     "bureau_pickup_status": _run_bureau_pickup_status,
     "bureau_pickup_release": _run_bureau_pickup_release,
     "bureau_pickup_orphan_reconcile": _run_bureau_pickup_orphan_reconcile,
+    "browser_semantic_observe": _run_browser_semantic_observe,
+    "browser_semantic_act": _run_browser_semantic_act,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
     "transport_roundtrip": _run_transport_roundtrip,
     "convergence_assess": _run_convergence_assess,
