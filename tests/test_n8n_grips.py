@@ -34,8 +34,15 @@ class N8nGripContractTests(unittest.TestCase):
         contracts = {item["name"]: item for item in grips.grip_list("operator")["grips"]}
         self.assertEqual("read_only", contracts["n8n-workflow-edge-verify"]["effect"])
         self.assertEqual("mutating", contracts["n8n-workflow-edge-apply"]["effect"])
-        self.assertIn("provider-post-readback", contracts["n8n-workflow-edge-apply"]["acceptance_ids"])
-        self.assertIn("revision-cas-bound", contracts["n8n-workflow-edge-apply"]["acceptance_ids"])
+        apply_contract = contracts["n8n-workflow-edge-apply"]
+        self.assertEqual("1.1", apply_contract["version"])
+        self.assertIn("provider-post-readback", apply_contract["acceptance_ids"])
+        self.assertIn("revision-precondition-bound", apply_contract["acceptance_ids"])
+        self.assertIn("provider-prewrite-revalidated", apply_contract["acceptance_ids"])
+        self.assertIn("provider-concurrency-contract-explicit", apply_contract["acceptance_ids"])
+        self.assertNotIn("revision-cas-bound", apply_contract["acceptance_ids"])
+        self.assertNotIn("cas-apply", apply_contract["summary"].casefold())
+        self.assertTrue(any("not treated as an atomic external-writer cas boundary" in item.casefold() for item in apply_contract["preconditions"]))
 
     def test_verify_uses_fixed_runtime_adapter_and_never_falls_back_to_command_runner(self) -> None:
         called = []
@@ -110,7 +117,7 @@ class N8nGripContractTests(unittest.TestCase):
         self.assertIn("allow_mutation=true", result["output"]["error"])
         self.assertEqual([], called)
 
-    def test_apply_accepts_only_revision_bound_single_edge_post_readback(self) -> None:
+    def test_apply_accepts_precondition_bound_prewrite_and_post_readback(self) -> None:
         def dispatcher(operation: str, parameters: dict) -> dict:
             self.assertEqual("apply", operation)
             return {
@@ -118,6 +125,7 @@ class N8nGripContractTests(unittest.TestCase):
                 "mode": "apply",
                 "providerProfile": PROFILE,
                 "providerMutationPerformed": True,
+                "concurrencyContract": "exact-preconditions-revalidated-before-put-no-atomic-provider-cas",
                 "effect": {
                     "kind": "n8n-workflow-single-edge-add",
                     "sourceNodeName": "Transcribe Audio (Whisper)",
@@ -125,6 +133,12 @@ class N8nGripContractTests(unittest.TestCase):
                     "payloadSha256": "c" * 64,
                 },
                 "pre": {
+                    "state": "isolated",
+                    "versionId": parameters["expected_version_id"],
+                    "responseSha256": parameters["expected_response_sha256"],
+                    "outgoingCount": 0,
+                },
+                "preWrite": {
                     "state": "isolated",
                     "versionId": parameters["expected_version_id"],
                     "responseSha256": parameters["expected_response_sha256"],
@@ -147,18 +161,60 @@ class N8nGripContractTests(unittest.TestCase):
         )
         self.assertEqual("passed", result["status"])
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
-        self.assertEqual("pass", checks["revision-cas-bound"])
+        self.assertEqual("pass", checks["revision-precondition-bound"])
+        self.assertEqual("pass", checks["provider-prewrite-revalidated"])
+        self.assertEqual("pass", checks["provider-concurrency-contract-explicit"])
         self.assertEqual("pass", checks["single-edge-only"])
         self.assertEqual("pass", checks["provider-post-readback"])
         self.assertEqual("pass", checks["receipt-bound-effect"])
 
-    def test_apply_fails_closed_if_post_readback_is_not_final(self) -> None:
+    def test_apply_fails_closed_if_concurrency_contract_is_missing(self) -> None:
         def dispatcher(_operation: str, parameters: dict) -> dict:
             return {
                 "ok": True,
                 "providerMutationPerformed": True,
                 "effect": {"kind": "n8n-workflow-single-edge-add"},
                 "pre": {
+                    "state": "isolated",
+                    "versionId": parameters["expected_version_id"],
+                    "responseSha256": parameters["expected_response_sha256"],
+                },
+                "preWrite": {
+                    "state": "isolated",
+                    "versionId": parameters["expected_version_id"],
+                    "responseSha256": parameters["expected_response_sha256"],
+                },
+                "post": {
+                    "state": "final",
+                    "versionId": "version-2",
+                    "responseSha256": "d" * 64,
+                },
+            }
+
+        result = grips.grip_run(
+            "n8n-workflow-edge-apply",
+            apply_parameters(),
+            profile="operator",
+            allow_mutation=True,
+            n8n_provider_dispatcher=dispatcher,
+        )
+        self.assertEqual("failed", result["status"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["provider-concurrency-contract-explicit"])
+
+    def test_apply_fails_closed_if_post_readback_is_not_final(self) -> None:
+        def dispatcher(_operation: str, parameters: dict) -> dict:
+            return {
+                "ok": True,
+                "providerMutationPerformed": True,
+                "concurrencyContract": "exact-preconditions-revalidated-before-put-no-atomic-provider-cas",
+                "effect": {"kind": "n8n-workflow-single-edge-add"},
+                "pre": {
+                    "state": "isolated",
+                    "versionId": parameters["expected_version_id"],
+                    "responseSha256": parameters["expected_response_sha256"],
+                },
+                "preWrite": {
                     "state": "isolated",
                     "versionId": parameters["expected_version_id"],
                     "responseSha256": parameters["expected_response_sha256"],
