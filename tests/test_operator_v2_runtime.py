@@ -960,6 +960,54 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         self.assertNotIn("server runtime lease identity failed", json.dumps(result))
         github.assert_not_called()
 
+    def test_grip_core_uses_per_grip_capability_without_terminal_leakage(self) -> None:
+        allowed = {
+            "allowed": True,
+            "session_profile": {"profile": "test"},
+        }
+        output = {"receipt": {"status": "passed"}}
+        with (
+            patch.object(grabowski_mcp, "_session_grip_policy_decision", return_value=allowed),
+            patch.object(grabowski_mcp, "_require_capability") as require_capability,
+            patch.object(grabowski_mcp, "_require_mutations_enabled") as require_mutations,
+            patch.object(grabowski_mcp.grabowski_grips, "grip_run", return_value=output),
+        ):
+            observed = grabowski_mcp._grip_run_core(
+                "browser-semantic-observe",
+                {"worker_id": "a" * 20},
+                profile="operator",
+                allow_mutation=False,
+            )
+            require_capability.assert_called_once_with("browser_worker")
+            require_mutations.assert_not_called()
+            require_capability.reset_mock()
+
+            acted = grabowski_mcp._grip_run_core(
+                "browser-semantic-act",
+                {
+                    "worker_id": "b" * 20,
+                    "snapshot_id": "bsid2_" + "c" * 64,
+                    "action_kind": "read_state",
+                },
+                profile="operator",
+                allow_mutation=True,
+            )
+            require_capability.assert_not_called()
+            require_mutations.assert_called_once_with("browser_worker")
+            require_mutations.reset_mock()
+
+            terminal = grabowski_mcp._grip_run_core(
+                "repo-orient",
+                {"repo": "/tmp/repo"},
+                profile="operator",
+                allow_mutation=False,
+            )
+            require_capability.assert_called_once_with("terminal_execute")
+
+        self.assertIs(observed, output)
+        self.assertIs(acted, output)
+        self.assertIs(terminal, output)
+
     def test_session_forbidden_hosts_block_operator_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1195,8 +1243,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
         self.assertNotIn("grabowski_terminal_run", missing)
         self.assertNotIn("grabowski_git", missing)
-        self.assertIn("grip_run", missing)
-        self.assertEqual(missing["grip_run"], ["terminal_execute"])
+        self.assertNotIn("grip_run", missing)
 
     def test_status_reports_registered_tool_missing_required_capability(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1241,7 +1288,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ["git_cli", "github_cli", "resource_lease"],
         )
         self.assertNotIn("grabowski_verify_audit", missing)
-        self.assertEqual(missing["grip_run"], ["terminal_execute"])
+        self.assertNotIn("grip_run", missing)
         self.assertEqual(
             missing["grabowski_connector_transport_diagnostics"],
             ["user_service_control"],
@@ -1839,6 +1886,61 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertEqual(result["source_path"], str(source))
                 self.assertIn("<REDACTED>", result["stdout"])
                 self.assertNotIn("trusted-owner-secret-root-12345", result["stdout"])
+
+    def test_secret_use_annotations_match_open_world_command_effects(self) -> None:
+        annotations = grabowski_mcp.SECRET_USE_ANNOTATIONS.values
+        self.assertFalse(annotations["readOnlyHint"])
+        self.assertTrue(annotations["destructiveHint"])
+        self.assertFalse(annotations["idempotentHint"])
+        self.assertTrue(annotations["openWorldHint"])
+
+    def test_trusted_owner_secret_use_command_shape_relaxes_local_shell_guard_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            with (
+                patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True),
+                patch.object(grabowski_mcp, "_resolve_executable", return_value="/bin/sh"),
+            ):
+                command = grabowski_mcp._validate_secret_use_argv(
+                    ["sh", "-c", "printf ok {SECRET_FD_PATH}"],
+                    cwd=cwd,
+                    secret_data=b"synthetic-value",
+                )
+                self.assertEqual(command[0], "/bin/sh")
+                with self.assertRaisesRegex(PermissionError, "argv"):
+                    grabowski_mcp._validate_secret_use_argv(
+                        ["sh", "-c", "printf synthetic-value {SECRET_FD_PATH}"],
+                        cwd=cwd,
+                        secret_data=b"synthetic-value",
+                    )
+
+    def test_trusted_owner_secret_use_environment_accepts_nonsecret_extra_keys(self) -> None:
+        with patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True):
+            environment = grabowski_mcp._secret_use_environment(
+                {"EXTRA_CONTEXT": "metadata-only"},
+                b"synthetic-value",
+            )
+            self.assertEqual(environment["EXTRA_CONTEXT"], "metadata-only")
+            with self.assertRaisesRegex(PermissionError, "environment"):
+                grabowski_mcp._secret_use_environment(
+                    {"EXTRA_CONTEXT": "synthetic-value"},
+                    b"synthetic-value",
+                )
+
+    def test_trusted_owner_secret_use_cwd_accepts_sensitive_operator_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            with (
+                patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True),
+                patch.object(grabowski_mcp, "_roots", return_value=[cwd]),
+                patch.object(grabowski_mcp, "_path_is_sensitive", return_value=True),
+                patch.object(
+                    grabowski_mcp,
+                    "_protected_generic_write_target",
+                    return_value=True,
+                ),
+            ):
+                self.assertEqual(grabowski_mcp._resolve_secret_use_cwd(str(cwd)), cwd)
 
     def test_secret_use_rejects_shell_and_cleans_temp_fallback_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

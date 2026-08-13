@@ -908,6 +908,8 @@ class GripFoundationTests(unittest.TestCase):
                 "bureau-pickup-status",
                 "captain-preflight",
                 "captain-run",
+                "browser-semantic-observe",
+                "browser-semantic-act",
                 "connector-snapshot-bind",
                 "n8n-workflow-edge-apply",
                 "n8n-workflow-edge-verify",
@@ -946,6 +948,11 @@ class GripFoundationTests(unittest.TestCase):
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
         self.assertEqual("read_only", specs["repo-orient"]["effect"])
+        self.assertEqual("read_only", specs["browser-semantic-observe"]["effect"])
+        self.assertEqual("mutating", specs["browser-semantic-act"]["effect"])
+        self.assertEqual("browser_worker", specs["browser-semantic-observe"]["required_capability"])
+        self.assertEqual("browser_worker", specs["browser-semantic-act"]["required_capability"])
+        self.assertEqual("terminal_execute", specs["repo-orient"]["required_capability"])
         self.assertEqual(
             ("publication", "push", "merge-disjointness-eligible"),
             (
@@ -996,6 +1003,144 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("never creates or renews leases", worktree_ensure_preconditions)
         self.assertIn("work-acquire", worktree_ensure_preconditions)
         self.assertIn("work-acquire", specs["worktree-ensure"]["summary"])
+
+    def test_browser_semantic_grips_publish_browser_worker_capability(self) -> None:
+        contracts = {item["name"]: item for item in grips.list_grips("operator")}
+        self.assertEqual(
+            "browser_worker", contracts["browser-semantic-observe"]["required_capability"]
+        )
+        self.assertEqual(
+            "browser_worker", contracts["browser-semantic-act"]["required_capability"]
+        )
+        self.assertEqual("terminal_execute", contracts["repo-orient"]["required_capability"])
+        self.assertEqual(
+            "terminal_execute", grips.grip_required_capability("not-a-real-grip")
+        )
+
+    def test_browser_semantic_observe_grip_delegates_to_canonical_gateway(self) -> None:
+        module = types.ModuleType("grabowski_workers")
+        gateway = Mock(
+            return_value={
+                "ok": True,
+                "result_code": "ok",
+                "audit": {"outcome": {"recorded": True}},
+            }
+        )
+        module.browser_semantic_gateway = gateway
+        with patch.dict(sys.modules, {"grabowski_workers": module}):
+            result = grips.grip_run(
+                "browser-semantic-observe",
+                {"worker_id": "a" * 20, "timeout_seconds": 7},
+                profile="observer",
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        gateway.assert_called_once_with("a" * 20, "observe", timeout_seconds=7)
+        self.assertEqual("ok", result["output"]["result_code"])
+
+    def test_browser_semantic_observe_grip_fails_without_canonical_outcome_audit(self) -> None:
+        module = types.ModuleType("grabowski_workers")
+        module.browser_semantic_gateway = Mock(
+            return_value={"ok": True, "result_code": "ok", "audit": {}}
+        )
+        with patch.dict(sys.modules, {"grabowski_workers": module}):
+            result = grips.grip_run(
+                "browser-semantic-observe",
+                {"worker_id": "a" * 20},
+                profile="observer",
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+
+    def test_browser_semantic_observe_grip_rejects_contract_injection(self) -> None:
+        module = types.ModuleType("grabowski_workers")
+        gateway = Mock(return_value={"ok": True, "result_code": "ok", "audit": {}})
+        module.browser_semantic_gateway = gateway
+        with patch.dict(sys.modules, {"grabowski_workers": module}):
+            result = grips.grip_run(
+                "browser-semantic-observe",
+                {"worker_id": "a" * 20, "effect_class": "local_ui"},
+                profile="observer",
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("unknown browser semantic field", result["output"]["error"])
+        gateway.assert_not_called()
+
+    def test_browser_semantic_act_grip_requires_mutation_and_preserves_retry_contract(self) -> None:
+        module = types.ModuleType("grabowski_workers")
+        gateway = Mock(
+            return_value={
+                "ok": False,
+                "result_code": "outcome_unknown",
+                "effect_class": "local_ui",
+                "retry_readback": {"retry_authorized": False},
+                "audit": {
+                    "intent": {"recorded": True},
+                    "outcome": {"recorded": True},
+                },
+            }
+        )
+        module.browser_semantic_gateway = gateway
+        parameters = {
+            "worker_id": "b" * 20,
+            "snapshot_id": "bsid2_" + "c" * 64,
+            "action_kind": "scroll_into_view",
+            "element_id": "beid1_" + "d" * 64,
+            "timeout_seconds": 9,
+        }
+        with patch.dict(sys.modules, {"grabowski_workers": module}):
+            blocked = grips.grip_run(
+                "browser-semantic-act", parameters, profile="operator"
+            )
+            result = grips.grip_run(
+                "browser-semantic-act",
+                parameters,
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        self.assertEqual("blocked", blocked["receipt"]["status"])
+        self.assertEqual("failed", result["receipt"]["status"])
+        gateway.assert_called_once_with(
+            "b" * 20,
+            "act",
+            snapshot_id="bsid2_" + "c" * 64,
+            action_kind="scroll_into_view",
+            element_id="beid1_" + "d" * 64,
+            timeout_seconds=9,
+        )
+        self.assertFalse(result["output"]["retry_readback"]["retry_authorized"])
+        retry_check = next(
+            item
+            for item in result["receipt"]["checks"]
+            if item["id"] == "retry-authority-not-widened"
+        )
+        self.assertEqual("pass", retry_check["status"])
+
+    def test_browser_semantic_act_grip_fails_if_audit_is_not_preserved(self) -> None:
+        module = types.ModuleType("grabowski_workers")
+        module.browser_semantic_gateway = Mock(
+            return_value={
+                "ok": True,
+                "result_code": "ok",
+                "retry_readback": {"retry_authorized": False},
+                "audit": {"outcome": {"recorded": False}},
+            }
+        )
+        with patch.dict(sys.modules, {"grabowski_workers": module}):
+            result = grips.grip_run(
+                "browser-semantic-act",
+                {
+                    "worker_id": "b" * 20,
+                    "snapshot_id": "bsid2_" + "c" * 64,
+                    "action_kind": "read_state",
+                },
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
 
     def test_checkout_binding_terminal_preview_grip_is_read_only_and_delegates(self) -> None:
         checkout_key = "a" * 64
