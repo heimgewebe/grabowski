@@ -1127,6 +1127,13 @@ def ensure_worktree(
             if reposkop_required:
                 admission_parameters["reposkop_required"] = True
             admission = assessor(**admission_parameters)
+            if (
+                admission.get("decision") == "isolate_and_execute"
+                and not work_admission.has_verified_isolation_evidence(admission)
+            ):
+                raise WorktreeEnsurePreflight(
+                    "isolated worktree admission lacks valid nonconflict evidence"
+                )
             expected_plan_sha256 = inputs.get("system_convergence_plan_sha256")
             if expected_plan_sha256 is not None:
                 admission_plan = admission.get("system_convergence_plan")
