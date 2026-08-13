@@ -85,6 +85,7 @@ class TransportIngressOAuthDiscoveryTests(unittest.TestCase):
             {
                 "resource": "http://127.0.0.1:18180/mcp",
                 "resource_name": "Grabowski MCP",
+                "authorization_servers": [],
                 "bearer_methods_supported": [],
             },
         )
