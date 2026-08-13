@@ -198,6 +198,33 @@
         "tool": "grabowski_browser_worker_stored_form_action"
       }
     },
+    "grabowski_browser_worker_semantic": {
+      "evidence_refs": [
+        "docs:browser-control-plane-v1.md",
+        "tests:test_workers.py",
+        "contract:browser-operator-default-v2"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes one browser-scoped semantic gateway with server-owned observe and act operations, opaque state-bound handles and no raw browser backend authority.",
+        "evidence": "One mixed gateway surface, server-owned effect classification, HMAC-bound snapshot and element handles, bounded public Accessibility roles and names, fresh pre-effect state validation, immediate adapter TOCTOU revalidation, authoritative post-action observation, content-free audit records and fail-closed external effect classes."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "The existing grabowski_operation_* gateway runs configured argv recipes under terminal_execute with string parameters and command-dependent rollback. Reusing it would conflate terminal and browser authority, cannot carry structured opaque snapshot and element handles, and would weaken the browser-specific stale-state and post-action readback contract.",
+      "rationale": "A single browser-worker gateway keeps observe and act as named operations without adding one tool per intent. It preserves browser_worker authority, derives effect class from a fixed server catalog, exposes opaque handles with bounded Accessibility labels, keeps audit records free of page content and leaves reversible_external, external_mutation and high_impact fail-closed.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "browser-worker",
+        "effects": [
+          "audit-create",
+          "browser-local-ui",
+          "browser-read"
+        ],
+        "read_only": false,
+        "reversibility": "read-not-applicable; local-ui-state-dependent",
+        "risk_class": "medium",
+        "tool": "grabowski_browser_worker_semantic"
+      }
+    },
     "grabowski_bureau_candidate_assess": {
       "evidence_refs": [
         "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",

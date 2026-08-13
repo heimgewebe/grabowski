@@ -226,8 +226,39 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         contract = self.staged.manifest()["entrypoint_contract"]
         browser = contract["browser_operator_default"]
 
+        self.assertEqual(browser["schema_version"], 2)
         self.assertEqual(browser["canonical_browser"]["family"], "chrome-stable")
+        self.assertEqual(browser["transport"]["primary"], "direct-cdp")
         self.assertIs(browser["transport"]["loopback_only"], True)
+        self.assertEqual(browser["semantic_gateway"]["coverage"], "partial")
+        self.assertEqual(
+            browser["semantic_gateway"]["tool"],
+            "grabowski_browser_worker_semantic",
+        )
+        self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
+        self.assertEqual(
+            browser["semantic_gateway"]["supported_intents"],
+            ["read_state", "scroll_into_view"],
+        )
+        self.assertEqual(
+            browser["semantic_gateway"]["uncovered_intents"],
+            {"navigate": "direct-cdp-required"},
+        )
+        self.assertEqual(
+            browser["semantic_gateway"]["fail_closed_effect_classes"],
+            ["reversible_external", "external_mutation", "high_impact"],
+        )
+        self.assertFalse(
+            browser["semantic_gateway"]["ambiguous_effect_retry_authorized"]
+        )
+        self.assertTrue(
+            browser["semantic_gateway"][
+                "authoritative_readback_required_before_new_intent"
+            ]
+        )
+        self.assertFalse(
+            browser["semantic_gateway"]["readback_grants_retry_authority"]
+        )
         self.assertEqual(browser["profile"]["default"], "ephemeral")
         # The embedded contract and the snapshotted contract file are identical.
         self.assertEqual(
@@ -282,6 +313,45 @@ class ReleaseLifecycleRejectionTests(unittest.TestCase):
             ("persistent default profile", ["profile", "default"], "persistent"),
             ("shared profile lease", ["profile", "exclusive_profile_lease"], False),
             ("relative executable", ["canonical_browser", "executable"], "chrome"),
+            (
+                "semantic gateway replaces direct CDP primary",
+                ["transport", "primary"],
+                "grabowski_browser_worker_semantic",
+            ),
+            ("semantic coverage overclaimed", ["semantic_gateway", "coverage"], "full"),
+            (
+                "navigate claimed supported",
+                ["semantic_gateway", "supported_intents"],
+                ["read_state", "scroll_into_view", "navigate"],
+            ),
+            (
+                "navigate no longer requires direct CDP",
+                ["semantic_gateway", "uncovered_intents", "navigate"],
+                "semantic-gateway",
+            ),
+            (
+                "external mutation enabled",
+                ["semantic_gateway", "fail_closed_effect_classes"],
+                ["reversible_external", "high_impact"],
+            ),
+            (
+                "ambiguous retry enabled",
+                ["semantic_gateway", "ambiguous_effect_retry_authorized"],
+                True,
+            ),
+            (
+                "readback skipped",
+                [
+                    "semantic_gateway",
+                    "authoritative_readback_required_before_new_intent",
+                ],
+                False,
+            ),
+            (
+                "readback grants retry",
+                ["semantic_gateway", "readback_grants_retry_authority"],
+                True,
+            ),
         ]
         for label, path, value in cases:
             with self.subTest(label):
@@ -305,6 +375,18 @@ class ReleaseLifecycleRejectionTests(unittest.TestCase):
             step
             for step in browser["lifecycle"]
             if step != "grabowski_browser_worker_stop"
+        ]
+        self._reject_both(manifest)
+
+    def test_browser_operator_default_requires_ordered_direct_cdp_readback(self) -> None:
+        manifest = self.staged.manifest()
+        browser = manifest["entrypoint_contract"]["browser_operator_default"]
+        browser["lifecycle"] = [
+            "grabowski_browser_worker_start",
+            "direct_cdp_readback",
+            "direct_cdp_action",
+            "grabowski_browser_worker_stop",
+            "profile_and_lease_cleanup_readback",
         ]
         self._reject_both(manifest)
 

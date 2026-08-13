@@ -115,7 +115,8 @@ _OPTIONAL_FIELDS: dict[int, frozenset[str]] = {
     4: frozenset({"browser_operator_default"}),
 }
 
-BROWSER_OPERATOR_DEFAULT_SCHEMA_VERSION = 1
+BROWSER_OPERATOR_DEFAULT_SCHEMA_VERSIONS = (1, 2)
+BROWSER_OPERATOR_DEFAULT_SCHEMA_VERSION = 2
 
 _LOOPBACK_ENDPOINTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -362,6 +363,16 @@ def _validate_browser_operator_default(value: Any) -> None:
 
     label = "browser_operator_default"
     contract = _require_mapping(value, label=label)
+    schema_version = contract.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in BROWSER_OPERATOR_DEFAULT_SCHEMA_VERSIONS
+    ):
+        _fail(
+            f"{label}.schema_version must be one of "
+            f"{list(BROWSER_OPERATOR_DEFAULT_SCHEMA_VERSIONS)}"
+        )
     _require_exact_keys(
         contract,
         label=label,
@@ -373,19 +384,10 @@ def _validate_browser_operator_default(value: Any) -> None:
             "transport",
             "profile",
             "lifecycle",
+            *(("semantic_gateway",) if schema_version >= 2 else ()),
         ),
         optional=("human_browser_default", "future_adapter", "evidence_anchor"),
     )
-    schema_version = contract["schema_version"]
-    if (
-        not isinstance(schema_version, int)
-        or isinstance(schema_version, bool)
-        or schema_version != BROWSER_OPERATOR_DEFAULT_SCHEMA_VERSION
-    ):
-        _fail(
-            f"{label}.schema_version must be "
-            f"{BROWSER_OPERATOR_DEFAULT_SCHEMA_VERSION}"
-        )
     _require_text(contract["authority"], label=f"{label}.authority", maximum=200)
     _require_text(contract["decision_rule"], label=f"{label}.decision_rule", maximum=1024)
 
@@ -426,7 +428,13 @@ def _validate_browser_operator_default(value: Any) -> None:
             "vendor_mcp_role",
         ),
     )
-    _require_text(transport["primary"], label=f"{transport_label}.primary", maximum=200)
+    primary = _require_text(
+        transport["primary"], label=f"{transport_label}.primary", maximum=200
+    )
+    if schema_version >= 2 and primary != "direct-cdp":
+        _fail(
+            f"{transport_label}.primary must remain 'direct-cdp' for schema 2"
+        )
     _require_text(
         transport["vendor_mcp_role"],
         label=f"{transport_label}.vendor_mcp_role",
@@ -444,6 +452,138 @@ def _validate_browser_operator_default(value: Any) -> None:
         transport["loopback_only"], label=f"{transport_label}.loopback_only"
     ) is not True:
         _fail(f"{transport_label}.loopback_only must be true")
+
+    if schema_version >= 2:
+        semantic_label = f"{label}.semantic_gateway"
+        semantic = _require_mapping(
+            contract["semantic_gateway"], label=semantic_label
+        )
+        _require_exact_keys(
+            semantic,
+            label=semantic_label,
+            required=(
+                "coverage",
+                "tool",
+                "operations",
+                "supported_intents",
+                "uncovered_intents",
+                "public_target_contract",
+                "implemented_effect_classes",
+                "fail_closed_effect_classes",
+                "ambiguous_effect_retry_authorized",
+                "authoritative_readback_required_before_new_intent",
+                "readback_grants_retry_authority",
+            ),
+        )
+        coverage = _require_text(
+            semantic["coverage"],
+            label=f"{semantic_label}.coverage",
+            maximum=64,
+        )
+        if coverage != "partial":
+            _fail(f"{semantic_label}.coverage must remain 'partial'")
+        tool_name = _require_text(
+            semantic["tool"],
+            label=f"{semantic_label}.tool",
+            maximum=200,
+        )
+        if tool_name != "grabowski_browser_worker_semantic":
+            _fail(
+                f"{semantic_label}.tool must be "
+                "'grabowski_browser_worker_semantic'"
+            )
+        semantic_operations = _require_list(
+            semantic["operations"],
+            label=f"{semantic_label}.operations",
+            maximum=8,
+        )
+        if semantic_operations != ["observe", "act"]:
+            _fail(f"{semantic_label}.operations must be ['observe', 'act']")
+        supported_intents = _require_list(
+            semantic["supported_intents"],
+            label=f"{semantic_label}.supported_intents",
+            maximum=8,
+        )
+        if supported_intents != ["read_state", "scroll_into_view"]:
+            _fail(
+                f"{semantic_label}.supported_intents must be "
+                "['read_state', 'scroll_into_view']"
+            )
+        uncovered_intents = _require_mapping(
+            semantic["uncovered_intents"],
+            label=f"{semantic_label}.uncovered_intents",
+        )
+        _require_exact_keys(
+            uncovered_intents,
+            label=f"{semantic_label}.uncovered_intents",
+            required=("navigate",),
+        )
+        navigate_route = _require_text(
+            uncovered_intents["navigate"],
+            label=f"{semantic_label}.uncovered_intents.navigate",
+            maximum=64,
+        )
+        if navigate_route != "direct-cdp-required":
+            _fail(
+                f"{semantic_label}.uncovered_intents.navigate must remain "
+                "'direct-cdp-required'"
+            )
+        public_target_contract = _require_text(
+            semantic["public_target_contract"],
+            label=f"{semantic_label}.public_target_contract",
+            maximum=200,
+        )
+        if public_target_contract != "opaque-snapshot-and-element-handles":
+            _fail(
+                f"{semantic_label}.public_target_contract must expose only opaque "
+                "snapshot and element handles"
+            )
+        implemented = _require_list(
+            semantic["implemented_effect_classes"],
+            label=f"{semantic_label}.implemented_effect_classes",
+            maximum=8,
+        )
+        if implemented != ["read", "local_ui"]:
+            _fail(
+                f"{semantic_label}.implemented_effect_classes must remain "
+                "['read', 'local_ui']"
+            )
+        fail_closed = _require_list(
+            semantic["fail_closed_effect_classes"],
+            label=f"{semantic_label}.fail_closed_effect_classes",
+            maximum=8,
+        )
+        if fail_closed != [
+            "reversible_external",
+            "external_mutation",
+            "high_impact",
+        ]:
+            _fail(
+                f"{semantic_label}.fail_closed_effect_classes must keep all "
+                "external and high-impact classes blocked"
+            )
+        if _require_bool(
+            semantic["ambiguous_effect_retry_authorized"],
+            label=f"{semantic_label}.ambiguous_effect_retry_authorized",
+        ) is not False:
+            _fail(
+                f"{semantic_label}.ambiguous_effect_retry_authorized must be false"
+            )
+        if _require_bool(
+            semantic["authoritative_readback_required_before_new_intent"],
+            label=(
+                f"{semantic_label}.authoritative_readback_required_before_new_intent"
+            ),
+        ) is not True:
+            _fail(
+                f"{semantic_label}.authoritative_readback_required_before_new_intent "
+                "must be true"
+            )
+        if _require_bool(
+            semantic["readback_grants_retry_authority"],
+            label=f"{semantic_label}.readback_grants_retry_authority",
+        ) is not False:
+            _fail(f"{semantic_label}.readback_grants_retry_authority must be false")
 
     profile_label = f"{label}.profile"
     profile = _require_mapping(contract["profile"], label=profile_label)
@@ -488,6 +628,19 @@ def _validate_browser_operator_default(value: Any) -> None:
     for required_step in ("grabowski_browser_worker_start", "grabowski_browser_worker_stop"):
         if required_step not in lifecycle:
             _fail(f"{lifecycle_label} must include {required_step}")
+    if schema_version >= 2:
+        direct_cdp_steps = (
+            "grabowski_browser_worker_start",
+            "direct_cdp_action",
+            "direct_cdp_readback",
+            "grabowski_browser_worker_stop",
+        )
+        for required_step in direct_cdp_steps:
+            if required_step not in lifecycle:
+                _fail(f"{lifecycle_label} must include {required_step}")
+        direct_cdp_positions = [lifecycle.index(step) for step in direct_cdp_steps]
+        if direct_cdp_positions != sorted(direct_cdp_positions):
+            _fail(f"{lifecycle_label} must order direct CDP action and readback")
 
     if "human_browser_default" in contract:
         human_label = f"{label}.human_browser_default"

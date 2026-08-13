@@ -203,6 +203,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_merge_delivery_record` | artifact | unknown | high | Optionally record one durable, exact user-visible diff artifact handoff. |
 | `grabowski_browser_worker_start` | browser-worker | no | high | Start an agent-owned browser with a loopback-only debugging endpoint. |
 | `grabowski_browser_worker_stored_form_action` | browser-worker | no | high | Use browser-managed stored form data on one exact local-device origin without returning field contents. |
+| `grabowski_browser_worker_semantic` | browser-worker | no | medium | Observe or act through snapshot-bound semantic browser handles with bounded Accessibility labels and no raw browser locators. |
 | `grabowski_browser_worker_status` | browser-worker | yes | low | Observe one isolated browser worker and reconcile terminal leases. |
 | `grabowski_browser_worker_stop` | browser-worker | no | medium | Stop one isolated browser worker and clean ephemeral state. |
 | `grabowski_browser_worker_list` | browser-worker | yes | low | List current or historical browser workers with fresh read-only active observation. |

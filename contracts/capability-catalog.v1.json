@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "8c498848970d9f70476872bee9b102d52916ef26a327eaed8636f618566ac74e",
+  "capability_source_sha256": "11d619d1a11cbd050a5385e2cec490b989c133e8716ab0f25c62bbdf6065b19f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "02d607357e903b9b6279101fd4c7fd09c93d9ee1df943826b5d48044c93621ec",
+  "contract_sha256": "632369e85fdfec0856007c154860216db738228b6cfaccbaa7db1fb185dd1559",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -2089,6 +2089,21 @@
       "reversibility": "target-dependent; fields cleared on failed or unobserved submission",
       "risk_class": "high",
       "tool": "grabowski_browser_worker_stored_form_action"
+    },
+    {
+      "category": "browser-worker",
+      "description": "Observe or act through semantic snapshot and element handles only.\n\n``operation`` is either ``observe`` or ``act``. Element observations expose\nonly opaque element ids plus bounded Accessibility roles and names; origins,\ntitles, selectors, browser backend identifiers and protocol method names stay\nprivate. Effect class and retry/readback authority come from the server-owned\nsemantic catalog.",
+      "effects": [
+        "audit-create",
+        "browser-read",
+        "browser-local-ui"
+      ],
+      "id": "grabowski_browser_worker_semantic",
+      "purpose": "Observe or act through snapshot-bound semantic browser handles with bounded Accessibility labels and no raw browser locators.",
+      "read_only": false,
+      "reversibility": "read-not-applicable; local-ui-state-dependent",
+      "risk_class": "medium",
+      "tool": "grabowski_browser_worker_semantic"
     },
     {
       "category": "browser-worker",

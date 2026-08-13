@@ -1997,6 +1997,77 @@ globalThis.fetch = async () => ({
                 workers.browser_semantic_observe(worker["worker_id"])
         run.assert_not_called()
 
+    def test_browser_semantic_gateway_legacy_worker_preserves_fresh_worker_diagnostic(self) -> None:
+        worker = self._running_browser(port=9376)
+        record = workers._row(worker["worker_id"])
+        key_path = Path(record["config_path"]).parent / ".semantic-handle-key"
+        key_path.unlink()
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic"
+        ) as run, patch.object(
+            workers.base, "_append_audit_with_digest", return_value="a" * 64
+        ) as append_audit:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"], "observe"
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "fresh_worker_required")
+        self.assertEqual(outcome["effect_state"], "not_applicable")
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertEqual(
+            outcome["retry_readback"]["authoritative_readback_state"],
+            "unavailable",
+        )
+        require_mutation.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(append_audit.call_count, 1)
+
+    def test_browser_semantic_gateway_legacy_worker_act_is_not_outcome_unknown(self) -> None:
+        worker = self._running_browser(port=9377)
+        record = workers._row(worker["worker_id"])
+        key_path = Path(record["config_path"]).parent / ".semantic-handle-key"
+        key_path.unlink()
+        snapshot_id = workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64
+        element_id = workers.BROWSER_ELEMENT_ID_PREFIX + "b" * 64
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic"
+        ) as run, patch.object(
+            workers.base,
+            "_append_audit_with_digest",
+            side_effect=["a" * 64, "b" * 64],
+        ) as append_audit:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=snapshot_id,
+                action_kind="scroll_into_view",
+                element_id=element_id,
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "fresh_worker_required")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertFalse(
+            outcome["retry_readback"]["authoritative_readback_required"]
+        )
+        require_mutation.assert_called_once_with("browser_worker")
+        run.assert_not_called()
+        self.assertEqual(append_audit.call_count, 2)
+
     def test_browser_semantic_observe_bounds_and_redacts_element_projection(self) -> None:
         worker = self._running_browser(port=9360)
         raw_elements = [
@@ -2323,6 +2394,320 @@ globalThis.fetch = async () => ({
         self.assertEqual(outcome["result_code"], "effect_not_implemented")
         run.assert_called_once()
         self.assertEqual(run.call_args.args[1]["op"], "read_state")
+
+    def test_browser_semantic_gateway_observe_exposes_bounded_name_but_audit_does_not(self) -> None:
+        worker = self._running_browser(port=9370)
+        accessibility_name = "Transfer all funds " + "x" * 200
+        payload = self._semantic_state_payload(
+            origin="https://user:password@example.invalid/private?token=secret",
+            title="Private account dashboard",
+            elements=[
+                {
+                    "backend_node_id": "101",
+                    "role": "button",
+                    "name": accessibility_name,
+                    "selector": "#dangerous-private-selector",
+                }
+            ],
+        )
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ) as require_capability, patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ), patch.object(
+            workers.base, "_append_audit_with_digest", return_value="a" * 64
+        ) as append_audit:
+            result_payload = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"], "observe"
+            )
+
+        self.assertTrue(result_payload["ok"])
+        self.assertEqual(result_payload["operation"], "observe")
+        self.assertEqual(result_payload["effect_class"], "read")
+        self.assertFalse(result_payload["retry_readback"]["retry_authorized"])
+        self.assertEqual(
+            result_payload["retry_readback"]["authoritative_readback_state"],
+            "authoritative_fresh_observation",
+        )
+        self.assertEqual(
+            set(result_payload["observation"]["elements"][0]),
+            {"element_id", "role", "name"},
+        )
+        self.assertEqual(
+            result_payload["observation"]["elements"][0]["name"],
+            accessibility_name[: workers.BROWSER_ELEMENT_NAME_MAX],
+        )
+        self.assertLessEqual(
+            len(result_payload["observation"]["elements"][0]["name"]),
+            workers.BROWSER_ELEMENT_NAME_MAX,
+        )
+        require_capability.assert_called_with("browser_worker")
+        require_mutation.assert_not_called()
+        for effect_class in (
+            "reversible_external",
+            "external_mutation",
+            "high_impact",
+        ):
+            effect = result_payload["semantic_catalog"]["effect_classes"][
+                effect_class
+            ]
+            self.assertEqual(effect["admission"], "fail_closed")
+            self.assertFalse(effect["ambiguous_outcome"]["retry_authorized"])
+            self.assertTrue(
+                effect["ambiguous_outcome"]["authoritative_readback_required"]
+            )
+            self.assertFalse(
+                effect["ambiguous_outcome"]["readback_grants_retry_authority"]
+            )
+
+        rendered = json.dumps(result_payload, sort_keys=True)
+        audit_rendered = json.dumps(append_audit.call_args.args[0], sort_keys=True)
+        for forbidden in (
+            "password",
+            "token=secret",
+            "Private account dashboard",
+            "#dangerous-private-selector",
+            "backend_node_id",
+            "Runtime.evaluate",
+            "Accessibility.getFullAXTree",
+        ):
+            self.assertNotIn(forbidden, rendered)
+            self.assertNotIn(forbidden, audit_rendered)
+        self.assertIn(accessibility_name[:160], rendered)
+        self.assertNotIn(accessibility_name[:160], audit_rendered)
+        self.assertNotIn('"name"', audit_rendered)
+        self.assertEqual(append_audit.call_count, 1)
+        audit_record = append_audit.call_args.args[0]
+        self.assertEqual(audit_record["operation"], "browser-semantic-outcome")
+        self.assertEqual(audit_record["worker_id"], worker["worker_id"])
+        self.assertEqual(audit_record["intent"], "observe")
+        self.assertEqual(audit_record["effect_class"], "read")
+        self.assertTrue(audit_record["ok"])
+        self.assertEqual(audit_record["result_code"], "ok")
+        self.assertFalse(audit_record["retry_authorized"])
+        self.assertEqual(result_payload["audit"]["outcome"]["record_sha256"], "a" * 64)
+
+    def test_browser_semantic_gateway_act_preserves_post_action_readback(self) -> None:
+        worker = self._running_browser(port=9371)
+        payload = self._semantic_state_payload(title="Private title")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers,
+            "_run_node_browser_semantic",
+            side_effect=[payload, payload],
+        ), patch.object(
+            workers.base,
+            "_append_audit_with_digest",
+            side_effect=["a" * 64, "b" * 64],
+        ) as append_audit:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=observation["snapshot_id"],
+                action_kind="scroll_into_view",
+                element_id=observation["elements"][0]["element_id"],
+            )
+
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["effect_class"], "local_ui")
+        self.assertEqual(outcome["effect_state"], "observed")
+        self.assertEqual(
+            outcome["retry_readback"]["authoritative_readback_state"],
+            "authoritative_post_action_observation",
+        )
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertFalse(outcome["retry_readback"]["readback_grants_retry_authority"])
+        self.assertNotIn("title", json.dumps(outcome))
+        require_mutation.assert_called_once_with("browser_worker")
+        self.assertEqual(append_audit.call_count, 2)
+        audit_records = json.dumps(
+            [call.args[0] for call in append_audit.call_args_list], sort_keys=True
+        )
+        self.assertNotIn('"name"', audit_records)
+        self.assertNotIn("Target", audit_records)
+        self.assertNotIn("Private title", audit_records)
+        self.assertEqual(
+            [call.args[0]["operation"] for call in append_audit.call_args_list],
+            ["browser-semantic-intent", "browser-semantic-outcome"],
+        )
+        self.assertEqual(outcome["audit"]["intent"]["record_sha256"], "a" * 64)
+        self.assertEqual(outcome["audit"]["outcome"]["record_sha256"], "b" * 64)
+
+    def test_browser_semantic_gateway_stale_snapshot_returns_fresh_safe_handles(self) -> None:
+        worker = self._running_browser(port=9372)
+        initial = self._semantic_state_payload(title="Before")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=initial
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        changed = self._semantic_state_payload(title="After private navigation")
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ), patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=changed
+        ) as run, patch.object(
+            workers.base, "_append_audit_with_digest", return_value="a" * 64
+        ):
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=observation["snapshot_id"],
+                action_kind="scroll_into_view",
+                element_id=observation["elements"][0]["element_id"],
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "stale_snapshot")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        self.assertNotEqual(
+            outcome["observation"]["snapshot_id"], observation["snapshot_id"]
+        )
+        self.assertEqual(
+            outcome["retry_readback"]["authoritative_readback_state"],
+            "pre_action_observation_only",
+        )
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertNotIn("After private navigation", json.dumps(outcome))
+        run.assert_called_once()
+
+    def test_browser_semantic_gateway_external_effects_remain_fail_closed(self) -> None:
+        worker = self._running_browser(port=9373)
+        payload = self._semantic_state_payload()
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        fake_catalog = dict(workers.BROWSER_ACTION_CATALOG)
+        fake_catalog["submit_generic"] = {
+            "effect_class": "external_mutation",
+            "requires_element": False,
+        }
+        with patch.object(
+            workers, "BROWSER_ACTION_CATALOG", fake_catalog
+        ), patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ) as run, patch.object(
+            workers.base, "_append_audit_with_digest", return_value="a" * 64
+        ) as append_audit:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=observation["snapshot_id"],
+                action_kind="submit_generic",
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "effect_not_implemented")
+        self.assertEqual(outcome["effect_contract"]["admission"], "fail_closed")
+        self.assertFalse(
+            outcome["effect_contract"]["ambiguous_outcome"]["retry_authorized"]
+        )
+        self.assertTrue(
+            outcome["effect_contract"]["ambiguous_outcome"][
+                "authoritative_readback_required"
+            ]
+        )
+        require_mutation.assert_not_called()
+        run.assert_called_once()
+        self.assertEqual(append_audit.call_count, 1)
+
+    def test_browser_semantic_gateway_intent_audit_failure_blocks_effect(self) -> None:
+        worker = self._running_browser(port=9374)
+        snapshot_id = workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64
+        element_id = workers.BROWSER_ELEMENT_ID_PREFIX + "b" * 64
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ), patch.object(
+            workers.base,
+            "_append_audit_with_digest",
+            side_effect=OSError("audit unavailable"),
+        ), patch.object(workers, "browser_semantic_act") as semantic_act:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=snapshot_id,
+                action_kind="scroll_into_view",
+                element_id=element_id,
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "audit_unavailable")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        self.assertFalse(outcome["audit"]["intent"]["recorded"])
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        semantic_act.assert_not_called()
+
+    def test_browser_semantic_gateway_ambiguous_effect_and_audit_failure_forbid_retry(self) -> None:
+        worker = self._running_browser(port=9375)
+        snapshot_id = workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64
+        element_id = workers.BROWSER_ELEMENT_ID_PREFIX + "b" * 64
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ), patch.object(
+            workers.base,
+            "_append_audit_with_digest",
+            side_effect=["a" * 64, OSError("outcome audit unavailable")],
+        ), patch.object(
+            workers, "browser_semantic_act", side_effect=RuntimeError("lost response")
+        ):
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=snapshot_id,
+                action_kind="scroll_into_view",
+                element_id=element_id,
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "outcome_unknown")
+        self.assertEqual(outcome["effect_state"], "unknown")
+        self.assertTrue(outcome["audit"]["intent"]["recorded"])
+        self.assertFalse(outcome["audit"]["outcome"]["recorded"])
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertTrue(
+            outcome["retry_readback"]["authoritative_readback_required"]
+        )
+        self.assertFalse(
+            outcome["retry_readback"]["readback_grants_retry_authority"]
+        )
+        self.assertEqual(
+            outcome["retry_readback"]["next_action_after_ambiguous_effect"],
+            "perform_authoritative_readback_then_form_a_new_explicit_intent",
+        )
 
     def test_browser_semantic_contract_does_not_change_stored_form_action_safety(self) -> None:
         worker = self._running_browser(port=9366)
