@@ -608,7 +608,7 @@ def _active_creation_count(
             total += 1
             continue
         try:
-            Path(str(row["checkout_path"])).stat()
+            Path(str(row["checkout_path"])).lstat()
         except FileNotFoundError:
             continue
         except OSError:

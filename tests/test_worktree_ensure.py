@@ -402,6 +402,45 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertIn("active checkout limit", blocked["error"])
         self.assertFalse(Path(str(second["target_path"])).exists())
 
+    def test_expired_broken_symlink_active_binding_still_consumes_creation_capacity(self) -> None:
+        broken_symlink = self.worktree_root / "expired-broken-symlink"
+        common_dir = checkouts._git_common_dir(self.repo)
+        checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=broken_symlink,
+            owner_id=self.owner,
+            purpose="retain broken symlink lifecycle evidence",
+            source_kind="bureau_task",
+            source_id="STORAGE-LIFECYCLE-V1-T003",
+            artifact_class="operator_worktree",
+            retention_until_unix=self.retention_until,
+            expected_head=self.head,
+            expected_branch="feat/expired-broken-symlink",
+        )
+        broken_symlink.symlink_to(self.worktree_root / "missing-worktree", target_is_directory=True)
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (int(time.time()) - 1, checkouts._checkout_key(common_dir, broken_symlink)),
+            )
+            connection.commit()
+
+        second = self._parameters(
+            key="limit-after-expired-broken-symlink",
+            branch="feat/limit-after-expired-broken-symlink",
+            target=self.worktree_root / "limit-after-expired-broken-symlink",
+        )
+        with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1):
+            blocked = self._ensure(
+                second,
+                assess_admission=lambda **_kwargs: {"decision": "allow", "blocker_codes": []},
+            )
+
+        self.assertEqual(blocked["result_state"], "NOT_ACCEPTED")
+        self.assertIn("active checkout limit", blocked["error"])
+        self.assertFalse(Path(str(second["target_path"])).exists())
+
     def test_creates_and_replays_same_durable_result(self) -> None:
         parameters = self._parameters()
         created = self._ensure(parameters)
