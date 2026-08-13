@@ -229,6 +229,51 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertTrue(executed["output"]["target_result"]["called"])
         self.assertIsNotNone(executed["output"]["consumption_receipt_sha256"])
 
+    def test_mcp_browser_semantic_grips_use_browser_worker_capability(self) -> None:
+        base = _load_grabowski_mcp()
+        observed: list[tuple[str, bool]] = []
+
+        def fake_core(name, parameters, profile, allow_mutation, ctx, **_kwargs):
+            observed.append((name, allow_mutation))
+            return {"status": "passed"}
+
+        with (
+            mock.patch.object(base, "_require_capability") as require_capability,
+            mock.patch.object(base, "_grip_run_core", side_effect=fake_core),
+        ):
+            observe = asyncio.run(
+                base._grip_run_mcp(
+                    "browser-semantic-observe",
+                    {"worker_id": "a" * 20},
+                    allow_mutation=False,
+                )
+            )
+            require_capability.assert_called_once_with("browser_worker")
+            require_capability.reset_mock()
+
+            act = asyncio.run(
+                base._grip_run_mcp(
+                    "browser-semantic-act",
+                    {
+                        "worker_id": "b" * 20,
+                        "snapshot_id": "bsid2_" + "c" * 64,
+                        "action_kind": "read_state",
+                    },
+                    allow_mutation=True,
+                )
+            )
+            require_capability.assert_called_once_with("browser_worker")
+
+        self.assertEqual(observe["status"], "passed")
+        self.assertEqual(act["status"], "passed")
+        self.assertEqual(
+            observed,
+            [
+                ("browser-semantic-observe", False),
+                ("browser-semantic-act", True),
+            ],
+        )
+
     def test_mcp_handshake_does_not_depend_on_client_mutation_flag(self) -> None:
         base = _load_grabowski_mcp()
         observed: list[tuple[str, bool]] = []
@@ -1433,6 +1478,19 @@ class CentralTransportGateTests(unittest.TestCase):
             )
         self.assertTrue(result["called"])
         consume_verified.assert_not_called()
+
+    def test_browser_semantic_grip_transport_classification_is_not_widened(self) -> None:
+        operator = self.configured_operator()
+        self.assertTrue(
+            operator._transport_roundtrip_exempt_call(
+                "grip_run", {"name": "browser-semantic-observe"}
+            )
+        )
+        self.assertFalse(
+            operator._transport_roundtrip_exempt_call(
+                "grip_run", {"name": "browser-semantic-act"}
+            )
+        )
 
     def test_registered_mutating_grip_still_requires_exact_roundtrip(self) -> None:
         operator = self.configured_operator()
