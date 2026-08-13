@@ -108,6 +108,7 @@ MAX_OUTPUT_BYTES = 2_000_000
 TRUSTED_MAX_OUTPUT_BYTES = 33_554_432
 SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS = 30
 SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES = 64 * 1024
+PROCESS_TERMINATION_GRACE_SECONDS = 3.0
 SYNCHRONOUS_SHELL_EXECUTABLES = frozenset({
     "bash", "dash", "fish", "ksh", "sh", "zsh",
 })
@@ -1752,19 +1753,81 @@ def _synchronous_public_contract(*, surface: str) -> dict[str, Any]:
     }
 
 
+def _timeout_partial_bytes(value: Any) -> bytes:
+    return value if isinstance(value, bytes) else b""
+
+
+def _close_process_output_pipes(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 def _terminate_process_group(
     process: subprocess.Popen[bytes],
     *,
-    grace_seconds: float = 3.0,
+    grace_seconds: float | None = None,
 ) -> tuple[bytes, bytes]:
-    if process.poll() is not None:
-        return process.communicate()
-    os.killpg(process.pid, signal.SIGTERM)
+    """Terminate the owned process group without waiting forever on inherited pipes.
+
+    A descendant can escape the process group while retaining stdout/stderr. In
+    that case the group leader may already be dead while ``communicate()`` still
+    waits for EOF. Every post-timeout wait therefore remains bounded; once the
+    owned leader is terminal we close our pipe readers rather than waiting on an
+    unowned detached pipe holder.
+    """
+    grace = (
+        PROCESS_TERMINATION_GRACE_SECONDS
+        if grace_seconds is None
+        else grace_seconds
+    )
+    if not isinstance(grace, (int, float)) or isinstance(grace, bool) or grace <= 0:
+        raise ValueError("process termination grace must be positive")
+
+    partial_stdout = b""
+    partial_stderr = b""
+
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            return process.communicate(timeout=grace)
+        except subprocess.TimeoutExpired as exc:
+            partial_stdout = _timeout_partial_bytes(exc.output)
+            partial_stderr = _timeout_partial_bytes(exc.stderr)
+
+    # Do not signal a process group after the leader has been reaped: its numeric
+    # pgid could theoretically be reused. If the leader is still live, however,
+    # SIGKILL is safe because start_new_session=True made its pid the owned pgid.
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "command process group did not terminate after SIGKILL"
+            ) from exc
+
+    # ``wait()`` is independent of pipe EOF. A detached descendant may still
+    # own inherited descriptors, so make only one zero-wait capture attempt and
+    # then close our readers. TimeoutExpired carries the cumulative buffered
+    # output retained by Popen.communicate().
     try:
-        return process.communicate(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        return process.communicate()
+        return process.communicate(timeout=0)
+    except subprocess.TimeoutExpired as exc:
+        stdout = _timeout_partial_bytes(exc.output) or partial_stdout
+        stderr = _timeout_partial_bytes(exc.stderr) or partial_stderr
+        _close_process_output_pipes(process)
+        return stdout, stderr
 
 
 def _run(

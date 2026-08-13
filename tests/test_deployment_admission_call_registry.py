@@ -347,6 +347,55 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             asyncio.run(operator.mcp._tool_manager.call_tool("read", {}))
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_gate_sync_detached_pipe_holder_cannot_orphan_admission_identity(self) -> None:
+        operator = _load_operator_module()
+        script = (
+            "import os,time\n"
+            "pid=os.fork()\n"
+            "if pid: os._exit(0)\n"
+            "os.setsid()\n"
+            "while True:\n"
+            "    try: os.write(1,b'x')\n"
+            "    except OSError: os._exit(0)\n"
+            "    time.sleep(0.02)\n"
+        )
+
+        async def detached_pipe_call(*args, **kwargs):
+            return operator._run(
+                [operator.sys.executable, "-c", script],
+                cwd=Path(tempfile.gettempdir()),
+                timeout_seconds=1,
+                max_output_bytes=1024,
+            )
+
+        operator.mcp._tool_manager.call_tool = detached_pipe_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._configure_http_runtime()
+        started = time.monotonic()
+        with patch.object(
+            operator, "PROCESS_TERMINATION_GRACE_SECONDS", 0.1
+        ), patch.object(
+            operator, "_require_transport_roundtrip_for_tool", return_value=None
+        ):
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_terminal_run", {}
+                )
+            )
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual(
+            0, operator._deployment_admission_active_tool_calls()
+        )
+        snapshot = operator._deployment_admission_snapshot()
+        self.assertEqual(0, snapshot["drain_blocking_tool_calls"])
+        self.assertEqual([], snapshot["active_tool_calls_sample"])
+
     def test_gate_async_tool_success_and_exception_release_by_identity(self) -> None:
         operator = _load_operator_module()
 
