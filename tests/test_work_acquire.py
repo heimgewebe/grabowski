@@ -74,6 +74,48 @@ class WorkAcquireTests(unittest.TestCase):
         )
         return inputs, receipt
 
+    def isolation_admission(self) -> dict[str, object]:
+        scope = {
+            "target_path": str(self.target),
+            "branch": "feat/authority-p0",
+        }
+        signal = {
+            "code": "unrelated-dirty-worktree",
+            "path": str(self.root / "foreign-worktree"),
+        }
+        evidence_material = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_isolation_evidence",
+            "scope_identity": scope,
+            "signals": [signal],
+            "signal_codes": ["unrelated-dirty-worktree"],
+            "nonconflict_verified": True,
+            "does_not_establish": [
+                "mutation authority",
+                "cleanup authority over unrelated work",
+                "absence of later semantic or merge conflicts",
+            ],
+        }
+        evidence = {
+            **evidence_material,
+            "evidence_sha256": work_acquire.work_admission._digest(
+                evidence_material
+            ),
+        }
+        material = {
+            "decision": "isolate_and_execute",
+            "scope_mode": "exact_checkout",
+            "scope_identity": scope,
+            "blockers": [],
+            "blocker_codes": [],
+            "isolation_signals": [signal],
+            "isolation_evidence": evidence,
+        }
+        return {
+            **material,
+            "assessment_sha256": work_acquire.work_admission._digest(material),
+        }
+
     @staticmethod
     def acquired(
         owner: str,
@@ -183,6 +225,58 @@ class WorkAcquireTests(unittest.TestCase):
             ensure_parameters["system_convergence_plan_sha256"],
             result["inputs"]["system_convergence_plan"]["plan_sha256"],
         )
+
+    def test_verified_isolation_promotes_lane_decision(self) -> None:
+        admission = self.isolation_admission()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+                "work_admission": admission,
+            }
+        )
+        result = work_acquire.acquire_work(
+            self.parameters(),
+            acquire_resources_fn=self.acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["decision"], "ISOLATE_AND_EXECUTE")
+        self.assertEqual(result["worktree_receipt"]["work_admission"], admission)
+
+    def test_tampered_isolation_never_promotes_lane_decision(self) -> None:
+        admission = self.isolation_admission()
+        admission["isolation_evidence"] = {
+            **admission["isolation_evidence"],
+            "nonconflict_verified": False,
+        }
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+                "work_admission": admission,
+            }
+        )
+        result = work_acquire.acquire_work(
+            self.parameters(),
+            acquire_resources_fn=self.acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertEqual(result["decision"], "AUTO_PREPARE_AND_EXECUTE")
 
     def test_bureau_path_and_branch_use_same_owner_separate_contract_groups(self) -> None:
         calls: list[dict[str, object]] = []

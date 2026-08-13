@@ -1226,6 +1226,36 @@ class GripFoundationTests(unittest.TestCase):
         acquire.assert_called_once_with(**parameters)
 
 
+    def test_work_acquire_grip_accepts_verified_isolated_ready_lane(self) -> None:
+        parameters = {
+            "source_kind": "direct",
+            "source_id": "user-mandate:isolate",
+            "controller_actor": "operator:chatgpt:test",
+            "repo": "/tmp/repo",
+            "base_head": "a" * 40,
+            "branch": "test/isolate",
+            "target_path": "/tmp/isolate-worktree",
+            "purpose": "test isolated work acquire grip",
+            "retention_until_unix": 1_900_000_000,
+            "idempotency_key": "work-acquire-isolate-test",
+        }
+        lane = {
+            "state": "ready",
+            "decision": "ISOLATE_AND_EXECUTE",
+            "inputs": {"source": {"kind": "direct", "id": "user-mandate:isolate"}},
+            "lease_receipt": {"leases": [{"resource_key": "path:/tmp/isolate-worktree"}]},
+            "worktree_receipt": {"result_state": "CREATED"},
+            "authority": {"controller_only_effects": ["merge", "deployment"]},
+            "durable_receipt_path": "/tmp/isolate-lane.json",
+        }
+        with patch(
+            "grabowski_work_acquire.grabowski_work_acquire", return_value=lane
+        ):
+            result = grips.grip_run("work-acquire", parameters, allow_mutation=True)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["output"]["receipt_status"], "passed")
+        self.assertEqual(result["output"]["decision"], "ISOLATE_AND_EXECUTE")
+
     def test_reposkop_review_grip_runs_evidence_bound_surface(self) -> None:
         parameters = {
             "evaluation_id": "a" * 64,
