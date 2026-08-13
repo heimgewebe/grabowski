@@ -176,6 +176,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_context_fabric_compose` | context-fabric | yes | low | Compose and pack one fail-closed operator context that binds caller-supplied observations to their owning authority without copying lifecycle truth. |
 | `grabowski_context_fabric_explain` | context-fabric | yes | low | Explain claim inclusion, authority, freshness and preserved contradictions for one digest-bound operator context. |
 | `grabowski_context_fabric_compare` | context-fabric | yes | low | Compare two digest-bound operator contexts for one target without ranking, resolving or approving either. |
+| `grabowski_host_capability_resolve` | knowledge | yes | low | Resolve one declared host-local capability intent through the installed byte-identical operator-entry contract without execution authority. |
 | `grabowski_systemkatalog_query` | knowledge | yes | low | Run one bounded, revision-bound Systemkatalog v2 semantic query without catalog, task, runtime or merge authority. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |

@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "c99047d77b7cb95016a0c5ba49abee65d9ea47c78c9a8cab3303078c968e022c"
+    "sha256": "0ab1f487d5fc3c43357ba747e4bdb499bedeb8312862e66c75940184a3bcac7c"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "d8b31e18cd7d92332e20e704a635206e9ed63a6adc00ff0922cd2d5a8f449e70"
+    "sha256": "10dcbdd65092960352d0635ec3e3a56c43cd0772f5b4e944ab89ac633ff71b6d"
   },
   "counts": {
     "core": 22,
-    "full": 195,
-    "operator": 180
+    "full": 196,
+    "operator": 181
   },
   "profiles": {
     "core": [
@@ -175,6 +175,7 @@
       "grabowski_context_fabric_compose",
       "grabowski_context_fabric_explain",
       "grabowski_context_fabric_compare",
+      "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
@@ -357,6 +358,7 @@
       "grabowski_context_fabric_compose",
       "grabowski_context_fabric_explain",
       "grabowski_context_fabric_compare",
+      "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",

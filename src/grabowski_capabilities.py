@@ -1489,6 +1489,16 @@ TOOL_PROFILES.update(
 
 TOOL_PROFILES.update(
     {
+        "grabowski_host_capability_resolve": {
+            "category": "knowledge",
+            "purpose": (
+                "Resolve one declared host-local capability intent through the "
+                "installed byte-identical operator-entry contract without execution authority."
+            ),
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
         "grabowski_systemkatalog_query": {
             "category": "knowledge",
             "purpose": (
