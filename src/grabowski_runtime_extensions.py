@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import time
 from typing import Any
@@ -23,6 +25,372 @@ LOGICAL_RUNTIME_SERVICE = "grabowski-mcp"
 OPERATOR_UNIT = "grabowski-operator.service"
 TUNNEL_UNIT = "tunnel-client-grabowski.service"
 RUNTIME_TARGET = "heim-pc"
+
+HOST_CAPABILITY_SCHEMA_VERSION = 1
+HOST_CAPABILITY_RESULT_KIND = "grabowski.host_capability_resolution"
+HOST_OPERATOR_ENTRY_ENV = "GRABOWSKI_HOST_OPERATOR_ENTRY"
+HOST_OPERATOR_ENTRY_DEFAULT = HOME / ".config" / "heimgewebe" / "operator-entry.v1.json"
+HOST_OPERATOR_ENTRY_MAX_BYTES = 512 * 1024
+HOST_CAPABILITY_MAX_INTENT_CHARS = 160
+HOST_CAPABILITY_AUTHORITY_KIND = "capability_locator_only"
+HOST_CAPABILITY_DOES_NOT_ESTABLISH = (
+    "execution_authority",
+    "child_command_authority",
+    "current_capability_readiness",
+    "runtime_health",
+    "audio_file_access",
+    "cloud_or_metered_cost_authorization",
+    "secret_access_authority",
+    "capability_result_correctness",
+    "future_contract_state",
+)
+
+
+class HostCapabilityResolutionError(RuntimeError):
+    def __init__(self, code: str, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
+def _host_contract_path() -> Path:
+    raw = os.environ.get(HOST_OPERATOR_ENTRY_ENV)
+    path = Path(raw).expanduser() if raw is not None else HOST_OPERATOR_ENTRY_DEFAULT
+    if not path.is_absolute():
+        raise HostCapabilityResolutionError(
+            "contract_path_invalid",
+            f"{HOST_OPERATOR_ENTRY_ENV} must resolve to an absolute path",
+        )
+    return path
+
+
+def _host_read_contract(
+    path: Path,
+    *,
+    missing_code: str,
+    invalid_code: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise HostCapabilityResolutionError(
+            missing_code,
+            "host operator-entry contract is unavailable",
+            details={"path": str(path)},
+        ) from exc
+    except OSError as exc:
+        raise HostCapabilityResolutionError(
+            invalid_code,
+            "host operator-entry contract cannot be opened safely",
+            details={"path": str(path), "error_type": type(exc).__name__},
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise HostCapabilityResolutionError(
+                invalid_code,
+                "host operator-entry contract is not a regular file",
+                details={"path": str(path)},
+            )
+        if before.st_size < 2 or before.st_size > HOST_OPERATOR_ENTRY_MAX_BYTES:
+            raise HostCapabilityResolutionError(
+                invalid_code,
+                "host operator-entry contract violates the size bound",
+                details={"path": str(path), "bytes": before.st_size},
+            )
+        chunks: list[bytes] = []
+        remaining = HOST_OPERATOR_ENTRY_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise HostCapabilityResolutionError(
+                "contract_changed_during_read",
+                "host operator-entry contract changed while it was read",
+            )
+        if len(payload) != before.st_size or len(payload) > HOST_OPERATOR_ENTRY_MAX_BYTES:
+            raise HostCapabilityResolutionError(
+                invalid_code,
+                "host operator-entry contract read size changed",
+            )
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HostCapabilityResolutionError(
+                invalid_code,
+                "host operator-entry contract is not valid UTF-8 JSON",
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise HostCapabilityResolutionError(
+                invalid_code,
+                "host operator-entry root must be an object",
+            )
+        return decoded, {
+            "path": str(path),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "bytes": len(payload),
+            "mtime_ns": before.st_mtime_ns,
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _host_text(value: Any, *, label: str, maximum: int = 512) -> str:
+    if not isinstance(value, str):
+        raise HostCapabilityResolutionError("contract_invalid", f"{label} must be text")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > maximum
+        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+    ):
+        raise HostCapabilityResolutionError("contract_invalid", f"{label} is invalid")
+    return normalized
+
+
+def _host_resolve_home(value: Any) -> Any:
+    token = "${HOME}"
+    if isinstance(value, str):
+        if value == token:
+            return str(HOME)
+        prefix = token + "/"
+        if value.startswith(prefix):
+            relative = value[len(prefix):]
+            if not relative or relative.startswith("/"):
+                raise HostCapabilityResolutionError(
+                    "contract_template_invalid",
+                    "invalid HOME-relative locator path",
+                )
+            return str(HOME / relative)
+        if token in value:
+            raise HostCapabilityResolutionError(
+                "contract_template_invalid",
+                "unsupported HOME template placement",
+            )
+        return value
+    if isinstance(value, list):
+        return [_host_resolve_home(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _host_resolve_home(item) for key, item in value.items()}
+    return value
+
+
+def _host_validate_locators(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    if document.get("schemaVersion") != 1 or document.get("kind") != "heim_pc_operator_entry":
+        raise HostCapabilityResolutionError("contract_invalid", "unsupported host operator-entry contract")
+    if document.get("authority") != "static_local_entry_contract":
+        raise HostCapabilityResolutionError("contract_invalid", "unsupported host operator-entry authority")
+    model = document.get("operatorModel")
+    if not isinstance(model, dict) or model.get("liveStateRequiresFreshRead") is not True:
+        raise HostCapabilityResolutionError(
+            "contract_invalid",
+            "host operator-entry must require fresh live-state reads",
+        )
+    projection = document.get("projection")
+    if not isinstance(projection, dict) or projection.get("byteIdenticalContractRequired") is not True:
+        raise HostCapabilityResolutionError(
+            "contract_invalid",
+            "host operator-entry must require byte-identical projection",
+        )
+    path_resolution = document.get("pathResolution")
+    variables = path_resolution.get("variables") if isinstance(path_resolution, dict) else None
+    home = variables.get("HOME") if isinstance(variables, dict) else None
+    if (
+        not isinstance(home, dict)
+        or home.get("source") != "operator_process_home"
+        or home.get("required") is not True
+        or home.get("mustResolveToAbsoluteDirectory") is not True
+    ):
+        raise HostCapabilityResolutionError(
+            "contract_invalid",
+            "host operator-entry HOME resolution contract is missing or invalid",
+        )
+    locators = document.get("capabilityLocators")
+    if not isinstance(locators, dict) or not locators:
+        raise HostCapabilityResolutionError(
+            "capability_locators_missing",
+            "host operator-entry publishes no capabilityLocators",
+        )
+    validated: dict[str, dict[str, Any]] = {}
+    seen: dict[str, str] = {}
+    for raw_id, raw_locator in locators.items():
+        locator_id = _host_text(raw_id, label="locator id", maximum=160)
+        if not isinstance(raw_locator, dict) or raw_locator.get("schemaVersion") != 1:
+            raise HostCapabilityResolutionError("contract_invalid", f"locator {locator_id} is invalid")
+        authority = _host_text(raw_locator.get("authority"), label=f"locator {locator_id} authority", maximum=240)
+        authority_kind = _host_text(raw_locator.get("authorityKind"), label=f"locator {locator_id} authorityKind", maximum=120)
+        if authority_kind != HOST_CAPABILITY_AUTHORITY_KIND:
+            raise HostCapabilityResolutionError(
+                "authority_kind_unsupported",
+                f"locator {locator_id} is not locator-only",
+            )
+        intents = raw_locator.get("intents")
+        if not isinstance(intents, list) or not intents:
+            raise HostCapabilityResolutionError("contract_invalid", f"locator {locator_id} intents are invalid")
+        normalized_intents: list[str] = []
+        for raw_intent in intents:
+            normalized = _host_text(
+                raw_intent,
+                label=f"locator {locator_id} intent",
+                maximum=HOST_CAPABILITY_MAX_INTENT_CHARS,
+            ).casefold()
+            previous = seen.get(normalized)
+            if previous is not None:
+                raise HostCapabilityResolutionError(
+                    "intent_ambiguous",
+                    "host operator-entry publishes a duplicate capability intent",
+                    details={
+                        "intent": normalized,
+                        "first_locator": previous,
+                        "second_locator": locator_id,
+                    },
+                )
+            seen[normalized] = locator_id
+            normalized_intents.append(normalized)
+        validated[locator_id] = {
+            **raw_locator,
+            "authority": authority,
+            "authorityKind": authority_kind,
+            "_normalized_intents": normalized_intents,
+        }
+    return validated
+
+
+def _host_projection_identity(
+    document: dict[str, Any],
+    installed: dict[str, Any],
+) -> dict[str, Any]:
+    host = document.get("host")
+    if not isinstance(host, dict):
+        raise HostCapabilityResolutionError("contract_invalid", "host section is missing")
+    canonical_raw = _host_text(
+        host.get("canonicalEntryFile"),
+        label="host.canonicalEntryFile",
+        maximum=1024,
+    )
+    canonical_resolved = _host_resolve_home(canonical_raw)
+    if not isinstance(canonical_resolved, str) or not Path(canonical_resolved).is_absolute():
+        raise HostCapabilityResolutionError(
+            "contract_invalid",
+            "canonicalEntryFile did not resolve to an absolute path",
+        )
+    _canonical_document, canonical = _host_read_contract(
+        Path(canonical_resolved),
+        missing_code="canonical_contract_missing",
+        invalid_code="canonical_contract_invalid",
+    )
+    if canonical["sha256"] != installed["sha256"]:
+        raise HostCapabilityResolutionError(
+            "installed_projection_drift",
+            "installed host operator-entry differs from canonical source",
+            details={
+                "installed_sha256": installed["sha256"],
+                "canonical_sha256": canonical["sha256"],
+            },
+        )
+    return {
+        "required": True,
+        "matches": True,
+        "installed": installed,
+        "canonical": canonical,
+    }
+
+
+def resolve_host_capability(intent: str) -> dict[str, Any]:
+    """Resolve one host-local capability intent from the installed static contract."""
+    try:
+        normalized_intent = _host_text(
+            intent,
+            label="intent",
+            maximum=HOST_CAPABILITY_MAX_INTENT_CHARS,
+        ).casefold()
+        document, installed = _host_read_contract(
+            _host_contract_path(),
+            missing_code="installed_contract_missing",
+            invalid_code="installed_contract_invalid",
+        )
+        locators = _host_validate_locators(document)
+        projection = _host_projection_identity(document, installed)
+        matches = [
+            (locator_id, locator)
+            for locator_id, locator in locators.items()
+            if normalized_intent in locator["_normalized_intents"]
+        ]
+        if not matches:
+            return {
+                "schema_version": HOST_CAPABILITY_SCHEMA_VERSION,
+                "kind": HOST_CAPABILITY_RESULT_KIND,
+                "status": "not_found",
+                "intent": intent.strip(),
+                "matching": {
+                    "strategy": "exact-casefold-declared-intent-v1",
+                    "match_count": 0,
+                    "available_intent_count": sum(
+                        len(locator["_normalized_intents"])
+                        for locator in locators.values()
+                    ),
+                },
+                "contract_identity": projection,
+                "does_not_establish": list(HOST_CAPABILITY_DOES_NOT_ESTABLISH),
+            }
+        locator_id, internal = matches[0]
+        locator = {
+            key: value
+            for key, value in internal.items()
+            if key != "_normalized_intents"
+        }
+        return {
+            "schema_version": HOST_CAPABILITY_SCHEMA_VERSION,
+            "kind": HOST_CAPABILITY_RESULT_KIND,
+            "status": "resolved",
+            "intent": intent.strip(),
+            "matching": {
+                "strategy": "exact-casefold-declared-intent-v1",
+                "match_count": 1,
+                "locator_id": locator_id,
+            },
+            "authority": locator["authority"],
+            "authority_kind": locator["authorityKind"],
+            "locator": locator,
+            "resolved_locator": _host_resolve_home(locator),
+            "contract_identity": projection,
+            "policy_resolution": locator.get("policyResolution"),
+            "does_not_establish": list(HOST_CAPABILITY_DOES_NOT_ESTABLISH),
+        }
+    except HostCapabilityResolutionError as exc:
+        return {
+            "schema_version": HOST_CAPABILITY_SCHEMA_VERSION,
+            "kind": HOST_CAPABILITY_RESULT_KIND,
+            "status": "blocked",
+            "intent": intent.strip() if isinstance(intent, str) else None,
+            "error": {
+                "code": exc.code,
+                "message": str(exc),
+                "details": exc.details,
+            },
+            "does_not_establish": list(HOST_CAPABILITY_DOES_NOT_ESTABLISH),
+        }
+
+
+@mcp.tool(name="grabowski_host_capability_resolve", annotations=READ_ONLY)
+def grabowski_host_capability_resolve(intent: str) -> dict[str, Any]:
+    """Resolve one host capability from the installed contract without execution authority."""
+    operator._require_operator_capability("file_read")
+    return resolve_host_capability(intent)
+
 
 
 def runtime_service_model(deployment: dict[str, Any] | None = None) -> dict[str, Any]:

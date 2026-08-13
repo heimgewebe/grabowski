@@ -1838,6 +1838,30 @@
         "tool": "repoground_range_get"
       }
     },
+    "grabowski_host_capability_resolve": {
+      "evidence_refs": [
+        "heim-pc:pull-request-105",
+        "systemkatalog:pull-request-170",
+        "tests:tests/test_operator_context.py",
+        "contract:docs/agent-facing-contract.md"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes one read-only resolution shape over the installed, byte-identical host operator-entry capabilityLocators contract without copying capability policy or gaining execution authority.",
+        "evidence": "Exact declared-intent matching, locator-only authority kind, bounded no-follow contract reads, installed/canonical SHA equality, HOME-template validation, no-match and drift fail-closed tests, and a real transcription locator smoke against the installed heim-pc contract."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic file or terminal reads were rejected because callers would have to discover the host contract, verify its canonical byte identity, validate templates and ambiguity, parse locator authority boundaries, and could silently duplicate provider or model selection logic.",
+      "rationale": "Host-local capabilities need one stable typed lookup before implementation selection. The resolver returns only the owning locator and authority from the host contract; it performs no child command and grants no cloud, metered, file-access or runtime-readiness authority.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_host_capability_resolve"
+      }
+    },
     "grabowski_systemkatalog_query": {
       "evidence_refs": [
         "systemkatalog:heimgewebe/systemkatalog#164",

@@ -137,6 +137,7 @@
     "grabowski_context_fabric_compose",
     "grabowski_context_fabric_explain",
     "grabowski_context_fabric_compare",
+    "grabowski_host_capability_resolve",
     "grabowski_systemkatalog_query",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_candidate_assess",

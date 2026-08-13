@@ -84,6 +84,16 @@ class AgentInstructionsTests(unittest.TestCase):
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
         self.assertIn("narrowest typed read", rules["narrowest-typed-read-first"].lower())
+        host_resolution = rules["host-capability-resolution"].lower()
+        for phrase in (
+            "grabowski_host_capability_resolve",
+            "canonical authority",
+            "policy",
+            "do not pin",
+            "provider",
+            "model",
+        ):
+            self.assertIn(phrase, host_resolution)
         mutation = rules["mutation-preconditions"].lower()
         for phrase in (
             "target",

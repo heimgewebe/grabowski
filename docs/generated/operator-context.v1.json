@@ -1799,6 +1799,17 @@
     },
     {
       "category": "knowledge",
+      "description": "Resolve one host capability from the installed contract without execution authority.",
+      "effects": [],
+      "id": "grabowski_host_capability_resolve",
+      "purpose": "Resolve one declared host-local capability intent through the installed byte-identical operator-entry contract without execution authority.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_host_capability_resolve"
+    },
+    {
+      "category": "knowledge",
       "description": "Run one typed, revision-bound Systemkatalog v2 query without write authority.",
       "effects": [],
       "id": "grabowski_systemkatalog_query",
@@ -2929,6 +2940,7 @@
       "grabowski_context_fabric_compose",
       "grabowski_context_fabric_explain",
       "grabowski_context_fabric_compare",
+      "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
@@ -3445,7 +3457,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "11d619d1a11cbd050a5385e2cec490b989c133e8716ab0f25c62bbdf6065b19f"
+      "sha256": "f38a272d9ad8bca2565e9c6444b99da8e85ede919f9d4271f3e5b4bfd2f71d21"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3453,7 +3465,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "c99047d77b7cb95016a0c5ba49abee65d9ea47c78c9a8cab3303078c968e022c"
+      "sha256": "0ab1f487d5fc3c43357ba747e4bdb499bedeb8312862e66c75940184a3bcac7c"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3475,7 +3487,7 @@
       "src/grabowski_bureau_launcher_contract.py": "091908c70502dddd0bbe5582a3412b30cd92f5736801f76279bfd061ad141435",
       "src/grabowski_bureau_leases.py": "25965a1d91d8386103b8da033a09488005e943b5b575579a9722ce7e580fc378",
       "src/grabowski_bureau_pickup.py": "da5e5ebad67fc3a82318a6c6acb217c94b63868bcb7b11b221354a20cac1c7cb",
-      "src/grabowski_capabilities.py": "11d619d1a11cbd050a5385e2cec490b989c133e8716ab0f25c62bbdf6065b19f",
+      "src/grabowski_capabilities.py": "f38a272d9ad8bca2565e9c6444b99da8e85ede919f9d4271f3e5b4bfd2f71d21",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "74845b418561c79196ae7a98ab9e16d1d2e2509b6b037fd1e0381bc64a8b3257",
@@ -3513,7 +3525,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "b4e39bf55f91c4f87ecdeb3c2081bcd64421aaa3752cb9c2065acdf009b90f6c",
+      "src/grabowski_mcp.py": "e39cdc77e0d725cc00d9e6c2459b3ea49ac5c30faf4b99e64b47f152d581d999",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "6bb5772e2f54017c367d9c13d63579e0e7a45bfbd8116a035ee0a1da058cf012",
@@ -3542,7 +3554,7 @@
       "src/grabowski_resources.py": "ae6ba89c29104078387a64fe76284f955d7cc10f7e5ab533f4b997142dd0628d",
       "src/grabowski_runtime.py": "4b9100b1424b89950c16b57f733afa5f618204baa5ace44048a7643ab358cf9a",
       "src/grabowski_runtime_contract.py": "6bf0c2e202955d1258c71676ffe2575be681df283108c08bec19eb925cb72cbc",
-      "src/grabowski_runtime_extensions.py": "66e7e5988f167865a23cea380fcefc9c5099f90354b12e3e7b3bc3827c07b2c2",
+      "src/grabowski_runtime_extensions.py": "e618a435abf1f07d5b7a00d07dc59fc8fb844e1ddd52dfa7f025a0d754a66ef8",
       "src/grabowski_self_deploy.py": "0ec1de6d5f2c502307da4cd87ae8578d84d3daa2feac0cbfcbb57e56fefc8803",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",

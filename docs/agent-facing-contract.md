@@ -32,7 +32,11 @@ The rendered contract requires the agent to:
 1. treat live runtime state and concrete receipts as higher-authority than prose;
 2. use the narrowest typed read tool that can answer the question before broader
    surfaces;
-3. determine mutation target, expected result, validation, stop condition and
+3. for a host-local capability intent, resolve the installed host contract first
+   through `grabowski_host_capability_resolve`, follow its canonical authority and
+   reread that authority's policy at execution time; Grabowski must not duplicate
+   provider or model choices from the owning host contract;
+4. determine mutation target, expected result, validation, stop condition and
    rollback before changing state;
 4. verify target state after transport, platform-filter or policy failures and
    avoid unchanged retries without state evidence;

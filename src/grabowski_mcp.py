@@ -71,6 +71,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
         "Use the narrowest typed read tool that can answer the question before broader surfaces.",
     ),
     (
+        "host-capability-resolution",
+        "For a host-local capability intent, call grabowski_host_capability_resolve before choosing an implementation; follow the returned canonical authority and reread its policy at execution time, and do not pin or duplicate provider or model choices in Grabowski.",
+    ),
+    (
         "mutation-preconditions",
         "Before a mutation, determine the target, expected result, validation, stop condition, and rollback.",
     ),
@@ -701,6 +705,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_context_fabric_compose": (),
     "grabowski_context_fabric_explain": (),
     "grabowski_context_fabric_compare": (),
+    "grabowski_host_capability_resolve": ("file_read",),
     "grabowski_systemkatalog_query": (),
     "grabowski_resource_nonconflict_assess": ("resource_lease",),
     "grabowski_runtime_refresh_lease_release": ("resource_lease",),
@@ -749,6 +754,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_text_artifact_publish",
     "grabowski_text_artifact_read",
     "grabowski_merge_delivery_record",
+    "grabowski_host_capability_resolve",
     "grabowski_github_pr_view",
     "grabowski_github_checks",
     "grabowski_service_status",

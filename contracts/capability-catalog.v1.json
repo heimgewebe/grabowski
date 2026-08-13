@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "11d619d1a11cbd050a5385e2cec490b989c133e8716ab0f25c62bbdf6065b19f",
+  "capability_source_sha256": "f38a272d9ad8bca2565e9c6444b99da8e85ede919f9d4271f3e5b4bfd2f71d21",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "c99047d77b7cb95016a0c5ba49abee65d9ea47c78c9a8cab3303078c968e022c",
+  "contract_sha256": "0ab1f487d5fc3c43357ba747e4bdb499bedeb8312862e66c75940184a3bcac7c",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1729,6 +1729,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_context_fabric_compare"
+    },
+    {
+      "category": "knowledge",
+      "description": "Resolve one host capability from the installed contract without execution authority.",
+      "effects": [],
+      "id": "grabowski_host_capability_resolve",
+      "purpose": "Resolve one declared host-local capability intent through the installed byte-identical operator-entry contract without execution authority.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_host_capability_resolve"
     },
     {
       "category": "knowledge",

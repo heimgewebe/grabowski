@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -72,6 +74,167 @@ class OperatorContextTests(unittest.TestCase):
         catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
         by_tool = {item["tool"]: item for item in catalog["tools"]}
         self.assertIs(by_tool["grabowski_secret_use"]["read_only"], False)
+
+    def test_host_capability_resolver_is_generated_as_read_only_knowledge(self) -> None:
+        catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+        by_tool = {item["tool"]: item for item in catalog["tools"]}
+        resolver = by_tool["grabowski_host_capability_resolve"]
+        self.assertIs(resolver["read_only"], True)
+        self.assertEqual(resolver["category"], "knowledge")
+        self.assertEqual(resolver["risk_class"], "low")
+        self.assertEqual(resolver["effects"], [])
+
+    @staticmethod
+    def _host_capability_contract() -> dict[str, object]:
+        return {
+            "schemaVersion": 1,
+            "kind": "heim_pc_operator_entry",
+            "authority": "static_local_entry_contract",
+            "operatorModel": {"liveStateRequiresFreshRead": True},
+            "host": {
+                "canonicalEntryFile": "${HOME}/repos/heim-pc/manifest/operator-entry.v1.json",
+            },
+            "projection": {"byteIdenticalContractRequired": True},
+            "pathResolution": {
+                "variables": {
+                    "HOME": {
+                        "source": "operator_process_home",
+                        "required": True,
+                        "mustResolveToAbsoluteDirectory": True,
+                    }
+                }
+            },
+            "capabilityLocators": {
+                "audioTranscription": {
+                    "schemaVersion": 1,
+                    "intents": [
+                        "audio.transcribe",
+                        "speech_to_text",
+                        "transcription",
+                        "asr",
+                    ],
+                    "authority": "heim_pc_asr_open_engine",
+                    "authorityKind": "capability_locator_only",
+                    "policy": "${HOME}/repos/heim-pc/manifest/asr-engine-policy.v1.json",
+                    "entryArgvPrefix": [
+                        "python3",
+                        "${HOME}/repos/heim-pc/scripts/asr_engine.py",
+                    ],
+                    "policyResolution": "read_at_execution_time",
+                    "consumerEnginePinningAllowed": False,
+                    "cloudOrMeteredUseAuthorizedByLocator": False,
+                }
+            },
+        }
+
+    def _run_host_capability_resolution(
+        self,
+        *,
+        intent: str,
+        drift_canonical: bool = False,
+    ) -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installed = home / ".config/heimgewebe/operator-entry.v1.json"
+            canonical = home / "repos/heim-pc/manifest/operator-entry.v1.json"
+            installed.parent.mkdir(parents=True)
+            canonical.parent.mkdir(parents=True)
+            contract = self._host_capability_contract()
+            encoded = json.dumps(contract, ensure_ascii=False, indent=2) + "\n"
+            installed.write_text(encoded, encoding="utf-8")
+            canonical.write_text(encoded, encoding="utf-8")
+            if drift_canonical:
+                changed = dict(contract)
+                changed["testDrift"] = True
+                canonical.write_text(
+                    json.dumps(changed, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            code = f"""
+import json
+from pathlib import Path
+import sys
+import types
+
+class FakeMCP:
+    def tool(self, *args, **kwargs):
+        return lambda function: function
+
+operator = types.ModuleType('grabowski_operator_core')
+operator.mcp = FakeMCP()
+operator.HOME = Path.home()
+operator.EVIDENCE_ROOT = Path.home() / '.local/state/grabowski/evidence'
+operator.PROTECTED_BRANCHES = {{'main', 'master'}}
+operator.READ_ONLY = object()
+operator.MUTATING = object()
+operator.MAX_OUTPUT_BYTES = 1024 * 1024
+operator._require_operator_capability = lambda capability: None
+operator._safe_environment = lambda: {{}}
+
+sys.modules['grabowski_operator_core'] = operator
+sys.modules['grabowski_capabilities'] = types.ModuleType('grabowski_capabilities')
+sys.modules['grabowski_mcp'] = types.ModuleType('grabowski_mcp')
+sys.modules['grabowski_consumer_surface'] = types.ModuleType('grabowski_consumer_surface')
+
+import grabowski_runtime_extensions as runtime
+print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
+"""
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "PYTHONPATH": str(ROOT / "src"),
+                    "GRABOWSKI_HOST_OPERATOR_ENTRY": str(installed),
+                }
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=completed.stdout + completed.stderr,
+            )
+            return json.loads(completed.stdout)
+
+    def test_host_capability_resolver_resolves_transcription_without_model_pinning(self) -> None:
+        result = self._run_host_capability_resolution(intent="transcription")
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["authority"], "heim_pc_asr_open_engine")
+        self.assertEqual(result["authority_kind"], "capability_locator_only")
+        self.assertEqual(result["matching"]["locator_id"], "audioTranscription")
+        self.assertEqual(result["policy_resolution"], "read_at_execution_time")
+        self.assertIs(result["locator"]["consumerEnginePinningAllowed"], False)
+        self.assertIs(result["locator"]["cloudOrMeteredUseAuthorizedByLocator"], False)
+        self.assertTrue(result["contract_identity"]["matches"])
+        self.assertEqual(
+            result["contract_identity"]["installed"]["sha256"],
+            result["contract_identity"]["canonical"]["sha256"],
+        )
+        self.assertTrue(Path(result["resolved_locator"]["policy"]).is_absolute())
+        rendered = json.dumps(result, ensure_ascii=False).lower()
+        for engine_name in ("faster-whisper", "qwen", "parakeet"):
+            self.assertNotIn(engine_name, rendered)
+
+    def test_host_capability_resolver_blocks_installed_projection_drift(self) -> None:
+        result = self._run_host_capability_resolution(
+            intent="transcription",
+            drift_canonical=True,
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["error"]["code"], "installed_projection_drift")
+
+    def test_host_capability_resolver_returns_not_found_without_guessing(self) -> None:
+        result = self._run_host_capability_resolution(intent="nonexistent.intent")
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["matching"]["match_count"], 0)
+        self.assertNotIn("authority", result)
 
     def test_browser_operator_default_is_runtime_bound_and_generated(self) -> None:
         contract = json.loads(
