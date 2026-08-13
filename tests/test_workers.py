@@ -1693,14 +1693,40 @@ globalThis.fetch = async () => ({
             started = workers.browser_start(str(self.binary), port=9350, runtime_seconds=60)
         worker = started["worker"]
         config_path = Path(workers._row(worker["worker_id"])["config_path"])
+        handle_key = config_path.parent / ".semantic-handle-key"
+        self.assertTrue(handle_key.is_file())
         with patch.object(workers.operator, "_run", return_value=result()):
             stopped = workers.worker_stop(worker["worker_id"], expected_kind="browser")
         self.assertEqual(stopped["worker"]["state"], "stopped")
         self.assertTrue(config_path.exists())
+        self.assertFalse(handle_key.exists())
         self.assertIsNone(workers.resources.inspect_resource("port:9350"))
         terminalization = stopped["worker"]["last_observation"]["terminalization"]
         self.assertEqual(terminalization["release"]["status"], "released")
         self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertIn(str(handle_key), terminalization["cleanup"]["removed"])
+
+    def test_stop_unlinks_semantic_handle_key_symlink_without_following_target(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9380, runtime_seconds=60)
+        worker = started["worker"]
+        config_path = Path(workers._row(worker["worker_id"])["config_path"])
+        handle_key = config_path.parent / ".semantic-handle-key"
+        target = self.root / "semantic-key-cleanup-target"
+        target.write_text("preserve-me")
+        handle_key.unlink()
+        handle_key.symlink_to(target)
+
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(worker["worker_id"], expected_kind="browser")
+
+        self.assertFalse(handle_key.exists())
+        self.assertEqual(target.read_text(), "preserve-me")
+        terminalization = stopped["worker"]["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertIn(str(handle_key), terminalization["cleanup"]["removed"])
 
     def test_stopped_status_preserves_explicit_state_over_timeout_evidence(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(

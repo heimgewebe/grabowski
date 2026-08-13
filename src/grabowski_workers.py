@@ -696,6 +696,15 @@ def _cleanup(record: dict[str, Any]) -> dict[str, Any]:
     preserved: list[str] = []
     errors: list[dict[str, str]] = []
     evidence_directory = WORKER_STATE / "instances" / record["worker_id"]
+    if record.get("kind") == "browser":
+        handle_key = evidence_directory / ".semantic-handle-key"
+        try:
+            handle_key.unlink()
+            removed.append(str(handle_key))
+        except FileNotFoundError:
+            absent.append(str(handle_key))
+        except OSError as exc:
+            errors.append({"path": str(handle_key), "error": str(exc)})
     for raw in json.loads(record["ephemeral_paths_json"]):
         path = Path(raw)
         if path == evidence_directory:
