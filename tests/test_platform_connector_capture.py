@@ -153,7 +153,11 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         self.assertEqual(result["missing_from_platform"], ["runtime-only"])
         self.assertEqual(result["unexpected_in_platform"], [])
         self.assertEqual(result["catalog_sha256"], metadata["artifact_sha256"])
-        self.assertEqual(self.platform_path.stat().st_mode & 0o777, 0o600)
+        mode = self.platform_path.stat().st_mode & 0o777
+        self.assertEqual(snapshot.PLATFORM_SNAPSHOT_MODE, 0o644)
+        self.assertEqual(mode, snapshot.PLATFORM_SNAPSHOT_MODE)
+        self.assertEqual(mode & 0o022, 0)
+        self.assertEqual(mode & 0o044, 0o044)
 
         runtime_artifact = {
             "schema_version": 1,
