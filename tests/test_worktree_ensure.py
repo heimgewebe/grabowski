@@ -125,6 +125,50 @@ class WorktreeEnsureTests(unittest.TestCase):
             "expires_at_unix": int(time.time()) + 3600,
         }
 
+    def _isolation_admission(
+        self, parameters: dict[str, object]
+    ) -> dict[str, object]:
+        scope = {
+            "target_path": str(parameters["target_path"]),
+            "branch": str(parameters["branch"]),
+        }
+        signal = {
+            "code": "unrelated-dirty-worktree",
+            "path": str(self.worktree_root / "foreign"),
+        }
+        evidence_material = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_isolation_evidence",
+            "scope_identity": scope,
+            "signals": [signal],
+            "signal_codes": ["unrelated-dirty-worktree"],
+            "nonconflict_verified": True,
+            "does_not_establish": [
+                "mutation authority",
+                "cleanup authority over unrelated work",
+                "absence of later semantic or merge conflicts",
+            ],
+        }
+        evidence = {
+            **evidence_material,
+            "evidence_sha256": worktree_ensure.work_admission._digest(
+                evidence_material
+            ),
+        }
+        material = {
+            "decision": "isolate_and_execute",
+            "scope_mode": "exact_checkout",
+            "scope_identity": scope,
+            "blockers": [],
+            "blocker_codes": [],
+            "isolation_signals": [signal],
+            "isolation_evidence": evidence,
+        }
+        return {
+            **material,
+            "assessment_sha256": worktree_ensure.work_admission._digest(material),
+        }
+
     def _record_friction(self, **kwargs: object) -> dict[str, object]:
         event_id = f"event-{len(self.friction_events) + 1}"
         event = {"event_id": event_id, "recorded": True, **kwargs}
@@ -216,6 +260,46 @@ class WorktreeEnsureTests(unittest.TestCase):
         created = self._ensure(parameters, runner=newline_runner)
         self.assertEqual(created["result_state"], "CREATED")
         self.assertTrue(Path(str(parameters["target_path"])).is_dir())
+
+    def test_verified_isolated_admission_is_bound_before_worktree_mutation(self) -> None:
+        parameters = self._parameters(
+            key="verified-isolation",
+            branch="feat/verified-isolation",
+            target=self.worktree_root / "verified-isolation",
+        )
+        admission = self._isolation_admission(parameters)
+        result = self._ensure(
+            parameters, assess_admission=lambda **_kwargs: admission
+        )
+        self.assertEqual(result["result_state"], "CREATED")
+        self.assertEqual(result["work_admission"], admission)
+        self.assertTrue(
+            worktree_ensure.work_admission.has_verified_isolation_evidence(
+                result["work_admission"]
+            )
+        )
+
+    def test_tampered_isolated_admission_fails_before_git_mutation(self) -> None:
+        parameters = self._parameters(
+            key="tampered-isolation",
+            branch="feat/tampered-isolation",
+            target=self.worktree_root / "tampered-isolation",
+        )
+        admission = self._isolation_admission(parameters)
+        admission["isolation_evidence"] = {
+            **admission["isolation_evidence"],
+            "nonconflict_verified": False,
+        }
+        with self.assertRaisesRegex(
+            worktree_ensure.WorktreeEnsurePreflight,
+            "valid nonconflict evidence",
+        ):
+            self._ensure(parameters, assess_admission=lambda **_kwargs: admission)
+        self.assertFalse(Path(str(parameters["target_path"])).exists())
+        self.assertNotEqual(
+            self._git(self.repo, "branch", "--list", str(parameters["branch"])).stdout.strip(),
+            str(parameters["branch"]),
+        )
 
     def test_active_limit_blocks_new_growth_without_deleting_existing_checkout(self) -> None:
         first = self._parameters(

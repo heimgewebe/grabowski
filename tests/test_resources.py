@@ -4135,6 +4135,21 @@ class ResourceTests(unittest.TestCase):
                 admission_assessor=assessor,
             )
 
+    def test_work_admission_metadata_counts_isolated_decision(self) -> None:
+        evidence = resources._work_admission_metadata(
+            [
+                {
+                    "decision": "isolate_and_execute",
+                    "blockers": [],
+                    "blocker_codes": [],
+                }
+            ]
+        )
+        self.assertEqual(evidence["assessment_count"], 1)
+        self.assertEqual(evidence["decision_counts"]["isolate_and_execute"], 1)
+        self.assertEqual(evidence["decision_counts"]["allow"], 0)
+        self.assertEqual(evidence["blocker_count"], 0)
+
     def test_work_admission_metadata_is_not_caller_controlled(self) -> None:
         with self.assertRaisesRegex(ValueError, "not a public authority surface"):
             resources.acquire_resources(

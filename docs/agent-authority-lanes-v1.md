@@ -46,6 +46,7 @@ The surface returns one of these operational decisions:
 
 - `EXECUTE`: the exact lane already exists.
 - `AUTO_PREPARE_AND_EXECUTE`: Grabowski prepared the exact lane.
+- `ISOLATE_AND_EXECUTE`: the requested worktree lane is exact and locally conflict-free while unrelated dirty or foreign live work remains protected outside that lane. The decision is accepted only with integrity-bound isolation evidence from repository admission and never grants cleanup or override authority over that unrelated work.
 - `AUTO_PREPARE_FAILED`: no effect was attempted and acquired leases were compensated.
 - `HARD_BLOCK`: a real conflict or an uncertain post-effect outcome requires reconciliation.
 
@@ -76,6 +77,7 @@ Single-call connector authorization is provided by the owner-bound transport con
 This contract does not claim completion of:
 
 - automatic PR and dirty-state rescue closeout,
+- automatic selection of a replacement branch/worktree when the caller-supplied target itself is occupied or conflicting,
 - implicit transfer of controller-only effects to a writer,
 - cleanup without terminal lane evidence.
 

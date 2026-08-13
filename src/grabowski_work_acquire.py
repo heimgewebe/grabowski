@@ -1324,7 +1324,14 @@ def acquire_work(
             return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
         result_state = output.get("result_state")
         if result_state in SUCCESS_STATES:
-            decision = "AUTO_PREPARE_AND_EXECUTE" if result_state == "CREATED" else "EXECUTE"
+            admission = output.get("work_admission")
+            decision = (
+                "ISOLATE_AND_EXECUTE"
+                if work_admission.has_verified_isolation_evidence(admission)
+                else "AUTO_PREPARE_AND_EXECUTE"
+                if result_state == "CREATED"
+                else "EXECUTE"
+            )
             authority = {
                 "controller": inputs["controller"],
                 "scoped_writer": inputs["scoped_writer"],

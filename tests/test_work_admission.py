@@ -311,7 +311,7 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertIn("foreign-live-coordination", foreign["blocker_codes"])
         self.assertIn("foreign-retained-worktree", foreign["blocker_codes"])
 
-    def test_exact_disjoint_checkout_ignores_unrelated_repository_hygiene(self) -> None:
+    def test_exact_disjoint_checkout_isolates_from_unrelated_live_work(self) -> None:
         target_path = str(self.repo.parent / "worktrees" / "fresh-target")
         branch = "fix/fresh-target"
         unrelated = self._linked(
@@ -351,9 +351,69 @@ class WorkAdmissionTests(unittest.TestCase):
             source_id="NEW-TASK",
         )
 
-        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["decision"], "isolate_and_execute")
         self.assertEqual(result["scope_mode"], "exact_checkout")
         self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["blocker_codes"], [])
+        self.assertEqual(
+            set(result["isolation_evidence"]["signal_codes"]),
+            {
+                "unrelated-dirty-worktree",
+                "unrelated-foreign-live-coordination",
+            },
+        )
+        self.assertTrue(admission.has_verified_isolation_evidence(result))
+        self.assertIn("exact isolated lane", result["next_action"])
+
+        tampered = dict(result)
+        tampered["isolation_evidence"] = {
+            **result["isolation_evidence"],
+            "nonconflict_verified": False,
+        }
+        self.assertFalse(admission.has_verified_isolation_evidence(tampered))
+
+    def test_exact_clean_checkout_without_unrelated_live_work_remains_allow(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "fresh-target")
+        branch = "fix/fresh-target"
+        result = self._assess(
+            [self._main()],
+            requested_scope={"paths": [target_path], "branch": branch},
+            target_path=target_path,
+            branch=branch,
+            source_kind="bureau_task",
+            source_id="NEW-TASK",
+        )
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["isolation_signals"], [])
+        self.assertIsNone(result["isolation_evidence"])
+        self.assertFalse(admission.has_verified_isolation_evidence(result))
+
+    def test_normal_mode_accepts_verified_isolated_checkout_without_bypass(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "fresh-target")
+        branch = "fix/fresh-target"
+        unrelated = self._linked(
+            state="managed_lifecycle_drift",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+        result = admission.require_repository_admission(
+            mode="normal",
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="worktree_create",
+            requested_scope={"paths": [target_path], "branch": branch},
+            target_path=target_path,
+            branch=branch,
+            source_kind="bureau_task",
+            source_id="NEW-TASK",
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(dirty=True), unrelated]
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual(result["decision"], "isolate_and_execute")
+        self.assertTrue(admission.has_verified_isolation_evidence(result))
 
     def test_exact_checkout_still_blocks_target_overlap(self) -> None:
         target = self._linked(
