@@ -2147,6 +2147,9 @@ async function verifyElementImmediately(expected) {
     throw new Error('element-contract');
   }
   const backendNodeId = Number(expected.backend_node_id);
+  if (!Number.isSafeInteger(backendNodeId) || backendNodeId <= 0) {
+    throw new Error('element-contract');
+  }
   let partial;
   try {
     partial = await call('Accessibility.getPartialAXTree', {backendNodeId, fetchRelatives: false});
@@ -2210,16 +2213,23 @@ try {
     // Re-resolve and re-check the exact AX node immediately before the effect.
     // This closes the Python -> adapter gap without exposing backend ids publicly.
     const objectId = await verifyElementImmediately(expectedElement);
-    const effect = await call('Runtime.callFunctionOn', {
-      objectId,
-      functionDeclaration: `function () {
-        if (!this || !this.isConnected) return false;
-        this.scrollIntoView({block: 'center', inline: 'nearest'});
-        return true;
-      }`,
-      returnByValue: true,
-      awaitPromise: false,
-    });
+    let effect;
+    try {
+      effect = await call('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function () {
+          if (!this || !this.isConnected) return false;
+          this.scrollIntoView({block: 'center', inline: 'nearest'});
+          return true;
+        }`,
+        returnByValue: true,
+        awaitPromise: false,
+      });
+    } finally {
+      try {
+        await call('Runtime.releaseObject', {objectId});
+      } catch {}
+    }
     if (effect.exceptionDetails || !effect.result || effect.result.value !== true) {
       throw new Error('stale-snapshot');
     }
@@ -2364,21 +2374,40 @@ def _browser_semantic_handle_key(record: dict[str, Any]) -> bytes:
     key_path = directory / ".semantic-handle-key"
     if key_path.is_symlink():
         raise PermissionError("browser semantic handle key may not be a symlink")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
     try:
-        metadata = key_path.stat()
+        descriptor = os.open(key_path, flags)
     except FileNotFoundError as exc:
         raise RuntimeError(
             "browser worker predates semantic handle keys; start a fresh browser worker"
         ) from exc
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_size > 128
-        or stat.S_IMODE(metadata.st_mode) & 0o077
-    ):
+    except OSError as exc:
+        raise PermissionError(
+            "browser semantic handle key could not be opened safely"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 128
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise PermissionError("browser semantic handle key metadata is unsafe")
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            raw = handle.read(129)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > 128:
         raise PermissionError("browser semantic handle key metadata is unsafe")
     try:
-        value = key_path.read_text(encoding="ascii").strip()
+        value = raw.decode("ascii").strip()
     except UnicodeDecodeError as exc:
         raise RuntimeError("browser semantic handle key is invalid") from exc
     if re.fullmatch(r"[0-9a-f]{64}", value) is None:

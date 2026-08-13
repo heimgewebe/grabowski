@@ -1945,6 +1945,18 @@ globalThis.fetch = async () => ({
         rendered = json.dumps(worker_a)
         self.assertNotIn(key_a.hex(), rendered)
 
+    def test_browser_semantic_handle_key_rejects_hard_link(self) -> None:
+        worker = self._running_browser(port=9356)
+        record = workers._row(worker["worker_id"])
+        key_path = Path(record["config_path"]).parent / ".semantic-handle-key"
+        linked_path = key_path.with_name(".semantic-handle-key-link")
+        os.link(key_path, linked_path)
+        try:
+            with self.assertRaisesRegex(PermissionError, "metadata is unsafe"):
+                workers._browser_semantic_handle_key(record)
+        finally:
+            linked_path.unlink()
+
     def test_browser_semantic_legacy_worker_without_handle_key_fails_before_transport(self) -> None:
         worker = self._running_browser(port=9357)
         record = workers._row(worker["worker_id"])
@@ -2214,12 +2226,17 @@ globalThis.fetch = async () => ({
         self.assertIn("Accessibility.getPartialAXTree", source)
         self.assertIn("DOM.resolveNode", source)
         self.assertIn("Runtime.callFunctionOn", source)
+        self.assertIn("Runtime.releaseObject", source)
+        self.assertIn("Number.isSafeInteger", source)
         self.assertNotIn("document.querySelector", source)
         verify = "const objectId = await verifyElementImmediately(expectedElement);"
-        effect = "const effect = await call('Runtime.callFunctionOn'"
+        effect = "effect = await call('Runtime.callFunctionOn'"
+        release = "await call('Runtime.releaseObject', {objectId});"
         self.assertIn(verify, source)
         self.assertIn(effect, source)
+        self.assertIn(release, source)
         self.assertLess(source.index(verify), source.index(effect))
+        self.assertLess(source.index(effect), source.index(release))
 
     def test_browser_semantic_act_read_state_performs_no_separate_effect_call(self) -> None:
         worker = self._running_browser(port=9368)
