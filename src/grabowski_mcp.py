@@ -2484,6 +2484,16 @@ def _resolve_secret_existing(raw_path: str) -> Path:
     return _resolve_rooted_existing(raw_path, _secret_roots(), "secret")
 
 
+def _resolve_secret_use_source(raw_path: str) -> Path:
+    if _trusted_owner_enabled():
+        return _resolve_rooted_existing(
+            raw_path,
+            [*_secret_roots(), *_roots("read")],
+            "secret-use",
+        )
+    return _resolve_secret_existing(raw_path)
+
+
 def _resolve_browser_profile_existing(raw_path: str) -> Path:
     return _resolve_rooted_existing(
         raw_path,
@@ -6121,7 +6131,7 @@ def grabowski_secret_use(
     """Run one argv-only command with a secret exposed only through an fd/path."""
     _require_mutations_enabled("secret_use")
     _validate_sha256(expected_source_sha256, "expected_source_sha256")
-    source = _resolve_secret_existing(source_path)
+    source = _resolve_secret_use_source(source_path)
     policy = _load_policy()
     snapshot = _read_bound_regular_bytes(
         source,
@@ -7657,6 +7667,62 @@ def _repoground_freshness_source(
     return (HOME / "repos" / repo).resolve(strict=False), "conventional_checkout", None
 
 
+def _repoground_remote_branch_observation(
+    repo_path: Path, source_ref: str | None
+) -> dict[str, Any]:
+    """Observe one remote branch head without updating local Git refs."""
+    basis = "git_ls_remote_origin"
+    ref = source_ref.strip() if isinstance(source_ref, str) else ""
+    full_ref = f"refs/heads/{ref}" if ref else None
+
+    def unavailable(error_code: str, *, returncode: int | None = None) -> dict[str, Any]:
+        return {
+            "status": "unavailable",
+            "basis": basis,
+            "remote": "origin",
+            "ref": ref or None,
+            "full_ref": full_ref,
+            "head": None,
+            "returncode": returncode,
+            "error_code": error_code,
+        }
+
+    if full_ref is None:
+        return unavailable("publication_ref_unavailable")
+    try:
+        remote_rc, remote_out, _remote_err = _repoground_git(
+            repo_path,
+            ["ls-remote", "--exit-code", "--refs", "--", "origin", full_ref],
+        )
+    except subprocess.TimeoutExpired:
+        return unavailable("git_ls_remote_timeout")
+    except OSError:
+        return unavailable("git_ls_remote_unavailable")
+    if remote_rc != 0:
+        return unavailable("git_ls_remote_failed", returncode=remote_rc)
+
+    lines = [line for line in remote_out.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return unavailable("git_ls_remote_ambiguous", returncode=remote_rc)
+    fields = lines[0].split()
+    if (
+        len(fields) != 2
+        or fields[1] != full_ref
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[0]) is None
+    ):
+        return unavailable("git_ls_remote_invalid", returncode=remote_rc)
+    return {
+        "status": "observed",
+        "basis": basis,
+        "remote": "origin",
+        "ref": ref,
+        "full_ref": full_ref,
+        "head": fields[0],
+        "returncode": remote_rc,
+        "error_code": None,
+    }
+
+
 @mcp.tool(name="repoground_freshness_check", annotations=READ_ANNOTATIONS)
 def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, Any]:
     """Compare one healthy RepoGround publication with its local source identity."""
@@ -7719,15 +7785,17 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
         )
         comparison_head = checkout_head if checkout_rc == 0 else None
         comparison_ref = "HEAD"
-        remote_err = ""
-        if source_kind == "publication_source_checkout" and source_ref:
-            remote_ref = f"origin/{source_ref}"
-            remote_rc, remote_head, remote_err = _repoground_git(
-                repo_path, ["rev-parse", remote_ref]
+        branch_head_observation: dict[str, Any] | None = None
+        if source_kind == "publication_source_checkout":
+            branch_head_observation = _repoground_remote_branch_observation(
+                repo_path, source_ref
             )
-            if remote_rc == 0:
-                comparison_head = remote_head
-                comparison_ref = remote_ref
+            comparison_head = (
+                branch_head_observation.get("head")
+                if branch_head_observation.get("status") == "observed"
+                else None
+            )
+            comparison_ref = f"origin/{source_ref}" if source_ref else None
         live.update(
             {
                 "head_returncode": checkout_rc,
@@ -7736,10 +7804,12 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
                 "comparison_ref": comparison_ref,
                 "dirty_returncode": dirty_rc,
                 "dirty": bool(dirty_out) if dirty_rc == 0 else None,
-                "error": checkout_err or dirty_err or remote_err or None,
+                "error": checkout_err or dirty_err or None,
             }
         )
-        if checkout_rc != 0 or dirty_rc != 0 or not isinstance(comparison_head, str):
+        if branch_head_observation is not None:
+            live["branch_head_observation"] = branch_head_observation
+        if checkout_rc != 0 or dirty_rc != 0:
             freshness = "fresh_dirty_unverified" if bundle_dirty else "unknown"
             freshness_status = "dirty_overlay" if bundle_dirty else "source_unavailable"
             reason = "publication_source_dirty" if bundle_dirty else "git_unavailable"
@@ -7751,6 +7821,20 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
             freshness = "fresh_dirty_unverified"
             freshness_status = "dirty_overlay"
             reason = "dirty_source_or_publication_overlay"
+        elif (
+            source_kind == "publication_source_checkout"
+            and (
+                branch_head_observation is None
+                or branch_head_observation.get("status") != "observed"
+            )
+        ):
+            freshness = "unknown"
+            freshness_status = "source_unavailable"
+            reason = "authoritative_branch_head_unavailable"
+        elif not isinstance(comparison_head, str):
+            freshness = "unknown"
+            freshness_status = "source_unavailable"
+            reason = "git_unavailable"
         elif bundle_commit != comparison_head:
             freshness = "stale_head"
             freshness_status = "stale"
@@ -7787,6 +7871,7 @@ def repoground_freshness_check(repo: str, stem: str | None = None) -> dict[str, 
             "runtime_correctness",
             "repo_understood",
             "claims_true",
+            "future_branch_freshness",
         ],
     }
 

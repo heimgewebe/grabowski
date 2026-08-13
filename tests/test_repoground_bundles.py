@@ -279,6 +279,27 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         ).strip()
         return repo, head
 
+    def _bind_origin_main(self, repo: Path, head: str) -> Path:
+        remotes = self.root / "remotes"
+        remotes.mkdir(exist_ok=True)
+        remote = remotes / f"origin-{len(list(remotes.iterdir()))}.git"
+        subprocess.run(
+            ["git", "clone", "--bare", "-q", str(repo), str(remote)], check=True
+        )
+        subprocess.run(
+            ["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", head],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", head],
+            cwd=repo,
+            check=True,
+        )
+        return remote
+
     def test_full_max_stem_maps_to_base_repository(self) -> None:
         stem = "demo-repo-full-max-260701-1200"
         _repo, head = self._git_repo("demo-repo")
@@ -591,11 +612,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
             text=True,
             stdout=subprocess.PIPE,
         ).stdout.strip()
-        subprocess.run(
-            ["git", "update-ref", "refs/remotes/origin/main", source_head],
-            cwd=source,
-            check=True,
-        )
+        self._bind_origin_main(source, source_head)
         self._write_canonical_bundle("demo-repo", commit=source_head)
 
         result = mcp.repoground_freshness_check("demo-repo")
@@ -616,11 +633,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         source_root.mkdir()
         source = source_root / f"heimgewebe__demo-repo__main--{source_head}"
         temporary.rename(source)
-        subprocess.run(
-            ["git", "update-ref", "refs/remotes/origin/main", source_head],
-            cwd=source,
-            check=True,
-        )
+        self._bind_origin_main(source, source_head)
         self._write_canonical_bundle(
             "demo-repo",
             commit=source_head,
@@ -638,6 +651,100 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(result["live_repo"]["comparison_ref"], "origin/main")
         self.assertEqual(result["live_repo"]["head"], source_head)
         self.assertFalse(result["live_repo"]["dirty"])
+        observation = result["live_repo"]["branch_head_observation"]
+        self.assertEqual(observation["status"], "observed")
+        self.assertEqual(observation["basis"], "git_ls_remote_origin")
+        self.assertEqual(observation["full_ref"], "refs/heads/main")
+        self.assertEqual(observation["head"], source_head)
+
+    def test_canonical_freshness_observes_remote_head_not_stale_tracking_ref(self) -> None:
+        temporary, source_head = self._git_repo("revision-source-stale-tracking")
+        source_root = self.home / "repos" / ".repoground-sources"
+        source_root.mkdir()
+        source = source_root / f"heimgewebe__demo-repo__main--{source_head}"
+        temporary.rename(source)
+        remote = self._bind_origin_main(source, source_head)
+        source.joinpath("README.md").write_text("remote advanced\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=source, check=True)
+        subprocess.run(["git", "commit", "-qm", "advance remote"], cwd=source, check=True)
+        advanced_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+        subprocess.run(["git", "--git-dir", str(remote), "fetch", "-q", str(source), advanced_head], check=True)
+        subprocess.run(["git", "--git-dir", str(remote), "update-ref", "refs/heads/main", advanced_head], check=True)
+        subprocess.run(["git", "reset", "--hard", "-q", source_head], cwd=source, check=True)
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", source_head], cwd=source, check=True)
+        self._write_canonical_bundle("demo-repo", commit=source_head, provenance_name=source.name)
+        self.assertEqual(subprocess.check_output(["git", "rev-parse", "origin/main"], cwd=source, text=True).strip(), source_head)
+
+        result = mcp.repoground_freshness_check("demo-repo")
+
+        self.assertEqual(result["freshness"], "stale_head")
+        self.assertEqual(result["freshness_status"], "stale")
+        self.assertEqual(result["live_repo"]["checkout_head"], source_head)
+        self.assertEqual(result["live_repo"]["head"], advanced_head)
+        self.assertEqual(result["live_repo"]["branch_head_observation"]["head"], advanced_head)
+        self.assertEqual(subprocess.check_output(["git", "rev-parse", "origin/main"], cwd=source, text=True).strip(), source_head)
+
+    def test_canonical_freshness_remote_failure_is_unverified_and_redacted(self) -> None:
+        temporary, source_head = self._git_repo("revision-source-unavailable")
+        source_root = self.home / "repos" / ".repoground-sources"
+        source_root.mkdir()
+        source = source_root / f"heimgewebe__demo-repo__main--{source_head}"
+        temporary.rename(source)
+        subprocess.run(["git", "remote", "add", "origin", str(self.root / "missing-secret.git")], cwd=source, check=True)
+        self._write_canonical_bundle("demo-repo", commit=source_head, provenance_name=source.name)
+
+        result = mcp.repoground_freshness_check("demo-repo")
+
+        self.assertEqual(result["freshness"], "unknown")
+        self.assertEqual(result["freshness_status"], "source_unavailable")
+        self.assertEqual(result["reason"], "authoritative_branch_head_unavailable")
+        observation = result["live_repo"]["branch_head_observation"]
+        self.assertEqual(observation["error_code"], "git_ls_remote_failed")
+        self.assertNotIn("fatal:", json.dumps(result))
+        self.assertNotIn("missing-secret.git", json.dumps(result))
+
+    def test_canonical_freshness_remote_timeout_is_machine_readable(self) -> None:
+        temporary, source_head = self._git_repo("revision-source-timeout")
+        source_root = self.home / "repos" / ".repoground-sources"
+        source_root.mkdir()
+        source = source_root / f"heimgewebe__demo-repo__main--{source_head}"
+        temporary.rename(source)
+        self._bind_origin_main(source, source_head)
+        self._write_canonical_bundle("demo-repo", commit=source_head, provenance_name=source.name)
+        real_git = mcp._repoground_git
+        def timeout_remote(repo_path: Path, args: list[str]):
+            if args and args[0] == "ls-remote":
+                raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+            return real_git(repo_path, args)
+        with patch.object(mcp, "_repoground_git", side_effect=timeout_remote):
+            result = mcp.repoground_freshness_check("demo-repo")
+        self.assertEqual(result["freshness_status"], "source_unavailable")
+        self.assertEqual(result["live_repo"]["branch_head_observation"]["error_code"], "git_ls_remote_timeout")
+
+    def test_canonical_freshness_remote_match_does_not_upgrade_dirty_source(self) -> None:
+        temporary, source_head = self._git_repo("revision-source-dirty")
+        source_root = self.home / "repos" / ".repoground-sources"
+        source_root.mkdir()
+        source = source_root / f"heimgewebe__demo-repo__main--{source_head}"
+        temporary.rename(source)
+        self._bind_origin_main(source, source_head)
+        source.joinpath("dirty.txt").write_text("dirty\n", encoding="utf-8")
+        self._write_canonical_bundle("demo-repo", commit=source_head, provenance_name=source.name)
+        result = mcp.repoground_freshness_check("demo-repo")
+        self.assertEqual(result["freshness_status"], "dirty_overlay")
+        self.assertEqual(result["reason"], "dirty_source_or_publication_overlay")
+
+    def test_canonical_freshness_missing_provenance_is_rejected_before_remote(self) -> None:
+        temporary, source_head = self._git_repo("revision-source-no-provenance")
+        source_root = self.home / "repos" / ".repoground-sources"
+        source_root.mkdir()
+        source = source_root / f"heimgewebe__demo-repo__main--{source_head}"
+        temporary.rename(source)
+        self._bind_origin_main(source, source_head)
+        self._write_canonical_bundle("demo-repo", commit=source_head, provenance_name=source.name, include_snapshot_provenance=False)
+        result = mcp.repoground_freshness_check("demo-repo")
+        self.assertEqual(result["freshness_status"], "publication_unavailable")
+        self.assertNotIn("live_repo", result)
 
     def test_retired_lenskit_qualified_query_resolves_to_repoground(self) -> None:
         self._write_canonical_bundle("repoground")
