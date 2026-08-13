@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 from pathlib import Path
+import re
 import sys
 import types
 import unittest
@@ -133,6 +134,15 @@ class AgentInstructionsTests(unittest.TestCase):
         authority = rules["no-authority-escalation"].lower()
         for phrase in ("action", "merge", "deploy", "secret", "retry"):
             self.assertIn(phrase, authority)
+
+    def test_contract_documentation_rule_numbers_are_sequential(self) -> None:
+        contract = (ROOT / "docs" / "agent-facing-contract.md").read_text(encoding="utf-8")
+        numbers = [
+            int(match.group(1))
+            for line in contract.splitlines()
+            if (match := re.match(r"^(\d+)\. ", line)) is not None
+        ]
+        self.assertEqual(numbers, list(range(1, len(numbers) + 1)))
 
     def test_contract_documentation_states_integrity_and_observability_boundaries(self) -> None:
         documentation = (ROOT / "docs/agent-facing-contract.md").read_text(
