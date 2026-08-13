@@ -96,6 +96,15 @@ class AgentInstructionsTests(unittest.TestCase):
         retry = rules["state-check-before-retry"].lower()
         self.assertIn("verify target state", retry)
         self.assertIn("do not repeat an unchanged call", retry)
+        narrowing = rules["platform-filter-narrowing"].lower()
+        for phrase in (
+            "readback",
+            "upstream platform filter",
+            "semantically narrower typed operation",
+            "do not weaken",
+            "bypass",
+        ):
+            self.assertIn(phrase, narrowing)
         typed = rules["typed-operation-preference"].lower()
         for phrase in ("typed operations", "terminal", "git", "github"):
             self.assertIn(phrase, typed)

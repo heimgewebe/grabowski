@@ -1887,6 +1887,61 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertIn("<REDACTED>", result["stdout"])
                 self.assertNotIn("trusted-owner-secret-root-12345", result["stdout"])
 
+    def test_secret_use_annotations_match_open_world_command_effects(self) -> None:
+        annotations = grabowski_mcp.SECRET_USE_ANNOTATIONS.values
+        self.assertFalse(annotations["readOnlyHint"])
+        self.assertTrue(annotations["destructiveHint"])
+        self.assertFalse(annotations["idempotentHint"])
+        self.assertTrue(annotations["openWorldHint"])
+
+    def test_trusted_owner_secret_use_command_shape_relaxes_local_shell_guard_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            with (
+                patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True),
+                patch.object(grabowski_mcp, "_resolve_executable", return_value="/bin/sh"),
+            ):
+                command = grabowski_mcp._validate_secret_use_argv(
+                    ["sh", "-c", "printf ok {SECRET_FD_PATH}"],
+                    cwd=cwd,
+                    secret_data=b"synthetic-value",
+                )
+                self.assertEqual(command[0], "/bin/sh")
+                with self.assertRaisesRegex(PermissionError, "argv"):
+                    grabowski_mcp._validate_secret_use_argv(
+                        ["sh", "-c", "printf synthetic-value {SECRET_FD_PATH}"],
+                        cwd=cwd,
+                        secret_data=b"synthetic-value",
+                    )
+
+    def test_trusted_owner_secret_use_environment_accepts_nonsecret_extra_keys(self) -> None:
+        with patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True):
+            environment = grabowski_mcp._secret_use_environment(
+                {"EXTRA_CONTEXT": "metadata-only"},
+                b"synthetic-value",
+            )
+            self.assertEqual(environment["EXTRA_CONTEXT"], "metadata-only")
+            with self.assertRaisesRegex(PermissionError, "environment"):
+                grabowski_mcp._secret_use_environment(
+                    {"EXTRA_CONTEXT": "synthetic-value"},
+                    b"synthetic-value",
+                )
+
+    def test_trusted_owner_secret_use_cwd_accepts_sensitive_operator_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            with (
+                patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True),
+                patch.object(grabowski_mcp, "_roots", return_value=[cwd]),
+                patch.object(grabowski_mcp, "_path_is_sensitive", return_value=True),
+                patch.object(
+                    grabowski_mcp,
+                    "_protected_generic_write_target",
+                    return_value=True,
+                ),
+            ):
+                self.assertEqual(grabowski_mcp._resolve_secret_use_cwd(str(cwd)), cwd)
+
     def test_secret_use_rejects_shell_and_cleans_temp_fallback_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

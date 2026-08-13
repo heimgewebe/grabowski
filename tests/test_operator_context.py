@@ -68,6 +68,11 @@ class OperatorContextTests(unittest.TestCase):
             )
         )
 
+    def test_secret_use_is_generated_as_mutating_capability(self) -> None:
+        catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+        by_tool = {item["tool"]: item for item in catalog["tools"]}
+        self.assertIs(by_tool["grabowski_secret_use"]["read_only"], False)
+
     def test_browser_operator_default_is_runtime_bound_and_generated(self) -> None:
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")

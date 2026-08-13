@@ -118,7 +118,7 @@
     },
     {
       "category": "secret",
-      "description": "Run one argv-only command with a secret exposed only through an fd/path.",
+      "description": "Run one hash-bound command while keeping secret bytes out of model-visible argv/environment.",
       "effects": [
         "process-start",
         "secret-use",

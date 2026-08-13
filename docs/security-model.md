@@ -131,8 +131,12 @@ Für den allein kontrollierten Heim-PC ist `trusted-owner` das vorgesehene
 Vollprofil. Es stellt den gesamten sichtbaren Host-Dateibaum, die vollständige
 Prozessumgebung, lange Laufzeitbudgets, Fleet-Ausführung und alle implementierten
 Capabilities bereit. Befehl-, Pfad- oder Programmnamen werden in diesem Profil
-nicht pauschal blockiert. Auch Privilegierungs-Frontends dürfen aufgerufen
-werden; ob sie erfolgreich sind, entscheidet die Hostkonfiguration.
+nicht pauschal blockiert. Das gilt auch für `secret_use`: die Secret-Bytes bleiben
+hashgebunden und aus modell sichtbarem argv/Environment heraus, aber lokale
+Convenience-Verbote für Shell-Command-Modi, sensitive Working Directories und
+nichtgeheime zusätzliche Environment-Keys entfallen im Trusted-Owner-Profil.
+Auch Privilegierungs-Frontends dürfen aufgerufen werden; ob sie erfolgreich sind,
+entscheidet die Hostkonfiguration.
 
 Erhalten bleiben nur wirkungsbezogene Invarianten: Konkurrenzleases, atomare
 Publikation, Audit-Provenienz, Secret-Redaktion in Ausgaben, Schutz vor stillen
