@@ -909,6 +909,8 @@ class GripFoundationTests(unittest.TestCase):
                 "captain-preflight",
                 "captain-run",
                 "connector-snapshot-bind",
+                "n8n-workflow-edge-apply",
+                "n8n-workflow-edge-verify",
                 "checkout-binding-terminal-apply",
                 "checkout-binding-terminal-preview",
                 "transport-roundtrip",

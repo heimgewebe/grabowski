@@ -37,7 +37,7 @@ class N8nGripContractTests(unittest.TestCase):
         self.assertIn("provider-post-readback", contracts["n8n-workflow-edge-apply"]["acceptance_ids"])
         self.assertIn("revision-cas-bound", contracts["n8n-workflow-edge-apply"]["acceptance_ids"])
 
-    def test_verify_requires_dispatcher_and_never_falls_back_to_command_runner(self) -> None:
+    def test_verify_uses_fixed_runtime_adapter_and_never_falls_back_to_command_runner(self) -> None:
         called = []
 
         def command_runner(_cwd, _argv):
@@ -50,8 +50,8 @@ class N8nGripContractTests(unittest.TestCase):
             profile="operator",
             command_runner=command_runner,
         )
-        self.assertEqual("blocked", result["status"])
-        self.assertIn("dispatcher is unavailable", result["output"]["error"])
+        self.assertEqual("failed", result["status"])
+        self.assertIn("provider verify failed", result["output"]["error"])
         self.assertEqual([], called)
 
     def test_verify_accepts_secret_free_semantic_readback(self) -> None:
