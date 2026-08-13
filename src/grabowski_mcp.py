@@ -79,6 +79,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
         "After a transport, platform-filter, or policy failure, verify target state; do not repeat an unchanged call without state evidence.",
     ),
     (
+        "platform-filter-narrowing",
+        "After readback proves an upstream platform filter caused no effect, continue the authorized goal through an existing semantically narrower typed operation when available; do not weaken, disguise, bypass, or repackage the platform safeguard.",
+    ),
+    (
         "transport-roundtrip-before-mutation",
         "Invoke a mutating MCP tool normally. If a shared_unlabeled call returns a fresh transport challenge, continue with grip_run transport-roundtrip action=execute carrying only challenge_receipt_sha256; the server retains the exact target briefly and atomically binds reservation, consumption, and dispatch. A stable client-declared scope may action=ack and then invoke the unchanged target once. Explicit action=begin with target_tool_name and target_arguments remains available for compatibility. A later ambiguous mutation still requires target readback before retry.",
     ),
@@ -1030,6 +1034,13 @@ SECRET_REVEAL_ANNOTATIONS = ToolAnnotations(
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=False,
+)
+SECRET_USE_ANNOTATIONS = ToolAnnotations(
+    title="Use a secret in a command",
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
 )
 CREATE_ANNOTATIONS = ToolAnnotations(
     title="Create local text file",
@@ -2660,9 +2671,10 @@ def _resolve_secret_use_cwd(cwd: str | None) -> Path:
         raise ValueError(f"cwd is not a directory: {resolved}")
     if not _is_within(resolved, _roots("read")):
         raise PermissionError(f"cwd is outside configured read roots: {resolved}")
-    if _path_is_sensitive(resolved):
+    trusted_owner = _trusted_owner_enabled()
+    if _path_is_sensitive(resolved) and not trusted_owner:
         raise PermissionError("cwd may not be inside secret/browser roots")
-    if _protected_generic_write_target(resolved):
+    if _protected_generic_write_target(resolved) and not trusted_owner:
         raise PermissionError("cwd may not be inside protected operator roots")
     return resolved
 
@@ -2706,23 +2718,24 @@ def _validate_secret_use_argv(
     for index, item in enumerate(argv):
         _reject_secret_variants_in_text(item, secret_data, f"argv[{index}]")
     executable_name = Path(argv[0]).name
-    if executable_name == "eval" or "eval" in argv:
-        raise PermissionError("eval is not allowed for secret_use")
-    if executable_name in SHELL_EXECUTABLES:
-        if any(_looks_like_shell_c_flag(item) for item in argv[1:]):
-            raise PermissionError("shell command mode is not allowed for secret_use")
-    if executable_name == "env":
-        for item in argv[1:]:
-            if "=" in item and not item.startswith("-"):
-                continue
-            nested_name = Path(item).name
-            if nested_name in SHELL_EXECUTABLES:
-                raise PermissionError("env-to-shell is not allowed for secret_use")
-            if nested_name == "eval":
-                raise PermissionError("eval is not allowed for secret_use")
-            if item == "--":
-                continue
-            break
+    if not _trusted_owner_enabled():
+        if executable_name == "eval" or "eval" in argv:
+            raise PermissionError("eval is not allowed for secret_use")
+        if executable_name in SHELL_EXECUTABLES:
+            if any(_looks_like_shell_c_flag(item) for item in argv[1:]):
+                raise PermissionError("shell command mode is not allowed for secret_use")
+        if executable_name == "env":
+            for item in argv[1:]:
+                if "=" in item and not item.startswith("-"):
+                    continue
+                nested_name = Path(item).name
+                if nested_name in SHELL_EXECUTABLES:
+                    raise PermissionError("env-to-shell is not allowed for secret_use")
+                if nested_name == "eval":
+                    raise PermissionError("eval is not allowed for secret_use")
+                if item == "--":
+                    continue
+                break
     command = [_resolve_executable(argv[0], cwd), *argv[1:]]
     return command
 
@@ -2743,12 +2756,15 @@ def _secret_use_environment(
     if not isinstance(extra_environment, dict):
         raise ValueError("environment must be an object")
     redaction_values = _secret_redaction_values(secret_data)
+    trusted_owner = _trusted_owner_enabled()
     for key, value in extra_environment.items():
         if not isinstance(key, str) or not isinstance(value, str):
             raise ValueError("environment keys and values must be strings")
-        if key not in SECRET_USE_ENV_ALLOWLIST:
+        if not key or "=" in key or "\x00" in key or "\x00" in value:
+            raise ValueError("environment contains an invalid key or value")
+        if not trusted_owner and key not in SECRET_USE_ENV_ALLOWLIST:
             raise PermissionError(f"Environment key is not allowlisted: {key}")
-        if any(part in key.upper() for part in SENSITIVE_ENV_PARTS):
+        if not trusted_owner and any(part in key.upper() for part in SENSITIVE_ENV_PARTS):
             raise PermissionError(f"Sensitive environment key is not allowed: {key}")
         if any(secret and secret in value for secret in redaction_values):
             raise PermissionError(
@@ -6120,7 +6136,7 @@ def grabowski_secret_reveal(
     }
 
 
-@mcp.tool(name="grabowski_secret_use", annotations=CREATE_ANNOTATIONS)
+@mcp.tool(name="grabowski_secret_use", annotations=SECRET_USE_ANNOTATIONS)
 def grabowski_secret_use(
     source_path: str,
     expected_source_sha256: str,
@@ -6130,7 +6146,7 @@ def grabowski_secret_use(
     max_output_bytes: int = DEFAULT_SECRET_USE_OUTPUT_BYTES,
     environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run one argv-only command with a secret exposed only through an fd/path."""
+    """Run one hash-bound command while keeping secret bytes out of model-visible argv/environment."""
     _require_mutations_enabled("secret_use")
     _validate_sha256(expected_source_sha256, "expected_source_sha256")
     source = _resolve_secret_use_source(source_path)
