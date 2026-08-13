@@ -960,6 +960,54 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         self.assertNotIn("server runtime lease identity failed", json.dumps(result))
         github.assert_not_called()
 
+    def test_grip_core_uses_per_grip_capability_without_terminal_leakage(self) -> None:
+        allowed = {
+            "allowed": True,
+            "session_profile": {"profile": "test"},
+        }
+        output = {"receipt": {"status": "passed"}}
+        with (
+            patch.object(grabowski_mcp, "_session_grip_policy_decision", return_value=allowed),
+            patch.object(grabowski_mcp, "_require_capability") as require_capability,
+            patch.object(grabowski_mcp, "_require_mutations_enabled") as require_mutations,
+            patch.object(grabowski_mcp.grabowski_grips, "grip_run", return_value=output),
+        ):
+            observed = grabowski_mcp._grip_run_core(
+                "browser-semantic-observe",
+                {"worker_id": "a" * 20},
+                profile="operator",
+                allow_mutation=False,
+            )
+            require_capability.assert_called_once_with("browser_worker")
+            require_mutations.assert_not_called()
+            require_capability.reset_mock()
+
+            acted = grabowski_mcp._grip_run_core(
+                "browser-semantic-act",
+                {
+                    "worker_id": "b" * 20,
+                    "snapshot_id": "bsid2_" + "c" * 64,
+                    "action_kind": "read_state",
+                },
+                profile="operator",
+                allow_mutation=True,
+            )
+            require_capability.assert_not_called()
+            require_mutations.assert_called_once_with("browser_worker")
+            require_mutations.reset_mock()
+
+            terminal = grabowski_mcp._grip_run_core(
+                "repo-orient",
+                {"repo": "/tmp/repo"},
+                profile="operator",
+                allow_mutation=False,
+            )
+            require_capability.assert_called_once_with("terminal_execute")
+
+        self.assertIs(observed, output)
+        self.assertIs(acted, output)
+        self.assertIs(terminal, output)
+
     def test_session_forbidden_hosts_block_operator_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1195,8 +1243,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
         self.assertNotIn("grabowski_terminal_run", missing)
         self.assertNotIn("grabowski_git", missing)
-        self.assertIn("grip_run", missing)
-        self.assertEqual(missing["grip_run"], ["terminal_execute"])
+        self.assertNotIn("grip_run", missing)
 
     def test_status_reports_registered_tool_missing_required_capability(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1241,7 +1288,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ["git_cli", "github_cli", "resource_lease"],
         )
         self.assertNotIn("grabowski_verify_audit", missing)
-        self.assertEqual(missing["grip_run"], ["terminal_execute"])
+        self.assertNotIn("grip_run", missing)
         self.assertEqual(
             missing["grabowski_connector_transport_diagnostics"],
             ["user_service_control"],

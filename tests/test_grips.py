@@ -948,6 +948,9 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("read_only", specs["repo-orient"]["effect"])
         self.assertEqual("read_only", specs["browser-semantic-observe"]["effect"])
         self.assertEqual("mutating", specs["browser-semantic-act"]["effect"])
+        self.assertEqual("browser_worker", specs["browser-semantic-observe"]["required_capability"])
+        self.assertEqual("browser_worker", specs["browser-semantic-act"]["required_capability"])
+        self.assertEqual("terminal_execute", specs["repo-orient"]["required_capability"])
         self.assertEqual(
             ("publication", "push", "merge-disjointness-eligible"),
             (
@@ -998,6 +1001,19 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("never creates or renews leases", worktree_ensure_preconditions)
         self.assertIn("work-acquire", worktree_ensure_preconditions)
         self.assertIn("work-acquire", specs["worktree-ensure"]["summary"])
+
+    def test_browser_semantic_grips_publish_browser_worker_capability(self) -> None:
+        contracts = {item["name"]: item for item in grips.list_grips("operator")}
+        self.assertEqual(
+            "browser_worker", contracts["browser-semantic-observe"]["required_capability"]
+        )
+        self.assertEqual(
+            "browser_worker", contracts["browser-semantic-act"]["required_capability"]
+        )
+        self.assertEqual("terminal_execute", contracts["repo-orient"]["required_capability"])
+        self.assertEqual(
+            "terminal_execute", grips.grip_required_capability("not-a-real-grip")
+        )
 
     def test_browser_semantic_observe_grip_delegates_to_canonical_gateway(self) -> None:
         module = types.ModuleType("grabowski_workers")

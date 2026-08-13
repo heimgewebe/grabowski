@@ -512,7 +512,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_status": (),
     "grabowski_context": (),
     "grip_list": ("file_read",),
-    "grip_run": ("terminal_execute",),
+    "grip_run": (),
     "grabowski_list_directory": ("file_read",),
     "grabowski_stat": ("file_read",),
     "grabowski_read_text": ("file_read",),
@@ -10564,9 +10564,11 @@ def _grip_run_core(
     transport_target_dispatcher: grabowski_grips.TransportTargetDispatcher | None = None,
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
-    _require_capability("terminal_execute")
+    grip_capability = grabowski_grips.grip_required_capability(name)
     if allow_mutation:
-        _require_mutations_enabled("terminal_execute")
+        _require_mutations_enabled(grip_capability)
+    else:
+        _require_capability(grip_capability)
     raw_parameters = parameters or {}
     reserved_server_parameters = sorted(
         {
@@ -10874,7 +10876,7 @@ async def _grip_run_mcp(
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
 
-    _require_capability("terminal_execute")
+    _require_capability(grabowski_grips.grip_required_capability(name))
     effective_parameters = parameters
     retained_claim_challenge: str | None = None
     if name == "transport-roundtrip" and isinstance(parameters, dict):

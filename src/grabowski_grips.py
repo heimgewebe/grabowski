@@ -41,6 +41,7 @@ class GripSpec:
     uses_github: bool = False
     operation_effect_class: str = "unknown"
     operation_class: str = "unknown"
+    capability: str = "terminal_execute"
 
 
 GRIP_RECEIPT_KIND = "grabowski.operator_grip_receipt"
@@ -435,6 +436,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
         runner="browser_semantic_observe",
         operation_effect_class="browser_semantic",
         operation_class="browser-semantic-observe",
+        capability="browser_worker",
     ),
     "browser-semantic-act": GripSpec(
         name="browser-semantic-act",
@@ -454,6 +456,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
         runner="browser_semantic_act",
         operation_effect_class="browser_semantic",
         operation_class="browser-semantic-act",
+        capability="browser_worker",
     ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
@@ -2312,6 +2315,7 @@ def _grip_catalog_snapshot() -> dict[str, Any]:
                 "uses_github": spec.uses_github,
                 "operation_effect_class": spec.operation_effect_class,
                 "operation_class": spec.operation_class,
+                "capability": spec.capability,
             }
             for name, spec in sorted(GRIP_SPECS.items())
         },
@@ -9432,6 +9436,7 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
             f"required parameters: {required}",
             *GRIP_CONDITIONAL_PRECONDITIONS.get(spec.name, ()),
             "grip name is present in GRIP_SURFACE_ALLOWLIST",
+            f"session capability required: {spec.capability}",
             "mutating grips require allow_mutation=true and an eligible profile",
         ],
         "required_parameters": list(spec.required_parameters),
@@ -9439,6 +9444,7 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
         "uses_github": spec.uses_github,
         "operation_effect_class": spec.operation_effect_class,
         "operation_class": spec.operation_class,
+        "required_capability": spec.capability,
         "operation_lease_parallelism": (
             "merge-disjointness-eligible"
             if spec.operation_effect_class == "publication"
@@ -9466,6 +9472,18 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
 
 def grip_risk_level(name: str) -> str:
     return GRIP_RISK_LEVELS.get(name, "medium")
+
+
+def grip_required_capability(name: str) -> str:
+    """Return the authority capability for one grip; unknown names stay conservative."""
+
+    spec = GRIP_SPECS.get(name)
+    if spec is None:
+        return "terminal_execute"
+    capability = spec.capability
+    if not isinstance(capability, str) or not capability:
+        raise RuntimeError(f"grip {name} has an invalid capability contract")
+    return capability
 
 
 def _validate_surface_profile(profile: str) -> str:
