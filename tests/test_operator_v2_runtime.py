@@ -1757,6 +1757,51 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertIn("env_has_value=False", result["stdout"])
                 self.assertTrue(grabowski_mcp.grabowski_verify_audit()["valid"])
 
+    def test_trusted_owner_secret_use_accepts_source_from_read_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root
+            )
+            source = work / "workspace-token.txt"
+            source.write_text("trusted-owner-read-root-secret-12345", encoding="utf-8")
+            source_sha = _sha256(source)
+            policy_path = root / "access.json"
+
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                with self.assertRaisesRegex(PermissionError, "outside configured secret roots"):
+                    grabowski_mcp.grabowski_secret_use(
+                        str(source),
+                        source_sha,
+                        [sys.executable, "-c", "pass", "{SECRET_FD_PATH}"],
+                        cwd=str(work),
+                    )
+
+                policy = json.loads(policy_path.read_text(encoding="utf-8"))
+                policy["profiles"]["test"]["trusted_owner"] = True
+                policy_path.write_text(
+                    json.dumps(policy, sort_keys=True) + "\n", encoding="utf-8"
+                )
+
+                result = grabowski_mcp.grabowski_secret_use(
+                    str(source),
+                    source_sha,
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; print(open(sys.argv[1], 'r').read())",
+                        "{SECRET_FD_PATH}",
+                    ],
+                    cwd=str(work),
+                )
+
+                self.assertEqual(result["returncode"], 0)
+                self.assertEqual(result["source_path"], str(source))
+                self.assertIn("<REDACTED>", result["stdout"])
+                self.assertNotIn(
+                    "trusted-owner-read-root-secret-12345", result["stdout"]
+                )
+
     def test_secret_use_rejects_shell_and_cleans_temp_fallback_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
