@@ -2486,7 +2486,11 @@ def _resolve_secret_existing(raw_path: str) -> Path:
 
 def _resolve_secret_use_source(raw_path: str) -> Path:
     if _trusted_owner_enabled():
-        return _resolve_existing(raw_path, "read")
+        return _resolve_rooted_existing(
+            raw_path,
+            [*_secret_roots(), *_roots("read")],
+            "secret-use",
+        )
     return _resolve_secret_existing(raw_path)
 
 
