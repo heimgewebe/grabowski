@@ -451,6 +451,14 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
+    if tool_name == "grabowski_browser_worker_semantic":
+        # The public tool stays conservatively MUTATING. Only the exact read
+        # operation may bypass the global mutation roundtrip; act, missing and
+        # unknown operations remain fail-closed on the normal path.
+        return (
+            isinstance(arguments, dict)
+            and arguments.get("operation") == "observe"
+        )
     if tool_name != "grip_run" or not isinstance(arguments, dict):
         return False
     grip_name = arguments.get("name")

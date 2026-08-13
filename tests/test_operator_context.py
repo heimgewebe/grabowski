@@ -77,6 +77,23 @@ class OperatorContextTests(unittest.TestCase):
         self.assertEqual(browser["canonical_browser"]["family"], "chrome-stable")
         self.assertEqual(browser["canonical_browser"]["adapter"], "chrome-cdp")
         self.assertEqual(browser["transport"]["primary"], "direct-cdp")
+        self.assertEqual(browser["semantic_gateway"]["coverage"], "partial")
+        self.assertEqual(
+            browser["semantic_gateway"]["tool"],
+            "grabowski_browser_worker_semantic",
+        )
+        self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
+        self.assertEqual(
+            browser["semantic_gateway"]["supported_intents"],
+            ["read_state", "scroll_into_view"],
+        )
+        self.assertEqual(
+            browser["semantic_gateway"]["uncovered_intents"],
+            {"navigate": "direct-cdp-required"},
+        )
+        self.assertFalse(
+            browser["semantic_gateway"]["ambiguous_effect_retry_authorized"]
+        )
         self.assertIs(browser["transport"]["loopback_only"], True)
         self.assertEqual(browser["profile"]["default"], "ephemeral")
         self.assertIs(browser["human_browser_default"]["preserve"], True)

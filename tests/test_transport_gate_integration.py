@@ -866,6 +866,70 @@ class CentralTransportGateTests(unittest.TestCase):
         )
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
+    def test_semantic_observe_alone_bypasses_mutation_roundtrip(self) -> None:
+        operator = self.configured_operator()
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+        arguments = {"operation": "observe", "worker_id": "worker-1"}
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=AssertionError("observe reached mutation roundtrip"),
+        ) as consume_verified, mock.patch.object(
+            operator.grabowski_effect_interceptor,
+            "admit_mutation",
+            side_effect=AssertionError("observe reached mutation admission"),
+        ) as admit_mutation:
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_browser_worker_semantic",
+                    arguments,
+                    context,
+                )
+            )
+
+        self.assertTrue(result["called"])
+        consume_verified.assert_not_called()
+        admit_mutation.assert_not_called()
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
+    def test_semantic_non_observe_operations_keep_mutation_roundtrip(self) -> None:
+        cases = (
+            {"operation": "act", "worker_id": "worker-1"},
+            {"worker_id": "worker-1"},
+            {"operation": "unknown", "worker_id": "worker-1"},
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                operator = self.configured_operator()
+                context = types.SimpleNamespace(client_id="mcp-client-1")
+                with mock.patch.object(
+                    operator.grabowski_transport_roundtrip,
+                    "consume_verified",
+                    side_effect=roundtrip.TransportRoundtripRequired(
+                        "handshake required"
+                    ),
+                ) as consume_verified:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "fresh intent-bound transport verification required",
+                    ):
+                        asyncio.run(
+                            operator.mcp._tool_manager.call_tool(
+                                "grabowski_browser_worker_semantic",
+                                arguments,
+                                context,
+                            )
+                        )
+                consume_verified.assert_called_once_with(
+                    client_scope=META_SCOPE,
+                    runtime_binding=BINDING,
+                    tool_name="grabowski_browser_worker_semantic",
+                    arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
+                )
+                self.assertEqual(
+                    operator._deployment_admission_active_tool_calls(), 0
+                )
+
     def test_shared_unlabeled_call_directs_atomic_execute_not_ack(self) -> None:
         operator = self.configured_operator()
         context = types.SimpleNamespace()

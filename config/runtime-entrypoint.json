@@ -164,6 +164,7 @@
     "grabowski_merge_delivery_record",
     "grabowski_browser_worker_start",
     "grabowski_browser_worker_stored_form_action",
+    "grabowski_browser_worker_semantic",
     "grabowski_browser_worker_status",
     "grabowski_browser_worker_stop",
     "grabowski_browser_worker_list",
@@ -652,7 +653,7 @@
     }
   ],
   "browser_operator_default": {
-    "schema_version": 1,
+    "schema_version": 2,
     "authority": "grabowski",
     "decision_rule": "Use this path by default for agent browser work unless a concrete task requirement cannot be satisfied by it.",
     "canonical_browser": {
@@ -668,6 +669,34 @@
       "endpoint_address": "127.0.0.1",
       "loopback_only": true,
       "vendor_mcp_role": "optional-diagnostic-or-adapter-never-lifecycle-authority"
+    },
+    "semantic_gateway": {
+      "coverage": "partial",
+      "tool": "grabowski_browser_worker_semantic",
+      "operations": [
+        "observe",
+        "act"
+      ],
+      "supported_intents": [
+        "read_state",
+        "scroll_into_view"
+      ],
+      "uncovered_intents": {
+        "navigate": "direct-cdp-required"
+      },
+      "public_target_contract": "opaque-snapshot-and-element-handles",
+      "implemented_effect_classes": [
+        "read",
+        "local_ui"
+      ],
+      "fail_closed_effect_classes": [
+        "reversible_external",
+        "external_mutation",
+        "high_impact"
+      ],
+      "ambiguous_effect_retry_authorized": false,
+      "authoritative_readback_required_before_new_intent": true,
+      "readback_grants_retry_authority": false
     },
     "profile": {
       "default": "ephemeral",
@@ -697,7 +726,8 @@
       "completion_receipt_sha256": "ab5b16ec7e17bed0e6a28ce15a4365a5d7f2e07197c008325d6c08546a0e5a90",
       "validated_at": "2026-08-11T23:56:29.955408Z",
       "does_not_establish": [
-        "future_runtime_availability"
+        "future_runtime_availability",
+        "semantic_gateway_live_deployment"
       ]
     }
   }
