@@ -339,6 +339,15 @@ async def _read_bounded_request_body(request: Any) -> bytes:
     return b"".join(chunks)
 
 
+def _oauth_protected_resource_metadata(base_url: object) -> dict[str, object]:
+    return {
+        "resource": f"{str(base_url).rstrip('/')}/mcp",
+        "resource_name": "Grabowski MCP",
+        "authorization_servers": [],
+        "bearer_methods_supported": [],
+    }
+
+
 class TransportIngress:
     def __init__(
         self, *, token: str, upstream: str, runtime_binding_sha256: str
@@ -367,12 +376,7 @@ class TransportIngress:
         from starlette.responses import JSONResponse
 
         return JSONResponse(
-            {
-                "resource": f"{str(request.base_url).rstrip('/')}/mcp",
-                "resource_name": "Grabowski MCP",
-                "authorization_servers": [],
-                "bearer_methods_supported": [],
-            },
+            _oauth_protected_resource_metadata(request.base_url),
             headers={"Cache-Control": "no-store"},
         )
 

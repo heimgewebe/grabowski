@@ -7,9 +7,6 @@ from pathlib import Path
 import sys
 import unittest
 
-from starlette.requests import Request
-from starlette.routing import Route
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -26,6 +23,10 @@ SPEC.loader.exec_module(ingress)
 
 SECRET = "A" * 43
 RUNTIME_BINDING_SHA256 = "b" * 64
+try:
+    STARLETTE_AVAILABLE = importlib.util.find_spec("starlette") is not None
+except (ImportError, ValueError):
+    STARLETTE_AVAILABLE = False
 
 
 class TransportIngressOAuthDiscoveryTests(unittest.TestCase):
@@ -36,28 +37,30 @@ class TransportIngressOAuthDiscoveryTests(unittest.TestCase):
             runtime_binding_sha256=RUNTIME_BINDING_SHA256,
         )
 
-    @staticmethod
-    def _request(*, root_path: str = "") -> Request:
-        return Request(
+    def test_oauth_metadata_contract_is_dependency_free_and_root_path_safe(self) -> None:
+        self.assertEqual(
+            ingress._oauth_protected_resource_metadata("http://127.0.0.1:18180/"),
             {
-                "type": "http",
-                "asgi": {"version": "3.0", "spec_version": "2.3"},
-                "http_version": "1.1",
-                "method": "GET",
-                "scheme": "http",
-                "path": f"{root_path}{ingress.OAUTH_PROTECTED_RESOURCE_PATH}",
-                "raw_path": (
-                    f"{root_path}{ingress.OAUTH_PROTECTED_RESOURCE_PATH}"
-                ).encode("ascii"),
-                "root_path": root_path,
-                "query_string": b"",
-                "headers": [],
-                "server": ("127.0.0.1", 18180),
-                "client": ("127.0.0.1", 40000),
-            }
+                "resource": "http://127.0.0.1:18180/mcp",
+                "resource_name": "Grabowski MCP",
+                "authorization_servers": [],
+                "bearer_methods_supported": [],
+            },
+        )
+        self.assertEqual(
+            ingress._oauth_protected_resource_metadata(
+                "http://127.0.0.1:18180/mounted/"
+            )["resource"],
+            "http://127.0.0.1:18180/mounted/mcp",
         )
 
-    def test_build_app_exposes_both_oauth_discovery_paths_without_mcp_auth(self) -> None:
+    @unittest.skipUnless(
+        STARLETTE_AVAILABLE,
+        "Starlette is optional in dependency-free repository validation",
+    )
+    def test_build_app_uses_real_starlette_route_semantics(self) -> None:
+        from starlette.routing import Route
+
         app = ingress.build_app(
             token=SECRET,
             upstream=ingress.DEFAULT_UPSTREAM,
@@ -77,29 +80,37 @@ class TransportIngressOAuthDiscoveryTests(unittest.TestCase):
         self.assertEqual(routes["/mcp"].endpoint.__name__, "proxy")
         self.assertEqual(routes["/mcp"].methods, {"DELETE", "GET", "HEAD", "POST"})
 
-    def test_oauth_discovery_advertises_ingress_facing_mcp_resource(self) -> None:
-        response = asyncio.run(self._transport().oauth_resource(self._request()))
+    @unittest.skipUnless(
+        STARLETTE_AVAILABLE,
+        "Starlette is optional in dependency-free repository validation",
+    )
+    def test_oauth_response_uses_real_starlette_json_response(self) -> None:
+        from starlette.requests import Request
+
+        request = Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": ingress.OAUTH_PROTECTED_RESOURCE_PATH,
+                "raw_path": ingress.OAUTH_PROTECTED_RESOURCE_PATH.encode("ascii"),
+                "root_path": "",
+                "query_string": b"",
+                "headers": [],
+                "server": ("127.0.0.1", 18180),
+                "client": ("127.0.0.1", 40000),
+            }
+        )
+        response = asyncio.run(self._transport().oauth_resource(request))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             json.loads(response.body),
-            {
-                "resource": "http://127.0.0.1:18180/mcp",
-                "resource_name": "Grabowski MCP",
-                "authorization_servers": [],
-                "bearer_methods_supported": [],
-            },
+            ingress._oauth_protected_resource_metadata("http://127.0.0.1:18180/"),
         )
         self.assertEqual(response.headers["cache-control"], "no-store")
         self.assertEqual(response.headers["content-type"], "application/json")
-
-    def test_oauth_discovery_resource_preserves_asgi_root_path(self) -> None:
-        response = asyncio.run(
-            self._transport().oauth_resource(self._request(root_path="/mounted"))
-        )
-        self.assertEqual(
-            json.loads(response.body)["resource"],
-            "http://127.0.0.1:18180/mounted/mcp",
-        )
 
 
 if __name__ == "__main__":
