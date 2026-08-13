@@ -995,9 +995,19 @@ class GripFoundationTests(unittest.TestCase):
             self.assertIn(field, specs["repo-orient"])
         self.assertEqual("operator", specs["repo-orient"]["profile"])
         work_acquire_preconditions = " ".join(specs["work-acquire"]["preconditions"])
-        for source_kind in ("bureau_task", "github_issue", "operator_obligation", "thread_focus"):
+        for source_kind in (
+            "bureau_task",
+            "github_issue",
+            "operator_obligation",
+            "thread_focus",
+            "work_lane",
+            "direct",
+            "direct-user",
+        ):
             self.assertIn(source_kind, work_acquire_preconditions)
-        self.assertIn("immutable terminal evidence observer", work_acquire_preconditions)
+        self.assertIn("rebound server-side", work_acquire_preconditions)
+        self.assertIn("durable work_lane lifecycle evidence", work_acquire_preconditions)
+        self.assertIn("fail closed", work_acquire_preconditions)
         worktree_ensure_preconditions = " ".join(specs["worktree-ensure"]["preconditions"])
         self.assertIn("must already be live", worktree_ensure_preconditions)
         self.assertIn("never creates or renews leases", worktree_ensure_preconditions)
