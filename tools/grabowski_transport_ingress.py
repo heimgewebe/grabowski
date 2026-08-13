@@ -54,6 +54,10 @@ REQUEST_AUDIENCE_HEADER = "X-Grabowski-Request-Audience"
 REQUEST_BODY_SHA256_HEADER = "X-Grabowski-Request-Body-Sha256"
 RUNTIME_BINDING_SHA256_HEADER = "X-Grabowski-Runtime-Binding-Sha256"
 REQUEST_MAC_HEADER = "X-Grabowski-Request-Mac"
+OAUTH_PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
+OAUTH_PROTECTED_RESOURCE_MCP_PATH = "/.well-known/oauth-protected-resource/mcp"
+OAUTH_AUTHORIZATION_SERVER = "https://auth.openai.com"
+OAUTH_SCOPE = "mcp:invoke"
 
 
 class IngressConfigurationError(RuntimeError):
@@ -361,6 +365,17 @@ class TransportIngress:
             }
         )
 
+    async def oauth_resource(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        return JSONResponse(
+            {
+                "resource": f"{str(request.base_url).rstrip('/')}/mcp",
+                "authorization_servers": [OAUTH_AUTHORIZATION_SERVER],
+                "scopes_supported": [OAUTH_SCOPE],
+            }
+        )
+
     async def proxy(self, request: Any) -> Any:
         import httpx
         from starlette.background import BackgroundTask
@@ -447,6 +462,16 @@ def build_app(*, token: str, upstream: str, runtime_binding_sha256: str) -> Any:
     return Starlette(
         routes=[
             Route("/_grabowski/transport-ingress", ingress.health, methods=["GET"]),
+            Route(
+                OAUTH_PROTECTED_RESOURCE_PATH,
+                ingress.oauth_resource,
+                methods=["GET"],
+            ),
+            Route(
+                OAUTH_PROTECTED_RESOURCE_MCP_PATH,
+                ingress.oauth_resource,
+                methods=["GET"],
+            ),
             Route("/mcp", ingress.proxy, methods=["GET", "POST", "DELETE"]),
         ]
     )
