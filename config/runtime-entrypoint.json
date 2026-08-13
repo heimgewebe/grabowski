@@ -270,6 +270,14 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_n8n_runtime",
+      "source": "src/grabowski_n8n_runtime.py"
+    },
+    {
+      "module": "grabowski_n8n_provider",
+      "source": "src/grabowski_n8n_provider.py"
+    },
+    {
       "module": "grabowski_convergence",
       "source": "src/grabowski_convergence.py"
     },

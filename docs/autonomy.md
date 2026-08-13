@@ -131,10 +131,16 @@ Betriebssystem-Sandbox.
 
 Rohe Offenlegung ist ein Break-Glass-Pfad. Standardmäßig wird ein Secret mit
 `grabowski_secret_use` verwendet, ohne es in den Chatkontext zu übertragen.
-`grabowski_secret_use` ist kein allgemeiner Shell-Runner. Das Tool akzeptiert
-nur argv-Listen, blockt Shell-Strings und `sh -c`/`bash -c`, ersetzt den
+Das Tool akzeptiert weiterhin nur strukturierte argv-Listen und ersetzt den
 Literal-Platzhalter `{SECRET_FD_PATH}` durch einen FD-Pfad oder restriktiven
-Tempfile-Fallback und gibt nur redigierte, bounded stdout/stderr zurück.
+Tempfile-Fallback; der Secret-Wert selbst darf weder in argv noch im Environment
+auftauchen und stdout/stderr werden redigiert und begrenzt. Im `trusted-owner`-
+Profil werden darüber hinaus keine zusätzlichen lokalen Verbote für Shell-
+Command-Modi, sensitive Working Directories oder nichtgeheime Environment-Keys
+erzwungen. Engere Profile behalten diese zusätzlichen Leitplanken. Da der
+ausgeführte Prozess lokale oder entfernte Wirkungen haben kann, ist die MCP-
+Annotation von `secret_use` ausdrücklich mutierend, nicht-idempotent und
+`openWorld`; sie wird nicht mehr fälschlich als lokale Dateierstellung deklariert.
 
 ## Privileged References
 

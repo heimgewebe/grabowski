@@ -27,6 +27,7 @@ Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 GithubRunner = Callable[[Path, list[str]], dict[str, Any]]
 TransportTargetDispatcher = Callable[[str, dict[str, Any], str], dict[str, Any]]
+N8nProviderDispatcher = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class GripSpec:
     uses_github: bool = False
     operation_effect_class: str = "unknown"
     operation_class: str = "unknown"
+    capability: str = "terminal_execute"
 
 
 GRIP_RECEIPT_KIND = "grabowski.operator_grip_receipt"
@@ -417,6 +419,46 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="bureau_pickup_orphan_reconcile",
     ),
+    "browser-semantic-observe": GripSpec(
+        name="browser-semantic-observe",
+        version="1.0",
+        summary=(
+            "Observe one isolated browser worker through the canonical semantic "
+            "gateway without introducing a second browser contract."
+        ),
+        effect=READ_ONLY,
+        required_parameters=("worker_id",),
+        acceptance_ids=(
+            "canonical-semantic-gateway",
+            "read-only-publication",
+            "semantic-receipt-preserved",
+            "no-second-browser-contract",
+        ),
+        runner="browser_semantic_observe",
+        operation_effect_class="browser_semantic",
+        operation_class="browser-semantic-observe",
+        capability="browser_worker",
+    ),
+    "browser-semantic-act": GripSpec(
+        name="browser-semantic-act",
+        version="1.0",
+        summary=(
+            "Act on one snapshot-bound browser intent through the canonical semantic "
+            "gateway under the mutating grip envelope."
+        ),
+        effect=MUTATING,
+        required_parameters=("worker_id", "snapshot_id", "action_kind"),
+        acceptance_ids=(
+            "canonical-semantic-gateway",
+            "mutation-envelope",
+            "semantic-outcome-preserved",
+            "retry-authority-not-widened",
+        ),
+        runner="browser_semantic_act",
+        operation_effect_class="browser_semantic",
+        operation_class="browser-semantic-act",
+        capability="browser_worker",
+    ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
         version="1.1",
@@ -440,6 +482,58 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "private-receipt-persisted",
         ),
         runner="connector_snapshot_bind",
+    ),
+    "n8n-workflow-edge-verify": GripSpec(
+        name="n8n-workflow-edge-verify",
+        version="1.0",
+        summary=(
+            "Read and semantically verify one fixed-profile n8n workflow edge state without "
+            "returning workflow bodies, credential references or secret material."
+        ),
+        effect=READ_ONLY,
+        required_parameters=(
+            "provider_profile",
+            "secret_path",
+            "expected_secret_sha256",
+            "expected_state",
+        ),
+        acceptance_ids=(
+            "provider-profile-bound",
+            "secret-hash-bound",
+            "provider-readback",
+            "semantic-state-bound",
+            "no-provider-mutation",
+        ),
+        runner="n8n_workflow_edge_verify",
+        operation_effect_class="external_provider",
+        operation_class="n8n-workflow-edge-verify",
+    ),
+    "n8n-workflow-edge-apply": GripSpec(
+        name="n8n-workflow-edge-apply",
+        version="1.0",
+        summary=(
+            "CAS-apply exactly one fixed-profile isolated-source n8n edge and immediately "
+            "read the provider back under the same secret-safe runtime boundary."
+        ),
+        effect=MUTATING,
+        required_parameters=(
+            "provider_profile",
+            "secret_path",
+            "expected_secret_sha256",
+            "expected_version_id",
+            "expected_response_sha256",
+        ),
+        acceptance_ids=(
+            "provider-profile-bound",
+            "secret-hash-bound",
+            "revision-cas-bound",
+            "single-edge-only",
+            "provider-post-readback",
+            "receipt-bound-effect",
+        ),
+        runner="n8n_workflow_edge_apply",
+        operation_effect_class="external_provider",
+        operation_class="n8n-workflow-edge-apply",
     ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
@@ -647,7 +741,11 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "bureau-pickup-status",
         "bureau-pickup-release",
         "bureau-pickup-orphan-reconcile",
+        "browser-semantic-observe",
+        "browser-semantic-act",
         "connector-snapshot-bind",
+        "n8n-workflow-edge-verify",
+        "n8n-workflow-edge-apply",
         "transport-roundtrip",
         "convergence-assess",
         "gate-evidence-preflight",
@@ -688,7 +786,11 @@ GRIP_SURFACE_TARGETS = {
     "bureau-pickup-status": "one coordinated Bureau pickup status and lease projection",
     "bureau-pickup-release": "one terminal coordinated pickup lease release",
     "bureau-pickup-orphan-reconcile": "one exact unbound coordinated pickup reconciliation",
+    "browser-semantic-observe": "one canonical semantic browser observation",
+    "browser-semantic-act": "one snapshot-bound canonical semantic browser action",
     "connector-snapshot-bind": "one connector client snapshot receipt",
+    "n8n-workflow-edge-verify": "one fixed-profile n8n workflow edge readback",
+    "n8n-workflow-edge-apply": "one revision-bound fixed-profile n8n single-edge mutation",
     "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
@@ -737,6 +839,16 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "read bureau-pickup-status for the exact run; on outcome_unknown perform the named "
         "required readback before any retry; never substitute generic fail, release or force-release"
     ),
+    "n8n-workflow-edge-apply": (
+        "run n8n-workflow-edge-verify against the exact provider profile before any retry; "
+        "after an ambiguous write, verify expected_state=final first and do not issue a new "
+        "apply unless fresh readback proves the source is still isolated"
+    ),
+    "browser-semantic-act": (
+        "honor the canonical gateway retry_readback contract; after outcome_unknown perform "
+        "authoritative browser readback and form a new explicit intent instead of retrying "
+        "the lost action"
+    ),
     "transport-roundtrip": (
         "invoke the mutating MCP target normally; for shared_unlabeled callers, continue "
         "with action=execute and the returned challenge only while the server-retained "
@@ -763,6 +875,24 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "work-acquire": (
         "source_kind must be one of bureau_task, github_issue, operator_obligation, thread_focus; "
         "other source kinds have no immutable terminal evidence observer and are rejected before checkout creation",
+    ),
+    "n8n-workflow-edge-verify": (
+        "provider_profile must be a server-known fixed target; expected_state must be isolated or final; "
+        "secret_path content is never returned and must match expected_secret_sha256",
+    ),
+    "n8n-workflow-edge-apply": (
+        "provider_profile must be a server-known fixed target; the current provider workflow must be inactive, "
+        "semantically isolated and match expected_version_id plus expected_response_sha256; only the named "
+        "single edge may be added; post-readback is mandatory",
+    ),
+    "browser-semantic-observe": (
+        "the operation is fixed to observe; only worker_id and optional timeout_seconds are forwarded "
+        "to the canonical browser_semantic_gateway",
+    ),
+    "browser-semantic-act": (
+        "the operation is fixed to act; effect_class remains server-owned and cannot be supplied by the caller",
+        "element_id and timeout_seconds are optional; snapshot and element validity remain exclusively "
+        "the canonical browser_semantic_gateway contract",
     ),
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
@@ -2256,6 +2386,7 @@ def _grip_catalog_snapshot() -> dict[str, Any]:
                 "uses_github": spec.uses_github,
                 "operation_effect_class": spec.operation_effect_class,
                 "operation_class": spec.operation_class,
+                "capability": spec.capability,
             }
             for name, spec in sorted(GRIP_SPECS.items())
         },
@@ -3169,6 +3300,135 @@ def _run_bureau_pickup_orphan_reconcile(
     return {**output, "receipt_status": "passed"}
 
 
+_BROWSER_SEMANTIC_OBSERVE_FIELDS = frozenset({"worker_id", "timeout_seconds"})
+_BROWSER_SEMANTIC_ACT_FIELDS = frozenset(
+    {"worker_id", "snapshot_id", "action_kind", "element_id", "timeout_seconds"}
+)
+
+
+def _browser_semantic_gateway_call(
+    parameters: dict[str, Any], *, operation: str
+) -> dict[str, Any]:
+    allowed = (
+        _BROWSER_SEMANTIC_OBSERVE_FIELDS
+        if operation == "observe"
+        else _BROWSER_SEMANTIC_ACT_FIELDS
+    )
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError(
+            "unknown browser semantic field(s): " + ", ".join(unknown)
+        )
+    workers = __import__("grabowski_workers")
+    kwargs: dict[str, Any] = {}
+    if "timeout_seconds" in parameters:
+        kwargs["timeout_seconds"] = parameters["timeout_seconds"]
+    if operation == "act":
+        kwargs["snapshot_id"] = parameters["snapshot_id"]
+        kwargs["action_kind"] = parameters["action_kind"]
+        if "element_id" in parameters:
+            kwargs["element_id"] = parameters["element_id"]
+    output = workers.browser_semantic_gateway(
+        parameters["worker_id"], operation, **kwargs
+    )
+    if not isinstance(output, dict):
+        raise GripActionError("canonical browser semantic gateway returned a non-object")
+    return output
+
+
+def _run_browser_semantic_observe(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    try:
+        output = _browser_semantic_gateway_call(parameters, operation="observe")
+    except (TypeError, ValueError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except (OSError, PermissionError, RuntimeError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", type(exc).__name__)
+        raise GripActionError("canonical browser semantic observe failed") from exc
+    _check(receipt, "canonical-semantic-gateway", "pass", "operation=observe")
+    _check(receipt, "read-only-publication", "pass", "grip=read_only; operation=observe")
+    audit = output.get("audit")
+    audit_preserved = (
+        isinstance(audit, dict)
+        and isinstance(audit.get("outcome"), dict)
+        and audit["outcome"].get("recorded") is True
+    )
+    _check(
+        receipt,
+        "semantic-receipt-preserved",
+        "pass" if audit_preserved else "fail",
+        str(output.get("result_code") or "missing"),
+    )
+    _check(
+        receipt,
+        "no-second-browser-contract",
+        "pass",
+        "delegates=browser_semantic_gateway",
+    )
+    return {
+        **output,
+        "receipt_status": (
+            "passed" if output.get("ok") is True and audit_preserved else "failed"
+        ),
+    }
+
+
+def _run_browser_semantic_act(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    try:
+        output = _browser_semantic_gateway_call(parameters, operation="act")
+    except (TypeError, ValueError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except (OSError, PermissionError, RuntimeError) as exc:
+        _check(receipt, "canonical-semantic-gateway", "fail", type(exc).__name__)
+        raise GripActionError("canonical browser semantic act failed") from exc
+    retry_readback = output.get("retry_readback")
+    retry_not_widened = (
+        isinstance(retry_readback, dict)
+        and retry_readback.get("retry_authorized") is False
+    )
+    audit = output.get("audit")
+    audit_preserved = (
+        isinstance(audit, dict)
+        and isinstance(audit.get("outcome"), dict)
+        and audit["outcome"].get("recorded") is True
+    )
+    _check(receipt, "canonical-semantic-gateway", "pass", "operation=act")
+    _check(receipt, "mutation-envelope", "pass", "grip=mutating; operation=act")
+    _check(
+        receipt,
+        "semantic-outcome-preserved",
+        "pass" if output.get("result_code") and audit_preserved else "fail",
+        str(output.get("result_code") or "missing"),
+    )
+    _check(
+        receipt,
+        "retry-authority-not-widened",
+        "pass" if retry_not_widened else "fail",
+        "retry_authorized=false" if retry_not_widened else "missing canonical retry prohibition",
+    )
+    return {
+        **output,
+        "receipt_status": (
+            "passed"
+            if output.get("ok") is True and retry_not_widened and audit_preserved
+            else "failed"
+        ),
+    }
+
+
 def _run_connector_snapshot_bind(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -3202,6 +3462,127 @@ def _run_connector_snapshot_bind(
         output["receipt_status"] = "blocked"
         output["decision"] = "blocked"
         output["blocked_reasons"] = ["connector_snapshot_mismatch"]
+    return output
+
+
+def _n8n_provider_parameters(
+    parameters: dict[str, Any],
+    *,
+    apply: bool,
+) -> dict[str, Any]:
+    allowed = {
+        "provider_profile",
+        "secret_path",
+        "expected_secret_sha256",
+    }
+    if apply:
+        allowed.update({"expected_version_id", "expected_response_sha256"})
+    else:
+        allowed.add("expected_state")
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError(
+            "unknown n8n provider grip field(s): " + ", ".join(unknown)
+        )
+    profile = parameters.get("provider_profile")
+    secret_path = parameters.get("secret_path")
+    secret_sha = parameters.get("expected_secret_sha256")
+    if not isinstance(profile, str) or not profile:
+        raise GripPreflightError("provider_profile must be non-empty text")
+    if not isinstance(secret_path, str) or not secret_path.startswith("/"):
+        raise GripPreflightError("secret_path must be an absolute path")
+    if not isinstance(secret_sha, str) or re.fullmatch(r"[0-9a-f]{64}", secret_sha) is None:
+        raise GripPreflightError("expected_secret_sha256 must be a lowercase SHA-256 digest")
+    if apply:
+        if not isinstance(parameters.get("expected_version_id"), str) or not parameters["expected_version_id"]:
+            raise GripPreflightError("expected_version_id must be non-empty text")
+        expected_response = parameters.get("expected_response_sha256")
+        if not isinstance(expected_response, str) or re.fullmatch(r"[0-9a-f]{64}", expected_response) is None:
+            raise GripPreflightError("expected_response_sha256 must be a lowercase SHA-256 digest")
+    elif parameters.get("expected_state") not in {"isolated", "final"}:
+        raise GripPreflightError("expected_state must be isolated or final")
+    return dict(parameters)
+
+
+def _run_n8n_workflow_edge_verify(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    provider_dispatcher: N8nProviderDispatcher | None = None,
+) -> dict[str, Any]:
+    del spec, runner
+    request = _n8n_provider_parameters(parameters, apply=False)
+    if provider_dispatcher is None:
+        import grabowski_n8n_runtime
+        provider_dispatcher = grabowski_n8n_runtime.dispatch
+    _check(receipt, "provider-profile-bound", "pass", request["provider_profile"])
+    _check(receipt, "secret-hash-bound", "pass", request["expected_secret_sha256"])
+    try:
+        output = provider_dispatcher("verify", request)
+    except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, "provider-readback", "fail", type(exc).__name__)
+        raise GripActionError("n8n provider verify failed") from exc
+    if not isinstance(output, dict) or output.get("ok") is not True:
+        _check(receipt, "provider-readback", "fail", "invalid-output")
+        raise GripActionError("n8n provider verify returned invalid output")
+    observed = output.get("observed")
+    state_valid = isinstance(observed, dict) and observed.get("state") == request["expected_state"]
+    no_mutation = output.get("providerMutationPerformed") is False
+    _check(receipt, "provider-readback", "pass", str(observed.get("responseSha256")) if isinstance(observed, dict) else "missing")
+    _check(receipt, "semantic-state-bound", "pass" if state_valid else "fail", request["expected_state"])
+    _check(receipt, "no-provider-mutation", "pass" if no_mutation else "fail", "read-only")
+    if not state_valid or not no_mutation:
+        return {
+            "receipt_status": "failed",
+            "error": "n8n provider verify violated its published contract",
+        }
+    return output
+
+
+def _run_n8n_workflow_edge_apply(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    provider_dispatcher: N8nProviderDispatcher | None = None,
+) -> dict[str, Any]:
+    del spec, runner
+    request = _n8n_provider_parameters(parameters, apply=True)
+    if provider_dispatcher is None:
+        import grabowski_n8n_runtime
+        provider_dispatcher = grabowski_n8n_runtime.dispatch
+    _check(receipt, "provider-profile-bound", "pass", request["provider_profile"])
+    _check(receipt, "secret-hash-bound", "pass", request["expected_secret_sha256"])
+    _check(
+        receipt,
+        "revision-cas-bound",
+        "pass",
+        f"version={request['expected_version_id']} response={request['expected_response_sha256']}",
+    )
+    try:
+        output = provider_dispatcher("apply", request)
+    except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, "single-edge-only", "fail", type(exc).__name__)
+        raise GripActionError("n8n provider apply failed; provider readback is required before retry") from exc
+    if not isinstance(output, dict) or output.get("ok") is not True:
+        _check(receipt, "single-edge-only", "fail", "invalid-output")
+        raise GripActionError("n8n provider apply returned invalid output")
+    effect = output.get("effect")
+    pre = output.get("pre")
+    post = output.get("post")
+    effect_valid = isinstance(effect, dict) and effect.get("kind") == "n8n-workflow-single-edge-add"
+    pre_valid = isinstance(pre, dict) and pre.get("state") == "isolated" and pre.get("versionId") == request["expected_version_id"] and pre.get("responseSha256") == request["expected_response_sha256"]
+    post_valid = isinstance(post, dict) and post.get("state") == "final" and post.get("versionId") != request["expected_version_id"]
+    mutation_valid = output.get("providerMutationPerformed") is True
+    _check(receipt, "single-edge-only", "pass" if effect_valid else "fail", "exact-single-edge")
+    _check(receipt, "provider-post-readback", "pass" if post_valid else "fail", str(post.get("responseSha256")) if isinstance(post, dict) else "missing")
+    _check(receipt, "receipt-bound-effect", "pass" if mutation_valid and pre_valid and post_valid else "fail", "pre/post-bound")
+    if not effect_valid or not pre_valid or not post_valid or not mutation_valid:
+        return {
+            "receipt_status": "failed",
+            "error": "n8n provider apply violated its published contract",
+        }
     return output
 
 
@@ -9107,7 +9488,11 @@ _RUNNERS = {
     "bureau_pickup_status": _run_bureau_pickup_status,
     "bureau_pickup_release": _run_bureau_pickup_release,
     "bureau_pickup_orphan_reconcile": _run_bureau_pickup_orphan_reconcile,
+    "browser_semantic_observe": _run_browser_semantic_observe,
+    "browser_semantic_act": _run_browser_semantic_act,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
+    "n8n_workflow_edge_verify": _run_n8n_workflow_edge_verify,
+    "n8n_workflow_edge_apply": _run_n8n_workflow_edge_apply,
     "transport_roundtrip": _run_transport_roundtrip,
     "convergence_assess": _run_convergence_assess,
     "gate_evidence_preflight": _run_gate_evidence_preflight,
@@ -9133,6 +9518,7 @@ def run_grip(
     command_runner: CommandRunner | None = None,
     github_runner: GithubRunner | None = None,
     transport_target_dispatcher: TransportTargetDispatcher | None = None,
+    n8n_provider_dispatcher: N8nProviderDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     spec = GRIP_SPECS.get(name)
@@ -9184,6 +9570,14 @@ def run_grip(
                 receipt,
                 command,
                 transport_target_dispatcher,
+            )
+        elif spec.runner in {"n8n_workflow_edge_verify", "n8n_workflow_edge_apply"}:
+            output = action(
+                spec,
+                parameters,
+                receipt,
+                command,
+                n8n_provider_dispatcher,
             )
         else:
             output = action(spec, parameters, receipt, command)
@@ -9245,6 +9639,7 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
             f"required parameters: {required}",
             *GRIP_CONDITIONAL_PRECONDITIONS.get(spec.name, ()),
             "grip name is present in GRIP_SURFACE_ALLOWLIST",
+            f"session capability required: {spec.capability}",
             "mutating grips require allow_mutation=true and an eligible profile",
         ],
         "required_parameters": list(spec.required_parameters),
@@ -9252,6 +9647,7 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
         "uses_github": spec.uses_github,
         "operation_effect_class": spec.operation_effect_class,
         "operation_class": spec.operation_class,
+        "required_capability": spec.capability,
         "operation_lease_parallelism": (
             "merge-disjointness-eligible"
             if spec.operation_effect_class == "publication"
@@ -9279,6 +9675,18 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
 
 def grip_risk_level(name: str) -> str:
     return GRIP_RISK_LEVELS.get(name, "medium")
+
+
+def grip_required_capability(name: str) -> str:
+    """Return the authority capability for one grip; unknown names stay conservative."""
+
+    spec = GRIP_SPECS.get(name)
+    if spec is None:
+        return "terminal_execute"
+    capability = spec.capability
+    if not isinstance(capability, str) or not capability:
+        raise RuntimeError(f"grip {name} has an invalid capability contract")
+    return capability
 
 
 def _validate_surface_profile(profile: str) -> str:
@@ -9336,6 +9744,7 @@ def grip_run(
     command_runner: CommandRunner | None = None,
     github_runner: GithubRunner | None = None,
     transport_target_dispatcher: TransportTargetDispatcher | None = None,
+    n8n_provider_dispatcher: N8nProviderDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     try:
@@ -9355,4 +9764,5 @@ def grip_run(
         command_runner=command_runner,
         github_runner=github_runner,
         transport_target_dispatcher=transport_target_dispatcher,
+        n8n_provider_dispatcher=n8n_provider_dispatcher,
     )

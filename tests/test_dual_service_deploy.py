@@ -2348,6 +2348,84 @@ class DeploymentAdmissionTests(unittest.TestCase):
         self.assertEqual(3, proof["attempts"])
         self.assertEqual(0, proof["observation"]["active_tool_calls"])
 
+    def test_operator_admission_extends_only_preexisting_effect_aware_blocker(self) -> None:
+        marker = self.marker()
+        observations = [
+            {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                "token": marker["token"],
+                "expected_head": marker["expected_head"],
+                "source_identity_sha256": marker["source_identity_sha256"],
+                "active_tool_calls": count,
+                "drain_blocking_tool_calls": count,
+                "read_only_active_tool_calls": 0,
+                "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            }
+            for count in (1, 0, 0)
+        ]
+        with (
+            mock.patch.object(
+                dual, "_operator_admission_observation", side_effect=observations
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            proof = dual.wait_for_operator_deployment_admission(
+                marker, timeout_seconds=5
+            )
+        self.assertTrue(proof["supported"])
+        self.assertTrue(proof["effect_aware"])
+        self.assertEqual(3, proof["attempts"])
+        self.assertEqual(1, proof["initial_blocking_tool_calls"])
+        self.assertTrue(proof["extended_existing_call_drain"])
+        self.assertEqual(
+            dual.OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS,
+            proof["drain_timeout_seconds"],
+        )
+        self.assertEqual(0, proof["observation"]["drain_blocking_tool_calls"])
+
+    def test_operator_admission_extended_timeout_preserves_failure_evidence(self) -> None:
+        marker = self.marker()
+        observed = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            "token": marker["token"],
+            "expected_head": marker["expected_head"],
+            "source_identity_sha256": marker["source_identity_sha256"],
+            "active_tool_calls": 1,
+            "drain_blocking_tool_calls": 1,
+            "read_only_active_tool_calls": 0,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+        }
+        with (
+            mock.patch.object(
+                dual, "_operator_admission_observation", return_value=observed
+            ),
+            mock.patch.object(
+                dual.time, "monotonic", side_effect=[0.0, 0.0, 121.0]
+            ),
+            mock.patch.object(dual.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.wait_for_operator_deployment_admission(
+                    marker, timeout_seconds=5
+                )
+        self.assertEqual("operator-admission-drain", raised.exception.phase)
+        self.assertEqual(1, raised.exception.details["initial_blocking_tool_calls"])
+        self.assertTrue(
+            raised.exception.details["extended_existing_call_drain"]
+        )
+        self.assertEqual(
+            dual.OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS,
+            raised.exception.details["drain_timeout_seconds"],
+        )
+        self.assertFalse(raised.exception.details["bootstrap_mode"])
+        sleep.assert_not_called()
+
     def test_operator_admission_ignores_observed_read_only_calls(self) -> None:
         marker = self.marker()
         observations = [
@@ -2392,6 +2470,8 @@ class DeploymentAdmissionTests(unittest.TestCase):
         self.assertEqual(1, proof["observation"]["active_tool_calls"])
         self.assertTrue(proof["effect_aware"])
         self.assertEqual(5, proof["drain_timeout_seconds"])
+        self.assertEqual(0, proof["initial_blocking_tool_calls"])
+        self.assertFalse(proof["extended_existing_call_drain"])
         self.assertEqual(0, proof["observation"]["drain_blocking_tool_calls"])
 
     def test_operator_admission_rejects_invalid_blocking_count(self) -> None:

@@ -3530,11 +3530,22 @@ def wait_for_operator_deployment_admission(
             }
         break
     initial_counts = _operator_admission_call_counts(first)
-    drain_timeout_seconds = (
-        timeout_seconds
-        if initial_counts["effect_aware"]
-        else max(timeout_seconds, OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS)
+    initial_blocking_tool_calls = initial_counts["blocking_tool_calls"]
+    extended_existing_call_drain = (
+        initial_counts["effect_aware"] and initial_blocking_tool_calls > 0
     )
+    if not initial_counts["effect_aware"]:
+        drain_timeout_seconds = max(
+            timeout_seconds, OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS
+        )
+    elif extended_existing_call_drain:
+        # The admission marker already rejects every new deployment-blocking
+        # tool call. A blocker visible in the first marker-bound readback therefore
+        # predates quiescence and may finish safely without widening admission.
+        # Use the existing supported maximum only for that bounded drain window.
+        drain_timeout_seconds = OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS
+    else:
+        drain_timeout_seconds = timeout_seconds
     deadline = time.monotonic() + drain_timeout_seconds
     consecutive_idle = 0
     attempts = 0
@@ -3576,6 +3587,8 @@ def wait_for_operator_deployment_admission(
                     "active_tool_calls": active_calls,
                     "read_only_active_tool_calls": call_counts["read_only_active_tool_calls"],
                     "drain_timeout_seconds": drain_timeout_seconds,
+                    "initial_blocking_tool_calls": initial_blocking_tool_calls,
+                    "extended_existing_call_drain": extended_existing_call_drain,
                     "probe_attempts": probe_attempts,
                     "transport_retries": transport_retries,
                     "attempts": attempts,
@@ -3593,6 +3606,8 @@ def wait_for_operator_deployment_admission(
             "attempts": attempts,
             "drain_timeout_seconds": drain_timeout_seconds,
             "bootstrap_mode": not initial_counts["effect_aware"],
+            "initial_blocking_tool_calls": initial_blocking_tool_calls,
+            "extended_existing_call_drain": extended_existing_call_drain,
             "last_observation": last,
         },
     )
