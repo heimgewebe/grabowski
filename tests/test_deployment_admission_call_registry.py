@@ -396,6 +396,72 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
         self.assertEqual(0, snapshot["drain_blocking_tool_calls"])
         self.assertEqual([], snapshot["active_tool_calls_sample"])
 
+    def test_gate_sync_same_group_survivor_is_killed_after_leader_exits(self) -> None:
+        operator = _load_operator_module()
+        marker = Path(tempfile.gettempdir()) / f"grabowski-child-{time.time_ns()}.pid"
+        heartbeat = marker.with_suffix(".heartbeat")
+        script = (
+            "import os,signal,sys,time\n"
+            "marker,heartbeat=sys.argv[1:3]\n"
+            "pid=os.fork()\n"
+            "if pid:\n"
+            "    while True: time.sleep(1)\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "with open(marker,'w',encoding='ascii') as handle: handle.write(str(os.getpid()))\n"
+            "with open(heartbeat,'ab',buffering=0) as handle:\n"
+            "    while True:\n"
+            "        handle.write(b'x')\n"
+            "        time.sleep(0.02)\n"
+        )
+
+        async def same_group_survivor(*args, **kwargs):
+            return operator._run(
+                [operator.sys.executable, "-c", script, str(marker), str(heartbeat)],
+                cwd=Path(tempfile.gettempdir()),
+                timeout_seconds=1,
+                max_output_bytes=1024,
+            )
+
+        operator.mcp._tool_manager.call_tool = same_group_survivor
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._configure_http_runtime()
+        child_pid = None
+        try:
+            started = time.monotonic()
+            with patch.object(
+                operator, "PROCESS_TERMINATION_GRACE_SECONDS", 0.1
+            ), patch.object(
+                operator, "_require_transport_roundtrip_for_tool", return_value=None
+            ):
+                result = asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "grabowski_terminal_run", {}
+                    )
+                )
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertTrue(result["timed_out"])
+            self.assertTrue(marker.exists())
+            child_pid = int(marker.read_text(encoding="ascii"))
+            size_after_return = heartbeat.stat().st_size
+            time.sleep(0.15)
+            self.assertEqual(size_after_return, heartbeat.stat().st_size)
+            self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+            self.assertEqual(
+                0, operator._deployment_admission_snapshot()["drain_blocking_tool_calls"]
+            )
+        finally:
+            if child_pid is not None:
+                try:
+                    operator.os.kill(child_pid, operator.signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            marker.unlink(missing_ok=True)
+            heartbeat.unlink(missing_ok=True)
+
     def test_gate_async_tool_success_and_exception_release_by_identity(self) -> None:
         operator = _load_operator_module()
 

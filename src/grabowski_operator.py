@@ -1802,14 +1802,17 @@ def _terminate_process_group(
             partial_stdout = _timeout_partial_bytes(exc.output)
             partial_stderr = _timeout_partial_bytes(exc.stderr)
 
-    # Do not signal a process group after the leader has been reaped: its numeric
-    # pgid could theoretically be reused. If the leader is still live, however,
-    # SIGKILL is safe because start_new_session=True made its pid the owned pgid.
+    # A communicate timeout after SIGTERM can mean that the group leader exited
+    # while another member of the *same owned group* ignored SIGTERM and kept a
+    # pipe open. Escalate the original pgid regardless of leader liveness. If no
+    # owned group remains (for example because the only holder detached with
+    # setsid()), killpg reports ESRCH and the bounded pipe fallback below applies.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
     if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         try:
             process.wait(timeout=grace)
         except subprocess.TimeoutExpired as exc:
@@ -1817,12 +1820,12 @@ def _terminate_process_group(
                 "command process group did not terminate after SIGKILL"
             ) from exc
 
-    # ``wait()`` is independent of pipe EOF. A detached descendant may still
-    # own inherited descriptors, so make only one zero-wait capture attempt and
-    # then close our readers. TimeoutExpired carries the cumulative buffered
-    # output retained by Popen.communicate().
+    # Give killed same-group descendants one bounded grace window to close their
+    # inherited descriptors. A detached descendant can still own them after that;
+    # TimeoutExpired carries cumulative buffered output, so close only our readers
+    # and return without waiting forever on an unowned pipe holder.
     try:
-        return process.communicate(timeout=0)
+        return process.communicate(timeout=grace)
     except subprocess.TimeoutExpired as exc:
         stdout = _timeout_partial_bytes(exc.output) or partial_stdout
         stderr = _timeout_partial_bytes(exc.stderr) or partial_stderr
