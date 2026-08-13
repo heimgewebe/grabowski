@@ -156,6 +156,9 @@ def _read_transport_connector_capability(path: Path) -> str:
             or before.st_mode != linked.st_mode
             or before.st_uid != linked.st_uid
             or before.st_nlink != linked.st_nlink
+            or before.st_size != linked.st_size
+            or before.st_mtime_ns != linked.st_mtime_ns
+            or before.st_ctime_ns != linked.st_ctime_ns
         ):
             raise ClientSnapshotError(
                 "transport connector capability changed during open"
@@ -188,8 +191,7 @@ def _read_transport_connector_capability(path: Path) -> str:
         raise ClientSnapshotError(
             "transport connector capability must be ASCII"
         ) from exc
-    if token.endswith("\n"):
-        token = token[:-1]
+    token = token.rstrip("\r\n")
     if _TRANSPORT_CONNECTOR_TOKEN_RE.fullmatch(token) is None:
         raise ClientSnapshotError("transport connector capability is invalid")
     return token
@@ -1361,16 +1363,31 @@ def _tool_names_sha256(names: list[str]) -> str:
 
 
 def _mcp_tool_payload(result: Any, *, label: str) -> dict[str, Any]:
-    if getattr(result, "isError", False) is True:
+    if isinstance(result, dict):
+        if (
+            isinstance(result.get("status"), str)
+            and isinstance(result.get("output"), dict)
+        ):
+            return result
+        is_error = result.get("isError", False)
+        structured = result.get("structuredContent")
+        content = result.get("content")
+    else:
+        is_error = getattr(result, "isError", False)
+        structured = getattr(result, "structuredContent", None)
+        content = getattr(result, "content", None)
+    if is_error is True:
         raise ClientSnapshotError(f"{label} returned an MCP tool error")
-    structured = getattr(result, "structuredContent", None)
     if isinstance(structured, dict):
         return structured
-    content = getattr(result, "content", None)
     if not isinstance(content, list):
         raise ClientSnapshotError(f"{label} returned no bounded JSON payload")
     for item in content:
-        text = getattr(item, "text", None)
+        text = (
+            item.get("text")
+            if isinstance(item, dict)
+            else getattr(item, "text", None)
+        )
         if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_SNAPSHOT_BYTES:
             continue
         try:
@@ -1555,6 +1572,7 @@ async def _observe_and_bind_snapshot(
                         "verification_receipt_sha256"
                     )
                 )
+                bind_result: Any | None = None
                 if (
                     transport_begin_output.get("state") == "verified"
                     and transport_begin_output.get("mutation_gate_open") is True
@@ -1585,41 +1603,40 @@ async def _observe_and_bind_snapshot(
                         raise ClientSnapshotError(
                             "transport roundtrip begin did not return a valid challenge"
                         )
-                    transport_ack_result = await client.call_tool(
+                    transport_execute_result = await client.call_tool(
                         "grip_run",
                         {
                             "name": "transport-roundtrip",
                             "parameters": {
-                                "action": "ack",
+                                "action": "execute",
                                 "challenge_receipt_sha256": (
                                     challenge_receipt_sha256
                                 ),
+                                "target_tool_name": "grip_run",
+                                "target_arguments": bind_arguments,
                             },
                             "profile": "operator",
                             "allow_mutation": True,
                         },
                         meta=request_meta,
                     )
-                    transport_ack = _mcp_tool_payload(
-                        transport_ack_result,
-                        label="transport roundtrip ack grip",
+                    transport_execute = _mcp_tool_payload(
+                        transport_execute_result,
+                        label="transport roundtrip execute grip",
                     )
-                    transport_ack_output = transport_ack.get("output")
+                    transport_execute_output = transport_execute.get("output")
                     transport_verification_receipt_sha256 = (
-                        transport_ack_output.get(
+                        transport_execute_output.get(
                             "verification_receipt_sha256"
                         )
-                        if isinstance(transport_ack_output, dict)
+                        if isinstance(transport_execute_output, dict)
                         else None
                     )
                     if (
-                        transport_ack.get("status") != "passed"
-                        or not isinstance(transport_ack_output, dict)
-                        or transport_ack_output.get("state") != "verified"
-                        or transport_ack_output.get(
-                            "mutation_gate_open"
-                        )
-                        is not True
+                        transport_execute.get("status") != "passed"
+                        or not isinstance(transport_execute_output, dict)
+                        or transport_execute_output.get("state") != "executed"
+                        or transport_execute_output.get("target_error") is not None
                         or not isinstance(
                             transport_verification_receipt_sha256, str
                         )
@@ -1627,17 +1644,22 @@ async def _observe_and_bind_snapshot(
                             transport_verification_receipt_sha256
                         )
                         is None
+                        or not isinstance(
+                            transport_execute_output.get("target_result"), dict
+                        )
                     ):
                         raise ClientSnapshotError(
-                            "transport roundtrip acknowledgement did not verify"
+                            "transport roundtrip execution did not execute the snapshot bind"
                         )
+                    bind_result = transport_execute_output["target_result"]
                 # Exactly the arguments the verification was bound to; any
                 # deviation would be refused by the gate.
-                bind_result = await client.call_tool(
-                    "grip_run",
-                    bind_arguments,
-                    meta=request_meta,
-                )
+                if bind_result is None:
+                    bind_result = await client.call_tool(
+                        "grip_run",
+                        bind_arguments,
+                        meta=request_meta,
+                    )
                 grip = _mcp_tool_payload(bind_result, label="connector-snapshot-bind grip")
                 output = grip.get("output")
                 if (

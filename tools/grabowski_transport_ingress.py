@@ -370,7 +370,6 @@ class TransportIngress:
             {
                 "resource": f"{str(request.base_url).rstrip('/')}/mcp",
                 "resource_name": "Grabowski MCP",
-                "authorization_servers": [],
                 "bearer_methods_supported": [],
             },
             headers={"Cache-Control": "no-store"},

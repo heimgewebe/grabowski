@@ -786,13 +786,15 @@ class ClientSnapshotTests(unittest.TestCase):
                         "challenge_receipt_sha256": "e" * 64,
                     },
                 }
-            if label == "transport roundtrip ack grip":
+            if label == "transport roundtrip execute grip":
                 return {
                     "status": "passed",
                     "output": {
-                        "state": "verified",
-                        "mutation_gate_open": True,
+                        "state": "executed",
+                        "mutation_gate_open": False,
                         "verification_receipt_sha256": "f" * 64,
+                        "target_result": {"isError": False, "structuredContent": {}},
+                        "target_error": None,
                     },
                 }
             return {
@@ -855,34 +857,31 @@ class ClientSnapshotTests(unittest.TestCase):
                 "f" * 64,
             )
             self.assertEqual(
-                request_metas[:4],
-                [{"client_id": snapshot.AUTO_REFRESH_CLIENT_ID}] * 4,
+                request_metas[:3],
+                [{"client_id": snapshot.AUTO_REFRESH_CLIENT_ID}] * 3,
             )
+            self.assertEqual(len(declarations), 2)
             self.assertEqual(
-                [entry["name"] for entry in declarations[-3:]],
-                [
-                    "transport-roundtrip",
-                    "transport-roundtrip",
-                    "connector-snapshot-bind",
-                ],
+                [entry["name"] for entry in declarations],
+                ["transport-roundtrip", "transport-roundtrip"],
             )
-            self.assertEqual(
-                declarations[-2]["parameters"],
-                {
-                    "action": "ack",
-                    "challenge_receipt_sha256": "e" * 64,
-                },
-            )
-            # The handshake must be bound to the exact bind call it precedes,
-            # otherwise the verification admits nothing and the bind fails.
-            begin_parameters = declarations[-3]["parameters"]
+            # Atomic execute stays bound to the exact binder declared by begin;
+            # a second direct binder call would duplicate the effect.
+            begin_parameters = declarations[-2]["parameters"]
             self.assertEqual(begin_parameters["action"], "begin")
             self.assertEqual(begin_parameters["target_tool_name"], "grip_run")
-            self.assertEqual(begin_parameters["target_arguments"], declarations[-1])
+            bind_arguments = begin_parameters["target_arguments"]
             self.assertEqual(
-                declarations[-1]["name"], "connector-snapshot-bind"
+                declarations[-1]["parameters"],
+                {
+                    "action": "execute",
+                    "challenge_receipt_sha256": "e" * 64,
+                    "target_tool_name": "grip_run",
+                    "target_arguments": bind_arguments,
+                },
             )
-            declaration = declarations[-1]["parameters"]
+            self.assertEqual(bind_arguments["name"], "connector-snapshot-bind")
+            declaration = bind_arguments["parameters"]
             self.assertEqual(declaration["observed_tools"], artifact)
             self.assertEqual(declaration["observed_tool_count"], len(names))
 
@@ -920,12 +919,29 @@ class ClientSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             target = root / "primary.token"
             token = "D" * 43
-            target.write_text(token + "\n", encoding="ascii")
+            target.write_text(token + "\r\n", encoding="ascii")
             target.chmod(0o600)
             self.assertEqual(
                 snapshot._read_transport_connector_capability(target),
                 token,
             )
+
+            linked = target.lstat()
+            stale_linked = mock.Mock(
+                st_mode=linked.st_mode,
+                st_uid=linked.st_uid,
+                st_nlink=linked.st_nlink,
+                st_size=linked.st_size,
+                st_dev=linked.st_dev,
+                st_ino=linked.st_ino,
+                st_mtime_ns=linked.st_mtime_ns + 1,
+                st_ctime_ns=linked.st_ctime_ns,
+            )
+            with mock.patch.object(Path, "lstat", return_value=stale_linked):
+                with self.assertRaisesRegex(
+                    snapshot.ClientSnapshotError, "changed during open"
+                ):
+                    snapshot._read_transport_connector_capability(target)
 
             target.chmod(0o644)
             with self.assertRaisesRegex(
@@ -942,6 +958,56 @@ class ClientSnapshotTests(unittest.TestCase):
                 snapshot.ClientSnapshotError, "capability file is unsafe"
             ):
                 snapshot._read_transport_connector_capability(target)
+
+            target.unlink()
+            os.link(real, target)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
+            target.unlink()
+            real.unlink()
+
+            target.write_bytes(b"D" * (snapshot.MAX_TRANSPORT_CONNECTOR_TOKEN_BYTES + 1))
+            target.chmod(0o600)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability file is unsafe"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+            target.write_bytes(b"D" * 42 + b"\xff")
+            target.chmod(0o600)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "must be ASCII"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+            target.write_text("!" * 43, encoding="ascii")
+            target.chmod(0o600)
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "capability is invalid"
+            ):
+                snapshot._read_transport_connector_capability(target)
+
+    def test_mcp_tool_payload_accepts_json_safe_embedded_result(self) -> None:
+        payload = snapshot._mcp_tool_payload(
+            {"isError": False, "structuredContent": {"status": "passed"}},
+            label="embedded tool result",
+        )
+        self.assertEqual(payload, {"status": "passed"})
+        direct = {"status": "passed", "output": {"state": "matched"}}
+        self.assertEqual(
+            snapshot._mcp_tool_payload(direct, label="direct grip result"),
+            direct,
+        )
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "embedded tool result returned an MCP tool error",
+        ):
+            snapshot._mcp_tool_payload(
+                {"isError": True, "content": []},
+                label="embedded tool result",
+            )
 
     def test_tool_name_hash_matches_runtime_contract_encoding(self) -> None:
         expected = snapshot.hashlib.sha256(b'["a","b"]').hexdigest()
