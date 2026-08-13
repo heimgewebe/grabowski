@@ -2252,6 +2252,57 @@ def _owner_lease_matches_terminal_lineage(
         for field in ("resource_key", "owner_id", "metadata_sha256")
     )
 
+
+def _lease_timestamp(value: dict[str, Any], field: str) -> int | None:
+    timestamp = value.get(field)
+    if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+        return None
+    return timestamp
+
+
+def _foreign_lease_is_strict_successor(
+    expected: dict[str, Any], observed: dict[str, Any]
+) -> bool:
+    """Prove that a foreign lease began strictly after the stored owner lease expired."""
+    if expected.get("resource_key") != observed.get("resource_key"):
+        return False
+    expected_owner = expected.get("owner_id")
+    observed_owner = observed.get("owner_id")
+    if (
+        not isinstance(expected_owner, str)
+        or not expected_owner
+        or not isinstance(observed_owner, str)
+        or not observed_owner
+        or observed_owner == expected_owner
+    ):
+        return False
+    expected_acquired = _lease_timestamp(expected, "acquired_at_unix")
+    expected_updated = _lease_timestamp(expected, "updated_at_unix")
+    expected_expires = _lease_timestamp(expected, "expires_at_unix")
+    observed_acquired = _lease_timestamp(observed, "acquired_at_unix")
+    observed_updated = _lease_timestamp(observed, "updated_at_unix")
+    observed_expires = _lease_timestamp(observed, "expires_at_unix")
+    if None in {
+        expected_acquired,
+        expected_updated,
+        expected_expires,
+        observed_acquired,
+        observed_updated,
+        observed_expires,
+    }:
+        return False
+    assert expected_acquired is not None
+    assert expected_updated is not None
+    assert expected_expires is not None
+    assert observed_acquired is not None
+    assert observed_updated is not None
+    assert observed_expires is not None
+    if expected_updated < expected_acquired or expected_expires <= expected_acquired:
+        return False
+    if observed_updated < observed_acquired or observed_expires <= observed_acquired:
+        return False
+    return observed_acquired > expected_expires
+
 def _journal_run_ids() -> list[str]:
     root = _absolute_path(STATE_ROOT)
     parent_descriptor = _open_existing_directory_chain(
@@ -3393,7 +3444,7 @@ def _validate_acquisition(acquisition: dict[str, Any]) -> None:
 
 def _verify_release_binding(
     run_id: str, status: dict[str, Any], acquisition: dict[str, Any]
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], list[str]]:
     if status.get("status") != "coordinated":
         raise BureauPickupError("terminal-readback-unavailable")
     run = status.get("run")
@@ -3422,14 +3473,20 @@ def _verify_release_binding(
         for lease in acquisition.get("leases", [])
         if isinstance(lease, dict) and isinstance(lease.get("resource_key"), str)
     }
+    release_keys: list[str] = []
+    preserved_keys: list[str] = []
     for key in keys:
-        observed = resources.inspect_resource(key)
-        if observed is None:
-            continue
         expected = expected_by_key.get(key)
         if expected is None:
             raise BureauPickupError("lease-release-snapshot-missing")
+        observed = resources.inspect_resource(key)
+        if observed is None:
+            preserved_keys.append(key)
+            continue
         if observed.get("owner_id") != owner_id:
+            if _foreign_lease_is_strict_successor(expected, observed):
+                preserved_keys.append(key)
+                continue
             raise BureauPickupError(
                 "lease-release-foreign-owner", details={"resource_key": key}
             )
@@ -3437,7 +3494,8 @@ def _verify_release_binding(
             raise BureauPickupError(
                 "lease-release-metadata-drift", details={"resource_key": key}
             )
-    return owner_id, keys
+        release_keys.append(key)
+    return owner_id, release_keys, preserved_keys
 
 
 def _terminal_release_lease_projection(value: Any, resource_keys: Any) -> Any:
@@ -3585,13 +3643,22 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     status, effective_binding = _coordination_status_for_binding(
         normalized_run_id, binding
     )
-    owner_id, keys = _verify_release_binding(
+    owner_id, keys, preserved_keys = _verify_release_binding(
         normalized_run_id, status, acquisition
     )
     terminal_readback = _write_or_reuse_terminal_readback(
         run_dir / "terminal-readback.json", status
     )
-    result = resources.release_resources(owner_id, keys)
+    if keys:
+        result = resources.release_resources(owner_id, keys)
+    else:
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "no-op",
+            "owner_id": owner_id,
+            "released": [],
+            "preserved_resource_keys": preserved_keys,
+        }
     _write_bound_json(run_dir / "release-result.json", result)
     remaining: dict[str, dict[str, Any]] = {}
     for key in keys:
@@ -3614,7 +3681,9 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
             "identity"
         ]["binding_sha256"],
         "owner_id": owner_id,
-        "resource_keys": keys,
+        "resource_keys": acquisition["resource_keys"],
+        "released_resource_keys": keys,
+        "preserved_resource_keys": preserved_keys,
         "release": result,
         "terminal_readback_sha256": _sha256(terminal_readback),
         "journal": str(run_dir),
@@ -3750,24 +3819,27 @@ def _assert_owner_leases_same_lineage_or_absent(
         if isinstance(lease, dict) and isinstance(lease.get("resource_key"), str)
     }
     for key in acquisition["resource_keys"]:
+        expected = expected_by_key.get(key)
+        if expected is None:
+            raise BureauPickupError(
+                "orphan-reconcile-lease-snapshot-missing",
+                details={"resource_key": key},
+            )
         observed = resources.inspect_resource(key)
         if observed is None:
             continue
         if observed.get("owner_id") != owner_id:
+            if _foreign_lease_is_strict_successor(expected, observed):
+                continue
             raise BureauPickupError(
                 "orphan-reconcile-foreign-lease",
                 details={
                     "resource_key": key,
                     "owner_id": observed.get("owner_id"),
                     "expected_owner_id": owner_id,
+                    "lineage_proof": "not-strictly-after-historical-expiry",
                     "does_not_establish": _execution_binding_does_not_establish(),
                 },
-            )
-        expected = expected_by_key.get(key)
-        if expected is None:
-            raise BureauPickupError(
-                "orphan-reconcile-lease-snapshot-missing",
-                details={"resource_key": key},
             )
         if not _owner_lease_matches_terminal_lineage(expected, observed):
             raise BureauPickupError(
@@ -4075,6 +4147,9 @@ def grabowski_bureau_pickup_orphan_reconcile(
         "observed_coordination_sha256": observed_coordination_sha256,
         "terminal_readback_sha256": _sha256(terminal_readback),
         "release_status": release_result.get("status"),
+        "preserved_resource_keys": release_result.get(
+            "preserved_resource_keys", []
+        ),
         "execution_binding": execution_binding,
         "preserves": [
             "dirty worktree content",
