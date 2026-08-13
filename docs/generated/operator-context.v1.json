@@ -3512,7 +3512,7 @@
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "982bc06d4e4be7823fcc7613df01d39294ebb2b76d2ed378f412e762191dfbc5",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
-      "src/grabowski_operator.py": "861220aed6ccab335590074cb27271b547f4417bb8bf8578c5d041d80d8f4d27",
+      "src/grabowski_operator.py": "66a3433723e4938be8811e8058c14e53de33c3d4512aa361f0388f0e03b349ed",
       "src/grabowski_operator_obligation.py": "6e7fb48bb6340ce04607b75a65a8e4f37dd8e80be34607d0c0771c41c105c8b7",
       "src/grabowski_operator_optimization.py": "f20ef7413ec8d38aeea9e68f1294f729eced48047844e4a17de0890e3fb697b8",
       "src/grabowski_operator_relay.py": "66d61095b1bc12545e81ec1072fc4330ec88f1f27b460a6487fe8fbbf0ed1bc2",
