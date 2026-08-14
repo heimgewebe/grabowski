@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 import unittest
 
 import grabowski_grips as grips
@@ -43,6 +45,54 @@ class N8nGripContractTests(unittest.TestCase):
         self.assertNotIn("revision-cas-bound", apply_contract["acceptance_ids"])
         self.assertNotIn("cas-apply", apply_contract["summary"].casefold())
         self.assertTrue(any("not treated as an atomic external-writer cas boundary" in item.casefold() for item in apply_contract["preconditions"]))
+
+    def test_mcp_composition_root_injects_n8n_dispatcher(self) -> None:
+        module = ast.parse(
+            (Path(__file__).resolve().parents[1] / "src" / "grabowski_mcp.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        functions = {
+            node.name: node
+            for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        grip_core = functions["_grip_run_core"]
+        grip_calls = [
+            node
+            for node in ast.walk(grip_core)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "grabowski_grips"
+            and node.func.attr == "grip_run"
+        ]
+        self.assertEqual(1, len(grip_calls))
+        grip_keywords = {item.arg: item.value for item in grip_calls[0].keywords}
+        dispatcher = grip_keywords["n8n_provider_dispatcher"]
+        self.assertIsInstance(dispatcher, ast.Name)
+        self.assertEqual("_n8n_provider_dispatcher", dispatcher.id)
+
+        provider_dispatcher = functions["_n8n_provider_dispatcher"]
+        runtime_calls = [
+            node
+            for node in ast.walk(provider_dispatcher)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "grabowski_n8n_runtime"
+            and node.func.attr == "dispatch"
+        ]
+        self.assertEqual(1, len(runtime_calls))
+        runtime_keywords = {item.arg: item.value for item in runtime_calls[0].keywords}
+        for keyword, expected in (
+            ("secret_loader", "_n8n_secret_loader"),
+            ("apply_recorder", "_n8n_apply_recorder"),
+        ):
+            value = runtime_keywords[keyword]
+            self.assertIsInstance(value, ast.Name)
+            self.assertEqual(expected, value.id)
 
     def test_verify_uses_fixed_runtime_adapter_and_never_falls_back_to_command_runner(self) -> None:
         called = []
