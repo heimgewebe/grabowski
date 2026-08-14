@@ -1,0 +1,563 @@
+from __future__ import annotations
+
+from contextlib import nullcontext
+import json
+from pathlib import Path
+import stat
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+TOOLS = ROOT / "tools"
+for module_root in (SRC, TOOLS):
+    if str(module_root) not in sys.path:
+        sys.path.insert(0, str(module_root))
+
+import deploy_runtime_dual as dual
+import grabowski_client_snapshot as client_snapshot
+import grabowski_transport_ingress as ingress
+
+
+HEAD_BLUE = "a" * 40
+HEAD_GREEN = "b" * 40
+NAMES_SHA256 = "12" * 32
+INSTRUCTIONS_SHA256 = "34" * 32
+ARTIFACT_SHA256 = "56" * 32
+SOURCE_IDENTITY_SHA256 = "78" * 32
+
+
+def runtime_binding(release_id: str, repo_head: str) -> dict[str, str]:
+    return {
+        "release_id": release_id,
+        "repo_head": repo_head,
+        "registered_names_sha256": NAMES_SHA256,
+        "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+    }
+
+
+class RoutingSelectorTests(unittest.TestCase):
+    def test_selector_is_private_two_target_cas_with_hash_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            selector_path = Path(temporary) / "routing.json"
+            blue = ingress.publish_routing_selector(
+                path=selector_path,
+                expected_selector_sha256=None,
+                selected_slot="canonical",
+                runtime_binding=runtime_binding("blue", HEAD_BLUE),
+                cutover_id="bootstrap",
+                now_unix=100,
+            )
+            self.assertEqual(blue["upstream_port"], 18181)
+            self.assertEqual(stat.S_IMODE(selector_path.stat().st_mode), 0o600)
+
+            green = ingress.publish_routing_selector(
+                path=selector_path,
+                expected_selector_sha256=blue["selector_sha256"],
+                selected_slot="green",
+                runtime_binding=runtime_binding("green", HEAD_GREEN),
+                cutover_id="cutover-1",
+                now_unix=101,
+            )
+            observed = ingress.read_routing_selector(selector_path)
+            self.assertEqual(observed, green)
+            self.assertEqual(observed["upstream"], "http://127.0.0.1:18182/mcp")
+            self.assertEqual(
+                observed["previous_selector_sha256"], blue["selector_sha256"]
+            )
+            with self.assertRaisesRegex(
+                ingress.IngressConfigurationError, "CAS precondition"
+            ):
+                ingress.publish_routing_selector(
+                    path=selector_path,
+                    expected_selector_sha256=blue["selector_sha256"],
+                    selected_slot="canonical",
+                    runtime_binding=runtime_binding("green", HEAD_GREEN),
+                    cutover_id="stale-writer",
+                )
+            with self.assertRaisesRegex(
+                ingress.IngressConfigurationError, "target is not allowed"
+            ):
+                ingress.publish_routing_selector(
+                    path=selector_path,
+                    expected_selector_sha256=green["selector_sha256"],
+                    selected_slot="attacker",
+                    runtime_binding=runtime_binding("green", HEAD_GREEN),
+                    cutover_id="invalid-target",
+                )
+
+    def test_systemd_ingress_lifecycle_is_not_owned_by_operator(self) -> None:
+        unit = (
+            ROOT / "systemd/grabowski-transport-ingress.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("PartOf=grabowski-operator.service", unit)
+        self.assertNotIn("Wants=grabowski-operator.service", unit)
+        self.assertNotIn("After=grabowski-operator.service", unit)
+        self.assertIn("--selector-file", unit)
+        self.assertIn("operator-routing-selector.json", unit)
+
+
+class AuthenticSnapshotCutoverTests(unittest.TestCase):
+    def _source_receipt(self, now_unix: int) -> dict[str, object]:
+        declaration = {
+            "client_id": "external-client",
+            "session_id": "session-1",
+            "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+            "observed_tool_count": 1,
+            "observed_names_sha256": NAMES_SHA256,
+            "observed_release_id": "blue",
+            "observed_agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "observed_tools_artifact_sha256": ARTIFACT_SHA256,
+        }
+        receipt = {
+            "schema_version": client_snapshot.SNAPSHOT_SCHEMA_VERSION,
+            "kind": client_snapshot.SNAPSHOT_KIND,
+            "created_at_unix": now_unix - 1,
+            "expires_at_unix": now_unix + 60,
+            "client_declaration": declaration,
+            "client_declaration_sha256": client_snapshot._sha256_json(declaration),
+            "server_binding": {
+                "registered_tool_count": 1,
+                "registered_names_sha256": NAMES_SHA256,
+                "release_id": "blue",
+                "repo_head": HEAD_BLUE,
+                "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            },
+            "schema_evidence": {
+                "probe": {"matches": True, "schema_contract_matches": True}
+            },
+            "cutover_binding": None,
+            "verified": True,
+            "mismatches": [],
+            "verification_model": "external-observation-test",
+            "does_not_establish": [],
+        }
+        receipt["receipt_sha256"] = client_snapshot._sha256_json(receipt)
+        return receipt
+
+    def test_rebind_preserves_authentic_external_declaration_and_source_hash(self) -> None:
+        now_unix = 1_000
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "snapshot"
+            state_root.mkdir(mode=0o700)
+            snapshot_path = state_root / "current.json"
+            source = self._source_receipt(now_unix)
+            with mock.patch.multiple(
+                client_snapshot,
+                STATE_ROOT=state_root,
+                LOCK_PATH=state_root / "snapshot.lock",
+                SNAPSHOT_PATH=snapshot_path,
+            ):
+                client_snapshot._write_private_json(snapshot_path, source)
+                result = client_snapshot.rebind_authentic_snapshot_for_cutover(
+                    cutover_id="cutover-1",
+                    cutover_generation=1,
+                    current_release_id="blue",
+                    current_repo_head=HEAD_BLUE,
+                    green_release_id="green",
+                    green_repo_head=HEAD_GREEN,
+                    registered_tool_count=1,
+                    registered_names_sha256=NAMES_SHA256,
+                    agent_instructions_sha256=INSTRUCTIONS_SHA256,
+                    green_readiness={
+                        "ready": True,
+                        "release_id": "green",
+                        "repo_head": HEAD_GREEN,
+                        "names_sha256": NAMES_SHA256,
+                        "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+                    },
+                    now_unix=now_unix,
+                )
+                rebound = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                result["source_receipt_sha256"], source["receipt_sha256"]
+            )
+            self.assertEqual(
+                rebound["client_declaration"], source["client_declaration"]
+            )
+            self.assertEqual(rebound["server_binding"]["release_id"], "green")
+            self.assertIn(
+                "external client has refreshed against green",
+                " ".join(result["does_not_establish"]),
+            )
+
+    def test_rebind_rejects_synthetic_proof_before_writing(self) -> None:
+        with self.assertRaisesRegex(client_snapshot.ClientSnapshotError, "synthetic"):
+            client_snapshot.rebind_authentic_snapshot_for_cutover(
+                cutover_id="cutover-1",
+                cutover_generation=1,
+                current_release_id="blue",
+                current_repo_head=HEAD_BLUE,
+                green_release_id="green",
+                green_repo_head=HEAD_GREEN,
+                registered_tool_count=1,
+                registered_names_sha256="0" * 64,
+                agent_instructions_sha256=INSTRUCTIONS_SHA256,
+                green_readiness={},
+            )
+
+
+class _FakeProductionRuntime:
+    def __init__(self, *, fail_phase: str | None = None) -> None:
+        self.fail_phase = fail_phase
+        self.connector_switched = False
+        self.rollback_calls = 0
+
+    def _step(self, phase: str, value: dict[str, object]) -> dict[str, object]:
+        if self.fail_phase == phase:
+            raise RuntimeError(f"{phase} failed")
+        return value
+
+    def start_green(self):
+        return self._step("start_green", {"started": True})
+
+    def verify_green(self):
+        return self._step("verify_green", {"ready": True})
+
+    def close_blue_mutations(self):
+        return self._step("close_blue", {"closed": True})
+
+    def terminalize_blue_effects(self):
+        return self._step("drain", {"blocking_tool_calls": 0})
+
+    def switch_connector(self):
+        value = self._step("switch", {"selector_sha256": "9a" * 32})
+        self.connector_switched = True
+        return value
+
+    def rebind_snapshot(self, cutover_id, generation):
+        return self._step("rebind", {"receipt_sha256": "9b" * 32})
+
+    def retire_blue(self):
+        return self._step(
+            "retire",
+            {"final_routing": {"selector_sha256": "9c" * 32}},
+        )
+
+    def authoritative_readback(self):
+        return {"authoritative": True, "readback_sha256": "9d" * 32}
+
+    def rollback_green(self):
+        self.rollback_calls += 1
+        return {"blue_preserved": True}
+
+
+class ProductionRecoverySemanticsTests(unittest.TestCase):
+    def _run(self, runtime: _FakeProductionRuntime) -> dict[str, object]:
+        def receipt(**kwargs):
+            return {
+                "receipt_sha256": "9e" * 32,
+                "outcome": kwargs["outcome"],
+                "phase": kwargs["phase"],
+            }
+
+        with (
+            mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
+            mock.patch.object(
+                dual, "prepare_production_blue_green_runtime", return_value=runtime
+            ),
+            mock.patch.object(
+                dual, "_production_blue_green_receipt", side_effect=receipt
+            ),
+            mock.patch.object(
+                dual,
+                "_persist_production_blue_green_receipt",
+                return_value={"path": "/state/receipt.json", "receipt_sha256": "9e" * 32},
+            ),
+        ):
+            return dual.run_production_blue_green_cutover(
+                repo=ROOT,
+                expected_head=HEAD_GREEN,
+                source_identity_sha256=SOURCE_IDENTITY_SHA256,
+                cutover_id="cutover-test",
+            )
+
+    def test_pre_switch_failure_rolls_back_and_preserves_blue(self) -> None:
+        runtime = _FakeProductionRuntime(fail_phase="verify_green")
+        result = self._run(runtime)
+        self.assertEqual(result["outcome"], "rolled_back")
+        self.assertEqual(runtime.rollback_calls, 1)
+        self.assertFalse(runtime.connector_switched)
+
+    def test_post_switch_failure_is_unknown_without_blind_rollback(self) -> None:
+        runtime = _FakeProductionRuntime(fail_phase="rebind")
+        result = self._run(runtime)
+        self.assertEqual(result["outcome"], "outcome_unknown")
+        self.assertEqual(runtime.rollback_calls, 0)
+        self.assertTrue(runtime.connector_switched)
+
+    def test_failed_snapshot_preflight_still_persists_typed_receipt(self) -> None:
+        persisted: list[dict[str, object]] = []
+
+        def persist(receipt):
+            persisted.append(receipt)
+            return {
+                "path": "/state/preflight.json",
+                "receipt_sha256": receipt["receipt_sha256"],
+            }
+
+        with (
+            mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
+            mock.patch.object(
+                dual,
+                "prepare_production_blue_green_runtime",
+                side_effect=client_snapshot.ClientSnapshotError(
+                    "authentic connector snapshot is unavailable"
+                ),
+            ),
+            mock.patch.object(
+                dual, "_persist_production_blue_green_receipt", side_effect=persist
+            ),
+        ):
+            result = dual.run_production_blue_green_cutover(
+                repo=ROOT,
+                expected_head=HEAD_GREEN,
+                source_identity_sha256=SOURCE_IDENTITY_SHA256,
+                cutover_id="cutover-preflight",
+            )
+        self.assertEqual(result["outcome"], "failed_pre_cutover")
+        self.assertEqual(len(persisted), 1)
+        receipt = persisted[0]
+        self.assertEqual(receipt["expected_head"], HEAD_GREEN)
+        self.assertEqual(receipt["source_identity_sha256"], SOURCE_IDENTITY_SHA256)
+        self.assertIsNone(receipt["selector_switch"])
+        self.assertTrue(receipt["recovery"]["blue_preserved"])
+
+    def test_ambiguous_selector_publish_is_classified_post_switch(self) -> None:
+        runtime = mock.Mock()
+        runtime.selector_before = {"selector_sha256": "1a" * 32}
+        runtime.green_binding = runtime_binding("green", HEAD_GREEN)
+        runtime.cutover_id = "cutover-ambiguous"
+        runtime.connector_switched = False
+        runtime.current_selector = runtime.selector_before
+        changed = {
+            "selector_sha256": "2b" * 32,
+            "selected_slot": "green",
+        }
+        with (
+            mock.patch.object(
+                dual.transport_ingress,
+                "publish_routing_selector",
+                side_effect=OSError("readback failed after replace"),
+            ),
+            mock.patch.object(
+                dual.transport_ingress,
+                "read_routing_selector",
+                return_value=changed,
+            ),
+        ):
+            with self.assertRaises(OSError):
+                dual.ProductionBlueGreenRuntime.switch_connector(runtime)
+        self.assertTrue(runtime.connector_switched)
+        self.assertEqual(runtime.current_selector, changed)
+
+
+class ProductionPreflightHardeningTests(unittest.TestCase):
+    def test_stale_external_declaration_fails_before_connector_switch(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.repo_head = HEAD_GREEN
+        snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])
+        topology = mock.Mock(kind="url", server_url_port=18180)
+        build = mock.Mock(
+            release_path=Path("/release/green"),
+            release_id="green",
+            agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+        )
+        blue_binding = runtime_binding("blue", HEAD_BLUE)
+        green_binding = runtime_binding("green", HEAD_GREEN)
+        selector = {
+            "selected_slot": "canonical",
+            "selector_sha256": "9a" * 32,
+            "runtime_binding": blue_binding,
+            "runtime_binding_sha256": "9b" * 32,
+        }
+        stale_transition_status = {
+            "state": "matched",
+            "external_client_snapshot_observable": True,
+            "external_client_schema_observable": True,
+            # Internal transition continuity may make snapshot_status matched,
+            # but it is not a fresh external observation of current Blue.
+            "client_observed_release_id": "older-blue",
+            "receipt_sha256": "9c" * 32,
+            "client_declaration_sha256": "9d" * 32,
+            "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+            "schema_observable": True,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "preflight_url",
+                return_value=(snapshot, Path("/runtime"), topology),
+            ),
+            mock.patch.object(dual, "require_service_active"),
+            mock.patch.object(
+                dual.core,
+                "read_manifest",
+                return_value={
+                    "entrypoint_contract": {"expected_tools": ["grabowski_status"]}
+                },
+            ),
+            mock.patch.object(
+                dual.transport_ingress,
+                "_read_runtime_binding",
+                side_effect=[(blue_binding, []), (green_binding, [])],
+            ),
+            mock.patch.object(
+                dual.transport_ingress,
+                "read_routing_selector",
+                return_value=selector,
+            ),
+            mock.patch.object(dual, "_require_selector_authority"),
+            mock.patch.object(dual.core, "build_release", return_value=build),
+            mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(dual.core, "verify_manifest"),
+            mock.patch.object(
+                dual.client_snapshot,
+                "snapshot_status",
+                return_value=stale_transition_status,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Authentic fresh external connector snapshot is unavailable"
+            ):
+                dual.prepare_production_blue_green_runtime(
+                    ROOT,
+                    Path("/runtime"),
+                    Path("/profile.json"),
+                    expected_head=HEAD_GREEN,
+                    cutover_id="cutover-stale-external",
+                    timeout_seconds=10,
+                )
+
+    def test_blue_admission_stays_closed_until_old_operator_is_stopped(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock()
+        build = mock.Mock(
+            release_path=Path("/release/green"),
+            release_id="green",
+            agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+        )
+        selector = {
+            "selector_sha256": "8a" * 32,
+            "selected_slot": "green",
+            "upstream_port": 18182,
+            "runtime_binding": runtime_binding("green", HEAD_GREEN),
+            "runtime_binding_sha256": "8b" * 32,
+        }
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(),
+            blue_manifest={},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before=selector,
+            cutover_id="cutover-sequence",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            admission_marker={"marker": "active"},
+            green_started=True,
+            connector_switched=True,
+            current_selector=selector,
+        )
+        events: list[str] = []
+        canonical = {
+            **selector,
+            "selector_sha256": "8c" * 32,
+            "selected_slot": "canonical",
+            "upstream_port": 18181,
+        }
+        with (
+            mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(
+                dual.core,
+                "activate_pointer",
+                side_effect=lambda *_args, **_kwargs: events.append("activate-pointer"),
+            ),
+            mock.patch.object(
+                dual,
+                "stop_service",
+                side_effect=lambda *_args, **_kwargs: events.append("stop-blue"),
+            ),
+            mock.patch.object(
+                dual,
+                "observe_service",
+                return_value=mock.Mock(confirmed_active=True),
+            ),
+            mock.patch.object(dual, "_require_selector_authority", return_value={"authoritative": True}),
+            mock.patch.object(
+                dual,
+                "release_operator_deployment_admission",
+                side_effect=lambda *_args, **_kwargs: events.append("release-admission"),
+            ),
+            mock.patch.object(
+                dual,
+                "start_service",
+                side_effect=lambda *_args, **_kwargs: events.append("start-canonical"),
+            ),
+            mock.patch.object(dual, "verify_operator_process"),
+            mock.patch.object(dual, "_require_loopback_listener", return_value={}),
+            mock.patch.object(
+                dual.transport_ingress,
+                "publish_routing_selector",
+                return_value=canonical,
+            ),
+            mock.patch.object(dual, "_probe_release_runtime", return_value={"ready": True}),
+            mock.patch.object(dual, "_stop_green_operator", return_value={"retired": True}),
+            mock.patch.object(dual, "require_service_active"),
+            mock.patch.object(
+                dual,
+                "verify_url_runtime_identity",
+                return_value={
+                    "process": {"pid": 123},
+                    "manifest": {"release_id": "green", "repo_head": HEAD_GREEN},
+                },
+            ),
+        ):
+            result = runtime.retire_blue()
+        self.assertTrue(result["retired"])
+        self.assertLess(events.index("stop-blue"), events.index("release-admission"))
+        self.assertLess(events.index("release-admission"), events.index("start-canonical"))
+        self.assertIsNone(runtime.admission_marker)
+
+    def test_green_inherits_only_canonical_nonsecret_recovery_environment(self) -> None:
+        observed = mock.Mock(
+            returncode=0,
+            stdout=(
+                "PYTHONUNBUFFERED=1 "
+                "GRABOWSKI_SERVER_RECOVERY_HOST=heimberry "
+                "GRABOWSKI_SERVER_RECOVERY_TARGET=heimberry:rest-server/probe "
+                "UNRELATED_SECRET=do-not-copy"
+            ),
+        )
+        with mock.patch.object(dual.core, "run", return_value=observed) as run:
+            environment = dual._canonical_operator_green_environment()
+        self.assertEqual(
+            environment,
+            {
+                "GRABOWSKI_SERVER_RECOVERY_HOST": "heimberry",
+                "GRABOWSKI_SERVER_RECOVERY_TARGET": "heimberry:rest-server/probe",
+            },
+        )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], dual.core.TIMEOUTS["systemd_query"]
+        )
+
+
+class ScheduledPathContractTests(unittest.TestCase):
+    def test_normal_runner_has_no_simulated_or_stop_world_default(self) -> None:
+        source = (ROOT / "tools/run_scheduled_deploy.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("run_production_blue_green_cutover", source)
+        self.assertNotIn("default_local_blue_green_hooks", source)
+        self.assertNotIn('["make", "deploy-apply"]', source)
+
+
+if __name__ == "__main__":
+    unittest.main()

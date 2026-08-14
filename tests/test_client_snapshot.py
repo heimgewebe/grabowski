@@ -914,6 +914,30 @@ class ClientSnapshotTests(unittest.TestCase):
             ):
                 snapshot._validate_loopback_mcp_url(url)
 
+    def test_runtime_readiness_probe_endpoints_are_auth_mode_bound(self) -> None:
+        self.assertEqual(
+            snapshot._validate_runtime_probe_mcp_url(
+                "http://127.0.0.1:18182/mcp", auth_mode="connector"
+            ),
+            "http://127.0.0.1:18182/mcp",
+        )
+        self.assertEqual(
+            snapshot._validate_runtime_probe_mcp_url(
+                "http://127.0.0.1:18180/mcp", auth_mode="ingress"
+            ),
+            "http://127.0.0.1:18180/mcp",
+        )
+        for url, auth_mode in (
+            ("http://127.0.0.1:18180/mcp", "connector"),
+            ("http://127.0.0.1:18182/mcp", "ingress"),
+            ("http://127.0.0.1:18181/mcp", "connector"),
+            ("http://localhost:18182/mcp", "connector"),
+        ):
+            with self.subTest(url=url, auth_mode=auth_mode), self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "bound loopback endpoint"
+            ):
+                snapshot._validate_runtime_probe_mcp_url(url, auth_mode=auth_mode)
+
     def test_auto_refresh_connector_capability_reader_is_private_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

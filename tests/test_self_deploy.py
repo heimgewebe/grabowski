@@ -185,6 +185,28 @@ def _sidecar_reconciliation(expected: str = "f" * 40) -> dict[str, object]:
     }
     return {**material, "evidence_sha256": RUNNER.canonical_json_sha256(material)}
 
+
+def _productive_blue_green_result(expected: str = "f" * 40) -> dict[str, object]:
+    summary = {
+        "schema_version": 1,
+        "kind": "grabowski_scheduled_blue_green_summary",
+        "receipt_sha256": "ab" * 32,
+        "outcome": "completed",
+        "expected_head": expected,
+        "source_identity_sha256": "cd" * 32,
+    }
+    return {
+        "outcome": "completed",
+        "receipt_sha256": "ab" * 32,
+        "receipt_path": "/state/blue-green.json",
+        "receipt": {
+            "receipt_sha256": "ab" * 32,
+            "outcome": "completed",
+            "expected_head": expected,
+        },
+        "summary": summary,
+    }
+
 class SelfDeployToolTests(unittest.TestCase):
     def test_annotations_and_schema_bounds(self) -> None:
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.readOnlyHint)
@@ -1251,6 +1273,15 @@ class SelfDeployToolTests(unittest.TestCase):
 
 
 class ScheduledDeployRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.productive_blue_green = patch.object(
+            RUNNER,
+            "run_productive_blue_green",
+            return_value=_productive_blue_green_result(),
+        )
+        self.productive_blue_green_mock = self.productive_blue_green.start()
+        self.addCleanup(self.productive_blue_green.stop)
+
     def test_capture_fails_closed_on_excess_output(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "exceeded"):
             RUNNER.run_capture(
@@ -1755,7 +1786,13 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.assertEqual(preflight.call_count, 3)
         self.assertEqual(verify.call_count, 6)
         self.assertEqual(sleep.call_args_list, [call(5), call(5), call(10)])
-        self.assertEqual(streamed.call_count, 2)
+        streamed.assert_called_once_with(
+            ["make", "validate"],
+            cwd=repo,
+            timeout_seconds=1200,
+            phase="validate",
+        )
+        self.assertEqual(self.productive_blue_green_mock.call_count, 1)
 
     def test_main_fails_after_bounded_contention_retries(self) -> None:
         repo = Path("/tmp/repository")
@@ -1852,7 +1889,11 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 4)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
-        self.assertEqual(streamed.call_args_list[1].args[0], ["make", "deploy-apply"])
+        self.productive_blue_green_mock.assert_called_once_with(
+            repo=repo,
+            expected_head=expected,
+            source_identity_sha256="0" * 64,
+        )
 
     def test_main_rejects_source_drift_before_sidecar_install(self) -> None:
         repo = Path("/tmp/repository")
@@ -1886,7 +1927,13 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         ) as reconcile:
             self.assertEqual(RUNNER.main(), 1)
         self.assertEqual(verify.call_count, 3)
-        self.assertEqual(streamed.call_count, 2)
+        streamed.assert_called_once_with(
+            ["make", "validate"],
+            cwd=repo,
+            timeout_seconds=1200,
+            phase="validate",
+        )
+        self.productive_blue_green_mock.assert_called_once()
         reconcile.assert_not_called()
 
     def test_finalization_binding_and_atomic_receipt_are_hash_bound(self) -> None:
@@ -1995,6 +2042,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=expected,
             release_id="release",
             failure_type=None,
+            blue_green=_productive_blue_green_result()["summary"],
         )
 
     def test_main_marks_runtime_live_sidecar_failure_as_outstanding(self) -> None:
@@ -2034,6 +2082,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=None,
             release_id=None,
             failure_type="SidecarInstallOutstanding",
+            blue_green=_productive_blue_green_result()["summary"],
         )
 
     def test_main_writes_failed_receipt_for_runner_failure(self) -> None:
@@ -2048,6 +2097,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=None,
             release_id=None,
             failure_type="RuntimeError",
+            blue_green=None,
         )
 
     def test_make_deploy_schedules_not_direct_apply(self) -> None:
@@ -2057,6 +2107,12 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             makefile,
         )
         self.assertIn("tools/deploy_runtime_dual.py --apply", makefile)
+        self.assertIn('test "$(BOOTSTRAP_RECOVERY)" = "1"', makefile)
+        runner_source = (ROOT / "tools/run_scheduled_deploy.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("run_productive_blue_green", runner_source)
+        self.assertNotIn('["make", "deploy-apply"]', runner_source)
         self.assertIn(
             'GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python',
             makefile,

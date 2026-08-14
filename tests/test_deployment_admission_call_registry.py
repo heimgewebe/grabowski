@@ -224,6 +224,13 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual(0, snapshot["read_only_active_tool_calls"])
         self.assertEqual("readOnlyHint-true-is-read-only-v1", snapshot["effect_classification"])
         self.assertEqual(
+            "live_grabowski_operator_call_boundary",
+            snapshot["registry_authority"],
+        )
+        self.assertEqual("draining", snapshot["effect_terminalization_state"])
+        self.assertFalse(snapshot["read_calls_block_retirement"])
+        self.assertRegex(snapshot["registry_observation_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
             {
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC: sync_count,
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC: async_count,

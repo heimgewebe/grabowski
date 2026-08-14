@@ -68,6 +68,10 @@ REUSABLE_JOB_STATUSES = frozenset({"running"})
 TERMINAL_JOB_STATUSES = frozenset({"completed", "succeeded", "failed", "launch_failed"})
 BLUE_GREEN_RECEIPT_KIND = "grabowski_blue_green_deployment_receipt"
 BLUE_GREEN_RECEIPT_SCHEMA_VERSION = 1
+BLUE_GREEN_RECEIPT_ROOT = (
+    Path.home() / ".local/state/grabowski/blue-green-deployment-receipts"
+)
+MAX_BLUE_GREEN_RECEIPT_BYTES = 256 * 1024
 
 
 class BlueGreenCutoverError(RuntimeError):
@@ -117,6 +121,7 @@ class BlueGreenHooks:
     terminalize_blue_effects: Callable[[], dict[str, Any]]
     retire_blue: Callable[[], dict[str, Any]]
     rollback_green: Callable[[], dict[str, Any]]
+    authoritative_readback: Callable[[], dict[str, Any]] | None = None
     observations: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -211,6 +216,9 @@ def build_deployment_receipt(
     green_readiness: dict[str, Any] | None,
     snapshot_rebind: dict[str, Any] | None,
     effect_terminalization: dict[str, Any] | None,
+    selector_switch: dict[str, Any] | None,
+    retirement: dict[str, Any] | None,
+    authoritative_readback: dict[str, Any] | None,
     observations: list[dict[str, Any]],
     outcome: str,
     recovery: dict[str, Any] | None = None,
@@ -245,7 +253,13 @@ def build_deployment_receipt(
                 "client_declaration_sha256": snapshot_rebind.get(
                     "client_declaration_sha256"
                 ),
+                "source_receipt_sha256": snapshot_rebind.get(
+                    "source_receipt_sha256"
+                ),
                 "cutover_binding": snapshot_rebind.get("cutover_binding"),
+                "cutover_transition": snapshot_rebind.get(
+                    "cutover_transition"
+                ),
                 "verified": snapshot_rebind.get("verified"),
             }
             if isinstance(snapshot_rebind, dict)
@@ -254,13 +268,33 @@ def build_deployment_receipt(
         "effect_terminalization": (
             {
                 "terminalized_count": effect_terminalization.get("terminalized_count"),
+                "initial_blocking_tool_calls": effect_terminalization.get(
+                    "initial_blocking_tool_calls"
+                ),
+                "blocking_tool_calls": effect_terminalization.get(
+                    "blocking_tool_calls"
+                ),
                 "remaining_read_count": effect_terminalization.get(
                     "remaining_read_count"
+                ),
+                "read_only_active_tool_calls": effect_terminalization.get(
+                    "read_only_active_tool_calls"
+                ),
+                "operator_observation_sha256": effect_terminalization.get(
+                    "operator_observation_sha256"
                 ),
             }
             if isinstance(effect_terminalization, dict)
             else None
         ),
+        "selector_switch": selector_switch,
+        "retirement": retirement,
+        "final_routing": (
+            retirement.get("final_routing")
+            if isinstance(retirement, dict)
+            else None
+        ),
+        "authoritative_readback": authoritative_readback,
         "observations": [
             {
                 "phase": item.get("phase"),
@@ -282,6 +316,81 @@ def build_deployment_receipt(
         ],
     }
     return {**material, "receipt_sha256": _sha256_json(material)}
+
+
+def persist_blue_green_receipt(
+    receipt: dict[str, Any],
+    *,
+    root: Path = BLUE_GREEN_RECEIPT_ROOT,
+) -> dict[str, str]:
+    """Create one immutable private receipt and verify exact readback."""
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("kind") != BLUE_GREEN_RECEIPT_KIND
+        or receipt.get("schema_version") != BLUE_GREEN_RECEIPT_SCHEMA_VERSION
+    ):
+        raise ValueError("blue-green deployment receipt is invalid")
+    declared = receipt.get("receipt_sha256")
+    unsigned = dict(receipt)
+    unsigned.pop("receipt_sha256", None)
+    if (
+        not isinstance(declared, str)
+        or re.fullmatch(r"[0-9a-f]{64}", declared) is None
+        or _sha256_json(unsigned) != declared
+    ):
+        raise ValueError("blue-green deployment receipt hash mismatch")
+    cutover_id = receipt.get("cutover_id")
+    if (
+        not isinstance(cutover_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", cutover_id) is None
+    ):
+        raise ValueError("blue-green cutover id is invalid")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = root.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or root.resolve(strict=True) != root
+    ):
+        raise PermissionError(
+            "blue-green receipt directory must be private and owner-controlled"
+        )
+    encoded = _canonical_json_bytes(receipt) + b"\n"
+    if len(encoded) > MAX_BLUE_GREEN_RECEIPT_BYTES:
+        raise ValueError("blue-green deployment receipt exceeds size bound")
+    path = root / f"{cutover_id}.json"
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
+                raise OSError("blue-green receipt write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_descriptor = os.open(
+        root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    observed = json.loads(path.read_text(encoding="utf-8"))
+    if observed != receipt:
+        raise RuntimeError("blue-green deployment receipt readback mismatch")
+    return {"path": str(path), "receipt_sha256": declared}
 
 
 def execute_blue_green_cutover(
@@ -306,6 +415,9 @@ def execute_blue_green_cutover(
     green_readiness: dict[str, Any] | None = None
     snapshot_rebind: dict[str, Any] | None = None
     effect_terminalization: dict[str, Any] | None = None
+    selector_switch: dict[str, Any] | None = None
+    retirement: dict[str, Any] | None = None
+    authoritative_readback: dict[str, Any] | None = None
     connector_switched = False
     green_started = False
 
@@ -344,20 +456,55 @@ def execute_blue_green_cutover(
         )
 
         phase = "pre_cutover_ready"
-        _record_observation(hooks, plan, phase)
-
-        phase = "cutover"
-        switch_result = hooks.switch_connector()
-        connector_switched = True
-        snapshot_rebind = hooks.rebind_snapshot(
-            plan["cutover_id"], plan["cutover_generation"]
-        )
+        close_result = hooks.close_blue_mutations()
+        effect_terminalization = hooks.terminalize_blue_effects()
+        if (
+            not isinstance(effect_terminalization, dict)
+            or "terminalized_count" not in effect_terminalization
+        ):
+            fail(
+                "effect-bearing drain returned an invalid operator receipt",
+                details={"effect_terminalization": effect_terminalization},
+            )
         _record_observation(
             hooks,
             plan,
             phase,
             details={
-                "switch": switch_result,
+                "close_blue": close_result,
+                "terminalized_count": effect_terminalization.get(
+                    "terminalized_count"
+                ),
+                "remaining_read_count": effect_terminalization.get(
+                    "remaining_read_count"
+                ),
+            },
+        )
+
+        phase = "cutover"
+        selector_switch = hooks.switch_connector()
+        connector_switched = True
+        snapshot_rebind = hooks.rebind_snapshot(
+            plan["cutover_id"], plan["cutover_generation"]
+        )
+        if (
+            not isinstance(snapshot_rebind, dict)
+            or snapshot_rebind.get("verified") is not True
+            or not isinstance(snapshot_rebind.get("receipt_sha256"), str)
+            or not isinstance(snapshot_rebind.get("source_receipt_sha256"), str)
+            or len(set(snapshot_rebind["receipt_sha256"])) == 1
+            or len(set(snapshot_rebind["source_receipt_sha256"])) == 1
+        ):
+            fail(
+                "cutover snapshot rebind lacks authentic receipt evidence",
+                details={"snapshot_rebind": snapshot_rebind},
+            )
+        _record_observation(
+            hooks,
+            plan,
+            phase,
+            details={
+                "switch": selector_switch,
                 "snapshot_receipt_sha256": (
                     snapshot_rebind.get("receipt_sha256")
                     if isinstance(snapshot_rebind, dict)
@@ -367,19 +514,14 @@ def execute_blue_green_cutover(
         )
 
         phase = "post_cutover"
-        close_result = hooks.close_blue_mutations()
-        _record_observation(hooks, plan, phase, details={"close_blue": close_result})
+        _record_observation(
+            hooks,
+            plan,
+            phase,
+            details={"connector_switched": True},
+        )
 
         phase = "terminalize_effects"
-        effect_terminalization = hooks.terminalize_blue_effects()
-        if (
-            not isinstance(effect_terminalization, dict)
-            or "terminalized_count" not in effect_terminalization
-        ):
-            fail(
-                "effect-bearing terminalization returned an invalid receipt",
-                details={"effect_terminalization": effect_terminalization},
-            )
         _record_observation(
             hooks,
             plan,
@@ -393,8 +535,23 @@ def execute_blue_green_cutover(
         )
 
         phase = "retire_blue"
-        retire_result = hooks.retire_blue()
-        _record_observation(hooks, plan, phase, details={"retire": retire_result})
+        retirement = hooks.retire_blue()
+        authoritative_readback = (
+            hooks.authoritative_readback()
+            if hooks.authoritative_readback is not None
+            else retirement.get("authoritative_readback")
+            if isinstance(retirement, dict)
+            else None
+        )
+        if (
+            not isinstance(authoritative_readback, dict)
+            or authoritative_readback.get("authoritative") is not True
+        ):
+            fail(
+                "final routing lacks authoritative ingress readback",
+                details={"retirement": retirement},
+            )
+        _record_observation(hooks, plan, phase, details={"retire": retirement})
 
         phase = "completed"
         _record_observation(hooks, plan, phase)
@@ -404,6 +561,9 @@ def execute_blue_green_cutover(
             green_readiness=green_readiness,
             snapshot_rebind=snapshot_rebind,
             effect_terminalization=effect_terminalization,
+            selector_switch=selector_switch,
+            retirement=retirement,
+            authoritative_readback=authoritative_readback,
             observations=hooks.observations,
             outcome="completed",
         )
@@ -427,6 +587,9 @@ def execute_blue_green_cutover(
                         green_readiness=green_readiness,
                         snapshot_rebind=snapshot_rebind,
                         effect_terminalization=effect_terminalization,
+                        selector_switch=selector_switch,
+                        retirement=retirement,
+                        authoritative_readback=authoritative_readback,
                         observations=hooks.observations,
                         outcome="outcome_unknown",
                         recovery={
@@ -442,6 +605,9 @@ def execute_blue_green_cutover(
                 green_readiness=green_readiness,
                 snapshot_rebind=snapshot_rebind,
                 effect_terminalization=effect_terminalization,
+                selector_switch=selector_switch,
+                retirement=retirement,
+                authoritative_readback=authoritative_readback,
                 observations=hooks.observations,
                 outcome="rolled_back",
                 recovery={
@@ -449,6 +615,14 @@ def execute_blue_green_cutover(
                     "reason": "failure occurred before connector cutover",
                 },
             )
+        if hooks.authoritative_readback is not None:
+            try:
+                authoritative_readback = hooks.authoritative_readback()
+            except Exception as readback_error:  # noqa: BLE001
+                authoritative_readback = {
+                    "authoritative": False,
+                    "error_type": type(readback_error).__name__,
+                }
         phase = "outcome_unknown"
         _record_observation(
             hooks,
@@ -466,6 +640,9 @@ def execute_blue_green_cutover(
             green_readiness=green_readiness,
             snapshot_rebind=snapshot_rebind,
             effect_terminalization=effect_terminalization,
+            selector_switch=selector_switch,
+            retirement=retirement,
+            authoritative_readback=authoritative_readback,
             observations=hooks.observations,
             outcome="outcome_unknown",
             recovery={
@@ -497,6 +674,9 @@ def execute_blue_green_cutover(
                         green_readiness=green_readiness,
                         snapshot_rebind=snapshot_rebind,
                         effect_terminalization=effect_terminalization,
+                        selector_switch=selector_switch,
+                        retirement=retirement,
+                        authoritative_readback=authoritative_readback,
                         observations=hooks.observations,
                         outcome="outcome_unknown",
                         recovery={
@@ -512,6 +692,9 @@ def execute_blue_green_cutover(
                 green_readiness=green_readiness,
                 snapshot_rebind=snapshot_rebind,
                 effect_terminalization=effect_terminalization,
+                selector_switch=selector_switch,
+                retirement=retirement,
+                authoritative_readback=authoritative_readback,
                 observations=hooks.observations,
                 outcome="rolled_back",
                 recovery={
@@ -519,6 +702,14 @@ def execute_blue_green_cutover(
                     "reason": "failure occurred before connector cutover",
                 },
             )
+        if hooks.authoritative_readback is not None:
+            try:
+                authoritative_readback = hooks.authoritative_readback()
+            except Exception as readback_error:  # noqa: BLE001
+                authoritative_readback = {
+                    "authoritative": False,
+                    "error_type": type(readback_error).__name__,
+                }
         phase = "outcome_unknown"
         _record_observation(
             hooks,
@@ -536,6 +727,9 @@ def execute_blue_green_cutover(
             green_readiness=green_readiness,
             snapshot_rebind=snapshot_rebind,
             effect_terminalization=effect_terminalization,
+            selector_switch=selector_switch,
+            retirement=retirement,
+            authoritative_readback=authoritative_readback,
             observations=hooks.observations,
             outcome="outcome_unknown",
             recovery={
@@ -551,7 +745,11 @@ def default_local_blue_green_hooks(
     green_readiness: dict[str, Any],
     snapshot_parameters: dict[str, Any] | None = None,
 ) -> BlueGreenHooks:
-    """Build hooks that exercise local serving-process and snapshot cutover seams."""
+    """Build explicit test-only hooks for deterministic protocol unit tests.
+
+    Production scheduling never calls this helper.  A real snapshot parameter
+    set is mandatory so the helper cannot manufacture receipt hashes.
+    """
 
     def start_green() -> dict[str, Any]:
         serving_process.set_role(serving_process.ROLE_STANDBY)
@@ -565,16 +763,9 @@ def default_local_blue_green_hooks(
 
     def rebind_snapshot(cutover_id: str, cutover_generation: int) -> dict[str, Any]:
         if snapshot_parameters is None:
-            return {
-                "verified": True,
-                "receipt_sha256": "0" * 64,
-                "client_declaration_sha256": "1" * 64,
-                "cutover_binding": {
-                    "cutover_id": cutover_id,
-                    "cutover_generation": cutover_generation,
-                    "rebind_role": "blue-green-cutover",
-                },
-            }
+            raise client_snapshot.ClientSnapshotError(
+                "test blue-green hooks require explicit snapshot parameters"
+            )
         return client_snapshot.rebind_for_cutover(
             snapshot_parameters,
             cutover_id=cutover_id,
@@ -591,6 +782,19 @@ def default_local_blue_green_hooks(
         return {
             "retired": True,
             "remaining_read_count": len(serving_process.active_read_calls()),
+            "final_routing": {"selected_slot": "canonical", "upstream_port": 18181},
+            "authoritative_readback": {
+                "authoritative": True,
+                "selected_slot": "canonical",
+                "upstream_port": 18181,
+            },
+        }
+
+    def authoritative_readback() -> dict[str, Any]:
+        return {
+            "authoritative": True,
+            "selected_slot": "canonical",
+            "upstream_port": 18181,
         }
 
     def rollback_green() -> dict[str, Any]:
@@ -606,6 +810,7 @@ def default_local_blue_green_hooks(
         terminalize_blue_effects=terminalize_blue_effects,
         retire_blue=retire_blue,
         rollback_green=rollback_green,
+        authoritative_readback=authoritative_readback,
     )
 
 

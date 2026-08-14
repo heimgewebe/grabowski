@@ -160,6 +160,28 @@ def _plan(**overrides: object) -> dict[str, object]:
     return self_deploy.build_blue_green_plan(**kwargs)
 
 
+def _test_hooks(green_readiness: dict[str, object]):
+    hooks = self_deploy.default_local_blue_green_hooks(
+        green_readiness=green_readiness
+    )
+
+    def rebind(cutover_id: str, cutover_generation: int) -> dict[str, object]:
+        return {
+            "verified": True,
+            "receipt_sha256": "ab" * 32,
+            "source_receipt_sha256": "cd" * 32,
+            "client_declaration_sha256": "ef" * 32,
+            "cutover_binding": {
+                "cutover_id": cutover_id,
+                "cutover_generation": cutover_generation,
+                "rebind_role": "blue-green-cutover",
+            },
+        }
+
+    hooks.rebind_snapshot = rebind
+    return hooks
+
+
 class ServingProcessBlueGreenTests(unittest.TestCase):
     def setUp(self) -> None:
         serving.reset_for_tests()
@@ -331,7 +353,7 @@ class BlueGreenOrchestrationTests(unittest.TestCase):
             "grabowski_task_start", serving.CALL_KIND_EFFECT_BEARING
         )
         plan = _plan()
-        hooks = self_deploy.default_local_blue_green_hooks(green_readiness=_ready_green())
+        hooks = _test_hooks(_ready_green())
         receipt = self_deploy.execute_blue_green_cutover(plan, hooks)
 
         self.assertEqual(receipt["outcome"], "completed")
@@ -361,7 +383,7 @@ class BlueGreenOrchestrationTests(unittest.TestCase):
 
     def test_pre_cutover_failure_rolls_back_without_switching(self) -> None:
         plan = _plan()
-        hooks = self_deploy.default_local_blue_green_hooks(
+        hooks = _test_hooks(
             green_readiness={"ready": False, "mismatches": ["schemas_or_sentinels"]}
         )
         switched = {"value": False}
@@ -379,7 +401,7 @@ class BlueGreenOrchestrationTests(unittest.TestCase):
 
     def test_post_cutover_failure_is_outcome_unknown(self) -> None:
         plan = _plan()
-        hooks = self_deploy.default_local_blue_green_hooks(green_readiness=_ready_green())
+        hooks = _test_hooks(_ready_green())
 
         def boom() -> dict[str, object]:
             raise RuntimeError("retire failed after switch")
@@ -398,7 +420,7 @@ class BlueGreenOrchestrationTests(unittest.TestCase):
         serving.register_call("long-read", serving.CALL_KIND_READ)
         serving.register_call("active-mutation", serving.CALL_KIND_EFFECT_BEARING)
         plan = _plan()
-        hooks = self_deploy.default_local_blue_green_hooks(green_readiness=_ready_green())
+        hooks = _test_hooks(_ready_green())
         receipt = self_deploy.execute_blue_green_cutover(plan, hooks)
         self.assertEqual(receipt["outcome"], "completed")
         self.assertEqual(receipt["effect_terminalization"]["terminalized_count"], 1)
@@ -414,7 +436,7 @@ class ConvergenceBlueGreenTests(unittest.TestCase):
         serving.freeze(RELEASE_BLUE, HEAD_BLUE)
         serving.register_call("mutation", serving.CALL_KIND_EFFECT_BEARING)
         plan = _plan()
-        hooks = self_deploy.default_local_blue_green_hooks(green_readiness=_ready_green())
+        hooks = _test_hooks(_ready_green())
         receipt = self_deploy.execute_blue_green_cutover(plan, hooks)
         profile = convergence.build_blue_green_deployment_profile(receipt)
         self.assertEqual(profile["profile_id"], convergence.BLUE_GREEN_PROFILE_ID)

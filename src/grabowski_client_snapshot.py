@@ -44,6 +44,7 @@ AUTO_REFRESH_CONNECTOR_TOKEN_PATH = (
     Path.home() / ".local/state/grabowski/transport-connectors/primary.token"
 )
 TRANSPORT_CONNECTOR_CAPABILITY_HEADER = "X-Grabowski-Connector-Capability"
+TRANSPORT_INGRESS_AUTH_HEADER = "X-Grabowski-Ingress-Auth"
 AUTO_REFRESH_RENEW_MARGIN_SECONDS = 900
 AUTO_REFRESH_TIMEOUT_SECONDS = 8.0
 MAX_DEPLOYMENT_MANIFEST_BYTES = 2 * 1024 * 1024
@@ -681,6 +682,228 @@ def rebind_for_cutover(
         "recommended_next_action": "none",
     }
 
+
+def _require_authentic_digest(value: Any, *, label: str) -> str:
+    digest = _validate_sha256(value, label=label)
+    if len(set(digest)) == 1:
+        raise ClientSnapshotError(f"{label} is synthetic and cannot prove cutover")
+    return digest
+
+
+def rebind_authentic_snapshot_for_cutover(
+    *,
+    cutover_id: str,
+    cutover_generation: int,
+    current_release_id: str,
+    current_repo_head: str,
+    green_release_id: str,
+    green_repo_head: str,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    agent_instructions_sha256: str,
+    green_readiness: dict[str, Any],
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Rebind a fresh external declaration without inventing a green observation.
+
+    The client declaration is copied byte-for-byte from a previously persisted,
+    hash-valid external connector receipt.  The new receipt records a transition
+    from that observed blue release to a separately verified green runtime.  It
+    therefore proves declaration continuity, not that the external platform has
+    already refreshed against green.
+    """
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise ClientSnapshotError("snapshot timestamp is invalid")
+    cutover_binding = _optional_cutover_binding(
+        {
+            "cutover_id": cutover_id,
+            "cutover_generation": cutover_generation,
+        }
+    )
+    assert cutover_binding is not None
+    if (
+        isinstance(registered_tool_count, bool)
+        or not isinstance(registered_tool_count, int)
+        or not 1 <= registered_tool_count <= 1_000
+    ):
+        raise ClientSnapshotError("registered tool count is invalid")
+    names_sha256 = _require_authentic_digest(
+        registered_names_sha256, label="registered_names_sha256"
+    )
+    instructions_sha256 = _require_authentic_digest(
+        agent_instructions_sha256, label="agent_instructions_sha256"
+    )
+    current_release = _validate_release_id(
+        current_release_id, label="current release id"
+    )
+    green_release = _validate_release_id(
+        green_release_id, label="green release id"
+    )
+    for label, head in (
+        ("current repository head", current_repo_head),
+        ("green repository head", green_repo_head),
+    ):
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+            raise ClientSnapshotError(f"{label} is invalid")
+    if (
+        not isinstance(green_readiness, dict)
+        or green_readiness.get("ready") is not True
+        or green_readiness.get("release_id") != green_release
+        or green_readiness.get("repo_head") != green_repo_head
+        or green_readiness.get("names_sha256") != names_sha256
+        or green_readiness.get("agent_instructions_sha256")
+        != instructions_sha256
+    ):
+        raise ClientSnapshotError(
+            "green readiness is not bound to the requested snapshot transition"
+        )
+
+    with _state_lock():
+        try:
+            source = _read_private_json(SNAPSHOT_PATH)
+        except FileNotFoundError as exc:
+            raise ClientSnapshotError(
+                "authentic connector snapshot is unavailable"
+            ) from exc
+        _validate_receipt(source)
+        source_receipt_sha256 = _require_authentic_digest(
+            source.get("receipt_sha256"), label="source receipt_sha256"
+        )
+        source_declaration_sha256 = _require_authentic_digest(
+            source.get("client_declaration_sha256"),
+            label="source client_declaration_sha256",
+        )
+        created = source.get("created_at_unix")
+        expires = source.get("expires_at_unix")
+        if (
+            isinstance(created, bool)
+            or not isinstance(created, int)
+            or isinstance(expires, bool)
+            or not isinstance(expires, int)
+            or not (created - SNAPSHOT_CLOCK_SKEW_SECONDS <= timestamp <= expires)
+        ):
+            raise ClientSnapshotError(
+                "authentic connector snapshot is missing or stale"
+            )
+        declaration = source.get("client_declaration")
+        source_binding = source.get("server_binding")
+        schema_evidence = source.get("schema_evidence")
+        if (
+            source.get("verified") is not True
+            or source.get("mismatches")
+            or not isinstance(declaration, dict)
+            or declaration.get("observation_scope")
+            != OBSERVATION_SCOPE_EXTERNAL_CLIENT
+            or not isinstance(source_binding, dict)
+            or not isinstance(schema_evidence, dict)
+            or not isinstance(schema_evidence.get("probe"), dict)
+            or schema_evidence["probe"].get("matches") is not True
+            or schema_evidence["probe"].get("schema_contract_matches") is not True
+        ):
+            raise ClientSnapshotError(
+                "authentic external connector schema receipt is required"
+            )
+        if (
+            source_binding.get("release_id") != current_release
+            or source_binding.get("repo_head") != current_repo_head
+            or declaration.get("observed_release_id") != current_release
+            or declaration.get("observed_tool_count") != registered_tool_count
+            or declaration.get("observed_names_sha256") != names_sha256
+            or declaration.get("observed_agent_instructions_sha256")
+            != instructions_sha256
+            or source_binding.get("registered_tool_count")
+            != registered_tool_count
+            or source_binding.get("registered_names_sha256") != names_sha256
+            or source_binding.get("agent_instructions_sha256")
+            != instructions_sha256
+        ):
+            raise ClientSnapshotError(
+                "authentic connector snapshot does not match blue or green surface continuity"
+            )
+        for label, value in (
+            ("observed names hash", declaration.get("observed_names_sha256")),
+            (
+                "observed instructions hash",
+                declaration.get("observed_agent_instructions_sha256"),
+            ),
+            (
+                "observed artifact hash",
+                declaration.get("observed_tools_artifact_sha256"),
+            ),
+        ):
+            _require_authentic_digest(value, label=label)
+
+        server_binding = {
+            "registered_tool_count": registered_tool_count,
+            "registered_names_sha256": names_sha256,
+            "release_id": green_release,
+            "repo_head": green_repo_head,
+            "agent_instructions_sha256": instructions_sha256,
+        }
+        transition = {
+            "source_receipt_sha256": source_receipt_sha256,
+            "source_client_declaration_sha256": source_declaration_sha256,
+            "from_release_id": current_release,
+            "from_repo_head": current_repo_head,
+            "to_release_id": green_release,
+            "to_repo_head": green_repo_head,
+            "surface_continuity_sha256": _sha256_json(
+                {
+                    "registered_tool_count": registered_tool_count,
+                    "registered_names_sha256": names_sha256,
+                    "agent_instructions_sha256": instructions_sha256,
+                }
+            ),
+            "green_readiness_sha256": _sha256_json(green_readiness),
+        }
+        receipt = {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "kind": SNAPSHOT_KIND,
+            "created_at_unix": timestamp,
+            "expires_at_unix": timestamp + SNAPSHOT_TTL_SECONDS,
+            "client_declaration": declaration,
+            "client_declaration_sha256": source_declaration_sha256,
+            "server_binding": server_binding,
+            "schema_evidence": schema_evidence,
+            "cutover_binding": cutover_binding,
+            "cutover_transition": transition,
+            "verified": True,
+            "mismatches": [],
+            "verification_model": (
+                "external-client-prior-observation+green-runtime-readiness+"
+                "cutover-rebind-v2"
+            ),
+            "does_not_establish": [
+                "that the external client has refreshed against green",
+                "platform connector catalog publication",
+                "application success of any tool call",
+                "resistance to compromised same-uid code",
+            ],
+        }
+        receipt["receipt_sha256"] = _sha256_json(receipt)
+        _write_private_json(SNAPSHOT_PATH, receipt)
+        readback = _read_private_json(SNAPSHOT_PATH)
+        _validate_receipt(readback)
+        if readback.get("receipt_sha256") != receipt["receipt_sha256"]:
+            raise ClientSnapshotError("cutover snapshot rebind readback mismatch")
+    return {
+        "schema_version": 1,
+        "state": "matched",
+        "verified": True,
+        "cutover_rebind": True,
+        "observation_scope": OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+        "client_declaration_sha256": source_declaration_sha256,
+        "source_receipt_sha256": source_receipt_sha256,
+        "receipt_sha256": receipt["receipt_sha256"],
+        "cutover_binding": cutover_binding,
+        "cutover_transition": transition,
+        "verification_model": receipt["verification_model"],
+        "schema_contract_matches": True,
+        "recommended_next_action": "refresh external client publication evidence",
+        "does_not_establish": list(receipt["does_not_establish"]),
+    }
+
 def _validate_receipt(receipt: dict[str, Any]) -> None:
     if receipt.get("schema_version") != SNAPSHOT_SCHEMA_VERSION or receipt.get("kind") != SNAPSHOT_KIND:
         raise ClientSnapshotError("client snapshot receipt contract mismatch")
@@ -1099,10 +1322,26 @@ def snapshot_status(
     binding_matches = all(
         binding.get(key) == value for key, value in expected.items()
     )
+    transition = receipt.get("cutover_transition")
+    transition_matches = (
+        isinstance(transition, dict)
+        and transition.get("source_client_declaration_sha256")
+        == receipt.get("client_declaration_sha256")
+        and transition.get("from_release_id")
+        == declaration.get("observed_release_id")
+        and transition.get("to_release_id") == expected_release_id
+        and transition.get("to_repo_head") == expected_repo_head
+        and isinstance(transition.get("source_receipt_sha256"), str)
+        and _SHA256_RE.fullmatch(transition["source_receipt_sha256"]) is not None
+        and len(set(transition["source_receipt_sha256"])) > 1
+    )
     declaration_matches = (
         declaration.get("observed_tool_count") == expected_tool_count
         and declaration.get("observed_names_sha256") == expected_names_sha256
-        and declaration.get("observed_release_id") == expected_release_id
+        and (
+            declaration.get("observed_release_id") == expected_release_id
+            or transition_matches
+        )
         and declaration.get("observed_agent_instructions_sha256")
         == expected_agent_instructions_sha256
     )
@@ -1189,6 +1428,7 @@ def snapshot_status(
         "state": state,
         "observable": observable,
         "observation_scope": observation_scope,
+        "client_observed_release_id": declaration.get("observed_release_id"),
         "schema_observable": external_client_schema_observable,
         "schema_evidence_observed": schema_evidence_observed,
         "schema_contract_matches": external_client_schema_contract_matches,
@@ -1417,7 +1657,31 @@ def _validate_loopback_mcp_url(url: str) -> str:
         raise ClientSnapshotError(
             "MCP snapshot observer requires the bound loopback operator endpoint"
         )
-    return AUTO_REFRESH_MCP_URL
+    return url
+
+
+def _validate_runtime_probe_mcp_url(url: str, *, auth_mode: str) -> str:
+    """Bind productive readiness probes to their exact loopback authority."""
+    if auth_mode not in {"connector", "ingress"}:
+        raise ClientSnapshotError("runtime probe auth mode is invalid")
+    if not isinstance(url, str) or len(url) > 2048:
+        raise ClientSnapshotError("runtime probe MCP URL is invalid")
+    parsed = urlsplit(url)
+    expected_port = 18182 if auth_mode == "connector" else 18180
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port != expected_port
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/mcp"
+    ):
+        raise ClientSnapshotError(
+            "runtime readiness probe is outside its bound loopback endpoint"
+        )
+    return url
 
 
 async def _list_all_tools(client: Any) -> list[Any]:
@@ -1462,6 +1726,143 @@ def _mixed_observed_tool_artifact(tools: list[Any]) -> dict[str, Any]:
 
 async def _list_all_tool_names(client: Any) -> list[str]:
     return [getattr(tool, "name", None) for tool in await _list_all_tools(client)]
+
+
+def probe_runtime_readiness(
+    *,
+    runtime_root: Path,
+    mcp_url: str,
+    connector_token_path: Path,
+    auth_mode: str,
+    expected_release_id: str,
+    expected_repo_head: str,
+    expected_agent_instructions_sha256: str,
+    timeout_seconds: float = AUTO_REFRESH_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Observe one real fixed loopback runtime without mutating snapshot state."""
+    if auth_mode not in {"connector", "ingress"}:
+        raise ClientSnapshotError("runtime probe auth mode is invalid")
+    token = _read_transport_connector_capability(connector_token_path)
+    url = _validate_runtime_probe_mcp_url(mcp_url, auth_mode=auth_mode)
+    runtime_binding, contract_names = _runtime_platform_binding(runtime_root)
+    if (
+        runtime_binding.get("release_id") != expected_release_id
+        or runtime_binding.get("repo_head") != expected_repo_head
+        or runtime_binding.get("agent_instructions_sha256")
+        != expected_agent_instructions_sha256
+    ):
+        raise ClientSnapshotError(
+            "runtime probe expectations do not match the immutable manifest"
+        )
+    try:
+        timeout = float(timeout_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ClientSnapshotError("runtime probe timeout is invalid") from exc
+    if not 0.1 <= timeout <= 60.0:
+        raise ClientSnapshotError("runtime probe timeout is invalid")
+
+    async def observe() -> dict[str, Any]:
+        try:
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamablehttp_client
+        except ImportError as exc:
+            raise ClientSnapshotError("MCP client runtime is unavailable") from exc
+        header = (
+            TRANSPORT_CONNECTOR_CAPABILITY_HEADER
+            if auth_mode == "connector"
+            else TRANSPORT_INGRESS_AUTH_HEADER
+        )
+        async with streamablehttp_client(
+            url,
+            headers={header: token},
+        ) as (read_stream, write_stream, _):
+            async with ClientSession(read_stream, write_stream) as client:
+                await client.initialize()
+                tools = await _list_all_tools(client)
+                observed_artifact = _mixed_observed_tool_artifact(tools)
+                observed_names, observed_schemas, observed_metadata = (
+                    connector_contract.parse_observed_artifact(
+                        observed_artifact,
+                        label="runtime readiness tools/list artifact",
+                    )
+                )
+                status_result = await client.call_tool(
+                    "grabowski_status",
+                    {"view": "minimal"},
+                    meta={"client_id": AUTO_REFRESH_CLIENT_ID},
+                )
+                status = _mcp_tool_payload(
+                    status_result, label="runtime readiness grabowski_status"
+                )
+                runtime = status.get("runtime")
+                instructions = status.get("agent_instructions")
+                tool_contract = status.get("tool_contract")
+                if (
+                    not isinstance(runtime, dict)
+                    or not isinstance(instructions, dict)
+                    or not isinstance(tool_contract, dict)
+                ):
+                    raise ClientSnapshotError(
+                        "runtime readiness status is incomplete"
+                    )
+                observed_release = _validate_release_id(
+                    runtime.get("release_id"), label="observed release id"
+                )
+                observed_head = runtime.get("repo_head")
+                if (
+                    not isinstance(observed_head, str)
+                    or re.fullmatch(r"[0-9a-f]{40}", observed_head) is None
+                ):
+                    raise ClientSnapshotError(
+                        "observed runtime repository head is invalid"
+                    )
+                observed_instructions = _validate_sha256(
+                    instructions.get("sha256"),
+                    label="observed agent instructions hash",
+                )
+                if (
+                    tool_contract.get("registered_tool_count")
+                    != len(observed_names)
+                    or tool_contract.get("registered_names_sha256")
+                    != observed_metadata["names_sha256"]
+                    or tool_contract.get("runtime_matches_deployment_contract")
+                    is not True
+                ):
+                    raise ClientSnapshotError(
+                        "runtime readiness tools/list disagrees with status contract"
+                    )
+                readiness = connector_contract.evaluate_green_readiness(
+                    observed_names=observed_names,
+                    observed_schemas=observed_schemas,
+                    runtime_names=observed_names,
+                    runtime_schemas=observed_schemas,
+                    contract_names=contract_names,
+                    observed_release_id=observed_release,
+                    expected_release_id=expected_release_id,
+                    observed_repo_head=observed_head,
+                    expected_repo_head=expected_repo_head,
+                    observed_agent_instructions_sha256=observed_instructions,
+                    expected_agent_instructions_sha256=(
+                        expected_agent_instructions_sha256
+                    ),
+                )
+                return {
+                    **readiness,
+                    "observation_endpoint": url,
+                    "observation_auth_mode": auth_mode,
+                    "observed_tool_count": len(observed_names),
+                    "observed_tools_artifact_sha256": observed_metadata[
+                        "artifact_sha256"
+                    ],
+                    "schema_coverage_count": observed_metadata[
+                        "schema_coverage_count"
+                    ],
+                }
+
+    try:
+        return asyncio.run(asyncio.wait_for(observe(), timeout=timeout))
+    except asyncio.TimeoutError as exc:
+        raise ClientSnapshotError("runtime readiness probe timed out") from exc
 
 
 async def _observe_and_bind_snapshot(
@@ -2039,6 +2440,22 @@ def _auto_refresh_parser() -> argparse.ArgumentParser:
     capture.add_argument("--runtime-root", type=Path, required=True)
     capture.add_argument("--source-reference", required=True)
     capture.add_argument("--observed-tools-json", required=True)
+    probe = subparsers.add_parser(
+        "probe-runtime",
+        help="Read one fixed loopback runtime and emit bounded green readiness evidence.",
+    )
+    probe.add_argument("--runtime-root", type=Path, required=True)
+    probe.add_argument("--mcp-url", required=True)
+    probe.add_argument(
+        "--connector-token-file",
+        type=Path,
+        default=AUTO_REFRESH_CONNECTOR_TOKEN_PATH,
+    )
+    probe.add_argument("--auth-mode", choices=("connector", "ingress"), required=True)
+    probe.add_argument("--expected-release-id", required=True)
+    probe.add_argument("--expected-repo-head", required=True)
+    probe.add_argument("--expected-agent-instructions-sha256", required=True)
+    probe.add_argument("--timeout-seconds", type=float, default=AUTO_REFRESH_TIMEOUT_SECONDS)
     return parser
 
 
@@ -2070,6 +2487,19 @@ def main(argv: list[str] | None = None) -> int:
                 observed_tools=observed_tools,
                 runtime_root=args.runtime_root,
                 source_reference=args.source_reference,
+            )
+        elif args.command == "probe-runtime":
+            result = probe_runtime_readiness(
+                runtime_root=args.runtime_root,
+                mcp_url=args.mcp_url,
+                connector_token_path=args.connector_token_file,
+                auth_mode=args.auth_mode,
+                expected_release_id=args.expected_release_id,
+                expected_repo_head=args.expected_repo_head,
+                expected_agent_instructions_sha256=(
+                    args.expected_agent_instructions_sha256
+                ),
+                timeout_seconds=args.timeout_seconds,
             )
         else:
             raise ClientSnapshotError("unsupported snapshot maintenance command")

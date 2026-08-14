@@ -45,6 +45,10 @@ class SidecarInstallOutstanding(RuntimeError):
     """The runtime is live but one required sidecar reconciliation did not settle."""
 
 
+class BlueGreenDeploymentIncomplete(RuntimeError):
+    """The productive cutover produced a durable non-completed receipt."""
+
+
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 FINALIZATION_ENV = {
     "job_id": "GRABOWSKI_JOB_ID",
@@ -117,6 +121,7 @@ def write_finalization_receipt(
     repo_head: str | None,
     release_id: str | None,
     failure_type: str | None,
+    blue_green: dict[str, Any] | None = None,
 ) -> Path:
     if final_status not in {"completed", "failed"}:
         raise ValueError("invalid finalization status")
@@ -127,6 +132,12 @@ def write_finalization_receipt(
         "repo_head": repo_head,
         "release_id": release_id,
         "failure_type": failure_type,
+        "blue_green": blue_green,
+        "blue_green_receipt_sha256": (
+            blue_green.get("receipt_sha256")
+            if isinstance(blue_green, dict)
+            else None
+        ),
         "timestamp_unix": int(time.time()),
     }
     payload = {**material, "payload_sha256": canonical_json_sha256(material)}
@@ -845,6 +856,72 @@ def verify_live_manifest(expected_head: str) -> dict[str, Any]:
     }
 
 
+def _blue_green_summary(result: dict[str, Any]) -> dict[str, Any]:
+    receipt = result.get("receipt")
+    if not isinstance(receipt, dict):
+        raise RuntimeError("productive blue-green result lacks a receipt")
+    summary = {
+        "schema_version": 1,
+        "kind": "grabowski_scheduled_blue_green_summary",
+        "receipt_sha256": receipt.get("receipt_sha256"),
+        "receipt_path": result.get("receipt_path"),
+        "outcome": receipt.get("outcome"),
+        "expected_head": receipt.get("expected_head"),
+        "source_identity_sha256": receipt.get("source_identity_sha256"),
+        "blue_release_id": receipt.get("blue_release_id"),
+        "green_release_id": receipt.get("green_release_id"),
+        "green_readiness_sha256": (
+            canonical_json_sha256(receipt["green_readiness"])
+            if isinstance(receipt.get("green_readiness"), dict)
+            else None
+        ),
+        "selector_switch_sha256": (
+            receipt.get("selector_switch", {}).get("selector_sha256")
+            if isinstance(receipt.get("selector_switch"), dict)
+            else None
+        ),
+        "snapshot_rebind_receipt_sha256": (
+            receipt.get("snapshot_rebind", {}).get("receipt_sha256")
+            if isinstance(receipt.get("snapshot_rebind"), dict)
+            else None
+        ),
+        "operator_drain_observation_sha256": (
+            receipt.get("effect_terminalization", {}).get(
+                "operator_observation_sha256"
+            )
+            if isinstance(receipt.get("effect_terminalization"), dict)
+            else None
+        ),
+        "final_selector_sha256": (
+            receipt.get("final_routing", {}).get("selector_sha256")
+            if isinstance(receipt.get("final_routing"), dict)
+            else None
+        ),
+        "authoritative_readback_sha256": (
+            receipt.get("authoritative_readback", {}).get("readback_sha256")
+            if isinstance(receipt.get("authoritative_readback"), dict)
+            else None
+        ),
+    }
+    return {**summary, "summary_sha256": canonical_json_sha256(summary)}
+
+
+def run_productive_blue_green(
+    *,
+    repo: Path,
+    expected_head: str,
+    source_identity_sha256: str,
+) -> dict[str, Any]:
+    result = deploy_dual.run_production_blue_green_cutover(
+        repo=repo,
+        expected_head=expected_head,
+        source_identity_sha256=source_identity_sha256,
+    )
+    summary = _blue_green_summary(result)
+    emit("blue-green-receipt", **summary)
+    return {**result, "summary": summary}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
@@ -860,6 +937,7 @@ def main() -> int:
     if re.fullmatch(r"[0-9a-f]{64}", args.source_identity_sha256) is None:
         raise ValueError("source_identity_sha256 must be a lowercase SHA-256")
     binding: dict[str, Any] | None = None
+    blue_green_result: dict[str, Any] | None = None
     try:
         binding = load_finalization_binding()
         if binding is not None and binding["expected_head"] != args.expected_head:
@@ -889,7 +967,15 @@ def main() -> int:
             args.source_kind,
             args.expected_head,
         )
-        run_streamed(["make", "deploy-apply"], cwd=repo, timeout_seconds=1_800, phase="deploy")
+        blue_green_result = run_productive_blue_green(
+            repo=repo,
+            expected_head=args.expected_head,
+            source_identity_sha256=args.source_identity_sha256,
+        )
+        if blue_green_result.get("outcome") != "completed":
+            raise BlueGreenDeploymentIncomplete(
+                "productive blue-green cutover did not complete; inspect its durable receipt"
+            )
         live = verify_live_manifest(args.expected_head)
         verify_repository(
             repo,
@@ -918,7 +1004,12 @@ def main() -> int:
         )
         live = verify_live_manifest(args.expected_head)
         emit("coding-agent-sidecars-complete", **sidecars)
-        emit("complete", **live, coding_agent_sidecars=sidecars)
+        emit(
+            "complete",
+            **live,
+            coding_agent_sidecars=sidecars,
+            blue_green=blue_green_result["summary"],
+        )
         if binding is not None:
             write_finalization_receipt(
                 binding,
@@ -926,6 +1017,7 @@ def main() -> int:
                 repo_head=live["repo_head"],
                 release_id=live["release_id"],
                 failure_type=None,
+                blue_green=blue_green_result["summary"],
             )
         return 0
     except Exception as exc:
@@ -937,6 +1029,11 @@ def main() -> int:
                     repo_head=None,
                     release_id=None,
                     failure_type=type(exc).__name__,
+                    blue_green=(
+                        blue_green_result.get("summary")
+                        if isinstance(blue_green_result, dict)
+                        else None
+                    ),
                 )
             except Exception as receipt_exc:
                 emit("finalization-receipt-failed", error_type=type(receipt_exc).__name__)

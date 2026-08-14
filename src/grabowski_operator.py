@@ -837,7 +837,7 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
     )
     truncated = len(sample) > _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX
     sample = sample[: _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX]
-    return {
+    observation = {
         **_read_deployment_admission_marker(),
         "active_tool_calls": len(registry),
         "drain_blocking_tool_calls": sum(
@@ -868,6 +868,28 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
         "active_tool_calls_sample_max": (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX
         ),
+        "registry_authority": "live_grabowski_operator_call_boundary",
+        "effect_terminalization_state": (
+            "settled"
+            if sum(
+                entry.get("drain_blocking") is not False
+                for entry in registry.values()
+            )
+            == 0
+            else "draining"
+        ),
+        "read_calls_block_retirement": False,
+    }
+    digest_material = {
+        key: value
+        for key, value in observation.items()
+        if key not in {"oldest_active_tool_call_age_seconds", "active_tool_calls_sample"}
+    }
+    return {
+        **observation,
+        "registry_observation_sha256": hashlib.sha256(
+            _canonical_json_bytes(digest_material)
+        ).hexdigest(),
     }
 
 
