@@ -54,6 +54,8 @@ REPOSKOP_SHADOW_TERMINAL_MARKER_MAX_BYTES = 64 * 1024
 TASK_LIST_SCAN_BATCH = 100
 TASK_RECONCILE_BATCH_LIMIT = 500
 DEFAULT_TASK_RECONCILE_BATCH_SIZE = 100
+TASK_RECONCILE_ACTIVE_REFRESH_MAX = 20
+TASK_RECONCILE_ACTIVE_CURSOR_METADATA_KEY = "task_reconcile_active_refresh_cursor_v1"
 DEFAULT_TASK_RECONCILE_CHECK_LIMIT = 50
 TASK_RECONCILE_CHECK_LIMIT = 200
 TASK_RECONCILE_CHECK_MAX_BYTES = 1024 * 1024
@@ -8279,10 +8281,12 @@ def _save_reconcile_cycle(
     cycle: dict[str, Any] | None,
     *,
     phase_turn: str,
+    active_refresh_cursor: tuple[int, int, str] | None,
 ) -> None:
     with _database_connection() as connection:
         _write_reconcile_cycle(connection, cycle)
         _write_reconcile_phase_turn(connection, phase_turn)
+        _write_active_refresh_cursor(connection, active_refresh_cursor)
 
 
 def _ensure_reconcile_cycle(
@@ -8308,6 +8312,7 @@ def _select_reconcile_task_rows(
     cycle: dict[str, Any],
     *,
     limit: int,
+    excluded_task_ids: set[str] | None = None,
 ) -> list[sqlite3.Row]:
     candidate_clause = (
         "(state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
@@ -8321,6 +8326,15 @@ def _select_reconcile_task_rows(
         TASK_RECONCILE_SEQUENCE_KEY_PREFIX,
         cycle["high_water_sequence"],
     ]
+    excluded = sorted(excluded_task_ids or ())
+    excluded_clause = ""
+    if excluded:
+        excluded_clause = (
+            " AND tasks.task_id NOT IN ("
+            + ",".join("?" for _ in excluded)
+            + ")"
+        )
+        parameters.extend(excluded)
     cursor = cycle["cursor"]
     cursor_clause = ""
     if cursor is not None:
@@ -8341,13 +8355,16 @@ def _select_reconcile_task_rows(
         "ON reconcile_order.key = ? || tasks.task_id "
         f"WHERE {candidate_clause} "
         "AND (reconcile_order.value IS NULL "
-        f"OR CAST(reconcile_order.value AS INTEGER) <= ?){cursor_clause} "
+        f"OR CAST(reconcile_order.value AS INTEGER) <= ?){excluded_clause}{cursor_clause} "
         "ORDER BY created_at_unix, task_id LIMIT ?",
         parameters,
     ).fetchall()
 
 
-def _reconcile_task_phase_has_work() -> bool:
+def _reconcile_task_phase_has_work(
+    *,
+    excluded_task_ids: set[str] | None = None,
+) -> bool:
     with _database_connection() as connection:
         cycle = _ensure_reconcile_cycle(connection)
         return bool(
@@ -8355,11 +8372,148 @@ def _reconcile_task_phase_has_work() -> bool:
                 connection,
                 cycle,
                 limit=1,
+                excluded_task_ids=excluded_task_ids,
             )
         )
 
 
-def _reconcile_task_candidate_page(limit: int) -> dict[str, Any]:
+def _load_active_refresh_cursor(
+    connection: sqlite3.Connection,
+) -> tuple[int, int, str] | None:
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_ACTIVE_CURSOR_METADATA_KEY,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError("Task reconcile active cursor metadata is ambiguous")
+    try:
+        payload = json.loads(str(rows[0][0]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Task reconcile active cursor metadata is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "updated_at_unix",
+        "created_at_unix",
+        "task_id",
+    }:
+        raise RuntimeError("Task reconcile active cursor metadata is invalid")
+    updated_at_unix = payload["updated_at_unix"]
+    created_at_unix = payload["created_at_unix"]
+    task_id = payload["task_id"]
+    if (
+        isinstance(updated_at_unix, bool)
+        or not isinstance(updated_at_unix, int)
+        or updated_at_unix < 0
+        or isinstance(created_at_unix, bool)
+        or not isinstance(created_at_unix, int)
+        or created_at_unix < 0
+        or not isinstance(task_id, str)
+        or TASK_ID.fullmatch(task_id) is None
+    ):
+        raise RuntimeError("Task reconcile active cursor metadata is invalid")
+    return updated_at_unix, created_at_unix, task_id
+
+
+def _write_active_refresh_cursor(
+    connection: sqlite3.Connection,
+    cursor: tuple[int, int, str] | None,
+) -> None:
+    if cursor is None:
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_ACTIVE_CURSOR_METADATA_KEY,),
+        )
+        return
+    payload = _canonical_json(
+        {
+            "updated_at_unix": cursor[0],
+            "created_at_unix": cursor[1],
+            "task_id": cursor[2],
+        }
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (TASK_RECONCILE_ACTIVE_CURSOR_METADATA_KEY, payload),
+    )
+
+
+def _reconcile_active_refresh_page(limit: int) -> dict[str, Any]:
+    bounded_limit = _validate_reconcile_phase_limit(limit)
+    now = _now()
+    active_states = tuple(TASK_STATE_PROJECTIONS["active"])
+    placeholders = ",".join("?" for _ in active_states)
+    with _database_connection() as connection:
+        cursor_before = _load_active_refresh_cursor(connection)
+        if bounded_limit == 0:
+            return {
+                "rows": [],
+                "examined": 0,
+                "cursor_before": cursor_before,
+                "cursor_after": cursor_before,
+                "cycle_completed": False,
+            }
+        parameters: list[Any] = [
+            *active_states,
+            now - TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS,
+            now,
+        ]
+        cursor_clause = ""
+        if cursor_before is not None:
+            cursor_clause = (
+                " AND (updated_at_unix > ? OR "
+                "(updated_at_unix = ? AND created_at_unix > ?) OR "
+                "(updated_at_unix = ? AND created_at_unix = ? AND task_id > ?))"
+            )
+            parameters.extend(
+                (
+                    cursor_before[0],
+                    cursor_before[0],
+                    cursor_before[1],
+                    cursor_before[0],
+                    cursor_before[1],
+                    cursor_before[2],
+                )
+            )
+        parameters.append(bounded_limit + 1)
+        examined_rows = connection.execute(
+            f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+            "AND (updated_at_unix <= ? OR created_at_unix + runtime_seconds <= ?)"
+            f"{cursor_clause} "
+            "ORDER BY updated_at_unix, created_at_unix, task_id LIMIT ?",
+            parameters,
+        ).fetchall()
+    has_more = len(examined_rows) > bounded_limit
+    examined_rows = examined_rows[:bounded_limit]
+    selected = [
+        dict(row)
+        for row in examined_rows
+        if not _task_has_fresh_active_observation(dict(row), now=now)
+    ]
+    cursor_after = (
+        (
+            int(examined_rows[-1]["updated_at_unix"]),
+            int(examined_rows[-1]["created_at_unix"]),
+            str(examined_rows[-1]["task_id"]),
+        )
+        if examined_rows and has_more
+        else None
+    )
+    return {
+        "rows": selected,
+        "examined": len(examined_rows),
+        "cursor_before": cursor_before,
+        "cursor_after": cursor_after,
+        "cycle_completed": not has_more,
+    }
+
+
+def _reconcile_task_candidate_page(
+    limit: int,
+    *,
+    excluded_task_ids: set[str] | None = None,
+) -> dict[str, Any]:
     bounded_limit = _validate_reconcile_phase_limit(limit)
     with _database_connection() as connection:
         cycle = _ensure_reconcile_cycle(connection)
@@ -8368,6 +8522,7 @@ def _reconcile_task_candidate_page(limit: int) -> dict[str, Any]:
             connection,
             cycle,
             limit=bounded_limit + 1,
+            excluded_task_ids=excluded_task_ids,
         )
     has_more = len(selected) > bounded_limit
     examined_rows = selected[:bounded_limit]
@@ -8425,6 +8580,15 @@ def _reconcile_task_candidate_page(limit: int) -> dict[str, Any]:
 
 def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
     limit = _validate_reconcile_batch_size(batch_size)
+    active_refresh_limit = min(
+        TASK_RECONCILE_ACTIVE_REFRESH_MAX,
+        limit // 5,
+    )
+    active_refresh_page = _reconcile_active_refresh_page(active_refresh_limit)
+    active_refresh_rows = active_refresh_page["rows"]
+    active_refresh_ids = {str(row["task_id"]) for row in active_refresh_rows}
+    active_refresh_examined = len(active_refresh_rows)
+    fair_limit = limit - active_refresh_examined
     # Validate persisted terminal recovery truth before either phase can
     # observe or mutate task state, even when the task phase has first turn.
     terminalization_cycle = _load_terminalization_recovery_cycle()
@@ -8442,34 +8606,42 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
             else terminalization_cycle["high_water"]
         ),
     )
-    task_has_work = _reconcile_task_phase_has_work()
+    task_has_work = _reconcile_task_phase_has_work(
+        excluded_task_ids=active_refresh_ids,
+    )
     both_phases_have_work = terminalization_has_work and task_has_work
     if not both_phases_have_work:
         phase_first = TASK_RECONCILE_PHASE_TERMINALIZATION
         terminalization_recovery = _recover_pending_task_terminalizations(
-            limit=limit
+            limit=fair_limit
         )
         task_page = _reconcile_task_candidate_page(
-            limit - int(terminalization_recovery["examined"])
+            fair_limit - int(terminalization_recovery["examined"]),
+            excluded_task_ids=active_refresh_ids,
         )
     else:
         phase_first = stored_phase_turn
-        first_phase_limit = (limit + 1) // 2
+        first_phase_limit = (fair_limit + 1) // 2
         if phase_first == TASK_RECONCILE_PHASE_TERMINALIZATION:
             terminalization_recovery = _recover_pending_task_terminalizations(
                 limit=first_phase_limit
             )
             task_page = _reconcile_task_candidate_page(
-                limit - int(terminalization_recovery["examined"])
+                fair_limit - int(terminalization_recovery["examined"]),
+                excluded_task_ids=active_refresh_ids,
             )
         else:
-            task_page = _reconcile_task_candidate_page(first_phase_limit)
-            terminalization_recovery = _recover_pending_task_terminalizations(
-                limit=limit - int(task_page["examined"])
+            task_page = _reconcile_task_candidate_page(
+                first_phase_limit,
+                excluded_task_ids=active_refresh_ids,
             )
-    total_examined = int(task_page["examined"]) + int(
+            terminalization_recovery = _recover_pending_task_terminalizations(
+                limit=fair_limit - int(task_page["examined"])
+            )
+    fair_examined = int(task_page["examined"]) + int(
         terminalization_recovery["examined"]
     )
+    total_examined = active_refresh_examined + fair_examined
     if total_examined > limit:
         raise RuntimeError("Task reconcile shared batch budget was exceeded")
     task_examined = int(task_page["examined"])
@@ -8481,9 +8653,24 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
         )
     else:
         phase_next = stored_phase_turn
+    fair_rows = [
+        row
+        for row in task_page["rows"]
+        if str(row["task_id"]) not in active_refresh_ids
+    ]
     return {
         **task_page,
+        "rows": [*active_refresh_rows, *fair_rows],
         "limit": limit,
+        "active_refresh": {
+            "limit": active_refresh_limit,
+            "examined": int(active_refresh_page["examined"]),
+            "selected": active_refresh_examined,
+            "cursor_before": active_refresh_page["cursor_before"],
+            "cursor_after": active_refresh_page["cursor_after"],
+            "cycle_completed": active_refresh_page["cycle_completed"],
+            "max_observation_age_seconds": TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS,
+        },
         "task_limit": int(task_page["limit"]),
         "task_examined": task_examined,
         "terminalization_recovery": terminalization_recovery,
@@ -9156,6 +9343,7 @@ def _reconcile_tasks_refresh_locked(
         _save_reconcile_cycle(
             batch["cycle_after"],
             phase_turn=batch["phase_next"],
+            active_refresh_cursor=batch["active_refresh"]["cursor_after"],
         )
     result = {
         "mode": "refresh",
@@ -9187,6 +9375,7 @@ def _reconcile_tasks_refresh_locked(
                 "total_examined_limit",
             )
         }
+        result["batch"]["active_refresh"] = batch["active_refresh"]
         result["batch"]["terminalization_recovery"] = batch[
             "terminalization_recovery"
         ]
