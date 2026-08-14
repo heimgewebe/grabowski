@@ -911,6 +911,7 @@ class GripFoundationTests(unittest.TestCase):
                 "browser-semantic-observe",
                 "browser-semantic-act",
                 "connector-snapshot-bind",
+                "forrest-server-exit-apply",
                 "n8n-workflow-edge-apply",
                 "n8n-workflow-edge-verify",
                 "checkout-binding-terminal-apply",
