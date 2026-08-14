@@ -109,11 +109,20 @@ class RoutingSelectorTests(unittest.TestCase):
 
 
 class AuthenticSnapshotCutoverTests(unittest.TestCase):
-    def _source_receipt(self, now_unix: int) -> dict[str, object]:
+    def _source_receipt(
+        self,
+        now_unix: int,
+        *,
+        observation_scope: str = client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+    ) -> dict[str, object]:
         declaration = {
-            "client_id": "external-client",
+            "client_id": (
+                "external-client"
+                if observation_scope == client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT
+                else client_snapshot.AUTO_REFRESH_CLIENT_ID
+            ),
             "session_id": "session-1",
-            "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+            "observation_scope": observation_scope,
             "observed_tool_count": TOOL_COUNT,
             "observed_names_sha256": NAMES_SHA256,
             "observed_release_id": "blue",
@@ -121,6 +130,8 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
             "observed_tools_artifact_sha256": ARTIFACT_SHA256,
             "observed_schema_coverage_count": TOOL_COUNT,
             "observed_schema_tools": sorted(SCHEMA_SHA256_BY_TOOL),
+            "observed_complete_schema_count": TOOL_COUNT,
+            "observed_complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
         }
         receipt = {
             "schema_version": client_snapshot.SNAPSHOT_SCHEMA_VERSION,
@@ -214,6 +225,71 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
             self.assertIn(
                 "external client has refreshed against green",
                 " ".join(result["does_not_establish"]),
+            )
+
+    def test_loopback_rebind_preserves_scope_without_platform_claim(self) -> None:
+        now_unix = 1_000
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "snapshot"
+            state_root.mkdir(mode=0o700)
+            snapshot_path = state_root / "current.json"
+            platform_path = state_root / "platform.json"
+            source = self._source_receipt(
+                now_unix,
+                observation_scope=client_snapshot.OBSERVATION_SCOPE_SERVER_LOOPBACK,
+            )
+            with mock.patch.multiple(
+                client_snapshot,
+                STATE_ROOT=state_root,
+                LOCK_PATH=state_root / "snapshot.lock",
+                SNAPSHOT_PATH=snapshot_path,
+                PLATFORM_SNAPSHOT_PATH=platform_path,
+            ):
+                client_snapshot._write_private_json(snapshot_path, source)
+                result = client_snapshot.rebind_server_loopback_snapshot_for_cutover(
+                    cutover_id="cutover-loopback",
+                    cutover_generation=1,
+                    current_release_id="blue",
+                    current_repo_head=HEAD_BLUE,
+                    green_release_id="green",
+                    green_repo_head=HEAD_GREEN,
+                    registered_tool_count=TOOL_COUNT,
+                    registered_names_sha256=NAMES_SHA256,
+                    agent_instructions_sha256=INSTRUCTIONS_SHA256,
+                    green_readiness={
+                        "ready": True,
+                        "release_id": "green",
+                        "repo_head": HEAD_GREEN,
+                        "names_sha256": NAMES_SHA256,
+                        "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+                        "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
+                        "schema_identity_sha256": SCHEMA_IDENTITY_SHA256,
+                        "complete_schema_count": TOOL_COUNT,
+                        "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+                    },
+                    now_unix=now_unix,
+                )
+                status = client_snapshot.snapshot_status(
+                    expected_tool_count=TOOL_COUNT,
+                    expected_names_sha256=NAMES_SHA256,
+                    expected_release_id="green",
+                    expected_repo_head=HEAD_GREEN,
+                    expected_agent_instructions_sha256=INSTRUCTIONS_SHA256,
+                    now_unix=now_unix,
+                )
+            self.assertEqual(
+                result["observation_scope"],
+                client_snapshot.OBSERVATION_SCOPE_SERVER_LOOPBACK,
+            )
+            self.assertTrue(status["server_loopback_observable"])
+            self.assertTrue(status["server_loopback_schema_observable"])
+            self.assertTrue(status["server_loopback_complete_schema_observable"])
+            self.assertFalse(status["external_client_snapshot_observable"])
+            self.assertFalse(status["external_client_schema_observable"])
+            self.assertFalse(status["platform_connector_snapshot_observable"])
+            self.assertIn(
+                "platform connector catalog publication",
+                result["does_not_establish"],
             )
 
     def test_rebind_rejects_schema_drift_before_writing(self) -> None:
@@ -668,6 +744,186 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
         self.assertFalse(runtime.green_started)
         self.assertTrue(recovery["green"]["retired"])
 
+    def test_changed_tool_name_blocks_before_snapshot_selection(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.repo_head = HEAD_GREEN
+        snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])
+        topology = mock.Mock(kind="url", server_url_port=18180)
+        build = mock.Mock(
+            release_path=Path("/release/green"),
+            release_id="green",
+            agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+        )
+        blue_binding = runtime_binding("blue", HEAD_BLUE)
+        green_binding = runtime_binding("green", HEAD_GREEN)
+        selector = {
+            "selected_slot": "canonical",
+            "selector_sha256": "8a" * 32,
+            "runtime_binding": blue_binding,
+            "runtime_binding_sha256": "8b" * 32,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "preflight_url",
+                return_value=(snapshot, Path("/runtime"), topology),
+            ),
+            mock.patch.object(dual, "require_service_active"),
+            mock.patch.object(
+                dual.core,
+                "read_manifest",
+                return_value={
+                    "entrypoint_contract": {"expected_tools": ["old_tool_name"]}
+                },
+            ),
+            mock.patch.object(
+                dual.transport_ingress,
+                "_read_runtime_binding",
+                side_effect=[(blue_binding, []), (green_binding, [])],
+            ),
+            mock.patch.object(
+                dual.transport_ingress,
+                "read_routing_selector",
+                return_value=selector,
+            ),
+            mock.patch.object(dual, "_require_selector_authority"),
+            mock.patch.object(dual.core, "build_release", return_value=build),
+            mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(dual.core, "verify_manifest"),
+            mock.patch.object(dual.client_snapshot, "snapshot_status") as status,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Blue and green tool-name continuity is unavailable"
+            ):
+                dual.prepare_production_blue_green_runtime(
+                    ROOT,
+                    Path("/runtime"),
+                    Path("/profile.json"),
+                    expected_head=HEAD_GREEN,
+                    cutover_id="cutover-name-drift",
+                    timeout_seconds=10,
+                )
+        status.assert_not_called()
+
+    def test_server_loopback_continuity_prepares_unchanged_surface(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.repo_head = HEAD_GREEN
+        snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])
+        topology = mock.Mock(kind="url", server_url_port=18180)
+        build = mock.Mock(
+            release_path=Path("/release/green"),
+            release_id="green",
+            agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+        )
+        blue_binding = runtime_binding("blue", HEAD_BLUE)
+        green_binding = runtime_binding("green", HEAD_GREEN)
+        selector = {
+            "selected_slot": "canonical",
+            "selector_sha256": "8a" * 32,
+            "runtime_binding": blue_binding,
+            "runtime_binding_sha256": "8b" * 32,
+        }
+        loopback_status = {
+            "state": "matched",
+            "external_client_snapshot_observable": False,
+            "external_client_schema_observable": False,
+            "server_loopback_observable": True,
+            "server_loopback_schema_observable": True,
+            "server_loopback_schema_contract_matches": True,
+            "server_loopback_complete_schema_observable": True,
+            "server_loopback_complete_schema_count": 1,
+            "server_loopback_complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+            "client_observed_release_id": "blue",
+            "receipt_sha256": "9c" * 32,
+            "client_declaration_sha256": "9d" * 32,
+            "observation_scope": client_snapshot.OBSERVATION_SCOPE_SERVER_LOOPBACK,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "preflight_url",
+                return_value=(snapshot, Path("/runtime"), topology),
+            ),
+            mock.patch.object(dual, "require_service_active"),
+            mock.patch.object(
+                dual.core,
+                "read_manifest",
+                return_value={
+                    "entrypoint_contract": {"expected_tools": ["grabowski_status"]}
+                },
+            ),
+            mock.patch.object(
+                dual.transport_ingress,
+                "_read_runtime_binding",
+                side_effect=[(blue_binding, []), (green_binding, [])],
+            ),
+            mock.patch.object(
+                dual.transport_ingress,
+                "read_routing_selector",
+                return_value=selector,
+            ),
+            mock.patch.object(dual, "_require_selector_authority"),
+            mock.patch.object(dual.core, "build_release", return_value=build),
+            mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(dual.core, "verify_manifest"),
+            mock.patch.object(
+                dual.client_snapshot,
+                "snapshot_status",
+                return_value=loopback_status,
+            ),
+        ):
+            runtime = dual.prepare_production_blue_green_runtime(
+                ROOT,
+                Path("/runtime"),
+                Path("/profile.json"),
+                expected_head=HEAD_GREEN,
+                cutover_id="cutover-loopback-continuity",
+                timeout_seconds=10,
+            )
+        self.assertEqual(runtime.snapshot_rebind_mode, "server_loopback_continuity")
+        self.assertEqual(
+            runtime.source_complete_schema_sha256, COMPLETE_SCHEMA_SHA256
+        )
+
+    def test_server_loopback_continuity_blocks_green_schema_drift_pre_switch(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])
+        build = mock.Mock(
+            release_path=Path("/release/green"),
+            release_id="green",
+            agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+        )
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(),
+            blue_manifest={},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-loopback-schema-drift",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            source_complete_schema_sha256=COMPLETE_SCHEMA_SHA256,
+            snapshot_rebind_mode="server_loopback_continuity",
+        )
+        with mock.patch.object(
+            dual,
+            "_probe_release_runtime",
+            return_value={
+                "ready": True,
+                "complete_schema_count": 1,
+                "complete_schema_sha256": "ab" * 32,
+            },
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Green complete schema identity differs"
+            ):
+                runtime.verify_green()
+        self.assertFalse(runtime.connector_switched)
+
     def test_stale_external_declaration_fails_before_connector_switch(self) -> None:
         snapshot = mock.Mock()
         snapshot.repo_head = HEAD_GREEN
@@ -733,7 +989,7 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "Authentic fresh external connector snapshot is unavailable"
+                RuntimeError, "Authentic Blue connector continuity snapshot is unavailable"
             ):
                 dual.prepare_production_blue_green_runtime(
                     ROOT,

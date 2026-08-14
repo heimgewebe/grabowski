@@ -726,7 +726,7 @@ def _require_schema_identity(
     return normalized, _sha256_json(normalized)
 
 
-def rebind_authentic_snapshot_for_cutover(
+def _rebind_snapshot_for_cutover(
     *,
     cutover_id: str,
     cutover_generation: int,
@@ -738,16 +738,23 @@ def rebind_authentic_snapshot_for_cutover(
     registered_names_sha256: str,
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
+    observation_scope: str,
+    verification_model: str,
+    recommended_next_action: str,
+    scope_error: str,
+    additional_nonclaims: tuple[str, ...],
     now_unix: int | None = None,
 ) -> dict[str, Any]:
-    """Rebind a fresh external declaration without inventing a green observation.
+    """Rebind one prior blue declaration to independently verified Green.
 
-    The client declaration is copied byte-for-byte from a previously persisted,
-    hash-valid external connector receipt.  The new receipt records a transition
-    from that observed blue release to a separately verified green runtime.  It
-    therefore proves declaration continuity, not that the external platform has
-    already refreshed against green.
+    The source observation scope is explicit. This proves surface continuity
+    only; a server-loopback source never upgrades platform publication evidence.
     """
+    if observation_scope not in {
+        OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+        OBSERVATION_SCOPE_SERVER_LOOPBACK,
+    }:
+        raise ClientSnapshotError("cutover snapshot source scope is invalid")
     timestamp = int(time.time()) if now_unix is None else now_unix
     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
         raise ClientSnapshotError("snapshot timestamp is invalid")
@@ -829,17 +836,14 @@ def rebind_authentic_snapshot_for_cutover(
             source.get("verified") is not True
             or source.get("mismatches")
             or not isinstance(declaration, dict)
-            or declaration.get("observation_scope")
-            != OBSERVATION_SCOPE_EXTERNAL_CLIENT
+            or declaration.get("observation_scope") != observation_scope
             or not isinstance(source_binding, dict)
             or not isinstance(schema_evidence, dict)
             or not isinstance(schema_evidence.get("probe"), dict)
             or schema_evidence["probe"].get("matches") is not True
             or schema_evidence["probe"].get("schema_contract_matches") is not True
         ):
-            raise ClientSnapshotError(
-                "authentic external connector schema receipt is required"
-            )
+            raise ClientSnapshotError(scope_error)
         if (
             source_binding.get("release_id") != current_release
             or source_binding.get("repo_head") != current_repo_head
@@ -873,7 +877,7 @@ def rebind_authentic_snapshot_for_cutover(
         observed_artifact = schema_evidence.get("observed_artifact")
         if not isinstance(observed_artifact, dict):
             raise ClientSnapshotError(
-                "authentic external connector schema identity is unavailable"
+                "bound source connector schema identity is unavailable"
             )
         source_schema_hashes, source_schema_identity_sha256 = (
             _require_schema_identity(
@@ -896,7 +900,7 @@ def rebind_authentic_snapshot_for_cutover(
             or green_complete_schema_count != registered_tool_count
         ):
             raise ClientSnapshotError(
-                "complete external connector schema identity is unavailable"
+                "complete source connector schema identity is unavailable"
             )
         source_complete_schema_sha256 = _require_authentic_digest(
             source_complete_schema_sha256,
@@ -914,7 +918,7 @@ def rebind_authentic_snapshot_for_cutover(
             or source_complete_schema_sha256 != green_complete_schema_sha256
         ):
             raise ClientSnapshotError(
-                "green readiness schema identity does not match the authentic external connector snapshot"
+                "green readiness schema identity does not match the bound source connector snapshot"
             )
 
         server_binding = {
@@ -957,16 +961,8 @@ def rebind_authentic_snapshot_for_cutover(
             "cutover_transition": transition,
             "verified": True,
             "mismatches": [],
-            "verification_model": (
-                "external-client-prior-observation+green-runtime-readiness+"
-                "cutover-rebind-v2"
-            ),
-            "does_not_establish": [
-                "that the external client has refreshed against green",
-                "platform connector catalog publication",
-                "application success of any tool call",
-                "resistance to compromised same-uid code",
-            ],
+            "verification_model": verification_model,
+            "does_not_establish": list(additional_nonclaims),
         }
         receipt["receipt_sha256"] = _sha256_json(receipt)
         _write_private_json(SNAPSHOT_PATH, receipt)
@@ -979,7 +975,7 @@ def rebind_authentic_snapshot_for_cutover(
         "state": "matched",
         "verified": True,
         "cutover_rebind": True,
-        "observation_scope": OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+        "observation_scope": observation_scope,
         "client_declaration_sha256": source_declaration_sha256,
         "source_receipt_sha256": source_receipt_sha256,
         "receipt_sha256": receipt["receipt_sha256"],
@@ -987,9 +983,97 @@ def rebind_authentic_snapshot_for_cutover(
         "cutover_transition": transition,
         "verification_model": receipt["verification_model"],
         "schema_contract_matches": True,
-        "recommended_next_action": "refresh external client publication evidence",
+        "recommended_next_action": recommended_next_action,
         "does_not_establish": list(receipt["does_not_establish"]),
     }
+
+
+def rebind_authentic_snapshot_for_cutover(
+    *,
+    cutover_id: str,
+    cutover_generation: int,
+    current_release_id: str,
+    current_repo_head: str,
+    green_release_id: str,
+    green_repo_head: str,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    agent_instructions_sha256: str,
+    green_readiness: dict[str, Any],
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Preserve a fresh external-client Blue declaration across cutover."""
+    return _rebind_snapshot_for_cutover(
+        cutover_id=cutover_id,
+        cutover_generation=cutover_generation,
+        current_release_id=current_release_id,
+        current_repo_head=current_repo_head,
+        green_release_id=green_release_id,
+        green_repo_head=green_repo_head,
+        registered_tool_count=registered_tool_count,
+        registered_names_sha256=registered_names_sha256,
+        agent_instructions_sha256=agent_instructions_sha256,
+        green_readiness=green_readiness,
+        observation_scope=OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+        verification_model=(
+            "external-client-prior-observation+green-runtime-readiness+"
+            "cutover-rebind-v2"
+        ),
+        recommended_next_action="refresh external client publication evidence",
+        scope_error="authentic external connector schema receipt is required",
+        additional_nonclaims=(
+            "that the external client has refreshed against green",
+            "platform connector catalog publication",
+            "application success of any tool call",
+            "resistance to compromised same-uid code",
+        ),
+        now_unix=now_unix,
+    )
+
+
+def rebind_server_loopback_snapshot_for_cutover(
+    *,
+    cutover_id: str,
+    cutover_generation: int,
+    current_release_id: str,
+    current_repo_head: str,
+    green_release_id: str,
+    green_repo_head: str,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    agent_instructions_sha256: str,
+    green_readiness: dict[str, Any],
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Preserve verified server-loopback continuity without claiming platform refresh."""
+    return _rebind_snapshot_for_cutover(
+        cutover_id=cutover_id,
+        cutover_generation=cutover_generation,
+        current_release_id=current_release_id,
+        current_repo_head=current_repo_head,
+        green_release_id=green_release_id,
+        green_repo_head=green_repo_head,
+        registered_tool_count=registered_tool_count,
+        registered_names_sha256=registered_names_sha256,
+        agent_instructions_sha256=agent_instructions_sha256,
+        green_readiness=green_readiness,
+        observation_scope=OBSERVATION_SCOPE_SERVER_LOOPBACK,
+        verification_model=(
+            "server-loopback-prior-observation+green-runtime-readiness+"
+            "cutover-rebind-v1"
+        ),
+        recommended_next_action="refresh external client and platform publication evidence",
+        scope_error="verified server-loopback schema receipt is required",
+        additional_nonclaims=(
+            "that an external client has refreshed against green",
+            "platform connector catalog publication",
+            "tool schema visibility in ChatGPT",
+            "application success of any tool call",
+            "resistance to compromised same-uid code",
+        ),
+        now_unix=now_unix,
+    )
+
 
 def _validate_receipt(receipt: dict[str, Any]) -> None:
     if receipt.get("schema_version") != SNAPSHOT_SCHEMA_VERSION or receipt.get("kind") != SNAPSHOT_KIND:
@@ -1372,6 +1456,9 @@ def snapshot_status(
         "server_loopback_observable": False,
         "server_loopback_schema_observable": False,
         "server_loopback_schema_contract_matches": False,
+        "server_loopback_complete_schema_observable": False,
+        "server_loopback_complete_schema_count": None,
+        "server_loopback_complete_schema_sha256": None,
         "fresh": False,
         "matched": False,
         "verification_model": "client-declared-server-compared-v1",
@@ -1581,6 +1668,19 @@ def snapshot_status(
         "server_loopback_schema_contract_matches": (
             server_loopback_schema_contract_matches
         ),
+        "server_loopback_complete_schema_observable": (
+            server_loopback_schema_observable and complete_schema_observable
+        ),
+        "server_loopback_complete_schema_count": (
+            complete_schema_count
+            if server_loopback_schema_observable and complete_schema_observable
+            else None
+        ),
+        "server_loopback_complete_schema_sha256": (
+            complete_schema_sha256
+            if server_loopback_schema_observable and complete_schema_observable
+            else None
+        ),
         "schema_probe": schema_probe,
         "fresh": fresh,
         "matched": matched,
@@ -1690,6 +1790,8 @@ def _snapshot_refresh_reason(
     # trigger renewal without weakening that external receipt immediately.
     if declaration.get("client_id") != AUTO_REFRESH_CLIENT_ID:
         return None
+    if declaration.get("observed_release_id") != expected_release_id:
+        return "runtime-release-changed"
     if declaration.get("session_id") != session_id:
         return "connector-session-changed"
     return None

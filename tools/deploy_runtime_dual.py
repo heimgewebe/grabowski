@@ -4978,6 +4978,7 @@ class ProductionBlueGreenRuntime:
     current_selector: dict[str, Any] | None = None
     green_readiness: dict[str, Any] | None = None
     source_complete_schema_sha256: str | None = None
+    snapshot_rebind_mode: str = "external_client"
 
     def start_green(self) -> dict[str, Any]:
         core.verify_apply_snapshot_unchanged(
@@ -5022,7 +5023,7 @@ class ProductionBlueGreenRuntime:
             != self.source_complete_schema_sha256
         ):
             core.fail(
-                "Green complete schema identity differs from the authentic external Blue snapshot",
+                "Green complete schema identity differs from the bound Blue continuity snapshot",
                 phase="snapshot-authenticity-preflight",
                 details={
                     "expected_complete_schema_sha256": self.source_complete_schema_sha256,
@@ -5139,7 +5140,17 @@ class ProductionBlueGreenRuntime:
     ) -> dict[str, Any]:
         if self.green_readiness is None:
             core.fail("Green readiness is unavailable for snapshot rebind")
-        return client_snapshot.rebind_authentic_snapshot_for_cutover(
+        if self.snapshot_rebind_mode == "external_client":
+            rebind = client_snapshot.rebind_authentic_snapshot_for_cutover
+        elif self.snapshot_rebind_mode == "server_loopback_continuity":
+            rebind = client_snapshot.rebind_server_loopback_snapshot_for_cutover
+        else:
+            core.fail(
+                "Blue-green snapshot rebind mode is invalid",
+                phase="snapshot-authenticity-preflight",
+                details={"snapshot_rebind_mode": self.snapshot_rebind_mode},
+            )
+        return rebind(
             cutover_id=cutover_id,
             cutover_generation=cutover_generation,
             current_release_id=self.blue_binding["release_id"],
@@ -5366,11 +5377,14 @@ def prepare_production_blue_green_runtime(
         if isinstance(blue_entrypoint, dict)
         else None
     )
-    if not isinstance(blue_tools, list) or len(blue_tools) != len(
-        snapshot.contract.expected_tools
+    green_tools = list(snapshot.contract.expected_tools)
+    if (
+        not isinstance(blue_tools, list)
+        or any(not isinstance(name, str) for name in blue_tools)
+        or sorted(blue_tools) != sorted(green_tools)
     ):
         core.fail(
-            "Blue and green tool count continuity is unavailable",
+            "Blue and green tool-name continuity is unavailable",
             phase="snapshot-authenticity-preflight",
         )
     snapshot_status = client_snapshot.snapshot_status(
@@ -5382,23 +5396,60 @@ def prepare_production_blue_green_runtime(
             "agent_instructions_sha256"
         ],
     )
-    if (
-        snapshot_status.get("external_client_snapshot_observable") is not True
-        or snapshot_status.get("external_client_schema_observable") is not True
-        or snapshot_status.get("client_observed_release_id")
-        != blue_binding["release_id"]
-        or snapshot_status.get("external_client_complete_schema_observable")
-        is not True
-        or not isinstance(
+    receipt_sha256 = snapshot_status.get("receipt_sha256")
+    client_declaration_sha256 = snapshot_status.get("client_declaration_sha256")
+    receipt_evidence_valid = (
+        isinstance(receipt_sha256, str)
+        and isinstance(client_declaration_sha256, str)
+        and len(set(receipt_sha256)) > 1
+        and len(set(client_declaration_sha256)) > 1
+    )
+    external_snapshot_usable = (
+        snapshot_status.get("external_client_snapshot_observable") is True
+        and snapshot_status.get("external_client_schema_observable") is True
+        and snapshot_status.get("client_observed_release_id")
+        == blue_binding["release_id"]
+        and snapshot_status.get("external_client_complete_schema_observable")
+        is True
+        and snapshot_status.get("external_client_complete_schema_count")
+        == len(blue_tools)
+        and isinstance(
             snapshot_status.get("external_client_complete_schema_sha256"), str
         )
-        or not isinstance(snapshot_status.get("receipt_sha256"), str)
-        or not isinstance(snapshot_status.get("client_declaration_sha256"), str)
-        or len(set(snapshot_status["receipt_sha256"])) == 1
-        or len(set(snapshot_status["client_declaration_sha256"])) == 1
-    ):
+        and receipt_evidence_valid
+    )
+    loopback_snapshot_usable = (
+        snapshot_status.get("server_loopback_observable") is True
+        and snapshot_status.get("server_loopback_schema_observable") is True
+        and snapshot_status.get("server_loopback_schema_contract_matches") is True
+        and snapshot_status.get("client_observed_release_id")
+        == blue_binding["release_id"]
+        and snapshot_status.get("server_loopback_complete_schema_observable")
+        is True
+        and snapshot_status.get("server_loopback_complete_schema_count")
+        == len(blue_tools)
+        and isinstance(
+            snapshot_status.get("server_loopback_complete_schema_sha256"), str
+        )
+        and receipt_evidence_valid
+    )
+    if external_snapshot_usable:
+        snapshot_rebind_mode = "external_client"
+        source_complete_schema_sha256 = snapshot_status[
+            "external_client_complete_schema_sha256"
+        ]
+    elif loopback_snapshot_usable:
+        # A verified Blue loopback receipt may prove that Green preserves the
+        # exact already-serving surface.  It never proves platform publication;
+        # that independent status remains stale/mismatched until externally
+        # observed evidence converges.
+        snapshot_rebind_mode = "server_loopback_continuity"
+        source_complete_schema_sha256 = snapshot_status[
+            "server_loopback_complete_schema_sha256"
+        ]
+    else:
         core.fail(
-            "Authentic fresh external connector snapshot is unavailable",
+            "Authentic Blue connector continuity snapshot is unavailable",
             phase="snapshot-authenticity-preflight",
             details={
                 "state": snapshot_status.get("state"),
@@ -5407,7 +5458,12 @@ def prepare_production_blue_green_runtime(
                     "client_observed_release_id"
                 ),
                 "expected_blue_release_id": blue_binding["release_id"],
-                "schema_observable": snapshot_status.get("schema_observable"),
+                "external_schema_observable": snapshot_status.get(
+                    "external_client_schema_observable"
+                ),
+                "server_loopback_schema_observable": snapshot_status.get(
+                    "server_loopback_schema_observable"
+                ),
             },
         )
     activation = core.ActivationState(
@@ -5429,9 +5485,8 @@ def prepare_production_blue_green_runtime(
         timeout_seconds=timeout_seconds,
         green_unit=_green_operator_unit(cutover_id),
         current_selector=selector_before,
-        source_complete_schema_sha256=snapshot_status[
-            "external_client_complete_schema_sha256"
-        ],
+        source_complete_schema_sha256=source_complete_schema_sha256,
+        snapshot_rebind_mode=snapshot_rebind_mode,
     )
 
 

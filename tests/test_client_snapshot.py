@@ -549,6 +549,41 @@ class ClientSnapshotTests(unittest.TestCase):
         )
         self.assertIsNone(reason)
 
+    def _rewrite_snapshot_binding_release(self, release_id: str) -> None:
+        receipt = snapshot._read_private_json(snapshot.SNAPSHOT_PATH)
+        receipt["server_binding"]["release_id"] = release_id
+        unsigned = dict(receipt)
+        unsigned.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = snapshot._sha256_json(unsigned)
+        snapshot._write_private_json(snapshot.SNAPSHOT_PATH, receipt)
+
+    def test_auto_refresh_detects_loopback_declaration_release_lag_after_cutover(self) -> None:
+        session = snapshot.connector_session_id(10, 20)
+        snapshot.bind_snapshot(
+            self.parameters(client_id=snapshot.AUTO_REFRESH_CLIENT_ID, session_id=session),
+            now_unix=1_000,
+        )
+        self._rewrite_snapshot_binding_release("new-release")
+        self.assertEqual(
+            snapshot._snapshot_refresh_reason(
+                session_id=session,
+                expected_release_id="new-release",
+                now_unix=1_100,
+            ),
+            "runtime-release-changed",
+        )
+
+    def test_auto_refresh_preserves_external_declaration_across_binding_transition(self) -> None:
+        snapshot.bind_snapshot(self.parameters(), now_unix=1_000)
+        self._rewrite_snapshot_binding_release("new-release")
+        self.assertIsNone(
+            snapshot._snapshot_refresh_reason(
+                session_id=snapshot.connector_session_id(10, 20),
+                expected_release_id="new-release",
+                now_unix=1_100,
+            )
+        )
+
     def test_auto_refresh_detects_tunnel_session_change(self) -> None:
         session = snapshot.connector_session_id(10, 20)
         snapshot.bind_snapshot(
