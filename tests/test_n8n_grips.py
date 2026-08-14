@@ -58,7 +58,7 @@ class N8nGripContractTests(unittest.TestCase):
             command_runner=command_runner,
         )
         self.assertEqual("failed", result["status"])
-        self.assertIn("provider verify failed", result["output"]["error"])
+        self.assertIn("dispatcher is unavailable", result["output"]["error"])
         self.assertEqual([], called)
 
     def test_verify_accepts_secret_free_semantic_readback(self) -> None:

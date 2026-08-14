@@ -10576,6 +10576,97 @@ def _captain_audit_completion(
     )
 
 
+def _n8n_secret_loader(
+    action: str,
+    secret_path: str,
+    expected_secret_sha256: str,
+) -> dict[str, Any]:
+    if action == "apply":
+        _require_mutations_enabled(
+            "secret_use", path=secret_path, fresh_preflight=True
+        )
+    elif action == "verify":
+        _require_capability("secret_use")
+        _require_valid_audit_chain()
+    else:
+        raise ValueError("unsupported n8n runtime action")
+
+    source = _resolve_secret_use_source(secret_path)
+    policy = _load_policy()
+    snapshot = _read_bound_regular_bytes(
+        source,
+        _policy_limit(policy, "max_read_bytes"),
+    )
+    if snapshot["sha256"] != expected_secret_sha256:
+        raise RuntimeError("provider secret digest precondition failed")
+    return {
+        "source_path": str(source),
+        "data": snapshot["data"],
+        "sha256": snapshot["sha256"],
+        "size": snapshot["size"],
+    }
+
+
+def _n8n_apply_recorder(
+    action: str,
+    snapshot: dict[str, Any],
+    output: dict[str, Any],
+) -> str:
+    if action != "apply":
+        raise ValueError("n8n audit recorder only accepts apply")
+    source = Path(str(snapshot.get("source_path")))
+    source_sha256 = snapshot.get("sha256")
+    source_size = snapshot.get("size")
+    if str(source) != str(_resolve_secret_use_source(str(source))):
+        raise RuntimeError("provider secret source changed before audit")
+    if not isinstance(source_sha256, str) or not isinstance(source_size, int):
+        raise RuntimeError("provider secret audit snapshot is invalid")
+
+    transaction_id, transaction_dir = _new_transaction_dir(
+        "n8n-provider-apply", source
+    )
+    output_sha256 = grabowski_grips.sha256_json(output)
+    evidence = {
+        "schema_version": 1,
+        "transaction_id": transaction_id,
+        "operation": "n8n-provider-apply",
+        "provider_profile": "forrest-transcription-post-done-v1",
+        "source_path": str(source),
+        "source_sha256": source_sha256,
+        "source_size": source_size,
+        "provider_mutation_performed": output.get("providerMutationPerformed") is True,
+        "output_sha256": output_sha256,
+    }
+    _write_json_evidence(transaction_dir / "provider.json", evidence)
+    return _append_audit_with_digest(
+        {
+            "timestamp": _utc_timestamp(),
+            "operation": "n8n-provider-apply",
+            "transaction_id": transaction_id,
+            "path": str(source),
+            "source_path": str(source),
+            "after_sha256": source_sha256,
+            "bytes": source_size,
+            "provider_profile": "forrest-transcription-post-done-v1",
+            "provider_mutation_performed": output.get("providerMutationPerformed") is True,
+            "output_sha256": output_sha256,
+        }
+    )
+
+
+def _n8n_provider_dispatcher(
+    action: str, request: dict[str, Any]
+) -> dict[str, Any]:
+    import grabowski_n8n_runtime
+
+    return grabowski_n8n_runtime.dispatch(
+        action,
+        request,
+        secret_loader=_n8n_secret_loader,
+        apply_recorder=_n8n_apply_recorder,
+    )
+
+
 def _grip_run_core(
     name: str,
     parameters: dict[str, Any] | None = None,
@@ -10762,6 +10853,7 @@ def _grip_run_core(
         profile=profile,
         allow_mutation=allow_mutation,
         transport_target_dispatcher=transport_target_dispatcher,
+        n8n_provider_dispatcher=_n8n_provider_dispatcher,
     )
     if name == "captain-run" and allow_mutation and captain_actor_identity is not None and captain_intent_audit is not None:
         try:
