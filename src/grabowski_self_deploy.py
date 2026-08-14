@@ -1130,6 +1130,113 @@ def _write_deploy_index(
     return payload
 
 
+def _deploy_finalization_retry_block(
+    entry: Path, metadata: dict[str, Any]
+) -> bool:
+    """Recognize only the durable no-blind-retry deployment state.
+
+    This is a scheduling guard, not a second success authority.  Any present
+    runtime-deploy finalization that cannot be safely parsed blocks bootstrap
+    rather than authorizing a retry.
+    """
+    contract = metadata.get("finalization_contract")
+    if not isinstance(contract, dict):
+        return False
+    if contract.get("kind") != "grabowski_runtime_deploy_finalization":
+        return False
+    receipt_paths = contract.get("receipt_paths")
+    if not isinstance(receipt_paths, dict):
+        raise RuntimeError(
+            f"runtime deploy finalization contract is malformed: {entry.name}"
+        )
+    path = entry / "finalization.json"
+    if receipt_paths.get("finalization") != str(path):
+        raise RuntimeError(
+            f"runtime deploy finalization path is not bound to {entry.name}"
+        )
+    if path.is_symlink():
+        raise RuntimeError(
+            f"runtime deploy finalization may not be a symlink: {entry.name}"
+        )
+    if not path.exists():
+        return False
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError(
+            f"runtime deploy finalization is unreadable: {entry.name}"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) & 0o077
+            or opened.st_size > 64 * 1024
+        ):
+            raise RuntimeError(
+                f"runtime deploy finalization is not one private regular file: {entry.name}"
+            )
+        raw = bytearray()
+        while len(raw) <= 64 * 1024:
+            chunk = os.read(descriptor, min(64 * 1024, 64 * 1024 + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        if len(raw) > 64 * 1024:
+            raise RuntimeError(
+                f"runtime deploy finalization exceeds its size bound: {entry.name}"
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(bytes(raw).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"runtime deploy finalization is invalid JSON: {entry.name}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"runtime deploy finalization is not an object: {entry.name}"
+        )
+    declared = payload.get("payload_sha256")
+    unsigned = dict(payload)
+    unsigned.pop("payload_sha256", None)
+    if (
+        not isinstance(declared, str)
+        or re.fullmatch(r"[0-9a-f]{64}", declared) is None
+        or _sha256_json(unsigned) != declared
+    ):
+        raise RuntimeError(
+            f"runtime deploy finalization hash is invalid: {entry.name}"
+        )
+    for key in ("unit", "job_id", "argv_sha256", "expected_head"):
+        if payload.get(key) != contract.get(key):
+            raise RuntimeError(
+                f"runtime deploy finalization binding drift: {entry.name}:{key}"
+            )
+    final_status = payload.get("final_status")
+    if final_status != "outcome_unknown":
+        return False
+    blue_green = payload.get("blue_green")
+    if (
+        payload.get("completion_status") != "outcome_unknown"
+        or payload.get("blind_retry_allowed") is not False
+        or not isinstance(blue_green, dict)
+        or blue_green.get("outcome") != "completed"
+        or blue_green.get("receipt_persisted") is not False
+        or blue_green.get("expected_head") != contract.get("expected_head")
+        or blue_green.get("receipt_sha256")
+        != payload.get("blue_green_receipt_sha256")
+    ):
+        raise RuntimeError(
+            f"runtime deploy outcome_unknown finalization is invalid: {entry.name}"
+        )
+    return True
+
+
 def _bootstrap_deploy_index(
     jobs_root: Path,
     _repository: Path | None = None,
@@ -1156,9 +1263,14 @@ def _bootstrap_deploy_index(
             and candidate_command[0] == "/usr/bin/python3"
             and candidate_command[1].endswith(f"/{RUNNER_RELATIVE_PATH}")
         )
-        if (
-            references_self_deploy
-            and metadata.get("final_status") not in TERMINAL_JOB_STATUSES
+        unresolved_finalization = (
+            _deploy_finalization_retry_block(entry, metadata)
+            if references_self_deploy
+            else False
+        )
+        if references_self_deploy and (
+            unresolved_finalization
+            or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
         ):
             units.append(entry.name)
     return _write_deploy_index(jobs_root, units=units, pending_unit=None)
@@ -1252,6 +1364,16 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
         if not isinstance(status, dict):
             raise RuntimeError(f"self deploy job status is unavailable: {entry.name}")
         final_status = status.get("final_status")
+        finalization = status.get("finalization_receipt")
+        if (
+            isinstance(finalization, dict)
+            and finalization.get("valid") is True
+            and finalization.get("final_status") == "outcome_unknown"
+            and finalization.get("blind_retry_allowed") is False
+        ):
+            raise RuntimeError(
+                f"self deploy job requires authoritative runtime readback before retry: {entry.name} (outcome_unknown)"
+            )
         if final_status in TERMINAL_JOB_STATUSES:
             continue
         retained_units.append(entry.name)

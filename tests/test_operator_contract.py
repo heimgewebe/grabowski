@@ -2805,6 +2805,101 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
         )
         self.assertTrue(status["finalization_receipt"]["valid"])
 
+    def test_runtime_deploy_outcome_unknown_preserves_applied_identity_and_blocks_retry(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def mutate(material):
+                expected_head = material["expected_head"]
+                receipt_sha256 = "ab" * 32
+                material.update(
+                    {
+                        "completion_status": "outcome_unknown",
+                        "repo_head": expected_head,
+                        "release_id": "release-test",
+                        "failure_type": "ProductionBlueGreenReceiptPersistenceError",
+                        "blue_green": {
+                            "schema_version": 1,
+                            "kind": "grabowski_scheduled_blue_green_summary",
+                            "receipt_sha256": receipt_sha256,
+                            "receipt_path": None,
+                            "receipt_persisted": False,
+                            "receipt_persistence_error_type": "OSError",
+                            "blind_retry_allowed": False,
+                            "outcome": "completed",
+                            "expected_head": expected_head,
+                            "source_identity_sha256": "cd" * 32,
+                        },
+                        "blue_green_receipt_sha256": receipt_sha256,
+                        "blind_retry_allowed": False,
+                    }
+                )
+
+            state, jobs, unit, expected_head = self._fixture(
+                operator,
+                root,
+                final_status="outcome_unknown",
+                mutate_payload=mutate,
+            )
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "outcome_unknown")
+        self.assertEqual(
+            status["terminalization_evidence"]["source"],
+            "persisted-runner-receipt",
+        )
+        self.assertEqual(
+            status["terminalization_evidence"]["expected_head"], expected_head
+        )
+        self.assertTrue(status["finalization_receipt"]["valid"])
+        self.assertFalse(status["finalization_receipt"]["blind_retry_allowed"])
+        self.assertEqual(
+            status["finalization_receipt"]["blue_green_receipt_sha256"],
+            "ab" * 32,
+        )
+
+    def test_runtime_deploy_outcome_unknown_rejects_retryable_receipt(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def mutate(material):
+                expected_head = material["expected_head"]
+                receipt_sha256 = "ab" * 32
+                material.update(
+                    {
+                        "completion_status": "outcome_unknown",
+                        "repo_head": expected_head,
+                        "release_id": "release-test",
+                        "failure_type": "ProductionBlueGreenReceiptPersistenceError",
+                        "blue_green": {
+                            "receipt_sha256": receipt_sha256,
+                            "receipt_persisted": False,
+                            "outcome": "completed",
+                            "expected_head": expected_head,
+                        },
+                        "blue_green_receipt_sha256": receipt_sha256,
+                        "blind_retry_allowed": True,
+                    }
+                )
+
+            state, jobs, unit, _ = self._fixture(
+                operator,
+                root,
+                final_status="outcome_unknown",
+                mutate_payload=mutate,
+            )
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "missing_finalization_evidence")
+        self.assertEqual(
+            status["finalization_receipt"]["reason"],
+            "outcome_unknown_receipt_semantics_invalid",
+        )
+
     def test_truncated_or_invalid_json_receipt_is_rejected_fail_closed(self) -> None:
         operator = _load_operator_module()
         for raw in (b'{"truncated":', b'not-json'):

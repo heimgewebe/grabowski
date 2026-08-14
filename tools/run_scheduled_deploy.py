@@ -123,12 +123,17 @@ def write_finalization_receipt(
     failure_type: str | None,
     blue_green: dict[str, Any] | None = None,
 ) -> Path:
-    if final_status not in {"completed", "failed"}:
+    if final_status not in {"completed", "failed", "outcome_unknown"}:
         raise ValueError("invalid finalization status")
+    completion_status = {
+        "completed": "complete",
+        "failed": "failed",
+        "outcome_unknown": "outcome_unknown",
+    }[final_status]
     material = {
         **binding,
         "final_status": final_status,
-        "completion_status": "complete" if final_status == "completed" else "failed",
+        "completion_status": completion_status,
         "repo_head": repo_head,
         "release_id": release_id,
         "failure_type": failure_type,
@@ -138,6 +143,7 @@ def write_finalization_receipt(
             if isinstance(blue_green, dict)
             else None
         ),
+        "blind_retry_allowed": False if final_status == "outcome_unknown" else None,
         "timestamp_unix": int(time.time()),
     }
     payload = {**material, "payload_sha256": canonical_json_sha256(material)}
@@ -865,6 +871,15 @@ def _blue_green_summary(result: dict[str, Any]) -> dict[str, Any]:
         "kind": "grabowski_scheduled_blue_green_summary",
         "receipt_sha256": receipt.get("receipt_sha256"),
         "receipt_path": result.get("receipt_path"),
+        "receipt_persisted": result.get(
+            "receipt_persisted", result.get("receipt_path") is not None
+        ),
+        "receipt_persistence_error_type": result.get(
+            "receipt_persistence_error_type"
+        ),
+        "blind_retry_allowed": False
+        if result.get("receipt_persisted") is False
+        else None,
         "outcome": receipt.get("outcome"),
         "expected_head": receipt.get("expected_head"),
         "source_identity_sha256": receipt.get("source_identity_sha256"),
@@ -912,11 +927,26 @@ def run_productive_blue_green(
     expected_head: str,
     source_identity_sha256: str,
 ) -> dict[str, Any]:
-    result = deploy_dual.run_production_blue_green_cutover(
-        repo=repo,
-        expected_head=expected_head,
-        source_identity_sha256=source_identity_sha256,
-    )
+    try:
+        result = deploy_dual.run_production_blue_green_cutover(
+            repo=repo,
+            expected_head=expected_head,
+            source_identity_sha256=source_identity_sha256,
+        )
+    except deploy_dual.ProductionBlueGreenReceiptPersistenceError as exc:
+        result = {
+            "receipt": exc.receipt,
+            "receipt_path": None,
+            "receipt_sha256": exc.receipt_sha256,
+            "receipt_persisted": False,
+            "receipt_persistence_error_type": exc.persistence_error_type,
+            "outcome": exc.outcome,
+            "error": None,
+        }
+        summary = _blue_green_summary(result)
+        emit("blue-green-receipt-persistence-failed", **summary)
+        return {**result, "summary": summary}
+    result = {**result, "receipt_persisted": True}
     summary = _blue_green_summary(result)
     emit("blue-green-receipt", **summary)
     return {**result, "summary": summary}
@@ -938,6 +968,7 @@ def main() -> int:
         raise ValueError("source_identity_sha256 must be a lowercase SHA-256")
     binding: dict[str, Any] | None = None
     blue_green_result: dict[str, Any] | None = None
+    live: dict[str, Any] | None = None
     try:
         binding = load_finalization_binding()
         if binding is not None and binding["expected_head"] != args.expected_head:
@@ -976,6 +1007,9 @@ def main() -> int:
             raise BlueGreenDeploymentIncomplete(
                 "productive blue-green cutover did not complete; inspect its durable receipt"
             )
+        primary_receipt_unpersisted = (
+            blue_green_result.get("receipt_persisted") is False
+        )
         live = verify_live_manifest(args.expected_head)
         verify_repository(
             repo,
@@ -1013,21 +1047,53 @@ def main() -> int:
         if binding is not None:
             write_finalization_receipt(
                 binding,
-                final_status="completed",
+                final_status=(
+                    "outcome_unknown" if primary_receipt_unpersisted else "completed"
+                ),
                 repo_head=live["repo_head"],
                 release_id=live["release_id"],
-                failure_type=None,
+                failure_type=(
+                    "ProductionBlueGreenReceiptPersistenceError"
+                    if primary_receipt_unpersisted
+                    else None
+                ),
                 blue_green=blue_green_result["summary"],
             )
+        if primary_receipt_unpersisted:
+            emit(
+                "runtime-applied-primary-receipt-outstanding",
+                repo_head=live["repo_head"],
+                release_id=live["release_id"],
+                blue_green=blue_green_result["summary"],
+                blind_retry_allowed=False,
+            )
+            return 1
         return 0
     except Exception as exc:
+        applied_without_primary_receipt = (
+            isinstance(blue_green_result, dict)
+            and blue_green_result.get("outcome") == "completed"
+            and blue_green_result.get("receipt_persisted") is False
+        )
         if binding is not None:
             try:
                 write_finalization_receipt(
                     binding,
-                    final_status="failed",
-                    repo_head=None,
-                    release_id=None,
+                    final_status=(
+                        "outcome_unknown"
+                        if applied_without_primary_receipt
+                        else "failed"
+                    ),
+                    repo_head=(
+                        live.get("repo_head")
+                        if applied_without_primary_receipt and isinstance(live, dict)
+                        else None
+                    ),
+                    release_id=(
+                        live.get("release_id")
+                        if applied_without_primary_receipt and isinstance(live, dict)
+                        else None
+                    ),
                     failure_type=type(exc).__name__,
                     blue_green=(
                         blue_green_result.get("summary")

@@ -412,6 +412,82 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
         self.assertEqual(runtime.rollback_calls, 0)
         self.assertTrue(runtime.connector_switched)
 
+    def test_primary_receipt_persistence_replays_identical_existing_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "receipts"
+            receipt = {
+                "cutover_id": "cutover-idempotent",
+                "receipt_sha256": "9f" * 32,
+                "outcome": "completed",
+            }
+            with mock.patch.object(dual, "BLUE_GREEN_RECEIPT_ROOT", root):
+                first = dual._persist_production_blue_green_receipt(receipt)
+                second = dual._persist_production_blue_green_receipt(receipt)
+        self.assertEqual(first, second)
+        self.assertEqual(first["receipt_sha256"], "9f" * 32)
+
+    def test_primary_receipt_persistence_rejects_existing_cutover_with_different_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "receipts"
+            first = {
+                "cutover_id": "cutover-conflict",
+                "receipt_sha256": "9f" * 32,
+                "outcome": "completed",
+            }
+            second = {
+                **first,
+                "receipt_sha256": "8e" * 32,
+            }
+            with mock.patch.object(dual, "BLUE_GREEN_RECEIPT_ROOT", root):
+                dual._persist_production_blue_green_receipt(first)
+                with self.assertRaisesRegex(
+                    RuntimeError, "already binds different receipt evidence"
+                ):
+                    dual._persist_production_blue_green_receipt(second)
+
+    def test_completed_cutover_preserves_receipt_when_primary_persistence_fails(self) -> None:
+        runtime = _FakeProductionRuntime()
+
+        def receipt(**kwargs):
+            return {
+                "schema_version": 1,
+                "kind": "grabowski_blue_green_deployment_receipt",
+                "cutover_id": "cutover-persist-failure",
+                "receipt_sha256": "9e" * 32,
+                "outcome": kwargs["outcome"],
+                "phase": kwargs["phase"],
+                "expected_head": HEAD_GREEN,
+            }
+
+        with (
+            mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
+            mock.patch.object(
+                dual, "prepare_production_blue_green_runtime", return_value=runtime
+            ),
+            mock.patch.object(
+                dual, "_production_blue_green_receipt", side_effect=receipt
+            ),
+            mock.patch.object(
+                dual,
+                "_persist_production_blue_green_receipt",
+                side_effect=OSError("receipt directory full"),
+            ),
+        ):
+            with self.assertRaises(
+                dual.ProductionBlueGreenReceiptPersistenceError
+            ) as raised:
+                dual.run_production_blue_green_cutover(
+                    repo=ROOT,
+                    expected_head=HEAD_GREEN,
+                    source_identity_sha256=SOURCE_IDENTITY_SHA256,
+                    cutover_id="cutover-persist-failure",
+                )
+        self.assertEqual(raised.exception.outcome, "completed")
+        self.assertEqual(raised.exception.receipt["outcome"], "completed")
+        self.assertEqual(raised.exception.receipt_sha256, "9e" * 32)
+        self.assertEqual(raised.exception.persistence_error_type, "OSError")
+        self.assertTrue(runtime.connector_switched)
+
     def test_failed_snapshot_preflight_still_persists_typed_receipt(self) -> None:
         persisted: list[dict[str, object]] = []
 

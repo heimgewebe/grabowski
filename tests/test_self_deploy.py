@@ -191,6 +191,10 @@ def _productive_blue_green_result(expected: str = "f" * 40) -> dict[str, object]
         "schema_version": 1,
         "kind": "grabowski_scheduled_blue_green_summary",
         "receipt_sha256": "ab" * 32,
+        "receipt_path": "/state/blue-green.json",
+        "receipt_persisted": True,
+        "receipt_persistence_error_type": None,
+        "blind_retry_allowed": None,
         "outcome": "completed",
         "expected_head": expected,
         "source_identity_sha256": "cd" * 32,
@@ -199,6 +203,7 @@ def _productive_blue_green_result(expected: str = "f" * 40) -> dict[str, object]
         "outcome": "completed",
         "receipt_sha256": "ab" * 32,
         "receipt_path": "/state/blue-green.json",
+        "receipt_persisted": True,
         "receipt": {
             "receipt_sha256": "ab" * 32,
             "outcome": "completed",
@@ -206,6 +211,27 @@ def _productive_blue_green_result(expected: str = "f" * 40) -> dict[str, object]
         },
         "summary": summary,
     }
+
+
+def _unpersisted_productive_blue_green_result(expected: str = "f" * 40) -> dict[str, object]:
+    result = _productive_blue_green_result(expected)
+    summary = dict(result["summary"])
+    summary.update(
+        {
+            "receipt_path": None,
+            "receipt_persisted": False,
+            "receipt_persistence_error_type": "OSError",
+            "blind_retry_allowed": False,
+        }
+    )
+    return {
+        **result,
+        "receipt_path": None,
+        "receipt_persisted": False,
+        "receipt_persistence_error_type": "OSError",
+        "summary": summary,
+    }
+
 
 class SelfDeployToolTests(unittest.TestCase):
     def test_annotations_and_schema_bounds(self) -> None:
@@ -1000,6 +1026,51 @@ class SelfDeployToolTests(unittest.TestCase):
                 create=True,
             ):
                 with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
+
+    def test_matching_deploy_blocks_durable_outcome_unknown_before_retry(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": command,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
+                "cwd": str(repo),
+                "expected_receipt": {
+                    "unit": job_dir.name,
+                    "metadata_path": str(job_dir / "metadata.json"),
+                    "stdout_path": str(job_dir / "stdout.log"),
+                    "stderr_path": str(job_dir / "stderr.log"),
+                    "status_tool": "grabowski_job_status",
+                    "logs_tool": "grabowski_job_logs",
+                },
+            }
+            status = {
+                "final_status": "failed",
+                "finalization_receipt": {
+                    "valid": True,
+                    "final_status": "outcome_unknown",
+                    "blind_retry_allowed": False,
+                },
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=root
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deploy_index",
+                return_value={"units": [job_dir.name], "pending_unit": None},
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "authoritative runtime readback before retry"
+                ):
                     SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
 
     def _job_fixture(self, root: Path, repo: Path, runner: Path, head: str, *, delay: int = 8) -> tuple[Path, list[str], dict[str, object]]:
@@ -1936,6 +2007,32 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.productive_blue_green_mock.assert_called_once()
         reconcile.assert_not_called()
 
+    def test_run_productive_blue_green_propagates_in_memory_receipt_on_persistence_failure(self) -> None:
+        self.productive_blue_green.stop()
+        receipt = {
+            "receipt_sha256": "ab" * 32,
+            "outcome": "completed",
+            "expected_head": "f" * 40,
+            "source_identity_sha256": "cd" * 32,
+        }
+        error = RUNNER.deploy_dual.ProductionBlueGreenReceiptPersistenceError(
+            receipt, OSError("receipt full")
+        )
+        with patch.object(
+            RUNNER.deploy_dual,
+            "run_production_blue_green_cutover",
+            side_effect=error,
+        ):
+            result = RUNNER.run_productive_blue_green(
+                repo=Path("/tmp/repository"),
+                expected_head="f" * 40,
+                source_identity_sha256="cd" * 32,
+            )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertFalse(result["receipt_persisted"])
+        self.assertIsNone(result["receipt_path"])
+        self.assertFalse(result["summary"]["blind_retry_allowed"])
+
     def test_finalization_binding_and_atomic_receipt_are_hash_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary).resolve()
@@ -2043,6 +2140,48 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             release_id="release",
             failure_type=None,
             blue_green=_productive_blue_green_result()["summary"],
+        )
+
+    def test_main_preserves_applied_runtime_when_primary_receipt_persistence_fails(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        binding = {"expected_head": expected}
+        blue_green = _unpersisted_productive_blue_green_result(expected)
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=binding
+        ), patch.object(RUNNER.time, "sleep"), patch.object(
+            RUNNER, "verify_repository"
+        ), patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(RUNNER, "run_streamed"), patch.object(
+            RUNNER, "run_productive_blue_green", return_value=blue_green
+        ), patch.object(
+            RUNNER,
+            "verify_live_manifest",
+            return_value={
+                "release_id": "release",
+                "repo_head": expected,
+                "completion_status": "complete",
+            },
+        ), patch.object(
+            RUNNER,
+            "reconcile_coding_agent_sidecars",
+            return_value=_sidecar_reconciliation(expected),
+        ), patch.object(
+            RUNNER, "write_finalization_receipt"
+        ) as write:
+            self.assertEqual(RUNNER.main(), 1)
+        write.assert_called_once_with(
+            binding,
+            final_status="outcome_unknown",
+            repo_head=expected,
+            release_id="release",
+            failure_type="ProductionBlueGreenReceiptPersistenceError",
+            blue_green=blue_green["summary"],
         )
 
     def test_main_marks_runtime_live_sidecar_failure_as_outstanding(self) -> None:

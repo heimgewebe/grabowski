@@ -5468,6 +5468,19 @@ BLUE_GREEN_RECEIPT_ROOT = (
 BLUE_GREEN_RECEIPT_MAX_BYTES = 256 * 1024
 
 
+class ProductionBlueGreenReceiptPersistenceError(RuntimeError):
+    """The cutover outcome is known in memory but its primary receipt was not persisted."""
+
+    def __init__(self, receipt: dict[str, Any], cause: BaseException) -> None:
+        self.receipt = dict(receipt)
+        self.receipt_sha256 = str(receipt.get("receipt_sha256") or "")
+        self.outcome = str(receipt.get("outcome") or "")
+        self.persistence_error_type = type(cause).__name__
+        super().__init__(
+            "productive blue-green cutover receipt persistence failed after outcome observation"
+        )
+
+
 def _json_sha256(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -5506,34 +5519,59 @@ def _persist_production_blue_green_receipt(
     if len(encoded) > BLUE_GREEN_RECEIPT_MAX_BYTES:
         core.fail("Blue-green receipt exceeds its size bound")
     path = root / f"{cutover_id}.json"
-    descriptor = os.open(
-        path,
+    create_flags = (
         os.O_WRONLY
         | os.O_CREAT
         | os.O_EXCL
         | os.O_CLOEXEC
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
+        | getattr(os, "O_NOFOLLOW", 0)
     )
+    created = False
     try:
-        offset = 0
-        while offset < len(encoded):
-            written = os.write(descriptor, encoded[offset:])
-            if written <= 0:
-                raise OSError("blue-green receipt write made no progress")
-            offset += written
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    _fsync_parent(path)
+        descriptor = os.open(path, create_flags, 0o600)
+    except FileExistsError:
+        descriptor = None
+    else:
+        created = True
+        try:
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("blue-green receipt write made no progress")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_parent(path)
+
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
+        opened = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.getuid()
+            or statmod.S_IMODE(opened.st_mode) & 0o077
+            or opened.st_size > BLUE_GREEN_RECEIPT_MAX_BYTES
+        ):
+            core.fail(
+                "Blue-green receipt file is not private and owner-controlled",
+                phase="blue-green-receipt",
+            )
         observed = os.read(descriptor, BLUE_GREEN_RECEIPT_MAX_BYTES + 1)
     finally:
         os.close(descriptor)
     if observed != encoded:
-        core.fail("Blue-green receipt readback mismatch")
+        core.fail(
+            (
+                "Blue-green receipt readback mismatch"
+                if created
+                else "Blue-green cutover id already binds different receipt evidence"
+            ),
+            phase="blue-green-receipt",
+        )
     return {
         "path": str(path),
         "receipt_sha256": str(receipt["receipt_sha256"]),
@@ -5861,11 +5899,19 @@ def run_production_blue_green_cutover(
         readback=readback,
         recovery=recovery,
     )
-    persisted = _persist_production_blue_green_receipt(receipt)
+    try:
+        persisted = _persist_production_blue_green_receipt(receipt)
+    except Exception as exc:
+        # All runtime effects and the authoritative readback have already been
+        # classified into the hash-bound receipt above.  Preserve that evidence
+        # across a storage failure so the scheduled wrapper cannot collapse an
+        # applied or ambiguous cutover into a generic retryable failure.
+        raise ProductionBlueGreenReceiptPersistenceError(receipt, exc) from exc
     return {
         "receipt": receipt,
         "receipt_path": persisted["path"],
         "receipt_sha256": persisted["receipt_sha256"],
+        "receipt_persisted": True,
         "outcome": outcome,
         "error": error,
     }
