@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
+import ast
 from pathlib import Path
-import sys
-import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import grabowski_n8n_runtime as runtime
 
@@ -14,45 +12,29 @@ PROFILE = runtime.FORREST_PROFILE
 SECRET_PATH = runtime.FORREST_SECRET_PATH
 SECRET_SHA = "a" * 64
 RESPONSE_SHA = "b" * 64
+SECRET_DATA = b"synthetic-api-key"
 
 
-grabowski_mcp = types.ModuleType("grabowski_mcp")
-grabowski_mcp._require_capability = lambda *_a, **_k: None
-grabowski_mcp._require_valid_audit_chain = lambda *_a, **_k: None
-grabowski_mcp._require_mutations_enabled = lambda *_a, **_k: None
-grabowski_mcp._resolve_secret_use_source = lambda *_a, **_k: Path(SECRET_PATH)
-grabowski_mcp._load_policy = lambda: {}
-grabowski_mcp._policy_limit = lambda *_a, **_k: 1024
-grabowski_mcp._read_bound_regular_bytes = lambda *_a, **_k: {"data": b"synthetic-api-key", "sha256": SECRET_SHA, "size": 17}
-grabowski_mcp._new_transaction_dir = lambda *_a, **_k: ("transaction-1", Path("/tmp/transaction-1"))
-grabowski_mcp._write_json_evidence = lambda *_a, **_k: None
-grabowski_mcp._append_audit_with_digest = lambda *_a, **_k: "c" * 64
-grabowski_mcp._utc_timestamp = lambda: "2026-08-13T17:00:00Z"
-grabowski_mcp.grabowski_grips = types.SimpleNamespace(sha256_json=lambda _value: "d" * 64)
+def secret_snapshot() -> dict:
+    return {
+        "source_path": SECRET_PATH,
+        "data": SECRET_DATA,
+        "sha256": SECRET_SHA,
+        "size": len(SECRET_DATA),
+    }
 
 
 class N8nRuntimeTests(unittest.TestCase):
-    def _enter_secret_patches(self, stack: ExitStack) -> None:
-        stack.enter_context(
-            patch.object(
-                grabowski_mcp,
-                "_resolve_secret_use_source",
-                return_value=Path(SECRET_PATH),
-            )
-        )
-        stack.enter_context(patch.object(grabowski_mcp, "_load_policy", return_value={}))
-        stack.enter_context(patch.object(grabowski_mcp, "_policy_limit", return_value=1024))
-        stack.enter_context(
-            patch.object(
-                grabowski_mcp,
-                "_read_bound_regular_bytes",
-                return_value={
-                    "data": b"synthetic-api-key",
-                    "sha256": SECRET_SHA,
-                    "size": len(b"synthetic-api-key"),
-                },
-            )
-        )
+    def test_runtime_has_no_mcp_or_grips_import(self) -> None:
+        tree = ast.parse(Path(runtime.__file__).read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".", 1)[0])
+        self.assertNotIn("grabowski_mcp", imported)
+        self.assertNotIn("grabowski_grips", imported)
 
     def test_verify_is_locally_read_only(self) -> None:
         request = {
@@ -68,53 +50,21 @@ class N8nRuntimeTests(unittest.TestCase):
             "providerMutationPerformed": False,
             "observed": {"state": "isolated", "responseSha256": RESPONSE_SHA},
         }
-        with ExitStack() as stack:
-            require_capability = stack.enter_context(
-                patch.object(grabowski_mcp, "_require_capability")
+        loader = Mock(return_value=secret_snapshot())
+        recorder = Mock(side_effect=AssertionError("verify must not record apply audit"))
+        with patch.object(runtime.provider, "verify", return_value=provider_output):
+            result = runtime.dispatch(
+                "verify",
+                request,
+                secret_loader=loader,
+                apply_recorder=recorder,
             )
-            require_audit = stack.enter_context(
-                patch.object(grabowski_mcp, "_require_valid_audit_chain")
-            )
-            self._enter_secret_patches(stack)
-            stack.enter_context(patch.dict(sys.modules, {"grabowski_mcp": grabowski_mcp}))
-            stack.enter_context(
-                patch.object(runtime.provider, "verify", return_value=provider_output)
-            )
-            stack.enter_context(
-                patch.object(
-                    grabowski_mcp,
-                    "_new_transaction_dir",
-                    side_effect=AssertionError(
-                        "read-only verify must not create transaction state"
-                    ),
-                )
-            )
-            stack.enter_context(
-                patch.object(
-                    grabowski_mcp,
-                    "_write_json_evidence",
-                    side_effect=AssertionError(
-                        "read-only verify must not write evidence state"
-                    ),
-                )
-            )
-            stack.enter_context(
-                patch.object(
-                    grabowski_mcp,
-                    "_append_audit_with_digest",
-                    side_effect=AssertionError(
-                        "read-only verify must not append audit state"
-                    ),
-                )
-            )
-            result = runtime.dispatch("verify", request)
-
         self.assertEqual(provider_output, result)
-        require_capability.assert_called_once_with("secret_use")
-        require_audit.assert_called_once_with()
+        loader.assert_called_once_with("verify", SECRET_PATH, SECRET_SHA)
+        recorder.assert_not_called()
         self.assertNotIn("auditRecordSha256", result)
 
-    def test_apply_keeps_local_audit_receipt(self) -> None:
+    def test_apply_keeps_local_audit_receipt_without_secret_bytes_in_recorder(self) -> None:
         request = {
             "provider_profile": PROFILE,
             "secret_path": SECRET_PATH,
@@ -128,42 +78,58 @@ class N8nRuntimeTests(unittest.TestCase):
             "providerProfile": PROFILE,
             "providerMutationPerformed": True,
         }
-        with ExitStack() as stack:
-            require_mutations = stack.enter_context(
-                patch.object(grabowski_mcp, "_require_mutations_enabled")
+        loader = Mock(return_value=secret_snapshot())
+        recorder = Mock(return_value="c" * 64)
+        with patch.object(runtime.provider, "apply", return_value=provider_output):
+            result = runtime.dispatch(
+                "apply",
+                request,
+                secret_loader=loader,
+                apply_recorder=recorder,
             )
-            self._enter_secret_patches(stack)
-            stack.enter_context(patch.dict(sys.modules, {"grabowski_mcp": grabowski_mcp}))
-            stack.enter_context(
-                patch.object(runtime.provider, "apply", return_value=provider_output)
-            )
-            stack.enter_context(
-                patch.object(
-                    grabowski_mcp,
-                    "_new_transaction_dir",
-                    return_value=("transaction-1", Path("/tmp/transaction-1")),
-                )
-            )
-            write_evidence = stack.enter_context(
-                patch.object(grabowski_mcp, "_write_json_evidence")
-            )
-            append_audit = stack.enter_context(
-                patch.object(
-                    grabowski_mcp,
-                    "_append_audit_with_digest",
-                    return_value="c" * 64,
-                )
-            )
-            result = runtime.dispatch("apply", request)
-
-        require_mutations.assert_called_once_with(
-            "secret_use",
-            path=SECRET_PATH,
-            fresh_preflight=True,
-        )
-        write_evidence.assert_called_once()
-        append_audit.assert_called_once()
+        loader.assert_called_once_with("apply", SECRET_PATH, SECRET_SHA)
+        recorder.assert_called_once()
+        action, metadata, output = recorder.call_args.args
+        self.assertEqual("apply", action)
+        self.assertNotIn("data", metadata)
+        self.assertEqual(SECRET_PATH, metadata["source_path"])
+        self.assertEqual(SECRET_SHA, metadata["sha256"])
+        self.assertEqual(len(SECRET_DATA), metadata["size"])
+        self.assertIs(provider_output, output)
         self.assertEqual("c" * 64, result["auditRecordSha256"])
+
+    def test_apply_without_recorder_fails_before_provider_effect(self) -> None:
+        request = {
+            "provider_profile": PROFILE,
+            "secret_path": SECRET_PATH,
+            "expected_secret_sha256": SECRET_SHA,
+            "expected_version_id": "version-1",
+            "expected_response_sha256": RESPONSE_SHA,
+        }
+        loader = Mock(return_value=secret_snapshot())
+        with patch.object(runtime.provider, "apply") as apply:
+            with self.assertRaisesRegex(runtime.N8nRuntimeError, "apply recorder"):
+                runtime.dispatch("apply", request, secret_loader=loader)
+        apply.assert_not_called()
+        loader.assert_not_called()
+
+    def test_loader_identity_drift_fails_before_provider_effect(self) -> None:
+        request = {
+            "provider_profile": PROFILE,
+            "secret_path": SECRET_PATH,
+            "expected_secret_sha256": SECRET_SHA,
+            "expected_state": "isolated",
+        }
+        snapshot = secret_snapshot()
+        snapshot["source_path"] = "/tmp/wrong"
+        with patch.object(runtime.provider, "verify") as verify:
+            with self.assertRaisesRegex(runtime.N8nRuntimeError, "path changed"):
+                runtime.dispatch(
+                    "verify",
+                    request,
+                    secret_loader=Mock(return_value=snapshot),
+                )
+        verify.assert_not_called()
 
 
 if __name__ == "__main__":

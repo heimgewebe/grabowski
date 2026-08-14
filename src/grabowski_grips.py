@@ -3538,8 +3538,8 @@ def _run_n8n_workflow_edge_verify(
     del spec, runner
     request = _n8n_provider_parameters(parameters, apply=False)
     if provider_dispatcher is None:
-        import grabowski_n8n_runtime
-        provider_dispatcher = grabowski_n8n_runtime.dispatch
+        _check(receipt, "provider-readback", "fail", "dispatcher-unavailable")
+        raise GripActionError("n8n provider dispatcher is unavailable")
     _check(receipt, "provider-profile-bound", "pass", request["provider_profile"])
     _check(receipt, "secret-hash-bound", "pass", request["expected_secret_sha256"])
     try:
@@ -3574,8 +3574,8 @@ def _run_n8n_workflow_edge_apply(
     del spec, runner
     request = _n8n_provider_parameters(parameters, apply=True)
     if provider_dispatcher is None:
-        import grabowski_n8n_runtime
-        provider_dispatcher = grabowski_n8n_runtime.dispatch
+        _check(receipt, "single-edge-only", "fail", "dispatcher-unavailable")
+        raise GripActionError("n8n provider dispatcher is unavailable")
     _check(receipt, "provider-profile-bound", "pass", request["provider_profile"])
     _check(receipt, "secret-hash-bound", "pass", request["expected_secret_sha256"])
     _check(
