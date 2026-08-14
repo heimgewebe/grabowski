@@ -73,8 +73,10 @@ lock. The sequence is:
    blue to green readiness without claiming that the external client already
    refreshed against green.
 7. Activate the stable runtime pointer, replace the canonical operator behind
-   still-authoritative green, verify it, CAS-switch ingress to canonical, probe
-   through 18180, and retire transient green.
+   still-authoritative green, verify it, CAS-switch ingress to canonical, and
+   complete MCP initialize/tools-list/minimal-status readiness through 18180 while
+   Green is still live and mutation admission remains closed. Only then retire
+   transient Green and reopen normal admission.
 8. Persist the blue-green receipt and expose its SHA in scheduled logs and job
    finalization.
 
@@ -97,8 +99,10 @@ Production rebind requires all of the following:
 - a hash-valid, unexpired receipt with external-client observation scope;
 - schema probe evidence that matched the declared server surface;
 - the observed blue release and repository head;
-- unchanged tool count, names, normalized per-sentinel schema fingerprints, and
-  instruction identity across blue and green;
+- unchanged tool count, names, one compact normalized schema identity over every
+  registered tool, the structured sentinel schema fingerprints, and instruction
+  identity across blue and green; legacy snapshots without the complete schema
+  identity remain readable but cannot authorize this cutover;
 - non-degenerate declaration, receipt, artifact, names, and instruction
   hashes;
 - independently observed green readiness.

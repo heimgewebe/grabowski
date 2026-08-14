@@ -117,15 +117,21 @@ class ClientSnapshotTests(unittest.TestCase):
             "grabowski_secret_reveal",
             "grabowski_task_start",
         ]
-        return {
-            "schema_version": 1,
-            "tools": [
-                {"name": name, "inputSchema": schemas[name]}
-                if name in schemas
-                else name
+        return connector_contract.mixed_artifact_from_runtime_tools(
+            [
+                {
+                    "name": name,
+                    "inputSchema": schemas.get(
+                        name,
+                        {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                        },
+                    ),
+                }
                 for name in names
-            ],
-        }
+            ]
+        )
 
     def schema_parameters(self, **overrides: object) -> dict[str, object]:
         artifact = self.schema_artifact()
@@ -638,7 +644,10 @@ class ClientSnapshotTests(unittest.TestCase):
                 self.inputSchema = schema
 
         tools = [
-            Tool("zeta"),
+            Tool(
+                "zeta",
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+            ),
             Tool("grabowski_task_start", schemas["grabowski_task_start"]),
             Tool("grip_run", schemas["grip_run"]),
             Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
@@ -673,7 +682,7 @@ class ClientSnapshotTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             snapshot.ClientSnapshotError,
-            "schema for sentinel grabowski_task_start is unavailable",
+            "runtime schema for grabowski_task_start is unavailable",
         ):
             snapshot._mixed_observed_tool_artifact(
                 [
@@ -715,7 +724,10 @@ class ClientSnapshotTests(unittest.TestCase):
             Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
             Tool("grip_run", schemas["grip_run"]),
             Tool("grabowski_task_start", schemas["grabowski_task_start"]),
-            Tool("zeta"),
+            Tool(
+                "zeta",
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+            ),
         ]
         artifact = snapshot._mixed_observed_tool_artifact(tools)
         names, _observed_schemas, metadata = (

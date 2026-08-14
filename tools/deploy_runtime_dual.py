@@ -4977,6 +4977,7 @@ class ProductionBlueGreenRuntime:
     connector_switched: bool = False
     current_selector: dict[str, Any] | None = None
     green_readiness: dict[str, Any] | None = None
+    source_complete_schema_sha256: str | None = None
 
     def start_green(self) -> dict[str, Any]:
         core.verify_apply_snapshot_unchanged(
@@ -5013,6 +5014,23 @@ class ProductionBlueGreenRuntime:
             ],
             timeout_seconds=self.timeout_seconds,
         )
+        if (
+            self.source_complete_schema_sha256 is None
+            or readiness.get("complete_schema_count")
+            != len(self.snapshot.contract.expected_tools)
+            or readiness.get("complete_schema_sha256")
+            != self.source_complete_schema_sha256
+        ):
+            core.fail(
+                "Green complete schema identity differs from the authentic external Blue snapshot",
+                phase="snapshot-authenticity-preflight",
+                details={
+                    "expected_complete_schema_sha256": self.source_complete_schema_sha256,
+                    "green_complete_schema_sha256": readiness.get(
+                        "complete_schema_sha256"
+                    ),
+                },
+            )
         self.green_readiness = readiness
         return readiness
 
@@ -5181,14 +5199,9 @@ class ProductionBlueGreenRuntime:
             expected_slot="canonical",
             expected_binding_sha256=canonical["runtime_binding_sha256"],
         )
-        green_retirement = _stop_green_operator(self.green_unit)
-        self.green_started = False
-        admission_release = None
-        if self.admission_marker is not None:
-            admission_release = release_operator_deployment_admission(
-                self.admission_marker
-            )
-            self.admission_marker = None
+        # Keep the already-verified Green runtime available and keep mutation
+        # admission closed until canonical proves full MCP readiness through
+        # ingress. Only the exact read-only minimal status probe is drain-neutral.
         canonical_readiness = _probe_release_runtime(
             release_path=self.build.release_path,
             port=TRANSPORT_INGRESS_LISTENER_PORT,
@@ -5200,6 +5213,14 @@ class ProductionBlueGreenRuntime:
             ],
             timeout_seconds=self.timeout_seconds,
         )
+        green_retirement = _stop_green_operator(self.green_unit)
+        self.green_started = False
+        admission_release = None
+        if self.admission_marker is not None:
+            admission_release = release_operator_deployment_admission(
+                self.admission_marker
+            )
+            self.admission_marker = None
         require_service_active(TRANSPORT_INGRESS_SERVICE)
         require_service_active(TUNNEL_SERVICE)
         identity = verify_url_runtime_identity(
@@ -5366,6 +5387,11 @@ def prepare_production_blue_green_runtime(
         or snapshot_status.get("external_client_schema_observable") is not True
         or snapshot_status.get("client_observed_release_id")
         != blue_binding["release_id"]
+        or snapshot_status.get("external_client_complete_schema_observable")
+        is not True
+        or not isinstance(
+            snapshot_status.get("external_client_complete_schema_sha256"), str
+        )
         or not isinstance(snapshot_status.get("receipt_sha256"), str)
         or not isinstance(snapshot_status.get("client_declaration_sha256"), str)
         or len(set(snapshot_status["receipt_sha256"])) == 1
@@ -5403,6 +5429,9 @@ def prepare_production_blue_green_runtime(
         timeout_seconds=timeout_seconds,
         green_unit=_green_operator_unit(cutover_id),
         current_selector=selector_before,
+        source_complete_schema_sha256=snapshot_status[
+            "external_client_complete_schema_sha256"
+        ],
     )
 
 

@@ -78,15 +78,18 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             "grabowski_secret_reveal",
             "grabowski_task_start",
         ]
-        return {
-            "schema_version": 1,
-            "tools": [
-                {"name": name, "inputSchema": schemas[name]}
-                if name in schemas
-                else name
+        return connector_contract.mixed_artifact_from_runtime_tools(
+            [
+                {
+                    "name": name,
+                    "inputSchema": schemas.get(
+                        name,
+                        {"type": "object", "properties": {"value": {"type": "string"}}},
+                    ),
+                }
                 for name in names
-            ],
-        }
+            ]
+        )
 
     def runtime_root(self, names: list[str]) -> Path:
         root = self.root / "runtime"
@@ -153,16 +156,34 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         self.assertEqual(result["missing_from_platform"], ["runtime-only"])
         self.assertEqual(result["unexpected_in_platform"], [])
         self.assertEqual(result["catalog_sha256"], metadata["artifact_sha256"])
+        self.assertEqual(
+            result["complete_schema_sha256"], metadata["complete_schema_sha256"]
+        )
         mode = self.platform_path.stat().st_mode & 0o777
         self.assertEqual(snapshot.PLATFORM_SNAPSHOT_MODE, 0o644)
         self.assertEqual(mode, snapshot.PLATFORM_SNAPSHOT_MODE)
         self.assertEqual(mode & 0o022, 0)
         self.assertEqual(mode & 0o044, 0o044)
 
-        runtime_artifact = {
-            "schema_version": 1,
-            "tools": list(artifact["tools"]) + ["runtime-only"],
-        }
+        runtime_artifact = connector_contract.mixed_artifact_from_runtime_tools(
+            [
+                {
+                    "name": item["name"] if isinstance(item, dict) else item,
+                    "inputSchema": (
+                        item["inputSchema"]
+                        if isinstance(item, dict)
+                        else {"type": "object", "properties": {"value": {"type": "string"}}}
+                    ),
+                }
+                for item in artifact["tools"]
+            ]
+            + [
+                {
+                    "name": "runtime-only",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ]
+        )
         runtime_metadata = connector_contract.parse_observed_artifact(
             runtime_artifact
         )[2]

@@ -521,6 +521,21 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         )
         if schema_probe["matches"] is not True:
             mismatches.append("schema_contract")
+        complete_schema_evidence_present = (
+            observed_metadata.get("complete_schema_observable") is True
+            or server_metadata.get("complete_schema_observable") is True
+        )
+        complete_schema_matches = (
+            observed_metadata.get("complete_schema_observable") is True
+            and server_metadata.get("complete_schema_observable") is True
+            and observed_metadata.get("complete_schema_count")
+            == server_metadata.get("complete_schema_count")
+            == contract["registered_tool_count"]
+            and observed_metadata.get("complete_schema_sha256")
+            == server_metadata.get("complete_schema_sha256")
+        )
+        if complete_schema_evidence_present and not complete_schema_matches:
+            mismatches.append("complete_schema_identity")
         schema_evidence = {
             "schema_version": 1,
             "observed_artifact": observed_metadata,
@@ -552,6 +567,12 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
                 "observed_schema_tools": schema_evidence["observed_artifact"][
                     "schema_tools"
                 ],
+                "observed_complete_schema_count": schema_evidence[
+                    "observed_artifact"
+                ].get("complete_schema_count"),
+                "observed_complete_schema_sha256": schema_evidence[
+                    "observed_artifact"
+                ].get("complete_schema_sha256"),
             }
         )
     cutover_binding = _optional_cutover_binding(parameters)
@@ -857,18 +878,40 @@ def rebind_authentic_snapshot_for_cutover(
         source_schema_hashes, source_schema_identity_sha256 = (
             _require_schema_identity(
                 observed_artifact.get("schema_sha256_by_tool"),
-                label="source schema identity",
+                label="source sentinel schema identity",
             )
         )
         green_schema_hashes, green_schema_identity_sha256 = _require_schema_identity(
             green_readiness.get("schema_sha256_by_tool"),
-            label="green schema identity",
+            label="green sentinel schema identity",
+        )
+        source_complete_schema_count = observed_artifact.get("complete_schema_count")
+        source_complete_schema_sha256 = observed_artifact.get("complete_schema_sha256")
+        green_complete_schema_count = green_readiness.get("complete_schema_count")
+        green_complete_schema_sha256 = green_readiness.get("complete_schema_sha256")
+        if (
+            observed_artifact.get("complete_schema_observable") is not True
+            or isinstance(source_complete_schema_count, bool)
+            or source_complete_schema_count != registered_tool_count
+            or green_complete_schema_count != registered_tool_count
+        ):
+            raise ClientSnapshotError(
+                "complete external connector schema identity is unavailable"
+            )
+        source_complete_schema_sha256 = _require_authentic_digest(
+            source_complete_schema_sha256,
+            label="source complete schema identity",
+        )
+        green_complete_schema_sha256 = _require_authentic_digest(
+            green_complete_schema_sha256,
+            label="green complete schema identity",
         )
         if (
             source_schema_hashes != green_schema_hashes
             or green_readiness.get("schema_identity_sha256")
             != green_schema_identity_sha256
             or source_schema_identity_sha256 != green_schema_identity_sha256
+            or source_complete_schema_sha256 != green_complete_schema_sha256
         ):
             raise ClientSnapshotError(
                 "green readiness schema identity does not match the authentic external connector snapshot"
@@ -889,12 +932,14 @@ def rebind_authentic_snapshot_for_cutover(
             "to_release_id": green_release,
             "to_repo_head": green_repo_head,
             "schema_identity_sha256": source_schema_identity_sha256,
+            "complete_schema_sha256": source_complete_schema_sha256,
             "surface_continuity_sha256": _sha256_json(
                 {
                     "registered_tool_count": registered_tool_count,
                     "registered_names_sha256": names_sha256,
                     "agent_instructions_sha256": instructions_sha256,
                     "schema_identity_sha256": source_schema_identity_sha256,
+                    "complete_schema_sha256": source_complete_schema_sha256,
                 }
             ),
             "green_readiness_sha256": _sha256_json(green_readiness),
@@ -1186,6 +1231,19 @@ def platform_snapshot_status(
             runtime_names,
             observed_source="platform",
         )
+        complete_schema_evidence_present = (
+            observed_metadata.get("complete_schema_observable") is True
+            or runtime_metadata.get("complete_schema_observable") is True
+        )
+        complete_schema_matches = (
+            observed_metadata.get("complete_schema_observable") is True
+            and runtime_metadata.get("complete_schema_observable") is True
+            and observed_metadata.get("complete_schema_count")
+            == runtime_metadata.get("complete_schema_count")
+            == expected_tool_count
+            and observed_metadata.get("complete_schema_sha256")
+            == runtime_metadata.get("complete_schema_sha256")
+        )
     except (TypeError, ValueError, ClientSnapshotError, connector_contract.ConnectorContractError) as exc:
         return {
             **base,
@@ -1219,7 +1277,11 @@ def platform_snapshot_status(
         not future_clock_drift
         and timestamp <= observed_at + PLATFORM_SNAPSHOT_TTL_SECONDS
     )
-    matched = binding_matches and probe.get("matches") is True
+    matched = (
+        binding_matches
+        and probe.get("matches") is True
+        and (not complete_schema_evidence_present or complete_schema_matches)
+    )
     observable = fresh and matched
     if future_clock_drift:
         state = "clock_drift"
@@ -1252,7 +1314,12 @@ def platform_snapshot_status(
         "runtime_binding_matches": binding_matches,
         "binding_mismatches": sorted(set(binding_mismatches)),
         "catalog": observed_metadata,
-        "schema_contract_matches": probe.get("schema_contract_matches") is True,
+        "schema_contract_matches": (
+            probe.get("schema_contract_matches") is True
+            and (not complete_schema_evidence_present or complete_schema_matches)
+        ),
+        "complete_schema_identity_matches": complete_schema_matches,
+        "complete_schema_sha256": observed_metadata.get("complete_schema_sha256"),
         "required_schema_property_mismatches": probe.get(
             "required_schema_property_mismatches", []
         ),
@@ -1411,6 +1478,22 @@ def snapshot_status(
         else {}
     )
     schema_evidence_observed = bool(schema_probe)
+    observed_artifact_metadata = (
+        schema_evidence.get("observed_artifact")
+        if isinstance(schema_evidence, dict)
+        and isinstance(schema_evidence.get("observed_artifact"), dict)
+        else {}
+    )
+    complete_schema_count = observed_artifact_metadata.get("complete_schema_count")
+    complete_schema_sha256 = observed_artifact_metadata.get("complete_schema_sha256")
+    complete_schema_observable = (
+        observed_artifact_metadata.get("complete_schema_observable") is True
+        and complete_schema_count == expected_tool_count
+        and declaration.get("observed_complete_schema_count") == expected_tool_count
+        and declaration.get("observed_complete_schema_sha256") == complete_schema_sha256
+        and isinstance(complete_schema_sha256, str)
+        and _SHA256_RE.fullmatch(complete_schema_sha256) is not None
+    )
     observed_schema_contract_matches = (
         schema_evidence_observed
         and schema_probe.get("matches") is True
@@ -1478,6 +1561,15 @@ def snapshot_status(
             external_client_snapshot_observable
         ),
         "external_client_schema_observable": external_client_schema_observable,
+        "external_client_complete_schema_observable": (
+            external_client_schema_observable and complete_schema_observable
+        ),
+        "external_client_complete_schema_count": (
+            complete_schema_count if complete_schema_observable else None
+        ),
+        "external_client_complete_schema_sha256": (
+            complete_schema_sha256 if complete_schema_observable else None
+        ),
         "platform_connector_snapshot_observable": platform_snapshot_observable,
         "platform_connector_schema_observable": platform_schema_observable,
         "platform_connector_snapshot_fresh": bool(platform_snapshot.get("fresh")),
@@ -1904,6 +1996,12 @@ def probe_runtime_readiness(
                     ],
                     "schema_identity_sha256": _sha256_json(
                         observed_metadata["schema_sha256_by_tool"]
+                    ),
+                    "complete_schema_count": observed_metadata.get(
+                        "complete_schema_count"
+                    ),
+                    "complete_schema_sha256": observed_metadata.get(
+                        "complete_schema_sha256"
                     ),
                 }
 
@@ -2460,6 +2558,8 @@ def capture_platform_connector_snapshot(
         "missing_from_platform": missing_from_platform,
         "unexpected_in_platform": unexpected_in_platform,
         "schema_coverage_count": observed_metadata["schema_coverage_count"],
+        "complete_schema_count": observed_metadata.get("complete_schema_count"),
+        "complete_schema_sha256": observed_metadata.get("complete_schema_sha256"),
         "source_reference": document["source"]["reference"],
     }
 

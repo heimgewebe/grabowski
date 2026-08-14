@@ -34,6 +34,7 @@ SCHEMA_SHA256_BY_TOOL = {
     for index, name in enumerate(sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS))
 }
 SCHEMA_IDENTITY_SHA256 = client_snapshot._sha256_json(SCHEMA_SHA256_BY_TOOL)
+COMPLETE_SCHEMA_SHA256 = "91" * 32
 TOOL_COUNT = len(SCHEMA_SHA256_BY_TOOL)
 
 
@@ -141,12 +142,18 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                     "schema_coverage_count": TOOL_COUNT,
                     "schema_tools": sorted(SCHEMA_SHA256_BY_TOOL),
                     "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
+                    "complete_schema_observable": True,
+                    "complete_schema_count": TOOL_COUNT,
+                    "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
                 },
                 "server_artifact": {
                     "artifact_sha256": ARTIFACT_SHA256,
                     "schema_coverage_count": TOOL_COUNT,
                     "schema_tools": sorted(SCHEMA_SHA256_BY_TOOL),
                     "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
+                    "complete_schema_observable": True,
+                    "complete_schema_count": TOOL_COUNT,
+                    "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
                 },
                 "probe": {"matches": True, "schema_contract_matches": True},
             },
@@ -191,6 +198,8 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                         "agent_instructions_sha256": INSTRUCTIONS_SHA256,
                         "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
                         "schema_identity_sha256": SCHEMA_IDENTITY_SHA256,
+                        "complete_schema_count": TOOL_COUNT,
+                        "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
                     },
                     now_unix=now_unix,
                 )
@@ -245,6 +254,52 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                             "agent_instructions_sha256": INSTRUCTIONS_SHA256,
                             "schema_sha256_by_tool": drifted,
                             "schema_identity_sha256": client_snapshot._sha256_json(drifted),
+                            "complete_schema_count": TOOL_COUNT,
+                            "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+                        },
+                        now_unix=now_unix,
+                    )
+                self.assertEqual(
+                    json.loads(snapshot_path.read_text(encoding="utf-8")), source
+                )
+
+    def test_rebind_rejects_non_sentinel_complete_schema_drift(self) -> None:
+        now_unix = 1_000
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "snapshot"
+            state_root.mkdir(mode=0o700)
+            snapshot_path = state_root / "current.json"
+            source = self._source_receipt(now_unix)
+            with mock.patch.multiple(
+                client_snapshot,
+                STATE_ROOT=state_root,
+                LOCK_PATH=state_root / "snapshot.lock",
+                SNAPSHOT_PATH=snapshot_path,
+            ):
+                client_snapshot._write_private_json(snapshot_path, source)
+                with self.assertRaisesRegex(
+                    client_snapshot.ClientSnapshotError, "schema identity"
+                ):
+                    client_snapshot.rebind_authentic_snapshot_for_cutover(
+                        cutover_id="cutover-complete-schema-drift",
+                        cutover_generation=1,
+                        current_release_id="blue",
+                        current_repo_head=HEAD_BLUE,
+                        green_release_id="green",
+                        green_repo_head=HEAD_GREEN,
+                        registered_tool_count=TOOL_COUNT,
+                        registered_names_sha256=NAMES_SHA256,
+                        agent_instructions_sha256=INSTRUCTIONS_SHA256,
+                        green_readiness={
+                            "ready": True,
+                            "release_id": "green",
+                            "repo_head": HEAD_GREEN,
+                            "names_sha256": NAMES_SHA256,
+                            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+                            "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
+                            "schema_identity_sha256": SCHEMA_IDENTITY_SHA256,
+                            "complete_schema_count": TOOL_COUNT,
+                            "complete_schema_sha256": "92" * 32,
                         },
                         now_unix=now_unix,
                     )
@@ -688,7 +743,11 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
                 "publish_routing_selector",
                 side_effect=lambda **_kwargs: (events.append("switch-canonical") or canonical),
             ),
-            mock.patch.object(dual, "_probe_release_runtime", return_value={"ready": True}),
+            mock.patch.object(
+                dual,
+                "_probe_release_runtime",
+                side_effect=lambda **_kwargs: (events.append("canonical-readiness") or {"ready": True}),
+            ),
             mock.patch.object(
                 dual,
                 "_stop_green_operator",
@@ -708,9 +767,79 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
         self.assertTrue(result["retired"])
         self.assertLess(events.index("stop-blue"), events.index("start-canonical"))
         self.assertLess(events.index("start-canonical"), events.index("switch-canonical"))
-        self.assertLess(events.index("switch-canonical"), events.index("stop-green"))
+        self.assertLess(
+            events.index("switch-canonical"), events.index("canonical-readiness")
+        )
+        self.assertLess(
+            events.index("canonical-readiness"), events.index("stop-green")
+        )
         self.assertLess(events.index("stop-green"), events.index("release-admission"))
         self.assertIsNone(runtime.admission_marker)
+
+    def test_canonical_mcp_failure_preserves_green_and_closed_admission(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock()
+        build = mock.Mock(
+            release_path=Path("/release/green"),
+            release_id="green",
+            agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+        )
+        selector = {
+            "selector_sha256": "6a" * 32,
+            "selected_slot": "green",
+            "upstream_port": 18182,
+            "runtime_binding": runtime_binding("green", HEAD_GREEN),
+            "runtime_binding_sha256": "6b" * 32,
+        }
+        marker = {"token": "active-marker"}
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(),
+            blue_manifest={},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before=selector,
+            cutover_id="cutover-canonical-readiness-failure",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            admission_marker=marker,
+            green_started=True,
+            connector_switched=True,
+            current_selector=selector,
+        )
+        canonical = {
+            **selector,
+            "selector_sha256": "6c" * 32,
+            "selected_slot": "canonical",
+            "upstream_port": 18181,
+        }
+        with (
+            mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(dual.core, "activate_pointer"),
+            mock.patch.object(dual, "stop_service"),
+            mock.patch.object(dual, "observe_service", return_value=mock.Mock(confirmed_active=True)),
+            mock.patch.object(dual, "_require_selector_authority", return_value={"authoritative": True}),
+            mock.patch.object(dual, "start_service"),
+            mock.patch.object(dual, "verify_operator_process"),
+            mock.patch.object(dual, "_require_loopback_listener", return_value={}),
+            mock.patch.object(dual.transport_ingress, "publish_routing_selector", return_value=canonical),
+            mock.patch.object(
+                dual,
+                "_probe_release_runtime",
+                side_effect=RuntimeError("canonical MCP readiness failed"),
+            ),
+            mock.patch.object(dual, "_stop_green_operator") as stop_green,
+            mock.patch.object(dual, "release_operator_deployment_admission") as release_admission,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "canonical MCP readiness failed"):
+                runtime.retire_blue()
+        stop_green.assert_not_called()
+        release_admission.assert_not_called()
+        self.assertTrue(runtime.green_started)
+        self.assertIs(runtime.admission_marker, marker)
 
     def test_green_inherits_only_canonical_nonsecret_recovery_environment(self) -> None:
         observed = mock.Mock(

@@ -724,6 +724,18 @@ def _deployment_observer_tool_call_parts(
     return tool_name, arguments, context
 
 
+def _deployment_readiness_status_call(
+    tool_name: Any,
+    arguments: Any,
+    tool: Any,
+) -> bool:
+    return (
+        tool_name == "grabowski_status"
+        and arguments == {"view": "minimal"}
+        and _tool_read_only_hint(tool) is True
+    )
+
+
 def _deployment_admission_active_tool_calls() -> int:
     with _DEPLOYMENT_ADMISSION_LOCK:
         return len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
@@ -978,6 +990,28 @@ def _install_deployment_admission_gate() -> None:
             if (
                 current_observer_evidence is not None
                 and current_observer_evidence.get("marker_bound") is True
+            ):
+                if tool is not None and getattr(tool, "is_async", True) is False:
+                    loop = asyncio.get_running_loop()
+                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                        _run_sync_tool_call,
+                        original,
+                        args,
+                        kwargs,
+                    )
+                    return await asyncio.wrap_future(worker_future, loop=loop)
+                return await original(*args, **kwargs)
+
+        if (
+            observer_marker.get("active") is True
+            and observer_marker.get("valid") is True
+            and _deployment_readiness_status_call(tool_name, arguments, tool)
+        ):
+            current_marker = _read_deployment_admission_marker()
+            if (
+                current_marker.get("active") is True
+                and current_marker.get("valid") is True
+                and _deployment_readiness_status_call(tool_name, arguments, tool)
             ):
                 if tool is not None and getattr(tool, "is_async", True) is False:
                     loop = asyncio.get_running_loop()
