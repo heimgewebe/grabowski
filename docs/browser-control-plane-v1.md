@@ -167,14 +167,28 @@ Für Dummies: Der Agent bekommt nicht mehr „klicke/rolle auf `#foo`“, sonder
 
 ## WebDriver BiDi / Firefox
 
-`webdriver-bidi` ist in v1 nur als **nicht implementierter Zukunftsadapter** modelliert. Das ermöglicht eine zweite Engine hinter derselben semantischen Control-Plane, ohne Session-, Profil-, Lease-, Outcome- oder Auditautorität neu zu entwerfen.
+`webdriver-bidi` bleibt in v1 als **nicht implementierter Produktionsadapter** modelliert. Wave B ändert diese Aussage ausdrücklich nicht: Firefox wird weder als Browser-Worker-Backend freigeschaltet noch zum Default, und `BROWSER_CONTROL_PLANE_FUTURE_ADAPTERS` bleibt fail-closed.
 
-Bis ein eigener BiDi-Adapter mit separaten Tests und Runtime-Acceptance existiert:
+Für die kontrollierte Kandidatenprüfung existiert stattdessen ein separater **Shadow-Benchmark** (`tools/browser_bidi_shadow_benchmark_core.py` plus `tools/browser_bidi_shadow_benchmark.py`). Er liegt außerhalb der öffentlichen MCP-/Grip-Surface und darf deshalb weder Session-, Profil-, Lease-, Outcome- oder Auditautorität der produktiven Browser-Control-Plane ersetzen noch eine Produktionsaktion auslösen.
+
+Der Shadow-Vertrag ist absichtlich enger als ein Adapter:
+
+- geckodriver und Firefox werden als explizite lokale Executable-Pfade übergeben; der Runner installiert nichts systemweit und fügt keine neue Python-Runtime-Abhängigkeit hinzu;
+- der Runner besitzt absichtlich keine zweite Lease-Autorität: der aufrufende Operator bindet HTTP-Port, WebSocket-Port und Work-Root vor dem Start; Live-Proben laufen als dauerhafte Grabowski-Task statt innerhalb der synchronen Operator-Surface, damit Browserkindprozess und Ressourcen denselben terminalen Lifecycle besitzen;
+- WebDriver HTTP und BiDi WebSocket werden hart an `127.0.0.1` gebunden; eine zurückgegebene WebSocket-URL muss denselben Loopback-Port und exakt die erzeugte Session-ID tragen;
+- Firefox läuft headless mit einem temporären Profil unter einem caller-eigenen Work-Root; geckodriver läuft in einer eigenen Prozessgruppe, die beim Closeout inklusive Eskalationspfad vollständig beendet wird;
+- die Probe verwendet eine deterministische lokale `data:`-Seite und liest über BiDi ausschließlich `browsingContext.getTree`, `browsingContext.navigate` und `script.evaluate`;
+- verglichen wird nur die kleine semantische Projektion `ready_state` plus geordnete `role`/`name`-Elemente gegen eine caller-gelieferte kanonische Referenz;
+- Session-ID wird im Report nur als SHA-256 ausgegeben, die WebSocket-URL gar nicht; Timings sind Messwerte des Kandidatenpfads und keine statistische Performance- oder Produktionsparitätsaussage;
+- Fehler enden `failed_closed`, `retry_authorized=false`; ein negativer Lauf beweist weder dauerhafte Transport-Unverfügbarkeit noch eine Berechtigung zum Retry oder Cutover.
+
+Bis ein eigener BiDi-Produktionsadapter mit separaten Tests und Runtime-Acceptance existiert:
 
 - Firefox ist kein Browser-Worker-Backend;
 - eine Allowlist-Erweiterung allein aktiviert Firefox nicht;
-- der Start scheitert explizit und fail-closed;
-- es wird keine Funktionsgleichheit zu Chrome/CDP behauptet.
+- der produktive Start scheitert explizit und fail-closed;
+- Shadow-Parität in einem Szenario behauptet keine Funktionsgleichheit zu Chrome/CDP;
+- Chrome/CDP bleibt der allgemeine Operator-Default und `navigate` bleibt `direct-cdp-required`.
 
 ## Runtime-Grenze dieses Changes
 
