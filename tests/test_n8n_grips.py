@@ -94,6 +94,30 @@ class N8nGripContractTests(unittest.TestCase):
             self.assertIsInstance(value, ast.Name)
             self.assertEqual(expected, value.id)
 
+    def test_apply_recorder_never_reresolves_secret_after_provider_effect(self) -> None:
+        module = ast.parse(
+            (Path(__file__).resolve().parents[1] / "src" / "grabowski_mcp.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        functions = {
+            node.name: node
+            for node in module.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        def resolver_calls(function_name: str) -> list[ast.Call]:
+            return [
+                node
+                for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_resolve_secret_use_source"
+            ]
+
+        self.assertEqual(1, len(resolver_calls("_n8n_secret_loader")))
+        self.assertEqual([], resolver_calls("_n8n_apply_recorder"))
+
     def test_verify_uses_fixed_runtime_adapter_and_never_falls_back_to_command_runner(self) -> None:
         called = []
 

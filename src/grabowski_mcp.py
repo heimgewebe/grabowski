@@ -10617,8 +10617,9 @@ def _n8n_apply_recorder(
     source = Path(str(snapshot.get("source_path")))
     source_sha256 = snapshot.get("sha256")
     source_size = snapshot.get("size")
-    if str(source) != str(_resolve_secret_use_source(str(source))):
-        raise RuntimeError("provider secret source changed before audit")
+    # The source identity and digest were validated before the provider effect.
+    # Do not re-resolve the credential path here: credential rotation after a
+    # successful external mutation must not suppress its local audit receipt.
     if not isinstance(source_sha256, str) or not isinstance(source_size, int):
         raise RuntimeError("provider secret audit snapshot is invalid")
 
