@@ -424,6 +424,52 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
 
 class ProductionPreflightHardeningTests(unittest.TestCase):
+    def test_start_green_marks_possible_unit_before_post_start_verification_failure(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock()
+        build = mock.Mock(release_path=Path("/release/green"))
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(),
+            blue_manifest={},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-start-failure",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+        )
+        projection = mock.Mock()
+        with (
+            mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=projection
+            ),
+            mock.patch.object(
+                dual, "install_safety_observer_unit", return_value={"installed": True}
+            ),
+            mock.patch.object(
+                dual,
+                "_start_green_operator",
+                side_effect=RuntimeError("listener verification failed after unit start"),
+            ),
+            mock.patch.object(
+                dual, "_stop_green_operator", return_value={"retired": True}
+            ) as stop_green,
+            mock.patch.object(dual, "restore_watchdog_host_assets") as restore_assets,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "listener verification failed"):
+                runtime.start_green()
+            self.assertTrue(runtime.green_started)
+            recovery = runtime.rollback_green()
+        stop_green.assert_called_once_with(runtime.green_unit)
+        restore_assets.assert_called_once_with(projection)
+        self.assertFalse(runtime.green_started)
+        self.assertTrue(recovery["green"]["retired"])
+
     def test_stale_external_declaration_fails_before_connector_switch(self) -> None:
         snapshot = mock.Mock()
         snapshot.repo_head = HEAD_GREEN

@@ -4979,13 +4979,17 @@ class ProductionBlueGreenRuntime:
         self.observer_repair = install_safety_observer_unit(
             self.repo, self.snapshot
         )
+        # From this point forward the start call may already have created the
+        # transient systemd unit even if a later service/argv/exe/listener
+        # verification raises. Mark the possible effect before dispatch so the
+        # pre-cutover rollback always attempts authoritative Green retirement.
+        self.green_started = True
         result = _start_green_operator(
             unit=self.green_unit,
             release_path=self.build.release_path,
             contract=self.snapshot.contract,
             timeout_seconds=self.timeout_seconds,
         )
-        self.green_started = True
         return result
 
     def verify_green(self) -> dict[str, Any]:
