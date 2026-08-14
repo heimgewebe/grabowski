@@ -1790,6 +1790,8 @@ def _snapshot_refresh_reason(
     # trigger renewal without weakening that external receipt immediately.
     if declaration.get("client_id") != AUTO_REFRESH_CLIENT_ID:
         return None
+    if declaration.get("observed_release_id") != expected_release_id:
+        return "runtime-release-changed"
     if declaration.get("session_id") != session_id:
         return "connector-session-changed"
     return None
