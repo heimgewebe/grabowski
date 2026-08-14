@@ -327,6 +327,27 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(helper.BootstrapRecoveryError, "filters"):
                 helper._canonical_repo_evidence(self.head)
 
+    def test_recovery_root_uses_private_parent_below_group_writable_repo_root(self) -> None:
+        self.assertEqual(
+            helper.RECOVERY_WORKTREE_ROOT,
+            Path("/home/alex/repos/.grabowski-deploy-worktrees/runtime-bootstrap"),
+        )
+        shared_repos = self.root / "shared-repos"
+        shared_repos.mkdir(mode=0o775)
+        shared_repos.chmod(0o775)
+        private_parent = shared_repos / ".grabowski-deploy-worktrees"
+        private_parent.mkdir(mode=0o700)
+        recovery_root = private_parent / "runtime-bootstrap"
+
+        with mock.patch.object(
+            helper, "RECOVERY_WORKTREE_ROOT", recovery_root
+        ), mock.patch.object(helper, "DEPLOY_UID", os.getuid()):
+            observed = helper._ensure_recovery_worktree_root()
+
+        self.assertEqual(os.stat(shared_repos).st_mode & 0o777, 0o775)
+        self.assertEqual(observed, recovery_root.resolve())
+        self.assertEqual(os.stat(observed).st_mode & 0o777, 0o700)
+
     def test_recovery_worktree_is_detached_exact_and_private(self) -> None:
         with self._patch_repository_constants():
             path, common = helper._create_recovery_worktree(self.head, "d" * 24)
