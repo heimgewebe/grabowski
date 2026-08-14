@@ -4789,17 +4789,26 @@ def _start_green_operator(
 def _stop_green_operator(unit: str) -> dict[str, Any]:
     name = _require_green_unit(unit)
     before = observe_service(name)
-    if before.confirmed_active:
+    after_stop = before
+    if not _green_confirmed_inactive(before):
         result = core.run(
             ["systemctl", "--user", "stop", name],
             check=False,
             capture=True,
             timeout=core.TIMEOUTS["service_stop"],
         )
-        if result.returncode != 0:
-            core.fail("Transient green operator stop failed", phase="retire-green")
+        after_stop = observe_service(name)
+        if result.returncode != 0 and not _green_confirmed_inactive(after_stop):
+            core.fail(
+                "Transient green operator stop failed",
+                phase="retire-green",
+                details={
+                    "returncode": result.returncode,
+                    "service": after_stop.to_dict(),
+                },
+            )
     deadline = time.monotonic() + core.TIMEOUTS["service_stop"]
-    after = observe_service(name)
+    after = after_stop
     while not _green_confirmed_inactive(after) and time.monotonic() < deadline:
         time.sleep(0.2)
         after = observe_service(name)

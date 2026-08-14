@@ -424,6 +424,73 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
 
 class ProductionPreflightHardeningTests(unittest.TestCase):
+    def test_stop_green_requests_stop_while_unit_is_still_activating(self) -> None:
+        activating = mock.Mock(
+            confirmed_active=False,
+            confirmed_inactive=False,
+            query_valid=True,
+            load_state="loaded",
+            active_state="activating",
+            main_pid=321,
+        )
+        inactive = mock.Mock(
+            confirmed_active=False,
+            confirmed_inactive=True,
+            query_valid=True,
+            load_state="loaded",
+            active_state="inactive",
+            main_pid=0,
+        )
+        inactive.to_dict.return_value = {"active_state": "inactive", "main_pid": 0}
+        stop_result = mock.Mock(returncode=0)
+        with (
+            mock.patch.object(dual, "observe_service", side_effect=[activating, inactive]),
+            mock.patch.object(dual.core, "run", return_value=stop_result) as run,
+        ):
+            result = dual._stop_green_operator(
+                "grabowski-green-operator-123456789abc.service"
+            )
+        run.assert_called_once_with(
+            [
+                "systemctl",
+                "--user",
+                "stop",
+                "grabowski-green-operator-123456789abc.service",
+            ],
+            check=False,
+            capture=True,
+            timeout=dual.core.TIMEOUTS["service_stop"],
+        )
+        self.assertTrue(result["retired"])
+        self.assertEqual(result["service"]["active_state"], "inactive")
+
+    def test_stop_green_accepts_failed_stop_only_after_inactive_readback(self) -> None:
+        unknown = mock.Mock(
+            confirmed_active=False,
+            confirmed_inactive=False,
+            query_valid=False,
+            load_state="unknown",
+            active_state="unknown",
+            main_pid=None,
+        )
+        inactive = mock.Mock(
+            confirmed_active=False,
+            confirmed_inactive=True,
+            query_valid=True,
+            load_state="not-found",
+            active_state="inactive",
+            main_pid=0,
+        )
+        inactive.to_dict.return_value = {"active_state": "inactive", "main_pid": 0}
+        with (
+            mock.patch.object(dual, "observe_service", side_effect=[unknown, inactive]),
+            mock.patch.object(dual.core, "run", return_value=mock.Mock(returncode=5)),
+        ):
+            result = dual._stop_green_operator(
+                "grabowski-green-operator-123456789abc.service"
+            )
+        self.assertTrue(result["retired"])
+
     def test_start_green_marks_possible_unit_before_post_start_verification_failure(self) -> None:
         snapshot = mock.Mock()
         snapshot.contract = mock.Mock()
