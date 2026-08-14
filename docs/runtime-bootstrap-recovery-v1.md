@@ -62,7 +62,9 @@ Root never runs Git, Make, the candidate runtime or a caller-controlled shell.
    local file transport for recovery Git commands;
 7. rejects configured local clean/smudge/process filters;
 8. creates a unique detached recovery worktree below
-   `/home/alex/repos/.grabowski-deploy-worktrees`;
+   `/home/alex/repos/.grabowski-deploy-worktrees/runtime-bootstrap`; the immediate
+   parent `.grabowski-deploy-worktrees` remains private (`0700`) even when the
+   broader `/home/alex/repos` collection is intentionally group-writable;
 9. revalidates detached HEAD, common-dir, origin/main, origin URL and cleanliness;
 10. builds the normal deploy-tooling environment;
 11. checks the kill switches again immediately before the deployment effect;
