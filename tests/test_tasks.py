@@ -6031,6 +6031,71 @@ class TaskTests(unittest.TestCase):
         self.assertEqual([], [item for item in recovery if item["failed"]])
         self.assertTrue(recovery[-1]["cycle_completed"])
 
+    def test_reconcile_refresh_reserves_stale_active_before_terminal_history(self) -> None:
+        terminal_ids: list[str] = []
+        for index in range(100):
+            started = self._start()
+            task_id = str(started["task"]["task_id"])
+            tasks._set_state(
+                task_id,
+                "failed",
+                observation={
+                    "state": "failed",
+                    "properties": {"ActiveState": "failed"},
+                    "probe": _launcher(),
+                    "observer": {"kind": "test"},
+                    "observed_at_unix": 100 + index,
+                },
+            )
+            terminal_ids.append(task_id)
+
+        active = self._start()
+        active_id = str(active["task"]["task_id"])
+        now = tasks._now()
+        with sqlite3.connect(self.database) as connection:
+            connection.executemany(
+                "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                [(index + 1, task_id) for index, task_id in enumerate(terminal_ids)],
+            )
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=?, updated_at_unix=?, runtime_seconds=? "
+                "WHERE task_id=?",
+                (now - 300, now - 300, 3600, active_id),
+            )
+            connection.commit()
+
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "completed",
+                "properties": {
+                    "LoadState": "not-found",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                },
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": now,
+            }
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            result = tasks.reconcile_tasks_refresh(
+                batch_size=tasks.DEFAULT_TASK_RECONCILE_BATCH_SIZE
+            )
+
+        self.assertEqual([active_id], observed)
+        self.assertEqual([active_id], [item["task_id"] for item in result["refreshed"]])
+        self.assertEqual("completed", tasks._row_raw(active_id)["state"])
+        batch = result["batch"]
+        self.assertEqual(20, batch["active_refresh"]["limit"])
+        self.assertEqual(1, batch["active_refresh"]["examined"])
+        self.assertEqual(99, batch["task_examined"])
+        self.assertEqual(100, batch["total_examined"])
+        self.assertEqual(1, result["scanned"])
+
     def test_reconcile_shared_budget_bounds_simultaneous_full_backlogs(self) -> None:
         for index in range(4):
             self._prepare_pending_terminalization(prepared_at_unix=100 + index)
