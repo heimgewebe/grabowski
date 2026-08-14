@@ -1070,9 +1070,9 @@ def main() -> int:
             return 1
         return 0
     except Exception as exc:
-        applied_without_primary_receipt = (
+        unresolved_without_primary_receipt = (
             isinstance(blue_green_result, dict)
-            and blue_green_result.get("outcome") == "completed"
+            and blue_green_result.get("outcome") in ("completed", "outcome_unknown")
             and blue_green_result.get("receipt_persisted") is False
         )
         if binding is not None:
@@ -1081,17 +1081,17 @@ def main() -> int:
                     binding,
                     final_status=(
                         "outcome_unknown"
-                        if applied_without_primary_receipt
+                        if unresolved_without_primary_receipt
                         else "failed"
                     ),
                     repo_head=(
                         live.get("repo_head")
-                        if applied_without_primary_receipt and isinstance(live, dict)
+                        if unresolved_without_primary_receipt and isinstance(live, dict)
                         else None
                     ),
                     release_id=(
                         live.get("release_id")
-                        if applied_without_primary_receipt and isinstance(live, dict)
+                        if unresolved_without_primary_receipt and isinstance(live, dict)
                         else None
                     ),
                     failure_type=type(exc).__name__,

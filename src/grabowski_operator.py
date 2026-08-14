@@ -2531,7 +2531,7 @@ def _runtime_deploy_finalization_receipt_result(
             or not failure_type
             or len(failure_type.encode("utf-8")) > 200
             or not isinstance(blue_green, dict)
-            or blue_green.get("outcome") != "completed"
+            or blue_green.get("outcome") not in ("completed", "outcome_unknown")
             or blue_green.get("receipt_persisted") is not False
             or (repo_head is not None and repo_head != contract["expected_head"])
             or ((repo_head is None) != (release_id is None))

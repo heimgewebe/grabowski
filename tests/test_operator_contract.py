@@ -2860,6 +2860,47 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
             "ab" * 32,
         )
 
+    def test_runtime_deploy_outcome_unknown_accepts_ambiguous_unpersisted_cutover(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def mutate(material):
+                expected_head = material["expected_head"]
+                receipt_sha256 = "ab" * 32
+                material.update(
+                    {
+                        "completion_status": "outcome_unknown",
+                        "repo_head": None,
+                        "release_id": None,
+                        "failure_type": "BlueGreenDeploymentIncomplete",
+                        "blue_green": {
+                            "schema_version": 1,
+                            "kind": "grabowski_scheduled_blue_green_summary",
+                            "receipt_sha256": receipt_sha256,
+                            "receipt_path": None,
+                            "receipt_persisted": False,
+                            "receipt_persistence_error_type": "OSError",
+                            "blind_retry_allowed": False,
+                            "outcome": "outcome_unknown",
+                            "expected_head": expected_head,
+                            "source_identity_sha256": "cd" * 32,
+                        },
+                        "blue_green_receipt_sha256": receipt_sha256,
+                        "blind_retry_allowed": False,
+                    }
+                )
+
+            state, jobs, unit, _ = self._fixture(
+                operator, root, final_status="outcome_unknown", mutate_payload=mutate
+            )
+            status = self._status(
+                operator, state, jobs, unit, self._systemd_not_found(root)
+            )
+        self.assertEqual(status["final_status"], "outcome_unknown")
+        self.assertTrue(status["finalization_receipt"]["valid"])
+        self.assertFalse(status["finalization_receipt"]["blind_retry_allowed"])
+
     def test_runtime_deploy_outcome_unknown_rejects_retryable_receipt(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as temporary:

@@ -233,6 +233,22 @@ def _unpersisted_productive_blue_green_result(expected: str = "f" * 40) -> dict[
     }
 
 
+def _unpersisted_outcome_unknown_blue_green_result(
+    expected: str = "f" * 40,
+) -> dict[str, object]:
+    result = _unpersisted_productive_blue_green_result(expected)
+    receipt = dict(result["receipt"])
+    receipt["outcome"] = "outcome_unknown"
+    summary = dict(result["summary"])
+    summary["outcome"] = "outcome_unknown"
+    return {
+        **result,
+        "outcome": "outcome_unknown",
+        "receipt": receipt,
+        "summary": summary,
+    }
+
+
 class SelfDeployToolTests(unittest.TestCase):
     def test_annotations_and_schema_bounds(self) -> None:
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.readOnlyHint)
@@ -305,6 +321,46 @@ class SelfDeployToolTests(unittest.TestCase):
             ):
                 index = SELF_DEPLOY._bootstrap_deploy_index(jobs, repository)
             self.assertEqual(index["units"], [running])
+
+    def test_bootstrap_retry_block_preserves_unpersisted_outcome_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary) / "grabowski-job-abcdef012345"
+            entry.mkdir(mode=0o700)
+            expected = "a" * 40
+            receipt_sha256 = "ab" * 32
+            contract = {
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": entry.name,
+                "job_id": "abcdef012345",
+                "argv_sha256": "b" * 64,
+                "expected_head": expected,
+                "receipt_paths": {"finalization": str(entry / "finalization.json")},
+            }
+            material = {
+                "unit": entry.name,
+                "job_id": "abcdef012345",
+                "argv_sha256": "b" * 64,
+                "expected_head": expected,
+                "final_status": "outcome_unknown",
+                "completion_status": "outcome_unknown",
+                "blue_green": {
+                    "receipt_sha256": receipt_sha256,
+                    "receipt_persisted": False,
+                    "outcome": "outcome_unknown",
+                    "expected_head": expected,
+                },
+                "blue_green_receipt_sha256": receipt_sha256,
+                "blind_retry_allowed": False,
+            }
+            payload = {**material, "payload_sha256": SELF_DEPLOY._sha256_json(material)}
+            receipt = entry / "finalization.json"
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            receipt.chmod(0o600)
+            self.assertTrue(
+                SELF_DEPLOY._deploy_finalization_retry_block(
+                    entry, {"finalization_contract": contract}
+                )
+            )
 
     def test_pending_deploy_index_unit_is_recovered_from_exact_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2181,6 +2237,42 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=expected,
             release_id="release",
             failure_type="ProductionBlueGreenReceiptPersistenceError",
+            blue_green=blue_green["summary"],
+        )
+
+    def test_main_preserves_unknown_runtime_when_primary_receipt_persistence_fails(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        binding = {"expected_head": expected}
+        blue_green = _unpersisted_outcome_unknown_blue_green_result(expected)
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=binding
+        ), patch.object(RUNNER.time, "sleep"), patch.object(
+            RUNNER, "verify_repository"
+        ), patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(RUNNER, "run_streamed"), patch.object(
+            RUNNER, "run_productive_blue_green", return_value=blue_green
+        ), patch.object(
+            RUNNER, "verify_live_manifest"
+        ) as verify_live, patch.object(
+            RUNNER, "reconcile_coding_agent_sidecars"
+        ) as reconcile, patch.object(
+            RUNNER, "write_finalization_receipt"
+        ) as write:
+            self.assertEqual(RUNNER.main(), 1)
+        verify_live.assert_not_called()
+        reconcile.assert_not_called()
+        write.assert_called_once_with(
+            binding,
+            final_status="outcome_unknown",
+            repo_head=None,
+            release_id=None,
+            failure_type="BlueGreenDeploymentIncomplete",
             blue_green=blue_green["summary"],
         )
 

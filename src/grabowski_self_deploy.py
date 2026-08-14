@@ -1225,7 +1225,7 @@ def _deploy_finalization_retry_block(
         payload.get("completion_status") != "outcome_unknown"
         or payload.get("blind_retry_allowed") is not False
         or not isinstance(blue_green, dict)
-        or blue_green.get("outcome") != "completed"
+        or blue_green.get("outcome") not in ("completed", "outcome_unknown")
         or blue_green.get("receipt_persisted") is not False
         or blue_green.get("expected_head") != contract.get("expected_head")
         or blue_green.get("receipt_sha256")
