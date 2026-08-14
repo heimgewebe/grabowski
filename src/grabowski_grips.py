@@ -707,6 +707,24 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="publication",
         operation_class="push",
     ),
+    "forrest-server-exit-apply": GripSpec(
+        name="forrest-server-exit-apply",
+        version="1.0",
+        summary="Remove only Forrest's fixed wg-prod-1 HTTPS 443 serve route after exact protected-route and backend-port preconditions.",
+        effect=MUTATING,
+        required_parameters=(),
+        acceptance_ids=(
+            "fixed-target-bound",
+            "forrest-route-precondition",
+            "backend-port-precondition",
+            "https-443-only",
+            "protected-8443-preserved",
+            "provider-post-readback",
+        ),
+        runner="forrest_server_exit_apply",
+        operation_effect_class="network_control",
+        operation_class="forrest-server-exit",
+    ),
     "pr-create-or-update": GripSpec(
         name="pr-create-or-update",
         version="1.2",
@@ -748,6 +766,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "connector-snapshot-bind",
         "n8n-workflow-edge-verify",
         "n8n-workflow-edge-apply",
+        "forrest-server-exit-apply",
         "transport-roundtrip",
         "convergence-assess",
         "gate-evidence-preflight",
@@ -9477,6 +9496,51 @@ def _run_captain_run(
     return grabowski_grip_orchestration.run_captain_run(sys.modules[__name__], spec, parameters, receipt, runner, github_runner)
 
 
+def _run_forrest_server_exit_apply(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    unknown = sorted(parameters)
+    if unknown:
+        raise GripPreflightError(
+            "forrest-server-exit-apply accepts no caller parameters: " + ", ".join(unknown)
+        )
+    import grabowski_forrest_server_exit
+
+    _check(receipt, "fixed-target-bound", "pass", "wg-prod-1:https:443")
+    try:
+        output = grabowski_forrest_server_exit.apply()
+    except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+        _check(receipt, "provider-post-readback", "fail", type(exc).__name__)
+        raise GripActionError(
+            "Forrest server-exit apply failed; fresh Tailscale/port readback is required before any retry"
+        ) from exc
+    if not isinstance(output, dict) or output.get("ok") is not True:
+        _check(receipt, "provider-post-readback", "fail", "invalid-output")
+        raise GripActionError("Forrest server-exit apply returned invalid output")
+    before = output.get("before") if isinstance(output.get("before"), dict) else {}
+    after = output.get("after") if isinstance(output.get("after"), dict) else {}
+    pre_route = (before.get("routes") or {}).get("443") == "http://127.0.0.1:18000"
+    pre_ports = before.get("port18000Listening") is False and before.get("port18090Listening") is True
+    removed = "443" not in (after.get("routes") or {})
+    preserved = (after.get("routes") or {}).get("8443") == "http://127.0.0.1:18090"
+    post_ports = after.get("port18000Listening") is False and after.get("port18090Listening") is True
+    _check(receipt, "forrest-route-precondition", "pass" if pre_route else "fail", "443->18000")
+    _check(receipt, "backend-port-precondition", "pass" if pre_ports else "fail", "18000 closed; 18090 open")
+    _check(receipt, "https-443-only", "pass" if removed else "fail", "443 absent")
+    _check(receipt, "protected-8443-preserved", "pass" if preserved and post_ports else "fail", "8443->18090 unchanged")
+    _check(receipt, "provider-post-readback", "pass" if removed and preserved and post_ports else "fail", str(after.get("stateSha256") or "missing"))
+    if not all((pre_route, pre_ports, removed, preserved, post_ports)):
+        return {
+            "receipt_status": "failed",
+            "error": "Forrest server-exit apply violated its fixed-target contract",
+        }
+    return output
+
+
 _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
@@ -9504,6 +9568,7 @@ _RUNNERS = {
     "connector_snapshot_bind": _run_connector_snapshot_bind,
     "n8n_workflow_edge_verify": _run_n8n_workflow_edge_verify,
     "n8n_workflow_edge_apply": _run_n8n_workflow_edge_apply,
+    "forrest_server_exit_apply": _run_forrest_server_exit_apply,
     "transport_roundtrip": _run_transport_roundtrip,
     "convergence_assess": _run_convergence_assess,
     "gate_evidence_preflight": _run_gate_evidence_preflight,

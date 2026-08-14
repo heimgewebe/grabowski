@@ -271,6 +271,10 @@
       "source": "src/grabowski_grips.py"
     },
     {
+      "module": "grabowski_forrest_server_exit",
+      "source": "src/grabowski_forrest_server_exit.py"
+    },
+    {
       "module": "grabowski_n8n_runtime",
       "source": "src/grabowski_n8n_runtime.py"
     },
