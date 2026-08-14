@@ -5132,11 +5132,10 @@ class ProductionBlueGreenRuntime:
             self.repo, self.snapshot, self.build.release_path
         )
         core.activate_pointer(self.activation)
-        # Keep the global admission marker engaged until the old canonical
-        # process is confirmed stopped. Releasing it earlier would briefly
-        # reopen Blue mutations through direct/local callers after ingress had
-        # already switched to Green. Green remains safely read-only during
-        # this bounded promotion interval.
+        # Keep the global admission marker engaged through the complete
+        # promotion. While it is active neither the old canonical process nor
+        # transient Green may admit a new normal tool call. This prevents an
+        # effect from starting on Green and then being cut off by retirement.
         stop_service(OPERATOR_SERVICE)
         ingress = observe_service(TRANSPORT_INGRESS_SERVICE)
         if not ingress.confirmed_active:
@@ -5148,9 +5147,6 @@ class ProductionBlueGreenRuntime:
                 "runtime_binding_sha256"
             ],
         )
-        if self.admission_marker is not None:
-            release_operator_deployment_admission(self.admission_marker)
-            self.admission_marker = None
         start_service(OPERATOR_SERVICE)
         verify_operator_process(
             self.runtime,
@@ -5172,6 +5168,14 @@ class ProductionBlueGreenRuntime:
             expected_slot="canonical",
             expected_binding_sha256=canonical["runtime_binding_sha256"],
         )
+        green_retirement = _stop_green_operator(self.green_unit)
+        self.green_started = False
+        admission_release = None
+        if self.admission_marker is not None:
+            admission_release = release_operator_deployment_admission(
+                self.admission_marker
+            )
+            self.admission_marker = None
         canonical_readiness = _probe_release_runtime(
             release_path=self.build.release_path,
             port=TRANSPORT_INGRESS_LISTENER_PORT,
@@ -5183,8 +5187,6 @@ class ProductionBlueGreenRuntime:
             ],
             timeout_seconds=self.timeout_seconds,
         )
-        green_retirement = _stop_green_operator(self.green_unit)
-        self.green_started = False
         require_service_active(TRANSPORT_INGRESS_SERVICE)
         require_service_active(TUNNEL_SERVICE)
         identity = verify_url_runtime_identity(
@@ -5198,6 +5200,7 @@ class ProductionBlueGreenRuntime:
             "retired": True,
             "blue_operator_replaced": True,
             "green_retirement": green_retirement,
+            "admission_release": admission_release,
             "final_routing": _selector_summary(canonical),
             "authoritative_readback": final_readback,
             "canonical_readiness_sha256": hashlib.sha256(

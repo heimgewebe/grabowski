@@ -690,6 +690,21 @@ def _require_authentic_digest(value: Any, *, label: str) -> str:
     return digest
 
 
+def _require_schema_identity(
+    value: Any, *, label: str
+) -> tuple[dict[str, str], str]:
+    required = set(connector_contract.REQUIRED_SCHEMA_SENTINELS)
+    if not isinstance(value, dict) or set(value) != required:
+        raise ClientSnapshotError(
+            f"{label} must cover exactly the required schema sentinels"
+        )
+    normalized = {
+        name: _validate_sha256(value[name], label=f"{label}.{name}")
+        for name in sorted(required)
+    }
+    return normalized, _sha256_json(normalized)
+
+
 def rebind_authentic_snapshot_for_cutover(
     *,
     cutover_id: str,
@@ -834,6 +849,31 @@ def rebind_authentic_snapshot_for_cutover(
         ):
             _require_authentic_digest(value, label=label)
 
+        observed_artifact = schema_evidence.get("observed_artifact")
+        if not isinstance(observed_artifact, dict):
+            raise ClientSnapshotError(
+                "authentic external connector schema identity is unavailable"
+            )
+        source_schema_hashes, source_schema_identity_sha256 = (
+            _require_schema_identity(
+                observed_artifact.get("schema_sha256_by_tool"),
+                label="source schema identity",
+            )
+        )
+        green_schema_hashes, green_schema_identity_sha256 = _require_schema_identity(
+            green_readiness.get("schema_sha256_by_tool"),
+            label="green schema identity",
+        )
+        if (
+            source_schema_hashes != green_schema_hashes
+            or green_readiness.get("schema_identity_sha256")
+            != green_schema_identity_sha256
+            or source_schema_identity_sha256 != green_schema_identity_sha256
+        ):
+            raise ClientSnapshotError(
+                "green readiness schema identity does not match the authentic external connector snapshot"
+            )
+
         server_binding = {
             "registered_tool_count": registered_tool_count,
             "registered_names_sha256": names_sha256,
@@ -848,11 +888,13 @@ def rebind_authentic_snapshot_for_cutover(
             "from_repo_head": current_repo_head,
             "to_release_id": green_release,
             "to_repo_head": green_repo_head,
+            "schema_identity_sha256": source_schema_identity_sha256,
             "surface_continuity_sha256": _sha256_json(
                 {
                     "registered_tool_count": registered_tool_count,
                     "registered_names_sha256": names_sha256,
                     "agent_instructions_sha256": instructions_sha256,
+                    "schema_identity_sha256": source_schema_identity_sha256,
                 }
             ),
             "green_readiness_sha256": _sha256_json(green_readiness),
@@ -1857,6 +1899,12 @@ def probe_runtime_readiness(
                     "schema_coverage_count": observed_metadata[
                         "schema_coverage_count"
                     ],
+                    "schema_sha256_by_tool": observed_metadata[
+                        "schema_sha256_by_tool"
+                    ],
+                    "schema_identity_sha256": _sha256_json(
+                        observed_metadata["schema_sha256_by_tool"]
+                    ),
                 }
 
     try:

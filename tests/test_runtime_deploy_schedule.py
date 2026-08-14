@@ -19,6 +19,7 @@ for module_root in (SRC, TOOLS):
 
 import deploy_runtime_dual as dual
 import grabowski_client_snapshot as client_snapshot
+import grabowski_connector_contract as connector_contract
 import grabowski_transport_ingress as ingress
 
 
@@ -28,6 +29,12 @@ NAMES_SHA256 = "12" * 32
 INSTRUCTIONS_SHA256 = "34" * 32
 ARTIFACT_SHA256 = "56" * 32
 SOURCE_IDENTITY_SHA256 = "78" * 32
+SCHEMA_SHA256_BY_TOOL = {
+    name: f"{index + 16:02x}" * 32
+    for index, name in enumerate(sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS))
+}
+SCHEMA_IDENTITY_SHA256 = client_snapshot._sha256_json(SCHEMA_SHA256_BY_TOOL)
+TOOL_COUNT = len(SCHEMA_SHA256_BY_TOOL)
 
 
 def runtime_binding(release_id: str, repo_head: str) -> dict[str, str]:
@@ -106,11 +113,13 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
             "client_id": "external-client",
             "session_id": "session-1",
             "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
-            "observed_tool_count": 1,
+            "observed_tool_count": TOOL_COUNT,
             "observed_names_sha256": NAMES_SHA256,
             "observed_release_id": "blue",
             "observed_agent_instructions_sha256": INSTRUCTIONS_SHA256,
             "observed_tools_artifact_sha256": ARTIFACT_SHA256,
+            "observed_schema_coverage_count": TOOL_COUNT,
+            "observed_schema_tools": sorted(SCHEMA_SHA256_BY_TOOL),
         }
         receipt = {
             "schema_version": client_snapshot.SNAPSHOT_SCHEMA_VERSION,
@@ -120,14 +129,26 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
             "client_declaration": declaration,
             "client_declaration_sha256": client_snapshot._sha256_json(declaration),
             "server_binding": {
-                "registered_tool_count": 1,
+                "registered_tool_count": TOOL_COUNT,
                 "registered_names_sha256": NAMES_SHA256,
                 "release_id": "blue",
                 "repo_head": HEAD_BLUE,
                 "agent_instructions_sha256": INSTRUCTIONS_SHA256,
             },
             "schema_evidence": {
-                "probe": {"matches": True, "schema_contract_matches": True}
+                "observed_artifact": {
+                    "artifact_sha256": ARTIFACT_SHA256,
+                    "schema_coverage_count": TOOL_COUNT,
+                    "schema_tools": sorted(SCHEMA_SHA256_BY_TOOL),
+                    "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
+                },
+                "server_artifact": {
+                    "artifact_sha256": ARTIFACT_SHA256,
+                    "schema_coverage_count": TOOL_COUNT,
+                    "schema_tools": sorted(SCHEMA_SHA256_BY_TOOL),
+                    "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
+                },
+                "probe": {"matches": True, "schema_contract_matches": True},
             },
             "cutover_binding": None,
             "verified": True,
@@ -159,7 +180,7 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                     current_repo_head=HEAD_BLUE,
                     green_release_id="green",
                     green_repo_head=HEAD_GREEN,
-                    registered_tool_count=1,
+                    registered_tool_count=TOOL_COUNT,
                     registered_names_sha256=NAMES_SHA256,
                     agent_instructions_sha256=INSTRUCTIONS_SHA256,
                     green_readiness={
@@ -168,6 +189,8 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                         "repo_head": HEAD_GREEN,
                         "names_sha256": NAMES_SHA256,
                         "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+                        "schema_sha256_by_tool": dict(SCHEMA_SHA256_BY_TOOL),
+                        "schema_identity_sha256": SCHEMA_IDENTITY_SHA256,
                     },
                     now_unix=now_unix,
                 )
@@ -183,6 +206,51 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                 "external client has refreshed against green",
                 " ".join(result["does_not_establish"]),
             )
+
+    def test_rebind_rejects_schema_drift_before_writing(self) -> None:
+        now_unix = 1_000
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary) / "snapshot"
+            state_root.mkdir(mode=0o700)
+            snapshot_path = state_root / "current.json"
+            source = self._source_receipt(now_unix)
+            drifted = dict(SCHEMA_SHA256_BY_TOOL)
+            first = sorted(drifted)[0]
+            drifted[first] = "ab" * 32
+            with mock.patch.multiple(
+                client_snapshot,
+                STATE_ROOT=state_root,
+                LOCK_PATH=state_root / "snapshot.lock",
+                SNAPSHOT_PATH=snapshot_path,
+            ):
+                client_snapshot._write_private_json(snapshot_path, source)
+                with self.assertRaisesRegex(
+                    client_snapshot.ClientSnapshotError, "schema identity"
+                ):
+                    client_snapshot.rebind_authentic_snapshot_for_cutover(
+                        cutover_id="cutover-schema-drift",
+                        cutover_generation=1,
+                        current_release_id="blue",
+                        current_repo_head=HEAD_BLUE,
+                        green_release_id="green",
+                        green_repo_head=HEAD_GREEN,
+                        registered_tool_count=TOOL_COUNT,
+                        registered_names_sha256=NAMES_SHA256,
+                        agent_instructions_sha256=INSTRUCTIONS_SHA256,
+                        green_readiness={
+                            "ready": True,
+                            "release_id": "green",
+                            "repo_head": HEAD_GREEN,
+                            "names_sha256": NAMES_SHA256,
+                            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+                            "schema_sha256_by_tool": drifted,
+                            "schema_identity_sha256": client_snapshot._sha256_json(drifted),
+                        },
+                        now_unix=now_unix,
+                    )
+                self.assertEqual(
+                    json.loads(snapshot_path.read_text(encoding="utf-8")), source
+                )
 
     def test_rebind_rejects_synthetic_proof_before_writing(self) -> None:
         with self.assertRaisesRegex(client_snapshot.ClientSnapshotError, "synthetic"):
@@ -505,10 +573,14 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             mock.patch.object(
                 dual.transport_ingress,
                 "publish_routing_selector",
-                return_value=canonical,
+                side_effect=lambda **_kwargs: (events.append("switch-canonical") or canonical),
             ),
             mock.patch.object(dual, "_probe_release_runtime", return_value={"ready": True}),
-            mock.patch.object(dual, "_stop_green_operator", return_value={"retired": True}),
+            mock.patch.object(
+                dual,
+                "_stop_green_operator",
+                side_effect=lambda *_args, **_kwargs: (events.append("stop-green") or {"retired": True}),
+            ),
             mock.patch.object(dual, "require_service_active"),
             mock.patch.object(
                 dual,
@@ -521,8 +593,10 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
         ):
             result = runtime.retire_blue()
         self.assertTrue(result["retired"])
-        self.assertLess(events.index("stop-blue"), events.index("release-admission"))
-        self.assertLess(events.index("release-admission"), events.index("start-canonical"))
+        self.assertLess(events.index("stop-blue"), events.index("start-canonical"))
+        self.assertLess(events.index("start-canonical"), events.index("switch-canonical"))
+        self.assertLess(events.index("switch-canonical"), events.index("stop-green"))
+        self.assertLess(events.index("stop-green"), events.index("release-admission"))
         self.assertIsNone(runtime.admission_marker)
 
     def test_green_inherits_only_canonical_nonsecret_recovery_environment(self) -> None:

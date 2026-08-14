@@ -62,8 +62,10 @@ lock. The sequence is:
    schemas, required sentinels, and agent instructions.
 4. Engage the current operator's deployment admission marker. The cross-process
    status endpoint reads the live registry in `grabowski_operator.py`. New
-   effect-bearing calls are rejected; only previously admitted effect-bearing
-   calls block settlement. Read-only calls remain non-blocking.
+   normal calls are rejected while promotion is in progress; only previously
+   admitted effect-bearing calls block settlement. Previously admitted read-only
+   calls remain non-blocking. The marker stays active until routing is back on
+   canonical and transient Green is confirmed stopped.
 5. CAS-switch ingress to green and verify selector-file plus live ingress
    readback. Probe green again through 18180.
 6. Rebind the connector snapshot using the exact declaration and hashes from a
@@ -95,8 +97,8 @@ Production rebind requires all of the following:
 - a hash-valid, unexpired receipt with external-client observation scope;
 - schema probe evidence that matched the declared server surface;
 - the observed blue release and repository head;
-- unchanged tool count, names, schemas, and instruction identity across blue
-  and green;
+- unchanged tool count, names, normalized per-sentinel schema fingerprints, and
+  instruction identity across blue and green;
 - non-degenerate declaration, receipt, artifact, names, and instruction
   hashes;
 - independently observed green readiness.
