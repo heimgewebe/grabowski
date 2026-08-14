@@ -77,7 +77,8 @@ deploy-preflight: context-check chronik-runtime-contract deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --preflight
 
 deploy-apply: context-check chronik-runtime-contract deploy-tooling
->$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --apply
+>test "$(BOOTSTRAP_RECOVERY)" = "1"
+>set -eu; expected_head="$$(git rev-parse --verify HEAD)"; $(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --apply --bootstrap-recovery --expected-head "$$expected_head"
 
 deploy-direct: deploy-apply
 

@@ -224,6 +224,13 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual(0, snapshot["read_only_active_tool_calls"])
         self.assertEqual("readOnlyHint-true-is-read-only-v1", snapshot["effect_classification"])
         self.assertEqual(
+            "live_grabowski_operator_call_boundary",
+            snapshot["registry_authority"],
+        )
+        self.assertEqual("draining", snapshot["effect_terminalization_state"])
+        self.assertFalse(snapshot["read_calls_block_retirement"])
+        self.assertRegex(snapshot["registry_observation_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
             {
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC: sync_count,
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC: async_count,
@@ -719,6 +726,46 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
                 snapshot = operator._deployment_admission_snapshot()
                 self.assertEqual(0, snapshot["active_tool_calls"])
                 self.assertFalse(snapshot["active_tool_calls_sample_truncated"])
+
+    def test_gate_allows_only_minimal_status_as_drain_neutral_readiness(self) -> None:
+        operator = _load_operator_module()
+        marker = {"state": "active", "active": True, "valid": True}
+        calls: list[tuple[str, object]] = []
+
+        async def original(name, arguments, *args, **kwargs):
+            calls.append((name, arguments))
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = original
+        operator.mcp._tool_manager.get_tool = lambda name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(
+                readOnlyHint=(name == "grabowski_status")
+            ),
+        )
+        with patch.object(
+            operator, "_read_deployment_admission_marker", return_value=marker
+        ):
+            operator._configure_http_runtime()
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_status", {"view": "minimal"}
+                )
+            )
+            self.assertTrue(result["called"])
+            with self.assertRaisesRegex(RuntimeError, "rejects new tool calls"):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "grabowski_status", {"view": "evidence"}
+                    )
+                )
+            with self.assertRaisesRegex(RuntimeError, "rejects new tool calls"):
+                asyncio.run(operator.mcp._tool_manager.call_tool("write", {}))
+        self.assertEqual(
+            [("grabowski_status", {"view": "minimal"})], calls
+        )
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_gate_marker_bound_observer_call_is_drain_neutral(self) -> None:
         operator = _load_operator_module()

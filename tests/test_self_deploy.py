@@ -185,6 +185,70 @@ def _sidecar_reconciliation(expected: str = "f" * 40) -> dict[str, object]:
     }
     return {**material, "evidence_sha256": RUNNER.canonical_json_sha256(material)}
 
+
+def _productive_blue_green_result(expected: str = "f" * 40) -> dict[str, object]:
+    summary = {
+        "schema_version": 1,
+        "kind": "grabowski_scheduled_blue_green_summary",
+        "receipt_sha256": "ab" * 32,
+        "receipt_path": "/state/blue-green.json",
+        "receipt_persisted": True,
+        "receipt_persistence_error_type": None,
+        "blind_retry_allowed": None,
+        "outcome": "completed",
+        "expected_head": expected,
+        "source_identity_sha256": "cd" * 32,
+    }
+    return {
+        "outcome": "completed",
+        "receipt_sha256": "ab" * 32,
+        "receipt_path": "/state/blue-green.json",
+        "receipt_persisted": True,
+        "receipt": {
+            "receipt_sha256": "ab" * 32,
+            "outcome": "completed",
+            "expected_head": expected,
+        },
+        "summary": summary,
+    }
+
+
+def _unpersisted_productive_blue_green_result(expected: str = "f" * 40) -> dict[str, object]:
+    result = _productive_blue_green_result(expected)
+    summary = dict(result["summary"])
+    summary.update(
+        {
+            "receipt_path": None,
+            "receipt_persisted": False,
+            "receipt_persistence_error_type": "OSError",
+            "blind_retry_allowed": False,
+        }
+    )
+    return {
+        **result,
+        "receipt_path": None,
+        "receipt_persisted": False,
+        "receipt_persistence_error_type": "OSError",
+        "summary": summary,
+    }
+
+
+def _unpersisted_outcome_unknown_blue_green_result(
+    expected: str = "f" * 40,
+) -> dict[str, object]:
+    result = _unpersisted_productive_blue_green_result(expected)
+    receipt = dict(result["receipt"])
+    receipt["outcome"] = "outcome_unknown"
+    summary = dict(result["summary"])
+    summary["outcome"] = "outcome_unknown"
+    return {
+        **result,
+        "outcome": "outcome_unknown",
+        "receipt": receipt,
+        "summary": summary,
+    }
+
+
 class SelfDeployToolTests(unittest.TestCase):
     def test_annotations_and_schema_bounds(self) -> None:
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.readOnlyHint)
@@ -257,6 +321,46 @@ class SelfDeployToolTests(unittest.TestCase):
             ):
                 index = SELF_DEPLOY._bootstrap_deploy_index(jobs, repository)
             self.assertEqual(index["units"], [running])
+
+    def test_bootstrap_retry_block_preserves_unpersisted_outcome_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            entry = Path(temporary) / "grabowski-job-abcdef012345"
+            entry.mkdir(mode=0o700)
+            expected = "a" * 40
+            receipt_sha256 = "ab" * 32
+            contract = {
+                "kind": "grabowski_runtime_deploy_finalization",
+                "unit": entry.name,
+                "job_id": "abcdef012345",
+                "argv_sha256": "b" * 64,
+                "expected_head": expected,
+                "receipt_paths": {"finalization": str(entry / "finalization.json")},
+            }
+            material = {
+                "unit": entry.name,
+                "job_id": "abcdef012345",
+                "argv_sha256": "b" * 64,
+                "expected_head": expected,
+                "final_status": "outcome_unknown",
+                "completion_status": "outcome_unknown",
+                "blue_green": {
+                    "receipt_sha256": receipt_sha256,
+                    "receipt_persisted": False,
+                    "outcome": "outcome_unknown",
+                    "expected_head": expected,
+                },
+                "blue_green_receipt_sha256": receipt_sha256,
+                "blind_retry_allowed": False,
+            }
+            payload = {**material, "payload_sha256": SELF_DEPLOY._sha256_json(material)}
+            receipt = entry / "finalization.json"
+            receipt.write_text(json.dumps(payload), encoding="utf-8")
+            receipt.chmod(0o600)
+            self.assertTrue(
+                SELF_DEPLOY._deploy_finalization_retry_block(
+                    entry, {"finalization_contract": contract}
+                )
+            )
 
     def test_pending_deploy_index_unit_is_recovered_from_exact_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -980,6 +1084,51 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
                     SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
 
+    def test_matching_deploy_blocks_durable_outcome_unknown_before_retry(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        command = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": command,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
+                "cwd": str(repo),
+                "expected_receipt": {
+                    "unit": job_dir.name,
+                    "metadata_path": str(job_dir / "metadata.json"),
+                    "stdout_path": str(job_dir / "stdout.log"),
+                    "stderr_path": str(job_dir / "stderr.log"),
+                    "status_tool": "grabowski_job_status",
+                    "logs_tool": "grabowski_job_logs",
+                },
+            }
+            status = {
+                "final_status": "failed",
+                "finalization_receipt": {
+                    "valid": True,
+                    "final_status": "outcome_unknown",
+                    "blind_retry_allowed": False,
+                },
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=root
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deploy_index",
+                return_value={"units": [job_dir.name], "pending_unit": None},
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "authoritative runtime readback before retry"
+                ):
+                    SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
+
     def _job_fixture(self, root: Path, repo: Path, runner: Path, head: str, *, delay: int = 8) -> tuple[Path, list[str], dict[str, object]]:
         job_dir = root / "grabowski-job-abcdef012345"
         job_dir.mkdir()
@@ -1251,6 +1400,15 @@ class SelfDeployToolTests(unittest.TestCase):
 
 
 class ScheduledDeployRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.productive_blue_green = patch.object(
+            RUNNER,
+            "run_productive_blue_green",
+            return_value=_productive_blue_green_result(),
+        )
+        self.productive_blue_green_mock = self.productive_blue_green.start()
+        self.addCleanup(self.productive_blue_green.stop)
+
     def test_capture_fails_closed_on_excess_output(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "exceeded"):
             RUNNER.run_capture(
@@ -1755,7 +1913,13 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.assertEqual(preflight.call_count, 3)
         self.assertEqual(verify.call_count, 6)
         self.assertEqual(sleep.call_args_list, [call(5), call(5), call(10)])
-        self.assertEqual(streamed.call_count, 2)
+        streamed.assert_called_once_with(
+            ["make", "validate"],
+            cwd=repo,
+            timeout_seconds=1200,
+            phase="validate",
+        )
+        self.assertEqual(self.productive_blue_green_mock.call_count, 1)
 
     def test_main_fails_after_bounded_contention_retries(self) -> None:
         repo = Path("/tmp/repository")
@@ -1852,7 +2016,11 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 4)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
-        self.assertEqual(streamed.call_args_list[1].args[0], ["make", "deploy-apply"])
+        self.productive_blue_green_mock.assert_called_once_with(
+            repo=repo,
+            expected_head=expected,
+            source_identity_sha256="0" * 64,
+        )
 
     def test_main_rejects_source_drift_before_sidecar_install(self) -> None:
         repo = Path("/tmp/repository")
@@ -1886,8 +2054,40 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         ) as reconcile:
             self.assertEqual(RUNNER.main(), 1)
         self.assertEqual(verify.call_count, 3)
-        self.assertEqual(streamed.call_count, 2)
+        streamed.assert_called_once_with(
+            ["make", "validate"],
+            cwd=repo,
+            timeout_seconds=1200,
+            phase="validate",
+        )
+        self.productive_blue_green_mock.assert_called_once()
         reconcile.assert_not_called()
+
+    def test_run_productive_blue_green_propagates_in_memory_receipt_on_persistence_failure(self) -> None:
+        self.productive_blue_green.stop()
+        receipt = {
+            "receipt_sha256": "ab" * 32,
+            "outcome": "completed",
+            "expected_head": "f" * 40,
+            "source_identity_sha256": "cd" * 32,
+        }
+        error = RUNNER.deploy_dual.ProductionBlueGreenReceiptPersistenceError(
+            receipt, OSError("receipt full")
+        )
+        with patch.object(
+            RUNNER.deploy_dual,
+            "run_production_blue_green_cutover",
+            side_effect=error,
+        ):
+            result = RUNNER.run_productive_blue_green(
+                repo=Path("/tmp/repository"),
+                expected_head="f" * 40,
+                source_identity_sha256="cd" * 32,
+            )
+        self.assertEqual(result["outcome"], "completed")
+        self.assertFalse(result["receipt_persisted"])
+        self.assertIsNone(result["receipt_path"])
+        self.assertFalse(result["summary"]["blind_retry_allowed"])
 
     def test_finalization_binding_and_atomic_receipt_are_hash_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1995,6 +2195,85 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=expected,
             release_id="release",
             failure_type=None,
+            blue_green=_productive_blue_green_result()["summary"],
+        )
+
+    def test_main_preserves_applied_runtime_when_primary_receipt_persistence_fails(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        binding = {"expected_head": expected}
+        blue_green = _unpersisted_productive_blue_green_result(expected)
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=binding
+        ), patch.object(RUNNER.time, "sleep"), patch.object(
+            RUNNER, "verify_repository"
+        ), patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(RUNNER, "run_streamed"), patch.object(
+            RUNNER, "run_productive_blue_green", return_value=blue_green
+        ), patch.object(
+            RUNNER,
+            "verify_live_manifest",
+            return_value={
+                "release_id": "release",
+                "repo_head": expected,
+                "completion_status": "complete",
+            },
+        ), patch.object(
+            RUNNER,
+            "reconcile_coding_agent_sidecars",
+            return_value=_sidecar_reconciliation(expected),
+        ), patch.object(
+            RUNNER, "write_finalization_receipt"
+        ) as write:
+            self.assertEqual(RUNNER.main(), 1)
+        write.assert_called_once_with(
+            binding,
+            final_status="outcome_unknown",
+            repo_head=expected,
+            release_id="release",
+            failure_type="ProductionBlueGreenReceiptPersistenceError",
+            blue_green=blue_green["summary"],
+        )
+
+    def test_main_preserves_unknown_runtime_when_primary_receipt_persistence_fails(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        binding = {"expected_head": expected}
+        blue_green = _unpersisted_outcome_unknown_blue_green_result(expected)
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=binding
+        ), patch.object(RUNNER.time, "sleep"), patch.object(
+            RUNNER, "verify_repository"
+        ), patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(RUNNER, "run_streamed"), patch.object(
+            RUNNER, "run_productive_blue_green", return_value=blue_green
+        ), patch.object(
+            RUNNER, "verify_live_manifest"
+        ) as verify_live, patch.object(
+            RUNNER, "reconcile_coding_agent_sidecars"
+        ) as reconcile, patch.object(
+            RUNNER, "write_finalization_receipt"
+        ) as write:
+            self.assertEqual(RUNNER.main(), 1)
+        verify_live.assert_not_called()
+        reconcile.assert_not_called()
+        write.assert_called_once_with(
+            binding,
+            final_status="outcome_unknown",
+            repo_head=None,
+            release_id=None,
+            failure_type="BlueGreenDeploymentIncomplete",
+            blue_green=blue_green["summary"],
         )
 
     def test_main_marks_runtime_live_sidecar_failure_as_outstanding(self) -> None:
@@ -2034,6 +2313,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=None,
             release_id=None,
             failure_type="SidecarInstallOutstanding",
+            blue_green=_productive_blue_green_result()["summary"],
         )
 
     def test_main_writes_failed_receipt_for_runner_failure(self) -> None:
@@ -2048,6 +2328,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=None,
             release_id=None,
             failure_type="RuntimeError",
+            blue_green=None,
         )
 
     def test_make_deploy_schedules_not_direct_apply(self) -> None:
@@ -2057,6 +2338,12 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             makefile,
         )
         self.assertIn("tools/deploy_runtime_dual.py --apply", makefile)
+        self.assertIn('test "$(BOOTSTRAP_RECOVERY)" = "1"', makefile)
+        runner_source = (ROOT / "tools/run_scheduled_deploy.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("run_productive_blue_green", runner_source)
+        self.assertNotIn('["make", "deploy-apply"]', runner_source)
         self.assertIn(
             'GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python',
             makefile,

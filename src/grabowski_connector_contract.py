@@ -5,7 +5,8 @@ import json
 from typing import Any
 
 
-OBSERVED_ARTIFACT_SCHEMA_VERSION = 1
+LEGACY_OBSERVED_ARTIFACT_SCHEMA_VERSION = 1
+OBSERVED_ARTIFACT_SCHEMA_VERSION = 2
 MAX_OBSERVED_ARTIFACT_BYTES = 32 * 1024
 MAX_OBSERVED_TOOLS = 1_000
 REQUIRED_SCHEMA_PROPERTIES = {
@@ -73,18 +74,44 @@ def schema_fingerprint(schema: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_bytes(normalize_schema(schema))).hexdigest()
 
 
+def complete_schema_fingerprint(
+    schemas: dict[str, dict[str, Any]],
+) -> str:
+    if not isinstance(schemas, dict) or not schemas:
+        raise ConnectorContractError("complete schema identity requires named schemas")
+    material: dict[str, str] = {}
+    for name, schema in sorted(schemas.items()):
+        if not isinstance(name, str) or not name or not isinstance(schema, dict):
+            raise ConnectorContractError("complete schema identity contains an invalid entry")
+        material[name] = schema_fingerprint(schema)
+    return hashlib.sha256(canonical_bytes(material)).hexdigest()
+
+
 def parse_observed_artifact(
     value: Any,
     *,
     label: str = "observed artifact",
 ) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, Any]]:
-    if not isinstance(value, dict) or set(value) != {"schema_version", "tools"}:
+    if not isinstance(value, dict):
+        raise ConnectorContractError(f"{label} must be an object")
+    artifact_version = value.get("schema_version")
+    if artifact_version == LEGACY_OBSERVED_ARTIFACT_SCHEMA_VERSION:
+        expected_keys = {"schema_version", "tools"}
+    elif artifact_version == OBSERVED_ARTIFACT_SCHEMA_VERSION:
+        expected_keys = {
+            "schema_version",
+            "tools",
+            "complete_schema_count",
+            "complete_schema_sha256",
+        }
+    else:
         raise ConnectorContractError(
-            f"{label} must contain exactly schema_version and tools"
+            f"{label} must use schema_version "
+            f"{LEGACY_OBSERVED_ARTIFACT_SCHEMA_VERSION} or {OBSERVED_ARTIFACT_SCHEMA_VERSION}"
         )
-    if value.get("schema_version") != OBSERVED_ARTIFACT_SCHEMA_VERSION:
+    if set(value) != expected_keys:
         raise ConnectorContractError(
-            f"{label} must use schema_version {OBSERVED_ARTIFACT_SCHEMA_VERSION}"
+            f"{label} fields do not match schema_version {artifact_version}"
         )
     encoded = canonical_bytes(value)
     if len(encoded) > MAX_OBSERVED_ARTIFACT_BYTES:
@@ -128,7 +155,35 @@ def parse_observed_artifact(
         names.append(name)
         if schema is not None:
             schemas[name] = schema
+    complete_schema_count: int | None = None
+    complete_schema_sha256: str | None = None
+    if artifact_version == OBSERVED_ARTIFACT_SCHEMA_VERSION:
+        complete_schema_count = value.get("complete_schema_count")
+        complete_schema_sha256 = value.get("complete_schema_sha256")
+        if (
+            isinstance(complete_schema_count, bool)
+            or not isinstance(complete_schema_count, int)
+            or complete_schema_count != len(names)
+        ):
+            raise ConnectorContractError(
+                f"{label} complete_schema_count must equal the tool count"
+            )
+        if (
+            not isinstance(complete_schema_sha256, str)
+            or len(complete_schema_sha256) != 64
+            or complete_schema_sha256 != complete_schema_sha256.lower()
+        ):
+            raise ConnectorContractError(
+                f"{label} complete_schema_sha256 must be a lowercase SHA-256"
+            )
+        try:
+            int(complete_schema_sha256, 16)
+        except ValueError as exc:
+            raise ConnectorContractError(
+                f"{label} complete_schema_sha256 must be a lowercase SHA-256"
+            ) from exc
     metadata = {
+        "artifact_schema_version": artifact_version,
         "artifact_bytes": len(encoded),
         "artifact_sha256": hashlib.sha256(encoded).hexdigest(),
         "name_count": len(names),
@@ -139,6 +194,9 @@ def parse_observed_artifact(
             name: schema_fingerprint(schema)
             for name, schema in sorted(schemas.items())
         },
+        "complete_schema_observable": complete_schema_sha256 is not None,
+        "complete_schema_count": complete_schema_count,
+        "complete_schema_sha256": complete_schema_sha256,
     }
     return names, schemas, metadata
 
@@ -270,19 +328,23 @@ def mixed_artifact_from_runtime_tools(
             raise ConnectorContractError(f"duplicate runtime tool: {name}")
         by_name[name] = item
     entries: list[Any] = []
+    complete_schemas: dict[str, dict[str, Any]] = {}
     for name, item in sorted(by_name.items()):
+        schema = item.get("inputSchema")
+        if not isinstance(schema, dict):
+            raise ConnectorContractError(
+                f"runtime schema for {name} is unavailable"
+            )
+        complete_schemas[name] = schema
         if name in REQUIRED_SCHEMA_SENTINELS:
-            schema = item.get("inputSchema")
-            if not isinstance(schema, dict):
-                raise ConnectorContractError(
-                    f"runtime schema for sentinel {name} is unavailable"
-                )
             entries.append({"name": name, "inputSchema": schema})
         else:
             entries.append(name)
     artifact = {
         "schema_version": OBSERVED_ARTIFACT_SCHEMA_VERSION,
         "tools": entries,
+        "complete_schema_count": len(complete_schemas),
+        "complete_schema_sha256": complete_schema_fingerprint(complete_schemas),
     }
     parse_observed_artifact(artifact, label="runtime artifact")
     return artifact

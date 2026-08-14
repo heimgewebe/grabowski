@@ -46,15 +46,16 @@ def _artifact(
     schemas: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object]:
     schemas = _sentinel_schemas() if schemas is None else schemas
-    return {
-        "schema_version": 1,
-        "tools": [
-            {"name": name, "inputSchema": schemas[name]}
-            if name in schemas
-            else name
-            for name in NAMES
-        ],
-    }
+    runtime_tools = [
+        {
+            "name": name,
+            "inputSchema": schemas.get(
+                name, {"type": "object", "properties": {"value": {"type": "string"}}}
+            ),
+        }
+        for name in NAMES
+    ]
+    return contract.mixed_artifact_from_runtime_tools(runtime_tools)
 
 
 class ConnectorContractTests(unittest.TestCase):
@@ -66,6 +67,9 @@ class ConnectorContractTests(unittest.TestCase):
         self.assertEqual(metadata["name_count"], len(NAMES))
         self.assertEqual(metadata["names_sha256"], contract.fingerprint(NAMES))
         self.assertEqual(metadata["schema_coverage_count"], 4)
+        self.assertTrue(metadata["complete_schema_observable"])
+        self.assertEqual(metadata["complete_schema_count"], len(NAMES))
+        self.assertRegex(metadata["complete_schema_sha256"], r"^[0-9a-f]{64}$")
         self.assertLessEqual(
             metadata["artifact_bytes"], contract.MAX_OBSERVED_ARTIFACT_BYTES
         )
@@ -203,7 +207,10 @@ class ConnectorContractTests(unittest.TestCase):
         ):
             contract.parse_observed_artifact(duplicate)
 
-        extra_schema = _artifact()
+        extra_schema = {
+            "schema_version": contract.LEGACY_OBSERVED_ARTIFACT_SCHEMA_VERSION,
+            "tools": list(_artifact()["tools"]),
+        }
         extra_schema["tools"][0] = {
             "name": "alpha",
             "inputSchema": {"type": "object"},
@@ -245,6 +252,43 @@ class ConnectorContractTests(unittest.TestCase):
             NAMES,
         )
         self.assertTrue(result["matches"])
+
+    def test_runtime_export_changes_complete_identity_for_non_sentinel_schema(self) -> None:
+        schemas = _sentinel_schemas()
+        baseline = [
+            {
+                "name": name,
+                "inputSchema": schemas.get(
+                    name, {"type": "object", "properties": {"value": {"type": "string"}}}
+                ),
+            }
+            for name in NAMES
+        ]
+        changed = copy.deepcopy(baseline)
+        changed[0]["inputSchema"]["properties"]["value"]["type"] = "integer"
+        baseline_meta = contract.parse_observed_artifact(
+            contract.mixed_artifact_from_runtime_tools(baseline)
+        )[2]
+        changed_meta = contract.parse_observed_artifact(
+            contract.mixed_artifact_from_runtime_tools(changed)
+        )[2]
+        self.assertEqual(
+            baseline_meta["schema_sha256_by_tool"],
+            changed_meta["schema_sha256_by_tool"],
+        )
+        self.assertNotEqual(
+            baseline_meta["complete_schema_sha256"],
+            changed_meta["complete_schema_sha256"],
+        )
+
+    def test_legacy_artifact_remains_readable_but_has_no_complete_identity(self) -> None:
+        legacy = {
+            "schema_version": contract.LEGACY_OBSERVED_ARTIFACT_SCHEMA_VERSION,
+            "tools": list(_artifact()["tools"]),
+        }
+        metadata = contract.parse_observed_artifact(legacy)[2]
+        self.assertFalse(metadata["complete_schema_observable"])
+        self.assertIsNone(metadata["complete_schema_sha256"])
 
     def test_runtime_export_keeps_only_four_schema_objects(self) -> None:
         schemas = _sentinel_schemas()

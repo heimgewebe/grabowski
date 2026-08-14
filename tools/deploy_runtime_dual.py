@@ -31,6 +31,9 @@ SOURCE_MODULE_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SOURCE_MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_MODULE_ROOT))
 deployment_observer = import_module("grabowski_deployment_observer")
+client_snapshot = import_module("grabowski_client_snapshot")
+connector_contract = import_module("grabowski_connector_contract")
+transport_ingress = import_module("grabowski_transport_ingress")
 
 
 @dataclass(frozen=True)
@@ -236,6 +239,7 @@ OBSERVER_USER_CAPABILITY_INCOMPATIBLE_DIRECTIVES = frozenset(
 OBSERVER_SAFETY_REPAIR_MARKER = "observer_safety_repair_retained_v1"
 OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
+GREEN_OPERATOR_LISTENER_PORT = 18182
 TRANSPORT_INGRESS_LISTENER_PORT = 18180
 TRANSPORT_INGRESS_AUTH_HEADER = "X-Grabowski-Ingress-Auth"
 TRANSPORT_CONNECTOR_TOKEN_PATH = core.HOME / ".local/state/grabowski/transport-connectors/primary.token"
@@ -307,6 +311,14 @@ OPERATOR_HTTP_ARGUMENTS = (
     OPERATOR_LISTENER_HOST,
     "--port",
     str(OPERATOR_LISTENER_PORT),
+)
+GREEN_OPERATOR_UNIT_PREFIX = "grabowski-green-operator-"
+GREEN_OPERATOR_UNIT_RE = re.compile(
+    rf"{GREEN_OPERATOR_UNIT_PREFIX}[0-9a-f]{{12}}\.service\Z"
+)
+GREEN_INHERITED_OPERATOR_ENV_KEYS = (
+    "GRABOWSKI_SERVER_RECOVERY_HOST",
+    "GRABOWSKI_SERVER_RECOVERY_TARGET",
 )
 
 
@@ -4404,6 +4416,11 @@ def deploy_url(
             verify_operator_deployment_admission(admission_marker)
 
         if profile_cutover is not None:
+            phase = "initialize-ingress-selector"
+            initialize_canonical_ingress_selector(
+                release_path=build.release_path,
+                cutover_id=f"recovery-{snapshot.repo_head[:12]}",
+            )
             phase = "start-transport-ingress"
             start_service(TRANSPORT_INGRESS_SERVICE)
             require_service_active(TRANSPORT_INGRESS_SERVICE)
@@ -4549,6 +4566,1355 @@ def deploy_url(
             profile_path=profile_path,
             profile_cutover=profile_cutover,
         )
+
+
+
+def _green_operator_unit(cutover_id: str) -> str:
+    digest = hashlib.sha256(cutover_id.encode("utf-8")).hexdigest()[:12]
+    return f"{GREEN_OPERATOR_UNIT_PREFIX}{digest}.service"
+
+
+def _require_green_unit(unit: str) -> str:
+    if not isinstance(unit, str) or GREEN_OPERATOR_UNIT_RE.fullmatch(unit) is None:
+        core.fail("Transient green operator unit identity is invalid")
+    return unit
+
+
+def _green_confirmed_inactive(observation: core.ServiceObservation) -> bool:
+    return observation.confirmed_inactive or (
+        observation.query_valid
+        and observation.load_state == "not-found"
+        and observation.active_state == "inactive"
+        and observation.main_pid == 0
+    )
+
+
+def _require_loopback_listener(port: int, *, timeout_seconds: int) -> dict[str, Any]:
+    if port not in {OPERATOR_LISTENER_PORT, GREEN_OPERATOR_LISTENER_PORT}:
+        core.fail("Operator listener port is outside the blue-green contract")
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    consecutive = 0
+    last_error: str | None = None
+    while time.monotonic() < deadline:
+        attempts += 1
+        try:
+            with socket.create_connection(
+                (OPERATOR_LISTENER_HOST, port), timeout=0.5
+            ):
+                consecutive += 1
+                last_error = None
+        except OSError as exc:
+            consecutive = 0
+            last_error = type(exc).__name__
+        if consecutive >= OPERATOR_LISTENER_REQUIRED_SAMPLES:
+            return {
+                "host": OPERATOR_LISTENER_HOST,
+                "port": port,
+                "attempts": attempts,
+                "successful_samples": consecutive,
+            }
+        time.sleep(0.1)
+    core.fail(
+        "Operator listener did not become ready",
+        phase="green-listener" if port == GREEN_OPERATOR_LISTENER_PORT else "operator-listener",
+        details={"port": port, "attempts": attempts, "last_error": last_error},
+    )
+
+
+def _canonical_operator_green_environment() -> dict[str, str]:
+    """Read the live canonical operator's non-secret recovery configuration."""
+    result = core.run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            OPERATOR_SERVICE,
+            "--property=Environment",
+            "--value",
+        ],
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["systemd_query"],
+    )
+    if result.returncode != 0:
+        core.fail(
+            "Canonical operator environment could not be read for green parity",
+            phase="start-green",
+            details={"returncode": result.returncode},
+        )
+    try:
+        entries = shlex.split(result.stdout)
+    except ValueError as exc:
+        core.fail(
+            "Canonical operator environment is not parseable for green parity",
+            phase="start-green",
+            details={"error_type": type(exc).__name__},
+        )
+    observed: dict[str, str] = {}
+    for entry in entries:
+        if "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        if key not in GREEN_INHERITED_OPERATOR_ENV_KEYS:
+            continue
+        if not value or any(character in value for character in "\r\n\x00"):
+            core.fail(
+                "Canonical operator recovery environment is invalid",
+                phase="start-green",
+                details={"environment_key": key},
+            )
+        if len(value.encode("utf-8")) > 1024:
+            core.fail(
+                "Canonical operator recovery environment is oversized",
+                phase="start-green",
+                details={"environment_key": key},
+            )
+        observed[key] = value
+    return observed
+
+
+def _start_green_operator(
+    *,
+    unit: str,
+    release_path: Path,
+    contract: core.RuntimeContract,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    name = _require_green_unit(unit)
+    existing = observe_service(name)
+    if not _green_confirmed_inactive(existing):
+        core.fail(
+            "Transient green operator unit already exists or is ambiguous",
+            phase="start-green",
+            details={"service": existing.to_dict()},
+        )
+    python = release_path / ".venv/bin/python"
+    argv = [
+        str(python),
+        "-m",
+        contract.module,
+        "--transport",
+        "streamable-http",
+        "--host",
+        OPERATOR_LISTENER_HOST,
+        "--port",
+        str(GREEN_OPERATOR_LISTENER_PORT),
+    ]
+    green_environment = _canonical_operator_green_environment()
+    command = [
+        "systemd-run",
+        "--user",
+        f"--unit={name}",
+        "--collect",
+        "--quiet",
+        "--property=Type=exec",
+        "--property=Restart=no",
+        "--property=KillMode=mixed",
+        "--property=UMask=0077",
+        "--property=NoNewPrivileges=yes",
+        "--property=PrivateTmp=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=read-only",
+        (
+            "--property=ReadWritePaths="
+            f"{core.HOME / '.local/state/grabowski'} "
+            f"{core.HOME / 'repos'} "
+            f"{core.HOME / 'grabowski-workspace'}"
+        ),
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "--property=LockPersonality=yes",
+        "--property=MemoryDenyWriteExecute=yes",
+        "--property=RestrictRealtime=yes",
+        "--property=LimitCORE=0",
+        "--property=SystemCallArchitectures=native",
+        "--setenv=PYTHONUNBUFFERED=1",
+        *[
+            f"--setenv={key}={green_environment[key]}"
+            for key in GREEN_INHERITED_OPERATOR_ENV_KEYS
+            if key in green_environment
+        ],
+        "--",
+        *argv,
+    ]
+    result = core.run(
+        command,
+        check=False,
+        capture=True,
+        timeout=core.TIMEOUTS["service_start"],
+    )
+    if result.returncode != 0:
+        core.fail(
+            "Transient green operator could not be started",
+            phase="start-green",
+            details={"returncode": result.returncode},
+        )
+    observation = wait_for_service(
+        name, active=True, timeout_seconds=core.TIMEOUTS["service_start"]
+    )
+    if not observation.confirmed_active or observation.main_pid is None:
+        core.fail(
+            "Transient green operator is not confirmed active",
+            phase="start-green",
+            details={"service": observation.to_dict()},
+        )
+    actual_argv = core.process_argv(observation.main_pid)
+    if actual_argv != argv:
+        core.fail(
+            "Transient green operator argv differs from the immutable release",
+            phase="start-green",
+        )
+    executable = core.process_exe(observation.main_pid)
+    if executable is None or executable.resolve() != python.resolve():
+        core.fail(
+            "Transient green operator executable differs from the immutable release",
+            phase="start-green",
+        )
+    listener = _require_loopback_listener(
+        GREEN_OPERATOR_LISTENER_PORT, timeout_seconds=timeout_seconds
+    )
+    return {
+        "started": True,
+        "unit": name,
+        "pid": observation.main_pid,
+        "release_path": str(release_path),
+        "listener": listener,
+        "argv_sha256": hashlib.sha256(
+            json.dumps(argv, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "inherited_environment_keys": sorted(green_environment),
+    }
+
+
+def _stop_green_operator(unit: str) -> dict[str, Any]:
+    name = _require_green_unit(unit)
+    before = observe_service(name)
+    after_stop = before
+    if not _green_confirmed_inactive(before):
+        result = core.run(
+            ["systemctl", "--user", "stop", name],
+            check=False,
+            capture=True,
+            timeout=core.TIMEOUTS["service_stop"],
+        )
+        after_stop = observe_service(name)
+        if result.returncode != 0 and not _green_confirmed_inactive(after_stop):
+            core.fail(
+                "Transient green operator stop failed",
+                phase="retire-green",
+                details={
+                    "returncode": result.returncode,
+                    "service": after_stop.to_dict(),
+                },
+            )
+    deadline = time.monotonic() + core.TIMEOUTS["service_stop"]
+    after = after_stop
+    while not _green_confirmed_inactive(after) and time.monotonic() < deadline:
+        time.sleep(0.2)
+        after = observe_service(name)
+    if not _green_confirmed_inactive(after):
+        core.fail(
+            "Transient green operator is not confirmed inactive",
+            phase="retire-green",
+            details={"service": after.to_dict()},
+        )
+    return {"retired": True, "unit": name, "service": after.to_dict()}
+
+
+def _probe_release_runtime(
+    *,
+    release_path: Path,
+    port: int,
+    auth_mode: str,
+    expected_release_id: str,
+    expected_repo_head: str,
+    expected_agent_instructions_sha256: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if port not in {TRANSPORT_INGRESS_LISTENER_PORT, GREEN_OPERATOR_LISTENER_PORT}:
+        core.fail("Runtime readiness probe port is outside the cutover contract")
+    argv = [
+        str(release_path / ".venv/bin/python"),
+        "-m",
+        "grabowski_client_snapshot",
+        "probe-runtime",
+        "--runtime-root",
+        str(release_path),
+        "--mcp-url",
+        f"http://127.0.0.1:{port}/mcp",
+        "--connector-token-file",
+        str(TRANSPORT_CONNECTOR_TOKEN_PATH),
+        "--auth-mode",
+        auth_mode,
+        "--expected-release-id",
+        expected_release_id,
+        "--expected-repo-head",
+        expected_repo_head,
+        "--expected-agent-instructions-sha256",
+        expected_agent_instructions_sha256,
+        "--timeout-seconds",
+        str(min(timeout_seconds, 60)),
+    ]
+    result = core.run(
+        argv,
+        check=False,
+        capture=True,
+        timeout=min(timeout_seconds + 10, 70),
+    )
+    if result.returncode != 0:
+        core.fail(
+            "Runtime MCP readiness probe failed",
+            phase="green-readiness",
+            details={"returncode": result.returncode},
+        )
+    try:
+        value = json.loads(result.stdout)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        core.fail(
+            "Runtime MCP readiness probe returned invalid JSON",
+            phase="green-readiness",
+            details={"error_type": type(exc).__name__},
+        )
+    if not isinstance(value, dict) or value.get("ready") is not True:
+        core.fail(
+            "Runtime MCP readiness did not bind manifest/tools/schemas/instructions",
+            phase="green-readiness",
+            details={"readiness": value if isinstance(value, dict) else None},
+        )
+    return value
+
+
+def _selector_summary(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selector_sha256": value.get("selector_sha256"),
+        "generation": value.get("generation"),
+        "selected_slot": value.get("selected_slot"),
+        "upstream_port": value.get("upstream_port"),
+        "runtime_binding_sha256": value.get("runtime_binding_sha256"),
+        "release_id": value.get("runtime_binding", {}).get("release_id"),
+        "repo_head": value.get("runtime_binding", {}).get("repo_head"),
+    }
+
+
+def _require_selector_authority(
+    *,
+    expected_selector_sha256: str,
+    expected_slot: str,
+    expected_binding_sha256: str,
+) -> dict[str, Any]:
+    selector = transport_ingress.read_routing_selector()
+    health = require_transport_ingress_health()
+    matched = (
+        selector.get("selector_sha256") == expected_selector_sha256
+        and selector.get("selected_slot") == expected_slot
+        and selector.get("runtime_binding_sha256") == expected_binding_sha256
+        and health.get("selector_authoritative") is True
+        and health.get("selector_sha256") == expected_selector_sha256
+        and health.get("selected_slot") == expected_slot
+        and health.get("runtime_binding_sha256") == expected_binding_sha256
+        and health.get("upstream_port")
+        == transport_ingress.ROUTING_SLOTS[expected_slot]
+    )
+    if not matched:
+        core.fail(
+            "Ingress routing selector authoritative readback failed",
+            phase="selector-readback",
+            details={
+                "selector": _selector_summary(selector),
+                "health": {
+                    key: health.get(key)
+                    for key in (
+                        "selector_authoritative",
+                        "selector_sha256",
+                        "selected_slot",
+                        "upstream_port",
+                        "runtime_binding_sha256",
+                    )
+                },
+            },
+        )
+    material = {
+        "authoritative": True,
+        "selector": _selector_summary(selector),
+        "ingress": {
+            "selector_sha256": health.get("selector_sha256"),
+            "selector_generation": health.get("selector_generation"),
+            "selected_slot": health.get("selected_slot"),
+            "upstream_port": health.get("upstream_port"),
+            "runtime_binding_sha256": health.get("runtime_binding_sha256"),
+            "release_id": health.get("release_id"),
+            "repo_head": health.get("repo_head"),
+        },
+    }
+    return {
+        **material,
+        "readback_sha256": hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest(),
+    }
+
+
+@dataclass
+class ProductionBlueGreenRuntime:
+    repo: Path
+    runtime: Path
+    snapshot: core.Snapshot
+    build: core.BuildResult
+    activation: core.ActivationState
+    blue_manifest: dict[str, Any]
+    blue_binding: dict[str, str]
+    green_binding: dict[str, str]
+    selector_before: dict[str, Any]
+    cutover_id: str
+    timeout_seconds: int
+    green_unit: str
+    watchdog_projection: WatchdogHostAssetProjection | None = None
+    observer_repair: dict[str, Any] | None = None
+    admission_marker: dict[str, Any] | None = None
+    green_started: bool = False
+    connector_switched: bool = False
+    current_selector: dict[str, Any] | None = None
+    green_readiness: dict[str, Any] | None = None
+    source_complete_schema_sha256: str | None = None
+
+    def start_green(self) -> dict[str, Any]:
+        core.verify_apply_snapshot_unchanged(
+            self.repo, self.snapshot, self.build.release_path
+        )
+        self.watchdog_projection = install_watchdog_host_assets(
+            self.repo, self.snapshot
+        )
+        self.observer_repair = install_safety_observer_unit(
+            self.repo, self.snapshot
+        )
+        # From this point forward the start call may already have created the
+        # transient systemd unit even if a later service/argv/exe/listener
+        # verification raises. Mark the possible effect before dispatch so the
+        # pre-cutover rollback always attempts authoritative Green retirement.
+        self.green_started = True
+        result = _start_green_operator(
+            unit=self.green_unit,
+            release_path=self.build.release_path,
+            contract=self.snapshot.contract,
+            timeout_seconds=self.timeout_seconds,
+        )
+        return result
+
+    def verify_green(self) -> dict[str, Any]:
+        readiness = _probe_release_runtime(
+            release_path=self.build.release_path,
+            port=GREEN_OPERATOR_LISTENER_PORT,
+            auth_mode="connector",
+            expected_release_id=self.build.release_id,
+            expected_repo_head=self.snapshot.repo_head,
+            expected_agent_instructions_sha256=self.build.agent_instructions[
+                "sha256"
+            ],
+            timeout_seconds=self.timeout_seconds,
+        )
+        if (
+            self.source_complete_schema_sha256 is None
+            or readiness.get("complete_schema_count")
+            != len(self.snapshot.contract.expected_tools)
+            or readiness.get("complete_schema_sha256")
+            != self.source_complete_schema_sha256
+        ):
+            core.fail(
+                "Green complete schema identity differs from the authentic external Blue snapshot",
+                phase="snapshot-authenticity-preflight",
+                details={
+                    "expected_complete_schema_sha256": self.source_complete_schema_sha256,
+                    "green_complete_schema_sha256": readiness.get(
+                        "complete_schema_sha256"
+                    ),
+                },
+            )
+        self.green_readiness = readiness
+        return readiness
+
+    def close_blue_mutations(self) -> dict[str, Any]:
+        self.admission_marker = engage_operator_deployment_admission(
+            self.snapshot, timeout_seconds=self.timeout_seconds
+        )
+        return {
+            "closed": True,
+            "marker_sha256": hashlib.sha256(
+                json.dumps(
+                    self.admission_marker,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "expected_head": self.admission_marker["expected_head"],
+            "source_identity_sha256": self.admission_marker[
+                "source_identity_sha256"
+            ],
+        }
+
+    def terminalize_blue_effects(self) -> dict[str, Any]:
+        if self.admission_marker is None:
+            core.fail("Blue operator admission marker is not engaged")
+        drained = wait_for_operator_deployment_admission(
+            self.admission_marker, timeout_seconds=self.timeout_seconds
+        )
+        final = verify_operator_deployment_admission(self.admission_marker)
+        observation = drained.get("observation")
+        return {
+            **drained,
+            "terminalized_count": drained.get("initial_blocking_tool_calls", 0),
+            "remaining_read_count": drained.get("read_only_active_tool_calls"),
+            "operator_observation_sha256": hashlib.sha256(
+                json.dumps(
+                    observation,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "final_guard_sha256": hashlib.sha256(
+                json.dumps(final, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+            "registry_authority": "grabowski_operator_cross_process_status",
+        }
+
+    def switch_connector(self) -> dict[str, Any]:
+        current_sha = self.selector_before["selector_sha256"]
+        try:
+            selected = transport_ingress.publish_routing_selector(
+                expected_selector_sha256=current_sha,
+                selected_slot="green",
+                runtime_binding=self.green_binding,
+                cutover_id=self.cutover_id,
+            )
+        except Exception:
+            # The atomic replace may have succeeded even when its durable
+            # readback failed.  Only an unchanged, readable predecessor proves
+            # this is still a pre-switch failure; every other state is
+            # externally ambiguous and must prohibit automatic rollback.
+            try:
+                observed = transport_ingress.read_routing_selector()
+            except Exception:
+                self.connector_switched = True
+            else:
+                if observed.get("selector_sha256") != current_sha:
+                    self.current_selector = observed
+                    self.connector_switched = True
+            raise
+        self.current_selector = selected
+        self.connector_switched = True
+        readback = _require_selector_authority(
+            expected_selector_sha256=selected["selector_sha256"],
+            expected_slot="green",
+            expected_binding_sha256=selected["runtime_binding_sha256"],
+        )
+        connector_readiness = _probe_release_runtime(
+            release_path=self.build.release_path,
+            port=TRANSPORT_INGRESS_LISTENER_PORT,
+            auth_mode="ingress",
+            expected_release_id=self.build.release_id,
+            expected_repo_head=self.snapshot.repo_head,
+            expected_agent_instructions_sha256=self.build.agent_instructions[
+                "sha256"
+            ],
+            timeout_seconds=self.timeout_seconds,
+        )
+        return {
+            "switched": True,
+            **_selector_summary(selected),
+            "authoritative_readback": readback,
+            "connector_readiness_sha256": hashlib.sha256(
+                json.dumps(
+                    connector_readiness,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    def rebind_snapshot(
+        self, cutover_id: str, cutover_generation: int
+    ) -> dict[str, Any]:
+        if self.green_readiness is None:
+            core.fail("Green readiness is unavailable for snapshot rebind")
+        return client_snapshot.rebind_authentic_snapshot_for_cutover(
+            cutover_id=cutover_id,
+            cutover_generation=cutover_generation,
+            current_release_id=self.blue_binding["release_id"],
+            current_repo_head=self.blue_binding["repo_head"],
+            green_release_id=self.green_binding["release_id"],
+            green_repo_head=self.green_binding["repo_head"],
+            registered_tool_count=len(self.snapshot.contract.expected_tools),
+            registered_names_sha256=self.green_binding[
+                "registered_names_sha256"
+            ],
+            agent_instructions_sha256=self.green_binding[
+                "agent_instructions_sha256"
+            ],
+            green_readiness=self.green_readiness,
+        )
+
+    def retire_blue(self) -> dict[str, Any]:
+        if not self.connector_switched or self.current_selector is None:
+            core.fail("Connector is not confirmed green before canonical promotion")
+        core.verify_apply_snapshot_unchanged(
+            self.repo, self.snapshot, self.build.release_path
+        )
+        core.activate_pointer(self.activation)
+        # Keep the global admission marker engaged through the complete
+        # promotion. While it is active neither the old canonical process nor
+        # transient Green may admit a new normal tool call. This prevents an
+        # effect from starting on Green and then being cut off by retirement.
+        stop_service(OPERATOR_SERVICE)
+        ingress = observe_service(TRANSPORT_INGRESS_SERVICE)
+        if not ingress.confirmed_active:
+            start_service(TRANSPORT_INGRESS_SERVICE)
+        _require_selector_authority(
+            expected_selector_sha256=self.current_selector["selector_sha256"],
+            expected_slot="green",
+            expected_binding_sha256=self.current_selector[
+                "runtime_binding_sha256"
+            ],
+        )
+        start_service(OPERATOR_SERVICE)
+        verify_operator_process(
+            self.runtime,
+            self.snapshot.contract,
+            release_hint=self.build.release_path,
+        )
+        _require_loopback_listener(
+            OPERATOR_LISTENER_PORT, timeout_seconds=self.timeout_seconds
+        )
+        canonical = transport_ingress.publish_routing_selector(
+            expected_selector_sha256=self.current_selector["selector_sha256"],
+            selected_slot="canonical",
+            runtime_binding=self.green_binding,
+            cutover_id=self.cutover_id,
+        )
+        self.current_selector = canonical
+        final_readback = _require_selector_authority(
+            expected_selector_sha256=canonical["selector_sha256"],
+            expected_slot="canonical",
+            expected_binding_sha256=canonical["runtime_binding_sha256"],
+        )
+        # Keep the already-verified Green runtime available and keep mutation
+        # admission closed until canonical proves full MCP readiness through
+        # ingress. Only the exact read-only minimal status probe is drain-neutral.
+        canonical_readiness = _probe_release_runtime(
+            release_path=self.build.release_path,
+            port=TRANSPORT_INGRESS_LISTENER_PORT,
+            auth_mode="ingress",
+            expected_release_id=self.build.release_id,
+            expected_repo_head=self.snapshot.repo_head,
+            expected_agent_instructions_sha256=self.build.agent_instructions[
+                "sha256"
+            ],
+            timeout_seconds=self.timeout_seconds,
+        )
+        green_retirement = _stop_green_operator(self.green_unit)
+        self.green_started = False
+        admission_release = None
+        if self.admission_marker is not None:
+            admission_release = release_operator_deployment_admission(
+                self.admission_marker
+            )
+            self.admission_marker = None
+        require_service_active(TRANSPORT_INGRESS_SERVICE)
+        require_service_active(TUNNEL_SERVICE)
+        identity = verify_url_runtime_identity(
+            self.build.release_path,
+            self.runtime,
+            self.snapshot.contract,
+            snapshot=self.snapshot,
+            agent_instructions=self.build.agent_instructions,
+        )
+        return {
+            "retired": True,
+            "blue_operator_replaced": True,
+            "green_retirement": green_retirement,
+            "admission_release": admission_release,
+            "final_routing": _selector_summary(canonical),
+            "authoritative_readback": final_readback,
+            "canonical_readiness_sha256": hashlib.sha256(
+                json.dumps(
+                    canonical_readiness,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "runtime_identity": {
+                "pid": identity["process"]["pid"],
+                "release_id": identity["manifest"]["release_id"],
+                "repo_head": identity["manifest"]["repo_head"],
+            },
+        }
+
+    def rollback_green(self) -> dict[str, Any]:
+        if self.connector_switched:
+            core.fail(
+                "Automatic rollback is forbidden after connector switch",
+                phase="post-cutover-rollback-forbidden",
+            )
+        result: dict[str, Any] = {"blue_preserved": True}
+        if self.admission_marker is not None:
+            release_operator_deployment_admission(self.admission_marker)
+            self.admission_marker = None
+            result["admission_released"] = True
+        if self.green_started:
+            result["green"] = _stop_green_operator(self.green_unit)
+            self.green_started = False
+        if self.watchdog_projection is not None:
+            restore_watchdog_host_assets(self.watchdog_projection)
+            result["watchdog_host_assets"] = "restored"
+        return result
+
+    def authoritative_readback(self) -> dict[str, Any]:
+        try:
+            selector = transport_ingress.read_routing_selector()
+            return _require_selector_authority(
+                expected_selector_sha256=selector["selector_sha256"],
+                expected_slot=selector["selected_slot"],
+                expected_binding_sha256=selector["runtime_binding_sha256"],
+            )
+        except Exception as exc:
+            selector_summary: dict[str, Any] | None = None
+            try:
+                selector_summary = _selector_summary(
+                    transport_ingress.read_routing_selector()
+                )
+            except Exception:
+                pass
+            return {
+                "authoritative": False,
+                "selector": selector_summary,
+                "error_type": type(exc).__name__,
+                "requires_operator_recovery": True,
+            }
+
+
+def prepare_production_blue_green_runtime(
+    repo: Path,
+    runtime: Path,
+    profile_path: Path,
+    *,
+    expected_head: str,
+    cutover_id: str,
+    timeout_seconds: int,
+) -> ProductionBlueGreenRuntime:
+    snapshot, runtime, topology = preflight_url(
+        repo,
+        runtime,
+        profile_path,
+        expected_head=expected_head,
+    )
+    if (
+        topology.kind != "url"
+        or topology.server_url_port != TRANSPORT_INGRESS_LISTENER_PORT
+    ):
+        core.fail(
+            "Productive blue-green deployment requires signed ingress topology",
+            phase="blue-green-topology",
+        )
+    require_service_active(TRANSPORT_INGRESS_SERVICE)
+    blue_manifest = core.read_manifest(runtime)
+    blue_binding, _ = transport_ingress._read_runtime_binding(
+        runtime / core.MANIFEST_NAME
+    )
+    selector_before = transport_ingress.read_routing_selector()
+    if (
+        selector_before.get("selected_slot") != "canonical"
+        or selector_before.get("runtime_binding") != blue_binding
+    ):
+        core.fail(
+            "Productive blue-green deployment requires canonical blue selector",
+            phase="selector-preflight",
+            details={"selector": _selector_summary(selector_before)},
+        )
+    _require_selector_authority(
+        expected_selector_sha256=selector_before["selector_sha256"],
+        expected_slot="canonical",
+        expected_binding_sha256=selector_before["runtime_binding_sha256"],
+    )
+    build = core.build_release(
+        snapshot, core.releases_root_for(runtime), runtime
+    )
+    core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
+    core.verify_manifest(
+        build.release_path,
+        snapshot=snapshot,
+        stable_runtime=runtime,
+        expected_agent_instructions=build.agent_instructions,
+    )
+    green_binding, _ = transport_ingress._read_runtime_binding(
+        build.release_path / core.MANIFEST_NAME
+    )
+    if (
+        blue_binding["registered_names_sha256"]
+        != green_binding["registered_names_sha256"]
+        or blue_binding["agent_instructions_sha256"]
+        != green_binding["agent_instructions_sha256"]
+    ):
+        core.fail(
+            "No authentic prior connector declaration covers the changed green surface",
+            phase="snapshot-authenticity-preflight",
+        )
+    blue_entrypoint = blue_manifest.get("entrypoint_contract")
+    blue_tools = (
+        blue_entrypoint.get("expected_tools")
+        if isinstance(blue_entrypoint, dict)
+        else None
+    )
+    if not isinstance(blue_tools, list) or len(blue_tools) != len(
+        snapshot.contract.expected_tools
+    ):
+        core.fail(
+            "Blue and green tool count continuity is unavailable",
+            phase="snapshot-authenticity-preflight",
+        )
+    snapshot_status = client_snapshot.snapshot_status(
+        expected_tool_count=len(blue_tools),
+        expected_names_sha256=blue_binding["registered_names_sha256"],
+        expected_release_id=blue_binding["release_id"],
+        expected_repo_head=blue_binding["repo_head"],
+        expected_agent_instructions_sha256=blue_binding[
+            "agent_instructions_sha256"
+        ],
+    )
+    if (
+        snapshot_status.get("external_client_snapshot_observable") is not True
+        or snapshot_status.get("external_client_schema_observable") is not True
+        or snapshot_status.get("client_observed_release_id")
+        != blue_binding["release_id"]
+        or snapshot_status.get("external_client_complete_schema_observable")
+        is not True
+        or not isinstance(
+            snapshot_status.get("external_client_complete_schema_sha256"), str
+        )
+        or not isinstance(snapshot_status.get("receipt_sha256"), str)
+        or not isinstance(snapshot_status.get("client_declaration_sha256"), str)
+        or len(set(snapshot_status["receipt_sha256"])) == 1
+        or len(set(snapshot_status["client_declaration_sha256"])) == 1
+    ):
+        core.fail(
+            "Authentic fresh external connector snapshot is unavailable",
+            phase="snapshot-authenticity-preflight",
+            details={
+                "state": snapshot_status.get("state"),
+                "observation_scope": snapshot_status.get("observation_scope"),
+                "client_observed_release_id": snapshot_status.get(
+                    "client_observed_release_id"
+                ),
+                "expected_blue_release_id": blue_binding["release_id"],
+                "schema_observable": snapshot_status.get("schema_observable"),
+            },
+        )
+    activation = core.ActivationState(
+        runtime=runtime,
+        release_path=build.release_path,
+        previous=core.capture_pointer(runtime),
+    )
+    return ProductionBlueGreenRuntime(
+        repo=repo,
+        runtime=runtime,
+        snapshot=snapshot,
+        build=build,
+        activation=activation,
+        blue_manifest=blue_manifest,
+        blue_binding=blue_binding,
+        green_binding=green_binding,
+        selector_before=selector_before,
+        cutover_id=cutover_id,
+        timeout_seconds=timeout_seconds,
+        green_unit=_green_operator_unit(cutover_id),
+        current_selector=selector_before,
+        source_complete_schema_sha256=snapshot_status[
+            "external_client_complete_schema_sha256"
+        ],
+    )
+
+
+def initialize_canonical_ingress_selector(
+    *,
+    release_path: Path,
+    cutover_id: str,
+) -> dict[str, Any]:
+    """Explicit bootstrap/recovery initialization while ingress is stopped."""
+    binding, _ = transport_ingress._read_runtime_binding(
+        release_path / core.MANIFEST_NAME
+    )
+    try:
+        current = transport_ingress.read_routing_selector()
+        expected = current["selector_sha256"]
+    except transport_ingress.IngressConfigurationError:
+        if (
+            transport_ingress.DEFAULT_SELECTOR_FILE.exists()
+            or transport_ingress.DEFAULT_SELECTOR_FILE.is_symlink()
+        ):
+            raise
+        expected = None
+    return transport_ingress.publish_routing_selector(
+        expected_selector_sha256=expected,
+        selected_slot="canonical",
+        runtime_binding=binding,
+        cutover_id=cutover_id,
+    )
+
+
+BLUE_GREEN_RECEIPT_ROOT = (
+    core.DEFAULT_STATE_ROOT / "blue-green-deployment-receipts"
+)
+BLUE_GREEN_RECEIPT_MAX_BYTES = 256 * 1024
+
+
+class ProductionBlueGreenReceiptPersistenceError(RuntimeError):
+    """The cutover outcome is known in memory but its primary receipt was not persisted."""
+
+    def __init__(self, receipt: dict[str, Any], cause: BaseException) -> None:
+        self.receipt = dict(receipt)
+        self.receipt_sha256 = str(receipt.get("receipt_sha256") or "")
+        self.outcome = str(receipt.get("outcome") or "")
+        self.persistence_error_type = type(cause).__name__
+        super().__init__(
+            "productive blue-green cutover receipt persistence failed after outcome observation"
+        )
+
+
+def _json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _persist_production_blue_green_receipt(
+    receipt: dict[str, Any],
+) -> dict[str, str]:
+    root = BLUE_GREEN_RECEIPT_ROOT
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = root.lstat()
+    if (
+        statmod.S_ISLNK(metadata.st_mode)
+        or not statmod.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or statmod.S_IMODE(metadata.st_mode) & 0o077
+        or root.resolve(strict=True) != root
+    ):
+        core.fail(
+            "Blue-green receipt directory is not private and owner-controlled",
+            phase="blue-green-receipt",
+        )
+    cutover_id = receipt.get("cutover_id")
+    if (
+        not isinstance(cutover_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", cutover_id) is None
+    ):
+        core.fail("Blue-green receipt cutover id is invalid")
+    encoded = (
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    if len(encoded) > BLUE_GREEN_RECEIPT_MAX_BYTES:
+        core.fail("Blue-green receipt exceeds its size bound")
+    path = root / f"{cutover_id}.json"
+    create_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    created = False
+    try:
+        descriptor = os.open(path, create_flags, 0o600)
+    except FileExistsError:
+        descriptor = None
+    else:
+        created = True
+        try:
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("blue-green receipt write made no progress")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_parent(path)
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.getuid()
+            or statmod.S_IMODE(opened.st_mode) & 0o077
+            or opened.st_size > BLUE_GREEN_RECEIPT_MAX_BYTES
+        ):
+            core.fail(
+                "Blue-green receipt file is not private and owner-controlled",
+                phase="blue-green-receipt",
+            )
+        observed = os.read(descriptor, BLUE_GREEN_RECEIPT_MAX_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if observed != encoded:
+        core.fail(
+            (
+                "Blue-green receipt readback mismatch"
+                if created
+                else "Blue-green cutover id already binds different receipt evidence"
+            ),
+            phase="blue-green-receipt",
+        )
+    return {
+        "path": str(path),
+        "receipt_sha256": str(receipt["receipt_sha256"]),
+    }
+
+
+def _blue_green_observation(
+    observations: list[dict[str, Any]],
+    *,
+    phase: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    material = {
+        "phase": phase,
+        "observed_at_unix": int(time.time()),
+        "details": details or {},
+    }
+    observations.append({**material, "observation_sha256": _json_sha256(material)})
+
+
+def _production_blue_green_receipt(
+    *,
+    runtime: ProductionBlueGreenRuntime,
+    source_identity_sha256: str,
+    phase: str,
+    outcome: str,
+    observations: list[dict[str, Any]],
+    green_readiness: dict[str, Any] | None,
+    drain: dict[str, Any] | None,
+    selector_switch: dict[str, Any] | None,
+    snapshot_rebind: dict[str, Any] | None,
+    retirement: dict[str, Any] | None,
+    readback: dict[str, Any] | None,
+    recovery: dict[str, Any] | None,
+) -> dict[str, Any]:
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_blue_green_deployment_receipt",
+        "cutover_id": runtime.cutover_id,
+        "cutover_generation": 1,
+        "expected_head": runtime.snapshot.repo_head,
+        "source_identity_sha256": source_identity_sha256,
+        "runtime_snapshot_source_identity_sha256": (
+            _deployment_source_identity_sha256(runtime.snapshot)
+        ),
+        "blue_release_id": runtime.blue_binding["release_id"],
+        "green_release_id": runtime.green_binding["release_id"],
+        "names_sha256": runtime.green_binding["registered_names_sha256"],
+        "agent_instructions_sha256": runtime.green_binding[
+            "agent_instructions_sha256"
+        ],
+        "schema_sentinels": sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS),
+        "phase": phase,
+        "outcome": outcome,
+        "green_readiness": green_readiness,
+        "selector_switch": selector_switch,
+        "snapshot_rebind": snapshot_rebind,
+        "effect_terminalization": drain,
+        "retirement": retirement,
+        "final_routing": (
+            retirement.get("final_routing")
+            if isinstance(retirement, dict)
+            else None
+        ),
+        "authoritative_readback": readback,
+        "observations": observations,
+        "recovery": recovery,
+        "preserves": [
+            "source_identity",
+            "deployment_lock",
+            "contention_preflight",
+            "watchdog_assets",
+            "transport_oauth",
+            "signed_mutation_assertions",
+            "sidecar_reconciliation",
+            "runtime_manifest_and_provenance",
+            "audit_and_recovery_gates",
+        ],
+        "does_not_establish": [
+            "that the external client refreshed against green",
+            "application success of settled admitted mutations",
+            "absence of long-lived read calls at blue retirement",
+        ],
+    }
+    return {**material, "receipt_sha256": _json_sha256(material)}
+
+
+def _production_blue_green_preflight_failure_receipt(
+    *,
+    cutover_id: str,
+    expected_head: str,
+    source_identity_sha256: str,
+    error: dict[str, Any],
+    observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_blue_green_deployment_receipt",
+        "cutover_id": cutover_id,
+        "cutover_generation": 1,
+        "expected_head": expected_head,
+        "source_identity_sha256": source_identity_sha256,
+        "runtime_snapshot_source_identity_sha256": None,
+        "blue_release_id": None,
+        "green_release_id": None,
+        "names_sha256": None,
+        "agent_instructions_sha256": None,
+        "schema_sentinels": sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS),
+        "phase": "failed_pre_cutover",
+        "outcome": "failed_pre_cutover",
+        "green_readiness": None,
+        "selector_switch": None,
+        "snapshot_rebind": None,
+        "effect_terminalization": None,
+        "retirement": None,
+        "final_routing": None,
+        "authoritative_readback": None,
+        "observations": observations,
+        "recovery": {
+            "action": "repair_preflight_evidence_and_retry",
+            "blue_preserved": True,
+            "connector_switch_attempted": False,
+            "error": error,
+        },
+        "preserves": [
+            "source_identity",
+            "deployment_lock",
+            "transport_oauth",
+            "signed_mutation_assertions",
+            "runtime_manifest_and_provenance",
+        ],
+        "does_not_establish": [
+            "green runtime readiness",
+            "connector switch",
+            "client snapshot rebind",
+            "deployment completion",
+        ],
+    }
+    return {**material, "receipt_sha256": _json_sha256(material)}
+
+
+def run_production_blue_green_cutover(
+    *,
+    repo: Path,
+    expected_head: str,
+    source_identity_sha256: str,
+    timeout_seconds: int = 40,
+    runtime: Path | None = None,
+    profile_path: Path | None = None,
+    lock_file: Path | None = None,
+    cutover_id: str | None = None,
+) -> dict[str, Any]:
+    """Run the normal productive receipt-bound cutover under the deploy lock."""
+    if re.fullmatch(r"[0-9a-f]{64}", source_identity_sha256 or "") is None:
+        raise ValueError("source_identity_sha256 must be a lowercase SHA-256")
+    identifier = cutover_id or f"bgc-{secrets.token_hex(8)}"
+    if re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", identifier) is None:
+        raise ValueError("cutover_id is invalid")
+    target_runtime = runtime or (core.HOME / ".local/share/grabowski-mcp")
+    target_profile = profile_path or core.DEFAULT_PROFILE_PATH
+    target_lock = lock_file or core.DEFAULT_LOCK_FILE
+    observations: list[dict[str, Any]] = []
+    context: ProductionBlueGreenRuntime | None = None
+    phase = "prepare"
+    green_readiness: dict[str, Any] | None = None
+    drain: dict[str, Any] | None = None
+    selector_switch: dict[str, Any] | None = None
+    snapshot_rebind: dict[str, Any] | None = None
+    retirement: dict[str, Any] | None = None
+    readback: dict[str, Any] | None = None
+    recovery: dict[str, Any] | None = None
+    outcome = "failed_pre_cutover"
+    error: dict[str, Any] | None = None
+    with core.deployment_lock(target_lock):
+        try:
+            context = prepare_production_blue_green_runtime(
+                repo,
+                target_runtime,
+                target_profile,
+                expected_head=expected_head,
+                cutover_id=identifier,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            error = _error_summary(exc)
+            _blue_green_observation(
+                observations,
+                phase="failed_pre_cutover",
+                details={"error_type": error.get("type")},
+            )
+            receipt = _production_blue_green_preflight_failure_receipt(
+                cutover_id=identifier,
+                expected_head=expected_head,
+                source_identity_sha256=source_identity_sha256,
+                error=error,
+                observations=observations,
+            )
+            persisted = _persist_production_blue_green_receipt(receipt)
+            return {
+                "receipt": receipt,
+                "receipt_path": persisted["path"],
+                "receipt_sha256": persisted["receipt_sha256"],
+                "outcome": "failed_pre_cutover",
+                "error": error,
+            }
+        _blue_green_observation(observations, phase=phase)
+        try:
+            phase = "start_green"
+            started = context.start_green()
+            _blue_green_observation(
+                observations, phase=phase, details={"start": started}
+            )
+            phase = "verify_green"
+            green_readiness = context.verify_green()
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "ready": True,
+                    "readiness_sha256": _json_sha256(green_readiness),
+                },
+            )
+            phase = "pre_cutover_ready"
+            closed = context.close_blue_mutations()
+            drain = context.terminalize_blue_effects()
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "close": closed,
+                    "drain_sha256": _json_sha256(drain),
+                },
+            )
+            phase = "cutover"
+            selector_switch = context.switch_connector()
+            snapshot_rebind = context.rebind_snapshot(identifier, 1)
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "selector_sha256": selector_switch.get("selector_sha256"),
+                    "snapshot_receipt_sha256": snapshot_rebind.get(
+                        "receipt_sha256"
+                    ),
+                },
+            )
+            phase = "retire_blue"
+            retirement = context.retire_blue()
+            readback = context.authoritative_readback()
+            if readback.get("authoritative") is not True:
+                core.fail(
+                    "Final canonical routing readback is not authoritative",
+                    phase="final-routing-readback",
+                )
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "final_selector_sha256": retirement.get(
+                        "final_routing", {}
+                    ).get("selector_sha256"),
+                    "readback_sha256": readback.get("readback_sha256"),
+                },
+            )
+            phase = "completed"
+            outcome = "completed"
+            _blue_green_observation(observations, phase=phase)
+        except Exception as exc:
+            error = _error_summary(exc)
+            if context.connector_switched:
+                outcome = "outcome_unknown"
+                phase = "outcome_unknown"
+                readback = context.authoritative_readback()
+                recovery = {
+                    "action": "readback_active_runtime_and_recover",
+                    "automatic_rollback_forbidden": True,
+                    "error": error,
+                }
+            else:
+                try:
+                    rollback = context.rollback_green()
+                    outcome = "rolled_back"
+                    phase = "rolled_back"
+                    readback = context.authoritative_readback()
+                    recovery = {
+                        "action": "retry_from_clean_blue",
+                        "blue_preserved": True,
+                        "rollback": rollback,
+                        "error": error,
+                    }
+                except Exception as rollback_error:
+                    outcome = "outcome_unknown"
+                    phase = "outcome_unknown"
+                    readback = context.authoritative_readback()
+                    recovery = {
+                        "action": "inspect_blue_and_green_runtimes",
+                        "automatic_rollback_forbidden": True,
+                        "error": error,
+                        "rollback_error": _error_summary(rollback_error),
+                    }
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "error_type": error.get("type") if isinstance(error, dict) else None,
+                    "readback_sha256": (
+                        readback.get("readback_sha256")
+                        if isinstance(readback, dict)
+                        else None
+                    ),
+                },
+            )
+    assert context is not None
+    receipt = _production_blue_green_receipt(
+        runtime=context,
+        source_identity_sha256=source_identity_sha256,
+        phase=phase,
+        outcome=outcome,
+        observations=observations,
+        green_readiness=green_readiness,
+        drain=drain,
+        selector_switch=selector_switch,
+        snapshot_rebind=snapshot_rebind,
+        retirement=retirement,
+        readback=readback,
+        recovery=recovery,
+    )
+    try:
+        persisted = _persist_production_blue_green_receipt(receipt)
+    except Exception as exc:
+        # All runtime effects and the authoritative readback have already been
+        # classified into the hash-bound receipt above.  Preserve that evidence
+        # across a storage failure so the scheduled wrapper cannot collapse an
+        # applied or ambiguous cutover into a generic retryable failure.
+        raise ProductionBlueGreenReceiptPersistenceError(receipt, exc) from exc
+    return {
+        "receipt": receipt,
+        "receipt_path": persisted["path"],
+        "receipt_sha256": persisted["receipt_sha256"],
+        "receipt_persisted": True,
+        "outcome": outcome,
+        "error": error,
+    }
 
 
 

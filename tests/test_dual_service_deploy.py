@@ -3372,6 +3372,13 @@ class DeploymentSequenceTests(unittest.TestCase):
                 mock.patch.object(dual, "require_transport_ingress_health", return_value={})
             )
             stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "initialize_canonical_ingress_selector",
+                    return_value={"selected_slot": "canonical"},
+                )
+            )
+            stack.enter_context(
                 mock.patch.object(dual, "apply_tunnel_profile_cutover", return_value={})
             )
             stack.enter_context(

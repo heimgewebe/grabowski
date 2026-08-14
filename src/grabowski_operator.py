@@ -724,6 +724,18 @@ def _deployment_observer_tool_call_parts(
     return tool_name, arguments, context
 
 
+def _deployment_readiness_status_call(
+    tool_name: Any,
+    arguments: Any,
+    tool: Any,
+) -> bool:
+    return (
+        tool_name == "grabowski_status"
+        and arguments == {"view": "minimal"}
+        and _tool_read_only_hint(tool) is True
+    )
+
+
 def _deployment_admission_active_tool_calls() -> int:
     with _DEPLOYMENT_ADMISSION_LOCK:
         return len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
@@ -837,7 +849,7 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
     )
     truncated = len(sample) > _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX
     sample = sample[: _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX]
-    return {
+    observation = {
         **_read_deployment_admission_marker(),
         "active_tool_calls": len(registry),
         "drain_blocking_tool_calls": sum(
@@ -868,6 +880,28 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
         "active_tool_calls_sample_max": (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX
         ),
+        "registry_authority": "live_grabowski_operator_call_boundary",
+        "effect_terminalization_state": (
+            "settled"
+            if sum(
+                entry.get("drain_blocking") is not False
+                for entry in registry.values()
+            )
+            == 0
+            else "draining"
+        ),
+        "read_calls_block_retirement": False,
+    }
+    digest_material = {
+        key: value
+        for key, value in observation.items()
+        if key not in {"oldest_active_tool_call_age_seconds", "active_tool_calls_sample"}
+    }
+    return {
+        **observation,
+        "registry_observation_sha256": hashlib.sha256(
+            _canonical_json_bytes(digest_material)
+        ).hexdigest(),
     }
 
 
@@ -956,6 +990,28 @@ def _install_deployment_admission_gate() -> None:
             if (
                 current_observer_evidence is not None
                 and current_observer_evidence.get("marker_bound") is True
+            ):
+                if tool is not None and getattr(tool, "is_async", True) is False:
+                    loop = asyncio.get_running_loop()
+                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                        _run_sync_tool_call,
+                        original,
+                        args,
+                        kwargs,
+                    )
+                    return await asyncio.wrap_future(worker_future, loop=loop)
+                return await original(*args, **kwargs)
+
+        if (
+            observer_marker.get("active") is True
+            and observer_marker.get("valid") is True
+            and _deployment_readiness_status_call(tool_name, arguments, tool)
+        ):
+            current_marker = _read_deployment_admission_marker()
+            if (
+                current_marker.get("active") is True
+                and current_marker.get("valid") is True
+                and _deployment_readiness_status_call(tool_name, arguments, tool)
             ):
                 if tool is not None and getattr(tool, "is_async", True) is False:
                     loop = asyncio.get_running_loop()
@@ -2306,7 +2362,7 @@ def _runtime_deploy_finalization_receipt_result(
             "does_not_establish": ["job_success"],
         }
 
-    allowed_payload_keys = {
+    required_payload_keys = {
         "schema_version",
         "kind",
         "unit",
@@ -2322,7 +2378,15 @@ def _runtime_deploy_finalization_receipt_result(
         "timestamp_unix",
         "payload_sha256",
     }
-    if set(payload) != allowed_payload_keys:
+    optional_payload_keys = {
+        "blue_green",
+        "blue_green_receipt_sha256",
+        "blind_retry_allowed",
+    }
+    if (
+        not required_payload_keys.issubset(payload)
+        or set(payload) - required_payload_keys - optional_payload_keys
+    ):
         return {
             "configured": True,
             "valid": False,
@@ -2386,6 +2450,36 @@ def _runtime_deploy_finalization_receipt_result(
             "does_not_establish": ["job_success"],
         }
 
+    blue_green = payload.get("blue_green")
+    blue_green_receipt_sha256 = payload.get("blue_green_receipt_sha256")
+    if blue_green is None:
+        if blue_green_receipt_sha256 is not None:
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_receipt",
+                "reason": "blue_green_receipt_without_summary",
+                "path": str(path),
+                "receipt_sha256": receipt_sha256,
+                "does_not_establish": ["job_success"],
+            }
+    elif (
+        not isinstance(blue_green, dict)
+        or blue_green.get("expected_head") != contract["expected_head"]
+        or not isinstance(blue_green.get("receipt_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", blue_green["receipt_sha256"]) is None
+        or blue_green_receipt_sha256 != blue_green["receipt_sha256"]
+    ):
+        return {
+            "configured": True,
+            "valid": False,
+            "state": "invalid_receipt",
+            "reason": "blue_green_summary_binding_invalid",
+            "path": str(path),
+            "receipt_sha256": receipt_sha256,
+            "does_not_establish": ["job_success"],
+        }
+
     final_status = payload.get("final_status")
     if final_status == "completed":
         release_id = payload.get("release_id")
@@ -2415,12 +2509,46 @@ def _runtime_deploy_finalization_receipt_result(
             or not isinstance(failure_type, str)
             or not failure_type
             or len(failure_type.encode("utf-8")) > 200
+            or payload.get("blind_retry_allowed") not in {None, True}
         ):
             return {
                 "configured": True,
                 "valid": False,
                 "state": "invalid_receipt",
                 "reason": "failed_receipt_semantics_invalid",
+                "path": str(path),
+                "receipt_sha256": receipt_sha256,
+                "does_not_establish": ["job_success"],
+            }
+    elif final_status == "outcome_unknown":
+        failure_type = payload.get("failure_type")
+        repo_head = payload.get("repo_head")
+        release_id = payload.get("release_id")
+        if (
+            payload.get("completion_status") != "outcome_unknown"
+            or payload.get("blind_retry_allowed") is not False
+            or not isinstance(failure_type, str)
+            or not failure_type
+            or len(failure_type.encode("utf-8")) > 200
+            or not isinstance(blue_green, dict)
+            or blue_green.get("outcome") not in ("completed", "outcome_unknown")
+            or blue_green.get("receipt_persisted") is not False
+            or (repo_head is not None and repo_head != contract["expected_head"])
+            or ((repo_head is None) != (release_id is None))
+            or (
+                release_id is not None
+                and (
+                    not isinstance(release_id, str)
+                    or not release_id
+                    or len(release_id.encode("utf-8")) > 512
+                )
+            )
+        ):
+            return {
+                "configured": True,
+                "valid": False,
+                "state": "invalid_receipt",
+                "reason": "outcome_unknown_receipt_semantics_invalid",
                 "path": str(path),
                 "receipt_sha256": receipt_sha256,
                 "does_not_establish": ["job_success"],
@@ -2447,6 +2575,8 @@ def _runtime_deploy_finalization_receipt_result(
         "final_status": final_status,
         "expected_head": contract["expected_head"],
         "timestamp_unix": timestamp,
+        "blind_retry_allowed": payload.get("blind_retry_allowed"),
+        "blue_green_receipt_sha256": blue_green_receipt_sha256,
         "does_not_establish": ["notification_delivery", "root_cause"],
     }
 

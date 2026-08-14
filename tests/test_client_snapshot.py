@@ -117,15 +117,21 @@ class ClientSnapshotTests(unittest.TestCase):
             "grabowski_secret_reveal",
             "grabowski_task_start",
         ]
-        return {
-            "schema_version": 1,
-            "tools": [
-                {"name": name, "inputSchema": schemas[name]}
-                if name in schemas
-                else name
+        return connector_contract.mixed_artifact_from_runtime_tools(
+            [
+                {
+                    "name": name,
+                    "inputSchema": schemas.get(
+                        name,
+                        {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                        },
+                    ),
+                }
                 for name in names
-            ],
-        }
+            ]
+        )
 
     def schema_parameters(self, **overrides: object) -> dict[str, object]:
         artifact = self.schema_artifact()
@@ -638,7 +644,10 @@ class ClientSnapshotTests(unittest.TestCase):
                 self.inputSchema = schema
 
         tools = [
-            Tool("zeta"),
+            Tool(
+                "zeta",
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+            ),
             Tool("grabowski_task_start", schemas["grabowski_task_start"]),
             Tool("grip_run", schemas["grip_run"]),
             Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
@@ -673,7 +682,7 @@ class ClientSnapshotTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             snapshot.ClientSnapshotError,
-            "schema for sentinel grabowski_task_start is unavailable",
+            "runtime schema for grabowski_task_start is unavailable",
         ):
             snapshot._mixed_observed_tool_artifact(
                 [
@@ -715,7 +724,10 @@ class ClientSnapshotTests(unittest.TestCase):
             Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
             Tool("grip_run", schemas["grip_run"]),
             Tool("grabowski_task_start", schemas["grabowski_task_start"]),
-            Tool("zeta"),
+            Tool(
+                "zeta",
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+            ),
         ]
         artifact = snapshot._mixed_observed_tool_artifact(tools)
         names, _observed_schemas, metadata = (
@@ -913,6 +925,30 @@ class ClientSnapshotTests(unittest.TestCase):
                 snapshot.ClientSnapshotError, "bound loopback operator endpoint"
             ):
                 snapshot._validate_loopback_mcp_url(url)
+
+    def test_runtime_readiness_probe_endpoints_are_auth_mode_bound(self) -> None:
+        self.assertEqual(
+            snapshot._validate_runtime_probe_mcp_url(
+                "http://127.0.0.1:18182/mcp", auth_mode="connector"
+            ),
+            "http://127.0.0.1:18182/mcp",
+        )
+        self.assertEqual(
+            snapshot._validate_runtime_probe_mcp_url(
+                "http://127.0.0.1:18180/mcp", auth_mode="ingress"
+            ),
+            "http://127.0.0.1:18180/mcp",
+        )
+        for url, auth_mode in (
+            ("http://127.0.0.1:18180/mcp", "connector"),
+            ("http://127.0.0.1:18182/mcp", "ingress"),
+            ("http://127.0.0.1:18181/mcp", "connector"),
+            ("http://localhost:18182/mcp", "connector"),
+        ):
+            with self.subTest(url=url, auth_mode=auth_mode), self.assertRaisesRegex(
+                snapshot.ClientSnapshotError, "bound loopback endpoint"
+            ):
+                snapshot._validate_runtime_probe_mcp_url(url, auth_mode=auth_mode)
 
     def test_auto_refresh_connector_capability_reader_is_private_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
