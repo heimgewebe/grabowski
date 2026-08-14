@@ -6096,6 +6096,50 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(100, batch["total_examined"])
         self.assertEqual(1, result["scanned"])
 
+    def test_active_refresh_cursor_rotates_past_permission_denials(self) -> None:
+        active_ids: list[str] = []
+        now = tasks._now()
+        for index in range(25):
+            started = self._start()
+            task_id = str(started["task"]["task_id"])
+            active_ids.append(task_id)
+            with sqlite3.connect(self.database) as connection:
+                connection.execute(
+                    "UPDATE tasks SET created_at_unix=?, updated_at_unix=?, runtime_seconds=? "
+                    "WHERE task_id=?",
+                    (now - 500 + index, now - 300, 3600, task_id),
+                )
+                connection.commit()
+
+        with (
+            patch.object(tasks, "_select_reconcile_task_rows", return_value=[]),
+            patch.object(
+                tasks,
+                "_reconcile_observation",
+                side_effect=PermissionError("test observer denied"),
+            ),
+        ):
+            first = tasks.reconcile_tasks_refresh(batch_size=100)
+            second = tasks.reconcile_tasks_refresh(batch_size=100)
+
+        first_ids = [item["task_id"] for item in first["blocked"]]
+        second_ids = [item["task_id"] for item in second["blocked"]]
+        self.assertEqual(20, first["batch"]["active_refresh"]["examined"])
+        self.assertEqual(20, first["batch"]["active_refresh"]["selected"])
+        self.assertIsNotNone(first["batch"]["active_refresh"]["cursor_after"])
+        self.assertFalse(first["batch"]["active_refresh"]["cycle_completed"])
+        self.assertEqual(5, second["batch"]["active_refresh"]["examined"])
+        self.assertEqual(5, second["batch"]["active_refresh"]["selected"])
+        self.assertIsNone(second["batch"]["active_refresh"]["cursor_after"])
+        self.assertTrue(second["batch"]["active_refresh"]["cycle_completed"])
+        self.assertEqual(set(active_ids), set(first_ids) | set(second_ids))
+        self.assertTrue(set(first_ids).isdisjoint(second_ids))
+
+        for task_id in active_ids:
+            record = tasks._row_raw(task_id)
+            self.assertEqual("running", record["state"])
+            self.assertEqual(now - 300, record["updated_at_unix"])
+
     def test_reconcile_shared_budget_bounds_simultaneous_full_backlogs(self) -> None:
         for index in range(4):
             self._prepare_pending_terminalization(prepared_at_unix=100 + index)
