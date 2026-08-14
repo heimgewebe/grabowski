@@ -69,6 +69,22 @@ class BrowserBidiShadowContractTests(unittest.TestCase):
                 expected_port=9502,
             )
 
+    def test_strict_loopback_websocket_binding_rejects_hostname_alias(self) -> None:
+        with self.assertRaisesRegex(shadow.BidiShadowError, "strict loopback"):
+            shadow.validate_loopback_ws_url(
+                "ws://localhost:9502/session/session-1",
+                expected_session_id="session-1",
+                expected_port=9502,
+            )
+
+    def test_strict_loopback_websocket_binding_rejects_ipv6_alias(self) -> None:
+        with self.assertRaisesRegex(shadow.BidiShadowError, "strict loopback"):
+            shadow.validate_loopback_ws_url(
+                "ws://[::1]:9502/session/session-1",
+                expected_session_id="session-1",
+                expected_port=9502,
+            )
+
     def test_strict_loopback_websocket_binding_rejects_wrong_session(self) -> None:
         with self.assertRaisesRegex(shadow.BidiShadowError, "session path"):
             shadow.validate_loopback_ws_url(
@@ -159,7 +175,7 @@ class BrowserBidiShadowContractTests(unittest.TestCase):
             shadow._recv_frame(left)
 
     def test_bidi_connection_rejects_non_loopback_before_connect(self) -> None:
-        with self.assertRaisesRegex(shadow.BidiShadowError, "not loopback"):
+        with self.assertRaisesRegex(shadow.BidiShadowError, "not the bound IPv4 loopback"):
             with shadow.BidiJsonConnection("ws://example.com:9502/session/x"):
                 pass
 
@@ -286,16 +302,33 @@ class BrowserBidiShadowRunTests(unittest.TestCase):
         process = mock.Mock(pid=12345)
         process.poll.return_value = None
         process.wait.return_value = 0
-        with mock.patch.object(shadow.os, "killpg") as killpg:
+        with (
+            mock.patch.object(shadow.os, "killpg") as killpg,
+            mock.patch.object(shadow, "_process_group_exists", return_value=False),
+        ):
             shadow._terminate_process_group(process)
         killpg.assert_called_once_with(12345, shadow.signal.SIGTERM)
+
+    def test_process_group_cleanup_signals_group_after_leader_exit(self) -> None:
+        process = mock.Mock(pid=12345)
+        process.poll.return_value = 0
+        with (
+            mock.patch.object(shadow.os, "killpg") as killpg,
+            mock.patch.object(shadow, "_process_group_exists", return_value=False),
+        ):
+            shadow._terminate_process_group(process)
+        killpg.assert_called_once_with(12345, shadow.signal.SIGTERM)
+        process.wait.assert_not_called()
 
     def test_process_group_cleanup_escalates_after_grace_timeout(self) -> None:
         process = mock.Mock(pid=12345)
         process.poll.return_value = None
-        process.wait.side_effect = [shadow.subprocess.TimeoutExpired("driver", 3), 0]
-        with mock.patch.object(shadow.os, "killpg") as killpg:
-            shadow._terminate_process_group(process)
+        process.wait.side_effect = [shadow.subprocess.TimeoutExpired("driver", 0), 0]
+        with (
+            mock.patch.object(shadow.os, "killpg") as killpg,
+            mock.patch.object(shadow, "_process_group_exists", return_value=True),
+        ):
+            shadow._terminate_process_group(process, grace_seconds=0)
         self.assertEqual(
             killpg.call_args_list,
             [

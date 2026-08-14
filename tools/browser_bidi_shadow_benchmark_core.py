@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
-import ipaddress
 import json
 import os
 from pathlib import Path
@@ -51,15 +50,6 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _is_loopback_host(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def validate_loopback_ws_url(
     value: str, *, expected_session_id: str, expected_port: int
 ) -> str:
@@ -68,8 +58,7 @@ def validate_loopback_ws_url(
     parsed = urlsplit(value)
     if (
         parsed.scheme != "ws"
-        or not parsed.hostname
-        or not _is_loopback_host(parsed.hostname)
+        or parsed.hostname != "127.0.0.1"
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -321,8 +310,8 @@ class BidiJsonConnection:
         parsed = urlsplit(self.websocket_url)
         if parsed.scheme != "ws" or not parsed.hostname or parsed.port is None:
             raise BidiShadowError("BiDi WebSocket URL is invalid")
-        if not _is_loopback_host(parsed.hostname):
-            raise BidiShadowError("BiDi WebSocket host is not loopback")
+        if parsed.hostname != "127.0.0.1":
+            raise BidiShadowError("BiDi WebSocket host is not the bound IPv4 loopback")
         sock = socket.create_connection(
             (parsed.hostname, parsed.port), timeout=self.timeout_seconds
         )
@@ -627,25 +616,42 @@ def run_shadow_benchmark(
                 _terminate_process_group(process)
 
 
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _terminate_process_group(
     process: subprocess.Popen[Any], *, grace_seconds: float = 3.0
 ) -> None:
-    if process.poll() is not None:
-        return
+    process_group_id = process.pid
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
         return
+
+    deadline = time.monotonic() + grace_seconds
+    if process.poll() is None:
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+    while _process_group_exists(process_group_id) and time.monotonic() < deadline:
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    if not _process_group_exists(process_group_id):
+        return
+
     try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if process.poll() is None:
         process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    process.wait(timeout=grace_seconds)
 
 
 def failure_report(exc: BaseException) -> dict[str, Any]:
