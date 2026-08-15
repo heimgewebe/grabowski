@@ -2283,6 +2283,45 @@ globalThis.fetch = async () => ({
         run.assert_not_called()
         self.assertEqual(append_audit.call_count, 2)
 
+    def test_browser_semantic_gateway_legacy_worker_navigate_preserves_fresh_worker_diagnostic(self) -> None:
+        worker = self._running_browser(port=9378)
+        record = workers._row(worker["worker_id"])
+        key_path = Path(record["config_path"]).parent / ".semantic-handle-key"
+        key_path.unlink()
+        snapshot_id = workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64
+        navigation_target = "https://example.test/next?token=secret-value"
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic"
+        ) as run, patch.object(
+            workers.base, "_append_audit_with_digest", return_value="a" * 64
+        ) as append_audit:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=snapshot_id,
+                action_kind="navigate",
+                navigation_target=navigation_target,
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "fresh_worker_required")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertFalse(
+            outcome["retry_readback"]["authoritative_readback_required"]
+        )
+        require_mutation.assert_called_once_with("browser_worker")
+        run.assert_not_called()
+        self.assertEqual(append_audit.call_count, 1)
+        self.assertNotIn(navigation_target, repr(outcome))
+        self.assertNotIn("secret-value", repr(outcome))
+
     def test_browser_semantic_observe_bounds_and_redacts_element_projection(self) -> None:
         worker = self._running_browser(port=9360)
         raw_elements = [

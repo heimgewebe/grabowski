@@ -3498,20 +3498,47 @@ def browser_semantic_gateway(
         navigation_target=navigation_target,
     )
     effect_class = intent["effect_class"]
-    target_hmac_sha256 = (
-        _browser_navigation_target_digest(
-            identifier,
-            intent["navigation_target"],
-            _browser_semantic_handle_key(_row(identifier)),
-        )
-        if intent["navigation_target"] is not None
-        else None
-    )
+    target_hmac_sha256 = None
     effect_contract = BROWSER_EFFECT_CONTRACTS[effect_class]
     if effect_contract["admission"] == "implemented" and effect_contract[
         "requires_operator_mutation"
     ]:
         operator._require_operator_mutation("browser_worker")
+        try:
+            target_hmac_sha256 = (
+                _browser_navigation_target_digest(
+                    identifier,
+                    intent["navigation_target"],
+                    _browser_semantic_handle_key(_row(identifier)),
+                )
+                if intent["navigation_target"] is not None
+                else None
+            )
+        except _BrowserSemanticFreshWorkerRequired:
+            result = _browser_semantic_public_result(
+                semantic_operation="act",
+                worker_id=identifier,
+                intent=action_kind,
+                effect_class=effect_class,
+                ok=False,
+                result_code="fresh_worker_required",
+                effect_state="not_started",
+                requested_snapshot_id=snapshot_id,
+                requested_element_id=element_id,
+                pre_action_snapshot_id=None,
+                post_action_snapshot_id=None,
+                observation=None,
+                target_hmac_sha256=None,
+            )
+            result["audit"] = {
+                "intent": {
+                    "recorded": False,
+                    "result_code": "not_attempted",
+                    "record_sha256": None,
+                },
+                "outcome": _browser_semantic_append_audit(result, phase="outcome"),
+            }
+            return result
         intent_result = _browser_semantic_public_result(
             semantic_operation="act",
             worker_id=identifier,
