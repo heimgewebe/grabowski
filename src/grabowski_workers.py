@@ -2029,6 +2029,11 @@ BROWSER_EFFECT_CLASSES_IMPLEMENTED = frozenset(
 )
 BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
     "read_state": {"effect_class": "read", "requires_element": False},
+    "navigate": {
+        "effect_class": "local_ui",
+        "requires_element": False,
+        "requires_navigation_target": True,
+    },
     "scroll_into_view": {"effect_class": "local_ui", "requires_element": True},
 }
 BROWSER_SEMANTIC_GATEWAY_OPERATIONS = ("observe", "act")
@@ -2049,6 +2054,7 @@ BROWSER_SEMANTIC_RESULT_CODES = {
     "protocol",
     "target-discovery",
     "element-contract",
+    "navigation-error",
     "stale-snapshot",
     "unsupported-op",
 }
@@ -2059,6 +2065,9 @@ BROWSER_SEMANTIC_OUTCOME_CODES = {
     "target_unavailable",
     "element_contract",
     "fresh_worker_required",
+    "navigation_failed",
+    "observation_failed",
+    "outcome_unknown",
     "protocol",
 }
 _BROWSER_NODE_RESULT_TO_OUTCOME = {
@@ -2067,6 +2076,7 @@ _BROWSER_NODE_RESULT_TO_OUTCOME = {
     "protocol": "protocol",
     "unsupported-op": "protocol",
     "element-contract": "element_contract",
+    "navigation-error": "navigation_failed",
     "stale-snapshot": "stale_snapshot",
 }
 BROWSER_SEMANTIC_NODE_SOURCE = r"""
@@ -2262,6 +2272,14 @@ try {
   if (request.op === 'read_state') {
     const state = await readState();
     emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
+  } else if (request.op === 'navigate') {
+    const navigation = await call('Page.navigate', {url: request.navigation_target});
+    if (typeof navigation.errorText === 'string' && navigation.errorText.trim()) {
+      throw new Error('navigation-error');
+    }
+    // This is intentionally only a command ACK. The Python semantic layer must
+    // establish success through a separate, fresh readState roundtrip.
+    emit({schema_version: 1, ok: true, result_code: 'ok', state: null}, 0);
   } else if (request.op === 'scroll_into_view') {
     const before = await readState();
     if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
@@ -2301,7 +2319,7 @@ try {
     throw new Error('unsupported-op');
   }
 } catch (error) {
-  const code = ['transport', 'protocol', 'target-discovery', 'element-contract', 'stale-snapshot'].includes(error.message)
+  const code = ['transport', 'protocol', 'target-discovery', 'element-contract', 'navigation-error', 'stale-snapshot'].includes(error.message)
     ? error.message : 'protocol';
   emit({schema_version: 1, ok: false, result_code: code, state: null}, 1);
 }
@@ -2431,6 +2449,87 @@ def _bounded_browser_state(raw: dict[str, Any]) -> dict[str, Any]:
         "loader_id": str(raw.get("loader_id") or "")[:128],
         "elements": _bounded_browser_elements(raw.get("elements")),
     }
+
+
+class CDPAdapter:
+    """Internal browser-adapter boundary; no CDP vocabulary crosses it."""
+
+    def observe_state(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def perform_local_ui_effect(
+        self,
+        intent: dict[str, Any],
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, str],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def navigate(self, navigation_target: str) -> None:
+        raise NotImplementedError
+
+
+class ChromeCDPAdapter(CDPAdapter):
+    """Chrome-family CDP implementation of the private semantic adapter."""
+
+    def __init__(self, record: dict[str, Any], *, timeout_seconds: int) -> None:
+        self._record = record
+        self._timeout_seconds = timeout_seconds
+
+    def _run(self, request: dict[str, Any]) -> dict[str, Any]:
+        return _run_node_browser_semantic(
+            self._record,
+            {
+                "schema_version": 1,
+                "port": self._record["port"],
+                "timeout_ms": self._timeout_seconds * 1000,
+                **request,
+            },
+            timeout_seconds=self._timeout_seconds,
+        )
+
+    def observe_state(self) -> dict[str, Any]:
+        payload = self._run({"op": "read_state"})
+        if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
+            raise _BrowserSemanticError(payload.get("result_code") or "protocol")
+        return _bounded_browser_state(payload["state"])
+
+    def perform_local_ui_effect(
+        self,
+        intent: dict[str, Any],
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, str],
+    ) -> dict[str, Any]:
+        payload = self._run(
+            {
+                "op": intent["action_kind"],
+                "expected_state": expected_state,
+                "expected_element": expected_element,
+            }
+        )
+        if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
+            raise _BrowserSemanticError(payload.get("result_code") or "protocol")
+        return _bounded_browser_state(payload["state"])
+
+    def navigate(self, navigation_target: str) -> None:
+        payload = self._run(
+            {"op": "navigate", "navigation_target": navigation_target}
+        )
+        if payload["ok"] is not True:
+            raise _BrowserSemanticError(payload.get("result_code") or "protocol")
+        if payload.get("state") is not None:
+            raise RuntimeError("browser navigate ACK must not contain observation state")
+
+
+def _browser_semantic_adapter(
+    record: dict[str, Any], *, timeout_seconds: int
+) -> CDPAdapter:
+    adapter = _browser_adapter_policy(record["executable"], require_supported=False)
+    if adapter.get("adapter_id") not in _BROWSER_CDP_ADAPTER_IDS:
+        raise RuntimeError("browser worker has no implemented semantic adapter")
+    return ChromeCDPAdapter(record, timeout_seconds=timeout_seconds)
 
 
 def _browser_semantic_handle_key(record: dict[str, Any]) -> bytes:
@@ -2585,55 +2684,15 @@ def _browser_observation(
     }
 
 
-def _browser_observed_state(
-    record: dict[str, Any], *, timeout_seconds: int
-) -> dict[str, Any]:
-    payload = _run_node_browser_semantic(
-        record,
-        {
-            "schema_version": 1,
-            "port": record["port"],
-            "op": "read_state",
-            "timeout_ms": timeout_seconds * 1000,
-        },
-        timeout_seconds=timeout_seconds,
-    )
-    if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
-        raise _BrowserSemanticError(payload.get("result_code") or "protocol")
-    return _bounded_browser_state(payload["state"])
-
-
-def _browser_local_ui_effect(
-    record: dict[str, Any],
-    intent: dict[str, Any],
-    *,
-    expected_state: dict[str, Any],
-    expected_element: dict[str, str],
-    timeout_seconds: int,
-) -> dict[str, Any]:
-    payload = _run_node_browser_semantic(
-        record,
-        {
-            "schema_version": 1,
-            "port": record["port"],
-            "op": intent["action_kind"],
-            "expected_state": expected_state,
-            "expected_element": expected_element,
-            "timeout_ms": timeout_seconds * 1000,
-        },
-        timeout_seconds=timeout_seconds,
-    )
-    if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
-        raise _BrowserSemanticError(payload.get("result_code") or "protocol")
-    return _bounded_browser_state(payload["state"])
-
-
 def _browser_outcome_code_from_node(result_code: str) -> str:
     return _BROWSER_NODE_RESULT_TO_OUTCOME.get(result_code, "protocol")
 
 
 def _browser_intent(
-    action_kind: str, *, element_id: str | None
+    action_kind: str,
+    *,
+    element_id: str | None,
+    navigation_target: str | None,
 ) -> dict[str, Any]:
     """Internal BrowserIntent: abstract action kind, never a CDP method or selector."""
     if not isinstance(action_kind, str):
@@ -2648,12 +2707,43 @@ def _browser_intent(
             raise ValueError("element_id is not a recognized opaque browser element id")
     elif element_id is not None:
         raise ValueError(f"browser action {action_kind!r} does not accept an element_id")
+    if spec.get("requires_navigation_target") is True:
+        navigation_target = _validate_browser_navigation_target(navigation_target)
+    elif navigation_target is not None:
+        raise ValueError(
+            f"browser action {action_kind!r} does not accept a navigation_target"
+        )
     return {
         "schema_version": 1,
         "action_kind": action_kind,
         "effect_class": spec["effect_class"],
         "element_id": element_id,
+        "navigation_target": navigation_target,
     }
+
+
+def _validate_browser_navigation_target(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("navigate requires a navigation_target")
+    if len(value.encode("utf-8")) > 4096:
+        raise ValueError("navigation_target is too large")
+    if value != value.strip() or "\\" in value:
+        raise ValueError("navigation_target is not a conservative absolute URL")
+    if any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError("navigation_target contains whitespace or control characters")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        raise ValueError("navigation_target must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("navigation_target may not contain user information")
+    try:
+        port = parsed.port
+        parsed.hostname.encode("idna")
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("navigation_target authority is invalid") from exc
+    if port is not None and port == 0:
+        raise ValueError("navigation_target port is invalid")
+    return value
 
 
 def _browser_action(
@@ -2737,7 +2827,8 @@ def browser_semantic_observe(
     timeout_seconds = _validate_browser_semantic_timeout(timeout_seconds)
     record = _browser_semantic_preflight(identifier)
     handle_key = _browser_semantic_handle_key(record)
-    state = _browser_observed_state(record, timeout_seconds=timeout_seconds)
+    adapter = _browser_semantic_adapter(record, timeout_seconds=timeout_seconds)
+    state = adapter.observe_state()
     return _browser_observation(identifier, state, handle_key)
 
 
@@ -2747,6 +2838,7 @@ def browser_semantic_act(
     action_kind: str,
     *,
     element_id: str | None = None,
+    navigation_target: str | None = None,
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
     """Execute a state-bound BrowserAction and return an authoritative outcome.
@@ -2755,18 +2847,25 @@ def browser_semantic_act(
     additionally require an opaque element_id from that exact observation. A
     fresh semantic DOM observation must still match immediately before effect;
     the adapter then revalidates the internal node fingerprint once more.
+    Navigation accepts only a validated backend-neutral target and succeeds only
+    after a separate authoritative post-command observation.
     """
     identifier = _validate_worker_id(worker_id)
     if not _is_browser_snapshot_id(snapshot_id):
         raise ValueError("snapshot_id is not a recognized opaque browser snapshot id")
     timeout_seconds = _validate_browser_semantic_timeout(timeout_seconds)
-    intent = _browser_intent(action_kind, element_id=element_id)
+    intent = _browser_intent(
+        action_kind,
+        element_id=element_id,
+        navigation_target=navigation_target,
+    )
     record = _browser_semantic_preflight(identifier)
     handle_key = _browser_semantic_handle_key(record)
+    adapter = _browser_semantic_adapter(record, timeout_seconds=timeout_seconds)
     action = _browser_action(identifier, snapshot_id, intent)
 
     try:
-        fresh_state = _browser_observed_state(record, timeout_seconds=timeout_seconds)
+        fresh_state = adapter.observe_state()
     except _BrowserSemanticError as exc:
         return _browser_outcome(
             action,
@@ -2814,16 +2913,48 @@ def browser_semantic_act(
     if intent["action_kind"] == "read_state":
         post_state = fresh_state
         effect_state = "not_applicable"
+    elif intent["action_kind"] == "navigate":
+        command_error: _BrowserSemanticError | None = None
+        try:
+            adapter.navigate(intent["navigation_target"])
+        except _BrowserSemanticError as exc:
+            command_error = exc
+        try:
+            post_state = adapter.observe_state()
+        except _BrowserSemanticError:
+            return _browser_outcome(
+                action,
+                ok=False,
+                result_code=(
+                    "observation_failed" if command_error is None else "outcome_unknown"
+                ),
+                effect_state="unknown",
+                pre_observation=pre_observation,
+                post_observation=None,
+            )
+        post_observation = _browser_observation(identifier, post_state, handle_key)
+        if command_error is not None:
+            return _browser_outcome(
+                action,
+                ok=False,
+                result_code=(
+                    "navigation_failed"
+                    if command_error.result_code == "navigation-error"
+                    else "outcome_unknown"
+                ),
+                effect_state="unknown",
+                pre_observation=pre_observation,
+                post_observation=post_observation,
+            )
+        effect_state = "observed"
     else:
         if expected_element is None:
             raise RuntimeError("element-targeted browser action lost its element binding")
         try:
-            post_state = _browser_local_ui_effect(
-                record,
+            post_state = adapter.perform_local_ui_effect(
                 intent,
                 expected_state=fresh_state,
                 expected_element=expected_element,
-                timeout_seconds=timeout_seconds,
             )
         except _BrowserSemanticError as exc:
             return _browser_outcome(
@@ -2886,6 +3017,9 @@ def _browser_semantic_catalog() -> dict[str, Any]:
             action_kind: {
                 "effect_class": spec["effect_class"],
                 "requires_element": spec["requires_element"],
+                "requires_navigation_target": spec.get(
+                    "requires_navigation_target", False
+                ),
                 "admission": BROWSER_EFFECT_CONTRACTS[spec["effect_class"]][
                     "admission"
                 ],
@@ -3063,6 +3197,7 @@ def browser_semantic_gateway(
     snapshot_id: str | None = None,
     action_kind: str | None = None,
     element_id: str | None = None,
+    navigation_target: str | None = None,
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
     """Dispatch one bounded semantic operation with content-free audit records."""
@@ -3073,8 +3208,13 @@ def browser_semantic_gateway(
     operator._require_operator_capability("browser_worker")
 
     if operation == "observe":
-        if any(value is not None for value in (snapshot_id, action_kind, element_id)):
-            raise ValueError("observe does not accept snapshot, action or element handles")
+        if any(
+            value is not None
+            for value in (snapshot_id, action_kind, element_id, navigation_target)
+        ):
+            raise ValueError(
+                "observe does not accept snapshot, action, element or navigation targets"
+            )
         try:
             observation = browser_semantic_observe(
                 identifier, timeout_seconds=timeout_seconds
@@ -3154,7 +3294,11 @@ def browser_semantic_gateway(
         raise ValueError("act requires snapshot_id and action_kind")
     if not _is_browser_snapshot_id(snapshot_id):
         raise ValueError("snapshot_id is not a recognized opaque browser snapshot id")
-    intent = _browser_intent(action_kind, element_id=element_id)
+    intent = _browser_intent(
+        action_kind,
+        element_id=element_id,
+        navigation_target=navigation_target,
+    )
     effect_class = intent["effect_class"]
     effect_contract = BROWSER_EFFECT_CONTRACTS[effect_class]
     if effect_contract["admission"] == "implemented" and effect_contract[
@@ -3198,6 +3342,7 @@ def browser_semantic_gateway(
             snapshot_id,
             action_kind,
             element_id=element_id,
+            navigation_target=navigation_target,
             timeout_seconds=timeout_seconds,
         )
     except _BrowserSemanticFreshWorkerRequired:
@@ -3792,15 +3937,17 @@ def grabowski_browser_worker_semantic(
     snapshot_id: str | None = None,
     action_kind: str | None = None,
     element_id: str | None = None,
+    navigation_target: str | None = None,
     timeout_seconds: int = 10,
 ) -> dict[str, Any]:
     """Observe or act through semantic snapshot and element handles only.
 
     ``operation`` is either ``observe`` or ``act``. Element observations expose
-    only opaque element ids plus bounded Accessibility roles and names; origins,
-    titles, selectors, browser backend identifiers and protocol method names stay
-    private. Effect class and retry/readback authority come from the server-owned
-    semantic catalog.
+    only opaque element ids plus bounded Accessibility roles and names. Navigate
+    accepts one conservatively validated ``navigation_target`` but never echoes it
+    into the outcome or audit. Origins, titles, selectors, browser backend
+    identifiers and protocol method names stay private. Effect class and
+    retry/readback authority come from the server-owned semantic catalog.
     """
     operator._require_operator_capability("browser_worker")
     return browser_semantic_gateway(
@@ -3809,6 +3956,7 @@ def grabowski_browser_worker_semantic(
         snapshot_id=snapshot_id,
         action_kind=action_kind,
         element_id=element_id,
+        navigation_target=navigation_target,
         timeout_seconds=timeout_seconds,
     )
 

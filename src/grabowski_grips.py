@@ -915,8 +915,9 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     ),
     "browser-semantic-act": (
         "the operation is fixed to act; effect_class remains server-owned and cannot be supplied by the caller",
-        "element_id and timeout_seconds are optional; snapshot and element validity remain exclusively "
-        "the canonical browser_semantic_gateway contract",
+        "element_id, navigation_target and timeout_seconds are optional at the adapter boundary; intent-specific "
+        "requirements plus snapshot, target and element validity remain exclusively the canonical "
+        "browser_semantic_gateway contract",
     ),
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
@@ -3326,7 +3327,14 @@ def _run_bureau_pickup_orphan_reconcile(
 
 _BROWSER_SEMANTIC_OBSERVE_FIELDS = frozenset({"worker_id", "timeout_seconds"})
 _BROWSER_SEMANTIC_ACT_FIELDS = frozenset(
-    {"worker_id", "snapshot_id", "action_kind", "element_id", "timeout_seconds"}
+    {
+        "worker_id",
+        "snapshot_id",
+        "action_kind",
+        "element_id",
+        "navigation_target",
+        "timeout_seconds",
+    }
 )
 
 
@@ -3352,6 +3360,8 @@ def _browser_semantic_gateway_call(
         kwargs["action_kind"] = parameters["action_kind"]
         if "element_id" in parameters:
             kwargs["element_id"] = parameters["element_id"]
+        if "navigation_target" in parameters:
+            kwargs["navigation_target"] = parameters["navigation_target"]
     output = workers.browser_semantic_gateway(
         parameters["worker_id"], operation, **kwargs
     )

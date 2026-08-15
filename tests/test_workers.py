@@ -2360,10 +2360,188 @@ globalThis.fetch = async () => ({
         self.assertEqual(outcome["post_action_snapshot_id"], snapshot_id)
         run.assert_called_once()
 
+    def test_browser_semantic_navigate_requires_a_conservative_target(self) -> None:
+        snapshot_id = workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64
+        invalid_targets = (
+            None,
+            "",
+            " example.com",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://user:password@example.invalid/private",
+            "https://example.invalid/path\nnext",
+            "https://example.invalid:0/",
+        )
+        for target in invalid_targets:
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                workers.browser_semantic_act(
+                    "0" * 20,
+                    snapshot_id,
+                    "navigate",
+                    navigation_target=target,
+                )
+
+    def test_browser_semantic_adapter_selects_chrome_cdp_boundary(self) -> None:
+        worker = self._running_browser(port=9382)
+        record = workers._row(worker["worker_id"])
+
+        adapter = workers._browser_semantic_adapter(record, timeout_seconds=10)
+
+        self.assertIsInstance(adapter, workers.CDPAdapter)
+        self.assertIsInstance(adapter, workers.ChromeCDPAdapter)
+
+    def test_browser_semantic_navigate_uses_adapter_ack_then_fresh_readback(self) -> None:
+        worker = self._running_browser(port=9378)
+        before = self._semantic_state_payload(title="Before", loader_id="loader-before")
+        after = self._semantic_state_payload(
+            origin="https://example.invalid",
+            title="After",
+            loader_id="loader-after",
+        )
+        navigate_ack = {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "ok",
+            "state": None,
+        }
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers,
+            "_run_node_browser_semantic",
+            side_effect=[before, navigate_ack, after],
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "navigate",
+                navigation_target="https://example.invalid/path?view=semantic",
+            )
+
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "ok")
+        self.assertEqual(outcome["effect_class"], "local_ui")
+        self.assertEqual(outcome["effect_state"], "observed")
+        self.assertEqual(outcome["pre_action_snapshot_id"], observation["snapshot_id"])
+        self.assertNotEqual(
+            outcome["post_action_snapshot_id"], observation["snapshot_id"]
+        )
+        self.assertEqual(
+            outcome["post_action_snapshot_id"], outcome["observation"]["snapshot_id"]
+        )
+        self.assertEqual(
+            [call.args[1]["op"] for call in run.call_args_list],
+            ["read_state", "navigate", "read_state"],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[1]["navigation_target"],
+            "https://example.invalid/path?view=semantic",
+        )
+        self.assertNotIn("navigation_target", json.dumps(outcome, sort_keys=True))
+
+    def test_browser_semantic_navigate_ack_without_readback_fails_closed(self) -> None:
+        worker = self._running_browser(port=9379)
+        before = self._semantic_state_payload(title="Before")
+        navigate_ack = {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "ok",
+            "state": None,
+        }
+        observation_failure = {
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "transport",
+            "state": None,
+        }
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers,
+            "_run_node_browser_semantic",
+            side_effect=[before, navigate_ack, observation_failure],
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "navigate",
+                navigation_target="https://example.invalid/",
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "observation_failed")
+        self.assertEqual(outcome["effect_state"], "unknown")
+        self.assertIsNone(outcome["post_action_snapshot_id"])
+        self.assertEqual(outcome["observation"]["snapshot_id"], observation["snapshot_id"])
+        self.assertEqual(run.call_count, 3)
+
+    def test_browser_semantic_navigate_error_text_is_unknown_with_fresh_readback(self) -> None:
+        worker = self._running_browser(port=9380)
+        before = self._semantic_state_payload(title="Before")
+        after = self._semantic_state_payload(title="Observed after failure")
+        navigation_error = {
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "navigation-error",
+            "state": None,
+        }
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers,
+            "_run_node_browser_semantic",
+            side_effect=[before, navigation_error, after],
+        ):
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "navigate",
+                navigation_target="https://example.invalid/",
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "navigation_failed")
+        self.assertEqual(outcome["effect_state"], "unknown")
+        self.assertIsNotNone(outcome["post_action_snapshot_id"])
+        self.assertEqual(
+            outcome["post_action_snapshot_id"], outcome["observation"]["snapshot_id"]
+        )
+
+    def test_browser_semantic_node_navigate_uses_page_navigate_and_error_text(self) -> None:
+        source = workers.BROWSER_SEMANTIC_NODE_SOURCE
+        self.assertIn("await call('Page.navigate'", source)
+        self.assertIn("request.navigation_target", source)
+        self.assertIn("navigation.errorText", source)
+        self.assertNotIn("location.assign", source)
+        self.assertNotIn("window.location", source)
+
     def test_browser_semantic_act_rejects_unsupported_action_kind(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported browser action kind"):
             workers.browser_semantic_act(
-                "0" * 20, workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64, "navigate"
+                "0" * 20,
+                workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64,
+                "not_supported",
             )
 
     def test_browser_semantic_act_fails_closed_for_unimplemented_effect_classes(self) -> None:
@@ -2447,6 +2625,10 @@ globalThis.fetch = async () => ({
         )
         require_capability.assert_called_with("browser_worker")
         require_mutation.assert_not_called()
+        self.assertTrue(
+            result_payload["semantic_catalog"]["intents"]["navigate"]
+            ["requires_navigation_target"]
+        )
         for effect_class in (
             "reversible_external",
             "external_mutation",
@@ -2548,6 +2730,69 @@ globalThis.fetch = async () => ({
         )
         self.assertEqual(outcome["audit"]["intent"]["record_sha256"], "a" * 64)
         self.assertEqual(outcome["audit"]["outcome"]["record_sha256"], "b" * 64)
+
+    def test_browser_semantic_gateway_navigate_redacts_target_and_requires_readback(self) -> None:
+        worker = self._running_browser(port=9381)
+        before = self._semantic_state_payload(title="Before", loader_id="loader-before")
+        after = self._semantic_state_payload(title="After", loader_id="loader-after")
+        navigate_ack = {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "ok",
+            "state": None,
+        }
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        navigation_target = "https://example.invalid/private?token=must-not-leak"
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers,
+            "_run_node_browser_semantic",
+            side_effect=[before, navigate_ack, after],
+        ), patch.object(
+            workers.base,
+            "_append_audit_with_digest",
+            side_effect=["a" * 64, "b" * 64],
+        ) as append_audit:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=observation["snapshot_id"],
+                action_kind="navigate",
+                navigation_target=navigation_target,
+            )
+
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["intent"], "navigate")
+        self.assertEqual(outcome["effect_class"], "local_ui")
+        self.assertEqual(
+            outcome["retry_readback"]["authoritative_readback_state"],
+            "authoritative_post_action_observation",
+        )
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertFalse(outcome["retry_readback"]["readback_grants_retry_authority"])
+        self.assertEqual(
+            outcome["observation"]["snapshot_id"], outcome["post_action_snapshot_id"]
+        )
+        require_mutation.assert_called_once_with("browser_worker")
+        rendered = json.dumps(outcome, sort_keys=True)
+        audit_rendered = json.dumps(
+            [call.args[0] for call in append_audit.call_args_list], sort_keys=True
+        )
+        self.assertNotIn(navigation_target, rendered)
+        self.assertNotIn("must-not-leak", rendered)
+        self.assertNotIn(navigation_target, audit_rendered)
+        self.assertNotIn("must-not-leak", audit_rendered)
 
     def test_browser_semantic_gateway_stale_snapshot_returns_fresh_safe_handles(self) -> None:
         worker = self._running_browser(port=9372)

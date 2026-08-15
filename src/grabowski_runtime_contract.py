@@ -504,10 +504,10 @@ def _validate_browser_operator_default(value: Any) -> None:
             label=f"{semantic_label}.supported_intents",
             maximum=8,
         )
-        if supported_intents != ["read_state", "scroll_into_view"]:
+        if supported_intents != ["read_state", "navigate", "scroll_into_view"]:
             _fail(
                 f"{semantic_label}.supported_intents must be "
-                "['read_state', 'scroll_into_view']"
+                "['read_state', 'navigate', 'scroll_into_view']"
             )
         uncovered_intents = _require_mapping(
             semantic["uncovered_intents"],
@@ -516,27 +516,20 @@ def _validate_browser_operator_default(value: Any) -> None:
         _require_exact_keys(
             uncovered_intents,
             label=f"{semantic_label}.uncovered_intents",
-            required=("navigate",),
+            required=(),
         )
-        navigate_route = _require_text(
-            uncovered_intents["navigate"],
-            label=f"{semantic_label}.uncovered_intents.navigate",
-            maximum=64,
-        )
-        if navigate_route != "direct-cdp-required":
-            _fail(
-                f"{semantic_label}.uncovered_intents.navigate must remain "
-                "'direct-cdp-required'"
-            )
         public_target_contract = _require_text(
             semantic["public_target_contract"],
             label=f"{semantic_label}.public_target_contract",
             maximum=200,
         )
-        if public_target_contract != "opaque-snapshot-and-element-handles":
+        if (
+            public_target_contract
+            != "opaque-handles-and-validated-navigation-targets"
+        ):
             _fail(
                 f"{semantic_label}.public_target_contract must expose only opaque "
-                "snapshot and element handles"
+                "handles and validated navigation targets"
             )
         implemented = _require_list(
             semantic["implemented_effect_classes"],
