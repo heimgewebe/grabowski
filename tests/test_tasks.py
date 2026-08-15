@@ -2301,6 +2301,68 @@ class TaskTests(unittest.TestCase):
                     chronik_outbox_state_root=str(self.root / "chronik-state"),
                 )
 
+    def test_bad_setting_running_task_projects_degraded_unit_health(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        probe = _launcher()
+        probe["stdout"] = (
+            "LoadState=bad-setting\n"
+            "ActiveState=active\n"
+            "SubState=running\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        with patch.object(tasks, "_dispatch", return_value=probe):
+            status = tasks.grabowski_task_status(task_id)
+
+        self.assertEqual(status["state"], "running")
+        self.assertEqual(status["systemd_unit_health"]["status"], "degraded")
+        self.assertEqual(
+            status["systemd_unit_health"]["reason"],
+            "systemd_load_state_bad_setting",
+        )
+        self.assertEqual(status["systemd_unit_health"]["load_state"], "bad-setting")
+
+        listed = tasks.grabowski_task_list(state="active", view="standard")
+        listed_task = next(item for item in listed["tasks"] if item["task_id"] == task_id)
+        self.assertEqual(listed_task["systemd_unit_health"]["status"], "degraded")
+        self.assertIn("degraded systemd unit", listed_task["recommended_next_action"])
+        self.assertIn(
+            {
+                "code": "task_systemd_unit_degraded",
+                "task_id": task_id,
+                "state": "running",
+                "reason": "systemd_load_state_bad_setting",
+                "load_state": "bad-setting",
+            },
+            listed["warnings"],
+        )
+
+        stale_observation = dict(status["last_observation"])
+        stale_properties = dict(stale_observation["properties"])
+        stale_properties["LoadState"] = "loaded"
+        stale_observation["properties"] = stale_properties
+        stale_observation["observed_at_unix"] = (
+            tasks._now() - tasks.TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS - 1
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET last_observation_json=? WHERE task_id=?",
+                (json.dumps(stale_observation, sort_keys=True), task_id),
+            )
+            connection.commit()
+
+        stale_listed = tasks.grabowski_task_list(state="active", view="standard")
+        stale_task = next(
+            item for item in stale_listed["tasks"] if item["task_id"] == task_id
+        )
+        self.assertEqual(stale_task["systemd_unit_health"]["status"], "unknown")
+        self.assertEqual(
+            stale_task["systemd_unit_health"]["reason"],
+            "stale_or_invalid_systemd_observation",
+        )
+
     def test_collected_success_unit_maps_to_completed_not_unknown(self) -> None:
         started = self._start()
         task_id = started["task"]["task_id"]

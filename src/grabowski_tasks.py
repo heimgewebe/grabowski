@@ -5546,7 +5546,57 @@ def _row(task_id: str) -> dict[str, Any]:
     recovered = _recover_task_terminalization(identifier)
     return recovered if recovered is not None else _row_raw(identifier)
 
+def _task_systemd_unit_health(
+    state: str,
+    observation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if state not in TASK_STATE_PROJECTIONS["active"]:
+        return {"status": "not_applicable"}
+    if not isinstance(observation, dict):
+        return {"status": "unknown", "reason": "missing_observation"}
+    properties = observation.get("properties")
+    if not isinstance(properties, dict):
+        return {"status": "unknown", "reason": "missing_systemd_properties"}
+    observed_at = observation.get("observed_at_unix")
+    now = _now()
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at < 0
+        or not 0 <= now - observed_at <= TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS
+    ):
+        return {
+            "status": "unknown",
+            "reason": "stale_or_invalid_systemd_observation",
+            "observed_at_unix": observed_at,
+        }
+    load_state = properties.get("LoadState")
+    health = {
+        "load_state": load_state,
+        "active_state": properties.get("ActiveState"),
+        "sub_state": properties.get("SubState"),
+    }
+    if load_state == "bad-setting":
+        return {
+            "status": "degraded",
+            "reason": "systemd_load_state_bad_setting",
+            **health,
+            "does_not_establish": [
+                "task_process_inactive",
+                "task_outcome_failure",
+            ],
+        }
+    if load_state == "loaded":
+        return {"status": "nominal", **health}
+    return {"status": "unknown", "reason": "unexpected_systemd_load_state", **health}
+
+
 def _public(record: dict[str, Any]) -> dict[str, Any]:
+    last_observation = (
+        json.loads(record["last_observation_json"])
+        if record["last_observation_json"]
+        else None
+    )
     return {
         "task_id": record["task_id"],
         "host": record["host"],
@@ -5567,10 +5617,9 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "created_at_unix": record["created_at_unix"],
         "updated_at_unix": record["updated_at_unix"],
         "launcher": json.loads(record["launcher_json"]),
-        "last_observation": (
-            json.loads(record["last_observation_json"])
-            if record["last_observation_json"]
-            else None
+        "last_observation": last_observation,
+        "systemd_unit_health": _task_systemd_unit_health(
+            str(record["state"]), last_observation
         ),
         "resource_keys": _record_resource_keys(record),
         "lease_owner_id": record.get("lease_owner_id"),
@@ -6041,7 +6090,20 @@ def _task_list_current_rows(
     return selected
 
 
-def _task_recommended_next_action(state: str) -> str:
+def _task_recommended_next_action(
+    state: str,
+    *,
+    systemd_unit_health: dict[str, Any] | None = None,
+) -> str:
+    if (
+        state in {"launching", "running"}
+        and isinstance(systemd_unit_health, dict)
+        and systemd_unit_health.get("status") == "degraded"
+    ):
+        return (
+            "inspect degraded systemd unit configuration before relying on "
+            "active task continuity"
+        )
     if state in {"launching", "running"}:
         return "read grabowski_task_status before deciding the next action"
     if state == "interrupted":
@@ -6075,7 +6137,10 @@ def _public_for_view(record: dict[str, Any], view: str) -> dict[str, Any]:
         "created_at_unix": full["created_at_unix"],
         "updated_at_unix": full["updated_at_unix"],
         "resource_keys": full["resource_keys"],
-        "recommended_next_action": _task_recommended_next_action(full["state"]),
+        "systemd_unit_health": full["systemd_unit_health"],
+        "recommended_next_action": _task_recommended_next_action(
+            full["state"], systemd_unit_health=full["systemd_unit_health"]
+        ),
     }
     if view == "standard":
         minimal.update({
@@ -10037,6 +10102,18 @@ def grabowski_task_list(
             if task.get("state") in warning_states
             and task.get("task_id") not in attention_excluded_task_ids
         )
+    warnings.extend(
+        {
+            "code": "task_systemd_unit_degraded",
+            "task_id": task["task_id"],
+            "state": task["state"],
+            "reason": task["systemd_unit_health"].get("reason"),
+            "load_state": task["systemd_unit_health"].get("load_state"),
+        }
+        for task in tasks
+        if isinstance(task.get("systemd_unit_health"), dict)
+        and task["systemd_unit_health"].get("status") == "degraded"
+    )
     payload: dict[str, Any] = {
         "schema_version": 2,
         "view": selected_view,
