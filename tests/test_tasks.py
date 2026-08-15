@@ -2339,6 +2339,30 @@ class TaskTests(unittest.TestCase):
             listed["warnings"],
         )
 
+        stale_observation = dict(status["last_observation"])
+        stale_properties = dict(stale_observation["properties"])
+        stale_properties["LoadState"] = "loaded"
+        stale_observation["properties"] = stale_properties
+        stale_observation["observed_at_unix"] = (
+            tasks._now() - tasks.TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS - 1
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET last_observation_json=? WHERE task_id=?",
+                (json.dumps(stale_observation, sort_keys=True), task_id),
+            )
+            connection.commit()
+
+        stale_listed = tasks.grabowski_task_list(state="active", view="standard")
+        stale_task = next(
+            item for item in stale_listed["tasks"] if item["task_id"] == task_id
+        )
+        self.assertEqual(stale_task["systemd_unit_health"]["status"], "unknown")
+        self.assertEqual(
+            stale_task["systemd_unit_health"]["reason"],
+            "stale_or_invalid_systemd_observation",
+        )
+
     def test_collected_success_unit_maps_to_completed_not_unknown(self) -> None:
         started = self._start()
         task_id = started["task"]["task_id"]

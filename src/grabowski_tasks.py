@@ -5557,6 +5557,19 @@ def _task_systemd_unit_health(
     properties = observation.get("properties")
     if not isinstance(properties, dict):
         return {"status": "unknown", "reason": "missing_systemd_properties"}
+    observed_at = observation.get("observed_at_unix")
+    now = _now()
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at < 0
+        or not 0 <= now - observed_at <= TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS
+    ):
+        return {
+            "status": "unknown",
+            "reason": "stale_or_invalid_systemd_observation",
+            "observed_at_unix": observed_at,
+        }
     load_state = properties.get("LoadState")
     health = {
         "load_state": load_state,
