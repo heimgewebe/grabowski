@@ -1370,7 +1370,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_agent_execution_route": {
             "category": "agent-workspace",
-            "purpose": "Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates.",
+            "purpose": "Expose the legacy execution-routing adapter over canonical controller or lane-scoped-writer routing, with optional advisory contrast candidates.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
