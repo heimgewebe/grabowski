@@ -2200,6 +2200,54 @@ class DeploymentAdmissionTests(unittest.TestCase):
                 dual.release_operator_deployment_admission(marker)
                 self.assertFalse(marker_path.exists())
 
+    def test_marker_accepts_explicit_scheduler_source_identity(self) -> None:
+        snapshot = SimpleNamespace(
+            repo_head="a" * 40,
+            contract_sha256="b" * 64,
+            runtime_input_sha256="c" * 64,
+            runtime_lock_sha256="d" * 64,
+            source_sha256s={"grabowski_operator": "e" * 64},
+            runtime_asset_sha256s={},
+        )
+        scheduler_source_identity = "1" * 64
+        self.assertNotEqual(
+            scheduler_source_identity,
+            dual._deployment_source_identity_sha256(snapshot),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            marker_path = Path(directory) / "deployment-admission-drain.json"
+            with (
+                mock.patch.object(dual, "OPERATOR_ADMISSION_MARKER_PATH", marker_path),
+                mock.patch.object(dual.time, "time", return_value=100),
+                mock.patch.object(dual.secrets, "token_hex", return_value="f" * 64),
+                mock.patch.object(dual, "_activate_runtime_deploy_observer"),
+            ):
+                marker = dual.engage_operator_deployment_admission(
+                    snapshot,
+                    timeout_seconds=40,
+                    source_identity_sha256=scheduler_source_identity,
+                )
+                self.assertEqual(
+                    scheduler_source_identity, marker["source_identity_sha256"]
+                )
+                self.assertEqual(marker, json.loads(marker_path.read_text()))
+                dual.release_operator_deployment_admission(marker)
+
+    def test_invalid_explicit_source_identity_fails_before_marker_state_read(self) -> None:
+        snapshot = SimpleNamespace(repo_head="a" * 40)
+        with (
+            mock.patch.object(dual, "_secure_admission_marker_payload") as read_marker,
+            mock.patch.object(dual, "release_operator_deployment_admission") as release_marker,
+        ):
+            with self.assertRaisesRegex(ValueError, "lowercase SHA-256"):
+                dual.engage_operator_deployment_admission(
+                    snapshot,
+                    timeout_seconds=40,
+                    source_identity_sha256="invalid",
+                )
+        read_marker.assert_not_called()
+        release_marker.assert_not_called()
+
     def test_marker_release_rejects_absence_after_publication(self) -> None:
         marker = self.marker()
         with tempfile.TemporaryDirectory() as directory:
