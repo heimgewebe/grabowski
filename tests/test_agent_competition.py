@@ -139,6 +139,11 @@ class AgentCompetitionTests(unittest.TestCase):
             mock.patch.object(competition.operator, "_require_operator_capability"),
             mock.patch.object(competition.shutil, "which", side_effect=lambda provider: f"/usr/bin/{provider}"),
             mock.patch.object(
+                competition.coding_router,
+                "canonical_execution_route",
+                side_effect=self._canonical_execution_route,
+            ),
+            mock.patch.object(
                 competition,
                 "_workspace_route_shadow_calibration",
                 return_value={
@@ -157,6 +162,28 @@ class AgentCompetitionTests(unittest.TestCase):
         for patcher in reversed(self.patchers):
             patcher.stop()
         self.temporary.cleanup()
+
+    def _canonical_execution_route(self, task_class: str, **kwargs: object) -> dict:
+        verification_policy = str(kwargs.get("verification_policy", "deterministic"))
+        body = {
+            "routing_contract_version": "agent-execution-fabric-routing-v1",
+            "executor": "scoped_writer",
+            "writer_route": "codex-sol-high",
+            "effect_profile": "candidate",
+            "verification_policy": verification_policy,
+            "risk": {
+                "flags": list(kwargs.get("risk_flags", [])),
+                "novelty": kwargs.get("novelty", "medium"),
+                "critical_task_class": False,
+            },
+            "integration_owner": "controller",
+            "direct_implementation_required": False,
+            "delegated_scoped_writers_allowed": True,
+            "external_primary_writer_forbidden": False,
+            "controller_integration_required": True,
+        }
+        body["recommendation_sha256"] = competition._sha256_json(body)
+        return body
 
 
     def _route_selection(self, *, max_candidates: int, allow_paid: bool) -> dict:
@@ -567,8 +594,19 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(competitive["risk_tier"], "R3")
         self.assertEqual(competitive["route_policy_version"], "direct-first-routing-v3.0")
         self.assertFalse(competitive["automatic_winner_selection"])
-        self.assertTrue(competitive["direct_implementation_required"])
-        self.assertTrue(competitive["external_primary_writer_forbidden"])
+        self.assertFalse(competitive["direct_implementation_required"])
+        self.assertFalse(competitive["external_primary_writer_forbidden"])
+        self.assertTrue(competitive["delegated_scoped_writers_allowed"])
+        self.assertTrue(competitive["controller_integration_required"])
+        self.assertEqual(competitive["executor"], "scoped_writer")
+        self.assertEqual(competitive["writer_route"], "codex-sol-high")
+        self.assertEqual(competitive["effect_profile"], "candidate")
+        self.assertEqual(competitive["verification_policy"], "competition")
+        self.assertTrue(competitive["execution_mode_deprecated"])
+        self.assertEqual(
+            competitive["execution_mode_scope"],
+            "legacy_workspace_contrast_shape_only_not_executor_authority",
+        )
         self.assertFalse(competitive["full_workspace"])
         self.assertEqual(len(competitive["external_candidates"]), 2)
         self.assertEqual(
@@ -661,8 +699,10 @@ class AgentCompetitionTests(unittest.TestCase):
             )
         self.assertEqual(contrast["execution_mode"], "direct_operator")
         self.assertEqual(len(contrast["external_candidates"]), 1)
+        self.assertEqual(contrast["verification_policy"], "competition")
         self.assertEqual(competition_route["execution_mode"], "direct_operator")
         self.assertEqual(len(competition_route["external_candidates"]), 2)
+        self.assertEqual(competition_route["verification_policy"], "competition")
 
     def test_parallelization_candidate_does_not_authorize_or_change_live_route(self) -> None:
         kwargs = dict(
