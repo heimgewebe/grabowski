@@ -246,6 +246,10 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
             "opaque-handles-and-validated-navigation-targets",
         )
         self.assertEqual(
+            browser["semantic_gateway"]["implemented_effect_classes"],
+            ["read", "local_ui", "network_navigation"],
+        )
+        self.assertEqual(
             browser["semantic_gateway"]["fail_closed_effect_classes"],
             ["reversible_external", "external_mutation", "high_impact"],
         )

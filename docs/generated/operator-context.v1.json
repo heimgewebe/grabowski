@@ -54,7 +54,8 @@
       ],
       "implemented_effect_classes": [
         "read",
-        "local_ui"
+        "local_ui",
+        "network_navigation"
       ],
       "operations": [
         "observe",
@@ -2173,13 +2174,14 @@
       "effects": [
         "audit-create",
         "browser-read",
-        "browser-local-ui"
+        "browser-local-ui",
+        "browser-network-navigation"
       ],
       "id": "grabowski_browser_worker_semantic",
-      "purpose": "Observe or act through snapshot-bound semantic browser handles with bounded Accessibility labels and no raw browser locators.",
+      "purpose": "Observe or act through snapshot-bound semantic browser handles, including explicitly audited network navigation, with bounded Accessibility labels and no raw browser locators.",
       "read_only": false,
-      "reversibility": "read-not-applicable; local-ui-state-dependent",
-      "risk_class": "medium",
+      "reversibility": "read-not-applicable; local-ui-and-network-navigation-state-dependent",
+      "risk_class": "high",
       "tool": "grabowski_browser_worker_semantic"
     },
     {
@@ -3460,7 +3462,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "f38a272d9ad8bca2565e9c6444b99da8e85ede919f9d4271f3e5b4bfd2f71d21"
+      "sha256": "2c0f83d283c064d06b2613a662a6d23e589699082381288431163aaa4b2322fc"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3468,7 +3470,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "5abfc481d34a114aff48e8b614052b05884b119563cd31e3ccd41f148852df1e"
+      "sha256": "368227a78cc845bdc667e0965cca7e572c5aeea045e3ffb12723c3b31c1a4e5a"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3490,7 +3492,7 @@
       "src/grabowski_bureau_launcher_contract.py": "091908c70502dddd0bbe5582a3412b30cd92f5736801f76279bfd061ad141435",
       "src/grabowski_bureau_leases.py": "25965a1d91d8386103b8da033a09488005e943b5b575579a9722ce7e580fc378",
       "src/grabowski_bureau_pickup.py": "da5e5ebad67fc3a82318a6c6acb217c94b63868bcb7b11b221354a20cac1c7cb",
-      "src/grabowski_capabilities.py": "f38a272d9ad8bca2565e9c6444b99da8e85ede919f9d4271f3e5b4bfd2f71d21",
+      "src/grabowski_capabilities.py": "2c0f83d283c064d06b2613a662a6d23e589699082381288431163aaa4b2322fc",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "74845b418561c79196ae7a98ab9e16d1d2e2509b6b037fd1e0381bc64a8b3257",
@@ -3557,7 +3559,7 @@
       "src/grabowski_reposkop_shadow.py": "257933f6dec5e9877b3fbf5186d7ad3756f313f8313d22cf90a30e9011b1cfab",
       "src/grabowski_resources.py": "ae6ba89c29104078387a64fe76284f955d7cc10f7e5ab533f4b997142dd0628d",
       "src/grabowski_runtime.py": "4b9100b1424b89950c16b57f733afa5f618204baa5ace44048a7643ab358cf9a",
-      "src/grabowski_runtime_contract.py": "ada09934a8da0181e16d7a97984b86200de7543575c5213ae1ac7e3119e13c29",
+      "src/grabowski_runtime_contract.py": "50b602e64c5fe884c2d73b76e769dde0dc157fe25f7bd8645a78979b2962a48b",
       "src/grabowski_runtime_extensions.py": "e618a435abf1f07d5b7a00d07dc59fc8fb844e1ddd52dfa7f025a0d754a66ef8",
       "src/grabowski_self_deploy.py": "7279f5f72a84457878ce51032c5ad69e841f351d3382eb45cd501384e109d671",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",
@@ -3574,7 +3576,7 @@
       "src/grabowski_work_acquire.py": "f630eafc26a70dcd523140792baeecefe316eaa598dc70564f4621237128f1b1",
       "src/grabowski_work_admission.py": "adf3d330a95f64381589f5d48261faeb49fe7001639f43305ed918bcbe133c6a",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
-      "src/grabowski_workers.py": "d40a90eeee42216e650ef918001a8d384653842ebcc0b42741b0202188c53937",
+      "src/grabowski_workers.py": "1782070b8e32674cb41e38aa0c17dd909e471523a6ea6c5f694924e32a5a4ad8",
       "src/grabowski_worktree_ensure.py": "bd6c477a1faf409fa094424329744dc30f8e96d56aa909927dde1d91a3e211a1"
     }
   }

@@ -1034,10 +1034,15 @@ TOOL_PROFILES.update(
         },
         "grabowski_browser_worker_semantic": {
             "category": "browser-worker",
-            "purpose": "Observe or act through snapshot-bound semantic browser handles with bounded Accessibility labels and no raw browser locators.",
-            "risk_class": "medium",
-            "effects": ["audit-create", "browser-read", "browser-local-ui"],
-            "reversibility": "read-not-applicable; local-ui-state-dependent",
+            "purpose": "Observe or act through snapshot-bound semantic browser handles, including explicitly audited network navigation, with bounded Accessibility labels and no raw browser locators.",
+            "risk_class": "high",
+            "effects": [
+                "audit-create",
+                "browser-read",
+                "browser-local-ui",
+                "browser-network-navigation",
+            ],
+            "reversibility": "read-not-applicable; local-ui-and-network-navigation-state-dependent",
         },
         "grabowski_browser_worker_status": {
             "category": "browser-worker",

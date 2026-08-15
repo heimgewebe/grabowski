@@ -536,10 +536,10 @@ def _validate_browser_operator_default(value: Any) -> None:
             label=f"{semantic_label}.implemented_effect_classes",
             maximum=8,
         )
-        if implemented != ["read", "local_ui"]:
+        if implemented != ["read", "local_ui", "network_navigation"]:
             _fail(
                 f"{semantic_label}.implemented_effect_classes must remain "
-                "['read', 'local_ui']"
+                "['read', 'local_ui', 'network_navigation']"
             )
         fail_closed = _require_list(
             semantic["fail_closed_effect_classes"],

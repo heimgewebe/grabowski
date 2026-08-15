@@ -699,7 +699,8 @@
       "public_target_contract": "opaque-handles-and-validated-navigation-targets",
       "implemented_effect_classes": [
         "read",
-        "local_ui"
+        "local_ui",
+        "network_navigation"
       ],
       "fail_closed_effect_classes": [
         "reversible_external",

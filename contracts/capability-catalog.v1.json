@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "f38a272d9ad8bca2565e9c6444b99da8e85ede919f9d4271f3e5b4bfd2f71d21",
+  "capability_source_sha256": "2c0f83d283c064d06b2613a662a6d23e589699082381288431163aaa4b2322fc",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "5abfc481d34a114aff48e8b614052b05884b119563cd31e3ccd41f148852df1e",
+  "contract_sha256": "368227a78cc845bdc667e0965cca7e572c5aeea045e3ffb12723c3b31c1a4e5a",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -2107,13 +2107,14 @@
       "effects": [
         "audit-create",
         "browser-read",
-        "browser-local-ui"
+        "browser-local-ui",
+        "browser-network-navigation"
       ],
       "id": "grabowski_browser_worker_semantic",
-      "purpose": "Observe or act through snapshot-bound semantic browser handles with bounded Accessibility labels and no raw browser locators.",
+      "purpose": "Observe or act through snapshot-bound semantic browser handles, including explicitly audited network navigation, with bounded Accessibility labels and no raw browser locators.",
       "read_only": false,
-      "reversibility": "read-not-applicable; local-ui-state-dependent",
-      "risk_class": "medium",
+      "reversibility": "read-not-applicable; local-ui-and-network-navigation-state-dependent",
+      "risk_class": "high",
       "tool": "grabowski_browser_worker_semantic"
     },
     {
