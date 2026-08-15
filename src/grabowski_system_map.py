@@ -42,11 +42,26 @@ def build_component_map(
     )
     obligation_attention = int(obligations.get("attention_count") or 0)
     active_leases = int(leases.get("active_count") or 0)
-    platform_connector_snapshot_observable = bool(
-        client_snapshot.get("platform_connector_snapshot_observable")
-    )
     connector_fresh = bool(client_snapshot.get("fresh"))
-    connector_observable = platform_connector_snapshot_observable and connector_fresh
+    connector_observable = bool(
+        client_snapshot.get(
+            "external_client_snapshot_observable", client_snapshot.get("observable")
+        )
+    ) and connector_fresh
+    publication_state = client_snapshot.get("platform_publication_state")
+    publication_observable = isinstance(publication_state, str) and publication_state not in {
+        "", "unavailable", "untracked"
+    }
+    publication_invalid = publication_state in {
+        "invalid", "outcome_unknown", "runtime_contract_changed"
+    }
+    publication_pending = publication_state in {
+        "publication_request_required",
+        "pending_activation",
+        "publication_pending",
+        "awaiting_platform_observation",
+        "convergence_observed_unreconciled",
+    }
     components = [
         {
             "id": "grabowski",
@@ -59,7 +74,7 @@ def build_component_map(
         {
             "id": "connector",
             "role": "ChatGPT-to-runtime transport binding",
-            "authority": "client snapshot handshake",
+            "authority": "external client snapshot handshake",
             "signal": overview_signal(
                 observable=connector_observable,
                 healthy=(
@@ -72,12 +87,43 @@ def build_component_map(
             "evidence": {
                 "fresh": client_snapshot.get("fresh"),
                 "matched": client_snapshot.get("matched"),
-                "platform_connector_snapshot_observable": (
-                    platform_connector_snapshot_observable
+                "external_client_snapshot_observable": client_snapshot.get(
+                    "external_client_snapshot_observable"
                 ),
                 "server_loopback_observable": client_snapshot.get(
                     "server_loopback_observable"
                 ),
+            },
+        },
+        {
+            "id": "platform_publication",
+            "role": "ChatGPT connector catalog publication lifecycle",
+            "authority": (source_registry.get("platform_publication") or {}).get(
+                "authority", "platform publication request/receipt journal"
+            ),
+            "signal": overview_signal(
+                observable=publication_observable,
+                healthy=(
+                    False
+                    if publication_invalid
+                    else True
+                    if publication_state == "platform_converged"
+                    else None
+                ),
+                attention=publication_pending,
+            ),
+            "observed": publication_observable,
+            "evidence": {
+                "state": publication_state,
+                "pending": client_snapshot.get("platform_publication_pending"),
+                "request_id": client_snapshot.get("platform_publication_request_id"),
+                "contract_sha256": client_snapshot.get(
+                    "platform_publication_contract_sha256"
+                ),
+                "observation_scope": client_snapshot.get(
+                    "platform_observation_scope"
+                ),
+                "observation_id": client_snapshot.get("platform_observation_id"),
             },
         },
         {

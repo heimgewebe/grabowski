@@ -31,6 +31,22 @@ class ClientSnapshotTests(unittest.TestCase):
                 snapshot, "PLATFORM_SNAPSHOT_PATH", root / "platform-current.json"
             ),
             mock.patch.object(snapshot, "PLATFORM_SNAPSHOT_TRUSTED_UID", os.getuid()),
+            mock.patch.object(snapshot, "PLATFORM_PUBLICATION_ROOT", root / "platform-publication"),
+            mock.patch.object(
+                snapshot, "PLATFORM_PUBLICATION_REQUEST_ROOT", root / "platform-publication/requests"
+            ),
+            mock.patch.object(
+                snapshot, "PLATFORM_PUBLICATION_ATTEMPT_ROOT", root / "platform-publication/attempts"
+            ),
+            mock.patch.object(
+                snapshot, "PLATFORM_PUBLICATION_RECEIPT_ROOT", root / "platform-publication/receipts"
+            ),
+            mock.patch.object(
+                snapshot, "PLATFORM_PUBLICATION_RESOLUTION_ROOT", root / "platform-publication/resolutions"
+            ),
+            mock.patch.object(
+                snapshot, "PLATFORM_PUBLICATION_CURRENT_PATH", root / "platform-publication/current.json"
+            ),
         )
         for patch in self.patches:
             patch.start()
@@ -266,9 +282,13 @@ class ClientSnapshotTests(unittest.TestCase):
         self.assertFalse(observed["platform_connector_snapshot_observable"])
         self.assertFalse(observed["platform_connector_schema_observable"])
         self.assertEqual(observed["platform_evidence_state"], "missing")
+        self.assertEqual(
+            observed["platform_publication_state"], "publication_request_required"
+        )
+        self.assertTrue(observed["platform_publication_pending"])
         self.assertFalse(observed["server_loopback_observable"])
         self.assertIn(
-            "platform connector catalog snapshot",
+            "immutable publication request",
             observed["recommended_next_action"],
         )
 
@@ -342,11 +362,14 @@ class ClientSnapshotTests(unittest.TestCase):
         self.assertTrue(observed["platform_connector_snapshot_observable"])
         self.assertTrue(observed["platform_connector_schema_observable"])
         self.assertEqual(observed["platform_evidence_state"], "matched")
+        self.assertTrue(observed["platform_publication_pending"])
+        self.assertEqual(
+            observed["platform_publication_state"], "publication_request_required"
+        )
         self.assertEqual(
             observed["platform_snapshot"]["source"]["kind"],
             snapshot.PLATFORM_SOURCE_KIND,
         )
-        self.assertEqual(observed["recommended_next_action"], "none")
 
     def test_platform_match_fields_remain_paired_without_client_receipt(self) -> None:
         artifact = self.schema_artifact()
@@ -385,6 +408,9 @@ class ClientSnapshotTests(unittest.TestCase):
         observed = self.platform_status(runtime_artifact=runtime_artifact)
 
         self.assertEqual(observed["state"], "mismatch")
+        self.assertTrue(observed["publication_pending"])
+        self.assertEqual(observed["publication_state"], "publication_request_required")
+        self.assertFalse(observed["publication_contract_matches"])
         self.assertFalse(observed["observable"])
         self.assertFalse(observed["schema_observable"])
         self.assertIn(
@@ -396,17 +422,63 @@ class ClientSnapshotTests(unittest.TestCase):
             observed["required_schema_property_mismatches"],
         )
 
-    def test_platform_snapshot_stale_and_revision_drift_fail_closed(self) -> None:
+    def test_platform_snapshot_stale_and_provenance_drift_are_separate(self) -> None:
         self.write_platform_snapshot(observed_at_unix=1_000)
         stale = self.platform_status(now_unix=5_000)
         self.assertEqual(stale["state"], "stale")
+        self.assertTrue(stale["publication_contract_matches"])
+        self.assertTrue(stale["publication_pending"])
+        self.assertEqual(stale["publication_state"], "publication_request_required")
         self.assertFalse(stale["observable"])
 
         self.write_platform_snapshot(repo_head="d" * 40)
         drifted = self.platform_status()
         self.assertEqual(drifted["state"], "mismatch")
+        self.assertTrue(drifted["publication_contract_matches"])
+        self.assertFalse(drifted["provenance_matches"])
         self.assertFalse(drifted["observable"])
-        self.assertIn("repo_head", drifted["binding_mismatches"])
+        self.assertIn("repo_head", drifted["provenance_mismatches"])
+
+    def test_stale_older_platform_catalog_is_publication_pending_before_stale(self) -> None:
+        platform_artifact = self.schema_artifact()
+        runtime_tools = []
+        for item in platform_artifact["tools"]:
+            if isinstance(item, dict):
+                runtime_tools.append(item)
+            else:
+                runtime_tools.append(
+                    {
+                        "name": item,
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                        },
+                    }
+                )
+        runtime_tools.append(
+            {
+                "name": "runtime-only-tool",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        )
+        runtime_artifact = connector_contract.mixed_artifact_from_runtime_tools(
+            runtime_tools
+        )
+        self.write_platform_snapshot(platform_artifact, observed_at_unix=1_000)
+
+        observed = self.platform_status(
+            runtime_artifact=runtime_artifact,
+            now_unix=5_000,
+        )
+
+        self.assertEqual(observed["state"], "stale")
+        self.assertTrue(observed["publication_pending"])
+        self.assertEqual(observed["publication_state"], "publication_request_required")
+        self.assertFalse(observed["publication_contract_matches"])
+        self.assertFalse(observed["fresh"])
+        self.assertIn("runtime-only-tool", observed["missing_from_platform"])
+        self.assertIn("observed_tool_count", observed["publication_mismatches"])
+        self.assertIn("observed_tool_names", observed["publication_mismatches"])
 
     def test_platform_snapshot_integrity_and_trust_boundary_fail_closed(self) -> None:
         document = self.write_platform_snapshot()
