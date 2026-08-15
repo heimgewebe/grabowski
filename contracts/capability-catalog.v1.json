@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "f38a272d9ad8bca2565e9c6444b99da8e85ede919f9d4271f3e5b4bfd2f71d21",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "85274180e76c927b8622297d467db53c07dc266637011824d02169791c10fe2d",
+  "contract_sha256": "5abfc481d34a114aff48e8b614052b05884b119563cd31e3ccd41f148852df1e",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -2103,7 +2103,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Observe or act through semantic snapshot and element handles only.\n\n``operation`` is either ``observe`` or ``act``. Element observations expose\nonly opaque element ids plus bounded Accessibility roles and names; origins,\ntitles, selectors, browser backend identifiers and protocol method names stay\nprivate. Effect class and retry/readback authority come from the server-owned\nsemantic catalog.",
+      "description": "Observe or act through semantic snapshot and element handles only.\n\n``operation`` is either ``observe`` or ``act``. Element observations expose\nonly opaque element ids plus bounded Accessibility roles and names. Navigate\naccepts one conservatively validated ``navigation_target`` but never echoes it\ninto the outcome or audit. Origins, titles, selectors, browser backend\nidentifiers and protocol method names stay private. Effect class and\nretry/readback authority come from the server-owned semantic catalog.",
       "effects": [
         "audit-create",
         "browser-read",
