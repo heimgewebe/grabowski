@@ -2119,10 +2119,6 @@ def grabowski_agent_execution_route(
     design_space = bool(decision["design_space"])
     external_available = list(input_facts["available_external_agents"])
     trivial_work = bool(decision["trivial_work"])
-    if candidate_plan:
-        verification_policy = "competition"
-    else:
-        verification_policy = "deterministic"
     canonical_route = coding_router.canonical_execution_route(
         coding_task_value,
         changed_files=changed_file_estimate,
@@ -2131,8 +2127,18 @@ def grabowski_agent_execution_route(
         risk_flags=normalized_flags,
         latency_priority=False,
         need_review=False,
-        verification_policy=verification_policy,
     )
+    if not canonical_route["direct_review_required"] and candidate_plan:
+        canonical_route = coding_router.canonical_execution_route(
+            coding_task_value,
+            changed_files=changed_file_estimate,
+            duration_minutes=expected_duration_minutes,
+            novelty=novelty_value,
+            risk_flags=normalized_flags,
+            latency_priority=False,
+            need_review=False,
+            verification_policy="competition",
+        )
     result = {
         "schema_version": 2,
         "adapter_status": "deprecated_compatibility_adapter",
@@ -2170,6 +2176,12 @@ def grabowski_agent_execution_route(
         "roles_remain_isolated": bool(candidate_plan),
         "single_mutating_writer": True,
         "parallel_writer_pilot": decision["parallel_writer_pilot"],
+        "parallel_writer_pilot_deprecated": True,
+        "parallel_writer_pilot_authority_scope": "legacy_workspace_v1_replay_only",
+        "parallel_writer_pilot_does_not_establish": [
+            "executor_selection",
+            "delegation_authority",
+        ],
         "input_facts": input_facts,
         "trivial_work": trivial_work,
         "deviation_requires_reason": True,

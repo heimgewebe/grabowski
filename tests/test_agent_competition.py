@@ -164,13 +164,23 @@ class AgentCompetitionTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def _canonical_execution_route(self, task_class: str, **kwargs: object) -> dict:
-        verification_policy = str(kwargs.get("verification_policy", "deterministic"))
+        direct_review_required = task_class in {
+            "independent-review",
+            "critical-review",
+            "security-review",
+        }
+        verification_policy = (
+            "independent_review"
+            if direct_review_required
+            else str(kwargs.get("verification_policy", "deterministic"))
+        )
         body = {
             "routing_contract_version": "agent-execution-fabric-routing-v1",
-            "executor": "scoped_writer",
-            "writer_route": "codex-sol-high",
+            "executor": "controller" if direct_review_required else "scoped_writer",
+            "writer_route": "grabowski-primary" if direct_review_required else "codex-sol-high",
             "effect_profile": "candidate",
             "verification_policy": verification_policy,
+            "direct_review_required": direct_review_required,
             "risk": {
                 "flags": list(kwargs.get("risk_flags", [])),
                 "novelty": kwargs.get("novelty", "medium"),
@@ -704,6 +714,23 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(len(competition_route["external_candidates"]), 2)
         self.assertEqual(competition_route["verification_policy"], "competition")
 
+    def test_legacy_route_preserves_independent_review_policy_for_review_task(self) -> None:
+        result = competition.grabowski_agent_execution_route(
+            task_kind="analysis",
+            changed_file_estimate=1,
+            expected_duration_minutes=30,
+            novelty="high",
+            risk_flags=["security"],
+            user_requested_external=True,
+            available_external_agents=["claude"],
+            decision_fork=True,
+            architecture_hypotheses=2,
+            coding_task_class="security-review",
+        )
+        self.assertEqual(result["verification_policy"], "independent_review")
+        self.assertEqual(result["executor"], "controller")
+        self.assertEqual(result["writer_route"], "grabowski-primary")
+
     def test_parallelization_candidate_does_not_authorize_or_change_live_route(self) -> None:
         kwargs = dict(
             task_kind="code",
@@ -721,6 +748,14 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(candidate["execution_mode"], baseline["execution_mode"])
         self.assertFalse(
             candidate["parallel_writer_pilot"]["eligible_for_assessment"]
+        )
+        self.assertTrue(candidate["parallel_writer_pilot_deprecated"])
+        self.assertEqual(
+            candidate["parallel_writer_pilot_authority_scope"],
+            "legacy_workspace_v1_replay_only",
+        )
+        self.assertIn(
+            "delegation_authority", candidate["parallel_writer_pilot_does_not_establish"]
         )
         self.assertIn(
             "direct-first policy",
