@@ -5108,6 +5108,179 @@ def _transport_signed_one_call_evidence(
     return {**evidence, "client_scope_kind": scope["kind"]}
 
 
+def _transport_signed_one_call_status(
+    ctx: Context | None,
+    *,
+    runtime_binding: dict[str, str],
+) -> dict[str, Any]:
+    """Project whether the normal signed-ingress carrier is available.
+
+    This is deliberately not mutation authorization and does not consume the
+    request assertion. Exact MAC, request digest and replay checks remain at
+    the mutating tool boundary in ``_transport_signed_one_call_evidence``.
+    """
+    version = _transport_context_header(ctx, _TRANSPORT_INGRESS_VERSION_HEADER)
+    if version is None:
+        return {
+            "schema_version": 1,
+            "state": "not_observed",
+            "observed": False,
+            "ready": False,
+            "recommended_next_action": (
+                "use signed ingress or the legacy transport roundtrip compatibility path"
+            ),
+            "does_not_establish": [
+                "absence of a signed ingress on another request",
+                "future mutation authority",
+            ],
+        }
+    if version != grabowski_transport_assertion.ASSERTION_VERSION:
+        return {
+            "schema_version": 1,
+            "state": "unsupported_assertion_version",
+            "observed": True,
+            "ready": False,
+            "assertion_version": version,
+            "recommended_next_action": "repair signed ingress version convergence",
+            "does_not_establish": ["future mutation authority"],
+        }
+    try:
+        scope = _transport_connector_capability_scope(ctx)
+    except RuntimeError as exc:
+        return {
+            "schema_version": 1,
+            "state": "connector_identity_invalid",
+            "observed": True,
+            "ready": False,
+            "error": type(exc).__name__,
+            "recommended_next_action": "repair enrolled connector capability binding",
+            "does_not_establish": ["future mutation authority"],
+        }
+    if scope is None or scope.get("kind") != "connector_capability":
+        return {
+            "schema_version": 1,
+            "state": "connector_identity_missing",
+            "observed": True,
+            "ready": False,
+            "recommended_next_action": "use an enrolled signed-ingress connector",
+            "does_not_establish": ["future mutation authority"],
+        }
+    headers = {
+        "request_id": _transport_context_header(ctx, _TRANSPORT_REQUEST_ID_HEADER),
+        "issued_at_unix": _transport_context_header(
+            ctx, _TRANSPORT_REQUEST_TIMESTAMP_HEADER
+        ),
+        "audience": _transport_context_header(ctx, _TRANSPORT_REQUEST_AUDIENCE_HEADER),
+        "body_sha256": _transport_context_header(
+            ctx, _TRANSPORT_REQUEST_BODY_SHA256_HEADER
+        ),
+        "runtime_binding_sha256": _transport_context_header(
+            ctx, _TRANSPORT_RUNTIME_BINDING_SHA256_HEADER
+        ),
+        "mac_sha256": _transport_context_header(ctx, _TRANSPORT_REQUEST_MAC_HEADER),
+    }
+    missing = sorted(key for key, value in headers.items() if value is None)
+    if missing:
+        return {
+            "schema_version": 1,
+            "state": "assertion_incomplete",
+            "observed": True,
+            "ready": False,
+            "missing_headers": missing,
+            "recommended_next_action": "repair signed ingress assertion forwarding",
+            "does_not_establish": ["future mutation authority"],
+        }
+    expected_runtime_binding_sha256 = (
+        grabowski_transport_assertion.runtime_binding_sha256(runtime_binding)
+    )
+    asserted_runtime_binding_sha256 = str(headers["runtime_binding_sha256"])
+    if not hmac.compare_digest(
+        asserted_runtime_binding_sha256, expected_runtime_binding_sha256
+    ):
+        return {
+            "schema_version": 1,
+            "state": "runtime_binding_mismatch",
+            "observed": True,
+            "ready": False,
+            "runtime_binding_sha256": expected_runtime_binding_sha256,
+            "recommended_next_action": "converge signed ingress to the current runtime",
+            "does_not_establish": ["future mutation authority"],
+        }
+    try:
+        issued_at_unix = int(str(headers["issued_at_unix"]), 10)
+        grabowski_transport_assertion.assertion_material(
+            request_id=str(headers["request_id"]),
+            issued_at_unix=issued_at_unix,
+            audience=str(headers["audience"]),
+            tool_name="grabowski_status",
+            arguments_sha256="0" * 64,
+            body_sha256=str(headers["body_sha256"]),
+            runtime_binding_sha256=asserted_runtime_binding_sha256,
+        )
+        mac_sha256 = str(headers["mac_sha256"])
+        if len(mac_sha256) != 64 or any(
+            char not in "0123456789abcdef" for char in mac_sha256
+        ):
+            raise grabowski_transport_assertion.TransportAssertionError(
+                "transport assertion MAC must be a lowercase SHA-256"
+            )
+    except (
+        ValueError,
+        grabowski_transport_assertion.TransportAssertionError,
+    ) as exc:
+        return {
+            "schema_version": 1,
+            "state": "assertion_malformed",
+            "observed": True,
+            "ready": False,
+            "error": type(exc).__name__,
+            "recommended_next_action": "repair signed ingress assertion forwarding",
+            "does_not_establish": ["future mutation authority"],
+        }
+    try:
+        observed_at_unix = int(time.time())
+        grabowski_transport_assertion.validate_assertion_freshness(
+            issued_at_unix=issued_at_unix,
+            now_unix=observed_at_unix,
+        )
+    except grabowski_transport_assertion.TransportAssertionError as exc:
+        return {
+            "schema_version": 1,
+            "state": "assertion_freshness_invalid",
+            "observed": True,
+            "ready": False,
+            "reason": str(exc),
+            "recommended_next_action": (
+                "repair signed ingress clock convergence or request latency"
+            ),
+            "does_not_establish": ["future mutation authority"],
+        }
+    if headers["audience"] != grabowski_transport_assertion.ASSERTION_AUDIENCE:
+        return {
+            "schema_version": 1,
+            "state": "audience_mismatch",
+            "observed": True,
+            "ready": False,
+            "recommended_next_action": "repair signed ingress audience binding",
+            "does_not_establish": ["future mutation authority"],
+        }
+    return {
+        "schema_version": 1,
+        "state": "ready",
+        "observed": True,
+        "ready": True,
+        "assertion_version": version,
+        "client_scope_kind": scope["kind"],
+        "runtime_binding_sha256": expected_runtime_binding_sha256,
+        "recommended_next_action": "none",
+        "does_not_establish": [
+            "MAC verification for this read-only status projection",
+            "authorization of any future mutation",
+            "application-level success of any mutating tool",
+        ],
+    }
+
+
 def _transport_roundtrip_client_scope(
     ctx: Context | None,
 ) -> dict[str, str]:
@@ -5160,10 +5333,51 @@ def _transport_roundtrip_status(ctx: Context | None) -> dict[str, Any]:
                 "absence of response loss after a later mutation",
             ],
         }
-    return grabowski_transport_roundtrip.status(
+    legacy_status = grabowski_transport_roundtrip.status(
         client_scope=client_scope,
         runtime_binding=runtime_binding,
     )
+    signed_one_call = _transport_signed_one_call_status(
+        ctx, runtime_binding=runtime_binding
+    )
+    legacy_recommended_next_action = str(
+        legacy_status.get(
+            "recommended_next_action",
+            "complete a fresh transport roundtrip before mutation",
+        )
+    )
+    if signed_one_call.get("ready") is True:
+        return {
+            **legacy_status,
+            "normal_mutation_path": "signed_one_call",
+            "normal_mutation_path_ready": True,
+            "legacy_roundtrip_required": False,
+            "legacy_recommended_next_action": legacy_recommended_next_action,
+            "signed_one_call": signed_one_call,
+            "recommended_next_action": "none",
+        }
+    if signed_one_call.get("observed") is True:
+        return {
+            **legacy_status,
+            "normal_mutation_path": "signed_one_call",
+            "normal_mutation_path_ready": False,
+            "legacy_roundtrip_required": False,
+            "legacy_recommended_next_action": legacy_recommended_next_action,
+            "signed_one_call": signed_one_call,
+            "recommended_next_action": str(
+                signed_one_call.get(
+                    "recommended_next_action",
+                    "repair signed ingress before mutation",
+                )
+            ),
+        }
+    return {
+        **legacy_status,
+        "normal_mutation_path": "legacy_roundtrip",
+        "normal_mutation_path_ready": legacy_status.get("mutation_gate_open") is True,
+        "legacy_roundtrip_required": True,
+        "signed_one_call": signed_one_call,
+    }
 
 
 def _runtime_tool_contract_summary(
@@ -5683,7 +5897,7 @@ def grabowski_status(
     # channel, which is reserved for immediate runtime/action gates.
     if (
         transport_roundtrip.get("state") != "unavailable"
-        and transport_roundtrip.get("mutation_gate_open") is not True
+        and transport_roundtrip.get("normal_mutation_path_ready") is not True
     ):
         warnings.append(
             {
@@ -5727,7 +5941,7 @@ def grabowski_status(
         )
     elif (
         transport_roundtrip.get("state") != "unavailable"
-        and transport_roundtrip.get("mutation_gate_open") is not True
+        and transport_roundtrip.get("normal_mutation_path_ready") is not True
     ):
         recommended_next_action = str(
             transport_roundtrip.get(
