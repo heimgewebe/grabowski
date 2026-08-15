@@ -32,7 +32,12 @@ def _component_map(**overrides: object) -> dict[str, object]:
             "observable": True,
             "matched": True,
             "fresh": True,
+            "external_client_snapshot_observable": True,
             "platform_connector_snapshot_observable": True,
+            "platform_publication_state": "platform_converged",
+            "platform_publication_pending": False,
+            "platform_publication_request_id": "gpp-test",
+            "platform_publication_contract_sha256": "a" * 64,
         },
         "coding_agent_catalog": {
             "ready": True,
@@ -80,7 +85,7 @@ def test_component_map_is_projection_only_and_target_bound() -> None:
         "unknown": 0,
         "amber": 0,
         "target_required": 5,
-        "green": 6,
+        "green": 7,
     }
 
 
@@ -90,7 +95,10 @@ def test_server_loopback_snapshot_does_not_make_platform_connector_green() -> No
             "observable": True,
             "matched": True,
             "fresh": True,
+            "external_client_snapshot_observable": False,
             "platform_connector_snapshot_observable": False,
+            "platform_publication_state": "platform_converged",
+            "platform_publication_pending": False,
             "server_loopback_observable": True,
         }
     )
@@ -99,28 +107,61 @@ def test_server_loopback_snapshot_does_not_make_platform_connector_green() -> No
     connector = components["connector"]
     assert connector["signal"] == "unknown"
     assert connector["observed"] is False
-    assert connector["evidence"]["platform_connector_snapshot_observable"] is False
+    assert connector["evidence"]["external_client_snapshot_observable"] is False
     assert connector["evidence"]["server_loopback_observable"] is True
     assert result["overall_signal"] == "unknown"
 
 
-def test_stale_platform_snapshot_stays_unknown() -> None:
+def test_stale_platform_catalog_does_not_demote_converged_publication() -> None:
     result = _component_map(
         client_snapshot={
             "observable": True,
             "matched": True,
-            "fresh": False,
-            "platform_connector_snapshot_observable": True,
+            "fresh": True,
+            "external_client_snapshot_observable": True,
+            "platform_connector_snapshot_observable": False,
+            "platform_connector_snapshot_fresh": False,
+            "platform_publication_state": "platform_converged",
+            "platform_publication_pending": False,
+            "platform_publication_request_id": "gpp-stable",
+            "platform_publication_contract_sha256": "b" * 64,
             "server_loopback_observable": True,
         }
     )
 
     components = {item["id"]: item for item in result["components"]}
-    connector = components["connector"]
-    assert connector["signal"] == "unknown"
-    assert connector["observed"] is False
-    assert connector["evidence"]["fresh"] is False
-    assert connector["evidence"]["platform_connector_snapshot_observable"] is True
+    assert components["connector"]["signal"] == "green"
+    publication = components["platform_publication"]
+    assert publication["signal"] == "green"
+    assert publication["evidence"]["state"] == "platform_converged"
+
+
+def test_pending_platform_publication_is_amber_and_outcome_unknown_is_red() -> None:
+    pending = _component_map(
+        client_snapshot={
+            "observable": True,
+            "matched": True,
+            "fresh": True,
+            "external_client_snapshot_observable": True,
+            "platform_publication_state": "publication_pending",
+            "platform_publication_pending": True,
+        }
+    )
+    components = {item["id"]: item for item in pending["components"]}
+    assert components["platform_publication"]["signal"] == "amber"
+
+    unknown = _component_map(
+        client_snapshot={
+            "observable": True,
+            "matched": True,
+            "fresh": True,
+            "external_client_snapshot_observable": True,
+            "platform_publication_state": "outcome_unknown",
+            "platform_publication_pending": True,
+        }
+    )
+    components = {item["id"]: item for item in unknown["components"]}
+    assert components["platform_publication"]["signal"] == "red"
 
 
 def test_attention_is_amber_without_becoming_health_failure() -> None:

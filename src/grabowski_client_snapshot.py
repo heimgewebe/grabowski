@@ -29,6 +29,7 @@ SNAPSHOT_PATH = STATE_ROOT / "current.json"
 OBSERVER_STATE_PATH = STATE_ROOT / "observer.json"
 LOCK_PATH = STATE_ROOT / ".lock"
 PLATFORM_SNAPSHOT_SCHEMA_VERSION = 1
+PLATFORM_SNAPSHOT_V2_SCHEMA_VERSION = 2
 PLATFORM_SNAPSHOT_KIND = "grabowski_platform_connector_snapshot"
 PLATFORM_SNAPSHOT_PATH = Path("/run/grabowski/platform-connector-snapshot.json")
 PLATFORM_SNAPSHOT_TRUSTED_UID = 0
@@ -36,6 +37,35 @@ PLATFORM_SNAPSHOT_MODE = 0o644
 PLATFORM_SNAPSHOT_TTL_SECONDS = 3_600
 MAX_PLATFORM_SNAPSHOT_BYTES = 64 * 1024
 PLATFORM_SOURCE_KIND = "chatgpt_connector_catalog"
+PLATFORM_PUBLICATION_ROOT = STATE_ROOT / "platform-publication"
+PLATFORM_PUBLICATION_REQUEST_ROOT = PLATFORM_PUBLICATION_ROOT / "requests"
+PLATFORM_PUBLICATION_ATTEMPT_ROOT = PLATFORM_PUBLICATION_ROOT / "attempts"
+PLATFORM_PUBLICATION_RECEIPT_ROOT = PLATFORM_PUBLICATION_ROOT / "receipts"
+PLATFORM_PUBLICATION_RESOLUTION_ROOT = PLATFORM_PUBLICATION_ROOT / "resolutions"
+PLATFORM_PUBLICATION_CURRENT_PATH = PLATFORM_PUBLICATION_ROOT / "current.json"
+PLATFORM_PUBLICATION_REQUEST_KIND = "grabowski_platform_publication_request"
+PLATFORM_PUBLICATION_ATTEMPT_KIND = "grabowski_platform_publication_attempt"
+PLATFORM_PUBLICATION_RECEIPT_KIND = "grabowski_platform_publication_convergence_receipt"
+PLATFORM_PUBLICATION_RESOLUTION_KIND = "grabowski_platform_publication_resolution"
+PLATFORM_PUBLICATION_CURRENT_KIND = "grabowski_platform_publication_current"
+PLATFORM_PUBLICATION_ACTION = "refresh_or_republish_chatgpt_connector_catalog"
+PLATFORM_OBSERVATION_SCOPES = frozenset(
+    {"connector_catalog", "new_chat_catalog", "chat_session_catalog"}
+)
+PLATFORM_CONVERGENCE_SCOPES = frozenset({"connector_catalog", "new_chat_catalog"})
+PLATFORM_PUBLICATION_CURRENT_STATES = frozenset(
+    {
+        "no_current",
+        "pending_activation",
+        "publication_pending",
+        "awaiting_platform_observation",
+        "outcome_unknown",
+        "platform_converged",
+    }
+)
+PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES = frozenset(
+    {"submitted", "outcome_unknown", "failed"}
+)
 AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
 OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
 OBSERVATION_SCOPE_SERVER_LOOPBACK = "server_loopback_watchdog"
@@ -988,6 +1018,1384 @@ def _rebind_snapshot_for_cutover(
     }
 
 
+def _platform_publication_contract(
+    *,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    complete_schema_count: int,
+    complete_schema_sha256: str,
+) -> dict[str, Any]:
+    if (
+        isinstance(registered_tool_count, bool)
+        or not isinstance(registered_tool_count, int)
+        or registered_tool_count < 1
+    ):
+        raise ClientSnapshotError("platform publication tool count is invalid")
+    if (
+        isinstance(complete_schema_count, bool)
+        or not isinstance(complete_schema_count, int)
+        or complete_schema_count != registered_tool_count
+    ):
+        raise ClientSnapshotError(
+            "platform publication complete schema count must equal the tool count"
+        )
+    material = {
+        "schema_version": 2,
+        "tool_count": registered_tool_count,
+        "tool_names_sha256": _validate_sha256(
+            registered_names_sha256, label="platform publication names hash"
+        ),
+        "tool_schemas_count": complete_schema_count,
+        "tool_schemas_sha256": _validate_sha256(
+            complete_schema_sha256, label="platform publication complete schema hash"
+        ),
+    }
+    return {**material, "tool_contract_sha256": _sha256_json(material)}
+
+
+def _validate_platform_publication_contract(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "tool_count",
+        "tool_names_sha256",
+        "tool_schemas_count",
+        "tool_schemas_sha256",
+        "tool_contract_sha256",
+    }:
+        raise ClientSnapshotError("platform publication contract fields are invalid")
+    count = value.get("tool_count")
+    schema_count = value.get("tool_schemas_count")
+    if (
+        value.get("schema_version") != 2
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 1
+        or isinstance(schema_count, bool)
+        or not isinstance(schema_count, int)
+        or schema_count != count
+    ):
+        raise ClientSnapshotError("platform publication contract counts are invalid")
+    names_sha256 = _validate_sha256(
+        value.get("tool_names_sha256"), label="platform publication names hash"
+    )
+    schemas_sha256 = _validate_sha256(
+        value.get("tool_schemas_sha256"), label="platform publication schema hash"
+    )
+    contract_sha256 = _validate_sha256(
+        value.get("tool_contract_sha256"), label="platform publication contract hash"
+    )
+    material = {
+        "schema_version": 2,
+        "tool_count": count,
+        "tool_names_sha256": names_sha256,
+        "tool_schemas_count": schema_count,
+        "tool_schemas_sha256": schemas_sha256,
+    }
+    if _sha256_json(material) != contract_sha256:
+        raise ClientSnapshotError("platform publication contract hash mismatch")
+    return {**material, "tool_contract_sha256": contract_sha256}
+
+
+def _platform_contract_from_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    try:
+        _names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            artifact, label="platform publication runtime artifact"
+        )
+    except connector_contract.ConnectorContractError as exc:
+        raise ClientSnapshotError(str(exc)) from exc
+    if metadata.get("complete_schema_observable") is not True:
+        raise ClientSnapshotError(
+            "platform publication requires complete runtime schema identity"
+        )
+    return _platform_publication_contract(
+        registered_tool_count=metadata["name_count"],
+        registered_names_sha256=metadata["names_sha256"],
+        complete_schema_count=metadata["complete_schema_count"],
+        complete_schema_sha256=metadata["complete_schema_sha256"],
+    )
+
+
+def _create_private_json(path: Path, payload: dict[str, Any]) -> bool:
+    _ensure_private_directory(path.parent)
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > MAX_SNAPSHOT_BYTES:
+        raise ClientSnapshotError("platform publication record exceeds size limit")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        existing = _read_private_json(path)
+        if existing != payload:
+            raise ClientSnapshotError(
+                "platform publication immutable record conflicts with existing evidence"
+            )
+        return False
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _validate_private_file(path.lstat(), label="platform publication record")
+        directory_fd = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return True
+
+
+def _publication_request_path(request_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="publication request id")
+    return PLATFORM_PUBLICATION_REQUEST_ROOT / f"{request_id}.json"
+
+
+def _publication_attempt_path(request_id: str, attempt_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="publication request id")
+    attempt_id = _validate_identifier(attempt_id, label="publication attempt id")
+    token = hashlib.sha256(attempt_id.encode("utf-8")).hexdigest()[:24]
+    return PLATFORM_PUBLICATION_ATTEMPT_ROOT / f"{request_id}--{token}.json"
+
+
+def _publication_receipt_path(request_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="publication request id")
+    return PLATFORM_PUBLICATION_RECEIPT_ROOT / f"{request_id}.json"
+
+
+def _publication_resolution_path(request_id: str) -> Path:
+    request_id = _validate_identifier(request_id, label="publication request id")
+    return PLATFORM_PUBLICATION_RESOLUTION_ROOT / f"{request_id}.json"
+
+
+def _read_publication_current() -> dict[str, Any] | None:
+    try:
+        value = _read_private_json(PLATFORM_PUBLICATION_CURRENT_PATH)
+    except FileNotFoundError:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "request_id",
+        "contract_sha256",
+        "state",
+        "attempt_id",
+        "updated_at_unix",
+        "current_sha256",
+    }:
+        raise ClientSnapshotError("platform publication current projection is invalid")
+    if value.get("schema_version") != 1 or value.get("kind") != PLATFORM_PUBLICATION_CURRENT_KIND:
+        raise ClientSnapshotError("platform publication current projection contract mismatch")
+    state = value.get("state")
+    if state not in PLATFORM_PUBLICATION_CURRENT_STATES:
+        raise ClientSnapshotError("platform publication current state is invalid")
+    request_id = value.get("request_id")
+    contract_sha256 = value.get("contract_sha256")
+    attempt_id = value.get("attempt_id")
+    if state == "no_current":
+        if request_id is not None or contract_sha256 is not None or attempt_id is not None:
+            raise ClientSnapshotError("empty platform publication projection is malformed")
+    else:
+        _validate_identifier(request_id, label="publication current request id")
+        _validate_sha256(contract_sha256, label="publication current contract hash")
+        if attempt_id is not None:
+            _validate_identifier(attempt_id, label="publication current attempt id")
+    updated_at = value.get("updated_at_unix")
+    if isinstance(updated_at, bool) or not isinstance(updated_at, int) or updated_at < 0:
+        raise ClientSnapshotError("platform publication current timestamp is invalid")
+    declared = _validate_sha256(
+        value.get("current_sha256"), label="platform publication current hash"
+    )
+    unsigned = dict(value)
+    unsigned.pop("current_sha256", None)
+    if _sha256_json(unsigned) != declared:
+        raise ClientSnapshotError("platform publication current hash mismatch")
+    return dict(value)
+
+
+def _write_publication_current(
+    *,
+    request_id: str | None,
+    contract_sha256: str | None,
+    state: str,
+    attempt_id: str | None = None,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    if state not in PLATFORM_PUBLICATION_CURRENT_STATES:
+        raise ClientSnapshotError("platform publication current state is invalid")
+    if state == "no_current":
+        request_id = None
+        contract_sha256 = None
+        attempt_id = None
+    else:
+        request_id = _validate_identifier(request_id, label="publication current request id")
+        contract_sha256 = _validate_sha256(
+            contract_sha256, label="publication current contract hash"
+        )
+        if attempt_id is not None:
+            attempt_id = _validate_identifier(
+                attempt_id, label="publication current attempt id"
+            )
+    material: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": PLATFORM_PUBLICATION_CURRENT_KIND,
+        "request_id": request_id,
+        "contract_sha256": contract_sha256,
+        "state": state,
+        "attempt_id": attempt_id,
+        "updated_at_unix": timestamp,
+    }
+    document = {**material, "current_sha256": _sha256_json(material)}
+    _ensure_private_directory(PLATFORM_PUBLICATION_ROOT)
+    _write_private_json(PLATFORM_PUBLICATION_CURRENT_PATH, document)
+    return document
+
+
+def _validate_publication_request(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "request_id",
+        "platform",
+        "connector_id",
+        "action",
+        "cutover_id",
+        "requested_at_unix",
+        "expected_contract",
+        "required_observation_scopes",
+        "previous_current",
+        "request_sha256",
+    }:
+        raise ClientSnapshotError("platform publication request fields are invalid")
+    if value.get("schema_version") != 1 or value.get("kind") != PLATFORM_PUBLICATION_REQUEST_KIND:
+        raise ClientSnapshotError("platform publication request contract mismatch")
+    request_id = _validate_identifier(value.get("request_id"), label="publication request id")
+    if value.get("platform") != "chatgpt" or value.get("connector_id") != "grabowski":
+        raise ClientSnapshotError("platform publication request target is invalid")
+    if value.get("action") != PLATFORM_PUBLICATION_ACTION:
+        raise ClientSnapshotError("platform publication request action is invalid")
+    cutover_id = _validate_identifier(value.get("cutover_id"), label="publication cutover id")
+    requested_at = value.get("requested_at_unix")
+    if isinstance(requested_at, bool) or not isinstance(requested_at, int) or requested_at < 0:
+        raise ClientSnapshotError("platform publication request timestamp is invalid")
+    contract = _validate_platform_publication_contract(value.get("expected_contract"))
+    scopes = value.get("required_observation_scopes")
+    if scopes != sorted(PLATFORM_CONVERGENCE_SCOPES):
+        raise ClientSnapshotError("platform publication request observation scopes are invalid")
+    previous = value.get("previous_current")
+    if previous is not None:
+        if not isinstance(previous, dict) or set(previous) != {
+            "request_id", "contract_sha256", "state", "attempt_id"
+        }:
+            raise ClientSnapshotError("platform publication request predecessor is invalid")
+        if previous.get("state") == "no_current":
+            previous = None
+        else:
+            _validate_identifier(previous.get("request_id"), label="publication predecessor request id")
+            _validate_sha256(previous.get("contract_sha256"), label="publication predecessor contract hash")
+            if previous.get("state") not in PLATFORM_PUBLICATION_CURRENT_STATES - {"no_current"}:
+                raise ClientSnapshotError("platform publication predecessor state is invalid")
+            if previous.get("attempt_id") is not None:
+                _validate_identifier(previous.get("attempt_id"), label="publication predecessor attempt id")
+    declared = _validate_sha256(value.get("request_sha256"), label="publication request hash")
+    unsigned = dict(value)
+    unsigned.pop("request_sha256", None)
+    if _sha256_json(unsigned) != declared:
+        raise ClientSnapshotError("platform publication request hash mismatch")
+    return {
+        **unsigned,
+        "request_sha256": declared,
+        "request_id": request_id,
+        "cutover_id": cutover_id,
+        "expected_contract": contract,
+        "previous_current": previous,
+    }
+
+
+def _read_publication_request(request_id: str) -> dict[str, Any]:
+    return _validate_publication_request(
+        _read_private_json(_publication_request_path(request_id))
+    )
+
+
+def _validate_publication_attempt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "request_id",
+        "request_sha256",
+        "attempt_id",
+        "outcome",
+        "reference",
+        "previous_current_sha256",
+        "previous_attempt_id",
+        "recorded_at_unix",
+        "attempt_sha256",
+    }:
+        raise ClientSnapshotError("platform publication attempt fields are invalid")
+    if value.get("schema_version") != 1 or value.get("kind") != PLATFORM_PUBLICATION_ATTEMPT_KIND:
+        raise ClientSnapshotError("platform publication attempt contract mismatch")
+    _validate_identifier(value.get("request_id"), label="publication attempt request id")
+    _validate_sha256(value.get("request_sha256"), label="publication attempt request hash")
+    _validate_identifier(value.get("attempt_id"), label="publication attempt id")
+    if value.get("outcome") not in PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES:
+        raise ClientSnapshotError("platform publication attempt outcome is invalid")
+    _validate_platform_source_reference(value.get("reference"))
+    _validate_sha256(
+        value.get("previous_current_sha256"),
+        label="publication attempt previous current hash",
+    )
+    previous_attempt_id = value.get("previous_attempt_id")
+    if previous_attempt_id is not None:
+        _validate_identifier(
+            previous_attempt_id, label="publication attempt previous attempt id"
+        )
+        if previous_attempt_id == value.get("attempt_id"):
+            raise ClientSnapshotError(
+                "platform publication attempt cannot name itself as predecessor"
+            )
+    recorded_at = value.get("recorded_at_unix")
+    if isinstance(recorded_at, bool) or not isinstance(recorded_at, int) or recorded_at < 0:
+        raise ClientSnapshotError("platform publication attempt timestamp is invalid")
+    declared = _validate_sha256(value.get("attempt_sha256"), label="publication attempt hash")
+    unsigned = dict(value)
+    unsigned.pop("attempt_sha256", None)
+    if _sha256_json(unsigned) != declared:
+        raise ClientSnapshotError("platform publication attempt hash mismatch")
+    return dict(value)
+
+
+def _read_publication_attempt(request_id: str, attempt_id: str) -> dict[str, Any]:
+    return _validate_publication_attempt(
+        _read_private_json(_publication_attempt_path(request_id, attempt_id))
+    )
+
+
+def _validate_publication_receipt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "request_id",
+        "request_sha256",
+        "contract_sha256",
+        "snapshot_sha256",
+        "observation_id",
+        "observation_scope",
+        "observed_at_unix",
+        "reconciled_at_unix",
+        "receipt_sha256",
+    }:
+        raise ClientSnapshotError("platform publication receipt fields are invalid")
+    if value.get("schema_version") != 1 or value.get("kind") != PLATFORM_PUBLICATION_RECEIPT_KIND:
+        raise ClientSnapshotError("platform publication receipt contract mismatch")
+    _validate_identifier(value.get("request_id"), label="publication receipt request id")
+    _validate_sha256(value.get("request_sha256"), label="publication receipt request hash")
+    _validate_sha256(value.get("contract_sha256"), label="publication receipt contract hash")
+    _validate_sha256(value.get("snapshot_sha256"), label="publication receipt snapshot hash")
+    _validate_identifier(value.get("observation_id"), label="publication receipt observation id")
+    if value.get("observation_scope") not in PLATFORM_CONVERGENCE_SCOPES:
+        raise ClientSnapshotError("platform publication receipt observation scope is invalid")
+    for field in ("observed_at_unix", "reconciled_at_unix"):
+        timestamp = value.get(field)
+        if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+            raise ClientSnapshotError(f"platform publication receipt {field} is invalid")
+    declared = _validate_sha256(value.get("receipt_sha256"), label="publication receipt hash")
+    unsigned = dict(value)
+    unsigned.pop("receipt_sha256", None)
+    if _sha256_json(unsigned) != declared:
+        raise ClientSnapshotError("platform publication receipt hash mismatch")
+    return dict(value)
+
+
+def _read_publication_receipt(request_id: str) -> dict[str, Any]:
+    return _validate_publication_receipt(
+        _read_private_json(_publication_receipt_path(request_id))
+    )
+
+
+def _validate_publication_resolution(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "request_id",
+        "outcome",
+        "successor_request_id",
+        "resolved_at_unix",
+        "resolution_sha256",
+    }:
+        raise ClientSnapshotError("platform publication resolution fields are invalid")
+    if value.get("schema_version") != 1 or value.get("kind") != PLATFORM_PUBLICATION_RESOLUTION_KIND:
+        raise ClientSnapshotError("platform publication resolution contract mismatch")
+    request_id = _validate_identifier(
+        value.get("request_id"), label="publication resolution request id"
+    )
+    outcome = value.get("outcome")
+    successor = value.get("successor_request_id")
+    if outcome == "superseded":
+        successor = _validate_identifier(
+            successor, label="publication resolution successor request id"
+        )
+        if successor == request_id:
+            raise ClientSnapshotError("platform publication resolution cannot supersede itself")
+    elif outcome == "rolled_back":
+        if successor is not None:
+            raise ClientSnapshotError("rolled-back publication resolution cannot name a successor")
+    else:
+        raise ClientSnapshotError("platform publication resolution outcome is invalid")
+    resolved_at = value.get("resolved_at_unix")
+    if isinstance(resolved_at, bool) or not isinstance(resolved_at, int) or resolved_at < 0:
+        raise ClientSnapshotError("platform publication resolution timestamp is invalid")
+    declared = _validate_sha256(
+        value.get("resolution_sha256"), label="publication resolution hash"
+    )
+    unsigned = dict(value)
+    unsigned.pop("resolution_sha256", None)
+    if _sha256_json(unsigned) != declared:
+        raise ClientSnapshotError("platform publication resolution hash mismatch")
+    return dict(value)
+
+
+def _read_publication_resolution(request_id: str) -> dict[str, Any]:
+    return _validate_publication_resolution(
+        _read_private_json(_publication_resolution_path(request_id))
+    )
+
+
+def _persist_publication_resolution(
+    *,
+    request_id: str,
+    outcome: str,
+    successor_request_id: str | None,
+    now_unix: int,
+) -> dict[str, Any]:
+    request_id = _validate_identifier(request_id, label="publication resolution request id")
+    try:
+        existing = _read_publication_resolution(request_id)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if (
+            existing["outcome"] != outcome
+            or existing["successor_request_id"] != successor_request_id
+        ):
+            raise ClientSnapshotError(
+                "platform publication resolution conflicts with existing immutable evidence"
+            )
+        return existing
+    material = {
+        "schema_version": 1,
+        "kind": PLATFORM_PUBLICATION_RESOLUTION_KIND,
+        "request_id": request_id,
+        "outcome": outcome,
+        "successor_request_id": successor_request_id,
+        "resolved_at_unix": now_unix,
+    }
+    resolution = {
+        **material,
+        "resolution_sha256": _sha256_json(material),
+    }
+    _create_private_json(_publication_resolution_path(request_id), resolution)
+    return resolution
+
+
+def _persist_publication_receipt(
+    *,
+    request: dict[str, Any],
+    contract: dict[str, Any],
+    observation: dict[str, Any],
+    now_unix: int,
+) -> dict[str, Any]:
+    request = _validate_publication_request(request)
+    contract = _validate_platform_publication_contract(contract)
+    request_id = request["request_id"]
+    expected = {
+        "request_id": request_id,
+        "request_sha256": request["request_sha256"],
+        "contract_sha256": contract["tool_contract_sha256"],
+        "snapshot_sha256": observation["snapshot_sha256"],
+        "observation_id": observation["observation_id"],
+        "observation_scope": observation["observation_scope"],
+        "observed_at_unix": observation["observed_at_unix"],
+    }
+    try:
+        existing = _read_publication_receipt(request_id)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if any(existing.get(key) != value for key, value in expected.items()):
+            raise ClientSnapshotError(
+                "platform convergence receipt conflicts with existing immutable evidence"
+            )
+        return existing
+    material = {
+        "schema_version": 1,
+        "kind": PLATFORM_PUBLICATION_RECEIPT_KIND,
+        **expected,
+        "reconciled_at_unix": now_unix,
+    }
+    receipt = {**material, "receipt_sha256": _sha256_json(material)}
+    _create_private_json(_publication_receipt_path(request_id), receipt)
+    return receipt
+
+
+def _request_id_for_contract(*, cutover_id: str, contract_sha256: str) -> str:
+    cutover_id = _validate_identifier(cutover_id, label="publication cutover id")
+    contract_sha256 = _validate_sha256(contract_sha256, label="publication contract hash")
+    digest = hashlib.sha256(
+        f"{cutover_id}:{contract_sha256}".encode("utf-8")
+    ).hexdigest()
+    return f"gpp-{digest[:32]}"
+
+
+def _platform_source_projection(document: dict[str, Any]) -> dict[str, Any]:
+    schema_version = document.get("schema_version")
+    source = document.get("source")
+    if not isinstance(source, dict):
+        raise ClientSnapshotError("platform publication snapshot source is invalid")
+    if schema_version == PLATFORM_SNAPSHOT_SCHEMA_VERSION:
+        expected = {
+            "kind", "connector", "reference", "observed_at_unix", "catalog_sha256"
+        }
+        if set(source) != expected or source.get("kind") != PLATFORM_SOURCE_KIND or source.get("connector") != "grabowski":
+            raise ClientSnapshotError("legacy platform publication source is invalid")
+        return {
+            "legacy": True,
+            "kind": source["kind"],
+            "platform": "chatgpt",
+            "connector_id": source["connector"],
+            "observation_scope": "unknown",
+            "observation_id": None,
+            "publication_request_id": None,
+            "requested_contract_sha256": None,
+            "reference": source.get("reference"),
+            "observed_at_unix": source.get("observed_at_unix"),
+            "catalog_sha256": source.get("catalog_sha256"),
+        }
+    if schema_version != PLATFORM_SNAPSHOT_V2_SCHEMA_VERSION:
+        raise ClientSnapshotError("platform publication snapshot schema version is unsupported")
+    expected = {
+        "kind",
+        "platform",
+        "connector_id",
+        "observation_scope",
+        "observation_id",
+        "publication_request_id",
+        "requested_contract_sha256",
+        "reference",
+        "observed_at_unix",
+        "catalog_sha256",
+    }
+    if set(source) != expected or source.get("kind") != PLATFORM_SOURCE_KIND:
+        raise ClientSnapshotError("platform publication source contract mismatch")
+    if source.get("platform") != "chatgpt" or source.get("connector_id") != "grabowski":
+        raise ClientSnapshotError("platform publication observation targets another connector")
+    scope = source.get("observation_scope")
+    if scope not in PLATFORM_OBSERVATION_SCOPES:
+        raise ClientSnapshotError("platform publication observation scope is invalid")
+    observation_id = _validate_identifier(
+        source.get("observation_id"), label="platform observation id"
+    )
+    request_id = source.get("publication_request_id")
+    contract_sha256 = source.get("requested_contract_sha256")
+    if (request_id is None) != (contract_sha256 is None):
+        raise ClientSnapshotError(
+            "platform publication observation request id and contract hash must be supplied together"
+        )
+    if request_id is None:
+        contract_sha256 = None
+    else:
+        request_id = _validate_identifier(request_id, label="platform observation request id")
+        contract_sha256 = _validate_sha256(
+            contract_sha256, label="platform observation contract hash"
+        )
+    return {
+        "legacy": False,
+        "kind": source["kind"],
+        "platform": "chatgpt",
+        "connector_id": "grabowski",
+        "observation_scope": scope,
+        "observation_id": observation_id,
+        "publication_request_id": request_id,
+        "requested_contract_sha256": contract_sha256,
+        "reference": source.get("reference"),
+        "observed_at_unix": source.get("observed_at_unix"),
+        "catalog_sha256": source.get("catalog_sha256"),
+    }
+
+
+def _platform_publication_observation(
+    document: dict[str, Any],
+    contract: dict[str, Any],
+    *,
+    now_unix: int,
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = _validate_platform_publication_contract(contract)
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version", "kind", "source", "runtime_binding", "observed_tools", "snapshot_sha256"
+    }:
+        raise ClientSnapshotError("platform publication snapshot fields are invalid")
+    if document.get("kind") != PLATFORM_SNAPSHOT_KIND:
+        raise ClientSnapshotError("platform publication snapshot kind is invalid")
+    declared_snapshot_sha256 = _validate_sha256(
+        document.get("snapshot_sha256"), label="platform snapshot sha256"
+    )
+    unsigned = dict(document)
+    unsigned.pop("snapshot_sha256", None)
+    if _sha256_json(unsigned) != declared_snapshot_sha256:
+        raise ClientSnapshotError("platform publication snapshot hash mismatch")
+    source = _platform_source_projection(document)
+    reference = _validate_platform_source_reference(source.get("reference"))
+    observed_at = source.get("observed_at_unix")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int) or observed_at < 0:
+        raise ClientSnapshotError("platform publication observation time is invalid")
+    catalog_sha256 = _validate_sha256(
+        source.get("catalog_sha256"), label="platform publication catalog hash"
+    )
+    try:
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            document.get("observed_tools"), label="platform publication catalog"
+        )
+    except connector_contract.ConnectorContractError as exc:
+        raise ClientSnapshotError(str(exc)) from exc
+    if metadata["artifact_sha256"] != catalog_sha256:
+        raise ClientSnapshotError("platform publication catalog hash mismatch")
+    full_schema_observable = metadata.get("complete_schema_observable") is True
+    surface_matches = bool(
+        not source["legacy"]
+        and full_schema_observable
+        and len(names) == contract["tool_count"]
+        and metadata["names_sha256"] == contract["tool_names_sha256"]
+        and metadata.get("complete_schema_count") == contract["tool_schemas_count"]
+        and metadata.get("complete_schema_sha256") == contract["tool_schemas_sha256"]
+    )
+    future_clock_drift = observed_at > now_unix + SNAPSHOT_CLOCK_SKEW_SECONDS
+    fresh = not future_clock_drift and now_unix <= observed_at + PLATFORM_SNAPSHOT_TTL_SECONDS
+    request_bound = False
+    post_request = False
+    scope_authoritative = source["observation_scope"] in PLATFORM_CONVERGENCE_SCOPES
+    if request is not None:
+        request = _validate_publication_request(request)
+        request_bound = bool(
+            source["publication_request_id"] == request["request_id"]
+            and source["requested_contract_sha256"]
+            == request["expected_contract"]["tool_contract_sha256"]
+        )
+        post_request = observed_at >= request["requested_at_unix"]
+    return {
+        "snapshot_sha256": declared_snapshot_sha256,
+        "source_reference": reference,
+        "observed_at_unix": observed_at,
+        "observed_tool_count": len(names),
+        "observed_names_sha256": metadata["names_sha256"],
+        "complete_schema_observable": full_schema_observable,
+        "complete_schema_count": metadata.get("complete_schema_count"),
+        "complete_schema_sha256": metadata.get("complete_schema_sha256"),
+        "observation_scope": source["observation_scope"],
+        "observation_id": source["observation_id"],
+        "publication_request_id": source["publication_request_id"],
+        "requested_contract_sha256": source["requested_contract_sha256"],
+        "legacy": source["legacy"],
+        "surface_matches": surface_matches,
+        "fresh": fresh,
+        "future_clock_drift": future_clock_drift,
+        "request_bound": request_bound,
+        "post_request": post_request,
+        "scope_authoritative": scope_authoritative,
+        "converged": bool(
+            surface_matches
+            and fresh
+            and request_bound
+            and post_request
+            and scope_authoritative
+        ),
+    }
+
+
+def _publication_projection_for_contract(
+    contract: dict[str, Any],
+    *,
+    document: dict[str, Any] | None = None,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    contract = _validate_platform_publication_contract(contract)
+    try:
+        current = _read_publication_current()
+    except (OSError, ClientSnapshotError) as exc:
+        return {
+            "state": "invalid",
+            "publication_pending": True,
+            "error": type(exc).__name__,
+            "request_id": None,
+            "contract_sha256": contract["tool_contract_sha256"],
+            "recommended_next_action": "repair the platform publication current projection before relying on convergence",
+        }
+    if current is None or current["state"] == "no_current":
+        return {
+            "state": "untracked",
+            "publication_pending": False,
+            "request_id": None,
+            "contract_sha256": contract["tool_contract_sha256"],
+            "recommended_next_action": "create a publication request only if platform evidence does not already match the semantic runtime contract",
+        }
+    request_id = current["request_id"]
+    try:
+        request = _read_publication_request(request_id)
+    except (OSError, ClientSnapshotError) as exc:
+        return {
+            "state": "invalid",
+            "publication_pending": True,
+            "request_id": request_id,
+            "contract_sha256": contract["tool_contract_sha256"],
+            "error": type(exc).__name__,
+            "recommended_next_action": "repair the immutable platform publication request evidence",
+        }
+    if current["contract_sha256"] != request["expected_contract"]["tool_contract_sha256"]:
+        return {
+            "state": "invalid",
+            "publication_pending": True,
+            "request_id": request_id,
+            "contract_sha256": contract["tool_contract_sha256"],
+            "recommended_next_action": "repair publication request/current contract binding",
+        }
+    if current["contract_sha256"] != contract["tool_contract_sha256"]:
+        return {
+            "state": "runtime_contract_changed",
+            "publication_pending": True,
+            "request_id": request_id,
+            "request_contract_sha256": current["contract_sha256"],
+            "contract_sha256": contract["tool_contract_sha256"],
+            "recommended_next_action": "prepare a new publication request for the current semantic runtime contract",
+        }
+    attempt = None
+    attempt_id = current.get("attempt_id")
+    if attempt_id is not None:
+        try:
+            attempt = _read_publication_attempt(request_id, attempt_id)
+        except (OSError, ClientSnapshotError) as exc:
+            return {
+                "state": "invalid",
+                "publication_pending": True,
+                "request_id": request_id,
+                "contract_sha256": contract["tool_contract_sha256"],
+                "error": type(exc).__name__,
+                "recommended_next_action": "repair the immutable platform publication attempt evidence",
+            }
+        if (
+            attempt["request_sha256"] != request["request_sha256"]
+            or attempt["request_id"] != request_id
+        ):
+            return {
+                "state": "invalid",
+                "publication_pending": True,
+                "request_id": request_id,
+                "contract_sha256": contract["tool_contract_sha256"],
+                "recommended_next_action": "repair publication attempt/request binding",
+            }
+        expected_attempt_state = {
+            "submitted": "awaiting_platform_observation",
+            "outcome_unknown": "outcome_unknown",
+            "failed": "publication_pending",
+        }[attempt["outcome"]]
+        if (
+            current["state"] != "platform_converged"
+            and current["state"] != expected_attempt_state
+        ):
+            return {
+                "state": "invalid",
+                "publication_pending": True,
+                "request_id": request_id,
+                "contract_sha256": contract["tool_contract_sha256"],
+                "recommended_next_action": "repair publication attempt/current lifecycle binding",
+            }
+    convergence_receipt = None
+    if current["state"] == "platform_converged":
+        try:
+            convergence_receipt = _read_publication_receipt(request_id)
+        except (OSError, ClientSnapshotError) as exc:
+            return {
+                "state": "invalid",
+                "publication_pending": True,
+                "request_id": request_id,
+                "contract_sha256": contract["tool_contract_sha256"],
+                "error": type(exc).__name__,
+                "recommended_next_action": "repair the immutable platform convergence receipt before claiming convergence",
+            }
+        if (
+            convergence_receipt["request_sha256"] != request["request_sha256"]
+            or convergence_receipt["contract_sha256"] != contract["tool_contract_sha256"]
+            or convergence_receipt["request_id"] != request_id
+        ):
+            return {
+                "state": "invalid",
+                "publication_pending": True,
+                "request_id": request_id,
+                "contract_sha256": contract["tool_contract_sha256"],
+                "recommended_next_action": "repair convergence receipt/request/contract binding",
+            }
+    observation = None
+    if document is None:
+        try:
+            document = _read_platform_snapshot()
+        except (FileNotFoundError, OSError, ClientSnapshotError):
+            document = None
+    if document is not None:
+        try:
+            observation = _platform_publication_observation(
+                document, contract, now_unix=timestamp, request=request
+            )
+        except ClientSnapshotError:
+            observation = None
+    state = current["state"]
+    if state == "pending_activation":
+        publication_state = "outcome_unknown"
+        next_action = "read back the active runtime contract, then recover or roll back the prepared publication request"
+    elif state == "platform_converged":
+        publication_state = "platform_converged"
+        next_action = "none"
+    elif observation is not None and observation["converged"]:
+        publication_state = "convergence_observed_unreconciled"
+        next_action = "run the user-owned platform publication reconciliation to persist the convergence receipt"
+    elif state == "outcome_unknown":
+        publication_state = "outcome_unknown"
+        next_action = "obtain a bound platform observation or reconcile the publication attempt outcome"
+    elif state == "awaiting_platform_observation":
+        publication_state = "awaiting_platform_observation"
+        next_action = "capture a fresh request-bound platform catalog from connector settings or a new ChatGPT chat"
+    else:
+        publication_state = "publication_pending"
+        next_action = "perform the requested ChatGPT connector refresh or republish action, then capture a fresh request-bound platform catalog"
+    return {
+        "state": publication_state,
+        "publication_pending": publication_state != "platform_converged",
+        "request_id": request_id,
+        "request_sha256": request["request_sha256"],
+        "contract_sha256": contract["tool_contract_sha256"],
+        "current_state": state,
+        "attempt_id": current.get("attempt_id"),
+        "attempt": attempt,
+        "convergence_receipt": convergence_receipt,
+        "observation": observation,
+        "requested_at_unix": request["requested_at_unix"],
+        "action": request["action"],
+        "platform": request["platform"],
+        "connector_id": request["connector_id"],
+        "required_observation_scopes": request["required_observation_scopes"],
+        "recommended_next_action": next_action,
+    }
+
+
+def prepare_platform_publication_for_runtime(
+    *,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    complete_schema_count: int,
+    complete_schema_sha256: str,
+    cutover_id: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    contract = _platform_publication_contract(
+        registered_tool_count=registered_tool_count,
+        registered_names_sha256=registered_names_sha256,
+        complete_schema_count=complete_schema_count,
+        complete_schema_sha256=complete_schema_sha256,
+    )
+    cutover_id = _validate_identifier(cutover_id, label="publication cutover id")
+    with _state_lock():
+        _ensure_private_directory(PLATFORM_PUBLICATION_ROOT)
+        current = _read_publication_current()
+        if (
+            current is not None
+            and current["state"] != "no_current"
+            and current["contract_sha256"] == contract["tool_contract_sha256"]
+        ):
+            request = _read_publication_request(current["request_id"])
+            if current["state"] == "pending_activation":
+                raise ClientSnapshotError(
+                    "an earlier platform publication request is still pending activation; reconcile the active runtime before another cutover"
+                )
+            if current.get("attempt_id") is not None:
+                try:
+                    attempt = _read_publication_attempt(
+                        current["request_id"], current["attempt_id"]
+                    )
+                except (OSError, ClientSnapshotError) as exc:
+                    raise ClientSnapshotError(
+                        "existing platform publication attempt evidence is unavailable or invalid"
+                    ) from exc
+                if attempt["request_sha256"] != request["request_sha256"]:
+                    raise ClientSnapshotError(
+                        "existing platform publication attempt does not bind the current request"
+                    )
+            if current["state"] == "platform_converged":
+                try:
+                    receipt = _read_publication_receipt(current["request_id"])
+                except (OSError, ClientSnapshotError) as exc:
+                    raise ClientSnapshotError(
+                        "existing platform convergence receipt is unavailable or invalid"
+                    ) from exc
+                if (
+                    receipt["request_sha256"] != request["request_sha256"]
+                    or receipt["contract_sha256"] != contract["tool_contract_sha256"]
+                ):
+                    raise ClientSnapshotError(
+                        "existing platform convergence receipt does not bind the current request contract"
+                    )
+            return {
+                "state": current["state"],
+                "request_id": current["request_id"],
+                "request_sha256": request["request_sha256"],
+                "contract": contract,
+                "reused": True,
+                "recommended_next_action": "continue the existing semantic publication lifecycle",
+            }
+        request_id = _request_id_for_contract(
+            cutover_id=cutover_id,
+            contract_sha256=contract["tool_contract_sha256"],
+        )
+        request_path = _publication_request_path(request_id)
+        try:
+            existing_request = _read_publication_request(request_id)
+        except FileNotFoundError:
+            previous = None
+            if current is not None and current["state"] != "no_current":
+                previous = {
+                    "request_id": current["request_id"],
+                    "contract_sha256": current["contract_sha256"],
+                    "state": current["state"],
+                    "attempt_id": current.get("attempt_id"),
+                }
+            material: dict[str, Any] = {
+                "schema_version": 1,
+                "kind": PLATFORM_PUBLICATION_REQUEST_KIND,
+                "request_id": request_id,
+                "platform": "chatgpt",
+                "connector_id": "grabowski",
+                "action": PLATFORM_PUBLICATION_ACTION,
+                "cutover_id": cutover_id,
+                "requested_at_unix": timestamp,
+                "expected_contract": contract,
+                "required_observation_scopes": sorted(PLATFORM_CONVERGENCE_SCOPES),
+                "previous_current": previous,
+            }
+            request = {**material, "request_sha256": _sha256_json(material)}
+            _create_private_json(request_path, request)
+        else:
+            request = existing_request
+            if request["expected_contract"] != contract or request["cutover_id"] != cutover_id:
+                raise ClientSnapshotError("publication request replay conflicts with existing request")
+        _write_publication_current(
+            request_id=request_id,
+            contract_sha256=contract["tool_contract_sha256"],
+            state="pending_activation",
+            now_unix=timestamp,
+        )
+        return {
+            "state": "pending_activation",
+            "request_id": request_id,
+            "request_sha256": request["request_sha256"],
+            "contract": contract,
+            "reused": False,
+            "recommended_next_action": "activate this durable publication request only after the connector switch succeeds",
+        }
+
+
+def activate_platform_publication_request(
+    *, request_id: str, now_unix: int | None = None
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    request_id = _validate_identifier(request_id, label="publication request id")
+    with _state_lock():
+        current = _read_publication_current()
+        if current is None or current["request_id"] != request_id:
+            raise ClientSnapshotError("publication request is not the prepared current request")
+        request = _read_publication_request(request_id)
+        if current["contract_sha256"] != request["expected_contract"]["tool_contract_sha256"]:
+            raise ClientSnapshotError(
+                "publication current projection no longer binds the immutable request contract"
+            )
+        if current["state"] in {
+            "publication_pending", "awaiting_platform_observation", "outcome_unknown", "platform_converged"
+        }:
+            if current.get("attempt_id") is not None:
+                try:
+                    attempt = _read_publication_attempt(request_id, current["attempt_id"])
+                except (OSError, ClientSnapshotError) as exc:
+                    raise ClientSnapshotError(
+                        "publication activation replay lacks valid attempt evidence"
+                    ) from exc
+                if attempt["request_sha256"] != request["request_sha256"]:
+                    raise ClientSnapshotError(
+                        "publication activation replay attempt does not bind the request"
+                    )
+            if current["state"] == "platform_converged":
+                try:
+                    receipt = _read_publication_receipt(request_id)
+                except (OSError, ClientSnapshotError) as exc:
+                    raise ClientSnapshotError(
+                        "publication activation replay lacks a valid convergence receipt"
+                    ) from exc
+                if (
+                    receipt["request_sha256"] != request["request_sha256"]
+                    or receipt["contract_sha256"] != current["contract_sha256"]
+                ):
+                    raise ClientSnapshotError(
+                        "publication activation replay convergence receipt does not bind current state"
+                    )
+            return {"state": current["state"], "request_id": request_id, "idempotent": True}
+        if current["state"] != "pending_activation":
+            raise ClientSnapshotError("publication request is not awaiting activation")
+        previous = request.get("previous_current")
+        if previous is not None and previous["contract_sha256"] != current["contract_sha256"]:
+            _persist_publication_resolution(
+                request_id=previous["request_id"],
+                outcome="superseded",
+                successor_request_id=request_id,
+                now_unix=timestamp,
+            )
+        updated = _write_publication_current(
+            request_id=request_id,
+            contract_sha256=current["contract_sha256"],
+            state="publication_pending",
+            now_unix=timestamp,
+        )
+        return {
+            "state": "publication_pending",
+            "request_id": request_id,
+            "current_sha256": updated["current_sha256"],
+            "idempotent": False,
+        }
+
+
+def rollback_platform_publication_request(
+    *,
+    request_id: str,
+    active_contract: dict[str, Any],
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    request_id = _validate_identifier(request_id, label="publication request id")
+    active_contract = _validate_platform_publication_contract(active_contract)
+    with _state_lock():
+        current = _read_publication_current()
+        if current is None or current["request_id"] != request_id:
+            return {"state": "not_current", "request_id": request_id, "idempotent": True}
+        request = _read_publication_request(request_id)
+        if request["expected_contract"]["tool_contract_sha256"] == active_contract["tool_contract_sha256"]:
+            updated = _write_publication_current(
+                request_id=request_id,
+                contract_sha256=current["contract_sha256"],
+                state="publication_pending",
+                attempt_id=current.get("attempt_id"),
+                now_unix=timestamp,
+            )
+            return {
+                "state": "publication_pending",
+                "request_id": request_id,
+                "reason": "rolled-back runtime has the same semantic tool contract",
+                "current_sha256": updated["current_sha256"],
+            }
+        resolution = _persist_publication_resolution(
+            request_id=request_id,
+            outcome="rolled_back",
+            successor_request_id=None,
+            now_unix=timestamp,
+        )
+        previous = request.get("previous_current")
+        if previous is None:
+            restored = _write_publication_current(
+                request_id=None,
+                contract_sha256=None,
+                state="no_current",
+                now_unix=timestamp,
+            )
+        else:
+            restored = _write_publication_current(
+                request_id=previous["request_id"],
+                contract_sha256=previous["contract_sha256"],
+                state=previous["state"],
+                attempt_id=previous.get("attempt_id"),
+                now_unix=timestamp,
+            )
+        return {
+            "state": "rolled_back",
+            "request_id": request_id,
+            "restored_request_id": restored.get("request_id"),
+            "resolution_sha256": resolution["resolution_sha256"],
+        }
+
+
+def record_platform_publication_attempt(
+    *,
+    request_id: str,
+    attempt_id: str,
+    outcome: str,
+    reference: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    request_id = _validate_identifier(request_id, label="publication request id")
+    attempt_id = _validate_identifier(attempt_id, label="publication attempt id")
+    if outcome not in PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES:
+        raise ClientSnapshotError("platform publication attempt outcome is invalid")
+    reference = _validate_platform_source_reference(reference)
+    with _state_lock():
+        current = _read_publication_current()
+        if current is None or current["request_id"] != request_id:
+            raise ClientSnapshotError("platform publication attempt targets a non-current request")
+        request = _read_publication_request(request_id)
+        if current["state"] == "pending_activation":
+            raise ClientSnapshotError(
+                "platform publication attempt cannot be recorded before request activation"
+            )
+        if current["state"] == "platform_converged":
+            receipt = _read_publication_receipt(request_id)
+            return {
+                "state": "platform_converged",
+                "request_id": request_id,
+                "attempt_id": current.get("attempt_id"),
+                "receipt_sha256": receipt["receipt_sha256"],
+                "idempotent": True,
+            }
+        state = {
+            "submitted": "awaiting_platform_observation",
+            "outcome_unknown": "outcome_unknown",
+            "failed": "publication_pending",
+        }[outcome]
+        try:
+            existing = _read_publication_attempt(request_id, attempt_id)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if (
+                existing["request_sha256"] != request["request_sha256"]
+                or existing["outcome"] != outcome
+                or existing["reference"] != reference
+            ):
+                raise ClientSnapshotError(
+                    "platform publication attempt id already binds different evidence"
+                )
+            if current.get("attempt_id") == attempt_id and current["state"] == state:
+                return {
+                    "state": state,
+                    "request_id": request_id,
+                    "attempt_id": attempt_id,
+                    "attempt_sha256": existing["attempt_sha256"],
+                    "current_sha256": current["current_sha256"],
+                    "idempotent": True,
+                    "recovered_projection": False,
+                }
+            if (
+                existing["previous_current_sha256"] == current["current_sha256"]
+                and existing["previous_attempt_id"] == current.get("attempt_id")
+                and current["state"] != "platform_converged"
+            ):
+                repaired = _write_publication_current(
+                    request_id=request_id,
+                    contract_sha256=current["contract_sha256"],
+                    state=state,
+                    attempt_id=attempt_id,
+                    now_unix=timestamp,
+                )
+                return {
+                    "state": state,
+                    "request_id": request_id,
+                    "attempt_id": attempt_id,
+                    "attempt_sha256": existing["attempt_sha256"],
+                    "current_sha256": repaired["current_sha256"],
+                    "idempotent": True,
+                    "recovered_projection": True,
+                }
+            raise ClientSnapshotError(
+                "platform publication attempt replay conflicts with a newer or different current projection"
+            )
+        material = {
+            "schema_version": 1,
+            "kind": PLATFORM_PUBLICATION_ATTEMPT_KIND,
+            "request_id": request_id,
+            "request_sha256": request["request_sha256"],
+            "attempt_id": attempt_id,
+            "outcome": outcome,
+            "reference": reference,
+            "previous_current_sha256": current["current_sha256"],
+            "previous_attempt_id": current.get("attempt_id"),
+            "recorded_at_unix": timestamp,
+        }
+        attempt = {**material, "attempt_sha256": _sha256_json(material)}
+        _create_private_json(_publication_attempt_path(request_id, attempt_id), attempt)
+        updated = _write_publication_current(
+            request_id=request_id,
+            contract_sha256=current["contract_sha256"],
+            state=state,
+            attempt_id=attempt_id,
+            now_unix=timestamp,
+        )
+        return {
+            "state": state,
+            "request_id": request_id,
+            "attempt_id": attempt_id,
+            "attempt_sha256": attempt["attempt_sha256"],
+            "current_sha256": updated["current_sha256"],
+            "idempotent": False,
+        }
+
+
+def reconcile_platform_publication_for_runtime(
+    *,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    complete_schema_count: int,
+    complete_schema_sha256: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    contract = _platform_publication_contract(
+        registered_tool_count=registered_tool_count,
+        registered_names_sha256=registered_names_sha256,
+        complete_schema_count=complete_schema_count,
+        complete_schema_sha256=complete_schema_sha256,
+    )
+    with _state_lock():
+        current = _read_publication_current()
+        if current is None or current["state"] == "no_current":
+            return {
+                "state": "no_current_request",
+                "contract": contract,
+                "recommended_next_action": "no publication request exists for reconciliation",
+            }
+        request = _read_publication_request(current["request_id"])
+        request_contract_sha256 = request["expected_contract"]["tool_contract_sha256"]
+        runtime_contract_sha256 = contract["tool_contract_sha256"]
+        if current["state"] == "pending_activation":
+            if request_contract_sha256 == runtime_contract_sha256:
+                updated = _write_publication_current(
+                    request_id=current["request_id"],
+                    contract_sha256=current["contract_sha256"],
+                    state="publication_pending",
+                    attempt_id=current.get("attempt_id"),
+                    now_unix=timestamp,
+                )
+                return {
+                    "state": "publication_pending",
+                    "request_id": current["request_id"],
+                    "current_sha256": updated["current_sha256"],
+                    "recovered_pending_activation": True,
+                    "recommended_next_action": "perform the requested ChatGPT connector refresh or republish action, then capture a fresh request-bound platform catalog",
+                }
+            return {
+                "state": "runtime_contract_changed",
+                "request_id": current["request_id"],
+                "request_contract_sha256": request_contract_sha256,
+                "runtime_contract_sha256": runtime_contract_sha256,
+                "recommended_next_action": "roll back or supersede the prepared publication request for the actually active runtime contract",
+            }
+        if request_contract_sha256 != runtime_contract_sha256:
+            return {
+                "state": "runtime_contract_changed",
+                "request_id": current["request_id"],
+                "request_contract_sha256": request_contract_sha256,
+                "runtime_contract_sha256": runtime_contract_sha256,
+                "recommended_next_action": "prepare a publication request for the active runtime contract",
+            }
+        if current["state"] == "platform_converged":
+            receipt = _read_publication_receipt(current["request_id"])
+            if (
+                receipt["request_sha256"] != request["request_sha256"]
+                or receipt["contract_sha256"] != contract["tool_contract_sha256"]
+            ):
+                raise ClientSnapshotError(
+                    "platform convergence receipt no longer binds the current request contract"
+                )
+            return {
+                "state": "platform_converged",
+                "request_id": current["request_id"],
+                "request_sha256": request["request_sha256"],
+                "receipt_sha256": receipt["receipt_sha256"],
+                "contract": contract,
+                "idempotent": True,
+                "current_sha256": current["current_sha256"],
+            }
+        try:
+            document = _read_platform_snapshot()
+        except FileNotFoundError:
+            document = None
+        except (OSError, ClientSnapshotError) as exc:
+            return {
+                "state": current["state"],
+                "request_id": current["request_id"],
+                "error": type(exc).__name__,
+                "recommended_next_action": "repair the trusted platform observation before reconciliation",
+            }
+        observation = None
+        if document is not None:
+            try:
+                observation = _platform_publication_observation(
+                    document, contract, now_unix=timestamp, request=request
+                )
+            except ClientSnapshotError as exc:
+                return {
+                    "state": current["state"],
+                    "request_id": current["request_id"],
+                    "error": type(exc).__name__,
+                    "recommended_next_action": "replace invalid platform evidence with a fresh request-bound observation",
+                }
+        if observation is None or not observation["converged"]:
+            if observation is not None and observation["request_bound"] is False:
+                reason = "historical_or_unbound_observation"
+            elif observation is not None and observation["observation_scope"] == "chat_session_catalog":
+                reason = "session_observation_not_connector_authority"
+            elif observation is not None and not observation["fresh"]:
+                reason = "stale_platform_observation"
+            elif observation is not None and not observation["surface_matches"]:
+                reason = "platform_surface_mismatch"
+            else:
+                reason = "platform_observation_missing"
+            return {
+                "state": current["state"],
+                "request_id": current["request_id"],
+                "reason": reason,
+                "observation": observation,
+                "recommended_next_action": "capture a fresh request-bound connector_catalog or new_chat_catalog observation after the publication action",
+            }
+        receipt = _persist_publication_receipt(
+            request=request,
+            contract=contract,
+            observation=observation,
+            now_unix=timestamp,
+        )
+        updated = _write_publication_current(
+            request_id=request["request_id"],
+            contract_sha256=contract["tool_contract_sha256"],
+            state="platform_converged",
+            attempt_id=current.get("attempt_id"),
+            now_unix=timestamp,
+        )
+        return {
+            "state": "platform_converged",
+            "request_id": request["request_id"],
+            "request_sha256": request["request_sha256"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "snapshot_sha256": observation["snapshot_sha256"],
+            "contract": contract,
+            "observation": observation,
+            "current_sha256": updated["current_sha256"],
+        }
+
+
 def rebind_authentic_snapshot_for_cutover(
     *,
     cutover_id: str,
@@ -1092,6 +2500,66 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
         raise ClientSnapshotError("client snapshot declaration hash mismatch")
 
 
+def _runtime_publication_contract_for_status(
+    *,
+    expected_tool_count: int,
+    expected_names_sha256: str,
+    expected_runtime_tools: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if expected_runtime_tools is None:
+        return None
+    try:
+        _names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            expected_runtime_tools,
+            label="runtime connector artifact",
+        )
+    except connector_contract.ConnectorContractError:
+        return None
+    if (
+        metadata.get("name_count") != expected_tool_count
+        or metadata.get("names_sha256") != expected_names_sha256
+        or metadata.get("complete_schema_observable") is not True
+        or metadata.get("complete_schema_count") != expected_tool_count
+    ):
+        return None
+    try:
+        return _platform_publication_contract(
+            registered_tool_count=expected_tool_count,
+            registered_names_sha256=expected_names_sha256,
+            complete_schema_count=metadata["complete_schema_count"],
+            complete_schema_sha256=metadata["complete_schema_sha256"],
+        )
+    except ClientSnapshotError:
+        return None
+
+
+def _normalized_publication_projection(
+    contract: dict[str, Any],
+    *,
+    document: dict[str, Any] | None = None,
+    now_unix: int,
+) -> tuple[dict[str, Any], str, bool, str]:
+    projection = _publication_projection_for_contract(
+        contract,
+        document=document,
+        now_unix=now_unix,
+    )
+    state = str(projection.get("state") or "invalid")
+    pending = bool(projection.get("publication_pending"))
+    next_action = str(
+        projection.get("recommended_next_action")
+        or "repair the platform publication lifecycle"
+    )
+    if state == "untracked":
+        state = "publication_request_required"
+        pending = True
+        next_action = (
+            "create an immutable publication request for the current semantic tool contract, "
+            "then refresh or republish the ChatGPT connector"
+        )
+    return projection, state, pending, next_action
+
+
 def platform_snapshot_status(
     *,
     expected_tool_count: int,
@@ -1117,14 +2585,28 @@ def platform_snapshot_status(
         "schema_observable": False,
         "fresh": False,
         "matched": False,
+        "surface_matches": False,
         "authority": authority,
         "source": None,
+        "observation_scope": None,
+        "observation_id": None,
         "runtime_binding_matches": False,
+        "provenance_matches": False,
+        "provenance_mismatches": [],
+        "publication_contract_matches": False,
+        "publication_pending": False,
+        "publication_state": "unavailable",
+        "publication_request_id": None,
+        "publication_contract_sha256": None,
+        "runtime_publication_contract": None,
+        "publication_projection": None,
+        "publication_mismatches": [],
         "schema_contract_matches": False,
+        "schema_mismatches": [],
         "required_schema_property_mismatches": [],
         "recommended_next_action": (
             "capture a trusted platform connector catalog snapshot from ChatGPT "
-            "connector discovery at the configured root-owned path"
+            "using an explicit observation scope and observation id"
         ),
         "does_not_establish": [
             "platform behavior outside the captured catalog revision",
@@ -1132,17 +2614,38 @@ def platform_snapshot_status(
             "a platform signature when the platform does not provide one",
         ],
     }
-    if (
-        isinstance(timestamp, bool)
-        or not isinstance(timestamp, int)
-        or timestamp < 0
-    ):
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
         return {
             **base,
             "state": "invalid",
             "error": "timestamp_contract",
             "recommended_next_action": "repair platform snapshot clock inputs",
         }
+    status_contract = _runtime_publication_contract_for_status(
+        expected_tool_count=expected_tool_count,
+        expected_names_sha256=expected_names_sha256,
+        expected_runtime_tools=expected_runtime_tools,
+    )
+    if status_contract is not None:
+        (
+            durable_projection,
+            durable_state,
+            durable_pending,
+            durable_next_action,
+        ) = _normalized_publication_projection(
+            status_contract, now_unix=timestamp
+        )
+        base.update(
+            {
+                "publication_pending": durable_pending,
+                "publication_state": durable_state,
+                "publication_request_id": durable_projection.get("request_id"),
+                "publication_contract_sha256": status_contract["tool_contract_sha256"],
+                "runtime_publication_contract": status_contract,
+                "publication_projection": durable_projection,
+                "recommended_next_action": durable_next_action,
+            }
+        )
     try:
         document = _read_platform_snapshot()
     except FileNotFoundError:
@@ -1153,8 +2656,9 @@ def platform_snapshot_status(
             "state": "invalid",
             "error": type(exc).__name__,
             "recommended_next_action": (
-                "replace the untrusted or invalid platform connector snapshot "
-                "through the platform evidence integration"
+                base["recommended_next_action"]
+                if base.get("publication_projection") is not None
+                else "replace the untrusted or invalid platform connector snapshot through the platform evidence integration"
             ),
         }
     try:
@@ -1166,70 +2670,29 @@ def platform_snapshot_status(
             "observed_tools",
             "snapshot_sha256",
         }
-        if set(document) != required_keys:
-            raise ClientSnapshotError(
-                "platform connector snapshot has unexpected fields"
-            )
-        if (
-            document.get("schema_version") != PLATFORM_SNAPSHOT_SCHEMA_VERSION
-            or document.get("kind") != PLATFORM_SNAPSHOT_KIND
-        ):
-            raise ClientSnapshotError(
-                "platform connector snapshot contract mismatch"
-            )
+        if set(document) != required_keys or document.get("kind") != PLATFORM_SNAPSHOT_KIND:
+            raise ClientSnapshotError("platform connector snapshot contract mismatch")
+        if document.get("schema_version") not in {
+            PLATFORM_SNAPSHOT_SCHEMA_VERSION,
+            PLATFORM_SNAPSHOT_V2_SCHEMA_VERSION,
+        }:
+            raise ClientSnapshotError("platform connector snapshot schema version is unsupported")
         declared_snapshot_sha256 = _validate_sha256(
-            document.get("snapshot_sha256"),
-            label="platform snapshot_sha256",
+            document.get("snapshot_sha256"), label="platform snapshot_sha256"
         )
         unsigned = dict(document)
         unsigned.pop("snapshot_sha256", None)
         if _sha256_json(unsigned) != declared_snapshot_sha256:
-            raise ClientSnapshotError(
-                "platform connector snapshot hash mismatch"
-            )
-        source = document.get("source")
-        binding = document.get("runtime_binding")
-        if not isinstance(source, dict) or set(source) != {
-            "kind",
-            "connector",
-            "reference",
-            "observed_at_unix",
-            "catalog_sha256",
-        }:
-            raise ClientSnapshotError(
-                "platform connector snapshot source contract mismatch"
-            )
-        if source.get("kind") != PLATFORM_SOURCE_KIND:
-            raise ClientSnapshotError(
-                "platform connector snapshot source is not authoritative"
-            )
-        if source.get("connector") != "grabowski":
-            raise ClientSnapshotError(
-                "platform connector snapshot targets another connector"
-            )
-        reference = source.get("reference")
-        if (
-            not isinstance(reference, str)
-            or not reference
-            or reference.strip() != reference
-            or len(reference.encode("utf-8")) > 1024
-        ):
-            raise ClientSnapshotError(
-                "platform connector snapshot source reference is invalid"
-            )
-        observed_at = source.get("observed_at_unix")
-        if (
-            isinstance(observed_at, bool)
-            or not isinstance(observed_at, int)
-            or observed_at < 0
-        ):
-            raise ClientSnapshotError(
-                "platform connector snapshot observation time is invalid"
-            )
+            raise ClientSnapshotError("platform connector snapshot hash mismatch")
+        source_projection = _platform_source_projection(document)
+        reference = _validate_platform_source_reference(source_projection.get("reference"))
+        observed_at = source_projection.get("observed_at_unix")
+        if isinstance(observed_at, bool) or not isinstance(observed_at, int) or observed_at < 0:
+            raise ClientSnapshotError("platform connector snapshot observation time is invalid")
         catalog_sha256 = _validate_sha256(
-            source.get("catalog_sha256"),
-            label="platform catalog_sha256",
+            source_projection.get("catalog_sha256"), label="platform catalog_sha256"
         )
+        binding = document.get("runtime_binding")
         if not isinstance(binding, dict) or set(binding) != {
             "registered_tool_count",
             "registered_names_sha256",
@@ -1237,33 +2700,22 @@ def platform_snapshot_status(
             "repo_head",
             "agent_instructions_sha256",
         }:
-            raise ClientSnapshotError(
-                "platform connector snapshot runtime binding mismatch"
-            )
+            raise ClientSnapshotError("platform connector snapshot runtime binding mismatch")
         registered_count = binding.get("registered_tool_count")
         if (
             isinstance(registered_count, bool)
             or not isinstance(registered_count, int)
             or not 1 <= registered_count <= connector_contract.MAX_OBSERVED_TOOLS
         ):
-            raise ClientSnapshotError(
-                "platform connector snapshot tool count is invalid"
-            )
+            raise ClientSnapshotError("platform connector snapshot tool count is invalid")
         _validate_sha256(
             binding.get("registered_names_sha256"),
             label="platform registered_names_sha256",
         )
-        _validate_release_id(
-            binding.get("release_id"), label="platform release id"
-        )
+        _validate_release_id(binding.get("release_id"), label="platform release id")
         repo_head = binding.get("repo_head")
-        if (
-            not isinstance(repo_head, str)
-            or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None
-        ):
-            raise ClientSnapshotError(
-                "platform connector snapshot repository head is invalid"
-            )
+        if not isinstance(repo_head, str) or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None:
+            raise ClientSnapshotError("platform connector snapshot repository head is invalid")
         _validate_sha256(
             binding.get("agent_instructions_sha256"),
             label="platform agent instructions sha256",
@@ -1275,17 +2727,14 @@ def platform_snapshot_status(
             )
         )
         if observed_metadata["artifact_sha256"] != catalog_sha256:
-            raise ClientSnapshotError(
-                "platform connector catalog content hash mismatch"
-            )
+            raise ClientSnapshotError("platform connector catalog content hash mismatch")
         if expected_runtime_tools is None:
             return {
                 **base,
                 "state": "runtime_schema_unavailable",
-                "source": dict(source),
+                "source": source_projection,
                 "recommended_next_action": (
-                    "restore runtime schema observability before evaluating "
-                    "the platform connector snapshot"
+                    "restore runtime schema observability before evaluating the platform connector snapshot"
                 ),
             }
         runtime_names, runtime_schemas, runtime_metadata = (
@@ -1297,16 +2746,23 @@ def platform_snapshot_status(
         if (
             runtime_metadata["name_count"] != expected_tool_count
             or runtime_metadata["names_sha256"] != expected_names_sha256
+            or runtime_metadata.get("complete_schema_observable") is not True
+            or runtime_metadata.get("complete_schema_count") != expected_tool_count
         ):
             return {
                 **base,
                 "state": "runtime_schema_invalid",
-                "source": dict(source),
+                "source": source_projection,
                 "recommended_next_action": (
-                    "repair runtime schema observability before evaluating "
-                    "platform publication"
+                    "repair complete runtime schema observability before evaluating platform publication"
                 ),
             }
+        runtime_contract = _platform_publication_contract(
+            registered_tool_count=expected_tool_count,
+            registered_names_sha256=expected_names_sha256,
+            complete_schema_count=runtime_metadata["complete_schema_count"],
+            complete_schema_sha256=runtime_metadata["complete_schema_sha256"],
+        )
         probe = connector_contract.probe_contract(
             observed_names,
             observed_schemas,
@@ -1315,18 +2771,11 @@ def platform_snapshot_status(
             runtime_names,
             observed_source="platform",
         )
-        complete_schema_evidence_present = (
+        complete_schema_matches = bool(
             observed_metadata.get("complete_schema_observable") is True
-            or runtime_metadata.get("complete_schema_observable") is True
-        )
-        complete_schema_matches = (
-            observed_metadata.get("complete_schema_observable") is True
-            and runtime_metadata.get("complete_schema_observable") is True
-            and observed_metadata.get("complete_schema_count")
-            == runtime_metadata.get("complete_schema_count")
-            == expected_tool_count
+            and observed_metadata.get("complete_schema_count") == expected_tool_count
             and observed_metadata.get("complete_schema_sha256")
-            == runtime_metadata.get("complete_schema_sha256")
+            == runtime_contract["tool_schemas_sha256"]
         )
     except (TypeError, ValueError, ClientSnapshotError, connector_contract.ConnectorContractError) as exc:
         return {
@@ -1334,74 +2783,107 @@ def platform_snapshot_status(
             "state": "invalid",
             "error": type(exc).__name__,
             "recommended_next_action": (
-                "replace the invalid platform connector snapshot with a fresh "
-                "platform-primary observation"
+                "replace the invalid platform connector snapshot with a fresh platform-primary observation"
             ),
         }
 
-    expected_binding = {
+    expected_provenance = {
         "registered_tool_count": expected_tool_count,
         "registered_names_sha256": expected_names_sha256,
         "release_id": expected_release_id,
         "repo_head": expected_repo_head,
         "agent_instructions_sha256": expected_agent_instructions_sha256,
     }
-    binding_mismatches = sorted(
+    provenance_mismatches = sorted(
         key
-        for key, expected_value in expected_binding.items()
+        for key, expected_value in expected_provenance.items()
         if binding.get(key) != expected_value
     )
+    provenance_matches = not provenance_mismatches
+    publication_mismatches: list[str] = []
     if observed_metadata["name_count"] != expected_tool_count:
-        binding_mismatches.append("observed_tool_count")
+        publication_mismatches.append("observed_tool_count")
     if observed_metadata["names_sha256"] != expected_names_sha256:
-        binding_mismatches.append("observed_names_sha256")
-    binding_matches = not binding_mismatches
+        publication_mismatches.append("observed_tool_names")
+    if probe.get("matches") is not True:
+        publication_mismatches.append("tool_or_schema_contract")
+    if not complete_schema_matches:
+        publication_mismatches.append("complete_schema_identity")
+    surface_matches = not publication_mismatches
     future_clock_drift = observed_at > timestamp + SNAPSHOT_CLOCK_SKEW_SECONDS
-    fresh = (
-        not future_clock_drift
-        and timestamp <= observed_at + PLATFORM_SNAPSHOT_TTL_SECONDS
+    fresh = not future_clock_drift and timestamp <= observed_at + PLATFORM_SNAPSHOT_TTL_SECONDS
+
+    # Backward compatibility: legacy matched/state retain their historical
+    # provenance-sensitive meaning. Publication convergence is a separate,
+    # stricter full-schema lifecycle below.
+    legacy_complete_requirement = (
+        observed_metadata.get("complete_schema_observable") is not True
+        or complete_schema_matches
     )
-    matched = (
-        binding_matches
+    matched = bool(
+        provenance_matches
         and probe.get("matches") is True
-        and (not complete_schema_evidence_present or complete_schema_matches)
+        and legacy_complete_requirement
     )
     observable = fresh and matched
+    schema_observable = bool(
+        observable
+        and probe.get("schema_contract_matches") is True
+        and legacy_complete_requirement
+    )
     if future_clock_drift:
         state = "clock_drift"
-        next_action = (
-            "replace the future-dated platform connector snapshot with a "
-            "current platform observation"
-        )
+        legacy_next_action = "replace the future-dated platform connector snapshot with a current platform observation"
     elif not fresh:
         state = "stale"
-        next_action = "capture a fresh platform connector catalog snapshot"
+        legacy_next_action = "capture a fresh platform connector catalog snapshot"
     elif not matched:
         state = "mismatch"
-        next_action = (
-            "capture the exact current platform connector catalog after "
-            "repairing reported schema or revision drift"
-        )
+        legacy_next_action = "repair reported platform catalog or provenance drift and capture a fresh platform-primary observation"
     else:
         state = "matched"
-        next_action = "none"
+        legacy_next_action = "none"
+
+    (
+        publication_projection,
+        publication_state,
+        publication_pending,
+        publication_next_action,
+    ) = _normalized_publication_projection(
+        runtime_contract,
+        document=document,
+        now_unix=timestamp,
+    )
     return {
         **base,
         "state": state,
         "observable": observable,
-        "schema_observable": observable and probe.get("schema_contract_matches") is True,
+        "schema_observable": schema_observable,
         "fresh": fresh,
         "matched": matched,
-        "source": dict(source),
+        "surface_matches": surface_matches,
+        "source": source_projection,
+        "observation_scope": source_projection.get("observation_scope"),
+        "observation_id": source_projection.get("observation_id"),
         "snapshot_sha256": declared_snapshot_sha256,
         "runtime_binding": dict(binding),
-        "runtime_binding_matches": binding_matches,
-        "binding_mismatches": sorted(set(binding_mismatches)),
+        "runtime_binding_matches": provenance_matches,
+        "binding_mismatches": provenance_mismatches,
+        "provenance_matches": provenance_matches,
+        "provenance_mismatches": provenance_mismatches,
+        "publication_contract_matches": surface_matches,
+        "publication_pending": publication_pending,
+        "publication_state": publication_state,
+        "publication_request_id": publication_projection.get("request_id"),
+        "publication_contract_sha256": runtime_contract["tool_contract_sha256"],
+        "runtime_publication_contract": runtime_contract,
+        "publication_projection": publication_projection,
+        "publication_mismatches": sorted(set(publication_mismatches)),
         "catalog": observed_metadata,
-        "schema_contract_matches": (
-            probe.get("schema_contract_matches") is True
-            and (not complete_schema_evidence_present or complete_schema_matches)
+        "schema_contract_matches": bool(
+            probe.get("schema_contract_matches") is True and complete_schema_matches
         ),
+        "schema_mismatches": probe.get("schema_mismatches", []),
         "complete_schema_identity_matches": complete_schema_matches,
         "complete_schema_sha256": observed_metadata.get("complete_schema_sha256"),
         "required_schema_property_mismatches": probe.get(
@@ -1411,7 +2893,11 @@ def platform_snapshot_status(
         "missing_from_platform": probe.get("missing_from_connector", []),
         "unexpected_in_platform": probe.get("unexpected_in_connector", []),
         "age_seconds": max(0, timestamp - observed_at),
-        "recommended_next_action": next_action,
+        "recommended_next_action": (
+            publication_next_action
+            if publication_pending or publication_state == "platform_converged"
+            else legacy_next_action
+        ),
     }
 
 
@@ -1451,6 +2937,18 @@ def snapshot_status(
         "platform_connector_schema_observable": platform_schema_observable,
         "platform_connector_snapshot_fresh": bool(platform_snapshot.get("fresh")),
         "platform_connector_snapshot_matched": bool(platform_snapshot.get("matched")),
+        "platform_publication_contract_matches": bool(
+            platform_snapshot.get("publication_contract_matches")
+        ),
+        "platform_publication_pending": bool(platform_snapshot.get("publication_pending")),
+        "platform_publication_state": platform_snapshot.get("publication_state"),
+        "platform_publication_request_id": platform_snapshot.get("publication_request_id"),
+        "platform_publication_contract_sha256": platform_snapshot.get("publication_contract_sha256"),
+        "platform_observation_scope": platform_snapshot.get("observation_scope"),
+        "platform_observation_id": platform_snapshot.get("observation_id"),
+        "platform_schema_mismatches": platform_snapshot.get("schema_mismatches", []),
+        "platform_missing_tools": platform_snapshot.get("missing_from_platform", []),
+        "platform_extra_tools": platform_snapshot.get("unexpected_in_platform", []),
         "platform_evidence_state": platform_snapshot.get("state"),
         "platform_snapshot": platform_snapshot,
         "server_loopback_observable": False,
@@ -1661,6 +3159,18 @@ def snapshot_status(
         "platform_connector_schema_observable": platform_schema_observable,
         "platform_connector_snapshot_fresh": bool(platform_snapshot.get("fresh")),
         "platform_connector_snapshot_matched": bool(platform_snapshot.get("matched")),
+        "platform_publication_contract_matches": bool(
+            platform_snapshot.get("publication_contract_matches")
+        ),
+        "platform_publication_pending": bool(platform_snapshot.get("publication_pending")),
+        "platform_publication_state": platform_snapshot.get("publication_state"),
+        "platform_publication_request_id": platform_snapshot.get("publication_request_id"),
+        "platform_publication_contract_sha256": platform_snapshot.get("publication_contract_sha256"),
+        "platform_observation_scope": platform_snapshot.get("observation_scope"),
+        "platform_observation_id": platform_snapshot.get("observation_id"),
+        "platform_schema_mismatches": platform_snapshot.get("schema_mismatches", []),
+        "platform_missing_tools": platform_snapshot.get("missing_from_platform", []),
+        "platform_extra_tools": platform_snapshot.get("unexpected_in_platform", []),
         "platform_evidence_state": platform_snapshot.get("state"),
         "platform_snapshot": platform_snapshot,
         "server_loopback_observable": server_loopback_observable,
@@ -2481,12 +3991,33 @@ def _build_platform_connector_snapshot_with_runtime_names(
     observed_tools: dict[str, Any],
     runtime_root: Path,
     source_reference: str,
+    observation_scope: str,
+    observation_id: str,
+    publication_request_id: str | None = None,
+    requested_contract_sha256: str | None = None,
     observed_at_unix: int | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     timestamp = int(time.time()) if observed_at_unix is None else observed_at_unix
     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
         raise ClientSnapshotError("platform connector observation time is invalid")
     reference = _validate_platform_source_reference(source_reference)
+    if observation_scope not in PLATFORM_OBSERVATION_SCOPES:
+        raise ClientSnapshotError("platform connector observation scope is invalid")
+    observation_id = _validate_identifier(
+        observation_id, label="platform connector observation id"
+    )
+    if (publication_request_id is None) != (requested_contract_sha256 is None):
+        raise ClientSnapshotError(
+            "platform connector publication request id and contract hash must be supplied together"
+        )
+    if publication_request_id is not None:
+        publication_request_id = _validate_identifier(
+            publication_request_id, label="platform connector publication request id"
+        )
+        requested_contract_sha256 = _validate_sha256(
+            requested_contract_sha256,
+            label="platform connector requested contract hash",
+        )
     try:
         _observed_names, _observed_schemas, observed_metadata = (
             connector_contract.parse_observed_artifact(
@@ -2498,11 +4029,16 @@ def _build_platform_connector_snapshot_with_runtime_names(
         raise ClientSnapshotError(str(exc)) from exc
     runtime_binding, runtime_names = _runtime_platform_binding(runtime_root)
     document: dict[str, Any] = {
-        "schema_version": PLATFORM_SNAPSHOT_SCHEMA_VERSION,
+        "schema_version": PLATFORM_SNAPSHOT_V2_SCHEMA_VERSION,
         "kind": PLATFORM_SNAPSHOT_KIND,
         "source": {
             "kind": PLATFORM_SOURCE_KIND,
-            "connector": "grabowski",
+            "platform": "chatgpt",
+            "connector_id": "grabowski",
+            "observation_scope": observation_scope,
+            "observation_id": observation_id,
+            "publication_request_id": publication_request_id,
+            "requested_contract_sha256": requested_contract_sha256,
             "reference": reference,
             "observed_at_unix": timestamp,
             "catalog_sha256": observed_metadata["artifact_sha256"],
@@ -2522,12 +4058,20 @@ def build_platform_connector_snapshot(
     observed_tools: dict[str, Any],
     runtime_root: Path,
     source_reference: str,
+    observation_scope: str,
+    observation_id: str,
+    publication_request_id: str | None = None,
+    requested_contract_sha256: str | None = None,
     observed_at_unix: int | None = None,
 ) -> dict[str, Any]:
     document, _runtime_names = _build_platform_connector_snapshot_with_runtime_names(
         observed_tools=observed_tools,
         runtime_root=runtime_root,
         source_reference=source_reference,
+        observation_scope=observation_scope,
+        observation_id=observation_id,
+        publication_request_id=publication_request_id,
+        requested_contract_sha256=requested_contract_sha256,
         observed_at_unix=observed_at_unix,
     )
     return document
@@ -2628,12 +4172,20 @@ def capture_platform_connector_snapshot(
     observed_tools: dict[str, Any],
     runtime_root: Path,
     source_reference: str,
+    observation_scope: str,
+    observation_id: str,
+    publication_request_id: str | None = None,
+    requested_contract_sha256: str | None = None,
     observed_at_unix: int | None = None,
 ) -> dict[str, Any]:
     document, runtime_names = _build_platform_connector_snapshot_with_runtime_names(
         observed_tools=observed_tools,
         runtime_root=runtime_root,
         source_reference=source_reference,
+        observation_scope=observation_scope,
+        observation_id=observation_id,
+        publication_request_id=publication_request_id,
+        requested_contract_sha256=requested_contract_sha256,
         observed_at_unix=observed_at_unix,
     )
     _persist_platform_snapshot(document)
@@ -2663,6 +4215,16 @@ def capture_platform_connector_snapshot(
         "complete_schema_count": observed_metadata.get("complete_schema_count"),
         "complete_schema_sha256": observed_metadata.get("complete_schema_sha256"),
         "source_reference": document["source"]["reference"],
+        "observation_scope": document["source"]["observation_scope"],
+        "observation_id": document["source"]["observation_id"],
+        "publication_request_id": document["source"]["publication_request_id"],
+        "requested_contract_sha256": document["source"]["requested_contract_sha256"],
+        "platform_publication": {
+            "state": "captured_unreconciled",
+            "recommended_next_action": (
+                "run the user-owned platform publication reconciliation; root capture does not mutate user publication state"
+            ),
+        },
     }
 
 
@@ -2689,7 +4251,33 @@ def _auto_refresh_parser() -> argparse.ArgumentParser:
     )
     capture.add_argument("--runtime-root", type=Path, required=True)
     capture.add_argument("--source-reference", required=True)
+    capture.add_argument(
+        "--observation-scope",
+        choices=sorted(PLATFORM_OBSERVATION_SCOPES),
+        required=True,
+    )
+    capture.add_argument("--observation-id", required=True)
+    capture.add_argument("--publication-request-id")
+    capture.add_argument("--requested-contract-sha256")
     capture.add_argument("--observed-tools-json", required=True)
+    reconcile = subparsers.add_parser(
+        "reconcile-platform-publication",
+        help="Reconcile user-owned publication state from one trusted platform snapshot.",
+    )
+    reconcile.add_argument("--registered-tool-count", type=int, required=True)
+    reconcile.add_argument("--registered-names-sha256", required=True)
+    reconcile.add_argument("--complete-schema-count", type=int, required=True)
+    reconcile.add_argument("--complete-schema-sha256", required=True)
+    attempt = subparsers.add_parser(
+        "record-platform-publication-attempt",
+        help="Persist one immutable external platform publication attempt outcome.",
+    )
+    attempt.add_argument("--request-id", required=True)
+    attempt.add_argument("--attempt-id", required=True)
+    attempt.add_argument(
+        "--outcome", choices=sorted(PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES), required=True
+    )
+    attempt.add_argument("--reference", required=True)
     probe = subparsers.add_parser(
         "probe-runtime",
         help="Read one fixed loopback runtime and emit bounded green readiness evidence.",
@@ -2737,6 +4325,32 @@ def main(argv: list[str] | None = None) -> int:
                 observed_tools=observed_tools,
                 runtime_root=args.runtime_root,
                 source_reference=args.source_reference,
+                observation_scope=args.observation_scope,
+                observation_id=args.observation_id,
+                publication_request_id=args.publication_request_id,
+                requested_contract_sha256=args.requested_contract_sha256,
+            )
+        elif args.command == "reconcile-platform-publication":
+            if os.geteuid() == 0:
+                raise ClientSnapshotError(
+                    "platform publication reconciliation must run as the runtime user, not root"
+                )
+            result = reconcile_platform_publication_for_runtime(
+                registered_tool_count=args.registered_tool_count,
+                registered_names_sha256=args.registered_names_sha256,
+                complete_schema_count=args.complete_schema_count,
+                complete_schema_sha256=args.complete_schema_sha256,
+            )
+        elif args.command == "record-platform-publication-attempt":
+            if os.geteuid() == 0:
+                raise ClientSnapshotError(
+                    "platform publication attempt recording must run as the runtime user, not root"
+                )
+            result = record_platform_publication_attempt(
+                request_id=args.request_id,
+                attempt_id=args.attempt_id,
+                outcome=args.outcome,
+                reference=args.reference,
             )
         elif args.command == "probe-runtime":
             result = probe_runtime_readiness(
