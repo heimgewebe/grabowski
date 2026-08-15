@@ -1,5 +1,5 @@
 {
-  "catalog_version": "direct-first-review-contrast-v5",
+  "catalog_version": "lane-scoped-writer-v6",
   "harnesses": {
     "antigravity": {
       "aliases": [
@@ -1547,7 +1547,7 @@
       "base_quality_rank": 100,
       "burn_weight": 2.4,
       "delegation_overhead_minutes": 7,
-      "disabled_reason": "Compatibility alias retained as plan-only. Authoritative implementation stays with grabowski-primary; use claude-fable-5-review-high for review or claude-fable-5-contrast-high for explicitly requested advisory contrast. Fable is paid-only and never an automatic fallback. Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline.",
+      "disabled_reason": "Compatibility alias retained as plan-only. This alias has no writer authority; implementation authority follows canonical execution routing and any explicit work lane. Use claude-fable-5-review-high for review or claude-fable-5-contrast-high for explicitly requested advisory contrast. Fable is paid-only and never an automatic fallback. Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline.",
       "effort": "high",
       "enabled": false,
       "harness": "claude",
@@ -1591,7 +1591,7 @@
       "burn_weight": 2.4,
       "contrast_only": true,
       "delegation_overhead_minutes": 7,
-      "disabled_reason": "Compatibility alias retired by the direct-first policy; authoritative writing stays with grabowski-primary. Use claude-fable-5-contrast-high only for explicit advisory contrast. Fable is paid-only and never an automatic fallback. Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline.",
+      "disabled_reason": "Compatibility alias retained disabled. Scoped writing is authorized only through canonical execution routing and an explicit work lane; use claude-fable-5-contrast-high only for explicitly requested advisory contrast. Fable is paid-only and never an automatic fallback. Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline.",
       "effort": "high",
       "enabled": false,
       "harness": "claude",

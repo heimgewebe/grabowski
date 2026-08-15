@@ -1924,7 +1924,7 @@ def grabowski_agent_execution_route(
     coding_task_class: str = "complex-patch",
     paid_execution_authorized: bool = False,
 ) -> dict[str, Any]:
-    """Keep implementation direct and optionally recommend advisory contrast."""
+    """Compatibility adapter over canonical execution routing plus legacy contrast advice."""
     kind = workspace._required_string(task_kind, "task_kind", max_length=32)
     if kind not in TASK_KINDS:
         raise AgentCompetitionError(
@@ -2119,12 +2119,44 @@ def grabowski_agent_execution_route(
     design_space = bool(decision["design_space"])
     external_available = list(input_facts["available_external_agents"])
     trivial_work = bool(decision["trivial_work"])
+    canonical_route = coding_router.canonical_execution_route(
+        coding_task_value,
+        changed_files=changed_file_estimate,
+        duration_minutes=expected_duration_minutes,
+        novelty=novelty_value,
+        risk_flags=normalized_flags,
+        latency_priority=False,
+        need_review=False,
+    )
+    if not canonical_route["direct_review_required"] and candidate_plan:
+        canonical_route = coding_router.canonical_execution_route(
+            coding_task_value,
+            changed_files=changed_file_estimate,
+            duration_minutes=expected_duration_minutes,
+            novelty=novelty_value,
+            risk_flags=normalized_flags,
+            latency_priority=False,
+            need_review=False,
+            verification_policy="competition",
+        )
     result = {
         "schema_version": 2,
+        "adapter_status": "deprecated_compatibility_adapter",
+        "canonical_route_tool": "grabowski_coding_agent_route",
+        "routing_contract_version": canonical_route["routing_contract_version"],
+        "executor": canonical_route["executor"],
+        "writer_route": canonical_route["writer_route"],
+        "effect_profile": canonical_route["effect_profile"],
+        "verification_policy": canonical_route["verification_policy"],
+        "risk": canonical_route["risk"],
+        "integration_owner": canonical_route["integration_owner"],
+        "canonical_route_recommendation_sha256": canonical_route["recommendation_sha256"],
         "route_policy_version": decision["route_policy_version"],
         "risk_tier": decision["risk_tier"],
         "score": score,
         "execution_mode": mode,
+        "execution_mode_deprecated": True,
+        "execution_mode_scope": "legacy_workspace_contrast_shape_only_not_executor_authority",
         "full_workspace": False,
         "external_candidates": candidate_plan,
         "external_route_candidates": external_route_candidates,
@@ -2137,11 +2169,19 @@ def grabowski_agent_execution_route(
         "automatic_patch_apply": False,
         "automatic_winner_selection": False,
         "operator_remains_integrator": True,
-        "direct_implementation_required": True,
-        "external_primary_writer_forbidden": True,
+        "direct_implementation_required": canonical_route["direct_implementation_required"],
+        "delegated_scoped_writers_allowed": canonical_route["delegated_scoped_writers_allowed"],
+        "external_primary_writer_forbidden": canonical_route["external_primary_writer_forbidden"],
+        "controller_integration_required": canonical_route["controller_integration_required"],
         "roles_remain_isolated": bool(candidate_plan),
         "single_mutating_writer": True,
         "parallel_writer_pilot": decision["parallel_writer_pilot"],
+        "parallel_writer_pilot_deprecated": True,
+        "parallel_writer_pilot_authority_scope": "legacy_workspace_v1_replay_only",
+        "parallel_writer_pilot_does_not_establish": [
+            "executor_selection",
+            "delegation_authority",
+        ],
         "input_facts": input_facts,
         "trivial_work": trivial_work,
         "deviation_requires_reason": True,
@@ -2171,7 +2211,7 @@ def grabowski_agent_execution_route(
             "execution_authority",
             "candidate_correctness",
             "merge_readiness",
-            "permission_to_delegate_authoritative_implementation",
+            "work_lane_acquired",
             "need_for_external_agents",
         ],
     }

@@ -225,7 +225,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_reconcile_stale` | agent-workspace | no | high | Mark one provably inactive stale workspace abandoned without stopping tasks, releasing resources or removing its checkout. |
 | `grabowski_agent_workspace_reconcile_idle_tmux` | agent-workspace | no | high | Remove only the exact non-authoritative idle tmux session from one provably inactive stale workspace, then invoke the existing non-destructive stale reconciliation. |
 | `grabowski_agent_workspace_cleanup` | agent-workspace | no | high | Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence. |
-| `grabowski_agent_execution_route` | agent-workspace | yes | low | Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates. |
+| `grabowski_agent_execution_route` | agent-workspace | yes | low | Expose the legacy execution-routing adapter over canonical controller or lane-scoped-writer routing, with optional advisory contrast candidates. |
 | `grabowski_coding_agent_catalog` | agent-workspace | yes | low | Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents. |
 | `grabowski_coding_agent_route` | agent-workspace | yes | low | Keep controller integration authoritative and recommend explicit lane-scoped writers or independent reviewers by role. |
 | `grabowski_agent_competition_start` | agent-workspace | no | medium | Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace. |

@@ -800,6 +800,13 @@ class CodingAgentRouterTests(unittest.TestCase):
                 self.assertEqual(result["decision"], "controller")
                 self.assertEqual(result["controller"], "grabowski-primary")
                 self.assertEqual(result["primary_role"], "controller-integrator")
+                self.assertEqual(result["routing_contract_version"], "agent-execution-fabric-routing-v1")
+                self.assertIn(result["executor"], {"controller", "scoped_writer"})
+                self.assertEqual(result["effect_profile"], "candidate")
+                self.assertEqual(result["verification_policy"], "independent_review")
+                self.assertEqual(result["integration_owner"], "controller")
+                self.assertEqual(result["decision_semantics"], "integration_owner_compatibility")
+                self.assertIn("flags", result["risk"])
                 self.assertFalse(result["direct_implementation_required"])
                 self.assertFalse(result["external_primary_writer_forbidden"])
                 self.assertTrue(result["controller_integration_required"])
@@ -815,6 +822,8 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(security["decision"], "controller")
         self.assertEqual(security["primary_role"], "controller-reviewer")
         self.assertTrue(security["direct_review_required"])
+        self.assertEqual(security["executor"], "controller")
+        self.assertEqual(security["verification_policy"], "independent_review")
         self.assertTrue(security["reviewers"][0]["review_capable"])
         self.assertFalse(security["authoritative_implementation_remains_direct"])
         self.assertFalse(security["scoped_writer_allowed"])
@@ -1209,6 +1218,19 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(result["scoped_writer_allowed"])
         self.assertIsNone(result["scoped_writer"])
         self.assertEqual(result["scoped_writer_status"], "controller-only")
+        self.assertEqual(result["executor"], "controller")
+        self.assertEqual(result["writer_route"], "grabowski-primary")
+
+    def test_verification_policy_is_an_independent_routing_axis(self) -> None:
+        deterministic = self._route("complex-patch", need_review=False)
+        self.assertEqual(deterministic["verification_policy"], "deterministic")
+        competition = self._route(
+            "complex-patch", need_review=False, verification_policy="competition"
+        )
+        self.assertEqual(competition["verification_policy"], "competition")
+        self.assertEqual(competition["executor"], deterministic["executor"])
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "need_review requires"):
+            self._route("complex-patch", need_review=True, verification_policy="competition")
 
     def test_request_validation_rejects_coercive_values(self) -> None:
         with self.assertRaisesRegex(router.CodingAgentRouterError, "boolean"):
@@ -1230,6 +1252,14 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(result["decision"], "controller")
         self.assertEqual(result["controller"], "grabowski-primary")
         self.assertEqual(result["primary_role"], "controller-integrator")
+        self.assertEqual(result["integration_owner"], "controller")
+        self.assertIn(result["executor"], {"controller", "scoped_writer"})
+        if result["executor"] == "scoped_writer":
+            self.assertEqual(result["writer_route"], result["scoped_writer"]["route"])
+        else:
+            self.assertEqual(result["writer_route"], "grabowski-primary")
+        self.assertEqual(result["effect_profile"], "candidate")
+        self.assertEqual(result["verification_policy"], "independent_review")
         self.assertFalse(result["direct_implementation_required"])
         self.assertFalse(result["external_primary_writer_forbidden"])
         self.assertTrue(result["capacity_fallback_to_external_writer"])
@@ -1266,6 +1296,7 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_module_exposes_both_read_only_tool_functions(self) -> None:
         self.assertTrue(callable(router.grabowski_coding_agent_catalog))
         self.assertTrue(callable(router.grabowski_coding_agent_route))
+        self.assertTrue(callable(router.canonical_execution_route))
 
 
 if __name__ == "__main__":
