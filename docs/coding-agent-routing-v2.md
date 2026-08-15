@@ -1,134 +1,208 @@
-# Coding-Agent-Routing v3 — Direct-first mit Review und Kontrast
+# Coding-Agent-Routing v4 — Agent Execution Fabric
 
-## Kanonische Regel
+## 1. Kanonische Regel
 
-ChatGPT/Grabowski führt jede autoritative Implementierung selbst aus. Das gilt unabhängig von Dateizahl, Laufzeit, Neuheit, Risiko oder vermutetem Arbeitsumfang. Große Arbeit wird zerlegt, isoliert, getestet und integriert, aber nicht wegen ihrer Größe an einen externen Writer abgegeben.
+Grabowski trennt Ausführungsautorität, Writerwahl und Verification.
 
-Externe Agents haben zwei zulässige Rollen:
+Die Autorität folgt nicht dem Modellnamen. Sie folgt der gebundenen Rolle und der Work Lane:
 
-1. **Review:** unabhängige Prüfung eines Plans, Diffs, Tests oder Ergebnisses.
-2. **Kontrastprogrammierung:** ein ausdrücklich angeforderter, isolierter Gegenentwurf oder Alternativpatch zum Vergleich.
+- `controller` plant, integriert, merged, deployt und schließt ab;
+- `scoped_writer` darf nur innerhalb einer explizit gebundenen Lane implementieren und testen;
+- `reviewer` arbeitet read-only und advisory;
+- `observer` liefert nur Evidenz.
 
-Beide Rollen sind beratend. Ein Agentenresultat wird niemals automatisch angewendet, ausgewählt, committet, gemergt oder deployt. ChatGPT/Grabowski prüft Befunde und Alternativen selbst und bleibt alleiniger Integrator.
+Für überlappenden Scope gibt es genau einen autoritativen mutierenden Writer. Disjunkte Work Lanes dürfen parallel laufen.
 
-Die maschinenlesbare Quellwahrheit für diese Doktrin liegt in `src/grabowski_operator_relay.py`. Runtime, Operator-Kontextgenerator und veröffentlichter Kontext lesen denselben Vertrag.
+Die Work Lane ist der Autoritäts- und Wirkungscontainer. Agent Workspace ist die Ausführungs- und Verification-Schicht innerhalb einer Lane. Solange lane-backed Workspaces noch nicht produktiv sind, darf der Legacy-Workspace diese Ownership nicht als zweite Wahrheit duplizieren.
 
-## Direkter Primärpfad
+## 2. Maschinenlesbare Quellwahrheit
 
-Für normale Coding-, Architektur-, Migrations-, Debug-, Test-, Dokumentations- und Betriebsaufgaben liefert `grabowski_coding_agent_route` stets:
+Die kanonische Routingimplementation liegt in `src/grabowski_coding_agent_router.py`:
 
-- `decision=controller`
-- `controller=grabowski-primary`
-- `primary_role=direct-writer`
-- `direct_implementation_required=true`
-- `external_primary_writer_forbidden=true`
-- `capacity_fallback_to_external_writer=false`
+- interne Implementierung: `canonical_execution_route`;
+- öffentliche Oberfläche: `grabowski_coding_agent_route`.
 
-Ein fehlender, veralteter oder katalogfremder Agentenstatus blockiert die direkte Arbeit nicht. Er kann lediglich verhindern, dass ein zusätzlicher externer Reviewer belastbar ausgewählt wird.
+`grabowski_agent_execution_route` in `src/grabowski_agent_competition.py` ist nur noch ein Kompatibilitätsadapter. Seine historische Workspace-/Kontrastbewertung darf keine eigene Executor-Autorität begründen.
 
-Die Operatorverantwortung umfasst Livezustand, Planung, Implementierung, Tests, Integration, Merge, Deployment und Abschluss. Der Router erteilt weiterhin keine automatische Ausführungs-, Merge- oder Deploymentautorität.
+Der Rollen- und Effektvertrag liegt ergänzend in `src/grabowski_operator_relay.py`. Er definiert dieselben vier Rollen und die controller-only Wirkungen. Er ist kein zweiter Router.
 
-## Externe Review-Routen
+## 3. Kanonische Routingachsen
 
-Auch explizite Review-Aufgaben wie `independent-review`, `critical-review` und `security-review` beginnen beim direkten ChatGPT/Grabowski-Review. Der Router kann danach einen provider- und lineage-unabhängigen externen Zusatzreviewer empfehlen. Ein fehlender oder gesperrter Agentenstatus blockiert den direkten Review nicht. Jeder externe Befund bleibt bis zur direkten Reproduktion oder anderweitigen Prüfung durch den Operator beratend.
+Jede aktuelle Routingentscheidung veröffentlicht unabhängig voneinander:
 
-Plan-Modus gilt global als Review-Modus: Jede Route mit `plan` als Permission- oder Approval-Modus muss `review_only=true` sein, mindestens eine als unabhängiger Review klassifizierte Aufgabe anbieten und darf keine Kontrastaufgabe enthalten.
+- `executor`: `controller` oder `scoped_writer`;
+- `writer_route`: konkrete Route, zum Beispiel `codex-sol-high`, oder `grabowski-primary` beim Controller;
+- `effect_profile`: in dieser Phase `candidate`;
+- `verification_policy`: `deterministic`, `independent_review` oder `competition`;
+- `risk`: normalisierte Risikoevidenz aus Flags, Neuheit und kritischer Taskklasse;
+- `task_class`.
 
-Claude Fable 5 ist pay-only. Die Route `claude-fable-5-review-high` bleibt katalogisiert, wird aber vom normalen kostenfreien Review-Ranking ausgeschlossen und erhält durch ihre bloße Existenz keine Ausführungsautorität. Claude Opus 4.8 bleibt plan-only und kann innerhalb des vorhandenen Claude-Kontingents weiterhin als Reviewer oder Urteilsinstanz gerankt werden.
+`effect_profile=delivery` ist absichtlich noch nicht freigeschaltet. Commit-/Push-/PR-Wirkungen des delegierten Writers gehören in die spätere Delivery-Phase und dürfen durch P0 nicht vorweggenommen werden.
 
-## Kontrastprogrammierung
+`verification_policy` ist keine Autoritätsklasse. Insbesondere macht `competition` aus einem Reviewer oder Vergleichskandidaten keinen Writer.
 
-Frühere externe Coding-Fähigkeiten heißen nun `contrast_capabilities`. Sie erlauben keinen Primär-Writer. Kontrastprogrammierung ist nur zulässig, wenn sie ausdrücklich angefordert wird und ein abgegrenzter Vergleich echten Erkenntnisgewinn verspricht.
+## 4. Controllerintegration versus Executor
 
-Der Ablauf ist:
+Der historische Schlüssel
 
-1. ChatGPT/Grabowski prüft den Livezustand und erstellt selbst Plan oder Kandidat.
-2. Höchstens zwei externe Kandidaten arbeiten isoliert als `contrast` oder `competitor`.
-3. Ihre Änderungen bleiben außerhalb des autoritativen Writerpfads.
-4. ChatGPT/Grabowski vergleicht, reproduziert und übernimmt nur nach eigener Prüfung einzelne Ideen oder Patches.
+`decision=controller`
 
-`grabowski_agent_execution_route` bleibt deshalb auch bei großen und riskanten Aufgaben auf `execution_mode=direct_operator`. Eine ausdrückliche Kontrastanforderung ergänzt lediglich beratende Kandidaten. Die konkrete Modell-/Harnesswahl stammt dabei nicht mehr aus einer zweiten providerbasierten Routinglogik: Der Coding-Agent-Katalog rankt konkrete `route_id`-Werte und veröffentlicht sie als `external_route_candidates`. Der kostenfreie Frontier-Standard ist `codex-sol-high`; der Selector rankt jedoch alle aktivierten, kontrastfähigen Katalogrouten nach Aufgabenfit, Qualität, Quota, Cooldown und adaptiver Historie. Dadurch können auch geeignete Agy-Routen als kostenfreie Fallbacks gewählt werden. Codex läuft über den vorhandenen `codexr`-Wrapper subscription-only, mit `max_budget_usd=0`, read-only Sandbox und einem expliziten `codex exec --output-schema`-Vertrag für das Candidate-JSON; routegebundene Agy-Candidates laufen mit ihrem exakten Katalog-`argv_prefix` im bestehenden `plan`-/`sandbox`-Vertrag ebenfalls mit `max_budget_usd=0`. Eine pay-only Route wie `claude-fable-5-contrast-high` wird nur bei ausdrücklicher Paid-Autorisierung und nur als explizit katalogisierte Paid-Ausnahme überhaupt in die Auswahl aufgenommen. Externe parallele Writer-Shards sind nicht zulässig.
+bleibt vorübergehend aus Kompatibilitätsgründen erhalten. Seine Semantik ist ausdrücklich:
 
-Ein kanonischer Candidate-Start über `grabowski_agent_competition_start` bindet die gewählte `route_id`, den Katalog-SHA-256, Harness, Modell, Effort, Permission-Modus, Quota-Pools und die Paid-Klassifikation in einen gehashten Route-Vertrag. Neue routegebundene Candidate-Packets, -Manifeste und -Receipts verwenden Schema 3. Historische providergebundene Schema-1/2-Artefakte bleiben lesbar; sie erhalten dadurch keine neue Route-Autorität.
+`decision_semantics=integration_owner_compatibility`
 
-Für Workspace-Routenevidenz bleibt außerdem die historische Policy `workspace-routing-v2.1` als eingefrorener Schema-2-Replaypfad erhalten. Sie dient nur der Lesbarkeit vorhandener Manifeste, Receipts und Shadow-Capture-Belege. Neue Workspace-Erzeugung verlangt ausdrücklich `direct-first-routing-v3.0`; ein historischer `full_workspace`-Beleg kann daher nicht als neue Ausführungsautorität wiederverwendet werden.
+Er bedeutet: Der Controller bleibt Integrator und Abschlussinstanz.
 
-## Fable-Routen
+Er bedeutet nicht: Der Controller muss jede Implementierung selbst schreiben.
 
-Die historische ID `claude-fable-5-high` bleibt als deaktivierter plan-only Kompatibilitätsalias sichtbar.
+Die tatsächliche Ausführungsentscheidung steht ausschließlich in `executor` und `writer_route`.
 
-Die zwischenzeitliche ID `claude-fable-5-writer-high` ist deaktiviert. Sie wird nicht mehr als Writer geroutet und verweist in ihrem `disabled_reason` auf die Direct-first-Doktrin.
+Damit sind diese Aussagen miteinander vereinbar:
 
-Der zulässige mutierende Vergleichspfad heißt `claude-fable-5-contrast-high`. Er verwendet `--safe-mode --permission-mode acceptEdits`, ist aber `contrast_only=true`, besitzt keine Writer-Autorität und darf ausschließlich in einem isolierten Vergleichsraum laufen. Die Route ist `paid_only=true`, wird nie automatisch gewählt und verlangt vor dem Start sowohl `paid_execution_authorized=true` als auch ein positives `max_budget_usd` innerhalb des separat konfigurierten External-Provider-Kostenlimits. Der Candidate-Runner übergibt dieses Limit zusätzlich als Claude-CLI-Hard-Budget.
+- `decision=controller`;
+- `integration_owner=controller`;
+- `executor=scoped_writer`;
+- `writer_route=codex-sol-high`;
+- `controller_integration_required=true`.
 
-Unabhängige Fable-Reviews sind weiterhin über `claude-fable-5-review-high` katalogisiert (`--permission-mode plan`, `review_only=true`), aber ebenfalls `paid_only=true` und deshalb vom normalen kostenfreien Reviewer-Ranking ausgeschlossen. Dieser PR führt keinen automatischen Paid-Review-Fallback ein.
+## 5. Writerwahl
 
-Die Zuordnung eines Fable-Routes zum Pool `claude-pro` dient ausschließlich der gemeinsamen Claude-Authentifizierungs-, Quota- und Concurrency-Abstammung. Die routeeigene Klassifikation `paid_only=true` überstimmt für die Ausführung die statische Nullkostenklassifikation dieses gemeinsamen Pools; Kostenautorität entsteht erst aus dem expliziten routegebundenen Budgetvertrag.
+Für nicht controller-eigene Taskklassen darf der Router einen `scoped_writer` wählen, wenn eine aktuelle, kataloggebundene und ausführbare Route vorhanden ist.
 
-## Abgeleitete Rollen
+Ist keine belastbare Writerroute verfügbar, fällt die konkrete Ausführung auf den Controller zurück. Das ist ein Verfügbarkeitsfallback, keine Rückkehr zur alten Direct-only-Doktrin.
 
-`route_role`, `direct_capable`, `writer_capable`, `contrast_capable` und `review_capable` werden aus Controllerstatus, Task-Klassen und einschränkenden Rollenflags abgeleitet.
+Die Policy bleibt deshalb:
 
-- Nur `grabowski-primary` ist direkt- und writer-fähig.
-- Externe Nicht-Review-Aufgaben erzeugen ausschließlich Kontrastfähigkeit.
-- Review-Routen erzeugen ausschließlich Reviewfähigkeit.
-- Externe Routen ohne Rollenflag werden für Nicht-Review-Taskklassen als Kontrastrouten behandelt. Unabhängige Review-Fähigkeit ist fail-closed und verlangt `review_only=true`; eine Route wird nie allein wegen historisch gemischter Taskklassen zum Reviewer.
-- `writer_only` ist als Katalogfeld stillgelegt und macht den Katalog ungültig.
+- `direct_implementation_required=false`;
+- `delegated_scoped_writers_allowed=true`;
+- `external_primary_writer_forbidden=false`;
+- `controller_integration_required=true`.
 
-Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für `--flag value` sowie `--flag=value` aus `argv_prefix` abgeleitet. Damit bleibt der Befehlsvertrag die einzige Wahrheit für den konkreten CLI-Modus.
+Controller-eigene Taskklassen, Integrationsarbeit, Merge, Deployment, Recovery und Closeout bleiben beim Controller.
 
-## Qualitäts- und Kostenhierarchie
+## 6. Work-Lane-Bindung
 
-Modellklassen ordnen nur noch Review- und Kontrastqualität, nicht die Autorenschaft:
+Eine Routingempfehlung allein erteilt keine Schreibautorität.
 
-- **S:** GPT-5.6 Sol high als bevorzugte kostenfreie Frontier-Kontrastroute; Claude Fable 5 nur als ausdrücklich autorisierte pay-only Kontrastroute; Sol xhigh als hochwertige Revieweskalation.
-- **A:** Claude Opus 4.8, Sol medium, Terra high, Sonnet 5 high und Grok 4.5 high.
-- **B:** Terra medium, Luna high, Sonnet 5 medium und Gemini 3.1 Pro high.
-- **C:** Flash-, GPT-OSS-, ältere Agy-Claude- und lokale oder unklare Fallbacks.
+Ein delegierter Writer wird erst autoritativ innerhalb seines Scopes, wenn eine Work Lane bindet:
 
-Jules ist ein verwalteter Remote-Harness; die Platzhalteridentität behauptet kein zugrunde liegendes Modell. API-Key-Fallbacks, unbekannte Kostenpfade und automatische PAYG-Fallbacks bleiben gesperrt. Ein ausdrücklich als `paid_only` katalogisierter Fable-Pfad ist die enge Ausnahme: Er erfordert eine separate Paid-Autorisierung, ein positives per-Aufruf-Budget und ein positives Runtime-Kostenlimit; ohne alle drei Bedingungen blockiert der Start vor dem Provider-Task.
+- Source;
+- Controller Actor;
+- Scoped Writer Actor;
+- Repository;
+- Base Head;
+- Branch;
+- Worktree;
+- Write Scope;
+- Resource Leases;
+- Checkout Lifecycle.
 
-`argv_prefix` bleibt in dieser Version die kanonische Befehlsquelle. Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für beide CLI-Schreibweisen (`--flag value` und `--flag=value`) validiert; der abgeleitete Wert erscheint als strukturiertes Feld `permission_mode` in Katalog- und Routingausgaben. Ein eigenständiges autoritatives Katalogfeld wäre eine separate Schemamigration und wird nicht neben dem bestehenden Befehlsvertrag als zweite Wahrheit eingeführt.
+Der gewünschte Prepare-only-Pfad ist:
 
-## Katalogauflösung ohne stille zweite Wahrheit
+`grabowski_work_acquire`
 
-`config/coding-agent-catalog.json` ist die redaktionelle Quellwahrheit. Der Runtime-Vertrag deklariert dieselbe Datei als `runtime_asset`; Deployment-Snapshot, Release-ID und Manifest binden sie per Pfad und SHA-256 an das unveränderliche Release. Der Router liest standardmäßig ausschließlich dieses releasegebundene `deployment_catalog`. `tools/build_coding_agent_catalog_data.py` erzeugt zusätzlich eine deterministische, hashgebundene Kopie in `src/grabowski_coding_agent_catalog_data.py`, die Generator- und Konsistenztests unterstützt, aber keine eigene Runtime-Autorität besitzt.
+mit gesetztem `scoped_writer_actor` und `scoped_writer_argv=None`.
 
-Eine alte Datei unter `%h/.config/grabowski/coding-agent-catalog.json` besitzt keine Routingautorität. Ein abweichender Katalog ist nur für kontrollierte Tests oder Diagnose zulässig, wenn **beide** Variablen gesetzt sind: `GRABOWSKI_CODING_AGENT_CATALOG=<pfad>` und `GRABOWSKI_CODING_AGENT_CATALOG_OVERRIDE=1`. Ein einzelner geerbter Pfadwert wird ignoriert. Status und `grabowski_contract_drift` veröffentlichen den tatsächlich gewählten Ursprung sowie die semantische Validierung; ein ungültiger ausdrücklicher Override setzt die Routing-Readiness fail-closed, ohne auf eine zweite Katalogwahrheit zurückzufallen.
+Dadurch besitzt die Lane bereits Checkout und Ressourcen, ohne einen zweiten Writer-Lifecycle zu starten.
 
-## Selbstlernen
+Bis der lane-backed Agent Workspace implementiert ist, darf `grabowski_agent_workspace_create` nicht als Ersatz für diese Lane-Ownership verwendet werden, weil der Legacy-Pfad eigene Ressourcen und Checkout-Lifecycle reserviert.
 
-Lokale Ergebnisse verändern die Rangfolge externer Review- und Kontrastrouten erst ab fünf vergleichbaren Läufen derselben Route und Aufgabenklasse. Verwendet werden First-Pass-, CI- und Merge-Erfolg, Nacharbeit, Rollbacks, falsche Behauptungen, Scope-Verstöße, Laufzeit und Kontingentverbrauch. Zugangstests zählen nie als Qualitätserfolg.
+## 7. Verification
 
-Selbstlernen kann keine externe Route zum autoritativen Writer machen und die Direct-first-Regel nicht überstimmen.
+Die drei Policies sind:
 
-## Sicherheit und Kosten
+### deterministic
 
-Automatische Agentenausführung bleibt deaktiviert. Review- und Kontrastempfehlungen sind beratend. Es gibt genau einen autoritativen mutierenden Writer: ChatGPT/Grabowski. Ein externer Candidate wird nur durch einen getrennten expliziten Start erzeugt; ein Routingresultat allein startet weder Codex noch Claude.
+Deterministische Tests und Prüfungen ohne zusätzlichen unabhängigen LLM-Reviewer.
 
-Statische Kosten-, PAYG-, Reserve- und Parallelitätspolitik stammt ausschließlich aus dem versionierten Katalog. Dynamischer Laufzeitstatus darf nur Verfügbarkeit, Restquote, Cooldown, aktive Sitzungen und Verifikationszeit ergänzen. Ungültige oder zukünftige Werte sperren die betroffene externe Route fail-closed, nicht die direkte Operatorarbeit. `zero_marginal_cost_only=true` bleibt für automatische Auswahl und historische provider-only Starts fail-closed wirksam; `zero_marginal_cost_only_scope` begrenzt diese Alt-Policy ausdrücklich auf `automatic-and-legacy-provider-only-routes`. Die einzige maschinenlesbare Paid-Ausnahme steht in `explicit_paid_route_exceptions` und muss exakt mit den `paid_contrast_routes` übereinstimmen. `paid_only=true` ist zusätzlich eine routeeigene Ausführungssperre: Ohne explizite Paid-Autorisierung wird die Route weder im normalen Ranking berücksichtigt noch als ausführbarer Route-Vertrag aufgelöst. Für kostenfreie Codex-Kontraste bleibt `max_budget_usd=0` obligatorisch; für Fable ist ein positives Budget obligatorisch.
+### independent_review
 
-Kontingentpools bilden eine Elternkette. Sperre, Erschöpfung, Cooldown, Reservegrenze, Parallelitätsgrenze oder Kostenunsicherheit eines Elternpools sperrt jede zugehörige externe Review- oder Kontrastroute.
+Deterministische Prüfungen plus unabhängiger read-only Review, wenn Aufgabe oder Risiko dies rechtfertigen.
 
-## Automatische Laufzeitstatus-Aktualisierung
+Explizite Review-Taskklassen wie `independent-review`, `critical-review` und `security-review` erzwingen diese Policy.
 
-Der dynamische Metadatenstand verfällt nach 3.600 Sekunden fail-closed nur für die Auswahl externer Zusatzreviewer und Kontrastkandidaten. `grabowski-coding-agent-probe.timer` erneuert ihn alle 45 Minuten mit höchstens drei Minuten Jitter. Der Scheduler startet zunächst ausschließlich `agent-route probe`; dieser Pfad liest Versions-, Auth- und Modellinventarmetadaten, führt aber keine Coding-, Review- oder Kontrastarbeit aus. Danach darf der Scheduler frische, ownergebundene Provider-Receipts lesen und ausschließlich über den bestehenden `set-quota`-Vertrag Restquote und Resetzeit ergänzen. Aktuell liefert nur Codex ein geeignetes Receipt mit `used_percent` und `resets_at`; andere Provider bleiben ohne gleichwertige Evidenz ausdrücklich opaque. Details und Bounds stehen in `docs/provider-quota-observability-v1.md`. Direkte Implementierung und direkter Review bleiben auch bei fehlender oder veralteter Probe verfügbar.
+### competition
 
-`agent-route` ist ein dünner, versionierter Wrapper auf das aktuelle Runtime-Modul `grabowski_coding_agent_router_cli`. `tools/install_coding_agent_router_cli.py` serialisiert den Cutover unter einem privaten exklusiven Installationslock, ersetzt Wrapper und SHA-256-Pin jeweils atomar, verlangt zuvor den eingebetteten Runtime-Katalog und nimmt beide Dateien bei fehlerhaftem Direct-first-Readback zurück. `coding_agent_probe_scheduler.py` öffnet den Wrapper ohne Symlink-Folge, prüft den Pin, entfernt bekannte API-Key-Variablen, begrenzt Laufzeit und Ausgabe und verlangt einen getrennten Status-Readback. Vorherige Historie muss strukturell erhalten bleiben. Der Probe-Receipt ist mit einem öffentlich domänenseparierten HMAC-SHA256 gebunden; dies dient deterministischer Typ- und Payloadtrennung, nicht Authentizität oder Passwortspeicherung. Ein fehlgeschlagener Probe-Lauf autorisiert nichts.
+Expliziter Vergleich mehrerer Kandidaten oder Ansätze. Competition bleibt ein Verification-/Vergleichsmodus. Sie ändert weder Lane-Ownership noch Integrationsautorität.
 
-Die Probe-Unit hängt nicht von einer Benutzerkopie des Katalogs ab. Ihre Startbedingungen prüfen ausschließlich den ausführbaren Metadatenpfad und dessen privaten SHA-256-Pin. Die versionierten Installationsquellen sind:
+Wenn `need_review=true` gesetzt ist, kann die Anfrage nicht gleichzeitig `verification_policy=competition` erzwingen. Widersprüchliche Fakten werden fail-closed abgewiesen.
 
-- `tools/agent-route`
-- `tools/install_coding_agent_router_cli.py`
-- `tools/coding_agent_probe_scheduler.py`
-- `systemd/grabowski-coding-agent-probe.service.example`
-- `systemd/grabowski-coding-agent-probe.timer.example`
+## 8. Legacy-Adapter
 
-Die Live-Ziele sind `%h/bin/agent-route`, `%h/.local/libexec/grabowski/coding_agent_probe_scheduler.py` und die Unit unter `%h/.config/systemd/user/`; der Wrapper-Pin liegt privat unter `%h/.config/grabowski/coding-agent-probe-scheduler-router.sha256`. Nur `%h/.local/state/grabowski/coding-agent-router` ist für den Dienst schreibbar. `MemoryMax=512M` und `TasksMax=50` begrenzen einen fehlerhaften Kindprozess. Der sichere Cutover lautet: geprüftes Runtime-Release aktivieren, Wrapper samt Pin installieren, Probe ausführen und Status sowie Direct-first-Empfehlung zurücklesen.
-## Kanonische Harness-Erweiterungen vom 24. Juli 2026
+`grabowski_agent_execution_route` bleibt vorübergehend lesbar, damit bestehende Workspace-Routenevidenz und Shadow-Kalibrierung nicht gebrochen werden.
 
-- `antigravity` ist die kanonische Google-Harness-Identität; das ausführbare CLI bleibt `agy`. Historische `agy`-Receipts bleiben lesbar, neue Routing-Evidenz verwendet `antigravity`.
-- `opencode` ist als mutierender, isolierter Kontrast-Harness aufgenommen. Die initiale Live-Route ist an `opencode/deepseek-v4-flash-free`, JSON-Ereignisse, `--pure` und `--auto` gebunden und wurde mit Kosten `0` live geprüft.
-- `openhands` ist als vollständiger mutierender Kontrast-Harness aufgenommen. Headless-Ausführung ist absichtlich an `--always-approve` gebunden. Diese Eigentümerentscheidung ersetzt keine Lease-, Worktree-, Review- oder Integrationsgrenze.
-- OpenHands bleibt bis zu einem live attestierten, kostenfreien oder abonnementsgebundenen Modellzugang fail-closed.
-- Die Direct-first-Autorität bleibt unverändert: Externe Ergebnisse sind bis zur Operatorprüfung beratend.
+Der Adapter ruft für die Autoritätsentscheidung `canonical_execution_route` auf und übernimmt daraus mindestens:
+
+- `executor`;
+- `writer_route`;
+- `effect_profile`;
+- `verification_policy`;
+- `risk`;
+- `integration_owner`;
+- `direct_implementation_required`;
+- `delegated_scoped_writers_allowed`;
+- `external_primary_writer_forbidden`;
+- `controller_integration_required`.
+
+Die historischen Felder `execution_mode`, `risk_tier`, `score`, `external_candidates` und `parallel_writer_pilot` bleiben nur für Legacy-Workspace-/Contrast-Replay bestehen.
+
+Der Adapter markiert deshalb:
+
+- `adapter_status=deprecated_compatibility_adapter`;
+- `execution_mode_deprecated=true`;
+- `execution_mode_scope=legacy_workspace_contrast_shape_only_not_executor_authority`.
+
+Ein Wert wie `execution_mode=direct_operator` darf damit nicht mehr als Aussage über den kanonischen `executor` gelesen werden.
+
+## 9. Review- und Kontrastrouten
+
+Plan-/Review-Routen bleiben read-only. Eine Route mit planartigem Permission-Modus darf nicht stillschweigend Writerautorität erhalten.
+
+Kontrastrouten dürfen mutierende Kandidaten in ihrem isolierten Vergleichspfad erzeugen, wenn der bestehende Competition-Vertrag dies erlaubt. Diese Kandidaten bleiben advisory, bis der Controller sie in einen autoritativen Lane-/Candidate-Pfad übernimmt.
+
+Das ist von einem echten `scoped_writer` zu unterscheiden: Ein lane-gebundener Scoped Writer ist innerhalb seiner Lane autoritativ für die delegierte Implementierung, aber nicht für Integration, Merge, Deployment oder Closeout.
+
+## 10. Kosten und Verfügbarkeit
+
+Modell- und Harnessqualität beeinflusst die konkrete Writer- oder Reviewerroute, nicht die Autorität.
+
+Der Katalog bleibt fail-closed für:
+
+- unbekannte oder verbotene Kostenpfade;
+- PAYG-Fallbacks ohne Freigabe;
+- erschöpfte oder stale Quota-Evidenz;
+- ungültige Route-/Permission-Verträge.
+
+Subscription-gebundene, aktuell attestierte Routen dürfen im vorhandenen Kontingent gerankt werden. Paid-only Routen benötigen weiterhin die bestehende explizite Kostenautorisierung.
+
+Ein fehlerhafter externer Status darf keine falsche Writerroute erzeugen. Wenn keine belastbare Writerroute übrig bleibt, ist `executor=controller` der sichere Fallback.
+
+## 11. Noch nicht durch P0 implementiert
+
+P0 behauptet ausdrücklich noch nicht:
+
+- lane-backed Agent Workspace;
+- getrennten Execution-Close/Lane-Close;
+- offiziellen Candidate-Receipt;
+- Candidate-Digest-Bindung für Test, Review und Integration;
+- Revision Rounds;
+- automatische Happy-Path-Komposition bis `integration_ready`;
+- Delivery-Profil für Writer-Commit/Push/PR;
+- Outcome-Learning für Controller-versus-Scoped-Writer.
+
+Diese Funktionen müssen auf bestehenden Lane-, Workspace-, Task- und Governor-Komponenten aufbauen und dürfen keinen zweiten Lifecycle- oder StateStore einführen.
+
+## 12. Invarianten
+
+P0 gilt nur dann als korrekt, wenn für dieselben Routingfacts kein öffentliches Interface gleichzeitig behauptet:
+
+- Delegation sei verboten, und
+- lane-gebundene Delegation sei erlaubt.
+
+Die kanonische Autoritätsaussage lautet:
+
+- Controller bleibt Integrator;
+- Implementierung kann an genau einen lane-gebundenen Scoped Writer delegiert werden;
+- Verification ist eine eigene Achse;
+- ein Routingresultat allein erzeugt weder Work Lane noch Writerwirkung;
+- Merge, Deployment und finaler Lane-Close bleiben Controllerwirkungen.

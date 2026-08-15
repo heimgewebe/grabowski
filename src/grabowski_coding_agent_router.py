@@ -35,6 +35,7 @@ CLAUDE_PLAN_TYPES = {"pro", "max", "team", "enterprise"}
 QUALITY_CLASSES = {"S", "A", "B", "C", "HARNESS", "CONTROLLER"}
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 PAID_ONLY_MODEL_IDS = frozenset({"claude-fable-5"})
+VERIFICATION_POLICIES = frozenset({"deterministic", "independent_review", "competition"})
 POOL_STATUSES = {
     "unknown",
     "available",
@@ -1858,8 +1859,7 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
     return {**body, "inventory_sha256": _canonical_sha256(body)}
 
 
-@mcp.tool(name="grabowski_coding_agent_route", annotations=READ_ONLY)
-def grabowski_coding_agent_route(
+def canonical_execution_route(
     task_class: str,
     changed_files: int = 1,
     duration_minutes: int = 30,
@@ -1867,8 +1867,9 @@ def grabowski_coding_agent_route(
     risk_flags: list[str] | None = None,
     latency_priority: bool = False,
     need_review: bool = False,
+    verification_policy: str | None = None,
 ) -> dict[str, Any]:
-    """Keep controller integration authoritative while allowing lane-scoped writers."""
+    """Return the single canonical execution-routing decision."""
     catalog, validation = _load_catalog()
     (
         task_value,
@@ -1894,7 +1895,28 @@ def grabowski_coding_agent_route(
     controller_owned = set(catalog["policy"].get("controller_owned_task_classes", []))
     task = catalog["task_classes"].get(task_value)
     direct_review_task = bool(task and task.get("independent_review") is True)
-    external_review_requested = direct_review_task or review_value
+    if verification_policy is not None and (
+        not isinstance(verification_policy, str)
+        or verification_policy not in VERIFICATION_POLICIES
+    ):
+        raise CodingAgentRouterError(
+            "verification_policy must be deterministic, independent_review or competition"
+        )
+    if direct_review_task:
+        if verification_policy not in (None, "independent_review"):
+            raise CodingAgentRouterError(
+                "independent review task requires verification_policy=independent_review"
+            )
+        verification_policy_value = "independent_review"
+    elif review_value:
+        if verification_policy not in (None, "independent_review"):
+            raise CodingAgentRouterError(
+                "need_review requires verification_policy=independent_review"
+            )
+        verification_policy_value = "independent_review"
+    else:
+        verification_policy_value = verification_policy or "deterministic"
+    external_review_requested = verification_policy_value == "independent_review"
     review_task_class = task_value if direct_review_task else "independent-review"
     common = {
         "changed_files": changed_value,
@@ -1906,6 +1928,7 @@ def grabowski_coding_agent_route(
     input_value = {
         **common,
         "need_review": review_value,
+        "verification_policy": verification_policy_value,
     }
 
     scoped_writer_allowed = not direct_review_task and task_value not in controller_owned
@@ -2010,16 +2033,48 @@ def grabowski_coding_agent_route(
         reason = "controller-owned task class"
     else:
         reason = "controller integration is canonical; implementation may be delegated to a scoped writer"
+    executor = (
+        "scoped_writer"
+        if scoped_writer_allowed and scoped_writer is not None
+        else "controller"
+    )
+    writer_route = (
+        str(scoped_writer["route"])
+        if executor == "scoped_writer" and scoped_writer is not None
+        else controller_id
+    )
+    if executor == "scoped_writer":
+        executor_reason = "eligible lane-scoped writer selected; controller remains integrator"
+    elif direct_review_task:
+        executor_reason = "review task is controller-owned; external review remains advisory"
+    elif task_value in controller_owned:
+        executor_reason = "task class is controller-owned"
+    else:
+        executor_reason = f"no eligible scoped writer selected ({scoped_writer_status}); controller fallback"
+    risk = {
+        "flags": flags,
+        "novelty": novelty_value,
+        "critical_task_class": bool(task and task.get("critical") is True),
+    }
     body = {
         "schema_version": 2,
+        "routing_contract_version": "agent-execution-fabric-routing-v1",
         "decision": "controller",
+        "decision_semantics": "integration_owner_compatibility",
+        "integration_owner": "controller",
+        "executor": executor,
+        "writer_route": writer_route,
+        "effect_profile": "candidate",
+        "verification_policy": verification_policy_value,
+        "risk": risk,
+        "executor_reason": executor_reason,
         "catalog_sha256": validation["catalog_sha256"],
         "task_class": task_value,
         "primary_role": primary_role,
         "controller": controller_id,
         "reason": reason,
         "input": input_value,
-        "direct_work_required": False,
+        "direct_work_required": executor == "controller" and not direct_review_task,
         "direct_review_required": direct_review_task,
         "direct_implementation_required": False,
         "controller_integration_required": True,
@@ -2057,7 +2112,7 @@ def grabowski_coding_agent_route(
         "single_mutating_writer": True,
         "single_mutating_writer_scope": "overlapping-resource-lane",
         "single_authoritative_mutating_writer": True,
-        "authoritative_implementation_remains_direct": False,
+        "authoritative_implementation_remains_direct": executor == "controller" and not direct_review_task,
         "delegated_writer_artifacts_require_controller_integration": True,
         "final_integrator": catalog["policy"]["final_integrator"],
         "automatic_execution_authorized": True,
@@ -2076,3 +2131,27 @@ def grabowski_coding_agent_route(
         ],
     }
     return {**body, "recommendation_sha256": _canonical_sha256(body)}
+
+
+@mcp.tool(name="grabowski_coding_agent_route", annotations=READ_ONLY)
+def grabowski_coding_agent_route(
+    task_class: str,
+    changed_files: int = 1,
+    duration_minutes: int = 30,
+    novelty: str = "medium",
+    risk_flags: list[str] | None = None,
+    latency_priority: bool = False,
+    need_review: bool = False,
+    verification_policy: str | None = None,
+) -> dict[str, Any]:
+    """Route execution canonically as controller or lane-scoped writer plus verification policy."""
+    return canonical_execution_route(
+        task_class,
+        changed_files=changed_files,
+        duration_minutes=duration_minutes,
+        novelty=novelty,
+        risk_flags=risk_flags,
+        latency_priority=latency_priority,
+        need_review=need_review,
+        verification_policy=verification_policy,
+    )

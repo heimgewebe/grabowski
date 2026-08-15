@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2c0f83d283c064d06b2613a662a6d23e589699082381288431163aaa4b2322fc",
+  "capability_source_sha256": "1620ad4b5d93a3859047ab9c1b7d91125ac5821121a25721733197a570397946",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "368227a78cc845bdc667e0965cca7e572c5aeea045e3ffb12723c3b31c1a4e5a",
   "integrity": {
@@ -2400,10 +2400,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Keep implementation direct and optionally recommend advisory contrast.",
+      "description": "Compatibility adapter over canonical execution routing plus legacy contrast advice.",
       "effects": [],
       "id": "grabowski_agent_execution_route",
-      "purpose": "Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates.",
+      "purpose": "Expose the legacy execution-routing adapter over canonical controller or lane-scoped-writer routing, with optional advisory contrast candidates.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -2422,7 +2422,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Keep controller integration authoritative while allowing lane-scoped writers.",
+      "description": "Route execution canonically as controller or lane-scoped writer plus verification policy.",
       "effects": [],
       "id": "grabowski_coding_agent_route",
       "purpose": "Keep controller integration authoritative and recommend explicit lane-scoped writers or independent reviewers by role.",
