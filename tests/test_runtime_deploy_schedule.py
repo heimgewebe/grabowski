@@ -420,9 +420,22 @@ class _FakeProductionRuntime:
         return self._step(
             "platform_publication",
             {
-                "state": "publication_pending",
-                "obligation_id": "goo-platform-catalog-convergence-test",
+                "state": "pending_activation",
+                "request_id": "gpp-test-request",
+                "contract": {"tool_contract_sha256": "7e" * 32},
             },
+        )
+
+    def activate_platform_publication(self):
+        return self._step(
+            "publication_activation",
+            {"state": "publication_pending", "request_id": "gpp-test-request"},
+        )
+
+    def rollback_platform_publication(self):
+        return self._step(
+            "publication_rollback",
+            {"state": "rolled_back", "request_id": "gpp-test-request"},
         )
 
     def close_blue_mutations(self):
@@ -539,6 +552,13 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
     def test_post_switch_failure_is_unknown_without_blind_rollback(self) -> None:
         runtime = _FakeProductionRuntime(fail_phase="rebind")
+        result = self._run(runtime)
+        self.assertEqual(result["outcome"], "outcome_unknown")
+        self.assertEqual(runtime.rollback_calls, 0)
+        self.assertTrue(runtime.connector_switched)
+
+    def test_publication_activation_failure_after_switch_is_outcome_unknown(self) -> None:
+        runtime = _FakeProductionRuntime(fail_phase="publication_activation")
         result = self._run(runtime)
         self.assertEqual(result["outcome"], "outcome_unknown")
         self.assertEqual(runtime.rollback_calls, 0)

@@ -5491,6 +5491,24 @@ def _runtime_tool_contract_summary(
         "platform_publication_pending": bool(
             client_snapshot.get("platform_publication_pending")
         ),
+        "platform_publication_state": client_snapshot.get(
+            "platform_publication_state"
+        ),
+        "platform_publication_request_id": client_snapshot.get(
+            "platform_publication_request_id"
+        ),
+        "platform_publication_contract_sha256": client_snapshot.get(
+            "platform_publication_contract_sha256"
+        ),
+        "platform_observation_scope": client_snapshot.get(
+            "platform_observation_scope"
+        ),
+        "platform_observation_id": client_snapshot.get("platform_observation_id"),
+        "platform_missing_tools": client_snapshot.get("platform_missing_tools", []),
+        "platform_extra_tools": client_snapshot.get("platform_extra_tools", []),
+        "platform_schema_mismatches": client_snapshot.get(
+            "platform_schema_mismatches", []
+        ),
         "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
         "client_snapshot_verification_model": client_snapshot.get("verification_model"),
         "refresh_required_when_client_count_or_hash_differs": True,
@@ -5633,6 +5651,11 @@ def _operator_system_overview(
         and platform_connector_snapshot_fresh
         and platform_connector_snapshot_matched
     )
+    platform_publication_state = client_snapshot.get("platform_publication_state")
+    platform_publication_ready = (
+        platform_publication_state == "platform_converged"
+        and client_snapshot.get("platform_publication_pending") is False
+    )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
     truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
@@ -5646,7 +5669,7 @@ def _operator_system_overview(
     operator_ready = (
         runtime_healthy
         and coding_agent_catalog_ready
-        and platform_connector_snapshot_ready
+        and platform_publication_ready
         and truth_model_ready
         and components_observable
     )
@@ -5661,11 +5684,11 @@ def _operator_system_overview(
                 "bind the current connector client snapshot",
             )
         )
-    elif not platform_connector_snapshot_ready:
+    elif not platform_publication_ready:
         next_action = str(
             client_snapshot.get(
                 "recommended_next_action",
-                "bind a platform connector snapshot to establish published tool visibility",
+                "complete the semantic platform publication lifecycle",
             )
         )
     elif not tasks.get("available"):
@@ -5711,6 +5734,16 @@ def _operator_system_overview(
             ),
             "freshness": "current bounded scan",
         },
+        "platform_publication": {
+            "authority": "user-owned immutable platform publication journal",
+            "observation_state": platform_publication_state,
+            "request_id": client_snapshot.get("platform_publication_request_id"),
+            "contract_sha256": client_snapshot.get(
+                "platform_publication_contract_sha256"
+            ),
+            "pending": client_snapshot.get("platform_publication_pending"),
+            "freshness": "semantic convergence persists until the tool contract changes",
+        },
         "platform_connector_catalog": {
             "authority": "trusted platform connector catalog snapshot",
             "observation_state": client_snapshot.get("platform_evidence_state"),
@@ -5755,12 +5788,6 @@ def _operator_system_overview(
         },
     }
     component_map_snapshot = dict(client_snapshot)
-    component_map_snapshot["fresh"] = client_snapshot.get(
-        "platform_connector_snapshot_fresh", client_snapshot.get("fresh")
-    )
-    component_map_snapshot["matched"] = client_snapshot.get(
-        "platform_connector_snapshot_matched", client_snapshot.get("matched")
-    )
     component_map = grabowski_system_map.build_component_map(
         runtime_healthy=runtime_healthy, client_snapshot=component_map_snapshot, coding_agent_catalog=coding_agent_catalog, tasks=tasks, leases=leases, obligations=obligations, source_registry=source_registry,
     )
@@ -5771,6 +5798,8 @@ def _operator_system_overview(
             "runtime_ready": runtime_healthy,
             "coding_agent_catalog_ready": coding_agent_catalog_ready,
             "connector_snapshot_ready": platform_connector_snapshot_ready,
+            "platform_publication_ready": platform_publication_ready,
+            "platform_publication_state": platform_publication_state,
             "truth_model_ready": truth_model_ready,
             "components_observable": components_observable,
         },
@@ -5797,6 +5826,24 @@ def _operator_system_overview(
             ),
             "platform_publication_pending": client_snapshot.get(
                 "platform_publication_pending"
+            ),
+            "platform_publication_state": client_snapshot.get(
+                "platform_publication_state"
+            ),
+            "platform_publication_request_id": client_snapshot.get(
+                "platform_publication_request_id"
+            ),
+            "platform_publication_contract_sha256": client_snapshot.get(
+                "platform_publication_contract_sha256"
+            ),
+            "platform_observation_scope": client_snapshot.get(
+                "platform_observation_scope"
+            ),
+            "platform_observation_id": client_snapshot.get("platform_observation_id"),
+            "platform_missing_tools": client_snapshot.get("platform_missing_tools", []),
+            "platform_extra_tools": client_snapshot.get("platform_extra_tools", []),
+            "platform_schema_mismatches": client_snapshot.get(
+                "platform_schema_mismatches", []
             ),
             "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
             "platform_snapshot": client_snapshot.get("platform_snapshot"),
@@ -5961,12 +6008,11 @@ def grabowski_status(
                 "complete a fresh transport roundtrip before mutation",
             )
         )
-    elif not bool(client_snapshot.get("platform_connector_snapshot_observable")):
-        platform_snapshot = client_snapshot.get("platform_snapshot")
+    elif client_snapshot.get("platform_publication_state") != "platform_converged":
         recommended_next_action = str(
-            (platform_snapshot if isinstance(platform_snapshot, dict) else {}).get(
+            client_snapshot.get(
                 "recommended_next_action",
-                "capture authoritative platform connector publication evidence",
+                "complete the semantic platform publication lifecycle",
             )
         )
     elif system_overview is not None:
@@ -6016,6 +6062,24 @@ def grabowski_status(
             ),
             "platform_publication_pending": tool_contract.get(
                 "platform_publication_pending"
+            ),
+            "platform_publication_state": tool_contract.get(
+                "platform_publication_state"
+            ),
+            "platform_publication_request_id": tool_contract.get(
+                "platform_publication_request_id"
+            ),
+            "platform_publication_contract_sha256": tool_contract.get(
+                "platform_publication_contract_sha256"
+            ),
+            "platform_observation_scope": tool_contract.get(
+                "platform_observation_scope"
+            ),
+            "platform_observation_id": tool_contract.get("platform_observation_id"),
+            "platform_missing_tools": tool_contract.get("platform_missing_tools", []),
+            "platform_extra_tools": tool_contract.get("platform_extra_tools", []),
+            "platform_schema_mismatches": tool_contract.get(
+                "platform_schema_mismatches", []
             ),
             "client_snapshot": client_snapshot,
             "refresh_required_when_client_count_or_hash_differs": tool_contract.get(

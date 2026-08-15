@@ -5055,19 +5055,74 @@ class ProductionBlueGreenRuntime:
         self.green_readiness = readiness
         return readiness
 
+    def _blue_platform_publication_contract(self) -> dict[str, Any]:
+        if self.source_complete_schema_sha256 is None:
+            core.fail(
+                "Blue complete schema identity is unavailable for platform publication recovery",
+                phase="platform-publication-preflight",
+            )
+        return client_snapshot._platform_publication_contract(
+            registered_tool_count=len(self.snapshot.contract.expected_tools),
+            registered_names_sha256=self.blue_binding["registered_names_sha256"],
+            complete_schema_count=len(self.snapshot.contract.expected_tools),
+            complete_schema_sha256=self.source_complete_schema_sha256,
+        )
+
     def prepare_platform_publication(self) -> dict[str, Any]:
         if self.green_readiness is None:
             core.fail(
                 "Green readiness is unavailable for platform publication preparation",
                 phase="platform-publication-preflight",
             )
-        result = client_snapshot.reconcile_platform_publication_for_runtime(
+        result = client_snapshot.prepare_platform_publication_for_runtime(
             registered_tool_count=len(self.snapshot.contract.expected_tools),
             registered_names_sha256=self.green_binding["registered_names_sha256"],
-            schema_sha256_by_tool=self.green_readiness.get("schema_sha256_by_tool"),
+            complete_schema_count=self.green_readiness["complete_schema_count"],
+            complete_schema_sha256=self.green_readiness["complete_schema_sha256"],
+            cutover_id=self.cutover_id,
         )
         self.platform_publication = result
         return result
+
+    def activate_platform_publication(self) -> dict[str, Any]:
+        publication = self.platform_publication
+        if not isinstance(publication, dict):
+            core.fail(
+                "Platform publication preflight evidence is unavailable",
+                phase="platform-publication-activation",
+            )
+        request_id = publication.get("request_id")
+        if request_id is None:
+            return {
+                "state": publication.get("state"),
+                "request_id": None,
+                "activation_required": False,
+            }
+        if publication.get("state") != "pending_activation":
+            return {
+                "state": publication.get("state"),
+                "request_id": request_id,
+                "activation_required": False,
+            }
+        activated = client_snapshot.activate_platform_publication_request(
+            request_id=request_id
+        )
+        self.platform_publication = {**publication, "activation": activated}
+        return activated
+
+    def rollback_platform_publication(self) -> dict[str, Any]:
+        publication = self.platform_publication
+        if (
+            not isinstance(publication, dict)
+            or publication.get("state") != "pending_activation"
+            or publication.get("reused") is True
+            or publication.get("request_id") is None
+        ):
+            return {"state": "no_prepared_request_effect"}
+        return client_snapshot.rollback_platform_publication_request(
+            request_id=publication["request_id"],
+            active_contract=self._blue_platform_publication_contract(),
+        )
 
     def close_blue_mutations(self) -> dict[str, Any]:
         if self.deployment_source_identity_sha256 is None:
@@ -5901,7 +5956,12 @@ def run_production_blue_green_cutover(
                 phase=phase,
                 details={
                     "state": platform_publication.get("state"),
-                    "obligation_id": platform_publication.get("obligation_id"),
+                    "request_id": platform_publication.get("request_id"),
+                    "contract_sha256": (
+                        platform_publication.get("contract", {}).get("tool_contract_sha256")
+                        if isinstance(platform_publication.get("contract"), dict)
+                        else None
+                    ),
                 },
             )
             phase = "pre_cutover_ready"
@@ -5917,6 +5977,17 @@ def run_production_blue_green_cutover(
             )
             phase = "cutover"
             selector_switch = context.switch_connector()
+            phase = "platform_publication_activation"
+            publication_activation = context.activate_platform_publication()
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "state": publication_activation.get("state"),
+                    "request_id": publication_activation.get("request_id"),
+                },
+            )
+            phase = "snapshot_rebind"
             snapshot_rebind = context.rebind_snapshot(identifier, 1)
             _blue_green_observation(
                 observations,
@@ -5963,6 +6034,7 @@ def run_production_blue_green_cutover(
             else:
                 try:
                     rollback = context.rollback_green()
+                    publication_rollback = context.rollback_platform_publication()
                     outcome = "rolled_back"
                     phase = "rolled_back"
                     readback = context.authoritative_readback()
@@ -5970,6 +6042,7 @@ def run_production_blue_green_cutover(
                         "action": "retry_from_clean_blue",
                         "blue_preserved": True,
                         "rollback": rollback,
+                        "platform_publication_rollback": publication_rollback,
                         "error": error,
                     }
                 except Exception as rollback_error:
