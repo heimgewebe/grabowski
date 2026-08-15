@@ -756,8 +756,11 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
                 self.base._TRANSPORT_REQUEST_MAC_HEADER: "3" * 64,
             }
         )
-        with mock.patch.object(
-            self.base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+        with (
+            mock.patch.object(
+                self.base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+            mock.patch.object(self.base.time, "time", return_value=100),
         ):
             projected = self.base._transport_roundtrip_status(context)
 
@@ -788,11 +791,133 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
         ):
             projected = self.base._transport_roundtrip_status(context)
 
-        self.assertEqual(projected["normal_mutation_path"], "legacy_roundtrip")
+        self.assertEqual(projected["normal_mutation_path"], "signed_one_call")
         self.assertFalse(projected["normal_mutation_path_ready"])
-        self.assertTrue(projected["legacy_roundtrip_required"])
+        self.assertFalse(projected["legacy_roundtrip_required"])
         self.assertEqual(
             projected["signed_one_call"]["state"], "runtime_binding_mismatch"
+        )
+        self.assertEqual(
+            projected["recommended_next_action"],
+            "converge signed ingress to the current runtime",
+        )
+
+    def test_status_projection_does_not_mask_broken_signed_ingress_with_ready_legacy(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        self.require_identity()
+        context = self.context(self.TOKEN_A)
+        scope = self.base._transport_roundtrip_client_scope(context)
+        intent = {"tool_name": "write", "arguments_sha256": "d" * 64}
+        begun = roundtrip.begin(
+            client_scope=scope,
+            runtime_binding=BINDING,
+            mutation_intent=intent,
+        )
+        verified = roundtrip.acknowledge(
+            client_scope=scope,
+            challenge_receipt_sha256=begun["challenge_receipt_sha256"],
+            runtime_binding=BINDING,
+        )
+        self.assertTrue(verified["mutation_gate_open"])
+        context.request_context.request.headers.update(
+            {
+                self.base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+                self.base._TRANSPORT_REQUEST_ID_HEADER: "1" * 32,
+                self.base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: "100",
+                self.base._TRANSPORT_REQUEST_AUDIENCE_HEADER: assertion.ASSERTION_AUDIENCE,
+                self.base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: "2" * 64,
+                self.base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: "f" * 64,
+                self.base._TRANSPORT_REQUEST_MAC_HEADER: "3" * 64,
+            }
+        )
+        with mock.patch.object(
+            self.base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+        ):
+            projected = self.base._transport_roundtrip_status(context)
+
+        self.assertTrue(projected["mutation_gate_open"])
+        self.assertEqual(projected["normal_mutation_path"], "signed_one_call")
+        self.assertFalse(projected["normal_mutation_path_ready"])
+        self.assertFalse(projected["legacy_roundtrip_required"])
+        self.assertEqual(
+            projected["signed_one_call"]["state"], "runtime_binding_mismatch"
+        )
+
+    def test_status_projection_rejects_stale_signed_one_call(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        self.require_identity()
+        context = self.context(self.TOKEN_A)
+        context.request_context.request.headers.update(
+            {
+                self.base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+                self.base._TRANSPORT_REQUEST_ID_HEADER: "1" * 32,
+                self.base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: "100",
+                self.base._TRANSPORT_REQUEST_AUDIENCE_HEADER: assertion.ASSERTION_AUDIENCE,
+                self.base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: "2" * 64,
+                self.base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: assertion.runtime_binding_sha256(
+                    BINDING
+                ),
+                self.base._TRANSPORT_REQUEST_MAC_HEADER: "3" * 64,
+            }
+        )
+        with (
+            mock.patch.object(
+                self.base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+            mock.patch.object(
+                self.base.time,
+                "time",
+                return_value=100 + assertion.ASSERTION_MAX_AGE_SECONDS + 1,
+            ),
+        ):
+            projected = self.base._transport_roundtrip_status(context)
+
+        self.assertEqual(projected["normal_mutation_path"], "signed_one_call")
+        self.assertFalse(projected["normal_mutation_path_ready"])
+        self.assertFalse(projected["legacy_roundtrip_required"])
+        self.assertEqual(
+            projected["signed_one_call"]["state"], "assertion_freshness_invalid"
+        )
+        self.assertEqual(
+            projected["signed_one_call"]["reason"], "transport assertion is stale"
+        )
+
+    def test_status_projection_rejects_future_signed_one_call(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        self.require_identity()
+        context = self.context(self.TOKEN_A)
+        context.request_context.request.headers.update(
+            {
+                self.base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+                self.base._TRANSPORT_REQUEST_ID_HEADER: "1" * 32,
+                self.base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: str(
+                    100 + assertion.ASSERTION_CLOCK_SKEW_SECONDS + 1
+                ),
+                self.base._TRANSPORT_REQUEST_AUDIENCE_HEADER: assertion.ASSERTION_AUDIENCE,
+                self.base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: "2" * 64,
+                self.base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: assertion.runtime_binding_sha256(
+                    BINDING
+                ),
+                self.base._TRANSPORT_REQUEST_MAC_HEADER: "3" * 64,
+            }
+        )
+        with (
+            mock.patch.object(
+                self.base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+            mock.patch.object(self.base.time, "time", return_value=100),
+        ):
+            projected = self.base._transport_roundtrip_status(context)
+
+        self.assertEqual(projected["normal_mutation_path"], "signed_one_call")
+        self.assertFalse(projected["normal_mutation_path_ready"])
+        self.assertFalse(projected["legacy_roundtrip_required"])
+        self.assertEqual(
+            projected["signed_one_call"]["state"], "assertion_freshness_invalid"
+        )
+        self.assertEqual(
+            projected["signed_one_call"]["reason"],
+            "transport assertion timestamp is from the future",
         )
 
 

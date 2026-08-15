@@ -206,6 +206,32 @@ def assertion_material(
     }
 
 
+def validate_assertion_freshness(
+    *,
+    issued_at_unix: int,
+    now_unix: int | None = None,
+) -> int:
+    """Validate the shared signed-assertion clock window without consuming it."""
+    if (
+        isinstance(issued_at_unix, bool)
+        or not isinstance(issued_at_unix, int)
+        or issued_at_unix < 0
+    ):
+        raise TransportAssertionError("transport assertion timestamp is invalid")
+    now = int(time.time()) if now_unix is None else now_unix
+    if isinstance(now, bool) or not isinstance(now, int) or now < 0:
+        raise TransportAssertionError(
+            "transport assertion observation timestamp is invalid"
+        )
+    if issued_at_unix > now + ASSERTION_CLOCK_SKEW_SECONDS:
+        raise TransportAssertionError(
+            "transport assertion timestamp is from the future"
+        )
+    if now - issued_at_unix > ASSERTION_MAX_AGE_SECONDS:
+        raise TransportAssertionError("transport assertion is stale")
+    return now
+
+
 def assertion_mac(
     *,
     secret: str,
@@ -1032,17 +1058,10 @@ def consume_assertion(
     )
     if material["audience"] != ASSERTION_AUDIENCE:
         raise TransportAssertionError("transport assertion audience mismatch")
-    now = int(time.time()) if now_unix is None else now_unix
-    if isinstance(now, bool) or not isinstance(now, int) or now < 0:
-        raise TransportAssertionError(
-            "transport assertion observation timestamp is invalid"
-        )
-    if issued_at_unix > now + ASSERTION_CLOCK_SKEW_SECONDS:
-        raise TransportAssertionError(
-            "transport assertion timestamp is from the future"
-        )
-    if now - issued_at_unix > ASSERTION_MAX_AGE_SECONDS:
-        raise TransportAssertionError("transport assertion is stale")
+    now = validate_assertion_freshness(
+        issued_at_unix=issued_at_unix,
+        now_unix=now_unix,
+    )
     supplied_mac = _sha256(mac_sha256, "transport assertion MAC")
     expected_mac = hmac.new(
         _secret_bytes(secret), _canonical_bytes(material), hashlib.sha256

@@ -5237,6 +5237,24 @@ def _transport_signed_one_call_status(
             "recommended_next_action": "repair signed ingress assertion forwarding",
             "does_not_establish": ["future mutation authority"],
         }
+    try:
+        observed_at_unix = int(time.time())
+        grabowski_transport_assertion.validate_assertion_freshness(
+            issued_at_unix=issued_at_unix,
+            now_unix=observed_at_unix,
+        )
+    except grabowski_transport_assertion.TransportAssertionError as exc:
+        return {
+            "schema_version": 1,
+            "state": "assertion_freshness_invalid",
+            "observed": True,
+            "ready": False,
+            "reason": str(exc),
+            "recommended_next_action": (
+                "repair signed ingress clock convergence or request latency"
+            ),
+            "does_not_establish": ["future mutation authority"],
+        }
     if headers["audience"] != grabowski_transport_assertion.ASSERTION_AUDIENCE:
         return {
             "schema_version": 1,
@@ -5337,6 +5355,21 @@ def _transport_roundtrip_status(ctx: Context | None) -> dict[str, Any]:
             "legacy_recommended_next_action": legacy_recommended_next_action,
             "signed_one_call": signed_one_call,
             "recommended_next_action": "none",
+        }
+    if signed_one_call.get("observed") is True:
+        return {
+            **legacy_status,
+            "normal_mutation_path": "signed_one_call",
+            "normal_mutation_path_ready": False,
+            "legacy_roundtrip_required": False,
+            "legacy_recommended_next_action": legacy_recommended_next_action,
+            "signed_one_call": signed_one_call,
+            "recommended_next_action": str(
+                signed_one_call.get(
+                    "recommended_next_action",
+                    "repair signed ingress before mutation",
+                )
+            ),
         }
     return {
         **legacy_status,
