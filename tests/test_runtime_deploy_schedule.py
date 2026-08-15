@@ -416,6 +416,15 @@ class _FakeProductionRuntime:
     def verify_green(self):
         return self._step("verify_green", {"ready": True})
 
+    def prepare_platform_publication(self):
+        return self._step(
+            "platform_publication",
+            {
+                "state": "publication_pending",
+                "obligation_id": "goo-platform-catalog-convergence-test",
+            },
+        )
+
     def close_blue_mutations(self):
         return self._step("close_blue", {"closed": True})
 
@@ -516,6 +525,13 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
     def test_pre_switch_failure_rolls_back_and_preserves_blue(self) -> None:
         runtime = _FakeProductionRuntime(fail_phase="verify_green")
+        result = self._run(runtime)
+        self.assertEqual(result["outcome"], "rolled_back")
+        self.assertEqual(runtime.rollback_calls, 1)
+        self.assertFalse(runtime.connector_switched)
+
+    def test_platform_publication_failure_is_pre_switch_and_rolls_back(self) -> None:
+        runtime = _FakeProductionRuntime(fail_phase="platform_publication")
         result = self._run(runtime)
         self.assertEqual(result["outcome"], "rolled_back")
         self.assertEqual(runtime.rollback_calls, 1)

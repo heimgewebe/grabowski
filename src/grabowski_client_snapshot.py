@@ -36,6 +36,14 @@ PLATFORM_SNAPSHOT_MODE = 0o644
 PLATFORM_SNAPSHOT_TTL_SECONDS = 3_600
 MAX_PLATFORM_SNAPSHOT_BYTES = 64 * 1024
 PLATFORM_SOURCE_KIND = "chatgpt_connector_catalog"
+PLATFORM_PUBLICATION_OBLIGATION_REPO = "repo.grabowski"
+PLATFORM_PUBLICATION_OBLIGATION_THREAD = "platform-catalog-convergence-v1"
+PLATFORM_PUBLICATION_OBLIGATION_PREFIX = "goo-platform-catalog-convergence-"
+PLATFORM_PUBLICATION_OBLIGATION_OBJECTIVE = (
+    "Converge the ChatGPT platform connector catalog to the current verified "
+    "Grabowski tool-name and sentinel-schema contract."
+)
+PLATFORM_PUBLICATION_CONTRACT_REFERENCE_PREFIX = "platform-publication-contract-v1:"
 AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
 OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
 OBSERVATION_SCOPE_SERVER_LOOPBACK = "server_loopback_watchdog"
@@ -988,6 +996,495 @@ def _rebind_snapshot_for_cutover(
     }
 
 
+def _platform_sentinel_schema_identity(schema_sha256_by_tool: Any) -> str:
+    if not isinstance(schema_sha256_by_tool, dict):
+        raise ClientSnapshotError("runtime sentinel schema identity is unavailable")
+    selected: dict[str, str] = {}
+    for name in sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS):
+        digest = schema_sha256_by_tool.get(name)
+        selected[name] = _validate_sha256(
+            digest, label=f"runtime schema hash for {name}"
+        )
+    return _sha256_json(selected)
+
+
+def _platform_publication_contract(
+    *,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    schema_sha256_by_tool: Any,
+) -> dict[str, Any]:
+    if (
+        isinstance(registered_tool_count, bool)
+        or not isinstance(registered_tool_count, int)
+        or registered_tool_count < 1
+    ):
+        raise ClientSnapshotError("platform publication tool count is invalid")
+    return {
+        "schema_version": 1,
+        "tool_count": registered_tool_count,
+        "names_sha256": _validate_sha256(
+            registered_names_sha256, label="platform publication names hash"
+        ),
+        "sentinel_schema_sha256": _platform_sentinel_schema_identity(
+            schema_sha256_by_tool
+        ),
+    }
+
+
+def _platform_publication_contract_reference(contract: dict[str, Any]) -> str:
+    return PLATFORM_PUBLICATION_CONTRACT_REFERENCE_PREFIX + _canonical_bytes(
+        contract
+    ).decode("utf-8")
+
+
+def _platform_publication_contract_from_status(
+    status: dict[str, Any],
+) -> dict[str, Any] | None:
+    references = status.get("references")
+    if not isinstance(references, list):
+        return None
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        value = reference.get("id")
+        if not isinstance(value, str) or not value.startswith(
+            PLATFORM_PUBLICATION_CONTRACT_REFERENCE_PREFIX
+        ):
+            continue
+        try:
+            contract = json.loads(
+                value.removeprefix(PLATFORM_PUBLICATION_CONTRACT_REFERENCE_PREFIX)
+            )
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(contract, dict) or set(contract) != {
+            "schema_version",
+            "tool_count",
+            "names_sha256",
+            "sentinel_schema_sha256",
+        }:
+            return None
+        count = contract.get("tool_count")
+        if (
+            contract.get("schema_version") != 1
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+        ):
+            return None
+        try:
+            _validate_sha256(contract.get("names_sha256"), label="publication names hash")
+            _validate_sha256(
+                contract.get("sentinel_schema_sha256"),
+                label="publication sentinel schema hash",
+            )
+        except ClientSnapshotError:
+            return None
+        return dict(contract)
+    return None
+
+
+def _platform_publication_observation(
+    document: dict[str, Any],
+    contract: dict[str, Any],
+    *,
+    now_unix: int,
+) -> dict[str, Any]:
+    if set(document) != {
+        "schema_version",
+        "kind",
+        "source",
+        "runtime_binding",
+        "observed_tools",
+        "snapshot_sha256",
+    }:
+        raise ClientSnapshotError("platform publication snapshot fields are invalid")
+    declared_snapshot_sha256 = _validate_sha256(
+        document.get("snapshot_sha256"), label="platform snapshot sha256"
+    )
+    unsigned = dict(document)
+    unsigned.pop("snapshot_sha256", None)
+    if _sha256_json(unsigned) != declared_snapshot_sha256:
+        raise ClientSnapshotError("platform publication snapshot hash mismatch")
+    source = document.get("source")
+    if not isinstance(source, dict) or source.get("kind") != PLATFORM_SOURCE_KIND:
+        raise ClientSnapshotError("platform publication snapshot source is invalid")
+    observed_at = source.get("observed_at_unix")
+    if isinstance(observed_at, bool) or not isinstance(observed_at, int):
+        raise ClientSnapshotError("platform publication observation time is invalid")
+    names, schemas, metadata = connector_contract.parse_observed_artifact(
+        document.get("observed_tools"), label="platform publication catalog"
+    )
+    sentinel_hashes = {
+        name: connector_contract.schema_fingerprint(schemas[name])
+        for name in sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS)
+        if name in schemas
+    }
+    sentinel_complete = len(sentinel_hashes) == len(
+        connector_contract.REQUIRED_SCHEMA_SENTINELS
+    )
+    sentinel_identity = (
+        _sha256_json(sentinel_hashes) if sentinel_complete else None
+    )
+    names_match = (
+        len(names) == contract["tool_count"]
+        and metadata["names_sha256"] == contract["names_sha256"]
+    )
+    schemas_match = (
+        sentinel_complete
+        and sentinel_identity == contract["sentinel_schema_sha256"]
+    )
+    fresh = (
+        observed_at <= now_unix + SNAPSHOT_CLOCK_SKEW_SECONDS
+        and now_unix <= observed_at + PLATFORM_SNAPSHOT_TTL_SECONDS
+    )
+    return {
+        "snapshot_sha256": declared_snapshot_sha256,
+        "source_reference": source.get("reference"),
+        "observed_at_unix": observed_at,
+        "observed_tool_count": len(names),
+        "observed_names_sha256": metadata["names_sha256"],
+        "sentinel_schema_sha256": sentinel_identity,
+        "names_match": names_match,
+        "schemas_match": schemas_match,
+        "fresh": fresh,
+        "matched": names_match and schemas_match and fresh,
+    }
+
+
+@contextmanager
+def _platform_obligation_root_binding(root: Path | None) -> Iterator[None]:
+    if root is None:
+        yield
+        return
+    key = "GRABOWSKI_OPERATOR_OBLIGATION_ROOT"
+    previous = os.environ.get(key)
+    os.environ[key] = str(root)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
+def _platform_obligation_root_for_runtime(runtime_root: Path) -> Path:
+    configured = os.environ.get("GRABOWSKI_OPERATOR_OBLIGATION_ROOT")
+    if configured:
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            raise ClientSnapshotError("configured operator obligation root is not absolute")
+        return root
+    try:
+        import pwd
+
+        resolved_runtime = runtime_root.expanduser().resolve(strict=True)
+        runtime_uid = resolved_runtime.stat().st_uid
+        home = Path(pwd.getpwuid(runtime_uid).pw_dir).resolve(strict=True)
+    except (KeyError, OSError) as exc:
+        raise ClientSnapshotError(
+            "cannot bind platform capture to the runtime owner's obligation store"
+        ) from exc
+    return home / ".local" / "state" / "grabowski" / "operator-obligations"
+
+
+def _platform_publication_obligation_statuses() -> tuple[Any, list[dict[str, Any]]]:
+    import grabowski_operator_obligation as obligations
+
+    listed = obligations.list_obligations(
+        {
+            "state": "all",
+            "repo": PLATFORM_PUBLICATION_OBLIGATION_REPO,
+            "thread_id": PLATFORM_PUBLICATION_OBLIGATION_THREAD,
+            "limit": 100,
+            "summary_only": False,
+        }
+    )
+    if listed.get("integrity_errors") or listed.get("scan_truncated"):
+        raise ClientSnapshotError(
+            "platform publication obligation inventory is incomplete"
+        )
+    records = [
+        record
+        for record in listed.get("records", [])
+        if isinstance(record, dict)
+        and record.get("objective") == PLATFORM_PUBLICATION_OBLIGATION_OBJECTIVE
+    ]
+    return obligations, records
+
+
+def _current_platform_publication_contract_bound() -> dict[str, Any] | None:
+    obligations, records = _platform_publication_obligation_statuses()
+    open_records = [record for record in records if record.get("state") == "open"]
+    if len(open_records) > 1:
+        raise ClientSnapshotError("multiple platform publication obligations are open")
+    if not open_records:
+        return None
+    status = obligations.status_obligation(open_records[0]["obligation_id"])
+    contract = _platform_publication_contract_from_status(status)
+    if contract is None:
+        raise ClientSnapshotError("open platform publication obligation has no valid contract")
+    return contract
+
+
+def _current_platform_publication_contract(
+    *, obligation_root: Path | None = None
+) -> dict[str, Any] | None:
+    with _platform_obligation_root_binding(obligation_root):
+        return _current_platform_publication_contract_bound()
+
+
+def _next_platform_publication_obligation_id(records: list[dict[str, Any]]) -> str:
+    sequence = 0
+    for record in records:
+        identifier = record.get("obligation_id")
+        if not isinstance(identifier, str) or not identifier.startswith(
+            PLATFORM_PUBLICATION_OBLIGATION_PREFIX
+        ):
+            continue
+        suffix = identifier.removeprefix(PLATFORM_PUBLICATION_OBLIGATION_PREFIX)
+        if suffix.isdigit():
+            sequence = max(sequence, int(suffix))
+    return f"{PLATFORM_PUBLICATION_OBLIGATION_PREFIX}{sequence + 1:06d}"
+
+
+def _reconcile_platform_publication_obligation(
+    contract: dict[str, Any],
+    *,
+    document: dict[str, Any] | None = None,
+    now_unix: int | None = None,
+    obligation_root: Path | None = None,
+) -> dict[str, Any]:
+    with _platform_obligation_root_binding(obligation_root):
+        return _reconcile_platform_publication_obligation_bound(
+            contract, document=document, now_unix=now_unix
+        )
+
+
+def _reconcile_platform_publication_obligation_bound(
+    contract: dict[str, Any],
+    *,
+    document: dict[str, Any] | None = None,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    obligations, records = _platform_publication_obligation_statuses()
+    contract_sha256 = _sha256_json(contract)
+    # A supersession is intentionally two immutable writes (close, then resolve).
+    # Recover the narrow crash window before selecting the current open record so
+    # a process death between those writes cannot leave historical attention.
+    for record in records:
+        if record.get("state") != "blocked":
+            continue
+        status = obligations.status_obligation(record["obligation_id"])
+        if status.get("resolution_disposition") is not None:
+            continue
+        blockers = status.get("blockers")
+        if not isinstance(blockers, list) or not any(
+            isinstance(blocker, dict)
+            and blocker.get("code") == "platform-contract-superseded"
+            for blocker in blockers
+        ):
+            continue
+        obligations.resolve_obligation(
+            {
+                "obligation_id": status["obligation_id"],
+                "disposition": "superseded",
+                "evidence": [
+                    {
+                        "source": "runtime",
+                        "reference": _platform_publication_contract_reference(contract),
+                        "sha256": contract_sha256,
+                    }
+                ],
+            }
+        )
+    open_records = [record for record in records if record.get("state") == "open"]
+    if len(open_records) > 1:
+        raise ClientSnapshotError("multiple platform publication obligations are open")
+    current = open_records[0] if open_records else None
+    current_status = (
+        obligations.status_obligation(current["obligation_id"])
+        if current is not None
+        else None
+    )
+    current_contract = (
+        _platform_publication_contract_from_status(current_status)
+        if isinstance(current_status, dict)
+        else None
+    )
+    if current_status is not None and current_contract != contract:
+        obligations.close_obligation(
+            {
+                "obligation_id": current_status["obligation_id"],
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "platform-contract-superseded",
+                        "detail": "A newer verified Grabowski tool surface superseded this pending publication contract.",
+                        "reference": _platform_publication_contract_reference(contract),
+                        "sha256": contract_sha256,
+                    }
+                ],
+                "next_action": "continue with the successor platform publication obligation",
+            }
+        )
+        obligations.resolve_obligation(
+            {
+                "obligation_id": current_status["obligation_id"],
+                "disposition": "superseded",
+                "evidence": [
+                    {
+                        "source": "runtime",
+                        "reference": _platform_publication_contract_reference(contract),
+                        "sha256": contract_sha256,
+                    }
+                ],
+            }
+        )
+        current_status = None
+        current_contract = None
+
+    if document is None:
+        try:
+            document = _read_platform_snapshot()
+        except (FileNotFoundError, OSError, ClientSnapshotError):
+            document = None
+    observation = None
+    if document is not None:
+        try:
+            observation = _platform_publication_observation(
+                document, contract, now_unix=timestamp
+            )
+        except (ClientSnapshotError, connector_contract.ConnectorContractError):
+            observation = None
+
+    if observation is not None and observation["matched"]:
+        if current_status is None:
+            return {
+                "state": "matched",
+                "obligation_id": None,
+                "observation": observation,
+            }
+        receipt_sha256 = observation["snapshot_sha256"]
+        completed = obligations.close_obligation(
+            {
+                "obligation_id": current_status["obligation_id"],
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "platform-tool-names",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": str(observation.get("source_reference") or "platform-catalog"),
+                        "sha256": receipt_sha256,
+                    },
+                    {
+                        "acceptance_id": "platform-sentinel-schemas",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": str(observation.get("source_reference") or "platform-catalog"),
+                        "sha256": receipt_sha256,
+                    },
+                    {
+                        "acceptance_id": "platform-fresh-readback",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": str(observation.get("source_reference") or "platform-catalog"),
+                        "sha256": receipt_sha256,
+                    },
+                ],
+            }
+        )
+        return {
+            "state": "matched",
+            "obligation_id": current_status["obligation_id"],
+            "obligation": completed,
+            "observation": observation,
+        }
+
+    if (
+        current_status is None
+        and observation is not None
+        and observation["names_match"]
+        and observation["schemas_match"]
+    ):
+        return {
+            "state": "stale",
+            "obligation_id": None,
+            "observation": observation,
+            "recommended_next_action": (
+                "capture a fresh platform catalog readback; no republish is required "
+                "because the observed tool surface already matches"
+            ),
+        }
+
+    if current_status is None:
+        obligation_id = _next_platform_publication_obligation_id(records)
+        current_status = obligations.open_obligation(
+            {
+                "obligation_id": obligation_id,
+                "objective": PLATFORM_PUBLICATION_OBLIGATION_OBJECTIVE,
+                "acceptance": [
+                    {
+                        "id": "platform-tool-names",
+                        "description": "A fresh ChatGPT platform catalog has the exact verified runtime tool count and names hash.",
+                    },
+                    {
+                        "id": "platform-sentinel-schemas",
+                        "description": "The platform-visible sentinel input schemas match the verified runtime schema identity.",
+                    },
+                    {
+                        "id": "platform-fresh-readback",
+                        "description": "The matching platform catalog is captured as a fresh trusted readback rather than inferred from loopback discovery.",
+                    },
+                ],
+                "origin": {
+                    "source": "platform-catalog-convergence",
+                    "repo": PLATFORM_PUBLICATION_OBLIGATION_REPO,
+                    "thread_id": PLATFORM_PUBLICATION_OBLIGATION_THREAD,
+                },
+                "references": [
+                    {
+                        "kind": "runtime",
+                        "id": _platform_publication_contract_reference(contract),
+                        "observation_tool": "grabowski_status",
+                    }
+                ],
+            }
+        )
+    return {
+        "state": "publication_pending",
+        "obligation_id": current_status["obligation_id"],
+        "obligation": current_status,
+        "observation": observation,
+        "recommended_next_action": (
+            "refresh or republish the ChatGPT connector catalog and capture a fresh platform readback"
+        ),
+    }
+
+
+def reconcile_platform_publication_for_runtime(
+    *,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    schema_sha256_by_tool: Any,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Persist the current verified tool surface before a runtime cutover."""
+    contract = _platform_publication_contract(
+        registered_tool_count=registered_tool_count,
+        registered_names_sha256=registered_names_sha256,
+        schema_sha256_by_tool=schema_sha256_by_tool,
+    )
+    return _reconcile_platform_publication_obligation(
+        contract, now_unix=now_unix
+    )
+
+
 def rebind_authentic_snapshot_for_cutover(
     *,
     cutover_id: str,
@@ -1120,6 +1617,11 @@ def platform_snapshot_status(
         "authority": authority,
         "source": None,
         "runtime_binding_matches": False,
+        "provenance_matches": False,
+        "provenance_mismatches": [],
+        "publication_contract_matches": False,
+        "publication_pending": False,
+        "publication_mismatches": [],
         "schema_contract_matches": False,
         "required_schema_property_mismatches": [],
         "recommended_next_action": (
@@ -1339,33 +1841,40 @@ def platform_snapshot_status(
             ),
         }
 
-    expected_binding = {
+    # Platform publication is a contract over the tool surface, not over an
+    # arbitrary Grabowski release identity.  A code-only deploy may change the
+    # release, repository head or Bedienvertrag while leaving every published
+    # tool name and input schema unchanged.  Keep those provenance mismatches
+    # visible, but never mistake them for platform publication drift.
+    expected_provenance = {
         "registered_tool_count": expected_tool_count,
         "registered_names_sha256": expected_names_sha256,
         "release_id": expected_release_id,
         "repo_head": expected_repo_head,
         "agent_instructions_sha256": expected_agent_instructions_sha256,
     }
-    binding_mismatches = sorted(
+    provenance_mismatches = sorted(
         key
-        for key, expected_value in expected_binding.items()
+        for key, expected_value in expected_provenance.items()
         if binding.get(key) != expected_value
     )
+    publication_mismatches: list[str] = []
     if observed_metadata["name_count"] != expected_tool_count:
-        binding_mismatches.append("observed_tool_count")
+        publication_mismatches.append("observed_tool_count")
     if observed_metadata["names_sha256"] != expected_names_sha256:
-        binding_mismatches.append("observed_names_sha256")
-    binding_matches = not binding_mismatches
+        publication_mismatches.append("observed_names_sha256")
+    if probe.get("matches") is not True:
+        publication_mismatches.append("tool_or_schema_contract")
+    if complete_schema_evidence_present and not complete_schema_matches:
+        publication_mismatches.append("complete_schema_identity")
+    publication_contract_matches = not publication_mismatches
+    provenance_matches = not provenance_mismatches
     future_clock_drift = observed_at > timestamp + SNAPSHOT_CLOCK_SKEW_SECONDS
     fresh = (
         not future_clock_drift
         and timestamp <= observed_at + PLATFORM_SNAPSHOT_TTL_SECONDS
     )
-    matched = (
-        binding_matches
-        and probe.get("matches") is True
-        and (not complete_schema_evidence_present or complete_schema_matches)
-    )
+    matched = publication_contract_matches
     observable = fresh and matched
     if future_clock_drift:
         state = "clock_drift"
@@ -1373,15 +1882,15 @@ def platform_snapshot_status(
             "replace the future-dated platform connector snapshot with a "
             "current platform observation"
         )
+    elif not publication_contract_matches:
+        state = "publication_pending"
+        next_action = (
+            "refresh or republish the ChatGPT connector tool catalog, then "
+            "capture an exact fresh platform catalog readback"
+        )
     elif not fresh:
         state = "stale"
         next_action = "capture a fresh platform connector catalog snapshot"
-    elif not matched:
-        state = "mismatch"
-        next_action = (
-            "capture the exact current platform connector catalog after "
-            "repairing reported schema or revision drift"
-        )
     else:
         state = "matched"
         next_action = "none"
@@ -1395,8 +1904,13 @@ def platform_snapshot_status(
         "source": dict(source),
         "snapshot_sha256": declared_snapshot_sha256,
         "runtime_binding": dict(binding),
-        "runtime_binding_matches": binding_matches,
-        "binding_mismatches": sorted(set(binding_mismatches)),
+        "runtime_binding_matches": provenance_matches,
+        "binding_mismatches": provenance_mismatches,
+        "provenance_matches": provenance_matches,
+        "provenance_mismatches": provenance_mismatches,
+        "publication_contract_matches": publication_contract_matches,
+        "publication_pending": not publication_contract_matches,
+        "publication_mismatches": sorted(set(publication_mismatches)),
         "catalog": observed_metadata,
         "schema_contract_matches": (
             probe.get("schema_contract_matches") is True
@@ -1451,6 +1965,10 @@ def snapshot_status(
         "platform_connector_schema_observable": platform_schema_observable,
         "platform_connector_snapshot_fresh": bool(platform_snapshot.get("fresh")),
         "platform_connector_snapshot_matched": bool(platform_snapshot.get("matched")),
+        "platform_publication_contract_matches": bool(
+            platform_snapshot.get("publication_contract_matches")
+        ),
+        "platform_publication_pending": bool(platform_snapshot.get("publication_pending")),
         "platform_evidence_state": platform_snapshot.get("state"),
         "platform_snapshot": platform_snapshot,
         "server_loopback_observable": False,
@@ -1661,6 +2179,10 @@ def snapshot_status(
         "platform_connector_schema_observable": platform_schema_observable,
         "platform_connector_snapshot_fresh": bool(platform_snapshot.get("fresh")),
         "platform_connector_snapshot_matched": bool(platform_snapshot.get("matched")),
+        "platform_publication_contract_matches": bool(
+            platform_snapshot.get("publication_contract_matches")
+        ),
+        "platform_publication_pending": bool(platform_snapshot.get("publication_pending")),
         "platform_evidence_state": platform_snapshot.get("state"),
         "platform_snapshot": platform_snapshot,
         "server_loopback_observable": server_loopback_observable,
@@ -2648,6 +3170,20 @@ def capture_platform_connector_snapshot(
         raise ClientSnapshotError(str(exc)) from exc
     missing_from_platform = sorted(set(runtime_names) - set(observed_names))
     unexpected_in_platform = sorted(set(observed_names) - set(runtime_names))
+    publication_lifecycle = None
+    obligation_root = _platform_obligation_root_for_runtime(runtime_root)
+    current_contract = _current_platform_publication_contract(
+        obligation_root=obligation_root
+    )
+    if current_contract is not None:
+        publication_lifecycle = _reconcile_platform_publication_obligation(
+            current_contract,
+            document=document,
+            now_unix=(
+                int(time.time()) if observed_at_unix is None else observed_at_unix
+            ),
+            obligation_root=obligation_root,
+        )
     return {
         "state": "captured",
         "snapshot_sha256": document["snapshot_sha256"],
@@ -2663,6 +3199,7 @@ def capture_platform_connector_snapshot(
         "complete_schema_count": observed_metadata.get("complete_schema_count"),
         "complete_schema_sha256": observed_metadata.get("complete_schema_sha256"),
         "source_reference": document["source"]["reference"],
+        "platform_publication": publication_lifecycle,
     }
 
 

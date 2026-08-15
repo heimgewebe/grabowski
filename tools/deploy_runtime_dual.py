@@ -4995,6 +4995,7 @@ class ProductionBlueGreenRuntime:
     connector_switched: bool = False
     current_selector: dict[str, Any] | None = None
     green_readiness: dict[str, Any] | None = None
+    platform_publication: dict[str, Any] | None = None
     source_complete_schema_sha256: str | None = None
     snapshot_rebind_mode: str = "external_client"
     deployment_source_identity_sha256: str | None = None
@@ -5053,6 +5054,20 @@ class ProductionBlueGreenRuntime:
             )
         self.green_readiness = readiness
         return readiness
+
+    def prepare_platform_publication(self) -> dict[str, Any]:
+        if self.green_readiness is None:
+            core.fail(
+                "Green readiness is unavailable for platform publication preparation",
+                phase="platform-publication-preflight",
+            )
+        result = client_snapshot.reconcile_platform_publication_for_runtime(
+            registered_tool_count=len(self.snapshot.contract.expected_tools),
+            registered_names_sha256=self.green_binding["registered_names_sha256"],
+            schema_sha256_by_tool=self.green_readiness.get("schema_sha256_by_tool"),
+        )
+        self.platform_publication = result
+        return result
 
     def close_blue_mutations(self) -> dict[str, Any]:
         if self.deployment_source_identity_sha256 is None:
@@ -5176,7 +5191,7 @@ class ProductionBlueGreenRuntime:
                 phase="snapshot-authenticity-preflight",
                 details={"snapshot_rebind_mode": self.snapshot_rebind_mode},
             )
-        return rebind(
+        result = rebind(
             cutover_id=cutover_id,
             cutover_generation=cutover_generation,
             current_release_id=self.blue_binding["release_id"],
@@ -5192,6 +5207,7 @@ class ProductionBlueGreenRuntime:
             ],
             green_readiness=self.green_readiness,
         )
+        return {**result, "platform_publication": self.platform_publication}
 
     def retire_blue(self) -> dict[str, Any]:
         if not self.connector_switched or self.current_selector is None:
@@ -5876,6 +5892,16 @@ def run_production_blue_green_cutover(
                 details={
                     "ready": True,
                     "readiness_sha256": _json_sha256(green_readiness),
+                },
+            )
+            phase = "platform_publication_preflight"
+            platform_publication = context.prepare_platform_publication()
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "state": platform_publication.get("state"),
+                    "obligation_id": platform_publication.get("obligation_id"),
                 },
             )
             phase = "pre_cutover_ready"

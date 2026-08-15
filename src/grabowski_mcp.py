@@ -5485,6 +5485,12 @@ def _runtime_tool_contract_summary(
         "platform_connector_snapshot_matched": bool(
             client_snapshot.get("platform_connector_snapshot_matched")
         ),
+        "platform_publication_contract_matches": bool(
+            client_snapshot.get("platform_publication_contract_matches")
+        ),
+        "platform_publication_pending": bool(
+            client_snapshot.get("platform_publication_pending")
+        ),
         "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
         "client_snapshot_verification_model": client_snapshot.get("verification_model"),
         "refresh_required_when_client_count_or_hash_differs": True,
@@ -5786,6 +5792,12 @@ def _operator_system_overview(
             "platform_matched": client_snapshot.get(
                 "platform_connector_snapshot_matched"
             ),
+            "platform_publication_contract_matches": client_snapshot.get(
+                "platform_publication_contract_matches"
+            ),
+            "platform_publication_pending": client_snapshot.get(
+                "platform_publication_pending"
+            ),
             "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
             "platform_snapshot": client_snapshot.get("platform_snapshot"),
             "server_loopback_observable": client_snapshot.get("server_loopback_observable"),
@@ -5999,6 +6011,12 @@ def grabowski_status(
                 "platform_connector_schema_observable"
             ),
             "platform_evidence_state": tool_contract.get("platform_evidence_state"),
+            "platform_publication_contract_matches": tool_contract.get(
+                "platform_publication_contract_matches"
+            ),
+            "platform_publication_pending": tool_contract.get(
+                "platform_publication_pending"
+            ),
             "client_snapshot": client_snapshot,
             "refresh_required_when_client_count_or_hash_differs": tool_contract.get(
                 "refresh_required_when_client_count_or_hash_differs"

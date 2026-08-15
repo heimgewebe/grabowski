@@ -384,7 +384,9 @@ class ClientSnapshotTests(unittest.TestCase):
 
         observed = self.platform_status(runtime_artifact=runtime_artifact)
 
-        self.assertEqual(observed["state"], "mismatch")
+        self.assertEqual(observed["state"], "publication_pending")
+        self.assertTrue(observed["publication_pending"])
+        self.assertFalse(observed["publication_contract_matches"])
         self.assertFalse(observed["observable"])
         self.assertFalse(observed["schema_observable"])
         self.assertIn(
@@ -396,17 +398,43 @@ class ClientSnapshotTests(unittest.TestCase):
             observed["required_schema_property_mismatches"],
         )
 
-    def test_platform_snapshot_stale_and_revision_drift_fail_closed(self) -> None:
+    def test_platform_snapshot_stale_and_provenance_drift_are_separate(self) -> None:
         self.write_platform_snapshot(observed_at_unix=1_000)
         stale = self.platform_status(now_unix=5_000)
         self.assertEqual(stale["state"], "stale")
+        self.assertTrue(stale["publication_contract_matches"])
+        self.assertFalse(stale["publication_pending"])
         self.assertFalse(stale["observable"])
 
         self.write_platform_snapshot(repo_head="d" * 40)
         drifted = self.platform_status()
-        self.assertEqual(drifted["state"], "mismatch")
-        self.assertFalse(drifted["observable"])
-        self.assertIn("repo_head", drifted["binding_mismatches"])
+        self.assertEqual(drifted["state"], "matched")
+        self.assertTrue(drifted["publication_contract_matches"])
+        self.assertFalse(drifted["provenance_matches"])
+        self.assertTrue(drifted["observable"])
+        self.assertIn("repo_head", drifted["provenance_mismatches"])
+
+    def test_stale_older_platform_catalog_is_publication_pending_before_stale(self) -> None:
+        platform_artifact = self.schema_artifact()
+        runtime_artifact = json.loads(json.dumps(platform_artifact))
+        runtime_artifact["tools"].append("runtime-only-tool")
+        runtime_artifact["schema_version"] = 1
+        runtime_artifact.pop("complete_schema_count", None)
+        runtime_artifact.pop("complete_schema_sha256", None)
+        self.write_platform_snapshot(platform_artifact, observed_at_unix=1_000)
+
+        observed = self.platform_status(
+            runtime_artifact=runtime_artifact,
+            now_unix=5_000,
+        )
+
+        self.assertEqual(observed["state"], "publication_pending")
+        self.assertTrue(observed["publication_pending"])
+        self.assertFalse(observed["publication_contract_matches"])
+        self.assertFalse(observed["fresh"])
+        self.assertIn("runtime-only-tool", observed["missing_from_platform"])
+        self.assertIn("observed_tool_count", observed["publication_mismatches"])
+        self.assertIn("observed_names_sha256", observed["publication_mismatches"])
 
     def test_platform_snapshot_integrity_and_trust_boundary_fail_closed(self) -> None:
         document = self.write_platform_snapshot()
