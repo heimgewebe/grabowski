@@ -3245,8 +3245,18 @@ def _activate_runtime_deploy_observer(marker: dict[str, Any]) -> dict[str, Any] 
 
 
 def engage_operator_deployment_admission(
-    snapshot: core.Snapshot, *, timeout_seconds: int
+    snapshot: core.Snapshot,
+    *,
+    timeout_seconds: int,
+    source_identity_sha256: str | None = None,
 ) -> dict[str, Any]:
+    marker_source_identity_sha256 = (
+        _deployment_source_identity_sha256(snapshot)
+        if source_identity_sha256 is None
+        else source_identity_sha256
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", marker_source_identity_sha256) is None:
+        raise ValueError("source_identity_sha256 must be a lowercase SHA-256")
     now = int(time.time())
     existing = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
     if existing is not None:
@@ -3263,7 +3273,7 @@ def engage_operator_deployment_admission(
         "kind": OPERATOR_ADMISSION_MARKER_KIND,
         "token": secrets.token_hex(32),
         "expected_head": snapshot.repo_head,
-        "source_identity_sha256": _deployment_source_identity_sha256(snapshot),
+        "source_identity_sha256": marker_source_identity_sha256,
         "created_at_unix": now,
         "expires_at_unix": now + lifetime,
     }
@@ -4987,6 +4997,7 @@ class ProductionBlueGreenRuntime:
     green_readiness: dict[str, Any] | None = None
     source_complete_schema_sha256: str | None = None
     snapshot_rebind_mode: str = "external_client"
+    deployment_source_identity_sha256: str | None = None
 
     def start_green(self) -> dict[str, Any]:
         core.verify_apply_snapshot_unchanged(
@@ -5044,9 +5055,16 @@ class ProductionBlueGreenRuntime:
         return readiness
 
     def close_blue_mutations(self) -> dict[str, Any]:
-        self.admission_marker = engage_operator_deployment_admission(
-            self.snapshot, timeout_seconds=self.timeout_seconds
-        )
+        if self.deployment_source_identity_sha256 is None:
+            self.admission_marker = engage_operator_deployment_admission(
+                self.snapshot, timeout_seconds=self.timeout_seconds
+            )
+        else:
+            self.admission_marker = engage_operator_deployment_admission(
+                self.snapshot,
+                timeout_seconds=self.timeout_seconds,
+                source_identity_sha256=self.deployment_source_identity_sha256,
+            )
         return {
             "closed": True,
             "marker_sha256": hashlib.sha256(
@@ -5321,6 +5339,7 @@ def prepare_production_blue_green_runtime(
     expected_head: str,
     cutover_id: str,
     timeout_seconds: int,
+    deployment_source_identity_sha256: str | None = None,
 ) -> ProductionBlueGreenRuntime:
     snapshot, runtime, topology = preflight_url(
         repo,
@@ -5495,6 +5514,7 @@ def prepare_production_blue_green_runtime(
         current_selector=selector_before,
         source_complete_schema_sha256=source_complete_schema_sha256,
         snapshot_rebind_mode=snapshot_rebind_mode,
+        deployment_source_identity_sha256=deployment_source_identity_sha256,
     )
 
 
@@ -5817,6 +5837,7 @@ def run_production_blue_green_cutover(
                 expected_head=expected_head,
                 cutover_id=identifier,
                 timeout_seconds=timeout_seconds,
+                deployment_source_identity_sha256=source_identity_sha256,
             )
         except Exception as exc:
             error = _error_summary(exc)

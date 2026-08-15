@@ -474,6 +474,46 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
                 cutover_id="cutover-test",
             )
 
+    def test_productive_cutover_threads_scheduler_source_identity_into_runtime_context(self) -> None:
+        runtime = _FakeProductionRuntime(fail_phase="verify_green")
+
+        def receipt(**kwargs):
+            return {
+                "receipt_sha256": "9e" * 32,
+                "outcome": kwargs["outcome"],
+                "phase": kwargs["phase"],
+            }
+
+        with (
+            mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
+            mock.patch.object(
+                dual, "prepare_production_blue_green_runtime", return_value=runtime
+            ) as prepare,
+            mock.patch.object(
+                dual, "_production_blue_green_receipt", side_effect=receipt
+            ),
+            mock.patch.object(
+                dual,
+                "_persist_production_blue_green_receipt",
+                return_value={"path": "/state/receipt.json", "receipt_sha256": "9e" * 32},
+            ),
+        ):
+            dual.run_production_blue_green_cutover(
+                repo=ROOT,
+                expected_head=HEAD_GREEN,
+                source_identity_sha256=SOURCE_IDENTITY_SHA256,
+                cutover_id="cutover-source-binding",
+            )
+        prepare.assert_called_once_with(
+            ROOT,
+            dual.core.HOME / ".local/share/grabowski-mcp",
+            dual.core.DEFAULT_PROFILE_PATH,
+            expected_head=HEAD_GREEN,
+            cutover_id="cutover-source-binding",
+            timeout_seconds=40,
+            deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+        )
+
     def test_pre_switch_failure_rolls_back_and_preserves_blue(self) -> None:
         runtime = _FakeProductionRuntime(fail_phase="verify_green")
         result = self._run(runtime)
@@ -697,6 +737,54 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
                 "grabowski-green-operator-123456789abc.service"
             )
         self.assertTrue(result["retired"])
+
+    def test_close_blue_mutations_binds_scheduler_source_identity_not_runtime_snapshot_identity(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.repo_head = HEAD_GREEN
+        snapshot.contract_sha256 = "11" * 32
+        snapshot.runtime_input_sha256 = "22" * 32
+        snapshot.runtime_lock_sha256 = "33" * 32
+        snapshot.source_sha256s = {"grabowski_operator": "44" * 32}
+        snapshot.runtime_asset_sha256s = {}
+        scheduler_source_identity = "55" * 32
+        self.assertNotEqual(
+            scheduler_source_identity,
+            dual._deployment_source_identity_sha256(snapshot),
+        )
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=mock.Mock(release_path=Path("/release/green")),
+            activation=mock.Mock(),
+            blue_manifest={},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-source-domain",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            deployment_source_identity_sha256=scheduler_source_identity,
+        )
+        marker = {
+            "token": "66" * 32,
+            "expected_head": HEAD_GREEN,
+            "source_identity_sha256": scheduler_source_identity,
+        }
+        with mock.patch.object(
+            dual,
+            "engage_operator_deployment_admission",
+            return_value=marker,
+        ) as engage:
+            closed = runtime.close_blue_mutations()
+        engage.assert_called_once_with(
+            snapshot,
+            timeout_seconds=10,
+            source_identity_sha256=scheduler_source_identity,
+        )
+        self.assertEqual(
+            scheduler_source_identity, closed["source_identity_sha256"]
+        )
 
     def test_start_green_marks_possible_unit_before_post_start_verification_failure(self) -> None:
         snapshot = mock.Mock()
