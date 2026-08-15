@@ -929,6 +929,31 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
                 )
         status.assert_not_called()
 
+    def _schema_verification_runtime(self, blue_schema_sha256: str):
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])
+        build = mock.Mock(
+            release_path=Path("/release/green"),
+            release_id="green",
+            agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+        )
+        return dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(),
+            blue_manifest={},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-schema-target",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            source_complete_schema_sha256=blue_schema_sha256,
+            snapshot_rebind_mode="server_loopback_continuity",
+        )
+
     def test_server_loopback_continuity_prepares_unchanged_surface(self) -> None:
         snapshot = mock.Mock()
         snapshot.repo_head = HEAD_GREEN
@@ -1033,19 +1058,94 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             source_complete_schema_sha256=COMPLETE_SCHEMA_SHA256,
             snapshot_rebind_mode="server_loopback_continuity",
         )
-        with mock.patch.object(
-            dual,
-            "_probe_release_runtime",
-            return_value={
-                "ready": True,
-                "complete_schema_count": 1,
-                "complete_schema_sha256": "ab" * 32,
-            },
+        with (
+            mock.patch.object(
+                dual,
+                "_release_complete_schema_identity",
+                return_value={
+                    "complete_schema_count": 1,
+                    "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+                },
+            ),
+            mock.patch.object(
+                dual,
+                "_probe_release_runtime",
+                return_value={
+                    "ready": True,
+                    "complete_schema_count": 1,
+                    "complete_schema_sha256": "ab" * 32,
+                },
+            ),
         ):
             with self.assertRaisesRegex(
                 RuntimeError, "Green complete schema identity differs"
             ):
                 runtime.verify_green()
+        self.assertFalse(runtime.connector_switched)
+
+    def test_green_schema_authenticity_accepts_unchanged_exact_target(self) -> None:
+        runtime = self._schema_verification_runtime(COMPLETE_SCHEMA_SHA256)
+        with (
+            mock.patch.object(
+                dual,
+                "_release_complete_schema_identity",
+                return_value={
+                    "complete_schema_count": 1,
+                    "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+                },
+            ),
+            mock.patch.object(
+                dual,
+                "_probe_release_runtime",
+                return_value={
+                    "ready": True,
+                    "complete_schema_count": 1,
+                    "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+                },
+            ),
+        ):
+            readiness = runtime.verify_green()
+        self.assertEqual(readiness["complete_schema_sha256"], COMPLETE_SCHEMA_SHA256)
+
+    def test_green_schema_authenticity_allows_revision_bound_schema_change(self) -> None:
+        target_schema_sha256 = "ab" * 32
+        runtime = self._schema_verification_runtime(COMPLETE_SCHEMA_SHA256)
+        with (
+            mock.patch.object(
+                dual,
+                "_release_complete_schema_identity",
+                return_value={
+                    "complete_schema_count": 1,
+                    "complete_schema_sha256": target_schema_sha256,
+                },
+            ),
+            mock.patch.object(
+                dual,
+                "_probe_release_runtime",
+                return_value={
+                    "ready": True,
+                    "complete_schema_count": 1,
+                    "complete_schema_sha256": target_schema_sha256,
+                },
+            ),
+        ):
+            readiness = runtime.verify_green()
+        self.assertEqual(readiness["complete_schema_sha256"], target_schema_sha256)
+        self.assertEqual(runtime.source_complete_schema_sha256, COMPLETE_SCHEMA_SHA256)
+
+    def test_green_schema_authenticity_requires_target_identity_before_probe(self) -> None:
+        runtime = self._schema_verification_runtime(COMPLETE_SCHEMA_SHA256)
+        with (
+            mock.patch.object(
+                dual,
+                "_release_complete_schema_identity",
+                side_effect=RuntimeError("target schema unavailable"),
+            ),
+            mock.patch.object(dual, "_probe_release_runtime") as probe,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "target schema unavailable"):
+                runtime.verify_green()
+        probe.assert_not_called()
         self.assertFalse(runtime.connector_switched)
 
     def test_stale_external_declaration_fails_before_connector_switch(self) -> None:

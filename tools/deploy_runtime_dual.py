@@ -4902,6 +4902,62 @@ def _probe_release_runtime(
     return value
 
 
+def _release_complete_schema_identity(
+    *,
+    release_path: Path,
+    expected_tool_count: int,
+    expected_names_sha256: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Derive the complete tool-schema identity from the immutable target release."""
+    python = release_path / ".venv/bin/python"
+    code = (
+        "import json, grabowski_operator, grabowski_mcp; "
+        "print(json.dumps(grabowski_mcp._runtime_connector_observed_tools(), sort_keys=True))"
+    )
+    result = core.run(
+        [str(python), "-c", code],
+        check=False,
+        capture=True,
+        cwd=release_path,
+        timeout=min(timeout_seconds + 10, 70),
+    )
+    if result.returncode != 0:
+        core.fail(
+            "Target release schema identity derivation failed",
+            phase="snapshot-authenticity-preflight",
+            details={"returncode": result.returncode},
+        )
+    try:
+        artifact = json.loads(result.stdout)
+        _, _, metadata = connector_contract.parse_observed_artifact(
+            artifact, label="target release schema artifact"
+        )
+    except (UnicodeError, json.JSONDecodeError, connector_contract.ConnectorContractError) as exc:
+        core.fail(
+            "Target release schema identity is invalid",
+            phase="snapshot-authenticity-preflight",
+            details={"error_type": type(exc).__name__},
+        )
+    if (
+        metadata.get("complete_schema_observable") is not True
+        or metadata.get("complete_schema_count") != expected_tool_count
+        or metadata.get("name_count") != expected_tool_count
+        or metadata.get("names_sha256") != expected_names_sha256
+    ):
+        core.fail(
+            "Target release schema identity does not match the bound runtime contract",
+            phase="snapshot-authenticity-preflight",
+            details={
+                "expected_tool_count": expected_tool_count,
+                "target_tool_count": metadata.get("complete_schema_count"),
+                "expected_names_sha256": expected_names_sha256,
+                "target_names_sha256": metadata.get("names_sha256"),
+            },
+        )
+    return metadata
+
+
 def _selector_summary(value: dict[str, Any]) -> dict[str, Any]:
     return {
         "selector_sha256": value.get("selector_sha256"),
@@ -5024,6 +5080,12 @@ class ProductionBlueGreenRuntime:
         return result
 
     def verify_green(self) -> dict[str, Any]:
+        target_schema = _release_complete_schema_identity(
+            release_path=self.build.release_path,
+            expected_tool_count=len(self.snapshot.contract.expected_tools),
+            expected_names_sha256=self.green_binding["registered_names_sha256"],
+            timeout_seconds=self.timeout_seconds,
+        )
         readiness = _probe_release_runtime(
             release_path=self.build.release_path,
             port=GREEN_OPERATOR_LISTENER_PORT,
@@ -5036,20 +5098,22 @@ class ProductionBlueGreenRuntime:
             timeout_seconds=self.timeout_seconds,
         )
         if (
-            self.source_complete_schema_sha256 is None
-            or readiness.get("complete_schema_count")
+            readiness.get("complete_schema_count")
             != len(self.snapshot.contract.expected_tools)
             or readiness.get("complete_schema_sha256")
-            != self.source_complete_schema_sha256
+            != target_schema.get("complete_schema_sha256")
         ):
             core.fail(
-                "Green complete schema identity differs from the bound Blue continuity snapshot",
+                "Green complete schema identity differs from the exact target release",
                 phase="snapshot-authenticity-preflight",
                 details={
-                    "expected_complete_schema_sha256": self.source_complete_schema_sha256,
+                    "target_complete_schema_sha256": target_schema.get(
+                        "complete_schema_sha256"
+                    ),
                     "green_complete_schema_sha256": readiness.get(
                         "complete_schema_sha256"
                     ),
+                    "blue_continuity_complete_schema_sha256": self.source_complete_schema_sha256,
                 },
             )
         self.green_readiness = readiness
