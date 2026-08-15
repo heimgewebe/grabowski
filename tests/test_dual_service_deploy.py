@@ -4295,5 +4295,92 @@ class SignedIngressProfileCutoverTests(unittest.TestCase):
             self.assertEqual([profile], list(root.iterdir()))
 
 
+class RuntimeDeployObserverActivationDiagnosticsTests(unittest.TestCase):
+    def test_activation_failures_report_exact_stage_without_exception_message(self) -> None:
+        directory = Path("/tmp/grabowski-observer-job")
+        metadata = {"deployment_observer_contract": {"schema_version": 1}}
+        binding = {
+            "unit": "grabowski-job-observer.service",
+            "contract_sha256": "a" * 64,
+            "binding_sha256": "b" * 64,
+            "expires_at_unix": 1234567890,
+        }
+        activation = directory / "deployment-observer-activation.json"
+        observed = {"kind": "grabowski_deployment_observer_activation"}
+        marker_value = {"kind": "grabowski_blue_green_cutover_marker"}
+        stages = (
+            "build_binding",
+            "activation_path",
+            "create_activation",
+            "read_activation",
+            "validate_activation",
+        )
+
+        for expected_stage in stages:
+            with self.subTest(expected_stage=expected_stage):
+                def result_or_fail(stage: str, result=None):
+                    if stage == expected_stage:
+                        raise ValueError("sensitive activation detail")
+                    return result
+
+                with (
+                    mock.patch.object(
+                        dual,
+                        "_runtime_deploy_observer_job",
+                        return_value=(directory, metadata),
+                    ),
+                    mock.patch.object(
+                        dual.deployment_observer,
+                        "build_activation_binding",
+                        side_effect=lambda *args, **kwargs: result_or_fail(
+                            "build_binding", binding
+                        ),
+                    ),
+                    mock.patch.object(
+                        dual.deployment_observer,
+                        "activation_path",
+                        side_effect=lambda *args, **kwargs: result_or_fail(
+                            "activation_path", activation
+                        ),
+                    ),
+                    mock.patch.object(
+                        dual.deployment_observer,
+                        "create_activation",
+                        side_effect=lambda *args, **kwargs: result_or_fail(
+                            "create_activation"
+                        ),
+                    ),
+                    mock.patch.object(
+                        dual.deployment_observer,
+                        "read_activation",
+                        side_effect=lambda *args, **kwargs: result_or_fail(
+                            "read_activation", observed
+                        ),
+                    ),
+                    mock.patch.object(
+                        dual.deployment_observer,
+                        "validate_activation_binding",
+                        side_effect=lambda *args, **kwargs: result_or_fail(
+                            "validate_activation"
+                        ),
+                    ),
+                ):
+                    with self.assertRaises(core.DeployError) as raised:
+                        dual._activate_runtime_deploy_observer(marker_value)
+
+                self.assertEqual("operator-admission-observer", raised.exception.phase)
+                self.assertEqual(
+                    {
+                        "error_type": "ValueError",
+                        "failure_stage": expected_stage,
+                    },
+                    raised.exception.details,
+                )
+                self.assertNotIn(
+                    "sensitive activation detail",
+                    json.dumps(raised.exception.details, sort_keys=True),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

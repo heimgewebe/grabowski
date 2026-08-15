@@ -3207,15 +3207,20 @@ def _activate_runtime_deploy_observer(marker: dict[str, Any]) -> dict[str, Any] 
     contract = metadata.get("deployment_observer_contract")
     if contract is None:
         return None
+    failure_stage = "build_binding"
     try:
         binding = deployment_observer.build_activation_binding(
             contract,
             metadata=metadata,
             marker=marker,
         )
+        failure_stage = "activation_path"
         path = deployment_observer.activation_path(directory)
+        failure_stage = "create_activation"
         deployment_observer.create_activation(path, binding)
+        failure_stage = "read_activation"
         observed = deployment_observer.read_activation(path)
+        failure_stage = "validate_activation"
         deployment_observer.validate_activation_binding(
             observed,
             contract_value=contract,
@@ -3226,7 +3231,10 @@ def _activate_runtime_deploy_observer(marker: dict[str, Any]) -> dict[str, Any] 
         core.fail(
             "Deployment-Observer-Aktivierung scheiterte",
             phase="operator-admission-observer",
-            details={"error_type": type(exc).__name__},
+            details={
+                "error_type": type(exc).__name__,
+                "failure_stage": failure_stage,
+            },
         )
     return {
         "unit": binding["unit"],
