@@ -500,7 +500,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         )
 
 
-    def test_operator_system_overview_requires_platform_connector_observation(self) -> None:
+    def test_operator_system_overview_requires_platform_publication_convergence(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {},
@@ -534,10 +534,15 @@ class ConsumerSurfaceTests(unittest.TestCase):
                     "observable": True,
                     "fresh": True,
                     "matched": True,
+                    "external_client_snapshot_observable": True,
                     "platform_connector_snapshot_observable": False,
+                    "platform_publication_state": "publication_pending",
+                    "platform_publication_pending": True,
+                    "platform_publication_request_id": "gpp-pending",
+                    "platform_publication_contract_sha256": "a" * 64,
                     "server_loopback_observable": True,
                     "recommended_next_action": (
-                        "bind a platform connector snapshot to establish published tool visibility"
+                        "perform the requested ChatGPT connector refresh or republish action"
                     ),
                     "verification_model": "client-declared-server-compared-v1",
                 },
@@ -545,18 +550,82 @@ class ConsumerSurfaceTests(unittest.TestCase):
 
         self.assertFalse(overview["operator_ready"])
         self.assertFalse(overview["readiness"]["connector_snapshot_ready"])
+        self.assertFalse(overview["readiness"]["platform_publication_ready"])
+        self.assertEqual(
+            "publication_pending", overview["readiness"]["platform_publication_state"]
+        )
         self.assertTrue(overview["connector"]["observable"])
         self.assertFalse(overview["connector"]["platform_snapshot_observable"])
         self.assertEqual(
-            "bind a platform connector snapshot to establish published tool visibility",
+            "perform the requested ChatGPT connector refresh or republish action",
             overview["recommended_next_action"],
         )
-        connector = next(
-            item for item in overview["component_map"]["components"]
-            if item["id"] == "connector"
+        components = {
+            item["id"]: item for item in overview["component_map"]["components"]
+        }
+        self.assertEqual("green", components["connector"]["signal"])
+        self.assertEqual("amber", components["platform_publication"]["signal"])
+        self.assertEqual(
+            "user-owned immutable platform publication journal",
+            overview["source_registry"]["platform_publication"]["authority"],
         )
-        self.assertEqual("unknown", connector["signal"])
-        self.assertFalse(connector["observed"])
+
+    def test_operator_system_overview_keeps_converged_semantics_across_platform_snapshot_provenance_drift(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {},
+                "projection_counts": {},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+            }
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "state": "matched",
+                    "observable": True,
+                    "fresh": True,
+                    "matched": True,
+                    "external_client_snapshot_observable": True,
+                    "platform_connector_snapshot_observable": False,
+                    "platform_connector_snapshot_fresh": True,
+                    "platform_connector_snapshot_matched": False,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                    "platform_publication_request_id": "gpp-converged",
+                    "platform_publication_contract_sha256": "b" * 64,
+                    "recommended_next_action": "none",
+                    "verification_model": "client-declared-server-compared-v1",
+                },
+            )
+
+        self.assertTrue(overview["operator_ready"])
+        self.assertFalse(overview["readiness"]["connector_snapshot_ready"])
+        self.assertTrue(overview["readiness"]["platform_publication_ready"])
+        self.assertEqual("none", overview["recommended_next_action"])
+        components = {
+            item["id"]: item for item in overview["component_map"]["components"]
+        }
+        self.assertEqual("green", components["connector"]["signal"])
+        self.assertEqual("green", components["platform_publication"]["signal"])
 
     def test_operator_system_overview_prioritizes_invalid_coding_catalog(self) -> None:
         fake_tasks = SimpleNamespace(
