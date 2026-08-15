@@ -1339,6 +1339,8 @@ def _validate_publication_attempt(value: Any) -> dict[str, Any]:
         "attempt_id",
         "outcome",
         "reference",
+        "previous_current_sha256",
+        "previous_attempt_id",
         "recorded_at_unix",
         "attempt_sha256",
     }:
@@ -1351,6 +1353,19 @@ def _validate_publication_attempt(value: Any) -> dict[str, Any]:
     if value.get("outcome") not in PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES:
         raise ClientSnapshotError("platform publication attempt outcome is invalid")
     _validate_platform_source_reference(value.get("reference"))
+    _validate_sha256(
+        value.get("previous_current_sha256"),
+        label="publication attempt previous current hash",
+    )
+    previous_attempt_id = value.get("previous_attempt_id")
+    if previous_attempt_id is not None:
+        _validate_identifier(
+            previous_attempt_id, label="publication attempt previous attempt id"
+        )
+        if previous_attempt_id == value.get("attempt_id"):
+            raise ClientSnapshotError(
+                "platform publication attempt cannot name itself as predecessor"
+            )
     recorded_at = value.get("recorded_at_unix")
     if isinstance(recorded_at, bool) or not isinstance(recorded_at, int) or recorded_at < 0:
         raise ClientSnapshotError("platform publication attempt timestamp is invalid")
@@ -2184,7 +2199,11 @@ def record_platform_publication_attempt(
                     "idempotent": True,
                     "recovered_projection": False,
                 }
-            if current.get("attempt_id") is None and current["state"] == "publication_pending":
+            if (
+                existing["previous_current_sha256"] == current["current_sha256"]
+                and existing["previous_attempt_id"] == current.get("attempt_id")
+                and current["state"] != "platform_converged"
+            ):
                 repaired = _write_publication_current(
                     request_id=request_id,
                     contract_sha256=current["contract_sha256"],
@@ -2202,7 +2221,7 @@ def record_platform_publication_attempt(
                     "recovered_projection": True,
                 }
             raise ClientSnapshotError(
-                "platform publication attempt replay conflicts with current lifecycle state"
+                "platform publication attempt replay conflicts with a newer or different current projection"
             )
         material = {
             "schema_version": 1,
@@ -2212,6 +2231,8 @@ def record_platform_publication_attempt(
             "attempt_id": attempt_id,
             "outcome": outcome,
             "reference": reference,
+            "previous_current_sha256": current["current_sha256"],
+            "previous_attempt_id": current.get("attempt_id"),
             "recorded_at_unix": timestamp,
         }
         attempt = {**material, "attempt_sha256": _sha256_json(material)}
@@ -2479,6 +2500,66 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
         raise ClientSnapshotError("client snapshot declaration hash mismatch")
 
 
+def _runtime_publication_contract_for_status(
+    *,
+    expected_tool_count: int,
+    expected_names_sha256: str,
+    expected_runtime_tools: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if expected_runtime_tools is None:
+        return None
+    try:
+        _names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            expected_runtime_tools,
+            label="runtime connector artifact",
+        )
+    except connector_contract.ConnectorContractError:
+        return None
+    if (
+        metadata.get("name_count") != expected_tool_count
+        or metadata.get("names_sha256") != expected_names_sha256
+        or metadata.get("complete_schema_observable") is not True
+        or metadata.get("complete_schema_count") != expected_tool_count
+    ):
+        return None
+    try:
+        return _platform_publication_contract(
+            registered_tool_count=expected_tool_count,
+            registered_names_sha256=expected_names_sha256,
+            complete_schema_count=metadata["complete_schema_count"],
+            complete_schema_sha256=metadata["complete_schema_sha256"],
+        )
+    except ClientSnapshotError:
+        return None
+
+
+def _normalized_publication_projection(
+    contract: dict[str, Any],
+    *,
+    document: dict[str, Any] | None = None,
+    now_unix: int,
+) -> tuple[dict[str, Any], str, bool, str]:
+    projection = _publication_projection_for_contract(
+        contract,
+        document=document,
+        now_unix=now_unix,
+    )
+    state = str(projection.get("state") or "invalid")
+    pending = bool(projection.get("publication_pending"))
+    next_action = str(
+        projection.get("recommended_next_action")
+        or "repair the platform publication lifecycle"
+    )
+    if state == "untracked":
+        state = "publication_request_required"
+        pending = True
+        next_action = (
+            "create an immutable publication request for the current semantic tool contract, "
+            "then refresh or republish the ChatGPT connector"
+        )
+    return projection, state, pending, next_action
+
+
 def platform_snapshot_status(
     *,
     expected_tool_count: int,
@@ -2517,6 +2598,8 @@ def platform_snapshot_status(
         "publication_state": "unavailable",
         "publication_request_id": None,
         "publication_contract_sha256": None,
+        "runtime_publication_contract": None,
+        "publication_projection": None,
         "publication_mismatches": [],
         "schema_contract_matches": False,
         "schema_mismatches": [],
@@ -2538,6 +2621,31 @@ def platform_snapshot_status(
             "error": "timestamp_contract",
             "recommended_next_action": "repair platform snapshot clock inputs",
         }
+    status_contract = _runtime_publication_contract_for_status(
+        expected_tool_count=expected_tool_count,
+        expected_names_sha256=expected_names_sha256,
+        expected_runtime_tools=expected_runtime_tools,
+    )
+    if status_contract is not None:
+        (
+            durable_projection,
+            durable_state,
+            durable_pending,
+            durable_next_action,
+        ) = _normalized_publication_projection(
+            status_contract, now_unix=timestamp
+        )
+        base.update(
+            {
+                "publication_pending": durable_pending,
+                "publication_state": durable_state,
+                "publication_request_id": durable_projection.get("request_id"),
+                "publication_contract_sha256": status_contract["tool_contract_sha256"],
+                "runtime_publication_contract": status_contract,
+                "publication_projection": durable_projection,
+                "recommended_next_action": durable_next_action,
+            }
+        )
     try:
         document = _read_platform_snapshot()
     except FileNotFoundError:
@@ -2548,8 +2656,9 @@ def platform_snapshot_status(
             "state": "invalid",
             "error": type(exc).__name__,
             "recommended_next_action": (
-                "replace the untrusted or invalid platform connector snapshot "
-                "through the platform evidence integration"
+                base["recommended_next_action"]
+                if base.get("publication_projection") is not None
+                else "replace the untrusted or invalid platform connector snapshot through the platform evidence integration"
             ),
         }
     try:
@@ -2735,20 +2844,16 @@ def platform_snapshot_status(
         state = "matched"
         legacy_next_action = "none"
 
-    publication_projection = _publication_projection_for_contract(
+    (
+        publication_projection,
+        publication_state,
+        publication_pending,
+        publication_next_action,
+    ) = _normalized_publication_projection(
         runtime_contract,
         document=document,
         now_unix=timestamp,
     )
-    publication_pending = bool(publication_projection.get("publication_pending"))
-    publication_state = publication_projection.get("state")
-    publication_next_action = publication_projection.get("recommended_next_action")
-    if publication_state == "untracked":
-        publication_state = "publication_request_required"
-        publication_pending = True
-        publication_next_action = (
-            "create an immutable publication request for the current semantic tool contract, then refresh or republish the ChatGPT connector"
-        )
     return {
         **base,
         "state": state,

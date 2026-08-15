@@ -403,6 +403,176 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         self.assertEqual(current["state"], "awaiting_platform_observation")
         self.assertEqual(current["attempt_id"], "attempt-crash")
 
+    def test_later_attempt_replay_repairs_over_older_current_attempt(self) -> None:
+        artifact = self.artifact()
+        prepared = self.prepare_request(artifact, cutover_id="attempt-chain")
+        request_id = prepared["request_id"]
+        snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
+        snapshot.record_platform_publication_attempt(
+            request_id=request_id,
+            attempt_id="attempt-failed-first",
+            outcome="failed",
+            reference="chatgpt:connector-refresh:failed-first",
+            now_unix=1_010,
+        )
+        prior_current = snapshot._read_publication_current()
+        self.assertEqual(prior_current["attempt_id"], "attempt-failed-first")
+        self.assertEqual(prior_current["state"], "publication_pending")
+
+        with mock.patch.object(
+            snapshot,
+            "_write_publication_current",
+            side_effect=RuntimeError("simulated later-attempt projection crash"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "later-attempt projection crash"):
+                snapshot.record_platform_publication_attempt(
+                    request_id=request_id,
+                    attempt_id="attempt-submitted-second",
+                    outcome="submitted",
+                    reference="chatgpt:connector-refresh:submitted-second",
+                    now_unix=1_020,
+                )
+        orphan = snapshot._read_publication_attempt(
+            request_id, "attempt-submitted-second"
+        )
+        self.assertEqual(
+            orphan["previous_current_sha256"], prior_current["current_sha256"]
+        )
+        self.assertEqual(orphan["previous_attempt_id"], "attempt-failed-first")
+        self.assertEqual(
+            snapshot._read_publication_current()["current_sha256"],
+            prior_current["current_sha256"],
+        )
+
+        replay = snapshot.record_platform_publication_attempt(
+            request_id=request_id,
+            attempt_id="attempt-submitted-second",
+            outcome="submitted",
+            reference="chatgpt:connector-refresh:submitted-second",
+            now_unix=2_000,
+        )
+        self.assertTrue(replay["idempotent"])
+        self.assertTrue(replay["recovered_projection"])
+        current = snapshot._read_publication_current()
+        self.assertEqual(current["attempt_id"], "attempt-submitted-second")
+        self.assertEqual(current["state"], "awaiting_platform_observation")
+
+    def test_orphaned_attempt_cannot_overwrite_genuinely_newer_projection(self) -> None:
+        artifact = self.artifact()
+        prepared = self.prepare_request(artifact, cutover_id="attempt-newer-projection")
+        request_id = prepared["request_id"]
+        snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
+        snapshot.record_platform_publication_attempt(
+            request_id=request_id,
+            attempt_id="attempt-old-current",
+            outcome="failed",
+            reference="chatgpt:connector-refresh:old-failure",
+            now_unix=1_010,
+        )
+        with mock.patch.object(
+            snapshot,
+            "_write_publication_current",
+            side_effect=RuntimeError("simulated orphaned second attempt"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "orphaned second attempt"):
+                snapshot.record_platform_publication_attempt(
+                    request_id=request_id,
+                    attempt_id="attempt-orphaned",
+                    outcome="submitted",
+                    reference="chatgpt:connector-refresh:orphaned",
+                    now_unix=1_020,
+                )
+        snapshot.record_platform_publication_attempt(
+            request_id=request_id,
+            attempt_id="attempt-newer-current",
+            outcome="outcome_unknown",
+            reference="chatgpt:connector-refresh:newer-current",
+            now_unix=1_030,
+        )
+        newer = snapshot._read_publication_current()
+        self.assertEqual(newer["attempt_id"], "attempt-newer-current")
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError, "newer or different current projection"
+        ):
+            snapshot.record_platform_publication_attempt(
+                request_id=request_id,
+                attempt_id="attempt-orphaned",
+                outcome="submitted",
+                reference="chatgpt:connector-refresh:orphaned",
+                now_unix=2_000,
+            )
+        self.assertEqual(
+            snapshot._read_publication_current()["current_sha256"],
+            newer["current_sha256"],
+        )
+
+    def test_durable_publication_state_survives_missing_platform_snapshot(self) -> None:
+        artifact = self.artifact()
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(artifact)
+        prepared = self.prepare_request(artifact, cutover_id="missing-platform-snapshot")
+        request_id = prepared["request_id"]
+        snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
+
+        pending = snapshot.snapshot_status(
+            expected_tool_count=metadata["name_count"],
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            expected_runtime_tools=artifact,
+            now_unix=1_010,
+        )
+        self.assertEqual(pending["platform_evidence_state"], "missing")
+        self.assertEqual(pending["platform_publication_state"], "publication_pending")
+        self.assertTrue(pending["platform_publication_pending"])
+        self.assertEqual(pending["platform_publication_request_id"], request_id)
+        self.assertEqual(
+            pending["platform_publication_contract_sha256"],
+            prepared["contract"]["tool_contract_sha256"],
+        )
+
+        self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        snapshot.capture_platform_connector_snapshot(
+            observed_tools=artifact,
+            runtime_root=self.runtime_root(names),
+            source_reference="chatgpt:connector:before-reboot",
+            observation_scope="connector_catalog",
+            observation_id="connector-before-reboot",
+            publication_request_id=request_id,
+            requested_contract_sha256=prepared["contract"]["tool_contract_sha256"],
+            observed_at_unix=1_100,
+        )
+        converged = snapshot.reconcile_platform_publication_for_runtime(
+            registered_tool_count=metadata["name_count"],
+            registered_names_sha256=metadata["names_sha256"],
+            complete_schema_count=metadata["complete_schema_count"],
+            complete_schema_sha256=metadata["complete_schema_sha256"],
+            now_unix=1_110,
+        )
+        self.assertEqual(converged["state"], "platform_converged")
+        self.platform_path.unlink()
+
+        after_reboot = snapshot.snapshot_status(
+            expected_tool_count=metadata["name_count"],
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            expected_runtime_tools=artifact,
+            now_unix=1_120,
+        )
+        self.assertEqual(after_reboot["platform_evidence_state"], "missing")
+        self.assertEqual(
+            after_reboot["platform_publication_state"], "platform_converged"
+        )
+        self.assertFalse(after_reboot["platform_publication_pending"])
+        self.assertEqual(after_reboot["platform_publication_request_id"], request_id)
+        self.assertEqual(
+            after_reboot["platform_snapshot"]["publication_projection"]["state"],
+            "platform_converged",
+        )
+
     def test_pending_activation_from_earlier_cutover_blocks_new_cutover(self) -> None:
         artifact = self.artifact()
         self.prepare_request(artifact, cutover_id="cutover-a")

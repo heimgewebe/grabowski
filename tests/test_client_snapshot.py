@@ -282,9 +282,13 @@ class ClientSnapshotTests(unittest.TestCase):
         self.assertFalse(observed["platform_connector_snapshot_observable"])
         self.assertFalse(observed["platform_connector_schema_observable"])
         self.assertEqual(observed["platform_evidence_state"], "missing")
+        self.assertEqual(
+            observed["platform_publication_state"], "publication_request_required"
+        )
+        self.assertTrue(observed["platform_publication_pending"])
         self.assertFalse(observed["server_loopback_observable"])
         self.assertIn(
-            "platform connector catalog snapshot",
+            "immutable publication request",
             observed["recommended_next_action"],
         )
 
