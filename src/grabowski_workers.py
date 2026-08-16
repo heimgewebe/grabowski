@@ -826,6 +826,38 @@ def _reconcile_record(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     return stored, observation
 
 
+_SYSTEMD_TIMESPAN_FACTORS_US = {
+    "us": 1,
+    "ms": 1_000,
+    "s": 1_000_000,
+    "min": 60 * 1_000_000,
+    "h": 60 * 60 * 1_000_000,
+    "d": 24 * 60 * 60 * 1_000_000,
+    "w": 7 * 24 * 60 * 60 * 1_000_000,
+}
+_SYSTEMD_TIMESPAN_TOKEN = re.compile(r"(\d+)(us|ms|s|min|h|d|w)")
+
+
+def _systemd_timespan_us(value: str | None) -> int | None:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or raw == "infinity":
+        return None
+    total = 0
+    position = 0
+    matched = False
+    for match in _SYSTEMD_TIMESPAN_TOKEN.finditer(raw):
+        if raw[position : match.start()].strip():
+            return None
+        total += int(match.group(1)) * _SYSTEMD_TIMESPAN_FACTORS_US[match.group(2)]
+        position = match.end()
+        matched = True
+    if not matched or raw[position:].strip():
+        return None
+    return total
+
+
 def _planned_runtime_limit_reached(
     record: dict[str, Any], properties: dict[str, str]
 ) -> bool:
@@ -837,7 +869,16 @@ def _planned_runtime_limit_reached(
         return False
     if runtime_seconds <= 0 or active_enter_us <= 0 or active_exit_us <= active_enter_us:
         return False
-    return active_exit_us - active_enter_us >= runtime_seconds * 1_000_000
+    expected_runtime_us = runtime_seconds * 1_000_000
+    if _systemd_timespan_us(properties.get("RuntimeMaxUSec")) != expected_runtime_us:
+        return False
+    if active_exit_us - active_enter_us < expected_runtime_us:
+        return False
+    exec_main_code = properties.get("ExecMainCode")
+    exec_main_status = properties.get("ExecMainStatus")
+    if exec_main_status == "0":
+        return exec_main_code in {None, "", "1"}
+    return exec_main_code == "2" and exec_main_status == "15"
 
 
 def _observe(record: dict[str, Any]) -> dict[str, Any]:
@@ -852,7 +893,9 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
             "--property=ActiveState",
             "--property=SubState",
             "--property=Result",
+            "--property=ExecMainCode",
             "--property=ExecMainStatus",
+            "--property=RuntimeMaxUSec",
             "--property=ActiveEnterTimestampMonotonic",
             "--property=ActiveExitTimestampMonotonic",
         ],
@@ -871,9 +914,7 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
     exec_main_status = properties.get("ExecMainStatus")
     observed_at_unix = _now()
     planned_runtime_limit = bool(
-        unit_result == "timeout"
-        and exec_main_status == "0"
-        and _planned_runtime_limit_reached(record, properties)
+        unit_result == "timeout" and _planned_runtime_limit_reached(record, properties)
     )
     if result["returncode"] != 0:
         state = "interrupted"
