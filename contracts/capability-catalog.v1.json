@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "e4365b11db969bdb6b62cccf6809923c205489a0b8217e53f4cfa343e3a002c3",
+  "capability_source_sha256": "1620ad4b5d93a3859047ab9c1b7d91125ac5821121a25721733197a570397946",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "e2752b37cb0f784e1c797fca9c10f529fba7e538cb1fad6ae5e27d1e86ad27a6",
+  "contract_sha256": "0569492859243af44933322c9a205014c53a413bccefaf579af61179977dc3aa",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -2103,17 +2103,18 @@
     },
     {
       "category": "browser-worker",
-      "description": "Observe or act through semantic snapshot and element handles only.\n\n``operation`` is either ``observe`` or ``act``. Element observations expose\nonly opaque element ids plus bounded Accessibility roles and names; origins,\ntitles, selectors, browser backend identifiers and protocol method names stay\nprivate. Effect class and retry/readback authority come from the server-owned\nsemantic catalog.",
+      "description": "Observe or act through semantic snapshot and element handles only.\n\n``operation`` is either ``observe`` or ``act``. Element observations expose\nonly opaque element ids plus bounded Accessibility roles and names. Navigate\naccepts one conservatively validated ``navigation_target`` but never echoes it\ninto the outcome or audit. Origins, titles, selectors, browser backend\nidentifiers and protocol method names stay private. Effect class and\nretry/readback authority come from the server-owned semantic catalog.",
       "effects": [
         "audit-create",
         "browser-read",
-        "browser-local-ui"
+        "browser-local-ui",
+        "browser-network-navigation"
       ],
       "id": "grabowski_browser_worker_semantic",
-      "purpose": "Observe or act through snapshot-bound semantic browser handles with bounded Accessibility labels and no raw browser locators.",
+      "purpose": "Observe or act through snapshot-bound semantic browser handles, including explicitly audited network navigation, with bounded Accessibility labels and no raw browser locators.",
       "read_only": false,
-      "reversibility": "read-not-applicable; local-ui-state-dependent",
-      "risk_class": "medium",
+      "reversibility": "read-not-applicable; local-ui-and-network-navigation-state-dependent",
+      "risk_class": "high",
       "tool": "grabowski_browser_worker_semantic"
     },
     {

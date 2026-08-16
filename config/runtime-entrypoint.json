@@ -696,15 +696,15 @@
       ],
       "supported_intents": [
         "read_state",
+        "navigate",
         "scroll_into_view"
       ],
-      "uncovered_intents": {
-        "navigate": "direct-cdp-required"
-      },
-      "public_target_contract": "opaque-snapshot-and-element-handles",
+      "uncovered_intents": {},
+      "public_target_contract": "opaque-handles-and-validated-navigation-targets",
       "implemented_effect_classes": [
         "read",
-        "local_ui"
+        "local_ui",
+        "network_navigation"
       ],
       "fail_closed_effect_classes": [
         "reversible_external",

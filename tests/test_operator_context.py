@@ -253,11 +253,16 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
         self.assertEqual(
             browser["semantic_gateway"]["supported_intents"],
-            ["read_state", "scroll_into_view"],
+            ["read_state", "navigate", "scroll_into_view"],
+        )
+        self.assertEqual(browser["semantic_gateway"]["uncovered_intents"], {})
+        self.assertEqual(
+            browser["semantic_gateway"]["public_target_contract"],
+            "opaque-handles-and-validated-navigation-targets",
         )
         self.assertEqual(
-            browser["semantic_gateway"]["uncovered_intents"],
-            {"navigate": "direct-cdp-required"},
+            browser["semantic_gateway"]["implemented_effect_classes"],
+            ["read", "local_ui", "network_navigation"],
         )
         self.assertFalse(
             browser["semantic_gateway"]["ambiguous_effect_retry_authorized"]
@@ -269,6 +274,14 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
 
         context = json.loads(CONTEXT.read_text(encoding="utf-8"))
         self.assertEqual(context["browser_operator_contract"], browser)
+
+        capability = next(
+            item
+            for item in context["capabilities"]
+            if item["tool"] == "grabowski_browser_worker_semantic"
+        )
+        self.assertEqual(capability["risk_class"], "high")
+        self.assertIn("browser-network-navigation", capability["effects"])
 
         entry = (ROOT / "GRABOWSKI.md").read_text(encoding="utf-8")
         self.assertIn("browser_operator_contract", entry)

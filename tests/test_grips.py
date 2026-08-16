@@ -1153,6 +1153,42 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("failed", result["receipt"]["status"])
 
+    def test_browser_semantic_act_grip_forwards_navigation_target(self) -> None:
+        module = types.ModuleType("grabowski_workers")
+        gateway = Mock(
+            return_value={
+                "ok": True,
+                "result_code": "ok",
+                "retry_readback": {"retry_authorized": False},
+                "audit": {
+                    "intent": {"recorded": True},
+                    "outcome": {"recorded": True},
+                },
+            }
+        )
+        module.browser_semantic_gateway = gateway
+        with patch.dict(sys.modules, {"grabowski_workers": module}):
+            result = grips.grip_run(
+                "browser-semantic-act",
+                {
+                    "worker_id": "b" * 20,
+                    "snapshot_id": "bsid2_" + "c" * 64,
+                    "action_kind": "navigate",
+                    "navigation_target": "https://example.invalid/",
+                },
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        gateway.assert_called_once_with(
+            "b" * 20,
+            "act",
+            snapshot_id="bsid2_" + "c" * 64,
+            action_kind="navigate",
+            navigation_target="https://example.invalid/",
+        )
+
     def test_checkout_binding_terminal_preview_grip_is_read_only_and_delegates(self) -> None:
         checkout_key = "a" * 64
         preview = {
