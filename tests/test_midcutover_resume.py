@@ -1232,5 +1232,103 @@ class RecoverySurfaceTests(unittest.TestCase):
                     )
 
 
+class OperatorCapabilitySourceTests(unittest.TestCase):
+    """Tests 24-26: one canonical capability authority, still fail-closed."""
+
+    @staticmethod
+    def _policy(capabilities: list[str]) -> dict[str, object]:
+        return {
+            "active_profile": "test",
+            "profiles": {"test": {"capabilities": list(capabilities)}},
+            "forbidden_capabilities": [],
+        }
+
+    def test_base_capabilities_from_the_active_profile_stay_available(self) -> None:
+        import grabowski_operator as operator
+
+        policy = self._policy(["file_read", "audit_verify", "durable_job"])
+        with mock.patch.object(operator.base, "_load_policy", return_value=policy):
+            operator._require_operator_capability("file_read")
+            operator._require_operator_capability("audit_verify")
+            operator._require_operator_capability("durable_job")
+            self.assertEqual(operator._operator_capabilities(), {"durable_job"})
+
+    def test_capability_absent_from_the_profile_is_refused(self) -> None:
+        import grabowski_operator as operator
+
+        policy = self._policy(["file_read"])
+        with mock.patch.object(operator.base, "_load_policy", return_value=policy):
+            with self.assertRaisesRegex(PermissionError, "not enabled"):
+                operator._require_operator_capability("audit_verify")
+
+    def test_undefined_capability_stays_fail_closed(self) -> None:
+        import grabowski_operator as operator
+
+        policy = self._policy(["file_read", "not_a_real_capability"])
+        with mock.patch.object(operator.base, "_load_policy", return_value=policy):
+            with self.assertRaisesRegex(PermissionError, "Unknown capability"):
+                operator._require_operator_capability("not_a_real_capability")
+            self.assertNotIn(
+                "not_a_real_capability", operator._effective_capability_set()
+            )
+
+    def test_forbidden_capabilities_still_win(self) -> None:
+        import grabowski_operator as operator
+
+        policy = self._policy(["file_read", "audit_verify"])
+        policy["forbidden_capabilities"] = ["audit_verify"]
+        with mock.patch.object(operator.base, "_load_policy", return_value=policy):
+            with self.assertRaisesRegex(PermissionError, "not enabled"):
+                operator._require_operator_capability("audit_verify")
+
+    def test_write_capability_follows_the_profile_and_nothing_else(self) -> None:
+        import grabowski_operator as operator
+
+        granted = self._policy(["file_read", "file_write"])
+        with mock.patch.object(operator.base, "_load_policy", return_value=granted):
+            operator._require_operator_capability("file_write")
+        withheld = self._policy(["file_read"])
+        with mock.patch.object(operator.base, "_load_policy", return_value=withheld):
+            with self.assertRaisesRegex(PermissionError, "not enabled"):
+                operator._require_operator_capability("file_write")
+
+    def test_capability_correction_grants_no_mutation_on_a_broken_runtime(self) -> None:
+        """A wider read capability must not widen the transport gate."""
+        import grabowski_operator as operator
+
+        broken = {
+            flag: False
+            for flag in operator._PROVENANCE_RECOVERY_REPAIRABLE_INTEGRITY_FLAGS
+        }
+        mutating = mock.Mock()
+        mutating.annotations = mock.Mock(readOnlyHint=False)
+        policy = self._policy(
+            ["file_read", "audit_verify", "durable_job", "git_cli", "power_execute"]
+        )
+        with (
+            mock.patch.object(operator.base, "_load_policy", return_value=policy),
+            mock.patch.object(
+                operator.base, "_deployment_metadata", return_value=broken
+            ),
+        ):
+            for tool_name in ("grabowski_power_run", "grabowski_git"):
+                with self.subTest(tool=tool_name):
+                    self.assertFalse(
+                        operator._provenance_recovery_transport_exempt_call(
+                            tool_name, mutating
+                        )
+                    )
+
+    def test_mutation_gate_stays_narrower_than_the_catalog(self) -> None:
+        import grabowski_operator as operator
+
+        policy = self._policy(["file_read", "audit_verify"])
+        with mock.patch.object(operator.base, "_load_policy", return_value=policy):
+            with self.assertRaisesRegex(
+                PermissionError, "Not an operator mutation capability"
+            ):
+                operator._require_operator_mutation("file_read")
+
+
 if __name__ == "__main__":
     unittest.main()

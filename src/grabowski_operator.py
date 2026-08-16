@@ -1453,20 +1453,38 @@ def _redacted_command(argv: list[str]) -> str:
 
 
 def _operator_capabilities() -> set[str]:
-    policy = base._load_policy()
-    forbidden = set(policy.get("forbidden_capabilities", []))
-    profiles = policy.get("profiles")
-    if isinstance(profiles, dict):
-        profile = base._active_profile(policy)
-        raw = profile.get("capabilities", [])
-        capabilities = {item for item in raw if isinstance(item, str)}
-    else:
-        capabilities = set(OPERATOR_CAPABILITIES)
+    """Operator-lane capabilities of the active profile.
+
+    Narrower than the canonical catalog on purpose: this set answers "may the
+    operator lane mutate through this capability", and only operator
+    capabilities can. It is *not* the answer to "does the active profile grant
+    this capability at all" -- see ``_effective_capability_set``.
+    """
     return {
         capability
-        for capability in capabilities
-        if capability in OPERATOR_CAPABILITIES and capability not in forbidden
+        for capability in _effective_capability_set()
+        if capability in OPERATOR_CAPABILITIES
     }
+
+
+def _effective_capability_set() -> set[str]:
+    """The single canonical answer to what the active profile actually grants.
+
+    There used to be a second, older authority here: the profile's capabilities
+    were intersected with the operator-only ``OPERATOR_CAPABILITIES`` tuple for
+    *every* capability question. That silently deleted capabilities the active
+    profile really does grant -- ``file_read`` and ``audit_verify`` among them --
+    so a tool requiring one of them could never run, no matter how the policy
+    was written. Two authorities over one question is one authority too many.
+
+    The catalog in ``grabowski_mcp`` is now the only definition of which
+    capability names exist, and the active policy profile is the only
+    definition of which of them are granted. Unknown names stay fail-closed:
+    a capability absent from the catalog is never granted by accident.
+    """
+    policy = base._load_policy()
+    granted = base._effective_capabilities(policy)
+    return {capability for capability in granted if capability in base.ALL_CAPABILITIES}
 
 
 def _trusted_owner_mode(policy: dict[str, Any] | None = None) -> bool:
@@ -1477,7 +1495,11 @@ def _trusted_owner_mode(policy: dict[str, Any] | None = None) -> bool:
 
 
 def _require_operator_capability(capability: str) -> None:
-    if capability not in _operator_capabilities():
+    if capability not in base.ALL_CAPABILITIES:
+        # Fail closed on names the catalog does not define. A typo must not be
+        # readable as "no such restriction applies".
+        raise PermissionError(f"Unknown capability: {capability}")
+    if capability not in _effective_capability_set():
         raise PermissionError(f"Operator capability is not enabled: {capability}")
 
 
@@ -1493,6 +1515,13 @@ def _require_operator_mutation(
     fresh_preflight: bool = False,
     opaque_command: bool = False,
 ) -> None:
+    if capability not in OPERATOR_CAPABILITIES:
+        # The mutation gate stays narrower than the capability catalog: only an
+        # operator capability may authorise an operator-lane mutation, even
+        # though the profile may grant read capabilities by the same mechanism.
+        raise PermissionError(
+            f"Not an operator mutation capability: {capability}"
+        )
     _require_operator_capability(capability)
     base._require_blockade_allows_mutation(
         capability,
