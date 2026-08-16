@@ -756,6 +756,158 @@ def _require_schema_identity(
     return normalized, _sha256_json(normalized)
 
 
+#: Publication-v2 states in which the green tool contract is already the
+#: authorised one.  ``publication_pending`` is the first such state: the request
+#: has been activated against the live runtime and the platform refresh is what
+#: is still outstanding.  Every later state only adds observation evidence on
+#: top of that same authorisation.
+PUBLICATION_REBIND_AUTHORIZED_STATES = frozenset(
+    {
+        "publication_pending",
+        "awaiting_platform_observation",
+        "outcome_unknown",
+        "convergence_observed_unreconciled",
+        "platform_converged",
+    }
+)
+#: Durable current states that are *not* an activation, whatever the lifecycle
+#: projection reports.  ``pending_activation`` projects as ``outcome_unknown``
+#: because the active runtime has not been read back yet -- which is the correct
+#: thing to tell an operator, and exactly the wrong thing to accept as
+#: authorisation. The durable state is checked separately for that reason.
+PUBLICATION_REBIND_FORBIDDEN_CURRENT_STATES = frozenset({"pending_activation"})
+
+
+def _authorized_publication_schema_transition(
+    *,
+    cutover_id: str,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    green_complete_schema_count: Any,
+    green_complete_schema_sha256: str,
+    source_schema_identity_sha256: str,
+    source_complete_schema_sha256: str,
+    target_schema_identity_sha256: str,
+    green_readiness: dict[str, Any],
+    now_unix: int,
+) -> dict[str, Any]:
+    """Authorise a *changed* green tool schema against durable Publication-v2.
+
+    Continuity of the connector surface is the ordinary case, and for it no
+    authorisation is required at all.  A schema change is different: the client
+    that produced the prior declaration observed a surface that no longer
+    exists.  Refusing every such change -- the old behaviour -- made an
+    authorised schema rollout impossible; accepting it silently would let the
+    rebind assert an observation nobody made.
+
+    So the change must be authorised by evidence that already exists and was
+    written before the rebind: an activated publication request naming this
+    exact cutover and this exact green tool contract.  Nothing is derived from
+    the caller: every value is recomputed and compared against the durable
+    request, the durable current projection and the lifecycle projection.
+    """
+    target_contract = _platform_publication_contract(
+        registered_tool_count=registered_tool_count,
+        registered_names_sha256=registered_names_sha256,
+        complete_schema_count=green_complete_schema_count,
+        complete_schema_sha256=green_complete_schema_sha256,
+    )
+    try:
+        current = _read_publication_current()
+    except (OSError, ClientSnapshotError) as exc:
+        raise ClientSnapshotError(
+            "connector schema changed but the platform publication projection is unreadable"
+        ) from exc
+    if current is None or current.get("state") == "no_current":
+        raise ClientSnapshotError(
+            "connector schema changed but no platform publication request authorises "
+            "the green tool contract"
+        )
+    request_id = current["request_id"]
+    try:
+        request = _read_publication_request(request_id)
+    except (OSError, ClientSnapshotError) as exc:
+        raise ClientSnapshotError(
+            "connector schema changed but the platform publication request evidence is unreadable"
+        ) from exc
+    if request["cutover_id"] != cutover_id:
+        raise ClientSnapshotError(
+            "platform publication request authorises a different cutover"
+        )
+    expected_contract = request["expected_contract"]
+    for label, observed, expected in (
+        ("tool count", expected_contract["tool_count"], registered_tool_count),
+        (
+            "tool names hash",
+            expected_contract["tool_names_sha256"],
+            registered_names_sha256,
+        ),
+        (
+            "complete schema count",
+            expected_contract["tool_schemas_count"],
+            green_complete_schema_count,
+        ),
+        (
+            "complete schema hash",
+            expected_contract["tool_schemas_sha256"],
+            green_complete_schema_sha256,
+        ),
+        (
+            "tool contract hash",
+            expected_contract["tool_contract_sha256"],
+            target_contract["tool_contract_sha256"],
+        ),
+        (
+            "current contract hash",
+            current["contract_sha256"],
+            target_contract["tool_contract_sha256"],
+        ),
+    ):
+        if observed != expected:
+            raise ClientSnapshotError(
+                f"platform publication {label} does not authorise the green surface"
+            )
+    projection = _publication_projection_for_contract(
+        target_contract, now_unix=now_unix
+    )
+    state = projection.get("state")
+    if projection.get("request_id") != request_id:
+        raise ClientSnapshotError(
+            "platform publication projection binds a different request"
+        )
+    durable_state = current["state"]
+    if (
+        durable_state in PUBLICATION_REBIND_FORBIDDEN_CURRENT_STATES
+        or state not in PUBLICATION_REBIND_AUTHORIZED_STATES
+    ):
+        raise ClientSnapshotError(
+            "platform publication request is not activated for the green tool "
+            f"contract (state {durable_state!r}/{state!r})"
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_connector_schema_transition",
+        "schema_changed": True,
+        "cutover_id": cutover_id,
+        "source_schema_identity_sha256": source_schema_identity_sha256,
+        "source_complete_schema_sha256": source_complete_schema_sha256,
+        "target_schema_identity_sha256": target_schema_identity_sha256,
+        "target_complete_schema_sha256": green_complete_schema_sha256,
+        "green_readiness_sha256": _sha256_json(green_readiness),
+        "publication_request_id": request_id,
+        "publication_request_sha256": request["request_sha256"],
+        "publication_contract_sha256": target_contract["tool_contract_sha256"],
+        "publication_state": state,
+        "publication_current_state": durable_state,
+        "authorized_at_unix": now_unix,
+        "does_not_establish": [
+            "that any client has observed the changed green schema",
+            "platform connector catalog publication",
+        ],
+    }
+    return {**material, "transition_sha256": _sha256_json(material)}
+
+
 def _rebind_snapshot_for_cutover(
     *,
     cutover_id: str,
@@ -941,14 +1093,32 @@ def _rebind_snapshot_for_cutover(
             label="green complete schema identity",
         )
         if (
-            source_schema_hashes != green_schema_hashes
-            or green_readiness.get("schema_identity_sha256")
+            green_readiness.get("schema_identity_sha256")
             != green_schema_identity_sha256
+        ):
+            # Readiness that disagrees with its own schema hashes proves nothing
+            # about green, changed schema or not.
+            raise ClientSnapshotError(
+                "green readiness schema identity is not internally consistent"
+            )
+        schema_changed = (
+            source_schema_hashes != green_schema_hashes
             or source_schema_identity_sha256 != green_schema_identity_sha256
             or source_complete_schema_sha256 != green_complete_schema_sha256
-        ):
-            raise ClientSnapshotError(
-                "green readiness schema identity does not match the bound source connector snapshot"
+        )
+        schema_transition: dict[str, Any] | None = None
+        if schema_changed:
+            schema_transition = _authorized_publication_schema_transition(
+                cutover_id=cutover_binding["cutover_id"],
+                registered_tool_count=registered_tool_count,
+                registered_names_sha256=names_sha256,
+                green_complete_schema_count=green_complete_schema_count,
+                green_complete_schema_sha256=green_complete_schema_sha256,
+                source_schema_identity_sha256=source_schema_identity_sha256,
+                source_complete_schema_sha256=source_complete_schema_sha256,
+                target_schema_identity_sha256=green_schema_identity_sha256,
+                green_readiness=green_readiness,
+                now_unix=timestamp,
             )
 
         server_binding = {
@@ -965,8 +1135,13 @@ def _rebind_snapshot_for_cutover(
             "from_repo_head": current_repo_head,
             "to_release_id": green_release,
             "to_repo_head": green_repo_head,
+            # The source values stay the source values. A rebind moves the
+            # binding forward; it never rewrites what was historically observed.
             "schema_identity_sha256": source_schema_identity_sha256,
             "complete_schema_sha256": source_complete_schema_sha256,
+            "target_schema_identity_sha256": green_schema_identity_sha256,
+            "target_complete_schema_sha256": green_complete_schema_sha256,
+            "schema_changed": schema_changed,
             "surface_continuity_sha256": _sha256_json(
                 {
                     "registered_tool_count": registered_tool_count,
@@ -977,7 +1152,19 @@ def _rebind_snapshot_for_cutover(
                 }
             ),
             "green_readiness_sha256": _sha256_json(green_readiness),
+            "publication_schema_transition": schema_transition,
         }
+        nonclaims = list(additional_nonclaims)
+        if schema_changed:
+            model = f"{verification_model}+publication-v2-schema-transition-v1"
+            for limitation in (
+                "that any client has observed the changed green tool schema",
+                "current green schema observability from the preserved historical evidence",
+            ):
+                if limitation not in nonclaims:
+                    nonclaims.append(limitation)
+        else:
+            model = verification_model
         receipt = {
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "kind": SNAPSHOT_KIND,
@@ -991,8 +1178,8 @@ def _rebind_snapshot_for_cutover(
             "cutover_transition": transition,
             "verified": True,
             "mismatches": [],
-            "verification_model": verification_model,
-            "does_not_establish": list(additional_nonclaims),
+            "verification_model": model,
+            "does_not_establish": nonclaims,
         }
         receipt["receipt_sha256"] = _sha256_json(receipt)
         _write_private_json(SNAPSHOT_PATH, receipt)
@@ -1012,8 +1199,17 @@ def _rebind_snapshot_for_cutover(
         "cutover_binding": cutover_binding,
         "cutover_transition": transition,
         "verification_model": receipt["verification_model"],
-        "schema_contract_matches": True,
-        "recommended_next_action": recommended_next_action,
+        # A changed schema means the preserved observation describes the
+        # predecessor surface. Reporting a contract match here would be the
+        # false claim this transition exists to avoid.
+        "schema_contract_matches": not schema_changed,
+        "schema_changed": schema_changed,
+        "publication_schema_transition": schema_transition,
+        "recommended_next_action": (
+            "capture a fresh client observation of the changed green schema"
+            if schema_changed
+            else recommended_next_action
+        ),
         "does_not_establish": list(receipt["does_not_establish"]),
     }
 
@@ -2931,6 +3127,10 @@ def snapshot_status(
         "schema_observable": False,
         "schema_evidence_observed": False,
         "schema_contract_matches": False,
+        "historical_schema_evidence_only": False,
+        "fresh_client_observation_required": False,
+        "runtime_fault_indicated": False,
+        "connector_schema_transition": None,
         "external_client_snapshot_observable": False,
         "external_client_schema_observable": False,
         "platform_connector_snapshot_observable": platform_snapshot_observable,
@@ -3071,8 +3271,16 @@ def snapshot_status(
     )
     complete_schema_count = observed_artifact_metadata.get("complete_schema_count")
     complete_schema_sha256 = observed_artifact_metadata.get("complete_schema_sha256")
+    # After an authorised schema transition the preserved evidence describes the
+    # predecessor surface.  It stays in the receipt as history, but it must not
+    # be reported as an observation of what is running now: no client has seen
+    # the changed schema until one actually looks.
+    historical_schema_evidence_only = bool(
+        isinstance(transition, dict) and transition.get("schema_changed") is True
+    )
     complete_schema_observable = (
-        observed_artifact_metadata.get("complete_schema_observable") is True
+        not historical_schema_evidence_only
+        and observed_artifact_metadata.get("complete_schema_observable") is True
         and complete_schema_count == expected_tool_count
         and declaration.get("observed_complete_schema_count") == expected_tool_count
         and declaration.get("observed_complete_schema_sha256") == complete_schema_sha256
@@ -3081,6 +3289,7 @@ def snapshot_status(
     )
     observed_schema_contract_matches = (
         schema_evidence_observed
+        and not historical_schema_evidence_only
         and schema_probe.get("matches") is True
         and schema_probe.get("schema_contract_matches") is True
     )
@@ -3112,6 +3321,16 @@ def snapshot_status(
     elif not matched:
         state = "mismatch"
         next_action = "refresh the connector tool snapshot and bind it again"
+    elif historical_schema_evidence_only:
+        # The runtime is fine and the binding holds; what is missing is a look at
+        # the new surface.  Saying that plainly matters: an operator who reads
+        # this as a runtime fault will start debugging a healthy deployment.
+        state = "matched"
+        next_action = (
+            "capture a fresh client observation of the changed green tool schema, "
+            "bind it, then reconcile the platform publication; the runtime itself "
+            "is bound and healthy and needs no repair"
+        )
     else:
         state = "matched"
         next_action = (
@@ -3141,6 +3360,14 @@ def snapshot_status(
         "client_observed_release_id": declaration.get("observed_release_id"),
         "schema_observable": external_client_schema_observable,
         "schema_evidence_observed": schema_evidence_observed,
+        "historical_schema_evidence_only": historical_schema_evidence_only,
+        "fresh_client_observation_required": historical_schema_evidence_only,
+        "runtime_fault_indicated": False,
+        "connector_schema_transition": (
+            transition.get("publication_schema_transition")
+            if historical_schema_evidence_only and isinstance(transition, dict)
+            else None
+        ),
         "schema_contract_matches": external_client_schema_contract_matches,
         "external_client_snapshot_observable": (
             external_client_snapshot_observable

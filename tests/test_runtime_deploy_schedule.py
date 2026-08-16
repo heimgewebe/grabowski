@@ -309,8 +309,12 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                 SNAPSHOT_PATH=snapshot_path,
             ):
                 client_snapshot._write_private_json(snapshot_path, source)
+                # Schema drift is still refused before anything is written --
+                # it is now refused as an *unauthorised* change rather than as
+                # an impossible one, which is what Publication-v2 is for.
                 with self.assertRaisesRegex(
-                    client_snapshot.ClientSnapshotError, "schema identity"
+                    client_snapshot.ClientSnapshotError,
+                    "no platform publication request authorises",
                 ):
                     client_snapshot.rebind_authentic_snapshot_for_cutover(
                         cutover_id="cutover-schema-drift",
@@ -353,8 +357,12 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
                 SNAPSHOT_PATH=snapshot_path,
             ):
                 client_snapshot._write_private_json(snapshot_path, source)
+                # Schema drift is still refused before anything is written --
+                # it is now refused as an *unauthorised* change rather than as
+                # an impossible one, which is what Publication-v2 is for.
                 with self.assertRaisesRegex(
-                    client_snapshot.ClientSnapshotError, "schema identity"
+                    client_snapshot.ClientSnapshotError,
+                    "no platform publication request authorises",
                 ):
                     client_snapshot.rebind_authentic_snapshot_for_cutover(
                         cutover_id="cutover-complete-schema-drift",
