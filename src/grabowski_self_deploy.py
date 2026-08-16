@@ -1499,6 +1499,18 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
             f"self deploy job status is unavailable: {entry.name}"
         )
     final_status = status.get("final_status")
+    # A job whose finalization receipt says outcome_unknown with blind retry
+    # forbidden is *not* finished in the sense that matters here, however
+    # cleanly its unit exited.  Treating the systemd status as the whole truth
+    # would prune exactly the entry that demands an authoritative runtime
+    # readback before anything else runs.
+    finalization = status.get("finalization_receipt")
+    readback_required = bool(
+        isinstance(finalization, dict)
+        and finalization.get("valid") is True
+        and finalization.get("final_status") == "outcome_unknown"
+        and finalization.get("blind_retry_allowed") is False
+    )
     return {
         "unit": entry.name,
         "kind": "deploy" if deploy_fields is not None else "midcutover_resume",
@@ -1508,8 +1520,9 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         "status": status,
         "final_status": final_status,
         "fields": command_fields,
-        "terminal": final_status in TERMINAL_JOB_STATUSES,
-        "reusable": final_status in REUSABLE_JOB_STATUSES,
+        "readback_required": readback_required,
+        "terminal": final_status in TERMINAL_JOB_STATUSES and not readback_required,
+        "reusable": final_status in REUSABLE_JOB_STATUSES and not readback_required,
     }
 
 
@@ -1532,6 +1545,7 @@ def inflight_runtime_job_evidence(
         "inflight_units": [],
         "blocking_units": [],
         "idempotent_match": None,
+        "ambiguous_identical_units": [],
         "pruned_units": [],
         "error": None,
     }
@@ -1568,6 +1582,26 @@ def inflight_runtime_job_evidence(
             and classified["argv_sha256"] == expected_sha256
             and classified["reusable"]
         ):
+            if evidence["idempotent_match"] is not None:
+                # Historical double-dispatch residue.  Two identical running
+                # jobs cannot both be "the one we may join", and silently
+                # picking the last would coalesce onto an arbitrary half of an
+                # ambiguity.  Both block instead.
+                evidence["ambiguous_identical_units"] = sorted(
+                    {evidence["idempotent_match"]["unit"], str(unit)}
+                )
+                evidence["blocking_units"].extend(
+                    evidence["ambiguous_identical_units"]
+                )
+                evidence["idempotent_match"] = None
+                evidence["error"] = (
+                    "multiple identical runtime jobs are running: "
+                    + ", ".join(evidence["ambiguous_identical_units"])
+                )
+                continue
+            if evidence.get("ambiguous_identical_units"):
+                evidence["blocking_units"].append(str(unit))
+                continue
             evidence["idempotent_match"] = {
                 "unit": classified["unit"],
                 "kind": classified["kind"],

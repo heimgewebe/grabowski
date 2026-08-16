@@ -2813,3 +2813,162 @@ class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
             {"grabowski-job-dddddddddddd": ["/usr/bin/python3", "/tmp/other.py"]}
         )
         self.assertEqual(written["units"], [])
+
+
+class ReadbackRequiredAndAmbiguityTests(unittest.TestCase):
+    """Two ways a job can look finished without being safe to move past."""
+
+    ARGV = [
+        "/usr/bin/python3",
+        "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+        "--repo",
+        "/home/alex/repos/grabowski",
+        "--canonical-repo",
+        "/home/alex/repos/grabowski",
+        "--source-kind",
+        "canonical-main",
+        "--source-identity-sha256",
+        "ab" * 32,
+        "--expected-head",
+        "a" * 40,
+        "--delay-seconds",
+        "8",
+    ]
+
+    def _classified(self, unit, *, status):
+        """Run the real classifier against a realistic job status shape."""
+        metadata = {
+            "argv": list(self.ARGV),
+            "argv_sha256": SELF_DEPLOY._deploy_command_sha256(self.ARGV),
+            "cwd": "/home/alex/repos/grabowski",
+        }
+        with (
+            mock.patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ),
+            mock.patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            return SELF_DEPLOY._classify_indexed_job(Path(f"/jobs/{unit}"))
+
+    def test_terminal_unit_with_readback_required_receipt_is_not_terminal(self) -> None:
+        """The real shape: the unit exited cleanly, the receipt says otherwise."""
+        classified = self._classified(
+            "grabowski-job-aaaaaaaaaaaa",
+            status={
+                "final_status": "succeeded",
+                "finalization_receipt": {
+                    "valid": True,
+                    "final_status": "outcome_unknown",
+                    "blind_retry_allowed": False,
+                },
+            },
+        )
+        self.assertTrue(classified["readback_required"])
+        # Pruning this entry would drop the one job that demands a readback.
+        self.assertFalse(classified["terminal"])
+        self.assertFalse(classified["reusable"])
+
+    def test_terminal_unit_with_settled_receipt_is_terminal(self) -> None:
+        classified = self._classified(
+            "grabowski-job-bbbbbbbbbbbb",
+            status={
+                "final_status": "succeeded",
+                "finalization_receipt": {
+                    "valid": True,
+                    "final_status": "completed",
+                    "blind_retry_allowed": None,
+                },
+            },
+        )
+        self.assertFalse(classified["readback_required"])
+        self.assertTrue(classified["terminal"])
+
+    def test_readback_required_entry_blocks_and_is_not_pruned(self) -> None:
+        def classify(entry):
+            return {
+                "unit": entry.name,
+                "kind": "deploy",
+                "argv": [],
+                "argv_sha256": SELF_DEPLOY._deploy_command_sha256(self.ARGV),
+                "metadata": {},
+                "status": {},
+                "final_status": "succeeded",
+                "fields": {},
+                "readback_required": True,
+                "terminal": False,
+                "reusable": False,
+            }
+
+        with (
+            mock.patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/jobs")
+            ),
+            mock.patch.object(
+                SELF_DEPLOY,
+                "_deploy_index",
+                return_value={
+                    "units": ["grabowski-job-cccccccccccc"],
+                    "pending_unit": None,
+                },
+            ),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index") as write,
+            mock.patch.object(SELF_DEPLOY, "_classify_indexed_job", side_effect=classify),
+        ):
+            evidence = SELF_DEPLOY.inflight_runtime_job_evidence(self.ARGV, prune=True)
+        self.assertEqual(evidence["pruned_units"], [])
+        self.assertEqual(evidence["blocking_units"], ["grabowski-job-cccccccccccc"])
+        self.assertIsNone(evidence["idempotent_match"])
+        write.assert_not_called()
+
+    def test_two_identical_running_jobs_are_ambiguous_not_coalesced(self) -> None:
+        """Historical double-dispatch residue must not be silently joined."""
+        expected = SELF_DEPLOY._deploy_command_sha256(self.ARGV)
+
+        def classify(entry):
+            return {
+                "unit": entry.name,
+                "kind": "deploy",
+                "argv": [],
+                "argv_sha256": expected,
+                "metadata": {},
+                "status": {},
+                "final_status": "running",
+                "fields": {},
+                "readback_required": False,
+                "terminal": False,
+                "reusable": True,
+            }
+
+        with (
+            mock.patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/jobs")
+            ),
+            mock.patch.object(
+                SELF_DEPLOY,
+                "_deploy_index",
+                return_value={
+                    "units": [
+                        "grabowski-job-dddddddddddd",
+                        "grabowski-job-eeeeeeeeeeee",
+                    ],
+                    "pending_unit": None,
+                },
+            ),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index"),
+            mock.patch.object(SELF_DEPLOY, "_classify_indexed_job", side_effect=classify),
+        ):
+            evidence = SELF_DEPLOY.inflight_runtime_job_evidence(self.ARGV)
+        self.assertIsNone(evidence["idempotent_match"])
+        self.assertEqual(
+            evidence["ambiguous_identical_units"],
+            ["grabowski-job-dddddddddddd", "grabowski-job-eeeeeeeeeeee"],
+        )
+        self.assertEqual(
+            sorted(set(evidence["blocking_units"])),
+            ["grabowski-job-dddddddddddd", "grabowski-job-eeeeeeeeeeee"],
+        )
+        self.assertIn("multiple identical runtime jobs", evidence["error"])

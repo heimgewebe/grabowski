@@ -1011,3 +1011,71 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
         self.assertEqual(evidence["inflight_deploy_jobs"], [])
         # ...but it must be visible, so the dispatch can coalesce onto it.
         self.assertEqual(evidence["idempotent_match"], match)
+
+
+class DispatchCoalescingTests(unittest.TestCase):
+    """The coalescing branch itself, not just the evidence that feeds it.
+
+    The double dispatch this closes happened at dispatch time, so the proof has
+    to be that ``_start_job`` is not called a second time -- not merely that the
+    projection could have said so.
+    """
+
+    def _repair(self, recheck: dict):
+        allowed_gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=allowed_gate),
+            patch.object(
+                provenance_recovery, "_volatile_gate_recheck", return_value=recheck
+            ),
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+            patch.object(
+                provenance_recovery.self_deploy, "_write_deploy_index"
+            ) as write_index,
+        ):
+            result = provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+        return result, start_job, audit, write_index
+
+    def test_identical_running_repair_returns_it_without_a_second_dispatch(self) -> None:
+        match = {
+            "unit": "grabowski-job-777777777777",
+            "kind": "deploy",
+            "argv_sha256": "cd" * 32,
+            "final_status": "running",
+        }
+        result, start_job, audit, write_index = self._repair(
+            {
+                "reasons": [],
+                "checks": {},
+                "competing_deployment": {"idempotent_match": match},
+            }
+        )
+        start_job.assert_not_called()
+        # No reservation either: reserving for a job that is already running
+        # would leave a pending unit nobody clears.
+        write_index.assert_not_called()
+        self.assertTrue(result["already_dispatched"])
+        self.assertEqual(result["job"], match)
+        operations = [
+            call.args[0].get("operation") for call in audit.call_args_list if call.args
+        ]
+        self.assertIn("provenance-recovery-coalesced", operations)
+
+    def test_absent_match_still_dispatches_normally(self) -> None:
+        result, start_job, _audit, _write = self._repair(
+            {"reasons": [], "checks": {}, "competing_deployment": {"idempotent_match": None}}
+        )
+        start_job.assert_called_once()
+        self.assertNotIn("already_dispatched", result)
+
+    def test_recheck_without_a_projection_dispatches_rather_than_coalescing(self) -> None:
+        """Absent evidence is not a match."""
+        result, start_job, _audit, _write = self._repair({"reasons": [], "checks": {}})
+        start_job.assert_called_once()
+        self.assertNotIn("already_dispatched", result)
