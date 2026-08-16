@@ -472,11 +472,21 @@ def _scoped_writer_argv(value: Any, writer: str | None) -> list[str] | None:
     return result
 
 
+def _require_noninteractive_scoped_writer_argv(argv: list[str]) -> None:
+    executable = Path(argv[0]).name
+    if executable == "codexr" and (len(argv) < 3 or argv[2] != "exec"):
+        raise ValueError(
+            "codexr scoped writer requires noninteractive `codexr TASK_CLASS exec ...`; "
+            "a routed argv_prefix is selection metadata, not a complete writer command"
+        )
+
+
 def _start_scoped_writer(
     argv: list[str], *, cwd: str, runtime_seconds: int
 ) -> dict[str, Any]:
     working_directory = Path(cwd).resolve(strict=True)
     try:
+        _require_noninteractive_scoped_writer_argv(argv)
         operator._validate_argv(argv, cwd=working_directory)
         operator._job_runtime(runtime_seconds)
     except Exception as exc:

@@ -839,6 +839,49 @@ class WorkAcquireTests(unittest.TestCase):
             "final_status": "launch_submitted",
         }
 
+    def test_codexr_scoped_writer_requires_noninteractive_exec_before_job_start(self) -> None:
+        with (
+            patch.object(work_acquire.operator, "_validate_argv") as validate,
+            patch.object(work_acquire.operator, "_job_runtime") as job_runtime,
+            patch.object(work_acquire.operator, "_start_job") as start_job,
+            self.assertRaisesRegex(
+                work_acquire.ScopedWriterStartPreflight,
+                r"codexr TASK_CLASS exec",
+            ),
+        ):
+            work_acquire._start_scoped_writer(
+                ["codexr", "architecture"],
+                cwd=str(self.repo),
+                runtime_seconds=600,
+            )
+        validate.assert_not_called()
+        job_runtime.assert_not_called()
+        start_job.assert_not_called()
+
+    def test_codexr_scoped_writer_accepts_explicit_noninteractive_exec(self) -> None:
+        expected = self.writer_result(self.repo)
+        with (
+            patch.object(work_acquire.operator, "_validate_argv") as validate,
+            patch.object(work_acquire.operator, "_job_runtime") as job_runtime,
+            patch.object(work_acquire.operator, "_start_job", return_value=expected) as start_job,
+        ):
+            result = work_acquire._start_scoped_writer(
+                ["/home/alex/bin/codexr", "architecture", "exec", "--help"],
+                cwd=str(self.repo),
+                runtime_seconds=600,
+            )
+        self.assertEqual(result, expected)
+        validate.assert_called_once_with(
+            ["/home/alex/bin/codexr", "architecture", "exec", "--help"],
+            cwd=self.repo.resolve(),
+        )
+        job_runtime.assert_called_once_with(600)
+        start_job.assert_called_once_with(
+            ["/home/alex/bin/codexr", "architecture", "exec", "--help"],
+            cwd=str(self.repo.resolve()),
+            runtime_seconds=600,
+        )
+
     def test_optional_scoped_writer_starts_and_binds_durable_job(self) -> None:
         params = self.parameters()
         params["scoped_writer_argv"] = ["writer", "--once"]
