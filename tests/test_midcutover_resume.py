@@ -16,8 +16,10 @@ from contextlib import nullcontext
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -31,6 +33,52 @@ for module_root in (TOOLS, SRC):
     if str(module_root) in sys.path:
         sys.path.remove(str(module_root))
     sys.path.insert(0, str(module_root))
+
+class _FakeFastMCP:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def tool(self, *args, **kwargs):
+        return lambda function: function
+
+
+class _FakeToolAnnotations:
+    def __init__(self, **kwargs):
+        self.values = kwargs
+
+
+def _install_import_stubs() -> None:
+    """Make the operator and recovery modules importable without their deps.
+
+    These checks must run wherever the suite runs.  Inheriting a stub from
+    whichever test module discovery happened to reach first made the capability
+    and transport-gate regressions below skip silently under some orderings and
+    on the interpreter CI actually uses -- which is the one place they matter
+    most.  Real packages always win; the stubs fill in only what is missing.
+    """
+    try:
+        import mcp  # noqa: F401
+    except ModuleNotFoundError:
+        fake_mcp = types.ModuleType("mcp")
+        fake_server = types.ModuleType("mcp.server")
+        fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+        fake_types = types.ModuleType("mcp.types")
+        fake_fastmcp.FastMCP = _FakeFastMCP
+        fake_fastmcp.Context = object
+        fake_types.ToolAnnotations = _FakeToolAnnotations
+        sys.modules.setdefault("mcp", fake_mcp)
+        sys.modules.setdefault("mcp.server", fake_server)
+        sys.modules.setdefault("mcp.server.fastmcp", fake_fastmcp)
+        sys.modules.setdefault("mcp.types", fake_types)
+    try:
+        import pydantic  # noqa: F401
+    except ModuleNotFoundError:
+        fake_pydantic = types.ModuleType("pydantic")
+        fake_pydantic.Field = lambda **kwargs: kwargs
+        sys.modules.setdefault("pydantic", fake_pydantic)
+
+
+_install_import_stubs()
 
 import deploy_runtime_dual as dual
 import grabowski_midcutover_resume as midcutover
@@ -788,6 +836,218 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
                     timeout_seconds=10,
                 )
         self.assertEqual(raised.exception.phase, "snapshot-authenticity-preflight")
+
+
+class GreenDrainTargetTests(unittest.TestCase):
+    """Green is the publicly routed process, so green is what must be drained."""
+
+    def _runtime(self, topology: str) -> dual.MidCutoverResumeRuntime:
+        runtime = dual.MidCutoverResumeRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            release_path=Path("/release/green"),
+            contract=mock.Mock(module="grabowski_operator"),
+            contract_evidence={"judged_by_checkout": False},
+            green_binding={
+                "release_id": GREEN_RELEASE,
+                "repo_head": HEAD_GREEN,
+                "registered_names_sha256": "d1" * 32,
+                "agent_instructions_sha256": "d2" * 32,
+            },
+            classification={"classification_sha256": "f0" * 32},
+            resume_binding={
+                "cutover_id": CUTOVER_ID,
+                "expected_selector_sha256": SELECTOR_SHA256,
+                "expected_runtime_binding_sha256": BINDING_SHA256,
+                "source_identity_sha256": SOURCE_IDENTITY_SHA256,
+            },
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-0123456789ab.service",
+            selector_before=selector_document(),
+        )
+        runtime.admission_topology = {"topology": topology}
+        return runtime
+
+    def test_absent_canonical_operator_still_closes_admission(self) -> None:
+        runtime = self._runtime(dual.CANONICAL_OPERATOR_ABSENT)
+        marker = {"token": "t", "expected_head": HEAD_GREEN}
+        with (
+            mock.patch.object(
+                dual,
+                "classify_canonical_admission_topology",
+                return_value={"topology": dual.CANONICAL_OPERATOR_ABSENT},
+            ),
+            mock.patch.object(
+                dual,
+                "engage_receipt_bound_deployment_admission",
+                return_value=marker,
+            ) as engage,
+        ):
+            result = runtime.close_mutations()
+        # The old canonical unit being gone is not a reason to leave green open:
+        # green is still the public route and can still admit a mutation.
+        engage.assert_called_once()
+        self.assertTrue(result["closed"])
+        self.assertEqual(result["drain_target_port"], 18182)
+        self.assertFalse(result["canonical_guard_available"])
+
+    def test_ambiguous_canonical_state_fails_closed(self) -> None:
+        runtime = self._runtime(dual.CANONICAL_OPERATOR_AMBIGUOUS)
+        with (
+            mock.patch.object(
+                dual,
+                "classify_canonical_admission_topology",
+                return_value={"topology": dual.CANONICAL_OPERATOR_AMBIGUOUS},
+            ),
+            mock.patch.object(
+                dual, "engage_receipt_bound_deployment_admission"
+            ) as engage,
+        ):
+            with self.assertRaises(dual.core.DeployError):
+                runtime.close_mutations()
+        engage.assert_not_called()
+
+    def test_drain_targets_the_green_listener_not_canonical(self) -> None:
+        for topology in (
+            dual.CANONICAL_OPERATOR_LIVE,
+            dual.CANONICAL_OPERATOR_ABSENT,
+        ):
+            with self.subTest(topology=topology):
+                runtime = self._runtime(topology)
+                runtime.admission_marker = {"token": "t"}
+                with (
+                    mock.patch.object(
+                        dual,
+                        "wait_for_operator_deployment_admission",
+                        return_value={"supported": True, "blocking_tool_calls": 0},
+                    ) as wait,
+                    mock.patch.object(
+                        dual,
+                        "verify_operator_deployment_admission",
+                        return_value={"guard": True},
+                    ) as verify,
+                ):
+                    result = runtime.terminalize_effects()
+                self.assertEqual(wait.call_args.kwargs["port"], 18182)
+                self.assertEqual(result["drain_target_port"], 18182)
+                verify_ports = [call.kwargs["port"] for call in verify.call_args_list]
+                self.assertIn(18182, verify_ports)
+                if topology == dual.CANONICAL_OPERATOR_LIVE:
+                    self.assertIn(18181, verify_ports)
+                    self.assertIsNotNone(result["canonical_guard_sha256"])
+                else:
+                    self.assertNotIn(18181, verify_ports)
+                    self.assertIsNone(result["canonical_guard_sha256"])
+
+    def test_green_without_admission_support_fails_closed(self) -> None:
+        runtime = self._runtime(dual.CANONICAL_OPERATOR_ABSENT)
+        runtime.admission_marker = {"token": "t"}
+        with mock.patch.object(
+            dual,
+            "wait_for_operator_deployment_admission",
+            return_value={"supported": False, "reason": "predates contract"},
+        ):
+            with self.assertRaises(dual.core.DeployError):
+                runtime.terminalize_effects()
+
+    def test_terminalize_refuses_without_an_engaged_marker(self) -> None:
+        runtime = self._runtime(dual.CANONICAL_OPERATOR_ABSENT)
+        with self.assertRaises(dual.core.DeployError):
+            runtime.terminalize_effects()
+
+    def test_admission_readback_url_is_bound_to_the_two_known_ports(self) -> None:
+        self.assertTrue(
+            dual._operator_admission_status_url(18182).startswith(
+                "http://127.0.0.1:18182/"
+            )
+        )
+        self.assertTrue(
+            dual._operator_admission_status_url(18181).startswith(
+                "http://127.0.0.1:18181/"
+            )
+        )
+        with self.assertRaises(dual.core.DeployError):
+            dual._operator_admission_status_url(18180)
+
+
+class ReceiptEvidencePrivacyTests(unittest.TestCase):
+    """An unkeyed self-hash only proves authorship if nobody else can write."""
+
+    def _write(self, root: Path, receipt: dict[str, object]) -> Path:
+        name = receipt.get("cutover_id") or receipt["resume_id"]
+        path = root / f"{name}.json"
+        path.write_text(
+            json.dumps(
+                receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def test_group_writable_receipt_is_not_authentic_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            path = self._write(root, cutover_receipt())
+            self.assertEqual(len(midcutover.load_receipts(root)["receipts"]), 1)
+            path.chmod(0o660)
+            loaded = midcutover.load_receipts(root)
+            self.assertEqual(loaded["receipts"], [])
+            self.assertEqual(len(loaded["unreadable"]), 1)
+
+    def test_group_writable_receipt_root_fails_the_classification_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o770)
+            self._write(root, cutover_receipt())
+            loaded = midcutover.load_receipts(root)
+            self.assertEqual(loaded["receipts"], [])
+            self.assertTrue(loaded["unreadable"])
+            verdict = midcutover.classify_recovery_lane(
+                expected_head=HEAD_GREEN,
+                selector=selector_document(),
+                receipts=loaded["receipts"],
+                unreadable_receipts=loaded["unreadable"],
+                green_observation=GREEN_OBSERVATION,
+            )
+            self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+            self.assertIn("all_receipt_evidence_readable", verdict["reasons"])
+
+
+class ObjectIdContractTests(unittest.TestCase):
+    """The resume path uses one object-id contract, not two."""
+
+    @staticmethod
+    def _self_deploy_object_id_pattern():
+        """Read the command builder's contract from source, not by importing it."""
+        source = (SRC / "grabowski_self_deploy.py").read_text(encoding="utf-8")
+        match = re.search(r'OBJECT_ID_RE = re\.compile\(r"([^"]+)"\)', source)
+        assert match is not None, "OBJECT_ID_RE contract not found"
+        return re.compile(match.group(1))
+
+    def test_classifier_accepts_every_supported_object_id_length(self) -> None:
+        command_contract = self._self_deploy_object_id_pattern()
+
+        for head in (HEAD_GREEN, "c" * 64):
+            with self.subTest(length=len(head)):
+                self.assertIsNotNone(midcutover.HEAD_RE.fullmatch(head))
+                self.assertIsNotNone(command_contract.fullmatch(head))
+                verdict = midcutover.classify_recovery_lane(
+                    expected_head=head,
+                    selector=selector_document(repo_head=head),
+                    receipts=[cutover_receipt(expected_head=head)],
+                    green_observation={**GREEN_OBSERVATION, "repo_head": head},
+                )
+                self.assertNotIn("expected_head_named", verdict["reasons"])
+                self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+
+    def test_runner_accepts_the_same_object_id_contract(self) -> None:
+        import run_midcutover_resume as runner
+
+        for head in (HEAD_GREEN, "c" * 64):
+            self.assertIsNotNone(runner.HEAD_RE.fullmatch(head))
+        self.assertIsNone(runner.HEAD_RE.fullmatch("c" * 39))
 
 
 class GreenProofBeforeEffectTests(unittest.TestCase):

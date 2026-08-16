@@ -27,7 +27,7 @@ if str(TOOLS_DIR) not in sys.path:
 
 import deploy_runtime_dual as deploy_dual
 
-HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
+HEAD_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 CUTOVER_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 
@@ -94,7 +94,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if HEAD_RE.fullmatch(args.expected_head) is None:
-        raise ValueError("expected_head must be a lowercase 40-hex commit id")
+        raise ValueError("expected_head must be a lowercase Git object id")
     if CUTOVER_ID_RE.fullmatch(args.cutover_id) is None:
         raise ValueError("cutover_id is invalid")
     if SHA256_RE.fullmatch(args.resume_binding_sha256) is None:

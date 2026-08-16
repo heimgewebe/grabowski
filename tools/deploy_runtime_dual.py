@@ -268,10 +268,24 @@ TUNNEL_DRAIN_STABILITY_NAMES = TUNNEL_DRAIN_COUNTER_NAMES + TUNNEL_DRAIN_IDENTIT
 OPERATOR_ADMISSION_MARKER_PATH = (
     core.DEFAULT_STATE_ROOT / "deployment-admission-drain.json"
 )
+OPERATOR_ADMISSION_STATUS_PATH = "/_grabowski/deployment-admission"
 OPERATOR_ADMISSION_STATUS_URL = (
     f"http://{OPERATOR_LISTENER_HOST}:{OPERATOR_LISTENER_PORT}"
-    "/_grabowski/deployment-admission"
+    f"{OPERATOR_ADMISSION_STATUS_PATH}"
 )
+
+
+def _operator_admission_status_url(port: int) -> str:
+    """The admission status endpoint of one specific operator process.
+
+    The marker itself is a file every grabowski operator reads, so engaging it
+    closes admission everywhere at once.  The *readback*, though, is per
+    process, and during a mid-cutover resume the process that matters is the
+    transient green one: it is what the public route points at.
+    """
+    if port not in {OPERATOR_LISTENER_PORT, GREEN_OPERATOR_LISTENER_PORT}:
+        core.fail("Admission readback port is outside the blue-green contract")
+    return f"http://{OPERATOR_LISTENER_HOST}:{port}{OPERATOR_ADMISSION_STATUS_PATH}"
 OPERATOR_ADMISSION_MARKER_KIND = "grabowski_deployment_admission_drain"
 #: Mirrors grabowski_operator.DEPLOYMENT_ADMISSION_HEAD_RE so a marker written
 #: here is always readable by the gate that consumes it.
@@ -3437,9 +3451,11 @@ def release_operator_deployment_admission(marker: dict[str, Any]) -> None:
         )
 
 
-def _operator_admission_observation() -> dict[str, Any] | None:
+def _operator_admission_observation(
+    port: int = OPERATOR_LISTENER_PORT,
+) -> dict[str, Any] | None:
     request = Request(
-        OPERATOR_ADMISSION_STATUS_URL,
+        _operator_admission_status_url(port),
         headers={"Cache-Control": "no-store", "Accept": "application/json"},
         method="GET",
     )
@@ -3567,7 +3583,10 @@ def _operator_admission_call_counts(
 
 
 def wait_for_operator_deployment_admission(
-    marker: dict[str, Any], *, timeout_seconds: int
+    marker: dict[str, Any],
+    *,
+    timeout_seconds: int,
+    port: int = OPERATOR_LISTENER_PORT,
 ) -> dict[str, Any]:
     probe_seconds = min(timeout_seconds, OPERATOR_ADMISSION_PROBE_SECONDS)
     probe_deadline = time.monotonic() + probe_seconds
@@ -3578,7 +3597,7 @@ def wait_for_operator_deployment_admission(
     while True:
         probe_attempts += 1
         try:
-            first = _operator_admission_observation()
+            first = _operator_admission_observation(port)
         except core.DeployError as exc:
             if not (
                 exc.phase == "operator-admission-drain"
@@ -3637,7 +3656,7 @@ def wait_for_operator_deployment_admission(
     last = first
     while True:
         attempts += 1
-        observed = first if attempts == 1 else _operator_admission_observation()
+        observed = first if attempts == 1 else _operator_admission_observation(port)
         if observed is None:
             consecutive_idle = 0
         else:
@@ -3700,8 +3719,10 @@ def wait_for_operator_deployment_admission(
 
 def verify_operator_deployment_admission(
     marker: dict[str, Any],
+    *,
+    port: int = OPERATOR_LISTENER_PORT,
 ) -> dict[str, Any]:
-    observed = _operator_admission_observation()
+    observed = _operator_admission_observation(port)
     call_counts = (
         _operator_admission_call_counts(
             observed, phase="operator-admission-final-guard"
@@ -6527,7 +6548,7 @@ def classify_canonical_admission_topology() -> dict[str, Any]:
     status_error: str | None = None
     if observation.confirmed_active:
         try:
-            _operator_admission_observation()
+            _operator_admission_observation(OPERATOR_LISTENER_PORT)
             status_reachable = True
         except core.DeployError as exc:
             status_reachable = False
@@ -6633,20 +6654,24 @@ class MidCutoverResumeRuntime:
         }
 
     def close_mutations(self) -> dict[str, Any]:
-        """Close admission if there is anything left that could admit."""
+        """Close admission on the process the public route actually points at.
+
+        Green is the publicly selected operator for the whole of a mid-cutover
+        state, so green is what must stop admitting before promotion -- an
+        earlier draft skipped admission entirely when the old canonical unit was
+        gone, which left green free to admit a mutation that retirement would
+        then cut off mid-effect.
+
+        The marker is one file every grabowski operator reads, so engaging it
+        closes both processes at once; only the *readback* is per process. The
+        canonical topology therefore no longer decides whether to close, just
+        whether the canonical side can also be guarded. Ambiguity still fails
+        closed: an unknown admission state is not an empty one.
+        """
         topology = classify_canonical_admission_topology()
         self.admission_topology = topology
         kind = topology["topology"]
-        if kind == CANONICAL_OPERATOR_ABSENT:
-            # Nothing to drain: the old canonical process is gone, and green is
-            # the public route either way.  Requiring blue to be alive here would
-            # make recovery depend on the health of what it is replacing.
-            return {
-                "closed": False,
-                "topology": kind,
-                "reason": "no canonical operator process can admit a mutation",
-            }
-        if kind != CANONICAL_OPERATOR_LIVE:
+        if kind == CANONICAL_OPERATOR_AMBIGUOUS:
             core.fail(
                 "Canonical operator admission state is ambiguous",
                 phase="midcutover-admission-topology",
@@ -6662,23 +6687,46 @@ class MidCutoverResumeRuntime:
         return {
             "closed": True,
             "topology": kind,
+            "drain_target_port": GREEN_OPERATOR_LISTENER_PORT,
+            "canonical_guard_available": kind == CANONICAL_OPERATOR_LIVE,
             "marker_sha256": _json_sha256(self.admission_marker),
             "expected_head": self.admission_marker["expected_head"],
         }
 
     def terminalize_effects(self) -> dict[str, Any]:
         if self.admission_marker is None:
-            return {
-                "supported": False,
-                "reason": "canonical operator was already absent",
-                "topology": (self.admission_topology or {}).get("topology"),
-                "does_not_establish": ["absence_of_inflight_commands"],
-            }
+            core.fail(
+                "Green effects cannot be terminalized without an engaged marker",
+                phase="midcutover-admission-drain",
+            )
+        # Drain green: it is the process the ingress selector routes to, so it
+        # is where an in-flight mutation would be.
         drained = wait_for_operator_deployment_admission(
-            self.admission_marker, timeout_seconds=self.timeout_seconds
+            self.admission_marker,
+            timeout_seconds=self.timeout_seconds,
+            port=GREEN_OPERATOR_LISTENER_PORT,
         )
-        final = verify_operator_deployment_admission(self.admission_marker)
+        if drained.get("supported") is not True:
+            core.fail(
+                "Green operator does not support the deployment admission contract",
+                phase="midcutover-admission-drain",
+                details={"drain": drained},
+            )
+        final = verify_operator_deployment_admission(
+            self.admission_marker, port=GREEN_OPERATOR_LISTENER_PORT
+        )
+        canonical_guard = None
+        if (self.admission_topology or {}).get("topology") == CANONICAL_OPERATOR_LIVE:
+            # The old canonical process is not publicly routed, but while it is
+            # alive it can still be reached directly, so guard it too.
+            canonical_guard = _json_sha256(
+                verify_operator_deployment_admission(
+                    self.admission_marker, port=OPERATOR_LISTENER_PORT
+                )
+            )
         return {
+            "drain_target_port": GREEN_OPERATOR_LISTENER_PORT,
+            "canonical_guard_sha256": canonical_guard,
             **drained,
             "final_guard_sha256": _json_sha256(final),
             "registry_authority": "grabowski_operator_cross_process_status",

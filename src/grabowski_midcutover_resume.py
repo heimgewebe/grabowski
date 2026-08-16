@@ -82,7 +82,11 @@ MAX_RECEIPT_BYTES = 256 * 1024
 MAX_RECEIPT_ENTRIES = 4096
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
-HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
+#: The same object-id contract the recovery tool input and the resume
+#: command builder use.  Accepting only 40 here would make every otherwise
+#: valid recovery fail closed on a SHA-256 repository, for a reason that has
+#: nothing to do with the cutover being recovered.
+HEAD_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 CUTOVER_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 
 
@@ -159,6 +163,28 @@ def validate_any_receipt(value: Any) -> dict[str, Any]:
     return validate_cutover_receipt(value)
 
 
+def _require_private_receipt_root(root: Path) -> None:
+    """A receipt root anyone else can write to is not evidence.
+
+    ``receipt_sha256`` is an unkeyed self-hash, so it proves internal
+    consistency and nothing about authorship: another local user who can write
+    the file can recompute it and forge resumable -- or already-resolved --
+    lineage. The privacy of the directory and of each file is therefore part of
+    the authenticity check, exactly as it already is for the routing selector
+    and for the writer that produced these files.
+    """
+    metadata = root.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise MidCutoverEvidenceError(
+            f"receipt directory must be private and owner-controlled: {root}"
+        )
+
+
 def _read_private_json(path: Path) -> Any:
     descriptor = os.open(
         path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -168,6 +194,8 @@ def _read_private_json(path: Path) -> Any:
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) & 0o077
             or metadata.st_size > MAX_RECEIPT_BYTES
         ):
             raise MidCutoverEvidenceError(f"receipt file is not private evidence: {path}")
@@ -191,15 +219,19 @@ def load_receipts(root: Path = BLUE_GREEN_RECEIPT_ROOT) -> dict[str, Any]:
     receipts: list[dict[str, Any]] = []
     unreadable: list[dict[str, str]] = []
     try:
+        _require_private_receipt_root(root)
         entries = sorted(root.iterdir())
     except FileNotFoundError:
         return {"receipts": [], "unreadable": [], "root": str(root), "present": False}
-    except OSError as exc:
+    except (MidCutoverEvidenceError, OSError) as exc:
+        # Reported as unreadable rather than empty: an insecure or unusable
+        # receipt root must fail the classification closed, not silently look
+        # like a system with no history.
         return {
             "receipts": [],
-            "unreadable": [{"path": str(root), "error": type(exc).__name__}],
+            "unreadable": [{"path": str(root), "error": str(exc)}],
             "root": str(root),
-            "present": False,
+            "present": True,
         }
     if len(entries) > MAX_RECEIPT_ENTRIES:
         return {
