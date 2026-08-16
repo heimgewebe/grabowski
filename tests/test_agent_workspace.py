@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -216,7 +217,9 @@ def passing_toolchain_preflight(manifest: dict, role_name: str, command: list[st
         "checked_at": "test",
         "sandbox": role.SANDBOX_LABEL,
         "executable": command[0],
+        "resolved_executable": command[0],
         "declared_python_module": role.declared_python_module(command),
+        "environment": {"environment_sha256": "e" * 64},
         "passed": True,
         "missing_executable": False,
         "missing_python_module": False,
@@ -446,7 +449,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             "thread_focus", "thread-1", self.git.repo, self.git.base
         )
         directory = self.state / identifier
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         value = {
             "schema_version": 1,
             "creation_state": "ready",
@@ -691,6 +694,27 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
         self.assertRegex(first[0], workspace.WORKSPACE_ID_RE)
+
+    def test_lane_backed_candidate_manifest_binds_exact_lane_id(self) -> None:
+        lane = self.lane_receipt()
+        manifest = self.lane_manifest(lane)
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, reference = workspace._persist_candidate_evidence(
+            manifest, snapshot, writer_result, writer_receipt
+        )
+        self.assertEqual(candidate["lane_id"], lane["lane_id"])
+        self.assertEqual(reference["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(
+            workspace.candidate_verification.read_immutable_receipt(
+                Path(reference["path"]),
+                validator=workspace.candidate_verification.validate_candidate_manifest,
+            ),
+            candidate,
+        )
 
     def test_lane_backed_workspace_identity_is_generation_safe(self) -> None:
         lane_input = {
@@ -4674,6 +4698,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(persisted["role_final_attempt"]["tests"], 1)
         self.assertEqual(persisted["role_retries"]["tests"]["count"], 1)
         self.assertEqual(len(persisted["role_preflight_blocks"]["tests"]), 1)
+        retry_preflight = persisted["role_attempt_preflights"]["tests"]["1"]
+        self.assertEqual(
+            retry_preflight["command_sha256"],
+            workspace._sha256_json(["python3", "-m", "unittest"]),
+        )
+        self.assertTrue(retry_preflight["passed"])
+        self.assertIsInstance(retry_preflight["environment"], dict)
         self.assertEqual(persisted.get("task_start_intents", {}), {})
         self.assertFalse((self.state / manifest["workspace_id"] / "tests-receipt.json").exists())
         self.assertFalse(
@@ -4750,6 +4781,50 @@ class AgentWorkspaceTests(unittest.TestCase):
             result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
         self.assertEqual(result["state"], "complete")
         self.assertEqual(result["result"]["tests"]["status"], "passed")
+        candidate = result["result"]["candidate_manifest"]
+        self.assertEqual(result["result"]["candidate_id"], candidate["candidate_id"])
+        self.assertNotIn("lane_id", candidate)
+        self.assertEqual(result["result"]["verification_summary"]["outcome"], "PASS")
+        self.assertEqual(
+            {item["candidate_id"] for item in result["result"]["verification_receipts"]},
+            {candidate["candidate_id"]},
+        )
+        self.assertEqual(
+            result["result"]["verification_summary"]["candidate_id"],
+            candidate["candidate_id"],
+        )
+        self.assertEqual(
+            set(result["result"]["verification_summary"]["observed_verifiers"]),
+            {"review", "tests"},
+        )
+        tests_verification = next(
+            item
+            for item in result["result"]["verification_receipts"]
+            if item["verifier_kind"] == "tests"
+        )
+        self.assertEqual(
+            tests_verification["toolchain_identity"]["source"],
+            "workspace-role-preflight-v1",
+        )
+        self.assertEqual(
+            tests_verification["toolchain_identity"]["command_sha256"],
+            workspace._sha256_json(replacement),
+        )
+        self.assertIsNotNone(
+            tests_verification["toolchain_identity"]["environment_sha256"]
+        )
+        for key in ("candidate", "tests", "review"):
+            if key == "candidate":
+                path = Path(result["result"]["candidate_receipt"]["path"])
+            else:
+                path = Path(result["result"]["verification_references"][key]["path"])
+                self.assertEqual(
+                    result["result"]["verification_references"][key]["verifier_attempt"],
+                    1,
+                )
+            self.assertTrue(path.is_file())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertNotIn("summary", result["result"]["verification_references"])
         checklist_items = {item["item"] for item in result["external_closeout_checklist"]}
         self.assertEqual(
             checklist_items,
@@ -4762,6 +4837,158 @@ class AgentWorkspaceTests(unittest.TestCase):
             },
         )
         self.assertTrue(all(item["status"] == "unknown" for item in result["external_closeout_checklist"]))
+
+    def test_collect_blocks_valid_same_round_candidate_drift_before_verifiers(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+            "frozen_at": "test",
+        }
+        workspace._write_manifest(manifest)
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, reference = workspace._persist_candidate_evidence(
+            manifest,
+            snapshot,
+            writer_result,
+            writer_receipt,
+        )
+        other_patch = "0" * 64
+        other = workspace.candidate_verification.build_candidate_manifest(
+            workspace_id=candidate["workspace_id"],
+            round_number=candidate["round"],
+            base_head=candidate["base_head"],
+            patch_sha256=other_patch,
+            untracked_manifest_sha256=candidate["untracked_manifest_sha256"],
+            scope_evidence_sha256=candidate["scope_evidence_sha256"],
+            resulting_tree_sha256=workspace.candidate_verification.derive_resulting_tree_sha256(
+                base_head=candidate["base_head"],
+                patch_sha256=other_patch,
+                untracked_manifest_sha256=candidate["untracked_manifest_sha256"],
+            ),
+            writer_evidence_sha256=candidate["writer_evidence_sha256"],
+        )
+        workspace._atomic_json(Path(reference["path"]), other)
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual(result["state"], "candidate_evidence_invalid")
+        self.assertIn("same-round receipt changed", result["error"])
+        start.assert_not_called()
+
+    def test_verification_retry_uses_attempt_specific_immutable_slot_for_same_candidate(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, _reference = workspace._persist_candidate_evidence(
+            manifest, snapshot, writer_result, writer_receipt
+        )
+        first_tests = signed_role_receipt(
+            "tests",
+            manifest,
+            snapshot,
+            returncode=1,
+            failure_classification="environment_toolchain_failure",
+        )
+        review = signed_role_receipt("review", manifest, snapshot)
+        first_receipts, first_summary, first_refs = workspace._persist_verification_evidence(
+            manifest,
+            candidate,
+            test_receipt=first_tests,
+            review_receipt=review,
+        )
+        self.assertEqual(first_summary["outcome"], "INDETERMINATE")
+        self.assertEqual(first_summary["verifier_attempts"], {"review": 1, "tests": 1})
+        first_path = Path(first_refs["tests"]["path"])
+        first_bytes = first_path.read_bytes()
+        self.assertEqual(first_refs["tests"]["verifier_attempt"], 1)
+        self.assertEqual(first_receipts[0]["candidate_id"], candidate["candidate_id"])
+
+        replacement = ["python3", "-m", "unittest"]
+        replacement_sha256 = workspace._sha256_json(replacement)
+        manifest["role_final_attempt"] = {"tests": 2, "review": 1}
+        manifest["role_attempt_preflights"] = {
+            "tests": {
+                "2": {
+                    "role": "tests",
+                    "command_sha256": replacement_sha256,
+                    "checked_at": "2026-08-16T12:00:00+00:00",
+                    "sandbox": workspace.agent_role.SANDBOX_LABEL,
+                    "passed": True,
+                    "failure_classification": None,
+                    "resolved_executable": "/usr/bin/python3",
+                    "environment": {"environment_sha256": "b" * 64},
+                }
+            }
+        }
+        second_tests = signed_role_receipt(
+            "tests",
+            manifest,
+            snapshot,
+            argv_sha256=replacement_sha256,
+        )
+        second_receipts, second_summary, second_refs = workspace._persist_verification_evidence(
+            manifest,
+            candidate,
+            test_receipt=second_tests,
+            review_receipt=review,
+        )
+        self.assertEqual(second_summary["outcome"], "PASS")
+        self.assertEqual(second_summary["verifier_attempts"], {"review": 1, "tests": 2})
+        second_path = Path(second_refs["tests"]["path"])
+        self.assertNotEqual(first_path, second_path)
+        self.assertTrue(second_path.is_file())
+        self.assertEqual(first_path.read_bytes(), first_bytes)
+        self.assertEqual(second_refs["tests"]["verifier_attempt"], 2)
+        self.assertEqual(second_receipts[0]["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(
+            second_receipts[0]["toolchain_identity"]["source"],
+            "workspace-role-preflight-v1",
+        )
+        self.assertEqual(
+            second_receipts[0]["toolchain_identity"]["environment_sha256"],
+            "b" * 64,
+        )
+        self.assertEqual(
+            second_receipts[0]["toolchain_identity"]["resolved_executable"],
+            "/usr/bin/python3",
+        )
+        self.assertEqual(first_receipts[1], second_receipts[1])
+
+    def test_verification_attempt_preflight_command_drift_fails_closed(self) -> None:
+        manifest = self.manifest()
+        receipt = {
+            "argv_sha256": "a" * 64,
+        }
+        manifest["role_attempt_preflights"] = {
+            "tests": {
+                "2": {
+                    "command_sha256": "b" * 64,
+                }
+            }
+        }
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "preflight command drift"
+        ):
+            workspace._role_toolchain_identity_for_receipt(
+                manifest, "tests", receipt, verifier_attempt=2
+            )
 
     def test_role_retry_blocks_unresolved_retry_start_intent_before_second_start(self) -> None:
         manifest = self.manifest()

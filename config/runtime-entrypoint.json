@@ -531,6 +531,10 @@
       "source": "src/grabowski_agent_workspace.py"
     },
     {
+      "module": "grabowski_candidate_verification",
+      "source": "src/grabowski_candidate_verification.py"
+    },
+    {
       "module": "grabowski_agent_role",
       "source": "src/grabowski_agent_role.py"
     },
