@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Iterable
 
 import grabowski_agent_role as agent_role
+import grabowski_candidate_verification as candidate_verification
 import grabowski_mcp as base
 import grabowski_resources as resources
 import grabowski_tasks as tasks
@@ -3615,6 +3616,225 @@ def _materialize_writer_patch(
     }
 
 
+
+def _candidate_receipt_paths(
+    manifest: dict[str, Any], *, round_number: int = 1
+) -> dict[str, Path]:
+    if isinstance(round_number, bool) or not isinstance(round_number, int) or round_number < 1:
+        raise AgentWorkspaceError("candidate round must be a positive integer")
+    root = _workspace_dir(str(manifest["workspace_id"]))
+    suffix = f"round-{round_number:04d}.json"
+    return {
+        "candidate": root / f"candidate-{suffix}",
+        "tests": root / f"verification-tests-{suffix}",
+        "review": root / f"verification-review-{suffix}",
+        "summary": root / f"verification-summary-{suffix}",
+    }
+
+
+def _candidate_lane_id(manifest: dict[str, Any]) -> str | None:
+    if not _lane_backed(manifest):
+        return None
+    resources_value = manifest.get("resources")
+    lane_binding = (
+        resources_value.get("lane_binding")
+        if isinstance(resources_value, dict)
+        else None
+    )
+    lane_id = lane_binding.get("lane_id") if isinstance(lane_binding, dict) else None
+    if not isinstance(lane_id, str) or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None:
+        raise AgentWorkspaceError("lane-backed candidate is missing canonical lane identity")
+    return lane_id
+
+
+def _candidate_manifest_from_frozen_writer(
+    manifest: dict[str, Any],
+    snapshot: dict[str, Any],
+    writer_result: dict[str, Any],
+    writer_receipt: dict[str, Any],
+    *,
+    round_number: int = 1,
+) -> dict[str, Any]:
+    untracked = snapshot.get("untracked_artifacts")
+    if not isinstance(untracked, list):
+        raise AgentWorkspaceError("candidate untracked manifest is unavailable")
+    scope = manifest.get("scope")
+    if not isinstance(scope, dict):
+        raise AgentWorkspaceError("candidate scope evidence is unavailable")
+    patch_sha256 = writer_result.get("sha256")
+    if not isinstance(patch_sha256, str) or SHA256_RE.fullmatch(patch_sha256) is None:
+        raise AgentWorkspaceError("candidate patch identity is invalid")
+    writer_receipt_sha256 = writer_receipt.get("receipt_sha256")
+    if (
+        not isinstance(writer_receipt_sha256, str)
+        or SHA256_RE.fullmatch(writer_receipt_sha256) is None
+        or not _receipt_integrity(writer_receipt)
+    ):
+        raise AgentWorkspaceError("candidate writer evidence is invalid")
+    untracked_manifest_sha256 = _sha256_json(untracked)
+    scope_evidence_sha256 = _sha256_json(
+        {
+            "allowed_paths": list(scope.get("allowed_paths", [])),
+            "forbidden_paths": list(scope.get("forbidden_paths", [])),
+            "changed_paths": list(snapshot.get("changed_paths", [])),
+            "scope_passed": snapshot.get("scope_passed"),
+            "scope_violations": list(snapshot.get("scope_violations", [])),
+        }
+    )
+    writer_evidence_sha256 = _sha256_json(
+        {
+            "writer_role_receipt_sha256": writer_receipt_sha256,
+            "writer_head": snapshot.get("writer_head"),
+            "diff_sha256": snapshot.get("diff_sha256"),
+            "dirty": snapshot.get("dirty"),
+            "patch_sha256": patch_sha256,
+            "freeze_binding_sha256": _writer_freeze_binding(snapshot),
+        }
+    )
+    resulting_tree_sha256 = candidate_verification.derive_resulting_tree_sha256(
+        base_head=str(manifest["expected_base_head"]),
+        patch_sha256=patch_sha256,
+        untracked_manifest_sha256=untracked_manifest_sha256,
+    )
+    return candidate_verification.build_candidate_manifest(
+        workspace_id=str(manifest["workspace_id"]),
+        round_number=round_number,
+        base_head=str(manifest["expected_base_head"]),
+        patch_sha256=patch_sha256,
+        untracked_manifest_sha256=untracked_manifest_sha256,
+        scope_evidence_sha256=scope_evidence_sha256,
+        resulting_tree_sha256=resulting_tree_sha256,
+        writer_evidence_sha256=writer_evidence_sha256,
+        lane_id=_candidate_lane_id(manifest),
+    )
+
+
+def _persist_candidate_evidence(
+    manifest: dict[str, Any],
+    snapshot: dict[str, Any],
+    writer_result: dict[str, Any],
+    writer_receipt: dict[str, Any],
+    *,
+    round_number: int = 1,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    candidate = _candidate_manifest_from_frozen_writer(
+        manifest,
+        snapshot,
+        writer_result,
+        writer_receipt,
+        round_number=round_number,
+    )
+    path = _candidate_receipt_paths(manifest, round_number=round_number)["candidate"]
+    created = candidate_verification.persist_immutable_receipt(
+        path,
+        candidate,
+        validator=candidate_verification.validate_candidate_manifest,
+    )
+    observed = candidate_verification.read_immutable_receipt(
+        path,
+        validator=candidate_verification.validate_candidate_manifest,
+    )
+    if observed != candidate:
+        raise AgentWorkspaceError("candidate receipt readback differs from frozen writer")
+    return candidate, {
+        "round": round_number,
+        "path": str(path),
+        "candidate_id": candidate["candidate_id"],
+        "created": created,
+    }
+
+
+def _role_toolchain_identity_for_receipt(
+    manifest: dict[str, Any],
+    role: str,
+    receipt: dict[str, Any],
+) -> dict[str, Any] | None:
+    preflights = manifest.get("initial_role_preflights")
+    preflight = preflights.get(role) if isinstance(preflights, dict) else None
+    if (
+        isinstance(preflight, dict)
+        and preflight.get("command_sha256") == receipt.get("argv_sha256")
+    ):
+        return preflight
+    return None
+
+
+def _persist_verification_evidence(
+    manifest: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    test_receipt: dict[str, Any],
+    review_receipt: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    round_number = int(candidate["round"])
+    paths = _candidate_receipt_paths(manifest, round_number=round_number)
+    receipts: list[dict[str, Any]] = []
+    references: dict[str, Any] = {}
+    for role, source in (("tests", test_receipt), ("review", review_receipt)):
+        verification = candidate_verification.derive_verification_receipt(
+            candidate_manifest=candidate,
+            verifier_kind=role,
+            source_role_receipt=source,
+            runtime_identity=(
+                manifest.get("runtime_identity")
+                if isinstance(manifest.get("runtime_identity"), dict)
+                else None
+            ),
+            toolchain_identity=_role_toolchain_identity_for_receipt(
+                manifest, role, source
+            ),
+        )
+        validator = lambda value, candidate_id=candidate["candidate_id"]: (
+            candidate_verification.validate_verification_receipt(
+                value,
+                expected_candidate_id=candidate_id,
+            )
+        )
+        created = candidate_verification.persist_immutable_receipt(
+            paths[role], verification, validator=validator
+        )
+        observed = candidate_verification.read_immutable_receipt(
+            paths[role], validator=validator
+        )
+        if observed != verification:
+            raise AgentWorkspaceError(
+                f"{role} verification receipt readback differs from role evidence"
+            )
+        receipts.append(observed)
+        references[role] = {
+            "path": str(paths[role]),
+            "receipt_sha256": observed["receipt_sha256"],
+            "candidate_id": observed["candidate_id"],
+            "created": created,
+        }
+    summary = candidate_verification.reduce_verifications(
+        candidate_manifest=candidate,
+        verification_receipts=receipts,
+    )
+    summary_validator = lambda value: candidate_verification.validate_verification_summary(
+        value,
+        candidate_manifest=candidate,
+        verification_receipts=receipts,
+    )
+    summary_created = candidate_verification.persist_immutable_receipt(
+        paths["summary"], summary, validator=summary_validator
+    )
+    observed_summary = candidate_verification.read_immutable_receipt(
+        paths["summary"], validator=summary_validator
+    )
+    if observed_summary != summary:
+        raise AgentWorkspaceError(
+            "verification summary readback differs from deterministic reduction"
+        )
+    references["summary"] = {
+        "path": str(paths["summary"]),
+        "summary_sha256": observed_summary["summary_sha256"],
+        "candidate_id": observed_summary["candidate_id"],
+        "created": summary_created,
+    }
+    return receipts, observed_summary, references
+
+
 def _verify_patch_artifact(
     result: dict[str, Any],
     *,
@@ -6560,6 +6780,26 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "frozen_writer": frozen,
                 "receipt_status": "blocked",
             }
+        try:
+            candidate_manifest, candidate_reference = _persist_candidate_evidence(
+                manifest,
+                snapshot,
+                writer_result,
+                writer_receipt,
+            )
+        except (
+            AgentWorkspaceError,
+            candidate_verification.CandidateVerificationError,
+            OSError,
+            PermissionError,
+        ) as exc:
+            return {
+                "workspace_id": identifier,
+                "state": "candidate_evidence_invalid",
+                "error": _error_summary(exc),
+                "worktree_preserved": True,
+                "receipt_status": "blocked",
+            }
         intents_value = manifest.get("task_start_intents", {})
         if not isinstance(intents_value, dict):
             return {
@@ -6745,6 +6985,29 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "error": "review receipt findings must be a list",
                 "receipt_status": "blocked",
             }
+        try:
+            verification_receipts, verification_summary, verification_references = (
+                _persist_verification_evidence(
+                    manifest,
+                    candidate_manifest,
+                    test_receipt=test_receipt,
+                    review_receipt=review_receipt,
+                )
+            )
+        except (
+            AgentWorkspaceError,
+            candidate_verification.CandidateVerificationError,
+            OSError,
+            PermissionError,
+        ) as exc:
+            return {
+                "workspace_id": identifier,
+                "state": "verification_evidence_invalid",
+                "candidate_id": candidate_manifest["candidate_id"],
+                "error": _error_summary(exc),
+                "worktree_preserved": True,
+                "receipt_status": "blocked",
+            }
         for observed_role, observed_receipt in (("tests", test_receipt), ("review", review_receipt)):
             _append_workspace_event(
                 manifest, "role_finished", role=observed_role,
@@ -6766,6 +7029,12 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             "dirty": snapshot["dirty"],
             "base_drift": snapshot["base_drift"],
             "integration_probe": snapshot["integration_probe"],
+            "candidate_id": candidate_manifest["candidate_id"],
+            "candidate_manifest": candidate_manifest,
+            "candidate_receipt": candidate_reference,
+            "verification_receipts": verification_receipts,
+            "verification_references": verification_references,
+            "verification_summary": verification_summary,
             "tests": {
                 "status": "passed" if test_receipt.get("returncode") == 0 else "failed",
                 "receipt_sha256": test_receipt.get("receipt_sha256"),

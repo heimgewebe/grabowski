@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -446,7 +447,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             "thread_focus", "thread-1", self.git.repo, self.git.base
         )
         directory = self.state / identifier
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         value = {
             "schema_version": 1,
             "creation_state": "ready",
@@ -691,6 +692,27 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
         self.assertRegex(first[0], workspace.WORKSPACE_ID_RE)
+
+    def test_lane_backed_candidate_manifest_binds_exact_lane_id(self) -> None:
+        lane = self.lane_receipt()
+        manifest = self.lane_manifest(lane)
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, reference = workspace._persist_candidate_evidence(
+            manifest, snapshot, writer_result, writer_receipt
+        )
+        self.assertEqual(candidate["lane_id"], lane["lane_id"])
+        self.assertEqual(reference["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(
+            workspace.candidate_verification.read_immutable_receipt(
+                Path(reference["path"]),
+                validator=workspace.candidate_verification.validate_candidate_manifest,
+            ),
+            candidate,
+        )
 
     def test_lane_backed_workspace_identity_is_generation_safe(self) -> None:
         lane_input = {
@@ -4750,6 +4772,29 @@ class AgentWorkspaceTests(unittest.TestCase):
             result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
         self.assertEqual(result["state"], "complete")
         self.assertEqual(result["result"]["tests"]["status"], "passed")
+        candidate = result["result"]["candidate_manifest"]
+        self.assertEqual(result["result"]["candidate_id"], candidate["candidate_id"])
+        self.assertNotIn("lane_id", candidate)
+        self.assertEqual(result["result"]["verification_summary"]["outcome"], "PASS")
+        self.assertEqual(
+            {item["candidate_id"] for item in result["result"]["verification_receipts"]},
+            {candidate["candidate_id"]},
+        )
+        self.assertEqual(
+            result["result"]["verification_summary"]["candidate_id"],
+            candidate["candidate_id"],
+        )
+        self.assertEqual(
+            set(result["result"]["verification_summary"]["observed_verifiers"]),
+            {"review", "tests"},
+        )
+        for key in ("candidate", "tests", "review", "summary"):
+            if key == "candidate":
+                path = Path(result["result"]["candidate_receipt"]["path"])
+            else:
+                path = Path(result["result"]["verification_references"][key]["path"])
+            self.assertTrue(path.is_file())
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         checklist_items = {item["item"] for item in result["external_closeout_checklist"]}
         self.assertEqual(
             checklist_items,
@@ -4762,6 +4807,57 @@ class AgentWorkspaceTests(unittest.TestCase):
             },
         )
         self.assertTrue(all(item["status"] == "unknown" for item in result["external_closeout_checklist"]))
+
+    def test_collect_blocks_valid_same_round_candidate_drift_before_verifiers(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+            "frozen_at": "test",
+        }
+        workspace._write_manifest(manifest)
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, reference = workspace._persist_candidate_evidence(
+            manifest,
+            snapshot,
+            writer_result,
+            writer_receipt,
+        )
+        other_patch = "0" * 64
+        other = workspace.candidate_verification.build_candidate_manifest(
+            workspace_id=candidate["workspace_id"],
+            round_number=candidate["round"],
+            base_head=candidate["base_head"],
+            patch_sha256=other_patch,
+            untracked_manifest_sha256=candidate["untracked_manifest_sha256"],
+            scope_evidence_sha256=candidate["scope_evidence_sha256"],
+            resulting_tree_sha256=workspace.candidate_verification.derive_resulting_tree_sha256(
+                base_head=candidate["base_head"],
+                patch_sha256=other_patch,
+                untracked_manifest_sha256=candidate["untracked_manifest_sha256"],
+            ),
+            writer_evidence_sha256=candidate["writer_evidence_sha256"],
+        )
+        workspace._atomic_json(Path(reference["path"]), other)
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual(result["state"], "candidate_evidence_invalid")
+        self.assertIn("same-round receipt changed", result["error"])
+        start.assert_not_called()
 
     def test_role_retry_blocks_unresolved_retry_start_intent_before_second_start(self) -> None:
         manifest = self.manifest()
