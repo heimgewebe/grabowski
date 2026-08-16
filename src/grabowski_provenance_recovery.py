@@ -454,6 +454,11 @@ def _integrity_evidence() -> dict[str, Any]:
     }
 
 
+def _resume_effect_repository() -> Path:
+    """The repository scope the mid-cutover resume actually acts under."""
+    return self_deploy.CANONICAL_REPOSITORY
+
+
 def _recovery_lane(expected_head: str) -> dict[str, Any]:
     """Classify which recovery lane the durable blue-green state admits.
 
@@ -490,7 +495,10 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
     kill_switch = base._kill_switch_state()
     broker = privileged.grabowski_privileged_broker_status()
     integrity = _integrity_evidence()
-    blockade = _blockade_evidence(None)
+    # The same scope the dispatch will re-check.  An assessment that evaluated a
+    # narrower blockade scope than the execution would report a lane as open and
+    # then have it close underneath the operator.
+    blockade = _blockade_evidence(_resume_effect_repository())
     competing = _competing_deployment_evidence()
     lane = _recovery_lane(expected_head)
     resume_binding = lane.get("resume_binding")
@@ -800,7 +808,7 @@ def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
     }
     intent_sha256 = base._append_audit_with_digest(intent)
 
-    volatile = _volatile_gate_recheck(repository)
+    volatile = _volatile_gate_recheck(_resume_effect_repository())
     if volatile["reasons"]:
         base._append_audit(
             {

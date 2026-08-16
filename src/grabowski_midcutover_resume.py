@@ -104,6 +104,12 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 #: nothing to do with the cutover being recovered.
 HEAD_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 CUTOVER_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
+#: The canonical release identifier grammar produced by the build:
+#: <head12>-srcset<12>-lock<12>-contract<12>, optionally -attempt<n>.
+RELEASE_ID_RE = re.compile(
+    r"[0-9a-f]{12}-srcset[0-9a-f]{12}-lock[0-9a-f]{12}-contract[0-9a-f]{12}"
+    r"(?:-attempt[0-9]{1,3})?\Z"
+)
 
 
 class MidCutoverEvidenceError(ValueError):
@@ -363,6 +369,11 @@ def observe_green_release(
         "error": None,
         "does_not_establish": ["that the green process serves the release"],
     }
+    if RELEASE_ID_RE.fullmatch(release_id or "") is None:
+        # Validate before any I/O: an unusable identifier is not a reason to
+        # open a socket.
+        observation["error"] = "release id is invalid"
+        return observation
     try:
         with socket.create_connection(
             ("127.0.0.1", port), timeout=connect_timeout_seconds
@@ -370,9 +381,6 @@ def observe_green_release(
             observation["listener_present"] = True
     except OSError:
         observation["listener_present"] = False
-    if not isinstance(release_id, str) or not release_id or "/" in release_id:
-        observation["error"] = "release id is invalid"
-        return observation
     manifest_path = releases_root / release_id / MANIFEST_NAME
     try:
         descriptor = os.open(
@@ -410,6 +418,39 @@ def observe_green_release(
 DEFAULT_STABLE_RUNTIME = Path.home() / ".local/share/grabowski-mcp"
 
 
+def _pointer_binding(runtime_path: Path) -> dict[str, Any]:
+    """What the stable runtime path actually *is*, before reading any manifest.
+
+    A manifest found under the path proves what that directory says about
+    itself; it does not prove the pointer binds it. The release directory the
+    symlink resolves to is the binding, and a pointer that is missing, is not a
+    symlink into the releases root, or resolves somewhere else entirely is not a
+    weaker phase -- it is an unclassifiable one.
+    """
+    binding: dict[str, Any] = {
+        "kind": None,
+        "target_release_id": None,
+        "error": None,
+    }
+    try:
+        linked = runtime_path.lstat()
+    except OSError as exc:
+        binding["error"] = type(exc).__name__
+        return binding
+    if not stat.S_ISLNK(linked.st_mode):
+        binding["kind"] = "directory" if stat.S_ISDIR(linked.st_mode) else "unexpected"
+        return binding
+    binding["kind"] = "symlink"
+    try:
+        resolved = runtime_path.resolve(strict=True)
+    except OSError as exc:
+        binding["error"] = type(exc).__name__
+        return binding
+    binding["resolved_path"] = str(resolved)
+    binding["target_release_id"] = resolved.name
+    return binding
+
+
 def observe_stable_pointer(runtime_path: Path = DEFAULT_STABLE_RUNTIME) -> dict[str, Any]:
     """Which release the stable runtime pointer currently names.
 
@@ -418,13 +459,21 @@ def observe_stable_pointer(runtime_path: Path = DEFAULT_STABLE_RUNTIME) -> dict[
     applied resume is indistinguishable from an untouched one, and the lane
     would either redo an applied effect or refuse forever.
     """
+    binding = _pointer_binding(runtime_path)
     observation: dict[str, Any] = {
         "runtime_path": str(runtime_path),
         "release_id": None,
         "repo_head": None,
         "completion_status": None,
-        "error": None,
+        "pointer_kind": binding["kind"],
+        "pointer_target_release_id": binding["target_release_id"],
+        "error": binding["error"],
     }
+    if binding["error"] is not None or binding["kind"] != "symlink":
+        observation["error"] = observation["error"] or (
+            f"stable runtime pointer is {binding['kind']}, not a managed symlink"
+        )
+        return observation
     manifest_path = runtime_path / MANIFEST_NAME
     try:
         descriptor = os.open(manifest_path, os.O_RDONLY | os.O_CLOEXEC)
@@ -447,10 +496,27 @@ def observe_stable_pointer(runtime_path: Path = DEFAULT_STABLE_RUNTIME) -> dict[
     if not isinstance(manifest, dict):
         observation["error"] = "stable runtime manifest is not an object"
         return observation
+    if manifest.get("release_id") != binding["target_release_id"]:
+        observation["error"] = "stable runtime manifest disagrees with the pointer"
+        return observation
     observation["release_id"] = manifest.get("release_id")
     observation["repo_head"] = manifest.get("repo_head")
     observation["completion_status"] = manifest.get("completion_status")
     return observation
+
+
+GREEN_OPERATOR_UNIT_PREFIX = "grabowski-green-operator-"
+
+
+def green_operator_unit(cutover_id: str) -> str:
+    """The transient unit name of one cutover -- derived, never supplied.
+
+    Mirrors the deploy tool's own derivation so classification asks about
+    exactly the unit that cutover created, and a caller cannot point the
+    observation at some other service.
+    """
+    digest = hashlib.sha256(cutover_id.encode("utf-8")).hexdigest()[:12]
+    return f"{GREEN_OPERATOR_UNIT_PREFIX}{digest}.service"
 
 
 def collect_classification_inputs(
@@ -474,6 +540,10 @@ def collect_classification_inputs(
     except (MidCutoverEvidenceError, OSError) as exc:
         selector_error = str(exc)
     loaded = load_receipts(receipt_root)
+    open_cutovers = unresolved_post_switch_receipts(loaded["receipts"])
+    open_cutover_id = (
+        str(open_cutovers[0]["cutover_id"]) if len(open_cutovers) == 1 else None
+    )
     green_observation = None
     if isinstance(selector, dict):
         green_observation = observe_green_release(
@@ -488,9 +558,11 @@ def collect_classification_inputs(
         "unreadable_receipts": loaded["unreadable"],
         "green_observation": green_observation,
         "pointer_observation": observe_stable_pointer(runtime_path),
-        "green_unit_observation": green_unit_observer()
-        if green_unit_observer is not None
-        else None,
+        "green_unit_observation": (
+            green_unit_observer(green_operator_unit(open_cutover_id))
+            if green_unit_observer is not None and open_cutover_id is not None
+            else None
+        ),
     }
 
 
@@ -555,6 +627,32 @@ def is_post_switch_outcome_unknown(receipt: dict[str, Any]) -> bool:
     # a later reason; continuing it would re-run promotion on an already
     # canonical runtime.
     return receipt.get("retirement") is None and receipt.get("final_routing") is None
+
+
+def _pointer_state(
+    observation: Any,
+    *,
+    blue_release_id: Any,
+    target_release_id: Any,
+    target_head: str,
+) -> str:
+    """Classify the stable pointer as exactly blue, exactly target, or neither.
+
+    "Not the target" is not the same as "still blue".  A pointer that is
+    missing, unreadable, malformed or naming some third release describes a
+    system this lane has no model of, and guessing S0 there would promote on top
+    of an unknown runtime.
+    """
+    if not isinstance(observation, dict) or observation.get("error") is not None:
+        return "unreadable"
+    if observation.get("pointer_kind") != "symlink":
+        return "unbound"
+    release_id = observation.get("release_id")
+    if release_id == target_release_id and observation.get("repo_head") == target_head:
+        return "target"
+    if release_id == blue_release_id:
+        return "blue"
+    return "foreign"
 
 
 def _resume_phase(
@@ -642,7 +740,7 @@ def _continues_this_lineage(
 
 
 def resolution_for_cutover(
-    receipts: Iterable[dict[str, Any]], cutover_id: str
+    receipts: Iterable[dict[str, Any]], cutover: dict[str, Any]
 ) -> dict[str, Any] | None:
     """Find the terminal resume receipt that retired one cutover, if any.
 
@@ -650,15 +748,23 @@ def resolution_for_cutover(
     scanning: an operator holding ``bgc-...`` has to be able to ask what became
     of it and get a hash-bound answer rather than an inference.
     """
-    for receipt in receipts:
+    materialised = list(receipts)
+    if not _lineage_resolved(materialised, cutover):
+        # Exactly one notion of "resolved" exists.  A weaker, name-only lookup
+        # beside the strict one would eventually disagree with it, and the
+        # disagreement would be invisible until it mattered.
+        return None
+    for receipt in materialised:
         if _completed_lineage_binding(receipt) is None:
             continue
-        if receipt.get("resumed_cutover_id") != cutover_id:
+        if receipt.get("resumed_cutover_id") != cutover.get("cutover_id"):
+            continue
+        if receipt.get("resumed_receipt_sha256") != cutover.get("receipt_sha256"):
             continue
         return {
             "resume_id": receipt.get("resume_id"),
             "resume_receipt_sha256": receipt.get("receipt_sha256"),
-            "resumed_cutover_id": cutover_id,
+            "resumed_cutover_id": cutover.get("cutover_id"),
             "resumed_receipt_sha256": receipt.get("resumed_receipt_sha256"),
             "expected_head": receipt.get("expected_head"),
             "final_routing": receipt.get("final_routing"),
@@ -666,8 +772,12 @@ def resolution_for_cutover(
     return None
 
 
-def resolved_cutover_ids(receipts: Iterable[dict[str, Any]]) -> set[str]:
-    """Cutovers a fully-bound completed resume receipt has already retired."""
+def claimed_resolution_cutover_ids(receipts: Iterable[dict[str, Any]]) -> set[str]:
+    """Cutover ids that some completed resume receipt *claims* to have retired.
+
+    A claim, not a verdict: whether the claim holds for a specific cutover is
+    ``_lineage_resolved``'s answer, and only that one is used for decisions.
+    """
     resolved: set[str] = set()
     for receipt in receipts:
         binding = _completed_lineage_binding(receipt)
@@ -828,8 +938,14 @@ def classify_recovery_lane(
     # If this selector's cutover was already continued, say so with the receipt
     # that did it.  "Refused" and "already done" are different answers, and an
     # operator who cannot tell them apart will retry the one that is finished.
-    evidence["resolution"] = resolution_for_cutover(
-        receipts, str(selector.get("cutover_id"))
+    evidence["resolution"] = next(
+        (
+            resolution
+            for cutover in receipts
+            if cutover.get("cutover_id") == selector.get("cutover_id")
+            and (resolution := resolution_for_cutover(receipts, cutover)) is not None
+        ),
+        None,
     )
 
     slot = selector.get("selected_slot")
@@ -893,24 +1009,39 @@ def classify_recovery_lane(
         }
         green_release = candidate.get("green_release_id")
         target_head = str(candidate.get("expected_head") or "")
-        pointer_promoted = bool(
-            isinstance(pointer_observation, dict)
-            and pointer_observation.get("release_id") == green_release
-            and pointer_observation.get("repo_head") == target_head
+        pointer_state = _pointer_state(
+            pointer_observation,
+            blue_release_id=candidate.get("blue_release_id"),
+            target_release_id=green_release,
+            target_head=target_head,
         )
-        green_retired = bool(
-            isinstance(green_unit_observation, dict)
-            and green_unit_observation.get("active") is False
+        pointer_promoted = pointer_state == "target"
+        # Only a *confirmed* inactive green unit retires green.  Unknown is not
+        # a quieter kind of inactive.
+        green_active = (
+            green_unit_observation.get("active")
+            if isinstance(green_unit_observation, dict)
+            else None
         )
-        phase = _resume_phase(
-            slot=str(slot),
-            pointer_promoted=pointer_promoted,
-            green_retired=green_retired,
+        green_retired = green_active is False
+        phase = (
+            _resume_phase(
+                slot=str(slot),
+                pointer_promoted=pointer_promoted,
+                green_retired=green_retired,
+            )
+            if pointer_state in {"blue", "target"}
+            else None
         )
+        evidence["pointer_state"] = pointer_state
         evidence["pointer_promoted"] = pointer_promoted
         evidence["green_retired"] = green_retired
         receipt_summary["resume_phase"] = phase
 
+        checks["stable_pointer_classifiable"] = pointer_state in {"blue", "target"}
+        checks["green_unit_state_known"] = (
+            green_active is not None if slot == CANONICAL_SLOT else True
+        )
         checks["resume_phase_derivable"] = phase is not None
         # The requested head names the *cutover* being continued, never the
         # revision this recovery code happens to come from.  Those are two

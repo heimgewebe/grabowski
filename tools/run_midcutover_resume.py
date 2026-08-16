@@ -74,7 +74,8 @@ def _resume_summary(result: dict[str, Any]) -> dict[str, Any]:
             if isinstance(receipt.get("authoritative_readback"), dict)
             else None
         ),
-        "blind_retry_allowed": receipt.get("outcome") == "denied",
+        "effect_applied": receipt.get("outcome") in {"completed", "outcome_unknown"},
+        "retry_requires_reclassification": True,
     }
     return {**summary, "summary_sha256": deploy_dual._json_sha256(summary)}
 

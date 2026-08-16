@@ -54,6 +54,35 @@ class MidCutoverResumeIncomplete(RuntimeError):
     """The staged mid-cutover resume produced a durable non-completed receipt."""
 
 
+class RecoveryClassificationBlocked(RuntimeError):
+    """The durable state classifies into neither lane, so nothing may run."""
+
+
+#: How a resume outcome maps onto the *deployed* job finalization contract.
+#: outcome_unknown cannot be expressed there for a resume -- that state requires
+#: a blue-green summary bound to this job's own expected head with an
+#: unpersisted receipt -- so the ambiguity is carried by the failure_type and by
+#: the durable resume receipt instead of being silently flattened into "failed".
+RESUME_FINALIZATION_FAILURE_TYPES = {
+    "completed": "MidCutoverPrerequisiteRecovered",
+    "outcome_unknown": "MidCutoverResumeOutcomeUnknown",
+    "denied": "MidCutoverResumeDenied",
+    "failed_pre_resume": "MidCutoverResumeFailedPreResume",
+}
+
+
+def _resume_finalization_failure_type(resume_result: dict[str, Any]) -> str:
+    outcome = str(resume_result.get("outcome") or "")
+    receipt_persisted = resume_result.get("receipt_persisted") is True
+    if outcome in {"completed", "outcome_unknown"} and not receipt_persisted:
+        # The effect happened but its evidence did not land. That is strictly
+        # more ambiguous than either outcome on its own.
+        return "MidCutoverResumeReceiptUnpersisted"
+    return RESUME_FINALIZATION_FAILURE_TYPES.get(
+        outcome, "MidCutoverResumeOutcomeUnknown"
+    )
+
+
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 FINALIZATION_ENV = {
     "job_id": "GRABOWSKI_JOB_ID",
@@ -958,10 +987,6 @@ def classify_recovery_before_deploy(*, repo: Path, execution_head: str) -> dict[
     )
     lane = classification.get("lane")
     if lane != midcutover.LANE_MID_CUTOVER_RESUME:
-        target_head = None
-        binding = classification.get("resume_binding")
-        if isinstance(binding, dict):
-            target_head = binding.get("target_head")
         # The classifier was asked about execution_head. A resumable cutover
         # about a *different* head is still a resumable cutover, so ask again
         # with the head the lineage itself names.
@@ -972,19 +997,33 @@ def classify_recovery_before_deploy(*, repo: Path, execution_head: str) -> dict[
                 receipt_root=None,
             )
             lane = classification.get("lane")
-            target_head = open_target
-        if lane != midcutover.LANE_MID_CUTOVER_RESUME:
-            return {
-                "lane": lane,
-                "resume_required": False,
-                "execution_head": execution_head,
-                "resume_target_head": target_head,
-                "classification_sha256": classification.get("classification_sha256"),
-            }
+    if lane == midcutover.LANE_SCHEDULED_DEPLOY:
+        return {
+            "lane": lane,
+            "resume_required": False,
+            "deploy_allowed": True,
+            "execution_head": execution_head,
+            "resume_target_head": None,
+            "classification_sha256": classification.get("classification_sha256"),
+        }
+    if lane != midcutover.LANE_MID_CUTOVER_RESUME:
+        # Neither lane is open.  A deployment is an effect, and an unclassified
+        # state is not a licence to take one: the ordinary path must never be
+        # the fallback for "we could not tell".
+        return {
+            "lane": lane,
+            "resume_required": False,
+            "deploy_allowed": False,
+            "execution_head": execution_head,
+            "resume_target_head": None,
+            "reasons": classification.get("reasons"),
+            "classification_sha256": classification.get("classification_sha256"),
+        }
     binding = classification["resume_binding"]
     return {
         "lane": lane,
         "resume_required": True,
+        "deploy_allowed": False,
         "execution_head": execution_head,
         "resume_target_head": binding["target_head"],
         "resume_phase": binding["resume_phase"],
@@ -1069,6 +1108,58 @@ def run_productive_blue_green(
     return {**result, "summary": summary}
 
 
+def run_resume_only(
+    recovery_decision: dict[str, Any], *, binding: dict[str, Any] | None
+) -> int:
+    """Continue the stranded cutover and stop; deploy nothing.
+
+    A stranded cutover is a precondition, not a deployment. Resuming it and
+    deploying the requested head are two effects on two revisions; collapsing
+    them into one job would make the outcome unreconstructable, so this run ends
+    after the resume and the controller starts the ordinary deploy separately.
+    """
+
+    resume_result = run_midcutover_resume(
+        repo=Path(recovery_decision["repo"]), decision=recovery_decision
+    )
+    outcome = resume_result.get("outcome")
+    failure_type = _resume_finalization_failure_type(resume_result)
+    emit(
+        "midcutover-recovery-terminal",
+        resume_outcome=outcome,
+        failure_type=failure_type,
+        resume_target_head=recovery_decision["resume_target_head"],
+        execution_head=recovery_decision["execution_head"],
+        requested_head_deployment_performed=False,
+        effect_applied=outcome in {"completed", "outcome_unknown"},
+        retry_requires_reclassification=True,
+        receipt_sha256=(resume_result.get("receipt") or {}).get(
+            "receipt_sha256"
+        ),
+        authority="durable mid-cutover resume receipt",
+    )
+    if binding is not None:
+        # The deployed finalization contract has no terminal state for
+        # "the prerequisite was recovered but the requested head was not
+        # deployed": completed demands this job's expected head *and* a
+        # real release id, and outcome_unknown demands a blue-green
+        # summary bound to that same head with an unpersisted receipt.
+        # Neither is true here, and claiming either would be a lie about
+        # a deployment that did not happen. The job therefore terminates
+        # as a typed non-success whose failure_type names exactly what
+        # occurred, and the durable bgcr receipt stays the authority on
+        # the recovery itself.
+        write_finalization_receipt(
+            binding,
+            final_status="failed",
+            repo_head=None,
+            release_id=None,
+            failure_type=failure_type,
+            blue_green=None,
+        )
+    return 0 if outcome == "completed" else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, required=True)
@@ -1124,34 +1215,14 @@ def main() -> int:
             if key != "classification"
         })
         if recovery_decision["resume_required"]:
-            # A stranded cutover is a precondition, not a deployment. Resuming
-            # it and deploying the requested head are two effects on two
-            # revisions; collapsing them into one job would make the outcome
-            # unreconstructable, so this run stops after the resume and the
-            # controller starts the ordinary deploy separately.
-            resume_result = run_midcutover_resume(
-                repo=repo, decision=recovery_decision
+            return run_resume_only(
+                {**recovery_decision, "repo": str(repo)}, binding=binding
             )
-            if resume_result.get("outcome") != "completed":
-                raise MidCutoverResumeIncomplete(
-                    "mid-cutover resume did not complete; inspect its durable receipt"
-                )
-            emit(
-                "midcutover-prerequisite-recovered",
-                resume_target_head=recovery_decision["resume_target_head"],
-                execution_head=recovery_decision["execution_head"],
-                requested_head_deployment_performed=False,
+        if not recovery_decision.get("deploy_allowed"):
+            raise RecoveryClassificationBlocked(
+                "recovery classification is fail-closed; no deployment may start: "
+                + ",".join(recovery_decision.get("reasons") or ["unclassified"])
             )
-            if binding is not None:
-                write_finalization_receipt(
-                    binding,
-                    final_status="completed",
-                    repo_head=recovery_decision["resume_target_head"],
-                    release_id=None,
-                    failure_type=None,
-                    blue_green=None,
-                )
-            return 0
         blue_green_result = run_productive_blue_green(
             repo=repo,
             expected_head=args.expected_head,

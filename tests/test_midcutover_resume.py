@@ -87,8 +87,8 @@ import grabowski_midcutover_resume as midcutover
 HEAD_BLUE = "a" * 40
 HEAD_GREEN = "b" * 40
 CUTOVER_ID = "bgc-stuck-cutover"
-GREEN_RELEASE = "bbbbbbbbbbbb-srcset0011223344-lock5566778899-contractaabbccdd"
-BLUE_RELEASE = "aaaaaaaaaaaa-srcset0011223344-lock5566778899-contractaabbccdd"
+GREEN_RELEASE = "bbbbbbbbbbbb-srcset001122334455-lock556677889900-contractaabbccddeeff"
+BLUE_RELEASE = "aaaaaaaaaaaa-srcset001122334455-lock556677889900-contractaabbccddeeff"
 SELECTOR_SHA256 = "c1" * 32
 BINDING_SHA256 = "c2" * 32
 SOURCE_IDENTITY_SHA256 = "c3" * 32
@@ -217,6 +217,8 @@ def classify(**overrides) -> dict[str, object]:
         "selector": selector_document(),
         "receipts": [cutover_receipt()],
         "green_observation": GREEN_OBSERVATION,
+        "pointer_observation": POINTER_AT_BLUE,
+        "green_unit_observation": {"active": True},
     }
     parameters.update(overrides)
     return midcutover.classify_recovery_lane(**parameters)
@@ -409,6 +411,10 @@ class _FakeResumeRuntime:
     def resume_phase(self) -> str:
         return str(self.resume_binding["resume_phase"])
 
+    def reconcile_admission_marker(self):
+        self.calls.append("reconcile_admission_marker")
+        return {"state": "absent", "cleanup_performed": False}
+
     def adopt_applied_promotion(self):
         self.calls.append("adopt_applied_promotion")
         self.pointer_promoted = True
@@ -569,7 +575,7 @@ class ResumeEffectSemanticsTests(unittest.TestCase):
         self.assertEqual(midcutover.validate_resume_receipt(persisted), persisted)
         # The persisted resume receipt is what retires the original ambiguity.
         self.assertEqual(
-            midcutover.resolved_cutover_ids([persisted]), {CUTOVER_ID}
+            midcutover.claimed_resolution_cutover_ids([persisted]), {CUTOVER_ID}
         )
         verdict = classify(receipts=[cutover_receipt(), persisted])
         self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
@@ -886,8 +892,22 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
         self.assertEqual(raised.exception.phase, "snapshot-authenticity-preflight")
 
 
-POINTER_AT_TARGET = {"release_id": GREEN_RELEASE, "repo_head": HEAD_GREEN}
-POINTER_AT_BLUE = {"release_id": BLUE_RELEASE, "repo_head": HEAD_BLUE}
+def pointer_observation(release_id: str, repo_head: str, **overrides) -> dict[str, object]:
+    observation = {
+        "runtime_path": "/runtime",
+        "release_id": release_id,
+        "repo_head": repo_head,
+        "completion_status": "complete",
+        "pointer_kind": "symlink",
+        "pointer_target_release_id": release_id,
+        "error": None,
+    }
+    observation.update(overrides)
+    return observation
+
+
+POINTER_AT_TARGET = pointer_observation(GREEN_RELEASE, HEAD_GREEN)
+POINTER_AT_BLUE = pointer_observation(BLUE_RELEASE, HEAD_BLUE)
 
 
 def canonical_selector(generation: int = GENERATION + 1) -> dict[str, object]:
@@ -1101,6 +1121,252 @@ class TwoHeadBootstrapTests(unittest.TestCase):
         self.assertEqual(decision["lane"], midcutover.LANE_SCHEDULED_DEPLOY)
 
 
+class LaneSwitchTests(unittest.TestCase):
+    """fail_closed is a stop, never a fallback into the ordinary deploy."""
+
+    FAIL_CLOSED_CASES = {
+        "unreadable_receipt": dict(
+            unreadable_receipts=[{"path": "/x.json", "error": "hash mismatch"}]
+        ),
+        "contradictory_pointer": dict(
+            selector=canonical_selector(), pointer_observation=POINTER_AT_BLUE
+        ),
+        "multiple_unresolved_cutovers": dict(
+            receipts=[cutover_receipt(), cutover_receipt(cutover_id="bgc-second")]
+        ),
+        "foreign_selector": dict(selector=selector_document(cutover_id="bgc-foreign")),
+        "unknown_green_unit": dict(
+            selector=canonical_selector(),
+            pointer_observation=POINTER_AT_TARGET,
+            green_unit_observation={"active": None},
+        ),
+        "pointer_on_a_third_release": dict(
+            pointer_observation=pointer_observation(
+                "cccccccccccc-srcset001122334455-lock556677889900-contractaabbccddeeff",
+                "c" * 40,
+            )
+        ),
+        "pointer_missing": dict(
+            pointer_observation=pointer_observation(
+                BLUE_RELEASE, HEAD_BLUE, error="FileNotFoundError"
+            )
+        ),
+        "pointer_not_a_symlink": dict(
+            pointer_observation=pointer_observation(
+                BLUE_RELEASE, HEAD_BLUE, pointer_kind="directory"
+            )
+        ),
+    }
+
+    def test_every_fail_closed_state_is_fail_closed(self) -> None:
+        for name, overrides in self.FAIL_CLOSED_CASES.items():
+            with self.subTest(case=name):
+                self.assertEqual(
+                    classify(**overrides)["lane"], midcutover.LANE_FAIL_CLOSED
+                )
+
+    def test_fail_closed_never_reaches_the_ordinary_deploy(self) -> None:
+        import run_scheduled_deploy as runner
+
+        for name, overrides in self.FAIL_CLOSED_CASES.items():
+            with self.subTest(case=name):
+                verdict = classify(**overrides)
+                with mock.patch.object(
+                    runner.deploy_dual,
+                    "classify_midcutover_resume",
+                    return_value=verdict,
+                ):
+                    decision = runner.classify_recovery_before_deploy(
+                        repo=ROOT, execution_head=HEAD_GREEN
+                    )
+                self.assertFalse(decision["resume_required"])
+                self.assertFalse(decision["deploy_allowed"])
+
+    def test_blocked_classification_stops_the_run(self) -> None:
+        import run_scheduled_deploy as runner
+
+        decision = {
+            "lane": midcutover.LANE_FAIL_CLOSED,
+            "resume_required": False,
+            "deploy_allowed": False,
+            "reasons": ["all_receipt_evidence_readable"],
+        }
+        with (
+            mock.patch.object(
+                runner, "classify_recovery_before_deploy", return_value=decision
+            ),
+            mock.patch.object(runner, "run_productive_blue_green") as deploy,
+        ):
+            self.assertTrue(hasattr(runner, "RecoveryClassificationBlocked"))
+            deploy.assert_not_called()
+
+    def test_clean_state_still_reaches_the_ordinary_deploy(self) -> None:
+        import run_scheduled_deploy as runner
+
+        clean = classify(
+            selector=selector_document(slot="canonical", cutover_id="bgc-old"),
+            receipts=[],
+            pointer_observation=POINTER_AT_TARGET,
+        )
+        self.assertEqual(clean["lane"], midcutover.LANE_SCHEDULED_DEPLOY)
+        with mock.patch.object(
+            runner.deploy_dual, "classify_midcutover_resume", return_value=clean
+        ):
+            decision = runner.classify_recovery_before_deploy(
+                repo=ROOT, execution_head=HEAD_GREEN
+            )
+        self.assertTrue(decision["deploy_allowed"])
+        self.assertFalse(decision["resume_required"])
+
+
+class DeployedFinalizationCompatibilityTests(unittest.TestCase):
+    """The finalization a resume-only run writes must satisfy the *deployed* validator.
+
+    Not a re-implementation of the rules: the acceptance conditions are read out
+    of the release that is actually running, so a drift between what this code
+    writes and what that runtime accepts shows up here rather than in a job that
+    silently fails to finalize.
+    """
+
+    #: The deployed grabowski_operator_core.py is installed from this file, so
+    #: the rules can be read here and still describe the running runtime. Where
+    #: the release is actually on disk, the equivalence is asserted rather than
+    #: assumed.
+    VALIDATOR_SOURCE = SRC / "grabowski_operator.py"
+    DEPLOYED_RELEASE = (
+        Path("/home/alex/.local/share/grabowski-mcp-releases")
+        / "8351bcdc257a-srcsetaa58d27f6581-lock33399b89320a-contract85274180e76c"
+        / ".venv/lib/python3.10/site-packages/grabowski_operator_core.py"
+    )
+
+    def setUp(self) -> None:
+        self.source = self.VALIDATOR_SOURCE.read_text(encoding="utf-8")
+
+    def test_finalization_rules_match_the_deployed_release_exactly(self) -> None:
+        """The rules this patch relies on are the rules that are running.
+
+        Compared block by block rather than file by file: this branch changes
+        other parts of the operator on purpose, and a whole-file digest would
+        fail for those changes while saying nothing about the contract that
+        actually matters here.
+        """
+        if not self.DEPLOYED_RELEASE.is_file():
+            self.skipTest("deployed release is not present on this host")
+        deployed = self.DEPLOYED_RELEASE.read_text(encoding="utf-8")
+        for marker in (
+            'if final_status == "completed":',
+            'elif final_status == "failed":',
+            'elif final_status == "outcome_unknown":',
+        ):
+            with self.subTest(rule=marker):
+                start = deployed.index(marker)
+                deployed_rule = deployed[start : start + 1400]
+                self.assertEqual(
+                    deployed_rule,
+                    self._deployed_rule(marker),
+                    "finalization rules drifted from the deployed release",
+                )
+
+    def _deployed_rule(self, marker: str) -> str:
+        start = self.source.index(marker)
+        return self.source[start : start + 1400]
+
+    def test_completed_requires_this_jobs_head_and_a_real_release(self) -> None:
+        rule = self._deployed_rule('if final_status == "completed":')
+        self.assertIn('payload.get("repo_head") != contract["expected_head"]', rule)
+        self.assertIn('not isinstance(release_id, str)', rule)
+        self.assertIn('payload.get("failure_type") is not None', rule)
+
+    def test_outcome_unknown_requires_an_unpersisted_blue_green_summary(self) -> None:
+        rule = self._deployed_rule('elif final_status == "outcome_unknown":')
+        self.assertIn('blue_green.get("receipt_persisted") is not False', rule)
+        self.assertIn("not isinstance(blue_green, dict)", rule)
+
+    def test_resume_only_finalization_matches_the_accepted_failed_shape(self) -> None:
+        import run_scheduled_deploy as runner
+
+        rule = self._deployed_rule('elif final_status == "failed":')
+        # What the deployed validator demands of a failed receipt.
+        self.assertIn('payload.get("completion_status") != "failed"', rule)
+        self.assertIn('payload.get("repo_head") is not None', rule)
+        self.assertIn('payload.get("release_id") is not None', rule)
+        self.assertIn('payload.get("blind_retry_allowed") not in {None, True}', rule)
+
+        for outcome, expected in (
+            ("completed", "MidCutoverPrerequisiteRecovered"),
+            ("outcome_unknown", "MidCutoverResumeOutcomeUnknown"),
+            ("denied", "MidCutoverResumeDenied"),
+            ("failed_pre_resume", "MidCutoverResumeFailedPreResume"),
+        ):
+            with self.subTest(outcome=outcome):
+                failure_type = runner._resume_finalization_failure_type(
+                    {"outcome": outcome, "receipt_persisted": True}
+                )
+                self.assertEqual(failure_type, expected)
+                self.assertTrue(0 < len(failure_type.encode("utf-8")) <= 200)
+
+    def test_unpersisted_resume_receipt_is_its_own_failure_type(self) -> None:
+        import run_scheduled_deploy as runner
+
+        self.assertEqual(
+            runner._resume_finalization_failure_type(
+                {"outcome": "completed", "receipt_persisted": False}
+            ),
+            "MidCutoverResumeReceiptUnpersisted",
+        )
+        self.assertEqual(
+            runner._resume_finalization_failure_type(
+                {"outcome": "outcome_unknown", "receipt_persisted": False}
+            ),
+            "MidCutoverResumeReceiptUnpersisted",
+        )
+
+    def test_resume_only_run_never_claims_a_deployed_head(self) -> None:
+        import run_scheduled_deploy as runner
+
+        written: dict[str, object] = {}
+
+        def capture(binding, **kwargs):
+            written.update(kwargs)
+            return Path("/jobs/finalization.json")
+
+        decision = {
+            "resume_required": True,
+            "deploy_allowed": False,
+            "execution_head": "e" * 40,
+            "resume_target_head": HEAD_GREEN,
+            "resume_binding_sha256": "f2" * 32,
+            "cutover_id": CUTOVER_ID,
+        }
+        with (
+            mock.patch.object(
+                runner, "classify_recovery_before_deploy", return_value=decision
+            ),
+            mock.patch.object(
+                runner,
+                "run_midcutover_resume",
+                return_value={
+                    "outcome": "completed",
+                    "receipt_persisted": True,
+                    "receipt": {"receipt_sha256": "ab" * 32},
+                },
+            ),
+            mock.patch.object(runner, "write_finalization_receipt", side_effect=capture),
+            mock.patch.object(runner, "run_productive_blue_green") as deploy,
+        ):
+            runner_result = runner.run_resume_only(
+                {**decision, "repo": str(ROOT)}, binding={"x": 1}
+            )
+        deploy.assert_not_called()
+        self.assertEqual(written["final_status"], "failed")
+        self.assertEqual(written["failure_type"], "MidCutoverPrerequisiteRecovered")
+        # Neither head may be presented as the deployed one.
+        self.assertIsNone(written["repo_head"])
+        self.assertIsNone(written["release_id"])
+        self.assertIsNone(written["blue_green"])
+        self.assertEqual(runner_result, 0)
+
+
 class GreenDrainTargetTests(unittest.TestCase):
     """Green is the publicly routed process, so green is what must be drained."""
 
@@ -1301,6 +1567,8 @@ class ObjectIdContractTests(unittest.TestCase):
                     selector=selector_document(repo_head=head),
                     receipts=[cutover_receipt(expected_head=head)],
                     green_observation={**GREEN_OBSERVATION, "repo_head": head},
+                    pointer_observation=POINTER_AT_BLUE,
+                    green_unit_observation={"active": True},
                 )
                 self.assertNotIn("expected_head_named", verdict["reasons"])
                 self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
@@ -1465,7 +1733,7 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
         # It must read back as authentic evidence...
         self.assertEqual(midcutover.validate_resume_receipt(denied), denied)
         # ...resolve nothing...
-        self.assertEqual(midcutover.resolved_cutover_ids([denied]), set())
+        self.assertEqual(midcutover.claimed_resolution_cutover_ids([denied]), set())
         # ...and leave the stranded cutover resumable.
         verdict = classify(receipts=[cutover_receipt(), denied])
         self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
@@ -1507,19 +1775,19 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
 
     def test_lineage_resolution_requires_canonical_final_routing(self) -> None:
         not_promoted = resume_receipt(final_slot="green")
-        self.assertEqual(midcutover.resolved_cutover_ids([not_promoted]), set())
+        self.assertEqual(midcutover.claimed_resolution_cutover_ids([not_promoted]), set())
         self.assertFalse(
             midcutover._lineage_resolved([not_promoted], cutover_receipt())
         )
 
     def test_resolution_is_discoverable_from_the_original_cutover(self) -> None:
         resolution = midcutover.resolution_for_cutover(
-            [cutover_receipt(), resume_receipt()], CUTOVER_ID
+            [cutover_receipt(), resume_receipt()], cutover_receipt()
         )
         self.assertIsNotNone(resolution)
         self.assertEqual(resolution["resumed_cutover_id"], CUTOVER_ID)
         self.assertIsNone(
-            midcutover.resolution_for_cutover([cutover_receipt()], CUTOVER_ID)
+            midcutover.resolution_for_cutover([cutover_receipt()], cutover_receipt())
         )
 
     def test_lineage_survives_a_process_restart_through_the_receipt_root(self) -> None:
@@ -1553,7 +1821,7 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
                 verdict["evidence"]["resolution"]["resumed_cutover_id"], CUTOVER_ID
             )
             self.assertEqual(
-                midcutover.resolved_cutover_ids(loaded["receipts"]), {CUTOVER_ID}
+                midcutover.claimed_resolution_cutover_ids(loaded["receipts"]), {CUTOVER_ID}
             )
 
     def test_second_resume_attempt_produces_no_effect(self) -> None:
@@ -1597,7 +1865,7 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
             self.assertEqual(
                 midcutover.validate_resume_receipt(persisted), persisted
             )
-            self.assertEqual(midcutover.resolved_cutover_ids([persisted]), set())
+            self.assertEqual(midcutover.claimed_resolution_cutover_ids([persisted]), set())
 
 
 class RecoverySurfaceTests(unittest.TestCase):

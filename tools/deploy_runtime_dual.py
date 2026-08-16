@@ -6776,6 +6776,24 @@ class MidCutoverResumeRuntime:
             )
         if self.resume_phase == midcutover.PHASE_PROMOTE_POINTER:
             self.reprobe_green()
+            # Compare-and-swap on the pointer, not just on the selector: the
+            # deployment lock keeps other deploys out, but it says nothing about
+            # what the pointer became while this run was draining.
+            observed = midcutover.observe_stable_pointer(self.runtime)
+            expected_blue = self.classification["receipt"]["blue_release_id"]
+            if (
+                observed.get("error") is not None
+                or observed.get("pointer_kind") != "symlink"
+                or observed.get("release_id") != expected_blue
+            ):
+                core.fail(
+                    "Stable pointer is no longer the predecessor this resume classified",
+                    phase="midcutover-pointer-cas",
+                    details={
+                        "expected_predecessor_release_id": expected_blue,
+                        "observed": observed,
+                    },
+                )
             self.activation = core.ActivationState(
                 runtime=self.runtime,
                 release_path=self.release_path,
@@ -6815,16 +6833,80 @@ class MidCutoverResumeRuntime:
         remaining steps run without re-applying an irreversible effect and
         without pretending it never happened.
         """
+        observed = transport_ingress.read_routing_selector()
+        expected_selector = self.resume_binding["expected_selector_sha256"]
+        expected_binding = self.resume_binding["expected_runtime_binding_sha256"]
+        ancestry = self.resume_binding["switch_selector_sha256"]
+        if (
+            observed.get("selector_sha256") != expected_selector
+            or observed.get("runtime_binding_sha256") != expected_binding
+            or observed.get("cutover_id") != self.cutover_id
+            or observed.get("selected_slot") != "canonical"
+            # The decisive binding: this canonical selector must be the direct
+            # successor of *our* green selector.  Verifying a selector against
+            # its own hash only proves it is internally consistent, which any
+            # foreign writer's selector also is.
+            or observed.get("previous_selector_sha256") != ancestry
+        ):
+            core.fail(
+                "Canonical selector does not continue this resume lineage",
+                phase="midcutover-adopt-promotion",
+                details={
+                    "observed": _selector_summary(observed),
+                    "expected_selector_sha256": expected_selector,
+                    "expected_previous_selector_sha256": ancestry,
+                },
+            )
         self.promotion_progress.pointer_promoted = True
         self.promotion_progress.canonical_selected = True
         self.green_proven = True
-        self.current_selector = transport_ingress.read_routing_selector()
+        self.current_selector = observed
         readback = _require_selector_authority(
-            expected_selector_sha256=self.current_selector["selector_sha256"],
+            expected_selector_sha256=expected_selector,
             expected_slot="canonical",
-            expected_binding_sha256=self.current_selector["runtime_binding_sha256"],
+            expected_binding_sha256=expected_binding,
         )
         return {"adopted": True, "authoritative_readback": readback}
+
+    def reconcile_admission_marker(self) -> dict[str, Any]:
+        """Clear a marker this lineage left behind -- and only such a marker.
+
+        A resume that retired green and then failed to release admission leaves
+        the runtime globally closed to mutations. The next run must finish that
+        cleanup rather than report completion over it. Ownership is proved by
+        the marker's own binding, so a marker belonging to somebody else's
+        deployment is never touched; it makes this run fail closed instead.
+        """
+        observed = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
+        if observed is None:
+            return {"state": "absent", "cleanup_performed": False}
+        expected_head = self.green_binding["repo_head"]
+        expected_identity = str(self.resume_binding["source_identity_sha256"])
+        if (
+            observed.get("expected_head") != expected_head
+            or observed.get("source_identity_sha256") != expected_identity
+        ):
+            core.fail(
+                "An unrelated deployment admission marker is active",
+                phase="midcutover-admission-cleanup",
+                details={
+                    "observed_expected_head": observed.get("expected_head"),
+                    "expected_head": expected_head,
+                },
+            )
+        release_operator_deployment_admission(observed)
+        residue = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
+        if residue is not None:
+            core.fail(
+                "Deployment admission marker is still present after release",
+                phase="midcutover-admission-cleanup",
+            )
+        self.admission_marker = None
+        return {
+            "state": "released",
+            "cleanup_performed": True,
+            "verified_absent": True,
+        }
 
     def retire_green(self) -> dict[str, Any]:
         if not self.canonical_selected:
@@ -6872,13 +6954,24 @@ class MidCutoverResumeRuntime:
         no reason, which is a denial of service rather than a safety property.
         """
         if self.admission_marker is None:
-            return {"released": False, "reason": "no_marker_engaged"}
+            return {"released": True, "reason": "no_marker_engaged", "clean": True}
         try:
             release_operator_deployment_admission(self.admission_marker)
         except Exception as exc:  # noqa: BLE001 - abort path must stay reportable
-            return {"released": False, "error": type(exc).__name__}
+            # A marker that could not be released is a residual effect of this
+            # run.  Reporting the state as unchanged would understate it.
+            return {
+                "released": False,
+                "clean": False,
+                "cleanup_required": True,
+                "marker_expected_head": self.admission_marker.get("expected_head"),
+                "marker_source_identity_sha256": self.admission_marker.get(
+                    "source_identity_sha256"
+                ),
+                "error": type(exc).__name__,
+            }
         self.admission_marker = None
-        return {"released": True}
+        return {"released": True, "clean": True}
 
     def authoritative_readback(self) -> dict[str, Any]:
         return observe_authoritative_routing()
@@ -6903,7 +6996,32 @@ def classify_midcutover_resume(
             receipt_root if receipt_root is not None else BLUE_GREEN_RECEIPT_ROOT
         ),
         releases_root=core.releases_root_for(target_runtime),
+        runtime_path=target_runtime,
+        green_unit_observer=observe_green_operator_unit,
     )
+
+
+def observe_green_operator_unit(unit: str) -> dict[str, Any]:
+    """Three-valued state of one transient green unit.
+
+    Without this the classifier could never see a retired green, so the closeout
+    phase would be unreachable outside tests -- a state machine whose last step
+    only exists on paper. Only a confirmed inactive unit counts as retired;
+    an unreadable service query is ambiguous and stays ambiguous.
+    """
+    observation = observe_service(_require_green_unit(unit))
+    if _green_confirmed_inactive(observation):
+        active: bool | None = False
+    elif observation.confirmed_active:
+        active = True
+    else:
+        active = None
+    return {
+        "unit": unit,
+        "active": active,
+        "service": observation.to_dict(),
+        "does_not_establish": ["that no effect is in flight on green"],
+    }
 
 
 def prepare_midcutover_resume_runtime(
@@ -6955,9 +7073,28 @@ def prepare_midcutover_resume_runtime(
             phase="midcutover-resume-preflight",
         )
     require_service_active(TRANSPORT_INGRESS_SERVICE)
-    release_path = (
-        core.releases_root_for(runtime) / resume_binding["expected_release_id"]
-    )
+    releases_root = core.releases_root_for(runtime)
+    release_path = releases_root / resume_binding["expected_release_id"]
+    resolved_root = releases_root.resolve(strict=True)
+    try:
+        resolved_release = release_path.resolve(strict=True)
+    except OSError as exc:
+        core.fail(
+            "Resumed green release path is unavailable",
+            phase="midcutover-resume-preflight",
+            details={"error_type": type(exc).__name__},
+        )
+    if resolved_release.parent != resolved_root:
+        # A release id is an identifier, not a path fragment: whatever it names
+        # must sit directly inside the releases root and nowhere else.
+        core.fail(
+            "Resumed green release resolves outside the releases root",
+            phase="midcutover-resume-preflight",
+            details={
+                "releases_root": str(resolved_root),
+                "resolved_release": str(resolved_release),
+            },
+        )
     contract, contract_evidence = _receipt_bound_release_contract(
         release_path,
         expected_release_id=str(resume_binding["expected_release_id"]),
@@ -7021,6 +7158,7 @@ def _midcutover_resume_receipt(
     selector_switch: dict[str, Any] | None,
     final_routing: dict[str, Any] | None,
     retirement: dict[str, Any] | None,
+    admission_state: dict[str, Any] | None,
     final_state: dict[str, Any] | None,
     readback: dict[str, Any] | None,
     recovery: dict[str, Any] | None,
@@ -7053,6 +7191,7 @@ def _midcutover_resume_receipt(
         "selector_switch": selector_switch,
         "final_routing": final_routing,
         "retirement": retirement,
+        "admission_state": admission_state,
         "final_state": final_state,
         "authoritative_readback": readback,
         "observations": observations,
@@ -7113,6 +7252,7 @@ def resume_production_blue_green_cutover(
     canonical_operator: dict[str, Any] | None = None
     selector_switch: dict[str, Any] | None = None
     retirement: dict[str, Any] | None = None
+    admission_state: dict[str, Any] | None = None
     final_state: dict[str, Any] | None = None
     readback: dict[str, Any] | None = None
     recovery: dict[str, Any] | None = None
@@ -7158,6 +7298,7 @@ def resume_production_blue_green_cutover(
                 selector_switch=None,
                 final_routing=None,
                 retirement=None,
+                admission_state=None,
                 final_state=None,
                 readback=None,
                 recovery={
@@ -7206,6 +7347,7 @@ def resume_production_blue_green_cutover(
                 selector_switch=None,
                 final_routing=None,
                 retirement=None,
+                admission_state=None,
                 final_state=None,
                 readback=None,
                 recovery={
@@ -7290,13 +7432,35 @@ def resume_production_blue_green_cutover(
             else:
                 # Canonical already carries this lineage; the pointer and the
                 # selector are applied effects, not work to repeat.
-                context.adopt_applied_promotion()
+                phase = "adopt_applied_promotion"
+                adoption = context.adopt_applied_promotion()
+                _blue_green_observation(
+                    observations, phase=phase, details={"adopted": True}
+                )
+            if resume_phase == midcutover.PHASE_RETIRE_GREEN:
+                # A later run cannot inherit the previous attempt's drain: that
+                # marker may be gone, expired or somebody else's. Green still
+                # holds whatever it admitted before the switch, so the proof is
+                # taken again here, from scratch.
+                phase = "close_mutations"
+                closed = context.close_mutations()
+                drain = context.terminalize_effects()
+                _blue_green_observation(
+                    observations,
+                    phase=phase,
+                    details={"close": closed, "drain_sha256": _json_sha256(drain)},
+                )
             if resume_phase != midcutover.PHASE_CLOSEOUT:
                 phase = "retire_green"
                 retirement = context.retire_green()
                 _blue_green_observation(
                     observations, phase=phase, details={"retired": True}
                 )
+            phase = "reconcile_admission"
+            admission_state = context.reconcile_admission_marker()
+            _blue_green_observation(
+                observations, phase=phase, details=dict(admission_state)
+            )
             phase = "final_readback"
             final_state = context.final_readback()
             readback = context.authoritative_readback()
@@ -7375,6 +7539,7 @@ def resume_production_blue_green_cutover(
             else None
         ),
         retirement=retirement,
+        admission_state=admission_state,
         final_state=final_state,
         readback=readback,
         recovery=recovery,
