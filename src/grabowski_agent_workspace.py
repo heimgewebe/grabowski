@@ -3624,12 +3624,29 @@ def _candidate_receipt_paths(
         raise AgentWorkspaceError("candidate round must be a positive integer")
     root = _workspace_dir(str(manifest["workspace_id"]))
     suffix = f"round-{round_number:04d}.json"
-    return {
-        "candidate": root / f"candidate-{suffix}",
-        "tests": root / f"verification-tests-{suffix}",
-        "review": root / f"verification-review-{suffix}",
-        "summary": root / f"verification-summary-{suffix}",
-    }
+    return {"candidate": root / f"candidate-{suffix}"}
+
+
+def _verification_receipt_path(
+    manifest: dict[str, Any],
+    role: str,
+    *,
+    candidate_round: int,
+    verifier_attempt: int,
+) -> Path:
+    if role not in READ_ONLY_ROLES:
+        raise AgentWorkspaceError("verification receipt role is invalid")
+    for value, field in (
+        (candidate_round, "candidate_round"),
+        (verifier_attempt, "verifier_attempt"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise AgentWorkspaceError(f"{field} must be a positive integer")
+    root = _workspace_dir(str(manifest["workspace_id"]))
+    return root / (
+        f"verification-{role}-round-{candidate_round:04d}"
+        f"-attempt-{verifier_attempt:04d}.json"
+    )
 
 
 def _candidate_lane_id(manifest: dict[str, Any]) -> str | None:
@@ -3767,10 +3784,16 @@ def _persist_verification_evidence(
     review_receipt: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     round_number = int(candidate["round"])
-    paths = _candidate_receipt_paths(manifest, round_number=round_number)
     receipts: list[dict[str, Any]] = []
     references: dict[str, Any] = {}
     for role, source in (("tests", test_receipt), ("review", review_receipt)):
+        verifier_attempt = _role_final_attempt(manifest, role)
+        path = _verification_receipt_path(
+            manifest,
+            role,
+            candidate_round=round_number,
+            verifier_attempt=verifier_attempt,
+        )
         verification = candidate_verification.derive_verification_receipt(
             candidate_manifest=candidate,
             verifier_kind=role,
@@ -3783,6 +3806,7 @@ def _persist_verification_evidence(
             toolchain_identity=_role_toolchain_identity_for_receipt(
                 manifest, role, source
             ),
+            verifier_attempt=verifier_attempt,
         )
         validator = lambda value, candidate_id=candidate["candidate_id"]: (
             candidate_verification.validate_verification_receipt(
@@ -3791,10 +3815,10 @@ def _persist_verification_evidence(
             )
         )
         created = candidate_verification.persist_immutable_receipt(
-            paths[role], verification, validator=validator
+            path, verification, validator=validator
         )
         observed = candidate_verification.read_immutable_receipt(
-            paths[role], validator=validator
+            path, validator=validator
         )
         if observed != verification:
             raise AgentWorkspaceError(
@@ -3802,37 +3826,17 @@ def _persist_verification_evidence(
             )
         receipts.append(observed)
         references[role] = {
-            "path": str(paths[role]),
+            "path": str(path),
             "receipt_sha256": observed["receipt_sha256"],
             "candidate_id": observed["candidate_id"],
+            "verifier_attempt": verifier_attempt,
             "created": created,
         }
     summary = candidate_verification.reduce_verifications(
         candidate_manifest=candidate,
         verification_receipts=receipts,
     )
-    summary_validator = lambda value: candidate_verification.validate_verification_summary(
-        value,
-        candidate_manifest=candidate,
-        verification_receipts=receipts,
-    )
-    summary_created = candidate_verification.persist_immutable_receipt(
-        paths["summary"], summary, validator=summary_validator
-    )
-    observed_summary = candidate_verification.read_immutable_receipt(
-        paths["summary"], validator=summary_validator
-    )
-    if observed_summary != summary:
-        raise AgentWorkspaceError(
-            "verification summary readback differs from deterministic reduction"
-        )
-    references["summary"] = {
-        "path": str(paths["summary"]),
-        "summary_sha256": observed_summary["summary_sha256"],
-        "candidate_id": observed_summary["candidate_id"],
-        "created": summary_created,
-    }
-    return receipts, observed_summary, references
+    return receipts, summary, references
 
 
 def _verify_patch_artifact(

@@ -193,10 +193,11 @@ Ein fehlerhafter externer Status darf keine falsche Writerroute erzeugen. Wenn k
 P2 ergänzt den bestehenden Workspace-Collect-Pfad additiv um immutable, exakt gebundene Ausführungsevidenz:
 
 - `CandidateManifest.v1` friert den Patch-Modus über Workspace, optionalen Work-Lane-Bezug, Round, Base, Patch-, Untracked-, Scope-, Resulting-Tree- und Writer-Evidence-Digests ein; `candidate_id` ist der SHA-256 des kanonischen Manifest-Bodys.
-- `VerificationReceipt.v1` wird aus den bereits bestehenden read-only Role-Receipts abgeleitet und bindet Test beziehungsweise Review an exakt dieselbe `candidate_id`, Command-/Tool-, Toolchain- und Environment-Identität sowie `PASS`, `NEEDS_CHANGE` oder `INDETERMINATE`.
-- `VerificationSummary.v1` ist eine rein deterministische Reduktion. Sie validiert Candidate-Bindungen, dedupliziert und sortiert Findings, erkennt fehlende Pflichtverifier und enthält keine Modellentscheidung.
-- Die Receipts werden create-only und round-gebunden im bestehenden Workspace-Evidenzverzeichnis gespeichert. Ein abweichendes Same-Round-Receipt blockiert fail-closed. Es gibt keinen Candidate-StateStore und keine zweite Verifier-Ausführung.
-- Die historische `collection` bleibt als Kompatibilitätsprojektion erhalten und verweist zusätzlich auf Candidate und Verification.
+- `VerificationReceipt.v1` wird aus den bereits bestehenden read-only Role-Receipts abgeleitet und bindet Test beziehungsweise Review an exakt dieselbe `candidate_id`, den konkreten Verifier-Attempt, Command-/Tool-, Toolchain- und Environment-Identität sowie `PASS`, `NEEDS_CHANGE` oder `INDETERMINATE`.
+- Ein Candidate-Round bleibt bei rein technischen Verifier-Retries unverändert. Jeder Verifier-Attempt erhält einen eigenen create-only Receipt-Slot; frühere Attempts bleiben immutable erhalten.
+- `VerificationSummary.v1` ist eine rein deterministische Projektion über die jeweils ausgewählten finalen Verifier-Receipts. Sie validiert Candidate-Bindungen, dedupliziert und sortiert Findings, erkennt fehlende Pflichtverifier und enthält keine Modellentscheidung. Der Summary ist keine dritte persistierte Autorität.
+- Candidate- und Verification-Receipts werden create-only im bestehenden Workspace-Evidenzverzeichnis gespeichert. Ein abweichendes Receipt im selben Candidate-Round/Verifier-Attempt blockiert fail-closed. Es gibt keinen Candidate-StateStore und keine zweite Verifier-Ausführung.
+- Die historische `collection` bleibt als Kompatibilitätsprojektion erhalten und verweist zusätzlich auf Candidate und aktuelle Verification.
 
 P2 implementiert ausdrücklich noch nicht:
 

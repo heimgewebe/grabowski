@@ -329,8 +329,15 @@ def derive_verification_receipt(
     source_role_receipt: dict[str, Any],
     runtime_identity: dict[str, Any] | None,
     toolchain_identity: dict[str, Any] | None = None,
+    verifier_attempt: int = 1,
 ) -> dict[str, Any]:
     candidate = validate_candidate_manifest(candidate_manifest)
+    if (
+        isinstance(verifier_attempt, bool)
+        or not isinstance(verifier_attempt, int)
+        or verifier_attempt < 1
+    ):
+        raise CandidateVerificationError("verifier_attempt must be a positive integer")
     if verifier_kind not in VERIFIER_POLICIES:
         raise CandidateVerificationError("verifier_kind is unsupported")
     source = _source_receipt_integrity(source_role_receipt)
@@ -368,6 +375,7 @@ def derive_verification_receipt(
         "candidate_id": candidate["candidate_id"],
         "workspace_id": candidate["workspace_id"],
         "round": candidate["round"],
+        "verifier_attempt": verifier_attempt,
         "verifier_kind": verifier_kind,
         "verifier_policy": VERIFIER_POLICIES[verifier_kind],
         "tool_or_command_identity": tool_or_command_identity,
@@ -397,6 +405,7 @@ def validate_verification_receipt(
         "candidate_id",
         "workspace_id",
         "round",
+        "verifier_attempt",
         "verifier_kind",
         "verifier_policy",
         "tool_or_command_identity",
@@ -424,6 +433,13 @@ def validate_verification_receipt(
     round_number = value.get("round")
     if isinstance(round_number, bool) or not isinstance(round_number, int) or round_number < 1:
         raise CandidateVerificationError("verification round is invalid")
+    verifier_attempt = value.get("verifier_attempt")
+    if (
+        isinstance(verifier_attempt, bool)
+        or not isinstance(verifier_attempt, int)
+        or verifier_attempt < 1
+    ):
+        raise CandidateVerificationError("verification verifier_attempt is invalid")
     _required_sha256(
         value.get("source_role_receipt_sha256"), "source_role_receipt_sha256"
     )
@@ -520,6 +536,10 @@ def reduce_verifications(
         "observed_verifiers": sorted(observed),
         "missing_required_verifiers": missing,
         "verifier_outcomes": required_outcomes,
+        "verifier_attempts": {
+            verifier: observed[verifier]["verifier_attempt"]
+            for verifier in sorted(observed)
+        },
         "outcome": outcome,
         "findings": normalized_findings,
         "findings_sha256": sha256_json(normalized_findings),

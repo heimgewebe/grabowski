@@ -88,6 +88,7 @@ class CandidateVerificationTests(unittest.TestCase):
         failure_classification: str = "passed",
         verdict: str = "PASS",
         findings: list[dict] | None = None,
+        verifier_attempt: int = 1,
     ) -> dict:
         source = self.source_receipt(
             role,
@@ -111,6 +112,7 @@ class CandidateVerificationTests(unittest.TestCase):
                 "passed": returncode == 0,
                 "failure_classification": failure_classification,
             },
+            verifier_attempt=verifier_attempt,
         )
 
     def test_candidate_id_is_canonical_and_lane_bound(self) -> None:
@@ -162,6 +164,7 @@ class CandidateVerificationTests(unittest.TestCase):
         candidate = self.candidate()
         receipt = self.verification("tests", candidate=candidate)
         self.assertEqual(receipt["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(receipt["verifier_attempt"], 1)
         self.assertEqual(receipt["outcome"], "PASS")
         self.assertIn("tool_or_command_identity", receipt)
         self.assertIn("toolchain_identity", receipt)
@@ -173,6 +176,16 @@ class CandidateVerificationTests(unittest.TestCase):
             ),
             receipt,
         )
+
+    def test_verifier_attempt_is_immutable_evidence_not_candidate_revision(self) -> None:
+        candidate = self.candidate()
+        first = self.verification("tests", candidate=candidate, verifier_attempt=1)
+        second = self.verification("tests", candidate=candidate, verifier_attempt=2)
+        self.assertEqual(first["candidate_id"], second["candidate_id"])
+        self.assertEqual(first["round"], second["round"])
+        self.assertEqual(first["verifier_attempt"], 1)
+        self.assertEqual(second["verifier_attempt"], 2)
+        self.assertNotEqual(first["receipt_sha256"], second["receipt_sha256"])
 
     def test_verification_for_another_candidate_is_rejected(self) -> None:
         candidate = self.candidate()
@@ -271,6 +284,7 @@ class CandidateVerificationTests(unittest.TestCase):
         )
         self.assertEqual(summary["outcome"], "PASS")
         self.assertEqual(summary["missing_required_verifiers"], [])
+        self.assertEqual(summary["verifier_attempts"], {"review": 1, "tests": 1})
         self.assertEqual(
             candidate_verification.validate_verification_summary(
                 summary,

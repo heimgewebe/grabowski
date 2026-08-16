@@ -4788,13 +4788,18 @@ class AgentWorkspaceTests(unittest.TestCase):
             set(result["result"]["verification_summary"]["observed_verifiers"]),
             {"review", "tests"},
         )
-        for key in ("candidate", "tests", "review", "summary"):
+        for key in ("candidate", "tests", "review"):
             if key == "candidate":
                 path = Path(result["result"]["candidate_receipt"]["path"])
             else:
                 path = Path(result["result"]["verification_references"][key]["path"])
+                self.assertEqual(
+                    result["result"]["verification_references"][key]["verifier_attempt"],
+                    1,
+                )
             self.assertTrue(path.is_file())
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertNotIn("summary", result["result"]["verification_references"])
         checklist_items = {item["item"] for item in result["external_closeout_checklist"]}
         self.assertEqual(
             checklist_items,
@@ -4858,6 +4863,61 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["state"], "candidate_evidence_invalid")
         self.assertIn("same-round receipt changed", result["error"])
         start.assert_not_called()
+
+    def test_verification_retry_uses_attempt_specific_immutable_slot_for_same_candidate(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, _reference = workspace._persist_candidate_evidence(
+            manifest, snapshot, writer_result, writer_receipt
+        )
+        first_tests = signed_role_receipt(
+            "tests",
+            manifest,
+            snapshot,
+            returncode=1,
+            failure_classification="environment_toolchain_failure",
+        )
+        review = signed_role_receipt("review", manifest, snapshot)
+        first_receipts, first_summary, first_refs = workspace._persist_verification_evidence(
+            manifest,
+            candidate,
+            test_receipt=first_tests,
+            review_receipt=review,
+        )
+        self.assertEqual(first_summary["outcome"], "INDETERMINATE")
+        self.assertEqual(first_summary["verifier_attempts"], {"review": 1, "tests": 1})
+        first_path = Path(first_refs["tests"]["path"])
+        first_bytes = first_path.read_bytes()
+        self.assertEqual(first_refs["tests"]["verifier_attempt"], 1)
+        self.assertEqual(first_receipts[0]["candidate_id"], candidate["candidate_id"])
+
+        replacement = ["python3", "-m", "unittest"]
+        manifest["role_final_attempt"] = {"tests": 2, "review": 1}
+        second_tests = signed_role_receipt(
+            "tests",
+            manifest,
+            snapshot,
+            argv_sha256=workspace._sha256_json(replacement),
+        )
+        second_receipts, second_summary, second_refs = workspace._persist_verification_evidence(
+            manifest,
+            candidate,
+            test_receipt=second_tests,
+            review_receipt=review,
+        )
+        self.assertEqual(second_summary["outcome"], "PASS")
+        self.assertEqual(second_summary["verifier_attempts"], {"review": 1, "tests": 2})
+        second_path = Path(second_refs["tests"]["path"])
+        self.assertNotEqual(first_path, second_path)
+        self.assertTrue(second_path.is_file())
+        self.assertEqual(first_path.read_bytes(), first_bytes)
+        self.assertEqual(second_refs["tests"]["verifier_attempt"], 2)
+        self.assertEqual(second_receipts[0]["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(first_receipts[1], second_receipts[1])
 
     def test_role_retry_blocks_unresolved_retry_start_intent_before_second_start(self) -> None:
         manifest = self.manifest()
