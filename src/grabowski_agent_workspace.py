@@ -1563,6 +1563,7 @@ def _validate_work_lane_binding(
     writer_branch: str,
     writer_worktree: Path,
     allowed_paths: list[str],
+    runtime_deadline_unix: int,
     runner: CommandRunner,
 ) -> dict[str, Any]:
     receipt = _lane_receipt(lane_id, expected_receipt_sha256)
@@ -1583,6 +1584,20 @@ def _validate_work_lane_binding(
         raise AgentWorkspaceError("work lane identity digest is invalid")
     if not isinstance(authority, dict):
         raise AgentWorkspaceError("work lane authority is missing")
+    if inputs.get("scoped_writer_command") is not None:
+        raise AgentWorkspaceError(
+            "work lane already configured a scoped writer command"
+        )
+    if receipt.get("writer_job") is not None or receipt.get("writer_start") is not None:
+        raise AgentWorkspaceError(
+            "work lane already has scoped writer execution state"
+        )
+    if (
+        isinstance(runtime_deadline_unix, bool)
+        or not isinstance(runtime_deadline_unix, int)
+        or runtime_deadline_unix <= 0
+    ):
+        raise AgentWorkspaceError("workspace runtime deadline is invalid")
     source = inputs.get("source")
     scoped_writer = inputs.get("scoped_writer")
     if (
@@ -1631,6 +1646,10 @@ def _validate_work_lane_binding(
             or int(lease["expires_at_unix"]) <= observed_at
         ):
             raise AgentWorkspaceError(f"work lane lease is not live and exactly owned: {key}")
+        if int(lease["expires_at_unix"]) < runtime_deadline_unix:
+            raise AgentWorkspaceError(
+                f"work lane lease does not cover workspace runtime deadline: {key}"
+            )
     worktree_receipt = receipt.get("worktree_receipt")
     if not isinstance(worktree_receipt, dict) or worktree_receipt.get("result_state") not in {"CREATED", "ALREADY_CORRECT"}:
         raise AgentWorkspaceError("work lane has no successful checkout receipt")
@@ -1666,6 +1685,15 @@ def _validate_work_lane_binding(
         or not isinstance(lifecycle.get("checkout_key"), str)
     ):
         raise AgentWorkspaceError("work lane checkout lifecycle is missing or mismatched")
+    lifecycle_deadline = lifecycle.get("expires_at_unix")
+    if (
+        isinstance(lifecycle_deadline, bool)
+        or not isinstance(lifecycle_deadline, int)
+        or lifecycle_deadline < runtime_deadline_unix
+    ):
+        raise AgentWorkspaceError(
+            "work lane checkout lifecycle does not cover workspace runtime deadline"
+        )
     try:
         top_level, _common_dir, checkout = checkouts._worktree_for_path(
             checkouts._resolve_repo(repository), writer_worktree
@@ -1693,6 +1721,10 @@ def _validate_work_lane_binding(
         or int(live_lifecycle.get("retention_until_unix") or 0) <= observed_at
     ):
         raise AgentWorkspaceError("live work lane checkout lifecycle drifted from its receipt")
+    if int(live_lifecycle["retention_until_unix"]) < runtime_deadline_unix:
+        raise AgentWorkspaceError(
+            "live work lane checkout lifecycle does not cover workspace runtime deadline"
+        )
     binding = {
         "schema_version": 1,
         "lane_id": lane_id,
@@ -1700,6 +1732,7 @@ def _validate_work_lane_binding(
         "inputs_sha256": receipt["inputs_sha256"],
         "lease_owner_id": lane_owner,
         "lease_keys": lease_keys,
+        "runtime_deadline_unix": runtime_deadline_unix,
         "write_paths": lane_scope,
         "source": source,
         "scoped_writer": scoped_writer,
@@ -1729,6 +1762,11 @@ def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run)
             writer_branch=str(manifest.get("writer_branch", "")),
             writer_worktree=Path(str(manifest.get("writer_worktree", ""))),
             allowed_paths=list(manifest.get("scope", {}).get("allowed_paths", [])),
+            runtime_deadline_unix=(
+                resources_value.get("runtime_deadline_unix")
+                if isinstance(resources_value, dict)
+                else None
+            ),
             runner=runner,
         )
         if observed != lane_binding:
@@ -2411,6 +2449,7 @@ def _normalize_create(
     route_evidence: dict[str, Any] | None = None,
     lane_id: str | None = None,
     expected_lane_receipt_sha256: str | None = None,
+    runtime_deadline_unix: int | None = None,
 ) -> dict[str, Any]:
     lane_mode = lane_id is not None or expected_lane_receipt_sha256 is not None
     if lane_mode and (
@@ -2488,9 +2527,20 @@ def _normalize_create(
         memory_max_bytes, "memory_max_bytes", 16 * 1024 * 1024, 1024**4
     )
     lane_binding: dict[str, Any] | None = None
+    lane_runtime_deadline: int | None = None
     if lane_mode:
         assert isinstance(lane_id, str)
         assert isinstance(expected_lane_receipt_sha256, str)
+        lane_runtime_deadline = (
+            _now() + runtime
+            if runtime_deadline_unix is None
+            else _positive_int(
+                runtime_deadline_unix,
+                "runtime_deadline_unix",
+                1,
+                2**63 - 1,
+            )
+        )
         lane_binding = _validate_work_lane_binding(
             lane_id=lane_id,
             expected_receipt_sha256=expected_lane_receipt_sha256,
@@ -2501,6 +2551,7 @@ def _normalize_create(
             writer_branch=branch,
             writer_worktree=worktree,
             allowed_paths=allowed,
+            runtime_deadline_unix=lane_runtime_deadline,
             runner=runner,
         )
         binding_evidence = {
@@ -2592,6 +2643,7 @@ def _normalize_create(
                 "workspace_owned_lease_keys": [],
                 "lane_binding": lane_binding,
                 "runtime_seconds": runtime,
+                "runtime_deadline_unix": lane_runtime_deadline,
                 "memory_max_bytes": memory,
                 "task_host": AGENT_WORKSPACE_TASK_HOST,
             }
@@ -5722,6 +5774,56 @@ def _assess_new_agent_workspace(
     )
 
 
+def _existing_lane_runtime_deadline(
+    *, lane_id: str, binding_id: str, repository: str
+) -> int | None:
+    identifier = _required_string(lane_id, "lane_id", max_length=32).lower()
+    if re.fullmatch(r"[0-9a-f]{32}", identifier) is None:
+        raise AgentWorkspaceError("lane_id must be a lowercase 32-character hex identity")
+    binding = _required_string(binding_id, "binding_id", max_length=256)
+    repo = _absolute_path(repository, "repository", must_exist=True)
+    workspace_id, _session = _lane_workspace_identity(binding, repo, identifier)
+    directory = _ensure_root() / workspace_id
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise PermissionError(
+            "workspace directory must be one private owner-controlled directory"
+        )
+    manifest = _optional_state(directory / "manifest.json")
+    if manifest is None:
+        return None
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("workspace_id") != workspace_id
+        or manifest.get("plan_sha256") != _sha256_json(_plan_from_manifest(manifest))
+    ):
+        raise AgentWorkspaceError("existing lane-backed workspace plan is invalid")
+    resources_value = manifest.get("resources")
+    lane_binding = (
+        resources_value.get("lane_binding")
+        if isinstance(resources_value, dict)
+        else None
+    )
+    if (
+        not isinstance(resources_value, dict)
+        or resources_value.get("ownership_mode") != WORKSPACE_OWNERSHIP_WORK_LANE
+        or not isinstance(lane_binding, dict)
+        or lane_binding.get("lane_id") != identifier
+    ):
+        raise AgentWorkspaceError("existing workspace does not match the requested work lane")
+    deadline = resources_value.get("runtime_deadline_unix")
+    if isinstance(deadline, bool) or not isinstance(deadline, int) or deadline <= 0:
+        raise AgentWorkspaceError("existing workspace runtime deadline is invalid")
+    return deadline
+
+
 @mcp.tool(name="grabowski_agent_workspace_create", annotations=MUTATING)
 def grabowski_agent_workspace_create(
     binding_kind: str,
@@ -5777,6 +5879,15 @@ def grabowski_agent_workspace_create(
         operator._require_operator_capability("resource_lease")
     else:
         operator._require_operator_mutation("resource_lease")
+    runtime_deadline_unix = (
+        _existing_lane_runtime_deadline(
+            lane_id=lane_id,
+            binding_id=binding_id,
+            repository=repository,
+        )
+        if lane_mode and isinstance(lane_id, str)
+        else None
+    )
     plan = _normalize_create(
         binding_kind=binding_kind,
         binding_id=binding_id,
@@ -5792,6 +5903,7 @@ def grabowski_agent_workspace_create(
         route_evidence=route_evidence,
         lane_id=lane_id,
         expected_lane_receipt_sha256=expected_lane_receipt_sha256,
+        runtime_deadline_unix=runtime_deadline_unix,
         runtime_seconds=runtime_seconds,
         memory_max_bytes=memory_max_bytes,
         runner=_run,

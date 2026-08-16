@@ -105,10 +105,16 @@ mit gesetztem `scoped_writer_actor` und `scoped_writer_argv=None`.
 
 Dadurch besitzt die Lane bereits Checkout und Ressourcen, ohne einen zweiten Writer-Lifecycle zu starten.
 
+Diese Prepare-only-Grenze ist verpflichtend: Der Lane-Receipt darf weder einen konfigurierten `scoped_writer_command` noch `writer_job` oder sonstigen `writer_start`-Ausführungszustand enthalten. Andernfalls lehnt der lane-backed Workspace die Erstellung ab, bevor er seinen eigenen Writer startet; innerhalb desselben überlappenden Lane-Scopes darf nie ein zweiter mutierender Writer entstehen.
+
 `grabowski_agent_workspace_create` besitzt deshalb zwei disjunkte Modi:
 
 - ohne Lane-Bindung bleibt der bisherige advisory-contrast-Pfad unverändert und besitzt seine bisherigen Workspace-Ressourcen;
 - mit `lane_id` und `expected_lane_receipt_sha256` muss Source, Repository, Base, Branch, Worktree, vollständiger Write Scope, Scoped Writer, jede Live-Lease, die vorhandene Repository-Admission und der aktive Checkout-Lifecycle exakt zur hashgültigen Lane passen.
+
+Der lane-backed Modus ist in dieser Phase ausdrücklich ein Working-Tree-Patch-Modus. Der Writer-Checkout-`HEAD` muss während Erstellung, Revalidierung und Collection unverändert `expected_base_head` bleiben. Ein Commit oder anderer HEAD-Advance wird durch die Live-Lane-Prüfung noch vor der Collection abgewiesen. `Delivery`, `commit_range` und jede Aufweichung dieser HEAD-Bindung liegen außerhalb dieses Vertrags.
+
+Bei der ersten lane-backed Erstellung bindet der Plan außerdem genau eine unveränderliche `runtime_deadline_unix` aus Erstellungszeit plus `runtime_seconds`. Jede Live-Lease der Lane sowie sowohl die quittierte als auch die live beobachtete Checkout-Lifecycle-Retention müssen diese Deadline mindestens erreichen; Gleichheit ist ausreichend. Spätere Lane-Revalidierungen und idempotente Create-Aufrufe verwenden dieselbe gespeicherte Deadline und berechnen sie nicht erneut relativ zu „jetzt“. Der Workspace erhält dadurch weder eine neue State-Ablage noch Renewal-Autorität und verlängert die Lane-Ressourcen nicht selbst.
 
 Der lane-backed Workspace reserviert keine zweite Lease oder Checkout-Generation, führt keine zweite Repository-Admission aus und erzeugt keinen Worktree. Create-Fehler und Workspace-Close erhalten sämtliche Lane-Ressourcen. Seine Close-Receipt weist deshalb `resources_released=false`, `lane_resources_preserved=true` und `workspace_resources_owned=false` aus; dieser Erhalt erfüllt den Workspace-Ausführungsabschluss, ohne einen Lane-Close zu behaupten. Workspace-Cleanup bleibt für diesen Modus gesperrt und verweist auf den separaten Work-Lane-Closeout.
 

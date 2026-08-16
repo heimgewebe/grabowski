@@ -511,6 +511,10 @@ class AgentWorkspaceTests(unittest.TestCase):
         source_kind: str = "thread_focus",
         source_id: str = "thread-1",
         write_paths: list[str] | None = None,
+        scoped_writer_argv: list[str] | None = None,
+        writer_job: dict | None = None,
+        lifecycle_expires_at_unix: int | None = None,
+        idempotency_key: str = "test-lane-backed-workspace",
     ) -> dict:
         if not self.git.writer.exists():
             self.git.add_writer()
@@ -528,8 +532,9 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "artifact_class": "implementation-worktree",
                 "retention_until_unix": int(time.time()) + 3600,
                 "ttl_seconds": 3600,
-                "idempotency_key": "test-lane-backed-workspace",
+                "idempotency_key": idempotency_key,
                 "write_paths": write_paths or ["src"],
+                "scoped_writer_argv": scoped_writer_argv,
             }
         )
         normalized.pop("_scoped_writer_argv", None)
@@ -555,6 +560,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             },
         }
         lifecycle = workspace._bind_writer_checkout_lifecycle(lifecycle_manifest)
+        if lifecycle_expires_at_unix is not None:
+            lifecycle["expires_at_unix"] = lifecycle_expires_at_unix
         scope_identity = {
             "branch": "feat/writer",
             "target_path": str(self.git.writer),
@@ -622,6 +629,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "work_admission": admission,
                 "lifecycle": lifecycle,
             },
+            **({"writer_job": writer_job} if writer_job is not None else {}),
         }
         with workspace.work_acquire._lane_lock(lane_id) as path:
             return workspace.work_acquire._write_state(path, record)
@@ -655,6 +663,26 @@ class AgentWorkspaceTests(unittest.TestCase):
         legacy_directory.rename(self.state / manifest["workspace_id"])
         workspace._write_manifest(manifest)
         return manifest
+
+    def normalize_lane(self, lane: dict, *, runtime_seconds: int = 600) -> dict:
+        return workspace._normalize_create(
+            binding_kind="thread_focus",
+            binding_id="thread-1",
+            repository=str(self.git.repo),
+            expected_base_head=self.git.base,
+            writer_branch="feat/writer",
+            writer_worktree=str(self.git.writer),
+            allowed_paths=["src"],
+            forbidden_paths=["secrets"],
+            writer_argv=["true"],
+            test_argv=["true"],
+            review_argv=["true"],
+            runtime_seconds=runtime_seconds,
+            memory_max_bytes=None,
+            runner=workspace._run,
+            lane_id=lane["lane_id"],
+            expected_lane_receipt_sha256=lane["receipt_sha256"],
+        )
 
     def test_deterministic_session_name_changes_with_binding(self) -> None:
         first = workspace._workspace_identity("thread_focus", "thread-1", self.git.repo, self.git.base)
@@ -824,6 +852,207 @@ class AgentWorkspaceTests(unittest.TestCase):
                 allowed_paths=["tests"],
                 expected_lane_receipt_sha256=lane["receipt_sha256"],
             )
+
+    def test_lane_backed_normalize_rejects_configured_scoped_writer_command(self) -> None:
+        lane = self.lane_receipt(
+            scoped_writer_argv=["true"],
+            idempotency_key="lane-with-configured-writer-command",
+        )
+
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "already configured a scoped writer command"
+        ):
+            self.normalize_lane(lane)
+
+    def test_lane_backed_normalize_rejects_existing_writer_job(self) -> None:
+        lane = self.lane_receipt(
+            writer_job={"job_id": "existing-writer-job"},
+            idempotency_key="lane-with-existing-writer-job",
+        )
+
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "already has scoped writer execution state"
+        ):
+            self.normalize_lane(lane)
+
+    def test_lane_backed_normalize_rejects_insufficient_lease_horizon(self) -> None:
+        observed_at = workspace._now()
+        deadline = observed_at + 600
+        lane = self.lane_receipt(idempotency_key="lane-short-lease-horizon")
+        inspect_resource = workspace.resources.inspect_resource
+
+        def short_lease(resource_key: str) -> dict:
+            return {
+                **inspect_resource(resource_key),
+                "expires_at_unix": deadline - 1,
+            }
+
+        with (
+            mock.patch.object(workspace, "_now", return_value=observed_at),
+            mock.patch.object(
+                workspace.resources, "inspect_resource", side_effect=short_lease
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "lease does not cover workspace runtime deadline",
+            ),
+        ):
+            self.normalize_lane(lane)
+
+    def test_lane_backed_normalize_rejects_insufficient_lifecycle_horizon(self) -> None:
+        observed_at = workspace._now()
+        deadline = observed_at + 600
+        lane = self.lane_receipt(
+            idempotency_key="lane-short-lifecycle-horizon",
+        )
+        lifecycle_bindings = workspace.checkouts._lifecycle_bindings
+
+        def short_lifecycle(checkout_keys: list[str]) -> dict:
+            return {
+                key: {**record, "retention_until_unix": deadline - 1}
+                for key, record in lifecycle_bindings(checkout_keys).items()
+            }
+
+        with (
+            mock.patch.object(workspace, "_now", return_value=observed_at),
+            mock.patch.object(
+                workspace.checkouts,
+                "_lifecycle_bindings",
+                side_effect=short_lifecycle,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "live work lane checkout lifecycle does not cover workspace runtime deadline",
+            ),
+        ):
+            self.normalize_lane(lane)
+
+    def _assert_lane_backed_horizon_is_accepted(
+        self, *, extra_seconds: int, idempotency_key: str
+    ) -> None:
+        observed_at = workspace._now()
+        deadline = observed_at + 600
+        horizon = deadline + extra_seconds
+        inspect_resource = workspace.resources.inspect_resource
+        lifecycle_bindings = workspace.checkouts._lifecycle_bindings
+        lane = self.lane_receipt(
+            lifecycle_expires_at_unix=horizon,
+            idempotency_key=idempotency_key,
+        )
+
+        def lease_at_horizon(resource_key: str) -> dict:
+            return {
+                **inspect_resource(resource_key),
+                "expires_at_unix": horizon,
+            }
+
+        def lifecycle_at_horizon(checkout_keys: list[str]) -> dict:
+            return {
+                key: {**record, "retention_until_unix": horizon}
+                for key, record in lifecycle_bindings(checkout_keys).items()
+            }
+
+        with (
+            mock.patch.object(workspace, "_now", return_value=observed_at),
+            mock.patch.object(
+                workspace.resources,
+                "inspect_resource",
+                side_effect=lease_at_horizon,
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "_lifecycle_bindings",
+                side_effect=lifecycle_at_horizon,
+            ),
+        ):
+            plan = self.normalize_lane(lane)
+
+        self.assertEqual(plan["resources"]["runtime_deadline_unix"], deadline)
+        self.assertEqual(
+            plan["resources"]["lane_binding"]["runtime_deadline_unix"],
+            deadline,
+        )
+
+    def test_lane_backed_normalize_accepts_exact_runtime_horizon(self) -> None:
+        self._assert_lane_backed_horizon_is_accepted(
+            extra_seconds=0,
+            idempotency_key="lane-exact-runtime-horizon",
+        )
+
+    def test_lane_backed_normalize_accepts_sufficient_runtime_horizon(self) -> None:
+        self._assert_lane_backed_horizon_is_accepted(
+            extra_seconds=60,
+            idempotency_key="lane-sufficient-runtime-horizon",
+        )
+
+    def test_lane_backed_later_revalidation_uses_stored_runtime_deadline(self) -> None:
+        observed_at = workspace._now()
+        deadline = observed_at + 600
+        lane = self.lane_receipt(
+            lifecycle_expires_at_unix=deadline,
+            idempotency_key="lane-stable-runtime-deadline",
+        )
+        inspect_resource = workspace.resources.inspect_resource
+        lifecycle_bindings = workspace.checkouts._lifecycle_bindings
+
+        def lease_at_deadline(resource_key: str) -> dict:
+            return {
+                **inspect_resource(resource_key),
+                "expires_at_unix": deadline,
+            }
+
+        def lifecycle_at_deadline(checkout_keys: list[str]) -> dict:
+            return {
+                key: {**record, "retention_until_unix": deadline}
+                for key, record in lifecycle_bindings(checkout_keys).items()
+            }
+
+        with (
+            mock.patch.object(workspace, "_now", return_value=observed_at),
+            mock.patch.object(
+                workspace.resources,
+                "inspect_resource",
+                side_effect=lease_at_deadline,
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "_lifecycle_bindings",
+                side_effect=lifecycle_at_deadline,
+            ),
+        ):
+            plan = self.normalize_lane(lane)
+
+        with (
+            mock.patch.object(workspace, "_now", return_value=observed_at + 300),
+            mock.patch.object(
+                workspace.resources,
+                "inspect_resource",
+                side_effect=lease_at_deadline,
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "_lifecycle_bindings",
+                side_effect=lifecycle_at_deadline,
+            ),
+        ):
+            status = workspace._lane_binding_status(plan)
+
+        self.assertTrue(status["valid"])
+        self.assertEqual(plan["resources"]["runtime_deadline_unix"], deadline)
+        stored_manifest = {
+            **plan,
+            "plan_sha256": workspace._sha256_json(plan),
+        }
+        (self.state / plan["workspace_id"]).mkdir()
+        workspace._write_manifest(stored_manifest)
+        self.assertEqual(
+            workspace._existing_lane_runtime_deadline(
+                lane_id=lane["lane_id"],
+                binding_id="thread-1",
+                repository=str(self.git.repo),
+            ),
+            deadline,
+        )
 
     def test_lane_backed_create_failure_preserves_lane_resources(self) -> None:
         lane = self.lane_receipt()
@@ -1838,6 +2067,28 @@ class AgentWorkspaceTests(unittest.TestCase):
             result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
         self.assertEqual(result["state"], "writer_head_changed")
         start.assert_not_called()
+
+    def test_lane_backed_writer_commit_drift_is_rejected_before_collection(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-writer-commit-drift")
+        manifest = self.lane_manifest(lane)
+        self.git.commit_writer()
+
+        with (
+            mock.patch.object(workspace, "_task_public") as task_public,
+            mock.patch.object(workspace, "_start_role_task") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "live work lane checkout drifted from its receipt",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+
+        task_public.assert_not_called()
+        start.assert_not_called()
+        observed = workspace._manifest(manifest["workspace_id"])
+        self.assertIsNone(observed["collection"])
+        self.assertNotIn("frozen_writer", observed)
 
 
     def test_collect_rejects_writer_change_after_freeze(self) -> None:

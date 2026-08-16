@@ -3481,7 +3481,7 @@
       "src/grabowski_agent_competition.py": "e25ad6cd44ddcc4297381b6d374851e46e290f3d580460503d54898a48a69044",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "272f06f80ef091a05f46bc55b7a41f12e1947fc42df6cc7fc4efdca64428a95e",
+      "src/grabowski_agent_workspace.py": "bc9d694b48bca3b65e69ca2acd57334f516063e140d6f8a3d7eb4e4bf9ee2cd1",
       "src/grabowski_agent_workspace_observer.py": "f7db154ac20b92e29eb654682f663b5e4f78743bf37e22a62f869df1b9331113",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_alert_outbox.py": "47d43bb27151032be8cd197038f358c27c52ca9066e6ed57530f71cfa793455d",
