@@ -742,6 +742,23 @@ class OperatorObligationTests(unittest.TestCase):
                     "next_action": "Changing only the next action must not park legacy work.",
                 }
             )
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationConflictError,
+            "legacy deferred migration requires new evidence",
+        ):
+            obligation.resolve_obligation(
+                {
+                    **legacy_parameters,
+                    "evidence": [
+                        {
+                            "source": "different-source",
+                            "reference": "different-reference",
+                            "sha256": "a" * 64,
+                        }
+                    ],
+                    "next_action": "Metadata changes must not manufacture fresh evidence.",
+                }
+            )
 
         migrated_parameters = {
             **legacy_parameters,
@@ -1006,7 +1023,13 @@ class OperatorObligationTests(unittest.TestCase):
             "sequence": 2,
             "predecessor_file_sha256": legacy_file_sha256,
             "disposition": "deferred",
-            "evidence": legacy_record["evidence"],
+            "evidence": [
+                {
+                    "source": "different-source",
+                    "reference": "different-reference",
+                    "sha256": "a" * 64,
+                }
+            ],
             "delegation_observation": {},
             "next_action": "This restored migration must fail closed.",
         }

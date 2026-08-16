@@ -973,14 +973,14 @@ def _read_resolution_chain(
             )
         if record["schema_version"] == RESOLUTION_SCHEMA_VERSION:
             if previous_record is not None:
-                requested_evidence = {_sha256(item) for item in record["evidence"]}
+                requested_evidence = {item["sha256"] for item in record["evidence"]}
                 if not requested_evidence - legacy_evidence:
                     raise OperatorObligationIntegrityError(
                         "schema-v2 migration requires evidence new to legacy prefix"
                     )
             seen_schema_v2 = True
         else:
-            legacy_evidence.update(_sha256(item) for item in record["evidence"])
+            legacy_evidence.update(item["sha256"] for item in record["evidence"])
         chain.append((record, file_sha256, path))
         predecessor = file_sha256
         previous_record = record
@@ -1459,15 +1459,16 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
                 # contract where deferred remained current attention.  Preserve
                 # that meaning on replay.  A v2 successor is a migration decision,
                 # so changing only disposition/next_action is insufficient: at
-                # least one newly bound evidence item must distinguish it from the
-                # complete legacy v1 prefix.
+                # least one newly bound evidence digest must distinguish it from
+                # the complete legacy v1 prefix; source/reference metadata cannot
+                # manufacture freshness for the same bound evidence.
                 legacy_evidence = {
-                    _sha256(item)
+                    item["sha256"]
                     for record, _, _ in chain
                     if record["schema_version"] == LEGACY_RESOLUTION_SCHEMA_VERSION
                     for item in record["evidence"]
                 }
-                requested_evidence = {_sha256(item) for item in evidence}
+                requested_evidence = {item["sha256"] for item in evidence}
                 if not requested_evidence - legacy_evidence:
                     raise OperatorObligationConflictError(
                         "legacy deferred migration requires new evidence"
