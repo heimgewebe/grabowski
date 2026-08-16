@@ -176,13 +176,29 @@ def cutover_receipt(
 
 
 def resume_receipt(
-    *, resumed_cutover_id: str = CUTOVER_ID, outcome: str = "completed"
+    *,
+    resumed_cutover_id: str = CUTOVER_ID,
+    outcome: str = "completed",
+    resumed_receipt_sha256: str | None = None,
+    expected_head: str = HEAD_GREEN,
+    green_release_id: str = GREEN_RELEASE,
+    final_slot: str = "canonical",
+    resume_id: str = "bgcr-0123456789abcdef",
 ) -> dict[str, object]:
     material = {
         "schema_version": 1,
         "kind": midcutover.RESUME_RECEIPT_KIND,
-        "resume_id": "bgcr-0123456789abcdef",
+        "resume_id": resume_id,
         "resumed_cutover_id": resumed_cutover_id,
+        "resumed_receipt_sha256": (
+            resumed_receipt_sha256
+            if resumed_receipt_sha256 is not None
+            else cutover_receipt()["receipt_sha256"]
+        ),
+        "resume_binding_sha256": "ab" * 32,
+        "expected_head": expected_head,
+        "green_release_id": green_release_id,
+        "final_routing": {"selected_slot": final_slot, "selector_sha256": "f3" * 32},
         "outcome": outcome,
     }
     return {**material, "receipt_sha256": midcutover.canonical_json_sha256(material)}
@@ -349,7 +365,12 @@ class SelectorEvidenceReaderTests(unittest.TestCase):
 class _FakeResumeRuntime:
     """Records the order of effects so promotion/retirement cannot silently swap."""
 
-    def __init__(self, *, fail_phase: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_phase: str | None = None,
+        phase: str = midcutover.PHASE_PROMOTE_POINTER,
+    ) -> None:
         self.fail_phase = fail_phase
         self.calls: list[str] = []
         self.pointer_promoted = False
@@ -360,19 +381,43 @@ class _FakeResumeRuntime:
         self.classification = {"classification_sha256": "f0" * 32}
         self.resume_binding = {
             "cutover_id": CUTOVER_ID,
-            "resumed_receipt_sha256": "f1" * 32,
+            "resumed_receipt_sha256": cutover_receipt()["receipt_sha256"],
             "binding_sha256": "f2" * 32,
+            "resume_phase": phase,
+            "target_head": HEAD_GREEN,
             "expected_head": HEAD_GREEN,
             "source_identity_sha256": SOURCE_IDENTITY_SHA256,
             "expected_release_id": GREEN_RELEASE,
             "expected_selector_sha256": SELECTOR_SHA256,
             "expected_generation": GENERATION,
         }
+        self.current_selector = {
+            "selector_sha256": "f3" * 32,
+            "generation": 9,
+            "selected_slot": "canonical",
+            "upstream_port": 18181,
+            "runtime_binding_sha256": BINDING_SHA256,
+            "runtime_binding": {"release_id": GREEN_RELEASE, "repo_head": HEAD_GREEN},
+        }
         self.admission_released = False
 
     @property
     def cutover_id(self) -> str:
         return CUTOVER_ID
+
+    @property
+    def resume_phase(self) -> str:
+        return str(self.resume_binding["resume_phase"])
+
+    def adopt_applied_promotion(self):
+        self.calls.append("adopt_applied_promotion")
+        self.pointer_promoted = True
+        self.canonical_selected = True
+        return {"adopted": True}
+
+    def reprobe_green(self):
+        self.calls.append("reprobe_green")
+        return {"green_still_serving": True}
 
     def _step(self, phase: str, value: dict[str, object]) -> dict[str, object]:
         self.calls.append(phase)
@@ -405,6 +450,7 @@ class _FakeResumeRuntime:
             "canonical_readiness_sha256": "f5" * 32,
             "operator": {"pid": 4321, "listener": {}},
             "activation_steps": ["symlink-replaced"],
+            "pointer_activated_now": True,
         }
 
     def promote_canonical_pointer_only(self):
@@ -515,7 +561,9 @@ class ResumeEffectSemanticsTests(unittest.TestCase):
         self.assertEqual(receipt["kind"], midcutover.RESUME_RECEIPT_KIND)
         self.assertEqual(receipt["outcome"], "completed")
         self.assertEqual(receipt["resumed_cutover_id"], CUTOVER_ID)
-        self.assertEqual(receipt["resumed_receipt_sha256"], "f1" * 32)
+        self.assertEqual(
+            receipt["resumed_receipt_sha256"], cutover_receipt()["receipt_sha256"]
+        )
         self.assertEqual(receipt["expected_head"], HEAD_GREEN)
         self.assertEqual(persisted, receipt)
         self.assertEqual(midcutover.validate_resume_receipt(persisted), persisted)
@@ -836,6 +884,221 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
                     timeout_seconds=10,
                 )
         self.assertEqual(raised.exception.phase, "snapshot-authenticity-preflight")
+
+
+POINTER_AT_TARGET = {"release_id": GREEN_RELEASE, "repo_head": HEAD_GREEN}
+POINTER_AT_BLUE = {"release_id": BLUE_RELEASE, "repo_head": HEAD_BLUE}
+
+
+def canonical_selector(generation: int = GENERATION + 1) -> dict[str, object]:
+    """The selector a previous resume left behind after its CAS."""
+    return selector_document(
+        slot="canonical",
+        generation=generation,
+        selector_sha256="f3" * 32,
+    )
+
+
+class ResumeStateMachineTests(unittest.TestCase):
+    """A resume that itself fails must be continuable, not terminal."""
+
+    def _classify(self, *, selector, pointer, green_active):
+        return midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN,
+            selector=selector,
+            receipts=[cutover_receipt()],
+            green_observation=GREEN_OBSERVATION,
+            pointer_observation=pointer,
+            green_unit_observation={"active": green_active},
+        )
+
+    def test_s0_pointer_not_yet_promoted(self) -> None:
+        verdict = self._classify(
+            selector=selector_document(), pointer=POINTER_AT_BLUE, green_active=True
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"], midcutover.PHASE_PROMOTE_POINTER
+        )
+
+    def test_s1_pointer_promoted_selector_still_green(self) -> None:
+        verdict = self._classify(
+            selector=selector_document(), pointer=POINTER_AT_TARGET, green_active=True
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"], midcutover.PHASE_SELECT_CANONICAL
+        )
+
+    def test_s2_canonical_selected_green_still_running(self) -> None:
+        verdict = self._classify(
+            selector=canonical_selector(), pointer=POINTER_AT_TARGET, green_active=True
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"], midcutover.PHASE_RETIRE_GREEN
+        )
+
+    def test_s3_green_retired_closeout_remains(self) -> None:
+        verdict = self._classify(
+            selector=canonical_selector(), pointer=POINTER_AT_TARGET, green_active=False
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"], midcutover.PHASE_CLOSEOUT
+        )
+
+    def test_canonical_selector_without_promoted_pointer_is_a_contradiction(self) -> None:
+        verdict = self._classify(
+            selector=canonical_selector(), pointer=POINTER_AT_BLUE, green_active=True
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+
+    def test_canonical_selector_of_a_foreign_cutover_is_not_adopted(self) -> None:
+        foreign = selector_document(
+            slot="canonical",
+            generation=GENERATION + 1,
+            selector_sha256="f3" * 32,
+            cutover_id="bgc-someone-else",
+        )
+        verdict = self._classify(
+            selector=foreign, pointer=POINTER_AT_TARGET, green_active=True
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+
+    def test_canonical_generation_must_follow_the_receipt_by_exactly_one(self) -> None:
+        jumped = canonical_selector(generation=GENERATION + 4)
+        verdict = self._classify(
+            selector=jumped, pointer=POINTER_AT_TARGET, green_active=True
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+        self.assertIn("canonical_generation_follows_receipt", verdict["reasons"])
+
+    def test_every_phase_stays_bound_to_the_same_cutover_lineage(self) -> None:
+        for selector, pointer, active, expected in (
+            (selector_document(), POINTER_AT_BLUE, True, midcutover.PHASE_PROMOTE_POINTER),
+            (selector_document(), POINTER_AT_TARGET, True, midcutover.PHASE_SELECT_CANONICAL),
+            (canonical_selector(), POINTER_AT_TARGET, True, midcutover.PHASE_RETIRE_GREEN),
+            (canonical_selector(), POINTER_AT_TARGET, False, midcutover.PHASE_CLOSEOUT),
+        ):
+            with self.subTest(phase=expected):
+                verdict = self._classify(
+                    selector=selector, pointer=pointer, green_active=active
+                )
+                binding = verdict["resume_binding"]
+                self.assertEqual(binding["cutover_id"], CUTOVER_ID)
+                self.assertEqual(binding["target_head"], HEAD_GREEN)
+                self.assertEqual(
+                    binding["resumed_receipt_sha256"],
+                    cutover_receipt()["receipt_sha256"],
+                )
+
+    def test_an_outcome_unknown_resume_receipt_does_not_strand_the_cutover(self) -> None:
+        """A failed resume attempt is evidence, never a terminal verdict."""
+        failed = resume_receipt(outcome="outcome_unknown", resume_id="bgcr-failedonce1")
+        verdict = midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN,
+            selector=canonical_selector(),
+            receipts=[cutover_receipt(), failed],
+            green_observation=GREEN_OBSERVATION,
+            pointer_observation=POINTER_AT_TARGET,
+            green_unit_observation={"active": True},
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(
+            verdict["resume_binding"]["resume_phase"], midcutover.PHASE_RETIRE_GREEN
+        )
+
+
+class TwoHeadBootstrapTests(unittest.TestCase):
+    """Execution head and resume target head are different revisions."""
+
+    NEW_HEAD = "e" * 40
+
+    def test_resume_target_comes_from_lineage_not_from_the_execution_head(self) -> None:
+        # The runner executes merged code (NEW_HEAD) while the open cutover is
+        # about 8351 (HEAD_GREEN).  Asking about the execution head must not
+        # reinterpret the execution head as the resume target.
+        asked_about_new_head = midcutover.classify_recovery_lane(
+            expected_head=self.NEW_HEAD,
+            selector=selector_document(),
+            receipts=[cutover_receipt()],
+            green_observation=GREEN_OBSERVATION,
+            pointer_observation=POINTER_AT_BLUE,
+            green_unit_observation={"active": True},
+        )
+        self.assertEqual(asked_about_new_head["lane"], midcutover.LANE_FAIL_CLOSED)
+        self.assertIn(
+            "receipt_expected_head_matches_request", asked_about_new_head["reasons"]
+        )
+
+        asked_about_lineage = midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN,
+            selector=selector_document(),
+            receipts=[cutover_receipt()],
+            green_observation=GREEN_OBSERVATION,
+            pointer_observation=POINTER_AT_BLUE,
+            green_unit_observation={"active": True},
+        )
+        binding = asked_about_lineage["resume_binding"]
+        self.assertEqual(binding["target_head"], HEAD_GREEN)
+        self.assertNotEqual(binding["target_head"], self.NEW_HEAD)
+
+    def test_runner_bridge_resumes_the_lineage_head_not_the_execution_head(self) -> None:
+        import run_scheduled_deploy as runner
+
+        classification = midcutover.classify_recovery_lane(
+            expected_head=HEAD_GREEN,
+            selector=selector_document(),
+            receipts=[cutover_receipt()],
+            green_observation=GREEN_OBSERVATION,
+            pointer_observation=POINTER_AT_BLUE,
+            green_unit_observation={"active": True},
+        )
+        empty = midcutover.classify_recovery_lane(
+            expected_head=self.NEW_HEAD,
+            selector=selector_document(),
+            receipts=[cutover_receipt()],
+            green_observation=GREEN_OBSERVATION,
+            pointer_observation=POINTER_AT_BLUE,
+            green_unit_observation={"active": True},
+        )
+        calls: list[str] = []
+
+        def classify(*, expected_head, receipt_root=None):
+            calls.append(expected_head)
+            return classification if expected_head == HEAD_GREEN else empty
+
+        with mock.patch.object(
+            runner.deploy_dual, "classify_midcutover_resume", side_effect=classify
+        ):
+            decision = runner.classify_recovery_before_deploy(
+                repo=ROOT, execution_head=self.NEW_HEAD
+            )
+        self.assertTrue(decision["resume_required"])
+        self.assertEqual(decision["execution_head"], self.NEW_HEAD)
+        self.assertEqual(decision["resume_target_head"], HEAD_GREEN)
+        self.assertEqual(decision["cutover_id"], CUTOVER_ID)
+        # It asked about the execution head first, then about the lineage head.
+        self.assertEqual(calls, [self.NEW_HEAD, HEAD_GREEN])
+
+    def test_runner_bridge_defers_to_the_ordinary_deploy_when_nothing_is_open(self) -> None:
+        import run_scheduled_deploy as runner
+
+        clean = midcutover.classify_recovery_lane(
+            expected_head=self.NEW_HEAD,
+            selector=selector_document(slot="canonical", cutover_id="bgc-old"),
+            receipts=[],
+            pointer_observation=POINTER_AT_TARGET,
+        )
+        with mock.patch.object(
+            runner.deploy_dual, "classify_midcutover_resume", return_value=clean
+        ):
+            decision = runner.classify_recovery_before_deploy(
+                repo=ROOT, execution_head=self.NEW_HEAD
+            )
+        self.assertFalse(decision["resume_required"])
+        self.assertEqual(decision["lane"], midcutover.LANE_SCHEDULED_DEPLOY)
 
 
 class GreenDrainTargetTests(unittest.TestCase):
@@ -1220,6 +1483,34 @@ class ResumeLineageIdempotenceTests(unittest.TestCase):
             midcutover.MidCutoverEvidenceError, "names no lineage"
         ):
             midcutover.validate_resume_receipt(broken)
+
+    def test_lineage_resolution_requires_the_exact_original_receipt(self) -> None:
+        """A matching cutover id is a name, not a proof."""
+        forged = resume_receipt(resumed_receipt_sha256="ee" * 32)
+        self.assertFalse(
+            midcutover._lineage_resolved([forged], cutover_receipt())
+        )
+        verdict = classify(receipts=[cutover_receipt(), forged])
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+
+    def test_lineage_resolution_requires_the_exact_target_head(self) -> None:
+        wrong_head = resume_receipt(expected_head=HEAD_BLUE)
+        self.assertFalse(
+            midcutover._lineage_resolved([wrong_head], cutover_receipt())
+        )
+
+    def test_lineage_resolution_requires_the_exact_target_release(self) -> None:
+        wrong_release = resume_receipt(green_release_id="cccccccccccc-srcset-lock-c")
+        self.assertFalse(
+            midcutover._lineage_resolved([wrong_release], cutover_receipt())
+        )
+
+    def test_lineage_resolution_requires_canonical_final_routing(self) -> None:
+        not_promoted = resume_receipt(final_slot="green")
+        self.assertEqual(midcutover.resolved_cutover_ids([not_promoted]), set())
+        self.assertFalse(
+            midcutover._lineage_resolved([not_promoted], cutover_receipt())
+        )
 
     def test_resolution_is_discoverable_from_the_original_cutover(self) -> None:
         resolution = midcutover.resolution_for_cutover(

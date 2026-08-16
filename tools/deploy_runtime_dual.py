@@ -5154,7 +5154,7 @@ def promote_green_release_to_canonical(
     release_path: Path,
     contract: core.RuntimeContract,
     green_binding: dict[str, str],
-    activation: core.ActivationState,
+    activation: core.ActivationState | None,
     expected_green_selector_sha256: str,
     expected_green_binding_sha256: str,
     cutover_id: str,
@@ -5182,8 +5182,14 @@ def promote_green_release_to_canonical(
         expected_slot="green",
         expected_binding_sha256=expected_green_binding_sha256,
     )
-    progress.pointer_promoted = True
-    core.activate_pointer(activation)
+    if activation is None:
+        # A resume whose pointer was already promoted by an earlier attempt.
+        # Re-running the swap would be a second irreversible effect for a state
+        # that is already correct, so the step is skipped -- not faked.
+        progress.pointer_promoted = True
+    else:
+        progress.pointer_promoted = True
+        core.activate_pointer(activation)
     # Admission stays engaged through the complete promotion where the caller
     # engaged it: while it is active neither the old canonical process nor the
     # transient green may admit a new normal tool call, so no effect can start
@@ -5250,7 +5256,8 @@ def promote_green_release_to_canonical(
         "authoritative_readback": final_readback,
         "canonical_readiness_sha256": _json_sha256(canonical_readiness),
         "operator": {"pid": process["pid"], "listener": listener},
-        "activation_steps": list(activation.steps),
+        "activation_steps": list(activation.steps) if activation is not None else [],
+        "pointer_activated_now": activation is not None,
     }
 
 
@@ -6732,6 +6739,34 @@ class MidCutoverResumeRuntime:
             "registry_authority": "grabowski_operator_cross_process_status",
         }
 
+    @property
+    def resume_phase(self) -> str:
+        return str(self.resume_binding["resume_phase"])
+
+    def reprobe_green(self) -> dict[str, Any]:
+        """Prove green again in the last moment before the pointer moves.
+
+        The first proof happens before the drain, and draining takes time. A
+        green process that died in that window would otherwise be promoted to
+        canonical on the strength of a stale proof, so the proof is taken again
+        with nothing but the pointer swap left to do.
+        """
+        readiness = _probe_release_runtime(
+            release_path=self.release_path,
+            port=GREEN_OPERATOR_LISTENER_PORT,
+            auth_mode="connector",
+            expected_release_id=self.green_binding["release_id"],
+            expected_repo_head=self.green_binding["repo_head"],
+            expected_agent_instructions_sha256=self.green_binding[
+                "agent_instructions_sha256"
+            ],
+            timeout_seconds=self.timeout_seconds,
+        )
+        return {
+            "green_still_serving": True,
+            "green_readiness_sha256": _json_sha256(readiness),
+        }
+
     def promote_canonical(self) -> dict[str, Any]:
         """Run the shared canonical promotion against the resumed green release."""
         if not self.green_proven:
@@ -6739,11 +6774,19 @@ class MidCutoverResumeRuntime:
                 "Canonical promotion requires an authoritative green readiness proof",
                 phase="midcutover-promote-canonical",
             )
-        self.activation = core.ActivationState(
-            runtime=self.runtime,
-            release_path=self.release_path,
-            previous=core.capture_pointer(self.runtime),
-        )
+        if self.resume_phase == midcutover.PHASE_PROMOTE_POINTER:
+            self.reprobe_green()
+            self.activation = core.ActivationState(
+                runtime=self.runtime,
+                release_path=self.release_path,
+                previous=core.capture_pointer(self.runtime),
+            )
+        else:
+            # Phase S1: an earlier resume already promoted the pointer. The
+            # promotion continues from there rather than repeating an applied
+            # effect.
+            self.activation = None
+            self.promotion_progress.pointer_promoted = True
         promotion = promote_green_release_to_canonical(
             runtime=self.runtime,
             release_path=self.release_path,
@@ -6762,6 +6805,26 @@ class MidCutoverResumeRuntime:
         )
         self.current_selector = promotion["selector"]
         return promotion
+
+    def adopt_applied_promotion(self) -> dict[str, Any]:
+        """Record a promotion an earlier resume already applied.
+
+        Phases S2 and S3 begin with canonical routing already published and the
+        pointer already moved. Those are facts on disk, verified by the
+        classifier before this object existed; marking them here lets the
+        remaining steps run without re-applying an irreversible effect and
+        without pretending it never happened.
+        """
+        self.promotion_progress.pointer_promoted = True
+        self.promotion_progress.canonical_selected = True
+        self.green_proven = True
+        self.current_selector = transport_ingress.read_routing_selector()
+        readback = _require_selector_authority(
+            expected_selector_sha256=self.current_selector["selector_sha256"],
+            expected_slot="canonical",
+            expected_binding_sha256=self.current_selector["runtime_binding_sha256"],
+        )
+        return {"adopted": True, "authoritative_readback": readback}
 
     def retire_green(self) -> dict[str, Any]:
         if not self.canonical_selected:
@@ -6956,6 +7019,7 @@ def _midcutover_resume_receipt(
     pointer_promotion: dict[str, Any] | None,
     canonical_operator: dict[str, Any] | None,
     selector_switch: dict[str, Any] | None,
+    final_routing: dict[str, Any] | None,
     retirement: dict[str, Any] | None,
     final_state: dict[str, Any] | None,
     readback: dict[str, Any] | None,
@@ -6969,7 +7033,12 @@ def _midcutover_resume_receipt(
         "resumed_receipt_sha256": resume_binding.get("resumed_receipt_sha256"),
         "resume_binding_sha256": resume_binding.get("binding_sha256"),
         "classification_sha256": classification_sha256,
-        "expected_head": resume_binding.get("expected_head"),
+        # The head this receipt is *about* is the cutover's target, never the
+        # revision the recovery code was executed from.
+        "expected_head": resume_binding.get("target_head")
+        or resume_binding.get("expected_head"),
+        "execution_expected_head": resume_binding.get("expected_head"),
+        "resume_phase": resume_binding.get("resume_phase"),
         "source_identity_sha256": resume_binding.get("source_identity_sha256"),
         "green_release_id": resume_binding.get("expected_release_id"),
         "resumed_selector_sha256": resume_binding.get("expected_selector_sha256"),
@@ -6982,22 +7051,7 @@ def _midcutover_resume_receipt(
         "pointer_promotion": pointer_promotion,
         "canonical_operator": canonical_operator,
         "selector_switch": selector_switch,
-        "final_routing": (
-            {
-                key: selector_switch.get(key)
-                for key in (
-                    "selector_sha256",
-                    "generation",
-                    "selected_slot",
-                    "upstream_port",
-                    "runtime_binding_sha256",
-                    "release_id",
-                    "repo_head",
-                )
-            }
-            if isinstance(selector_switch, dict)
-            else None
-        ),
+        "final_routing": final_routing,
         "retirement": retirement,
         "final_state": final_state,
         "authoritative_readback": readback,
@@ -7102,6 +7156,7 @@ def resume_production_blue_green_cutover(
                 pointer_promotion=None,
                 canonical_operator=None,
                 selector_switch=None,
+                final_routing=None,
                 retirement=None,
                 final_state=None,
                 readback=None,
@@ -7149,6 +7204,7 @@ def resume_production_blue_green_cutover(
                 pointer_promotion=None,
                 canonical_operator=None,
                 selector_switch=None,
+                final_routing=None,
                 retirement=None,
                 final_state=None,
                 readback=None,
@@ -7178,54 +7234,69 @@ def resume_production_blue_green_cutover(
             },
         )
         try:
-            phase = "verify_green_serving"
-            green_serving = context.verify_green_serving()
+            resume_phase = context.resume_phase
             _blue_green_observation(
-                observations,
-                phase=phase,
-                details={
-                    "green_readiness_sha256": green_serving.get(
-                        "green_readiness_sha256"
-                    )
-                },
+                observations, phase="resume_phase", details={"phase": resume_phase}
             )
-            phase = "close_mutations"
-            closed = context.close_mutations()
-            drain = context.terminalize_effects()
-            _blue_green_observation(
-                observations,
-                phase=phase,
-                details={"close": closed, "drain_sha256": _json_sha256(drain)},
-            )
-            phase = "promote_canonical"
-            promotion = context.promote_canonical()
-            pointer_promotion = {
-                "promoted": True,
-                "release_path": str(context.release_path),
-                "steps": promotion["activation_steps"],
+            promotion_pending = resume_phase in {
+                midcutover.PHASE_PROMOTE_POINTER,
+                midcutover.PHASE_SELECT_CANONICAL,
             }
-            canonical_operator = promotion["operator"]
-            selector_switch = {
-                "switched": True,
-                **promotion["final_routing"],
-                "authoritative_readback": promotion["authoritative_readback"],
-                "canonical_readiness_sha256": promotion[
-                    "canonical_readiness_sha256"
-                ],
-            }
-            _blue_green_observation(
-                observations,
-                phase=phase,
-                details={
-                    "selector_sha256": selector_switch.get("selector_sha256"),
-                    "generation": selector_switch.get("generation"),
-                },
-            )
-            phase = "retire_green"
-            retirement = context.retire_green()
-            _blue_green_observation(
-                observations, phase=phase, details={"retired": True}
-            )
+            if promotion_pending:
+                phase = "verify_green_serving"
+                green_serving = context.verify_green_serving()
+                _blue_green_observation(
+                    observations,
+                    phase=phase,
+                    details={
+                        "green_readiness_sha256": green_serving.get(
+                            "green_readiness_sha256"
+                        )
+                    },
+                )
+                phase = "close_mutations"
+                closed = context.close_mutations()
+                drain = context.terminalize_effects()
+                _blue_green_observation(
+                    observations,
+                    phase=phase,
+                    details={"close": closed, "drain_sha256": _json_sha256(drain)},
+                )
+                phase = "promote_canonical"
+                promotion = context.promote_canonical()
+                pointer_promotion = {
+                    "promoted": True,
+                    "release_path": str(context.release_path),
+                    "steps": promotion["activation_steps"],
+                    "pointer_activated_now": promotion["pointer_activated_now"],
+                }
+                canonical_operator = promotion["operator"]
+                selector_switch = {
+                    "switched": True,
+                    **promotion["final_routing"],
+                    "authoritative_readback": promotion["authoritative_readback"],
+                    "canonical_readiness_sha256": promotion[
+                        "canonical_readiness_sha256"
+                    ],
+                }
+                _blue_green_observation(
+                    observations,
+                    phase=phase,
+                    details={
+                        "selector_sha256": selector_switch.get("selector_sha256"),
+                        "generation": selector_switch.get("generation"),
+                    },
+                )
+            else:
+                # Canonical already carries this lineage; the pointer and the
+                # selector are applied effects, not work to repeat.
+                context.adopt_applied_promotion()
+            if resume_phase != midcutover.PHASE_CLOSEOUT:
+                phase = "retire_green"
+                retirement = context.retire_green()
+                _blue_green_observation(
+                    observations, phase=phase, details={"retired": True}
+                )
             phase = "final_readback"
             final_state = context.final_readback()
             readback = context.authoritative_readback()
@@ -7298,6 +7369,11 @@ def resume_production_blue_green_cutover(
         pointer_promotion=pointer_promotion,
         canonical_operator=canonical_operator,
         selector_switch=selector_switch,
+        final_routing=(
+            _selector_summary(context.current_selector)
+            if isinstance(context.current_selector, dict)
+            else None
+        ),
         retirement=retirement,
         final_state=final_state,
         readback=readback,

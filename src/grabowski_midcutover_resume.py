@@ -75,6 +75,22 @@ GREEN_SLOT = "green"
 CANONICAL_UPSTREAM_PORT = 18181
 GREEN_UPSTREAM_PORT = 18182
 
+#: The resume is a staged effect, so a resume that itself fails leaves the
+#: system somewhere in the middle of it.  Naming those places is what keeps the
+#: lane restartable: without them, a resume that promoted the pointer and then
+#: died would leave the original cutover permanently unresumable -- the very
+#: failure mode this whole lane exists to remove, reintroduced one level up.
+PHASE_PROMOTE_POINTER = "S0_promote_pointer"
+PHASE_SELECT_CANONICAL = "S1_select_canonical"
+PHASE_RETIRE_GREEN = "S2_retire_green"
+PHASE_CLOSEOUT = "S3_closeout"
+RESUME_PHASES = (
+    PHASE_PROMOTE_POINTER,
+    PHASE_SELECT_CANONICAL,
+    PHASE_RETIRE_GREEN,
+    PHASE_CLOSEOUT,
+)
+
 BLUE_GREEN_RECEIPT_ROOT = (
     Path.home() / ".local/state/grabowski/blue-green-deployment-receipts"
 )
@@ -391,11 +407,59 @@ def observe_green_release(
     return observation
 
 
+DEFAULT_STABLE_RUNTIME = Path.home() / ".local/share/grabowski-mcp"
+
+
+def observe_stable_pointer(runtime_path: Path = DEFAULT_STABLE_RUNTIME) -> dict[str, Any]:
+    """Which release the stable runtime pointer currently names.
+
+    This is the fact that separates "the resume has not started" from "the
+    resume already promoted the pointer and then failed". Without it a partially
+    applied resume is indistinguishable from an untouched one, and the lane
+    would either redo an applied effect or refuse forever.
+    """
+    observation: dict[str, Any] = {
+        "runtime_path": str(runtime_path),
+        "release_id": None,
+        "repo_head": None,
+        "completion_status": None,
+        "error": None,
+    }
+    manifest_path = runtime_path / MANIFEST_NAME
+    try:
+        descriptor = os.open(manifest_path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as exc:
+        observation["error"] = type(exc).__name__
+        return observation
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_MANIFEST_BYTES:
+            observation["error"] = "stable runtime manifest is not usable evidence"
+            return observation
+        raw = os.read(descriptor, MAX_MANIFEST_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        observation["error"] = "stable runtime manifest is invalid JSON"
+        return observation
+    if not isinstance(manifest, dict):
+        observation["error"] = "stable runtime manifest is not an object"
+        return observation
+    observation["release_id"] = manifest.get("release_id")
+    observation["repo_head"] = manifest.get("repo_head")
+    observation["completion_status"] = manifest.get("completion_status")
+    return observation
+
+
 def collect_classification_inputs(
     *,
     selector_path: Path = DEFAULT_SELECTOR_FILE,
     receipt_root: Path = BLUE_GREEN_RECEIPT_ROOT,
     releases_root: Path = DEFAULT_RELEASES_ROOT,
+    runtime_path: Path = DEFAULT_STABLE_RUNTIME,
+    green_unit_observer: Any = None,
 ) -> dict[str, Any]:
     """Gather every durable input the lane verdict is derived from."""
     selector: dict[str, Any] | None = None
@@ -423,6 +487,10 @@ def collect_classification_inputs(
         "receipts": loaded["receipts"],
         "unreadable_receipts": loaded["unreadable"],
         "green_observation": green_observation,
+        "pointer_observation": observe_stable_pointer(runtime_path),
+        "green_unit_observation": green_unit_observer()
+        if green_unit_observer is not None
+        else None,
     }
 
 
@@ -432,11 +500,15 @@ def classify_from_durable_state(
     selector_path: Path = DEFAULT_SELECTOR_FILE,
     receipt_root: Path = BLUE_GREEN_RECEIPT_ROOT,
     releases_root: Path = DEFAULT_RELEASES_ROOT,
+    runtime_path: Path = DEFAULT_STABLE_RUNTIME,
+    green_unit_observer: Any = None,
 ) -> dict[str, Any]:
     inputs = collect_classification_inputs(
         selector_path=selector_path,
         receipt_root=receipt_root,
         releases_root=releases_root,
+        runtime_path=runtime_path,
+        green_unit_observer=green_unit_observer,
     )
     return classify_recovery_lane(expected_head=expected_head, **inputs)
 
@@ -485,6 +557,90 @@ def is_post_switch_outcome_unknown(receipt: dict[str, Any]) -> bool:
     return receipt.get("retirement") is None and receipt.get("final_routing") is None
 
 
+def _resume_phase(
+    *, slot: str, pointer_promoted: bool, green_retired: bool
+) -> str | None:
+    """Where in the staged resume this durable state already is.
+
+    Derived, never chosen. The three observable facts -- which slot the ingress
+    serves, whether the stable pointer already names the target release, and
+    whether the transient green unit is still up -- pin the phase exactly, and a
+    combination that cannot occur in a forward-only resume returns ``None`` so
+    the caller fails closed rather than guessing which half is true.
+    """
+    if slot == GREEN_SLOT:
+        return PHASE_PROMOTE_POINTER if not pointer_promoted else PHASE_SELECT_CANONICAL
+    if slot == CANONICAL_SLOT:
+        if not pointer_promoted:
+            # Canonical routing to a release the stable pointer does not name is
+            # not a phase of this resume; it is a contradiction.
+            return None
+        return PHASE_CLOSEOUT if green_retired else PHASE_RETIRE_GREEN
+    return None
+
+
+def _completed_lineage_binding(receipt: dict[str, Any]) -> tuple[Any, ...] | None:
+    """The full identity a completed resume must carry to resolve a cutover.
+
+    ``resumed_cutover_id`` alone is a name, and a name is not a proof: a receipt
+    naming the right cutover but a different original receipt, release or head
+    would otherwise retire a lineage it never continued.
+    """
+    if receipt.get("kind") != RESUME_RECEIPT_KIND:
+        return None
+    if receipt.get("outcome") != "completed":
+        return None
+    required = (
+        receipt.get("resumed_cutover_id"),
+        receipt.get("resumed_receipt_sha256"),
+        receipt.get("resume_binding_sha256"),
+        receipt.get("expected_head"),
+        receipt.get("green_release_id"),
+    )
+    if any(value is None for value in required):
+        return None
+    routing = receipt.get("final_routing")
+    if not isinstance(routing, dict) or routing.get("selected_slot") != CANONICAL_SLOT:
+        return None
+    return required
+
+
+def _lineage_resolved(
+    receipts: Iterable[dict[str, Any]], cutover: dict[str, Any]
+) -> bool:
+    """True only for a completed resume bound to *this exact* cutover receipt."""
+    expected = (
+        cutover.get("cutover_id"),
+        cutover.get("receipt_sha256"),
+        cutover.get("expected_head"),
+        cutover.get("green_release_id"),
+    )
+    for receipt in receipts:
+        binding = _completed_lineage_binding(receipt)
+        if binding is None:
+            continue
+        if (binding[0], binding[1], binding[3], binding[4]) == expected:
+            return True
+    return False
+
+
+def _continues_this_lineage(
+    selector: dict[str, Any], open_cutovers: Sequence[dict[str, Any]]
+) -> bool:
+    """Does a canonical selector belong to an unresolved cutover of ours?
+
+    A canonical selector is normally the ordinary lane's world. It is *not*
+    when a resume of a still-open cutover already wrote it: refusing there
+    would strand the lineage one step before the finish line.
+    """
+    if selector.get("selected_slot") != CANONICAL_SLOT:
+        return False
+    return any(
+        cutover.get("cutover_id") == selector.get("cutover_id")
+        for cutover in open_cutovers
+    )
+
+
 def resolution_for_cutover(
     receipts: Iterable[dict[str, Any]], cutover_id: str
 ) -> dict[str, Any] | None:
@@ -495,9 +651,7 @@ def resolution_for_cutover(
     of it and get a hash-bound answer rather than an inference.
     """
     for receipt in receipts:
-        if receipt.get("kind") != RESUME_RECEIPT_KIND:
-            continue
-        if receipt.get("outcome") != "completed":
+        if _completed_lineage_binding(receipt) is None:
             continue
         if receipt.get("resumed_cutover_id") != cutover_id:
             continue
@@ -513,16 +667,12 @@ def resolution_for_cutover(
 
 
 def resolved_cutover_ids(receipts: Iterable[dict[str, Any]]) -> set[str]:
-    """Cutovers a terminal resume receipt has already retired."""
+    """Cutovers a fully-bound completed resume receipt has already retired."""
     resolved: set[str] = set()
     for receipt in receipts:
-        if receipt.get("kind") != RESUME_RECEIPT_KIND:
-            continue
-        if receipt.get("outcome") != "completed":
-            continue
-        resumed = receipt.get("resumed_cutover_id")
-        if isinstance(resumed, str):
-            resolved.add(resumed)
+        binding = _completed_lineage_binding(receipt)
+        if binding is not None and isinstance(binding[0], str):
+            resolved.add(binding[0])
     return resolved
 
 
@@ -530,12 +680,11 @@ def unresolved_post_switch_receipts(
     receipts: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     materialised = list(receipts)
-    resolved = resolved_cutover_ids(materialised)
     return [
         receipt
         for receipt in materialised
         if is_post_switch_outcome_unknown(receipt)
-        and receipt.get("cutover_id") not in resolved
+        and not _lineage_resolved(materialised, receipt)
     ]
 
 
@@ -605,6 +754,8 @@ def classify_recovery_lane(
     selector_present: bool = True,
     unreadable_receipts: Sequence[dict[str, str]] = (),
     green_observation: dict[str, Any] | None = None,
+    pointer_observation: dict[str, Any] | None = None,
+    green_unit_observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Decide which recovery lane -- if any -- this durable state admits."""
     checks: dict[str, bool] = {}
@@ -613,6 +764,8 @@ def classify_recovery_lane(
         "selector_present": selector_present,
         "unreadable_receipts": list(unreadable_receipts),
         "green_observation": green_observation,
+        "pointer_observation": pointer_observation,
+        "green_unit_observation": green_unit_observation,
     }
 
     checks["expected_head_named"] = bool(
@@ -680,7 +833,7 @@ def classify_recovery_lane(
     )
 
     slot = selector.get("selected_slot")
-    if slot == CANONICAL_SLOT:
+    if slot == CANONICAL_SLOT and not _continues_this_lineage(selector, open_cutovers):
         checks["selector_slot_is_canonical"] = True
         # The ordinary lane starts a *new* cutover.  Doing that while a switched
         # cutover is still unresolved would stack an unfinished promotion under
@@ -697,11 +850,11 @@ def classify_recovery_lane(
             evidence=evidence,
         )
 
-    checks["selector_slot_is_green"] = slot == GREEN_SLOT
-    checks["selector_upstream_is_green_port"] = (
-        selector.get("upstream_port") == GREEN_UPSTREAM_PORT
+    checks["selector_slot_is_resumable"] = slot in {GREEN_SLOT, CANONICAL_SLOT}
+    checks["selector_upstream_matches_slot"] = selector.get("upstream_port") == (
+        GREEN_UPSTREAM_PORT if slot == GREEN_SLOT else CANONICAL_UPSTREAM_PORT
     )
-    if not checks["selector_slot_is_green"]:
+    if not checks["selector_slot_is_resumable"]:
         reasons = sorted(name for name, ok in checks.items() if not ok)
         return _verdict(
             lane=LANE_FAIL_CLOSED,
@@ -738,51 +891,102 @@ def classify_recovery_lane(
             "switch_selector_sha256": switch.get("selector_sha256"),
             "switch_runtime_binding_sha256": switch.get("runtime_binding_sha256"),
         }
+        green_release = candidate.get("green_release_id")
+        target_head = str(candidate.get("expected_head") or "")
+        pointer_promoted = bool(
+            isinstance(pointer_observation, dict)
+            and pointer_observation.get("release_id") == green_release
+            and pointer_observation.get("repo_head") == target_head
+        )
+        green_retired = bool(
+            isinstance(green_unit_observation, dict)
+            and green_unit_observation.get("active") is False
+        )
+        phase = _resume_phase(
+            slot=str(slot),
+            pointer_promoted=pointer_promoted,
+            green_retired=green_retired,
+        )
+        evidence["pointer_promoted"] = pointer_promoted
+        evidence["green_retired"] = green_retired
+        receipt_summary["resume_phase"] = phase
+
+        checks["resume_phase_derivable"] = phase is not None
+        # The requested head names the *cutover* being continued, never the
+        # revision this recovery code happens to come from.  Those are two
+        # different things whenever recovery outlives the commit it repairs.
         checks["receipt_expected_head_matches_request"] = (
             candidate.get("expected_head") == expected_head
         )
-        checks["selector_generation_matches_receipt"] = selector.get(
-            "generation"
-        ) == switch.get("generation")
-        checks["selector_sha256_matches_receipt"] = selector.get(
-            "selector_sha256"
-        ) == switch.get("selector_sha256")
+        checks["selector_release_matches_receipt_green"] = (
+            binding.get("release_id") == green_release
+        )
+        checks["selector_repo_head_matches_target_head"] = (
+            binding.get("repo_head") == target_head
+        )
         checks["selector_binding_digest_matches_receipt"] = selector.get(
             "runtime_binding_sha256"
         ) == switch.get("runtime_binding_sha256")
-        checks["selector_release_matches_receipt_green"] = (
-            binding.get("release_id") == candidate.get("green_release_id")
+        checks["resume_not_already_terminal"] = not _lineage_resolved(
+            receipts, candidate
         )
-        checks["selector_repo_head_matches_expected_head"] = (
-            binding.get("repo_head") == expected_head
-        )
-        # Nothing may have switched the selector since this receipt was written.
-        checks["no_newer_switch_generation_recorded"] = _highest_switch_generation(
-            receipts
-        ) <= int(switch["generation"])
-        checks["resume_not_already_terminal"] = candidate.get(
-            "cutover_id"
-        ) not in resolved_cutover_ids(receipts)
-        green_release = candidate.get("green_release_id")
-        checks["green_serves_expected_release"] = bool(
-            isinstance(green_observation, dict)
-            and green_observation.get("release_id") == green_release
-            and green_observation.get("repo_head") == expected_head
-            and green_observation.get("listener_present") is True
-        )
-        if all(checks.values()):
+
+        if slot == GREEN_SLOT:
+            # Untouched half of the cutover: the selector must still be exactly
+            # the one the receipt recorded, generation included.
+            checks["selector_generation_matches_receipt"] = selector.get(
+                "generation"
+            ) == switch.get("generation")
+            checks["selector_sha256_matches_receipt"] = selector.get(
+                "selector_sha256"
+            ) == switch.get("selector_sha256")
+            checks["no_newer_switch_generation_recorded"] = (
+                _highest_switch_generation(receipts) <= int(switch["generation"])
+            )
+        else:
+            # A previous resume already promoted this lineage.  The selector has
+            # moved forward by exactly one generation and must still name this
+            # cutover; anything else is a foreign writer, not our own progress.
+            checks["canonical_selector_continues_this_cutover"] = selector.get(
+                "cutover_id"
+            ) == candidate.get("cutover_id")
+            checks["canonical_generation_follows_receipt"] = (
+                selector.get("generation") == int(switch["generation"]) + 1
+            )
+            checks["pointer_promoted_before_canonical_selector"] = pointer_promoted
+
+        # Green must still be serving until it is retired; once retired, the
+        # remaining work is readback and lineage closeout, which needs no green.
+        if phase in {PHASE_PROMOTE_POINTER, PHASE_SELECT_CANONICAL, PHASE_RETIRE_GREEN}:
+            checks["green_serves_expected_release"] = bool(
+                isinstance(green_observation, dict)
+                and green_observation.get("release_id") == green_release
+                and green_observation.get("repo_head") == target_head
+                and green_observation.get("listener_present") is True
+            )
+        else:
+            checks["green_release_artifact_matches_target"] = bool(
+                isinstance(green_observation, dict)
+                and green_observation.get("release_id") == green_release
+                and green_observation.get("repo_head") == target_head
+            )
+
+        if all(checks.values()) and phase is not None:
             resume_binding = {
                 "cutover_id": str(candidate["cutover_id"]),
                 "resumed_receipt_sha256": str(candidate["receipt_sha256"]),
+                "resume_phase": phase,
+                "target_head": target_head,
                 "expected_head": expected_head,
-                "expected_selector_sha256": str(switch["selector_sha256"]),
-                "expected_generation": int(switch["generation"]),
-                "expected_slot": GREEN_SLOT,
+                "expected_selector_sha256": str(selector["selector_sha256"]),
+                "switch_selector_sha256": str(switch["selector_sha256"]),
+                "expected_generation": int(selector["generation"]),
+                "expected_slot": str(slot),
                 "expected_release_id": str(green_release),
                 "expected_runtime_binding_sha256": str(
                     switch["runtime_binding_sha256"]
                 ),
-                "expected_upstream_port": GREEN_UPSTREAM_PORT,
+                "expected_upstream_port": selector.get("upstream_port"),
                 "source_identity_sha256": candidate.get("source_identity_sha256"),
             }
             resume_binding["binding_sha256"] = canonical_json_sha256(resume_binding)

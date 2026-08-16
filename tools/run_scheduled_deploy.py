@@ -20,6 +20,7 @@ if str(TOOLS_DIR) not in sys.path:
 
 import deploy_runtime as deploy_core
 import deploy_runtime_dual as deploy_dual
+import grabowski_midcutover_resume as midcutover
 
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
 SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
@@ -47,6 +48,10 @@ class SidecarInstallOutstanding(RuntimeError):
 
 class BlueGreenDeploymentIncomplete(RuntimeError):
     """The productive cutover produced a durable non-completed receipt."""
+
+
+class MidCutoverResumeIncomplete(RuntimeError):
+    """The staged mid-cutover resume produced a durable non-completed receipt."""
 
 
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
@@ -921,6 +926,118 @@ def _blue_green_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {**summary, "summary_sha256": canonical_json_sha256(summary)}
 
 
+def classify_recovery_before_deploy(*, repo: Path, execution_head: str) -> dict[str, Any]:
+    """Decide whether this run must continue a cutover instead of starting one.
+
+    This is the bridge that makes the fix reachable by the runtime it fixes.
+
+    The deployed operator is immutable: whatever release is serving MCP knows
+    only the dispatch it shipped with, and that dispatch has exactly one
+    outward-facing effect -- start *this* runner out of the verified source
+    checkout. So the classification has to live here. Once a merged checkout is
+    in place, the old operator's unchanged repair tool reaches the new
+    classifier through the one hop it already performs, with no new MCP surface
+    and no change to the running runtime.
+
+    Two revisions meet here and must not be confused:
+
+    ``execution_head``
+        the revision this runner's code comes from -- the merged head, supplied
+        by the existing self-deploy source contract.
+    ``resume_target_head``
+        the revision the stranded cutover is about -- read only from the
+        authentic receipt, selector and release lineage.
+
+    Deploying ``execution_head`` and resuming ``resume_target_head`` are
+    different operations on different revisions. The caller names the first and
+    never the second.
+    """
+    classification = deploy_dual.classify_midcutover_resume(
+        expected_head=execution_head,
+        receipt_root=None,
+    )
+    lane = classification.get("lane")
+    if lane != midcutover.LANE_MID_CUTOVER_RESUME:
+        target_head = None
+        binding = classification.get("resume_binding")
+        if isinstance(binding, dict):
+            target_head = binding.get("target_head")
+        # The classifier was asked about execution_head. A resumable cutover
+        # about a *different* head is still a resumable cutover, so ask again
+        # with the head the lineage itself names.
+        open_target = _open_cutover_target_head(classification)
+        if open_target is not None and open_target != execution_head:
+            classification = deploy_dual.classify_midcutover_resume(
+                expected_head=open_target,
+                receipt_root=None,
+            )
+            lane = classification.get("lane")
+            target_head = open_target
+        if lane != midcutover.LANE_MID_CUTOVER_RESUME:
+            return {
+                "lane": lane,
+                "resume_required": False,
+                "execution_head": execution_head,
+                "resume_target_head": target_head,
+                "classification_sha256": classification.get("classification_sha256"),
+            }
+    binding = classification["resume_binding"]
+    return {
+        "lane": lane,
+        "resume_required": True,
+        "execution_head": execution_head,
+        "resume_target_head": binding["target_head"],
+        "resume_phase": binding["resume_phase"],
+        "cutover_id": binding["cutover_id"],
+        "resume_binding_sha256": binding["binding_sha256"],
+        "classification_sha256": classification.get("classification_sha256"),
+        "classification": classification,
+    }
+
+
+def _open_cutover_target_head(classification: dict[str, Any]) -> str | None:
+    """The head named by the one unresolved post-switch cutover, if there is one."""
+    receipt = classification.get("receipt")
+    if isinstance(receipt, dict) and isinstance(receipt.get("expected_head"), str):
+        return receipt["expected_head"]
+    evidence = classification.get("evidence")
+    if not isinstance(evidence, dict):
+        return None
+    open_ids = evidence.get("unresolved_post_switch_cutover_ids")
+    if not isinstance(open_ids, list) or len(open_ids) != 1:
+        return None
+    loaded = midcutover.load_receipts(deploy_dual.BLUE_GREEN_RECEIPT_ROOT)
+    for candidate in midcutover.unresolved_post_switch_receipts(loaded["receipts"]):
+        head = candidate.get("expected_head")
+        if isinstance(head, str):
+            return head
+    return None
+
+
+def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, Any]:
+    """Continue the stranded cutover; deploy nothing."""
+    result = deploy_dual.resume_production_blue_green_cutover(
+        repo=repo,
+        expected_head=decision["resume_target_head"],
+        require_resume_binding_sha256=decision["resume_binding_sha256"],
+    )
+    receipt = result.get("receipt") or {}
+    summary = {
+        "schema_version": 1,
+        "kind": "grabowski_scheduled_midcutover_resume_summary",
+        "receipt_sha256": receipt.get("receipt_sha256"),
+        "receipt_path": result.get("receipt_path"),
+        "outcome": result.get("outcome"),
+        "resume_phase": receipt.get("resume_phase"),
+        "resumed_cutover_id": receipt.get("resumed_cutover_id"),
+        "resume_target_head": decision["resume_target_head"],
+        "execution_head": decision["execution_head"],
+    }
+    summary["summary_sha256"] = canonical_json_sha256(summary)
+    emit("midcutover-resume-receipt", **summary)
+    return {**result, "summary": summary}
+
+
 def run_productive_blue_green(
     *,
     repo: Path,
@@ -998,6 +1115,43 @@ def main() -> int:
             args.source_kind,
             args.expected_head,
         )
+        recovery_decision = classify_recovery_before_deploy(
+            repo=repo, execution_head=args.expected_head
+        )
+        emit("recovery-classification", **{
+            key: value
+            for key, value in recovery_decision.items()
+            if key != "classification"
+        })
+        if recovery_decision["resume_required"]:
+            # A stranded cutover is a precondition, not a deployment. Resuming
+            # it and deploying the requested head are two effects on two
+            # revisions; collapsing them into one job would make the outcome
+            # unreconstructable, so this run stops after the resume and the
+            # controller starts the ordinary deploy separately.
+            resume_result = run_midcutover_resume(
+                repo=repo, decision=recovery_decision
+            )
+            if resume_result.get("outcome") != "completed":
+                raise MidCutoverResumeIncomplete(
+                    "mid-cutover resume did not complete; inspect its durable receipt"
+                )
+            emit(
+                "midcutover-prerequisite-recovered",
+                resume_target_head=recovery_decision["resume_target_head"],
+                execution_head=recovery_decision["execution_head"],
+                requested_head_deployment_performed=False,
+            )
+            if binding is not None:
+                write_finalization_receipt(
+                    binding,
+                    final_status="completed",
+                    repo_head=recovery_decision["resume_target_head"],
+                    release_id=None,
+                    failure_type=None,
+                    blue_green=None,
+                )
+            return 0
         blue_green_result = run_productive_blue_green(
             repo=repo,
             expected_head=args.expected_head,
