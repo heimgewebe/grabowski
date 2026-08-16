@@ -32,7 +32,17 @@ Die Antwort darf dann weder Abschluss behaupten noch die offene Arbeit verschwei
 2. `blocked`: Mindestens ein konkreter, SHA-256-gebundener Blocker und eine nächste sichere Aktion sind angegeben. Das Antwortende ist zulässig, behauptet aber keine Fertigstellung; `continuation_required=true` hält den Folgearbeitsbedarf sichtbar.
 3. `delegated`: Der öffentliche Abschluss-Grip beobachtet den angegebenen Grabowski-Task, Agent-Workspace oder systemd-Job selbst. Nur ein tatsächlich laufender, identitäts- und receipt-gebundener Zustand wird akzeptiert. Auch dies behauptet keine Fertigstellung; die Verpflichtung bleibt im Standard-Listing sichtbar, bis eine Nachfolge-Verpflichtung die weitere Bearbeitung übernimmt.
 
-Für jeden Zustand außer `completed` gilt `continuation_required=true`; nur `completed` liefert `work_complete=true`. Ein fehlender Beleg, ein widersprüchlicher zweiter Abschluss, manipulierte Dateien, unsichere Dateirechte, unbekannte Felder oder eine unvollständige beziehungsweise widersprüchliche Statusprojektion führen fail-closed. Projektionsfehler werden im Listenaufruf als Integritätsfehler ausgewiesen und setzen `attention_required=true`; sie dürfen unfertige Arbeit nicht still ausblenden.
+Für jeden dieser drei `close.json`-Zustände außer `completed` gilt zunächst `continuation_required=true`; nur `completed` liefert `work_complete=true`. Eine spätere, explizite historische Resolution kann `blocked` oder `delegated` aus der aktuellen Aufmerksamkeit nehmen, ohne den ursprünglichen Abschluss oder dessen Akzeptanzstatus umzuschreiben. Ein fehlender Beleg, ein widersprüchlicher zweiter Abschluss, manipulierte Dateien, unsichere Dateirechte, unbekannte Felder oder eine unvollständige beziehungsweise widersprüchliche Statusprojektion führen fail-closed. Projektionsfehler werden im Listenaufruf als Integritätsfehler ausgewiesen und setzen `attention_required=true`; sie dürfen unfertige Arbeit nicht still ausblenden.
+
+## Historische Resolutionen und Deferred-Parken
+
+Eine bereits `blocked` oder `delegated` geschlossene Verpflichtung darf nur über `operator-obligation-resolve` aus Current Attention genommen werden. Der Resolve ist selbst create-only, bindet `open.json`, `close.json` und mindestens einen SHA-256-gebundenen Evidenzbeleg und ändert den ursprünglichen Terminalzustand nicht. Zulässig sind genau:
+
+1. `resolved`: Der frühere Folgearbeitsbedarf ist durch aktuelle Evidenz historisch erledigt.
+2. `superseded`: Eine andere, konkret belegte Arbeits- oder Wahrheitsquelle hat die Fortsetzung übernommen.
+3. `deferred`: Die Arbeit soll aktuell ausdrücklich nicht fortgesetzt werden. `continuation_required=false` und `attention_class=historical` parken sie aus dem Standard-Attention-Listing; der verpflichtende `next_action` bleibt als Wiederaufnahmekontext erhalten. Dies ist **keine** Fertigstellung: `work_complete=false`, der ursprüngliche `blocked`-/`delegated`-Datensatz bleibt unverändert und ist über seinen expliziten Zustandsfilter weiter lesbar.
+
+`deferred` darf daher nicht als stilles Wegfiltern benutzt werden. Es erfordert eine bewusste, evidenzgebundene Resolution. Eine identische Resolution ist idempotent; eine abweichende zweite Resolution derselben Obligation ist ein Konflikt. Soll deferred Arbeit später wieder aktuell werden, wird eine **neue Obligation mit neuer ID** geöffnet und auf die historische Obligation beziehungsweise deren Evidenz verwiesen. So bleibt die alte Entscheidung auditierbar, während nur der neue Arbeitsauftrag wieder Current Attention erzeugt.
 
 ## Speicher- und Integritätsmodell
 
@@ -42,6 +52,7 @@ Der Standardpfad ist:
 ~/.local/state/grabowski/operator-obligations/<obligation_id>/
   open.json
   close.json
+  resolution.json        # optional; historical attention decision
 ```
 
 Verzeichnisse sind eigentümergebunden mit Modus `0700`, Datensätze mit `0600`. Lese- und Schreibpfade prüfen reguläre Dateien, Eigentümer, Linkzahl, Inodebindung, Größenlimits und Hashbindung. Veröffentlichung erfolgt create-only über die vorhandene private I/O-Primitive; konkurrierende Sieger werden vollständig validiert und niemals überschrieben.
@@ -50,12 +61,13 @@ Ein Interprozess-Lock serialisiert Öffnung und Abschluss. Wiederholung desselbe
 
 ## Grip-Oberfläche
 
-- `operator-obligation-list` – read-only; verwendet standardmäßig den Filter `attention` und findet damit alle nicht abgeschlossenen Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder. Der frühere reine Open-Blick bleibt über die explizite Angabe `state="open"` unverändert verfügbar.
+- `operator-obligation-list` – read-only; verwendet standardmäßig den Filter `attention` und findet damit aktuelle Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder. `resolved`, `superseded` und evidenzgebunden `deferred` resolvte Datensätze sind historisch und erscheinen dort nicht; der ursprüngliche Zustand bleibt über explizite Filter wie `state="blocked"` lesbar. Der frühere reine Open-Blick bleibt über `state="open"` unverändert verfügbar.
 - `operator-obligation-open` – mutierend; legt die unveränderliche Verpflichtung an.
 - `operator-obligation-status` – read-only; entscheidet, ob Fortsetzung erforderlich ist und ob die Antwort enden darf.
 - `operator-obligation-close` – mutierend; akzeptiert nur `completed`, `blocked` oder `delegated` unter den beschriebenen Evidenzregeln.
+- `operator-obligation-resolve` – mutierend; bindet eine bereits `blocked` oder `delegated` geschlossene Verpflichtung evidenzgebunden als `resolved`, `superseded` oder `deferred` in die historische Projektion. Eine deferred Wiederaufnahme erfolgt nicht durch Umschreiben dieser Resolution, sondern durch eine neue Obligation.
 
-Die Agent-Anweisung nennt die exakten Aufrufe `operator-obligation-list`, `operator-obligation-open`, `operator-obligation-status` und `operator-obligation-close` über `grip_run`. Damit ist der Lifecycle im laufenden MCP-Vertrag sichtbar und nicht nur Dokumentation. Bei `delegated` akzeptiert der Grip vom Aufrufer nur Art und ID; Werkzeug, Status, Beobachtungszeit und Hash werden aus der unmittelbaren Livebeobachtung erzeugt.
+Die Agent-Anweisung nennt die exakten Aufrufe `operator-obligation-list`, `operator-obligation-open`, `operator-obligation-status`, `operator-obligation-close` und `operator-obligation-resolve` über `grip_run`. Damit ist der Lifecycle im laufenden MCP-Vertrag sichtbar und nicht nur Dokumentation. Bei `delegated` akzeptiert der Close-Grip vom Aufrufer nur Art und ID; Werkzeug, Status, Beobachtungszeit und Hash werden aus der unmittelbaren Livebeobachtung erzeugt.
 
 ## Grenzen
 
