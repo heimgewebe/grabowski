@@ -1674,6 +1674,65 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(decision["retention_active"])
         self.assertFalse(linked["cleanup_candidate"])
 
+    def test_inventory_projects_active_creation_capacity_separately_from_preservation(self) -> None:
+        self._managed_binding()
+        common_dir = self._common_dir()
+        now = int(time.time())
+        expired_present = self.root / "worktrees" / "expired-present"
+        expired_present.mkdir(parents=True, exist_ok=True)
+        expired_missing = self.root / "worktrees" / "expired-missing"
+        present_binding = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=expired_present,
+            owner_id="owner-a",
+            purpose="expired present capacity fixture",
+            source_kind="bureau_task",
+            source_id="GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+            artifact_class="implementation_worktree",
+            retention_until_unix=now + 3600,
+            expected_head=self.head,
+            expected_branch="expired-present",
+        )
+        missing_binding = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=expired_missing,
+            owner_id="owner-a",
+            purpose="expired missing capacity fixture",
+            source_kind="bureau_task",
+            source_id="GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+            artifact_class="implementation_worktree",
+            retention_until_unix=now + 3600,
+            expected_head=self.head,
+            expected_branch="expired-missing",
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key IN (?, ?)",
+                (now - 1, present_binding["checkout_key"], missing_binding["checkout_key"]),
+            )
+            connection.commit()
+
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        capacity = inventory["active_capacity"]
+        self.assertTrue(capacity["available"])
+        self.assertEqual(capacity["configured_limit"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO)
+        self.assertEqual(capacity["raw_active_rows"], 3)
+        self.assertEqual(capacity["unexpired_active_rows"], 1)
+        self.assertEqual(capacity["expired_present_active_rows"], 1)
+        self.assertEqual(capacity["expired_missing_active_rows"], 1)
+        self.assertEqual(capacity["expired_unobservable_active_rows"], 0)
+        self.assertEqual(capacity["used"], 1)
+        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO - 1)
+        self.assertFalse(capacity["saturated"])
+        self.assertIn("checkout_path_reuse_authority", capacity["does_not_establish"])
+
     def test_completed_retained_binding_is_terminal_and_not_cleanup_candidate(self) -> None:
         binding = self._managed_binding()
         checkouts._mark_checkout_completed_retained(

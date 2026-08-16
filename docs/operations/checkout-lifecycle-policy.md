@@ -18,12 +18,14 @@ Before a managed worktree is created, the caller must provide and Grabowski must
 
 ## Per-repository limits
 
-Limits apply to explicitly managed physical lifecycle rows in `active` or `completed_retained` for one Git common directory:
+Limits apply to explicitly managed lifecycle state for one Git common directory, but the two phases have different admission semantics:
 
-- at most **8 active** managed checkouts;
+- at most **8 concurrently retained active** managed checkouts;
 - at most **4 completed-retained** managed checkouts.
 
-Expiry alone does not stop a row from counting. It stops counting only after the lifecycle transitions to `archived`. The limit is a growth gate. It never authorizes deletion of an existing checkout and never counts an unmanaged foreign checkout as owned. A completed-retained transition that would exceed the limit fails closed and preserves the checkout in its prior active state.
+For active creation admission, an `active` binding reserves one of the eight global slots only while its `retention_until_unix` is still effective. An expired active row remains durable lifecycle and hygiene evidence and may still point at a present or dirty checkout, but it no longer consumes global creation concurrency. Expiry therefore grants **no** terminality, cleanup, archive, deletion, branch reuse or checkout-path reuse authority. Exact target-path, branch, Git-worktree, owner and identity conflicts remain independent fail-closed gates. Renewing or reactivating an expired active binding must pass the current active-capacity check, so a stale row cannot bypass a genuinely full set of unexpired active slots.
+
+The completed-retained limit remains row-based. A completed-retained transition that would exceed it fails closed and preserves the checkout in its prior active state. Neither limit counts an unmanaged foreign checkout as owned or authorizes deleting work merely because capacity is exhausted.
 
 ## Completion and immediate cleanup eligibility
 

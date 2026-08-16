@@ -791,6 +791,23 @@ class ConsumerSurfaceTests(unittest.TestCase):
             read_surface.runtime_extensions,
             "_worktree_context",
             return_value=context,
+        ), mock.patch.object(
+            read_surface.checkouts,
+            "active_capacity_projection",
+            return_value={
+                "available": True,
+                "configured_limit": 8,
+                "used": 2,
+                "free": 6,
+                "saturated": False,
+                "raw_active_rows": 11,
+                "unexpired_active_rows": 2,
+                "expired_present_active_rows": 6,
+                "expired_missing_active_rows": 3,
+                "expired_unobservable_active_rows": 0,
+                "capacity_semantics": "unexpired_active_retention",
+                "does_not_establish": ["checkout_path_reuse_authority"],
+            },
         ):
             paths: list[str] = []
             cursor = None
@@ -818,8 +835,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 )
             projected = read_surface.grabowski_checkout_summary(
                 view="minimal",
-                fields=["worktrees"],
+                fields=["worktrees", "active_capacity"],
             )
+            self.assertEqual(projected["active_capacity"]["configured_limit"], 8)
+            self.assertEqual(projected["active_capacity"]["free"], 6)
             self.assertIn("warnings", projected)
             self.assertIn("recommended_next_action", projected)
             self.assertIn("does_not_establish", projected)
