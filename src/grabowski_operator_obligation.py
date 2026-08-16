@@ -1441,8 +1441,13 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
                 # that meaning on replay.  A v2 successor is a migration decision,
                 # so changing only disposition/next_action is insufficient: at
                 # least one newly bound evidence item must distinguish it from the
-                # legacy decision.
-                legacy_evidence = {_sha256(item) for item in latest["evidence"]}
+                # complete legacy v1 prefix.
+                legacy_evidence = {
+                    _sha256(item)
+                    for record, _, _ in chain
+                    if record["schema_version"] == LEGACY_RESOLUTION_SCHEMA_VERSION
+                    for item in record["evidence"]
+                }
                 requested_evidence = {_sha256(item) for item in evidence}
                 if not requested_evidence - legacy_evidence:
                     raise OperatorObligationConflictError(
