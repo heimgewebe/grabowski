@@ -58,7 +58,7 @@ def _resume_summary(result: dict[str, Any]) -> dict[str, Any]:
         "receipt_path": result.get("receipt_path"),
         "receipt_persisted": result.get("receipt_persisted") is True,
         "outcome": receipt.get("outcome"),
-        "phase": receipt.get("phase"),
+        "resume_receipt_phase": receipt.get("phase"),
         "resume_id": receipt.get("resume_id"),
         "resumed_cutover_id": receipt.get("resumed_cutover_id"),
         "resumed_receipt_sha256": receipt.get("resumed_receipt_sha256"),

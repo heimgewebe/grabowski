@@ -52,7 +52,10 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 from typing import Any, Iterable, Sequence
+
+import grabowski_client_snapshot as client_snapshot
 
 
 SCHEMA_VERSION = 1
@@ -80,16 +83,71 @@ GREEN_UPSTREAM_PORT = 18182
 #: lane restartable: without them, a resume that promoted the pointer and then
 #: died would leave the original cutover permanently unresumable -- the very
 #: failure mode this whole lane exists to remove, reintroduced one level up.
-PHASE_PROMOTE_POINTER = "S0_promote_pointer"
-PHASE_SELECT_CANONICAL = "S1_select_canonical"
-PHASE_RETIRE_GREEN = "S2_retire_green"
-PHASE_CLOSEOUT = "S3_closeout"
+PHASE_REBIND_SNAPSHOT = "S0_rebind_snapshot"
+PHASE_PROMOTE_POINTER = "S1_promote_pointer"
+PHASE_SELECT_CANONICAL = "S2_select_canonical"
+PHASE_RETIRE_GREEN = "S3_retire_green"
+PHASE_CLOSEOUT = "S4_closeout"
 RESUME_PHASES = (
+    PHASE_REBIND_SNAPSHOT,
     PHASE_PROMOTE_POINTER,
     PHASE_SELECT_CANONICAL,
     PHASE_RETIRE_GREEN,
     PHASE_CLOSEOUT,
 )
+
+DEFAULT_CLIENT_SNAPSHOT_PATH = (
+    Path.home() / ".local/state/grabowski/client-snapshot/current.json"
+)
+SNAPSHOT_BINDING_PENDING = "bound_to_predecessor"
+SNAPSHOT_BINDING_DONE = "rebound_by_this_lineage"
+SNAPSHOT_BINDING_FOREIGN = "foreign"
+SNAPSHOT_BINDING_UNREADABLE = "unreadable"
+
+
+def observe_client_snapshot_binding(
+    *,
+    cutover_id: str,
+    cutover_generation: int,
+    blue_release_id: str,
+    blue_repo_head: str,
+    green_release_id: str,
+    target_head: str,
+    source_evidence_time: int,
+    publication_request_id: str,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    agent_instructions_sha256: str,
+    green_readiness: dict[str, Any],
+    path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
+) -> dict[str, Any]:
+    """Project canonical snapshot inspection into the recovery vocabulary."""
+    observed = client_snapshot.inspect_cutover_snapshot_binding(
+        cutover_id=cutover_id,
+        cutover_generation=cutover_generation,
+        source_release_id=blue_release_id,
+        source_repo_head=blue_repo_head,
+        target_release_id=green_release_id,
+        target_repo_head=target_head,
+        source_evidence_time=source_evidence_time,
+        publication_request_id=publication_request_id,
+        registered_tool_count=registered_tool_count,
+        registered_names_sha256=registered_names_sha256,
+        agent_instructions_sha256=agent_instructions_sha256,
+        green_readiness=green_readiness,
+        path=path,
+    )
+    state = observed.get("state")
+    return {
+        **observed,
+        "state": {
+            client_snapshot.SNAPSHOT_BINDING_PREDECESSOR: SNAPSHOT_BINDING_PENDING,
+            client_snapshot.SNAPSHOT_BINDING_REBOUND: SNAPSHOT_BINDING_DONE,
+            client_snapshot.SNAPSHOT_BINDING_FOREIGN: SNAPSHOT_BINDING_FOREIGN,
+            client_snapshot.SNAPSHOT_BINDING_UNREADABLE: SNAPSHOT_BINDING_UNREADABLE,
+        }.get(state, SNAPSHOT_BINDING_UNREADABLE),
+        "transition_sha256": observed.get("publication_transition_sha256"),
+    }
 
 BLUE_GREEN_RECEIPT_ROOT = (
     Path.home() / ".local/state/grabowski/blue-green-deployment-receipts"
@@ -139,6 +197,17 @@ def parse_release_id(release_id: Any) -> dict[str, Any] | None:
     }
 
 
+def release_id_binds_head(release_id: Any, repo_head: Any) -> bool:
+    """Whether one release identifier commits to the supplied repository head."""
+    identity = parse_release_id(release_id)
+    return bool(
+        identity is not None
+        and isinstance(repo_head, str)
+        and HEAD_RE.fullmatch(repo_head)
+        and repo_head.startswith(identity["head12"])
+    )
+
+
 class MidCutoverEvidenceError(ValueError):
     """A persisted receipt does not validate as authentic cutover evidence."""
 
@@ -173,7 +242,76 @@ def validate_cutover_receipt(value: Any) -> dict[str, Any]:
     cutover_id = value.get("cutover_id")
     if not isinstance(cutover_id, str) or CUTOVER_ID_RE.fullmatch(cutover_id) is None:
         raise MidCutoverEvidenceError("blue-green receipt cutover id is invalid")
+    generation = value.get("cutover_generation")
+    resumable = (
+        value.get("outcome") == RESUMABLE_OUTCOME
+        and value.get("phase") == RESUMABLE_OUTCOME
+    )
+    if (
+        (generation is not None or resumable)
+        and (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        )
+    ):
+        raise MidCutoverEvidenceError("blue-green receipt cutover generation is invalid")
     return _require_receipt_hash(value, label="blue-green receipt")
+
+
+def activation_observation(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Return the unique hash-bound Publication-v2 activation observation."""
+    validated = validate_cutover_receipt(receipt)
+    observations = validated.get("observations")
+    if not isinstance(observations, list):
+        raise MidCutoverEvidenceError("blue-green receipt observations are missing")
+    matches: list[dict[str, Any]] = []
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            raise MidCutoverEvidenceError(
+                f"blue-green observation {index} is not an object"
+            )
+        declared = observation.get("observation_sha256")
+        material = {
+            key: item
+            for key, item in observation.items()
+            if key != "observation_sha256"
+        }
+        if (
+            not isinstance(declared, str)
+            or SHA256_RE.fullmatch(declared) is None
+            or canonical_json_sha256(material) != declared
+        ):
+            raise MidCutoverEvidenceError(
+                f"blue-green observation {index} hash mismatch"
+            )
+        if observation.get("phase") == "platform_publication_activation":
+            matches.append(dict(observation))
+    if len(matches) != 1:
+        raise MidCutoverEvidenceError(
+            "blue-green receipt requires exactly one publication activation observation"
+        )
+    activation = matches[0]
+    observed_at = activation.get("observed_at_unix")
+    details = activation.get("details")
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at < 0
+        or not isinstance(details, dict)
+        or details.get("state") != "publication_pending"
+        or not isinstance(details.get("request_id"), str)
+        or CUTOVER_ID_RE.fullmatch(details["request_id"]) is None
+    ):
+        raise MidCutoverEvidenceError(
+            "blue-green publication activation observation is invalid"
+        )
+    return {
+        "source_evidence_time": observed_at,
+        "publication_request_id": details["request_id"],
+        "observation_sha256": activation["observation_sha256"],
+        "state": details["state"],
+    }
 
 
 def validate_resume_receipt(value: Any) -> dict[str, Any]:
@@ -567,6 +705,56 @@ def green_operator_unit(cutover_id: str) -> str:
     return f"{GREEN_OPERATOR_UNIT_PREFIX}{digest}.service"
 
 
+def observe_green_operator_unit(unit: str) -> dict[str, Any]:
+    """Read the transient unit state without importing the deployment runner."""
+    if not unit.startswith(GREEN_OPERATOR_UNIT_PREFIX) or not unit.endswith(
+        ".service"
+    ):
+        return {"unit": unit, "active": None, "error": "green unit is invalid"}
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--property=LoadState,ActiveState,SubState",
+                "--no-pager",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"unit": unit, "active": None, "error": type(exc).__name__}
+    fields = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key] = value
+    load = fields.get("LoadState")
+    active_state = fields.get("ActiveState")
+    sub_state = fields.get("SubState")
+    if active_state == "active":
+        active: bool | None = True
+    elif load == "not-found" or (
+        active_state == "inactive" and sub_state in {"dead", "exited"}
+    ):
+        active = False
+    else:
+        active = None
+    return {
+        "unit": unit,
+        "active": active,
+        "load_state": load,
+        "active_state": active_state,
+        "sub_state": sub_state,
+        "returncode": result.returncode,
+        "error": None if active is not None else "green unit state is ambiguous",
+    }
+
+
 def collect_classification_inputs(
     *,
     selector_path: Path = DEFAULT_SELECTOR_FILE,
@@ -574,9 +762,12 @@ def collect_classification_inputs(
     releases_root: Path = DEFAULT_RELEASES_ROOT,
     runtime_path: Path = DEFAULT_STABLE_RUNTIME,
     pointer_releases_root: Path | None = None,
+    client_snapshot_path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
     green_unit_observer: Any = None,
 ) -> dict[str, Any]:
     """Gather every durable input the lane verdict is derived from."""
+    if pointer_releases_root is None:
+        pointer_releases_root = releases_root
     selector: dict[str, Any] | None = None
     selector_error: str | None = None
     selector_present = True
@@ -599,6 +790,46 @@ def collect_classification_inputs(
             str(selector.get("runtime_binding", {}).get("release_id") or ""),
             releases_root=releases_root,
         )
+    snapshot_observation = None
+    activation_error = None
+    activation = None
+    blue_observation = None
+    if open_cutover_id is not None:
+        cutover = open_cutovers[0]
+        blue_observation = observe_green_release(
+            str(cutover.get("blue_release_id") or ""),
+            releases_root=releases_root,
+            port=0,
+            connect_timeout_seconds=0.01,
+        )
+        try:
+            activation = activation_observation(cutover)
+            readiness = cutover.get("green_readiness")
+            if not isinstance(readiness, dict):
+                raise MidCutoverEvidenceError(
+                    "blue-green receipt carries no green readiness evidence"
+                )
+            snapshot_observation = observe_client_snapshot_binding(
+                cutover_id=open_cutover_id,
+                cutover_generation=int(cutover["cutover_generation"]),
+                blue_release_id=str(cutover.get("blue_release_id") or ""),
+                blue_repo_head=str((blue_observation or {}).get("repo_head") or ""),
+                green_release_id=str(cutover.get("green_release_id") or ""),
+                target_head=str(cutover.get("expected_head") or ""),
+                source_evidence_time=activation["source_evidence_time"],
+                publication_request_id=activation["publication_request_id"],
+                registered_tool_count=int(
+                    readiness.get("complete_schema_count") or 0
+                ),
+                registered_names_sha256=str(cutover.get("names_sha256") or ""),
+                agent_instructions_sha256=str(
+                    cutover.get("agent_instructions_sha256") or ""
+                ),
+                green_readiness=readiness,
+                path=client_snapshot_path,
+            )
+        except (MidCutoverEvidenceError, KeyError, TypeError, ValueError) as exc:
+            activation_error = str(exc)
     return {
         "selector": selector,
         "selector_present": selector_present,
@@ -606,14 +837,20 @@ def collect_classification_inputs(
         "receipts": loaded["receipts"],
         "unreadable_receipts": loaded["unreadable"],
         "green_observation": green_observation,
+        "blue_observation": blue_observation,
+        "activation_observation": activation,
+        "activation_error": activation_error,
         "pointer_observation": observe_stable_pointer(
             runtime_path, pointer_releases_root
         ),
         "green_unit_observation": (
-            green_unit_observer(green_operator_unit(open_cutover_id))
-            if green_unit_observer is not None and open_cutover_id is not None
+            (green_unit_observer or observe_green_operator_unit)(
+                green_operator_unit(open_cutover_id)
+            )
+            if open_cutover_id is not None
             else None
         ),
+        "snapshot_observation": snapshot_observation,
     }
 
 
@@ -625,6 +862,7 @@ def classify_from_durable_state(
     releases_root: Path = DEFAULT_RELEASES_ROOT,
     runtime_path: Path = DEFAULT_STABLE_RUNTIME,
     pointer_releases_root: Path | None = None,
+    client_snapshot_path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
     green_unit_observer: Any = None,
 ) -> dict[str, Any]:
     inputs = collect_classification_inputs(
@@ -633,6 +871,7 @@ def classify_from_durable_state(
         releases_root=releases_root,
         runtime_path=runtime_path,
         pointer_releases_root=pointer_releases_root,
+        client_snapshot_path=client_snapshot_path,
         green_unit_observer=green_unit_observer,
     )
     return classify_recovery_lane(expected_head=expected_head, **inputs)
@@ -686,6 +925,7 @@ def _pointer_state(
     observation: Any,
     *,
     blue_release_id: Any,
+    blue_repo_head: Any,
     target_release_id: Any,
     target_head: str,
 ) -> str:
@@ -703,13 +943,21 @@ def _pointer_state(
     release_id = observation.get("release_id")
     if release_id == target_release_id and observation.get("repo_head") == target_head:
         return "target"
-    if release_id == blue_release_id:
+    if (
+        release_id == blue_release_id
+        and observation.get("repo_head") == blue_repo_head
+        and observation.get("completion_status") == "complete"
+    ):
         return "blue"
     return "foreign"
 
 
 def _resume_phase(
-    *, slot: str, pointer_promoted: bool, green_retired: bool
+    *,
+    slot: str,
+    pointer_promoted: bool,
+    green_retired: bool,
+    snapshot_rebound: bool,
 ) -> str | None:
     """Where in the staged resume this durable state already is.
 
@@ -720,6 +968,10 @@ def _resume_phase(
     the caller fails closed rather than guessing which half is true.
     """
     if slot == GREEN_SLOT:
+        if snapshot_rebound is not True:
+            # The step the original cutover died on. Nothing downstream may run
+            # until the cutover's own contract is fulfilled.
+            return PHASE_REBIND_SNAPSHOT if not pointer_promoted else None
         return PHASE_PROMOTE_POINTER if not pointer_promoted else PHASE_SELECT_CANONICAL
     if slot == CANONICAL_SLOT:
         if not pointer_promoted:
@@ -730,36 +982,211 @@ def _resume_phase(
     return None
 
 
-def _completed_lineage_binding(receipt: dict[str, Any]) -> tuple[Any, ...] | None:
+def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None:
     """The full identity a completed resume must carry to resolve a cutover.
 
     ``resumed_cutover_id`` alone is a name, and a name is not a proof: a receipt
     naming the right cutover but a different original receipt, release or head
     would otherwise retire a lineage it never continued.
     """
+    try:
+        receipt = validate_resume_receipt(receipt)
+    except MidCutoverEvidenceError:
+        return None
     if receipt.get("kind") != RESUME_RECEIPT_KIND:
         return None
     if receipt.get("outcome") != "completed":
         return None
-    required = (
-        receipt.get("resumed_cutover_id"),
-        receipt.get("resumed_receipt_sha256"),
-        receipt.get("resume_binding_sha256"),
-        receipt.get("expected_head"),
-        receipt.get("green_release_id"),
+    binding = receipt.get("resume_binding")
+    if not isinstance(binding, dict):
+        return None
+    binding_material = dict(binding)
+    binding_sha256 = binding_material.pop("binding_sha256", None)
+    if (
+        canonical_json_sha256(binding_material) != binding_sha256
+        or receipt.get("resume_binding_sha256") != binding_sha256
+    ):
+        return None
+    for digest in (receipt.get("resumed_receipt_sha256"), binding_sha256):
+        if SHA256_RE.fullmatch(str(digest)) is None:
+            return None
+    if (
+        receipt.get("resumed_cutover_id") != binding.get("cutover_id")
+        or receipt.get("resumed_receipt_sha256")
+        != binding.get("resumed_receipt_sha256")
+        or receipt.get("expected_head") != binding.get("target_head")
+        or receipt.get("green_release_id") != binding.get("expected_release_id")
+        or receipt.get("resume_phase") != binding.get("resume_phase")
+    ):
+        return None
+    if (
+        HEAD_RE.fullmatch(str(binding.get("target_head") or "")) is None
+        or HEAD_RE.fullmatch(str(binding.get("blue_repo_head") or "")) is None
+        or parse_release_id(binding.get("expected_release_id")) is None
+        or not release_id_binds_head(
+            binding.get("blue_release_id"), binding.get("blue_repo_head")
+        )
+        or isinstance(binding.get("cutover_generation"), bool)
+        or not isinstance(binding.get("cutover_generation"), int)
+        or binding["cutover_generation"] < 1
+    ):
+        return None
+    derived_phase = _resume_phase(
+        slot=str(binding.get("expected_slot")),
+        pointer_promoted=binding.get("pointer_state") == "target",
+        green_retired=binding.get("green_retired") is True,
+        snapshot_rebound=(
+            binding.get("snapshot_binding_state") == SNAPSHOT_BINDING_DONE
+        ),
     )
-    if any(value is None for value in required):
+    if derived_phase != binding.get("resume_phase"):
         return None
     routing = receipt.get("final_routing")
-    if not isinstance(routing, dict) or routing.get("selected_slot") != CANONICAL_SLOT:
+    if (
+        not isinstance(routing, dict)
+        or routing.get("selected_slot") != CANONICAL_SLOT
+        or routing.get("release_id") != binding.get("expected_release_id")
+        or routing.get("repo_head") != binding.get("target_head")
+        or routing.get("cutover_id") != binding.get("cutover_id")
+        or routing.get("previous_selector_sha256")
+        != binding.get("switch_selector_sha256")
+        or routing.get("generation") != int(binding.get("switch_generation", 0)) + 1
+        or routing.get("runtime_binding_sha256")
+        != binding.get("expected_runtime_binding_sha256")
+    ):
         return None
-    return required
+    starting_slot = binding.get("expected_slot")
+    if starting_slot == GREEN_SLOT:
+        if (
+            binding.get("expected_selector_sha256")
+            != binding.get("switch_selector_sha256")
+            or binding.get("expected_generation")
+            != binding.get("switch_generation")
+        ):
+            return None
+    elif starting_slot == CANONICAL_SLOT:
+        if (
+            binding.get("expected_selector_sha256")
+            != routing.get("selector_sha256")
+            or binding.get("expected_generation") != routing.get("generation")
+        ):
+            return None
+    else:
+        return None
+    # The cutover contract includes the snapshot rebind. A resume that finished
+    # canonical promotion without it has not completed the cutover, and its
+    # receipt must not retire the lineage -- a malformed or partial "completed"
+    # is not terminal, it is fail-closed.
+    rebind = receipt.get("snapshot_rebind")
+    if not isinstance(rebind, dict) or rebind.get("rebound") is not True:
+        return None
+    if SHA256_RE.fullmatch(str(rebind.get("receipt_sha256"))) is None:
+        return None
+    retirement = receipt.get("retirement")
+    admission = receipt.get("admission_state")
+    final = receipt.get("final_state")
+    expected_green_unit = green_operator_unit(str(binding.get("cutover_id")))
+    if (
+        not isinstance(retirement, dict)
+        or retirement.get("retired") is not True
+        or retirement.get("unit") != expected_green_unit
+        or not isinstance(admission, dict)
+        or admission.get("state") not in {"absent", "released"}
+        or (
+            admission.get("state") == "released"
+            and admission.get("verified_absent") is not True
+        )
+        or not isinstance(final, dict)
+        or final.get("release_id") != binding.get("expected_release_id")
+        or final.get("repo_head") != binding.get("target_head")
+        or final.get("completion_status") != "complete"
+        or final.get("runtime_binding_sha256")
+        != binding.get("expected_runtime_binding_sha256")
+        or final.get("admission_marker_state") != "absent"
+    ):
+        return None
+    final_pointer = final.get("pointer")
+    final_snapshot = final.get("snapshot")
+    final_selector = final.get("selector")
+    final_green = final.get("green_unit")
+    if (
+        not isinstance(final_pointer, dict)
+        or final_pointer.get("error") is not None
+        or final_pointer.get("pointer_kind") != "symlink"
+        or final_pointer.get("pointer_target_release_id")
+        != binding.get("expected_release_id")
+        or final_pointer.get("release_id") != binding.get("expected_release_id")
+        or final_pointer.get("repo_head") != binding.get("target_head")
+        or final_pointer.get("completion_status") != "complete"
+        or not isinstance(final_snapshot, dict)
+        or final_snapshot.get("state") != SNAPSHOT_BINDING_DONE
+        or final_snapshot.get("snapshot_receipt_sha256")
+        != rebind.get("receipt_sha256")
+        or not isinstance(final_selector, dict)
+        or final_selector != routing
+        or not isinstance(final_green, dict)
+        or final_green.get("active") is not False
+        or final_green.get("unit") != expected_green_unit
+        or final_green.get("error") is not None
+    ):
+        return None
+    schema_changed = final_snapshot.get("schema_changed")
+    transition_sha256 = final_snapshot.get("transition_sha256")
+    if schema_changed is True:
+        if (
+            SHA256_RE.fullmatch(str(transition_sha256 or "")) is None
+            or rebind.get("publication_schema_transition_sha256")
+            != transition_sha256
+        ):
+            return None
+    elif schema_changed is False:
+        if (
+            transition_sha256 is not None
+            or rebind.get("publication_schema_transition_sha256") is not None
+        ):
+            return None
+    else:
+        return None
+    readback = receipt.get("authoritative_readback")
+    if (
+        not isinstance(readback, dict)
+        or readback.get("authoritative") is not True
+        or set(readback) != {"authoritative", "selector", "ingress", "readback_sha256"}
+    ):
+        return None
+    readback_material = dict(readback)
+    readback_sha256 = readback_material.pop("readback_sha256", None)
+    readback_selector = readback.get("selector")
+    ingress = readback.get("ingress")
+    if (
+        canonical_json_sha256(readback_material) != readback_sha256
+        or readback_selector != routing
+        or not isinstance(ingress, dict)
+        or ingress.get("selector_sha256") != routing.get("selector_sha256")
+        or ingress.get("selector_generation") != routing.get("generation")
+        or ingress.get("selected_slot") != CANONICAL_SLOT
+        or ingress.get("upstream_port") != routing.get("upstream_port")
+        or ingress.get("runtime_binding_sha256")
+        != binding.get("expected_runtime_binding_sha256")
+        or ingress.get("release_id") != binding.get("expected_release_id")
+        or ingress.get("repo_head") != binding.get("target_head")
+    ):
+        return None
+    return binding
 
 
 def _lineage_resolved(
     receipts: Iterable[dict[str, Any]], cutover: dict[str, Any]
 ) -> bool:
     """True only for a completed resume bound to *this exact* cutover receipt."""
+    try:
+        cutover = validate_cutover_receipt(cutover)
+        activation = activation_observation(cutover)
+    except MidCutoverEvidenceError:
+        return False
+    switch = _switch_evidence(cutover)
+    if switch is None:
+        return False
     expected = (
         cutover.get("cutover_id"),
         cutover.get("receipt_sha256"),
@@ -770,8 +1197,38 @@ def _lineage_resolved(
         binding = _completed_lineage_binding(receipt)
         if binding is None:
             continue
-        if (binding[0], binding[1], binding[3], binding[4]) == expected:
-            return True
+        identity_matches = (
+            binding.get("cutover_id"),
+            binding.get("resumed_receipt_sha256"),
+            binding.get("target_head"),
+            binding.get("expected_release_id"),
+        ) == expected
+        if not identity_matches:
+            continue
+        if (
+            binding.get("cutover_generation") != cutover.get("cutover_generation")
+            or binding.get("blue_release_id") != cutover.get("blue_release_id")
+            or binding.get("source_identity_sha256")
+            != cutover.get("source_identity_sha256")
+            or binding.get("switch_generation") != switch.get("generation")
+            or binding.get("switch_selector_sha256")
+            != switch.get("selector_sha256")
+            or binding.get("expected_runtime_binding_sha256")
+            != switch.get("runtime_binding_sha256")
+            or binding.get("source_evidence_time")
+            != activation.get("source_evidence_time")
+            or binding.get("activation_observation_sha256")
+            != activation.get("observation_sha256")
+            or binding.get("publication_request_id")
+            != activation.get("publication_request_id")
+            or binding.get("registered_names_sha256")
+            != cutover.get("names_sha256")
+            or binding.get("agent_instructions_sha256")
+            != cutover.get("agent_instructions_sha256")
+            or binding.get("green_readiness") != cutover.get("green_readiness")
+        ):
+            continue
+        return True
     return False
 
 
@@ -834,8 +1291,8 @@ def claimed_resolution_cutover_ids(receipts: Iterable[dict[str, Any]]) -> set[st
     resolved: set[str] = set()
     for receipt in receipts:
         binding = _completed_lineage_binding(receipt)
-        if binding is not None and isinstance(binding[0], str):
-            resolved.add(binding[0])
+        if binding is not None and isinstance(binding.get("cutover_id"), str):
+            resolved.add(binding["cutover_id"])
     return resolved
 
 
@@ -917,8 +1374,12 @@ def classify_recovery_lane(
     selector_present: bool = True,
     unreadable_receipts: Sequence[dict[str, str]] = (),
     green_observation: dict[str, Any] | None = None,
+    blue_observation: dict[str, Any] | None = None,
+    activation_observation: dict[str, Any] | None = None,
+    activation_error: str | None = None,
     pointer_observation: dict[str, Any] | None = None,
     green_unit_observation: dict[str, Any] | None = None,
+    snapshot_observation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Decide which recovery lane -- if any -- this durable state admits."""
     checks: dict[str, bool] = {}
@@ -927,8 +1388,12 @@ def classify_recovery_lane(
         "selector_present": selector_present,
         "unreadable_receipts": list(unreadable_receipts),
         "green_observation": green_observation,
+        "blue_observation": blue_observation,
+        "activation_observation": activation_observation,
+        "activation_error": activation_error,
         "pointer_observation": pointer_observation,
         "green_unit_observation": green_unit_observation,
+        "snapshot_observation": snapshot_observation,
     }
 
     checks["expected_head_named"] = bool(
@@ -980,6 +1445,7 @@ def classify_recovery_lane(
         "upstream_port": selector.get("upstream_port"),
         "runtime_binding_sha256": selector.get("runtime_binding_sha256"),
         "cutover_id": selector.get("cutover_id"),
+        "previous_selector_sha256": selector.get("previous_selector_sha256"),
         "release_id": binding.get("release_id"),
         "repo_head": binding.get("repo_head"),
     }
@@ -1049,6 +1515,7 @@ def classify_recovery_lane(
         assert switch is not None
         receipt_summary = {
             "cutover_id": candidate.get("cutover_id"),
+            "cutover_generation": candidate.get("cutover_generation"),
             "receipt_sha256": candidate.get("receipt_sha256"),
             "outcome": candidate.get("outcome"),
             "phase": candidate.get("phase"),
@@ -1060,11 +1527,45 @@ def classify_recovery_lane(
             "switch_selector_sha256": switch.get("selector_sha256"),
             "switch_runtime_binding_sha256": switch.get("runtime_binding_sha256"),
         }
+        generation = candidate.get("cutover_generation")
+        activation = activation_observation
+        blue_head = (
+            blue_observation.get("repo_head")
+            if isinstance(blue_observation, dict)
+            else None
+        )
+        checks["cutover_generation_valid"] = bool(
+            not isinstance(generation, bool)
+            and isinstance(generation, int)
+            and generation >= 1
+        )
+        checks["activation_observation_valid"] = bool(
+            activation_error is None
+            and isinstance(activation, dict)
+            and isinstance(activation.get("source_evidence_time"), int)
+            and activation.get("state") == "publication_pending"
+            and isinstance(activation.get("publication_request_id"), str)
+            and SHA256_RE.fullmatch(
+                str(activation.get("observation_sha256") or "")
+            )
+            is not None
+        )
+        checks["blue_release_artifact_matches_predecessor"] = bool(
+            isinstance(blue_head, str)
+            and HEAD_RE.fullmatch(blue_head)
+            and release_id_binds_head(candidate.get("blue_release_id"), blue_head)
+            and isinstance(blue_observation, dict)
+            and blue_observation.get("error") is None
+            and blue_observation.get("release_id")
+            == candidate.get("blue_release_id")
+            and blue_observation.get("completion_status") == "complete"
+        )
         green_release = candidate.get("green_release_id")
         target_head = str(candidate.get("expected_head") or "")
         pointer_state = _pointer_state(
             pointer_observation,
             blue_release_id=candidate.get("blue_release_id"),
+            blue_repo_head=blue_head,
             target_release_id=green_release,
             target_head=target_head,
         )
@@ -1077,21 +1578,41 @@ def classify_recovery_lane(
             else None
         )
         green_retired = green_active is False
+        snapshot_state = (
+            snapshot_observation.get("state")
+            if isinstance(snapshot_observation, dict)
+            else None
+        )
+        snapshot_rebound = snapshot_state == SNAPSHOT_BINDING_DONE
         phase = (
             _resume_phase(
                 slot=str(slot),
                 pointer_promoted=pointer_promoted,
                 green_retired=green_retired,
+                snapshot_rebound=snapshot_rebound,
             )
             if pointer_state in {"blue", "target"}
+            and snapshot_state
+            in {SNAPSHOT_BINDING_PENDING, SNAPSHOT_BINDING_DONE}
             else None
         )
+        evidence["snapshot_binding_state"] = snapshot_state
+        evidence["snapshot_rebound"] = snapshot_rebound
         evidence["pointer_state"] = pointer_state
         evidence["pointer_promoted"] = pointer_promoted
         evidence["green_retired"] = green_retired
         receipt_summary["resume_phase"] = phase
 
         checks["stable_pointer_classifiable"] = pointer_state in {"blue", "target"}
+        checks["client_snapshot_classifiable"] = snapshot_state in {
+            SNAPSHOT_BINDING_PENDING,
+            SNAPSHOT_BINDING_DONE,
+        }
+        # A cutover whose snapshot rebind never happened is not finishable by
+        # promoting canonical: the contract it broke is still broken.
+        checks["snapshot_rebind_precedes_promotion"] = (
+            snapshot_rebound or phase == PHASE_REBIND_SNAPSHOT
+        )
         checks["green_unit_state_known"] = (
             green_active is not None if slot == CANONICAL_SLOT else True
         )
@@ -1137,6 +1658,10 @@ def classify_recovery_lane(
             checks["canonical_generation_follows_receipt"] = (
                 selector.get("generation") == int(switch["generation"]) + 1
             )
+            checks["canonical_selector_directly_follows_switch"] = (
+                selector.get("previous_selector_sha256")
+                == switch.get("selector_sha256")
+            )
             checks["pointer_promoted_before_canonical_selector"] = pointer_promoted
 
         # Green must still be serving until it is retired; once retired, the
@@ -1160,18 +1685,40 @@ def classify_recovery_lane(
                 "cutover_id": str(candidate["cutover_id"]),
                 "resumed_receipt_sha256": str(candidate["receipt_sha256"]),
                 "resume_phase": phase,
+                "cutover_generation": int(generation),
+                "snapshot_binding_state": snapshot_state,
+                "blue_release_id": candidate.get("blue_release_id"),
+                "blue_repo_head": blue_head,
                 "target_head": target_head,
                 "expected_head": expected_head,
                 "expected_selector_sha256": str(selector["selector_sha256"]),
                 "switch_selector_sha256": str(switch["selector_sha256"]),
                 "expected_generation": int(selector["generation"]),
+                "switch_generation": int(switch["generation"]),
                 "expected_slot": str(slot),
+                "pointer_state": pointer_state,
+                "green_retired": green_retired,
                 "expected_release_id": str(green_release),
                 "expected_runtime_binding_sha256": str(
                     switch["runtime_binding_sha256"]
                 ),
                 "expected_upstream_port": selector.get("upstream_port"),
                 "source_identity_sha256": candidate.get("source_identity_sha256"),
+                "source_evidence_time": activation.get("source_evidence_time"),
+                "activation_observation_sha256": activation.get(
+                    "observation_sha256"
+                ),
+                "publication_request_id": activation.get(
+                    "publication_request_id"
+                ),
+                "registered_tool_count": candidate.get("green_readiness", {}).get(
+                    "complete_schema_count"
+                ),
+                "registered_names_sha256": candidate.get("names_sha256"),
+                "agent_instructions_sha256": candidate.get(
+                    "agent_instructions_sha256"
+                ),
+                "green_readiness": candidate.get("green_readiness"),
             }
             resume_binding["binding_sha256"] = canonical_json_sha256(resume_binding)
 

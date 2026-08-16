@@ -1049,6 +1049,15 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
 
 
 class CentralTransportGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The contract-test operator is intentionally loaded against a fake
+        # deployment module.  Do not let a serving identity frozen by an
+        # earlier full-suite module leak into that isolated operator; the
+        # dedicated StaleServingProcessGateTests below exercise the real
+        # mismatch boundary explicitly.
+        serving.reset_for_tests()
+        self.addCleanup(serving.reset_for_tests)
+
     @staticmethod
     def mutating_tool() -> object:
         return types.SimpleNamespace(

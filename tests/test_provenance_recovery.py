@@ -239,6 +239,15 @@ class ProvenanceRecoveryGateTests(unittest.TestCase):
             patch.object(
                 provenance_recovery, "_blockade_evidence", return_value=blockade
             ),
+            patch.object(
+                provenance_recovery,
+                "_recovery_lane",
+                return_value={
+                    "lane": provenance_recovery.midcutover.LANE_SCHEDULED_DEPLOY,
+                    "resume_binding": None,
+                    "reasons": [],
+                },
+            ),
         ):
             return provenance_recovery.evaluate_gate(HEAD)
 
@@ -796,6 +805,98 @@ class DispatchOutcomeTests(unittest.TestCase):
 
         self.assertEqual(seen[0], seen[1])
         self.assertEqual(len(seen[0]), 64)
+
+
+class MidCutoverCompletionWarrantTests(unittest.TestCase):
+    def _gate(self, *, phase: str, repair_warranted: bool, lane: str | None = None):
+        selected_lane = lane or provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME
+        recovery_lane = {
+            "lane": selected_lane,
+            "resume_binding": (
+                {"binding_sha256": "ab" * 32, "resume_phase": phase}
+                if selected_lane
+                == provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME
+                else None
+            ),
+            "reasons": [],
+        }
+        with (
+            patch.object(
+                provenance_recovery.base,
+                "_verify_audit_log",
+                return_value={"valid": True, "audit_writable": True},
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_kill_switch_state",
+                return_value={"engaged": False},
+            ),
+            patch.object(
+                provenance_recovery.privileged,
+                "grabowski_privileged_broker_status",
+                return_value={"ready": True},
+            ),
+            patch.object(
+                provenance_recovery,
+                "_integrity_evidence",
+                return_value={"repair_warranted": repair_warranted},
+            ),
+            patch.object(
+                provenance_recovery,
+                "_blockade_evidence",
+                return_value={"allows_mutation": True},
+            ),
+            patch.object(
+                provenance_recovery,
+                "_competing_deployment_evidence",
+                return_value={
+                    "deploy_lock_free": True,
+                    "inflight_deploy_jobs": [],
+                    "error": None,
+                },
+            ),
+            patch.object(
+                provenance_recovery, "_recovery_lane", return_value=recovery_lane
+            ),
+        ):
+            return provenance_recovery.evaluate_resume_gate(HEAD)
+
+    def test_start_warrant_opens_s0_only_while_integrity_is_invalid(self) -> None:
+        opened = self._gate(
+            phase=provenance_recovery.midcutover.PHASE_REBIND_SNAPSHOT,
+            repair_warranted=True,
+        )
+        self.assertTrue(opened["allowed"])
+        self.assertTrue(opened["start_warrant"])
+        self.assertFalse(opened["completion_warrant"])
+
+        closed = self._gate(
+            phase=provenance_recovery.midcutover.PHASE_REBIND_SNAPSHOT,
+            repair_warranted=False,
+        )
+        self.assertFalse(closed["allowed"])
+        self.assertIn("start_or_completion_warrant", closed["reasons"])
+
+    def test_completion_warrant_finishes_only_an_applied_lineage(self) -> None:
+        for phase in (
+            provenance_recovery.midcutover.PHASE_PROMOTE_POINTER,
+            provenance_recovery.midcutover.PHASE_SELECT_CANONICAL,
+            provenance_recovery.midcutover.PHASE_RETIRE_GREEN,
+            provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        ):
+            with self.subTest(phase=phase):
+                gate = self._gate(phase=phase, repair_warranted=False)
+                self.assertTrue(gate["allowed"], gate["reasons"])
+                self.assertFalse(gate["start_warrant"])
+                self.assertTrue(gate["completion_warrant"])
+
+        foreign = self._gate(
+            phase=provenance_recovery.midcutover.PHASE_CLOSEOUT,
+            repair_warranted=False,
+            lane=provenance_recovery.midcutover.LANE_FAIL_CLOSED,
+        )
+        self.assertFalse(foreign["allowed"])
+        self.assertFalse(foreign["completion_warrant"])
 
 
 class IntegrityStateTests(unittest.TestCase):

@@ -502,9 +502,25 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
     competing = _competing_deployment_evidence()
     lane = _recovery_lane(expected_head)
     resume_binding = lane.get("resume_binding")
+    resume_phase = (
+        resume_binding.get("resume_phase")
+        if isinstance(resume_binding, dict)
+        else None
+    )
+    start_warrant = bool(integrity["repair_warranted"])
+    completion_warrant = bool(
+        lane.get("lane") == midcutover.LANE_MID_CUTOVER_RESUME
+        and resume_phase
+        in {
+            midcutover.PHASE_PROMOTE_POINTER,
+            midcutover.PHASE_SELECT_CANONICAL,
+            midcutover.PHASE_RETIRE_GREEN,
+            midcutover.PHASE_CLOSEOUT,
+        }
+    )
 
     checks = {
-        "repair_warranted": bool(integrity["repair_warranted"]),
+        "start_or_completion_warrant": start_warrant or completion_warrant,
         "audit_chain_valid": bool(audit.get("valid")),
         "audit_writable": bool(audit.get("audit_writable", audit.get("valid"))),
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
@@ -533,6 +549,8 @@ def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
         "recovery_lane": lane,
         "resume_binding": resume_binding,
         "runtime_integrity": integrity,
+        "start_warrant": start_warrant,
+        "completion_warrant": completion_warrant,
         "audit": {
             "valid": bool(audit.get("valid")),
             "writable": bool(audit.get("audit_writable", audit.get("valid"))),

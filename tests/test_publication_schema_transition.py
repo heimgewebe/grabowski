@@ -30,6 +30,7 @@ for module_root in (SRC, TOOLS):
 
 import grabowski_client_snapshot as client_snapshot
 import grabowski_connector_contract as connector_contract
+import grabowski_midcutover_resume as midcutover
 
 
 HEAD_BLUE = "a" * 40
@@ -132,6 +133,9 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         state_root = Path(self._temporary.name) / "snapshot"
         state_root.mkdir(mode=0o700)
         publication_root = state_root / "platform-publication"
+        receipt_root = state_root / "blue-green-receipts"
+        receipt_root.mkdir(mode=0o700)
+        self.receipt_root = receipt_root
         self.state_root = state_root
         self.snapshot_path = state_root / "current.json"
         patcher = mock.patch.multiple(
@@ -146,6 +150,7 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             PLATFORM_PUBLICATION_RECEIPT_ROOT=publication_root / "receipts",
             PLATFORM_PUBLICATION_RESOLUTION_ROOT=publication_root / "resolutions",
             PLATFORM_PUBLICATION_CURRENT_PATH=publication_root / "current.json",
+            BLUE_GREEN_RECEIPT_ROOT=receipt_root,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -182,23 +187,73 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         schema_by_tool: dict[str, str] = GREEN_SCHEMA_BY_TOOL,
         complete_schema_sha256: str = GREEN_COMPLETE_SCHEMA,
         cutover_id: str = CUTOVER_ID,
+        source_evidence_time: int | None = None,
+        publication_request_id: str | None = None,
+        now_unix: int | None = None,
     ) -> dict[str, object]:
-        return client_snapshot.rebind_authentic_snapshot_for_cutover(
-            cutover_id=cutover_id,
-            cutover_generation=1,
-            current_release_id="blue",
-            current_repo_head=HEAD_BLUE,
-            green_release_id="green",
-            green_repo_head=HEAD_GREEN,
-            registered_tool_count=TOOL_COUNT,
-            registered_names_sha256=NAMES_SHA256,
-            agent_instructions_sha256=INSTRUCTIONS_SHA256,
-            green_readiness=_green_readiness(
-                schema_by_tool=schema_by_tool,
-                complete_schema_sha256=complete_schema_sha256,
-            ),
-            now_unix=self.now_unix,
+        readiness = _green_readiness(
+            schema_by_tool=schema_by_tool,
+            complete_schema_sha256=complete_schema_sha256,
         )
+        parameters = {
+            "cutover_id": cutover_id,
+            "cutover_generation": 1,
+            "current_release_id": "blue",
+            "current_repo_head": HEAD_BLUE,
+            "green_release_id": "green",
+            "green_repo_head": HEAD_GREEN,
+            "registered_tool_count": TOOL_COUNT,
+            "registered_names_sha256": NAMES_SHA256,
+            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "green_readiness": readiness,
+        }
+        if source_evidence_time is None and publication_request_id is None:
+            return client_snapshot.rebind_authentic_snapshot_for_cutover(
+                **parameters,
+                now_unix=self.now_unix if now_unix is None else now_unix,
+            )
+        activation = {
+            "phase": "platform_publication_activation",
+            "observed_at_unix": (
+                self.now_unix
+                if source_evidence_time is None
+                else source_evidence_time
+            ),
+            "details": {
+                "request_id": publication_request_id,
+                "state": "publication_pending",
+            },
+        }
+        activation["observation_sha256"] = midcutover.canonical_json_sha256(
+            activation
+        )
+        cutover = {
+            "schema_version": 1,
+            "kind": midcutover.CUTOVER_RECEIPT_KIND,
+            "cutover_id": cutover_id,
+            "cutover_generation": 1,
+            "blue_release_id": "blue",
+            "green_release_id": "green",
+            "expected_head": HEAD_GREEN,
+            "names_sha256": NAMES_SHA256,
+            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "green_readiness": readiness,
+            "observations": [activation],
+        }
+        cutover["receipt_sha256"] = midcutover.canonical_json_sha256(cutover)
+        client_snapshot._write_private_json(
+            self.receipt_root / f"{cutover_id}.json", cutover
+        )
+        with mock.patch.object(
+            client_snapshot.time,
+            "time",
+            return_value=self.now_unix if now_unix is None else now_unix,
+        ):
+            return client_snapshot.rebind_snapshot_for_midcutover_recovery(
+                **parameters,
+                observation_scope=client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+                receipt_root=self.receipt_root,
+            )
 
     def _assert_snapshot_untouched(self) -> None:
         self.assertEqual(
@@ -340,6 +395,200 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             status["connector_schema_transition"]["target_complete_schema_sha256"],
             GREEN_COMPLETE_SCHEMA,
         )
+
+    def test_historical_freshness_is_independent_of_recovery_time(self) -> None:
+        prepared = self._prepare_publication()
+        cases = (
+            ("today_fresh_then_fresh", self.now_unix, self.now_unix, True),
+            ("today_stale_but_then_fresh", self.now_unix, 5_000, True),
+            ("already_expired_then", self.now_unix + 61, 5_000, False),
+            ("created_after_evidence", self.now_unix - 200, 5_000, False),
+        )
+        for label, source_time, recovery_time, allowed in cases:
+            with self.subTest(case=label):
+                client_snapshot._write_private_json(self.snapshot_path, self.source)
+                if allowed:
+                    result = self._rebind(
+                        source_evidence_time=source_time,
+                        publication_request_id=prepared["request_id"],
+                        now_unix=recovery_time,
+                    )
+                    persisted = json.loads(
+                        self.snapshot_path.read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        persisted["cutover_transition"]["source_evidence_time"],
+                        source_time,
+                    )
+                    self.assertEqual(persisted["created_at_unix"], recovery_time)
+                    self.assertEqual(result["state"], "matched")
+                else:
+                    with self.assertRaisesRegex(
+                        client_snapshot.ClientSnapshotError,
+                        "not fresh at source evidence time",
+                    ):
+                        self._rebind(
+                            source_evidence_time=source_time,
+                            publication_request_id=prepared["request_id"],
+                            now_unix=recovery_time,
+                        )
+                    self._assert_snapshot_untouched()
+
+    def test_historical_request_and_current_authorization_are_orthogonal(self) -> None:
+        prepared = self._prepare_publication()
+        with self.assertRaisesRegex(
+            client_snapshot.ClientSnapshotError,
+            "does not name the cutover activation request",
+        ):
+            self._rebind(
+                source_evidence_time=self.now_unix,
+                publication_request_id="gpp-foreign-history",
+                now_unix=5_000,
+            )
+        self._assert_snapshot_untouched()
+
+        result = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        self.assertTrue(result["schema_changed"])
+
+    def test_canonical_inspection_proves_predecessor_and_rebound_lineage(self) -> None:
+        prepared = self._prepare_publication()
+        readiness = _green_readiness(
+            schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+        )
+        parameters = {
+            "cutover_id": CUTOVER_ID,
+            "cutover_generation": 1,
+            "source_release_id": "blue",
+            "source_repo_head": HEAD_BLUE,
+            "target_release_id": "green",
+            "target_repo_head": HEAD_GREEN,
+            "source_evidence_time": self.now_unix,
+            "publication_request_id": prepared["request_id"],
+            "registered_tool_count": TOOL_COUNT,
+            "registered_names_sha256": NAMES_SHA256,
+            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "green_readiness": readiness,
+            "path": self.snapshot_path,
+            "now_unix": 5_000,
+        }
+        before = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
+        self.assertEqual(
+            before["state"], client_snapshot.SNAPSHOT_BINDING_PREDECESSOR
+        )
+        result = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        after = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
+        self.assertEqual(after["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND)
+        self.assertEqual(after["snapshot_receipt_sha256"], result["receipt_sha256"])
+
+        tampered = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        tampered["cutover_binding"]["cutover_generation"] = 2
+        tampered.pop("receipt_sha256")
+        tampered["receipt_sha256"] = client_snapshot._sha256_json(tampered)
+        client_snapshot._write_private_json(self.snapshot_path, tampered)
+        foreign = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
+        self.assertEqual(foreign["state"], client_snapshot.SNAPSHOT_BINDING_FOREIGN)
+
+    def test_cold_rebound_inspection_refuses_revoked_current_authorization(self) -> None:
+        prepared = self._prepare_publication()
+        self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        request = client_snapshot._read_publication_request(prepared["request_id"])
+        client_snapshot._write_publication_current(
+            request_id=prepared["request_id"],
+            contract_sha256=request["expected_contract"]["tool_contract_sha256"],
+            state="pending_activation",
+            now_unix=5_001,
+        )
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            cutover_id=CUTOVER_ID,
+            cutover_generation=1,
+            source_release_id="blue",
+            source_repo_head=HEAD_BLUE,
+            target_release_id="green",
+            target_repo_head=HEAD_GREEN,
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            registered_tool_count=TOOL_COUNT,
+            registered_names_sha256=NAMES_SHA256,
+            agent_instructions_sha256=INSTRUCTIONS_SHA256,
+            green_readiness=_green_readiness(
+                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+            ),
+            path=self.snapshot_path,
+            now_unix=5_001,
+        )
+        self.assertNotEqual(
+            observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND
+        )
+        self.assertEqual(observed["state"], client_snapshot.SNAPSHOT_BINDING_UNREADABLE)
+
+    def test_cold_inspection_revalidates_complete_rebind_time_and_transition(self) -> None:
+        prepared = self._prepare_publication()
+        self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        authentic = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        parameters = {
+            "cutover_id": CUTOVER_ID,
+            "cutover_generation": 1,
+            "source_release_id": "blue",
+            "source_repo_head": HEAD_BLUE,
+            "target_release_id": "green",
+            "target_repo_head": HEAD_GREEN,
+            "source_evidence_time": self.now_unix,
+            "publication_request_id": prepared["request_id"],
+            "registered_tool_count": TOOL_COUNT,
+            "registered_names_sha256": NAMES_SHA256,
+            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "green_readiness": _green_readiness(
+                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+            ),
+            "path": self.snapshot_path,
+            "now_unix": 5_000,
+        }
+        for label in ("source_declaration", "publication_state", "rebind_ttl"):
+            with self.subTest(contract=label):
+                tampered = json.loads(json.dumps(authentic))
+                if label == "source_declaration":
+                    tampered["cutover_transition"][
+                        "source_client_declaration_sha256"
+                    ] = "ee" * 32
+                elif label == "publication_state":
+                    transition = tampered["cutover_transition"][
+                        "publication_schema_transition"
+                    ]
+                    transition["publication_state"] = "pending_activation"
+                    transition.pop("transition_sha256")
+                    transition["transition_sha256"] = client_snapshot._sha256_json(
+                        transition
+                    )
+                else:
+                    tampered["expires_at_unix"] += 1
+                tampered.pop("receipt_sha256")
+                tampered["receipt_sha256"] = client_snapshot._sha256_json(tampered)
+                client_snapshot._write_private_json(self.snapshot_path, tampered)
+                observed = client_snapshot.inspect_cutover_snapshot_binding(
+                    **parameters
+                )
+                self.assertNotEqual(
+                    observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND
+                )
 
 
 if __name__ == "__main__":

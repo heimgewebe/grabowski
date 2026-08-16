@@ -1055,11 +1055,24 @@ def _open_cutover_target_head(classification: dict[str, Any]) -> str | None:
 
 def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, Any]:
     """Continue the stranded cutover; deploy nothing."""
-    result = deploy_dual.resume_production_blue_green_cutover(
-        repo=repo,
-        expected_head=decision["resume_target_head"],
-        require_resume_binding_sha256=decision["resume_binding_sha256"],
-    )
+    try:
+        result = deploy_dual.resume_production_blue_green_cutover(
+            repo=repo,
+            expected_head=decision["resume_target_head"],
+            require_resume_binding_sha256=decision["resume_binding_sha256"],
+        )
+    except deploy_dual.ProductionBlueGreenReceiptPersistenceError as exc:
+        result = {
+            "receipt": exc.receipt,
+            "receipt_path": None,
+            "receipt_sha256": exc.receipt_sha256,
+            "receipt_persisted": False,
+            "receipt_persistence_error_type": exc.persistence_error_type,
+            "outcome": exc.outcome,
+            "error": None,
+            "blind_retry_allowed": False,
+            "fresh_classification_required": True,
+        }
     receipt = result.get("receipt") or {}
     summary = {
         "schema_version": 1,
@@ -1073,7 +1086,14 @@ def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, 
         "execution_head": decision["execution_head"],
     }
     summary["summary_sha256"] = canonical_json_sha256(summary)
-    emit("midcutover-resume-receipt", **summary)
+    emit(
+        (
+            "midcutover-resume-receipt"
+            if result.get("receipt_persisted") is not False
+            else "midcutover-resume-receipt-persistence-failed"
+        ),
+        **summary,
+    )
     return {**result, "summary": summary}
 
 
@@ -1157,7 +1177,12 @@ def run_resume_only(
             failure_type=failure_type,
             blue_green=None,
         )
-    return 0 if outcome == "completed" else 1
+    return (
+        0
+        if outcome == "completed"
+        and resume_result.get("receipt_persisted") is True
+        else 1
+    )
 
 
 def main() -> int:

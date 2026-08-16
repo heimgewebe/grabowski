@@ -184,11 +184,16 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             snapshot_path = state_root / "current.json"
             source = self._source_receipt(now_unix)
-            with mock.patch.multiple(
-                client_snapshot,
-                STATE_ROOT=state_root,
-                LOCK_PATH=state_root / "snapshot.lock",
-                SNAPSHOT_PATH=snapshot_path,
+            with (
+                mock.patch.multiple(
+                    client_snapshot,
+                    STATE_ROOT=state_root,
+                    LOCK_PATH=state_root / "snapshot.lock",
+                    SNAPSHOT_PATH=snapshot_path,
+                ),
+                mock.patch.object(
+                    client_snapshot, "_read_publication_current", return_value=None
+                ),
             ):
                 client_snapshot._write_private_json(snapshot_path, source)
                 result = client_snapshot.rebind_authentic_snapshot_for_cutover(
@@ -302,11 +307,16 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
             drifted = dict(SCHEMA_SHA256_BY_TOOL)
             first = sorted(drifted)[0]
             drifted[first] = "ab" * 32
-            with mock.patch.multiple(
-                client_snapshot,
-                STATE_ROOT=state_root,
-                LOCK_PATH=state_root / "snapshot.lock",
-                SNAPSHOT_PATH=snapshot_path,
+            with (
+                mock.patch.multiple(
+                    client_snapshot,
+                    STATE_ROOT=state_root,
+                    LOCK_PATH=state_root / "snapshot.lock",
+                    SNAPSHOT_PATH=snapshot_path,
+                ),
+                mock.patch.object(
+                    client_snapshot, "_read_publication_current", return_value=None
+                ),
             ):
                 client_snapshot._write_private_json(snapshot_path, source)
                 # Schema drift is still refused before anything is written --
@@ -350,11 +360,16 @@ class AuthenticSnapshotCutoverTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             snapshot_path = state_root / "current.json"
             source = self._source_receipt(now_unix)
-            with mock.patch.multiple(
-                client_snapshot,
-                STATE_ROOT=state_root,
-                LOCK_PATH=state_root / "snapshot.lock",
-                SNAPSHOT_PATH=snapshot_path,
+            with (
+                mock.patch.multiple(
+                    client_snapshot,
+                    STATE_ROOT=state_root,
+                    LOCK_PATH=state_root / "snapshot.lock",
+                    SNAPSHOT_PATH=snapshot_path,
+                ),
+                mock.patch.object(
+                    client_snapshot, "_read_publication_current", return_value=None
+                ),
             ):
                 client_snapshot._write_private_json(snapshot_path, source)
                 # Schema drift is still refused before anything is written --
@@ -1280,6 +1295,16 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
                 side_effect=lambda *_args, **_kwargs: events.append("activate-pointer"),
             ),
             mock.patch.object(
+                dual.midcutover,
+                "observe_stable_pointer",
+                return_value={
+                    "error": None,
+                    "pointer_kind": "symlink",
+                    "release_id": "green",
+                    "repo_head": HEAD_GREEN,
+                },
+            ),
+            mock.patch.object(
                 dual,
                 "stop_service",
                 side_effect=lambda *_args, **_kwargs: events.append("stop-blue"),
@@ -1383,6 +1408,16 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
         with (
             mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
             mock.patch.object(dual.core, "activate_pointer"),
+            mock.patch.object(
+                dual.midcutover,
+                "observe_stable_pointer",
+                return_value={
+                    "error": None,
+                    "pointer_kind": "symlink",
+                    "release_id": "green",
+                    "repo_head": HEAD_GREEN,
+                },
+            ),
             mock.patch.object(dual, "stop_service"),
             mock.patch.object(dual, "observe_service", return_value=mock.Mock(confirmed_active=True)),
             mock.patch.object(dual, "_require_selector_authority", return_value={"authoritative": True}),
@@ -1427,6 +1462,109 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
         self.assertEqual(
             run.call_args.kwargs["timeout"], dual.core.TIMEOUTS["systemd_query"]
         )
+
+
+class ResumeReceiptPersistenceParityTests(unittest.TestCase):
+    def _persistence_error(self):
+        receipt = {
+            "schema_version": 1,
+            "kind": dual.MIDCUTOVER_RESUME_RECEIPT_KIND,
+            "resume_id": "bgcr-persistence-test",
+            "resumed_cutover_id": "bgc-persistence-test",
+            "receipt_sha256": "9d" * 32,
+            "outcome": "completed",
+            "phase": "completed",
+        }
+        return dual.ProductionBlueGreenReceiptPersistenceError(
+            receipt, OSError("receipt filesystem full")
+        )
+
+    def test_scheduled_resume_preserves_applied_effect_semantics(self) -> None:
+        import run_scheduled_deploy as runner
+
+        decision = {
+            "resume_target_head": HEAD_GREEN,
+            "resume_binding_sha256": "ab" * 32,
+            "execution_head": HEAD_GREEN,
+        }
+        events: list[str] = []
+        with (
+            mock.patch.object(
+                runner.deploy_dual,
+                "resume_production_blue_green_cutover",
+                side_effect=self._persistence_error(),
+            ),
+            mock.patch.object(
+                runner, "emit", side_effect=lambda phase, **_fields: events.append(phase)
+            ),
+        ):
+            result = runner.run_midcutover_resume(repo=ROOT, decision=decision)
+        self.assertFalse(result["receipt_persisted"])
+        self.assertFalse(result["blind_retry_allowed"])
+        self.assertTrue(result["fresh_classification_required"])
+        self.assertEqual(result["outcome"], "completed")
+        self.assertIn("midcutover-resume-receipt-persistence-failed", events)
+
+    def test_standalone_resume_reports_the_same_unpersisted_effect(self) -> None:
+        import run_midcutover_resume as runner
+
+        events: list[tuple[str, dict[str, object]]] = []
+        with (
+            mock.patch.object(
+                runner.deploy_dual,
+                "resume_production_blue_green_cutover",
+                side_effect=self._persistence_error(),
+            ),
+            mock.patch.object(
+                runner,
+                "emit",
+                side_effect=lambda phase, **fields: events.append((phase, fields)),
+            ),
+        ):
+            returncode = runner.main(
+                [
+                    "--repo",
+                    str(ROOT),
+                    "--expected-head",
+                    HEAD_GREEN,
+                    "--cutover-id",
+                    "bgc-persistence-test",
+                    "--resume-binding-sha256",
+                    "ab" * 32,
+                ]
+            )
+        self.assertEqual(returncode, 1)
+        failure = next(
+            fields
+            for phase, fields in events
+            if phase == "midcutover-resume-receipt-persistence-failed"
+        )
+        self.assertFalse(failure["receipt_persisted"])
+        self.assertTrue(failure["retry_requires_reclassification"])
+        self.assertTrue(failure["effect_applied"])
+
+    def test_resume_only_job_exits_nonzero_when_terminal_receipt_is_unpersisted(self) -> None:
+        import run_scheduled_deploy as runner
+
+        decision = {
+            "repo": str(ROOT),
+            "resume_target_head": HEAD_GREEN,
+            "resume_binding_sha256": "ab" * 32,
+            "execution_head": HEAD_GREEN,
+        }
+        result = {
+            "receipt": self._persistence_error().receipt,
+            "receipt_persisted": False,
+            "outcome": "completed",
+            "blind_retry_allowed": False,
+            "fresh_classification_required": True,
+        }
+        with (
+            mock.patch.object(runner, "run_midcutover_resume", return_value=result),
+            mock.patch.object(runner, "emit"),
+        ):
+            returncode = runner.run_resume_only(decision, binding=None)
+        self.assertEqual(returncode, 1)
 
 
 class ScheduledPathContractTests(unittest.TestCase):
