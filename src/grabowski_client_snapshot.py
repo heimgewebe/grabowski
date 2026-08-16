@@ -979,6 +979,9 @@ def _rebind_snapshot_for_cutover(
     source_evidence_time: int | None = None,
     publication_request_id: str | None = None,
     now_unix: int | None = None,
+    expected_source_snapshot_receipt_sha256: str | None = None,
+    expected_source_client_declaration_sha256: str | None = None,
+    expected_classified_snapshot_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Rebind one prior blue declaration to independently verified Green.
 
@@ -1012,6 +1015,28 @@ def _rebind_snapshot_for_cutover(
     instructions_sha256 = _require_authentic_digest(
         agent_instructions_sha256, label="agent_instructions_sha256"
     )
+    expected_snapshot_identity = (
+        expected_source_snapshot_receipt_sha256,
+        expected_source_client_declaration_sha256,
+        expected_classified_snapshot_receipt_sha256,
+    )
+    if any(value is not None for value in expected_snapshot_identity):
+        if any(value is None for value in expected_snapshot_identity):
+            raise ClientSnapshotError(
+                "classified snapshot identity must be supplied as one complete binding"
+            )
+        expected_source_snapshot_receipt_sha256 = _require_authentic_digest(
+            expected_source_snapshot_receipt_sha256,
+            label="expected source snapshot receipt_sha256",
+        )
+        expected_source_client_declaration_sha256 = _require_authentic_digest(
+            expected_source_client_declaration_sha256,
+            label="expected source client_declaration_sha256",
+        )
+        expected_classified_snapshot_receipt_sha256 = _require_authentic_digest(
+            expected_classified_snapshot_receipt_sha256,
+            label="expected classified snapshot receipt_sha256",
+        )
     current_release = _validate_release_id(
         current_release_id, label="current release id"
     )
@@ -1052,6 +1077,17 @@ def _rebind_snapshot_for_cutover(
             source.get("client_declaration_sha256"),
             label="source client_declaration_sha256",
         )
+        if expected_source_snapshot_receipt_sha256 is not None and (
+            source_receipt_sha256
+            != expected_source_snapshot_receipt_sha256
+            or source_receipt_sha256
+            != expected_classified_snapshot_receipt_sha256
+            or source_declaration_sha256
+            != expected_source_client_declaration_sha256
+        ):
+            raise ClientSnapshotError(
+                "classified predecessor snapshot identity changed before rebind"
+            )
         historical_time = (
             timestamp if source_evidence_time is None else source_evidence_time
         )
@@ -1246,6 +1282,13 @@ def _rebind_snapshot_for_cutover(
         "observation_scope": observation_scope,
         "client_declaration_sha256": source_declaration_sha256,
         "source_receipt_sha256": source_receipt_sha256,
+        "source_snapshot_receipt_sha256": source_receipt_sha256,
+        "source_client_declaration_sha256": source_declaration_sha256,
+        "classified_snapshot_receipt_sha256": source_receipt_sha256,
+        "source_release_id": current_release,
+        "source_repo_head": current_repo_head,
+        "target_release_id": green_release,
+        "target_repo_head": green_repo_head,
         "receipt_sha256": receipt["receipt_sha256"],
         "cutover_binding": cutover_binding,
         "cutover_transition": transition,
@@ -2743,6 +2786,9 @@ def rebind_snapshot_for_midcutover_recovery(
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
     observation_scope: str,
+    source_snapshot_receipt_sha256: str,
+    source_client_declaration_sha256: str,
+    classified_snapshot_receipt_sha256: str,
     receipt_root: Path | None = None,
 ) -> dict[str, Any]:
     """Rebind stale legacy evidence only from its durable cutover receipt.
@@ -2845,6 +2891,23 @@ def rebind_snapshot_for_midcutover_recovery(
     else:
         raise ClientSnapshotError("cutover snapshot source scope is invalid")
 
+    source_snapshot_receipt_sha256 = _require_authentic_digest(
+        source_snapshot_receipt_sha256,
+        label="source snapshot receipt_sha256",
+    )
+    source_client_declaration_sha256 = _require_authentic_digest(
+        source_client_declaration_sha256,
+        label="source client_declaration_sha256",
+    )
+    classified_snapshot_receipt_sha256 = _require_authentic_digest(
+        classified_snapshot_receipt_sha256,
+        label="classified snapshot receipt_sha256",
+    )
+    if classified_snapshot_receipt_sha256 != source_snapshot_receipt_sha256:
+        raise ClientSnapshotError(
+            "S0 classification is not bound to its predecessor snapshot"
+        )
+
     return _rebind_snapshot_for_cutover(
         cutover_id=cutover_id,
         cutover_generation=cutover_generation,
@@ -2863,6 +2926,11 @@ def rebind_snapshot_for_midcutover_recovery(
         additional_nonclaims=nonclaims,
         source_evidence_time=activation["source_evidence_time"],
         publication_request_id=activation["publication_request_id"],
+        expected_source_snapshot_receipt_sha256=source_snapshot_receipt_sha256,
+        expected_source_client_declaration_sha256=source_client_declaration_sha256,
+        expected_classified_snapshot_receipt_sha256=(
+            classified_snapshot_receipt_sha256
+        ),
     )
 
 
@@ -2916,6 +2984,13 @@ def inspect_cutover_snapshot_binding(
         "observation_scope": None,
         "snapshot_receipt_sha256": None,
         "source_receipt_sha256": None,
+        "source_snapshot_receipt_sha256": None,
+        "source_client_declaration_sha256": None,
+        "classified_snapshot_receipt_sha256": None,
+        "source_release_id": None,
+        "source_repo_head": None,
+        "target_release_id": None,
+        "target_repo_head": None,
         "source_evidence_time": source_evidence_time,
         "publication_request_id": publication_request_id,
         "publication_transition_sha256": None,
@@ -3064,6 +3139,9 @@ def inspect_cutover_snapshot_binding(
                 "bound_repo_head": binding.get("repo_head"),
                 "observation_scope": observation_scope,
                 "snapshot_receipt_sha256": receipt.get("receipt_sha256"),
+                "classified_snapshot_receipt_sha256": receipt.get(
+                    "receipt_sha256"
+                ),
                 "schema_changed": schema_changed,
                 "current_publication_authorized": current_authorization is not None
                 if schema_changed
@@ -3084,6 +3162,14 @@ def inspect_cutover_snapshot_binding(
             )
             observation["state"] = SNAPSHOT_BINDING_PREDECESSOR
             observation["source_receipt_sha256"] = receipt.get("receipt_sha256")
+            observation["source_snapshot_receipt_sha256"] = receipt.get(
+                "receipt_sha256"
+            )
+            observation["source_client_declaration_sha256"] = receipt.get(
+                "client_declaration_sha256"
+            )
+            observation["source_release_id"] = source_release
+            observation["source_repo_head"] = source_repo_head
             return observation
 
         if binding.get("release_id") != target_release or binding.get(
@@ -3235,11 +3321,95 @@ def inspect_cutover_snapshot_binding(
             return observation
         observation["state"] = SNAPSHOT_BINDING_REBOUND
         observation["source_receipt_sha256"] = source_receipt_sha256
+        observation["source_snapshot_receipt_sha256"] = source_receipt_sha256
+        observation["source_client_declaration_sha256"] = (
+            source_declaration_sha256
+        )
+        observation["source_release_id"] = source_release
+        observation["source_repo_head"] = source_repo_head
+        observation["target_release_id"] = target_release
+        observation["target_repo_head"] = target_repo_head
         return observation
     except (ClientSnapshotError, OSError, ValueError) as exc:
         observation["state"] = SNAPSHOT_BINDING_UNREADABLE
         observation["error"] = str(exc)
         return observation
+
+
+@contextmanager
+def cutover_snapshot_effect_guard(
+    *,
+    cutover_id: str,
+    cutover_generation: int,
+    source_release_id: str,
+    source_repo_head: str,
+    target_release_id: str,
+    target_repo_head: str,
+    source_evidence_time: int,
+    publication_request_id: str,
+    registered_tool_count: int,
+    registered_names_sha256: str,
+    agent_instructions_sha256: str,
+    green_readiness: dict[str, Any],
+    expected_state: str,
+    source_snapshot_receipt_sha256: str,
+    source_client_declaration_sha256: str,
+    classified_snapshot_receipt_sha256: str,
+    path: Path = SNAPSHOT_PATH,
+) -> Iterator[dict[str, Any]]:
+    """Hold the snapshot lock from exact identity readback through one effect.
+
+    Classification authorises one immutable receipt, not a merely equivalent
+    surface.  The caller supplies only identities already present in its
+    hash-bound resume binding; this guard reuses the canonical inspection while
+    holding the same lock every snapshot writer must acquire.
+    """
+    if expected_state not in {
+        SNAPSHOT_BINDING_PREDECESSOR,
+        SNAPSHOT_BINDING_REBOUND,
+    }:
+        raise ClientSnapshotError("expected snapshot binding state is invalid")
+    expected_source_receipt = _require_authentic_digest(
+        source_snapshot_receipt_sha256,
+        label="source snapshot receipt_sha256",
+    )
+    expected_declaration = _require_authentic_digest(
+        source_client_declaration_sha256,
+        label="source client_declaration_sha256",
+    )
+    expected_classified_receipt = _require_authentic_digest(
+        classified_snapshot_receipt_sha256,
+        label="classified snapshot receipt_sha256",
+    )
+    with _state_lock():
+        observed = inspect_cutover_snapshot_binding(
+            cutover_id=cutover_id,
+            cutover_generation=cutover_generation,
+            source_release_id=source_release_id,
+            source_repo_head=source_repo_head,
+            target_release_id=target_release_id,
+            target_repo_head=target_repo_head,
+            source_evidence_time=source_evidence_time,
+            publication_request_id=publication_request_id,
+            registered_tool_count=registered_tool_count,
+            registered_names_sha256=registered_names_sha256,
+            agent_instructions_sha256=agent_instructions_sha256,
+            green_readiness=green_readiness,
+            path=path,
+        )
+        if (
+            observed.get("state") != expected_state
+            or observed.get("source_snapshot_receipt_sha256")
+            != expected_source_receipt
+            or observed.get("source_client_declaration_sha256")
+            != expected_declaration
+            or observed.get("classified_snapshot_receipt_sha256")
+            != expected_classified_receipt
+        ):
+            raise ClientSnapshotError(
+                "classified snapshot identity changed before recovery effect"
+            )
+        yield observed
 
 
 def _runtime_publication_contract_for_status(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import ctypes
 import ctypes.util
 from dataclasses import dataclass, field
@@ -5162,6 +5163,7 @@ def promote_green_release_to_canonical(
     cutover_id: str,
     timeout_seconds: int,
     progress: CanonicalPromotionProgress,
+    snapshot_effect_guard: Any | None = None,
 ) -> dict[str, Any]:
     """The one canonical promotion sequence, shared by cutover and resume.
 
@@ -5191,7 +5193,13 @@ def promote_green_release_to_canonical(
         progress.pointer_promoted = True
     else:
         progress.pointer_promoted = True
-        core.activate_pointer(activation)
+        pointer_guard = (
+            snapshot_effect_guard("pointer")
+            if callable(snapshot_effect_guard)
+            else nullcontext()
+        )
+        with pointer_guard:
+            core.activate_pointer(activation)
     pointer_readback = midcutover.observe_stable_pointer(
         runtime, core.releases_root_for(runtime)
     )
@@ -5206,44 +5214,49 @@ def promote_green_release_to_canonical(
             phase="canonical-promotion-pointer-readback",
             details={"pointer_readback": pointer_readback},
         )
-    # Admission stays engaged through the complete promotion where the caller
-    # engaged it: while it is active neither the old canonical process nor the
-    # transient green may admit a new normal tool call, so no effect can start
-    # on green and then be cut off by retirement.
-    stop_service(OPERATOR_SERVICE)
-    ingress = observe_service(TRANSPORT_INGRESS_SERVICE)
-    if not ingress.confirmed_active:
-        start_service(TRANSPORT_INGRESS_SERVICE)
-    _require_selector_authority(
-        expected_selector_sha256=expected_green_selector_sha256,
-        expected_slot="green",
-        expected_binding_sha256=expected_green_binding_sha256,
+    selector_guard = (
+        snapshot_effect_guard("selector")
+        if callable(snapshot_effect_guard)
+        else nullcontext()
     )
-    start_service(OPERATOR_SERVICE)
-    process = verify_operator_process(runtime, contract, release_hint=release_path)
-    listener = _require_loopback_listener(
-        OPERATOR_LISTENER_PORT, timeout_seconds=timeout_seconds
-    )
-    try:
-        canonical = transport_ingress.publish_routing_selector(
+    with selector_guard:
+        # Admission stays engaged through the complete promotion where the caller
+        # engaged it: while it is active neither the old canonical process nor the
+        # transient green may admit a new normal tool call, so no effect can start
+        # on green and then be cut off by retirement.
+        stop_service(OPERATOR_SERVICE)
+        ingress = observe_service(TRANSPORT_INGRESS_SERVICE)
+        if not ingress.confirmed_active:
+            start_service(TRANSPORT_INGRESS_SERVICE)
+        _require_selector_authority(
             expected_selector_sha256=expected_green_selector_sha256,
-            selected_slot="canonical",
-            runtime_binding=green_binding,
-            cutover_id=cutover_id,
+            expected_slot="green",
+            expected_binding_sha256=expected_green_binding_sha256,
         )
-    except Exception:
-        # The atomic replace may have landed even when its durable readback
-        # failed.  Only an unchanged, readable predecessor proves nothing moved;
-        # every other state is ambiguous and must forbid automatic correction.
+        start_service(OPERATOR_SERVICE)
+        process = verify_operator_process(runtime, contract, release_hint=release_path)
+        listener = _require_loopback_listener(
+            OPERATOR_LISTENER_PORT, timeout_seconds=timeout_seconds
+        )
         try:
-            observed = transport_ingress.read_routing_selector()
+            canonical = transport_ingress.publish_routing_selector(
+                expected_selector_sha256=expected_green_selector_sha256,
+                selected_slot="canonical",
+                runtime_binding=green_binding,
+                cutover_id=cutover_id,
+            )
         except Exception:
-            progress.canonical_selected = True
-        else:
-            if observed.get("selector_sha256") != expected_green_selector_sha256:
-                progress.selector = observed
+            # The atomic replace may have landed even when its durable readback
+            # failed. Only an unchanged, readable predecessor proves nothing moved.
+            try:
+                observed = transport_ingress.read_routing_selector()
+            except Exception:
                 progress.canonical_selected = True
-        raise
+            else:
+                if observed.get("selector_sha256") != expected_green_selector_sha256:
+                    progress.selector = observed
+                    progress.canonical_selected = True
+            raise
     progress.selector = canonical
     progress.canonical_selected = True
     final_readback = _require_selector_authority(
@@ -6918,6 +6931,8 @@ class MidCutoverResumeRuntime:
     green_proven: bool = False
     green_readiness: dict[str, Any] | None = None
     snapshot_rebind: dict[str, Any] | None = None
+    effect_snapshot_receipt_sha256: str | None = None
+    effect_snapshot_state: str | None = None
 
     @property
     def cutover_id(self) -> str:
@@ -6930,6 +6945,64 @@ class MidCutoverResumeRuntime:
     @property
     def canonical_selected(self) -> bool:
         return self.promotion_progress.canonical_selected
+
+    def snapshot_effect_guard(self, effect: str) -> Any:
+        """Bind one recovery effect to the exact classified snapshot."""
+        readiness = self.resume_binding.get("green_readiness")
+        if not isinstance(readiness, dict):
+            core.fail(
+                "Resume binding carries no snapshot guard readiness",
+                phase=f"midcutover-{effect}-snapshot-cas",
+            )
+        expected_receipt = self.effect_snapshot_receipt_sha256 or str(
+            self.resume_binding["classified_snapshot_receipt_sha256"]
+        )
+        expected_state = self.effect_snapshot_state or str(
+            self.resume_binding["snapshot_binding_state"]
+        )
+        canonical_state = {
+            midcutover.SNAPSHOT_BINDING_PENDING: (
+                client_snapshot.SNAPSHOT_BINDING_PREDECESSOR
+            ),
+            midcutover.SNAPSHOT_BINDING_DONE: (
+                client_snapshot.SNAPSHOT_BINDING_REBOUND
+            ),
+        }.get(expected_state)
+        if canonical_state is None:
+            core.fail(
+                "Resume binding carries no effect-safe snapshot state",
+                phase=f"midcutover-{effect}-snapshot-cas",
+            )
+        return client_snapshot.cutover_snapshot_effect_guard(
+            cutover_id=self.cutover_id,
+            cutover_generation=self.cutover_generation,
+            source_release_id=str(self.resume_binding["blue_release_id"]),
+            source_repo_head=self.blue_repo_head,
+            target_release_id=self.green_binding["release_id"],
+            target_repo_head=self.green_binding["repo_head"],
+            source_evidence_time=int(self.resume_binding["source_evidence_time"]),
+            publication_request_id=str(
+                self.resume_binding["publication_request_id"]
+            ),
+            registered_tool_count=int(
+                self.resume_binding["registered_tool_count"]
+            ),
+            registered_names_sha256=str(
+                self.resume_binding["registered_names_sha256"]
+            ),
+            agent_instructions_sha256=str(
+                self.resume_binding["agent_instructions_sha256"]
+            ),
+            green_readiness=readiness,
+            expected_state=canonical_state,
+            source_snapshot_receipt_sha256=str(
+                self.resume_binding["source_snapshot_receipt_sha256"]
+            ),
+            source_client_declaration_sha256=str(
+                self.resume_binding["source_client_declaration_sha256"]
+            ),
+            classified_snapshot_receipt_sha256=expected_receipt,
+        )
 
     def verify_green_serving(self) -> dict[str, Any]:
         """Prove green authoritatively, before anything irreversible happens.
@@ -6996,13 +7069,14 @@ class MidCutoverResumeRuntime:
                 phase="midcutover-admission-topology",
                 details=topology,
             )
-        self.admission_marker = engage_receipt_bound_deployment_admission(
-            expected_head=self.green_binding["repo_head"],
-            source_identity_sha256=str(
-                self.resume_binding["source_identity_sha256"]
-            ),
-            timeout_seconds=self.timeout_seconds,
-        )
+        with self.snapshot_effect_guard("admission-engage"):
+            self.admission_marker = engage_receipt_bound_deployment_admission(
+                expected_head=self.green_binding["repo_head"],
+                source_identity_sha256=str(
+                    self.resume_binding["source_identity_sha256"]
+                ),
+                timeout_seconds=self.timeout_seconds,
+            )
         return {
             "closed": True,
             "topology": kind,
@@ -7125,6 +7199,15 @@ class MidCutoverResumeRuntime:
             ],
             green_readiness=self.green_readiness,
             observation_scope=str(scope),
+            source_snapshot_receipt_sha256=str(
+                self.resume_binding["source_snapshot_receipt_sha256"]
+            ),
+            source_client_declaration_sha256=str(
+                self.resume_binding["source_client_declaration_sha256"]
+            ),
+            classified_snapshot_receipt_sha256=str(
+                self.resume_binding["classified_snapshot_receipt_sha256"]
+            ),
             receipt_root=self.receipt_root,
         )
         # Read the effect back before this run relies on it. A rebind that
@@ -7155,6 +7238,10 @@ class MidCutoverResumeRuntime:
         if (
             readback.get("state") != midcutover.SNAPSHOT_BINDING_DONE
             or readback.get("snapshot_receipt_sha256") != result.get("receipt_sha256")
+            or readback.get("source_snapshot_receipt_sha256")
+            != self.resume_binding["source_snapshot_receipt_sha256"]
+            or readback.get("source_client_declaration_sha256")
+            != self.resume_binding["source_client_declaration_sha256"]
         ):
             core.fail(
                 "Snapshot rebind readback does not bind this cutover lineage",
@@ -7162,11 +7249,26 @@ class MidCutoverResumeRuntime:
                 details={"readback": readback},
             )
         self.snapshot_rebind = result
+        self.effect_snapshot_receipt_sha256 = str(result["receipt_sha256"])
+        self.effect_snapshot_state = midcutover.SNAPSHOT_BINDING_DONE
         return {
             "rebound": True,
             "readback_state": readback.get("state"),
             "readback_receipt_sha256": readback.get("snapshot_receipt_sha256"),
             "receipt_sha256": result.get("receipt_sha256"),
+            "source_snapshot_receipt_sha256": result.get(
+                "source_snapshot_receipt_sha256"
+            ),
+            "source_client_declaration_sha256": result.get(
+                "source_client_declaration_sha256"
+            ),
+            "classified_snapshot_receipt_sha256": result.get(
+                "classified_snapshot_receipt_sha256"
+            ),
+            "source_release_id": result.get("source_release_id"),
+            "source_repo_head": result.get("source_repo_head"),
+            "target_release_id": result.get("target_release_id"),
+            "target_repo_head": result.get("target_repo_head"),
             "schema_changed": result.get("schema_changed"),
             "publication_schema_transition": result.get(
                 "publication_schema_transition"
@@ -7196,6 +7298,19 @@ class MidCutoverResumeRuntime:
             "rebound": True,
             "adopted_from_durable_snapshot": True,
             "receipt_sha256": observation.get("snapshot_receipt_sha256"),
+            "source_snapshot_receipt_sha256": observation.get(
+                "source_snapshot_receipt_sha256"
+            ),
+            "source_client_declaration_sha256": observation.get(
+                "source_client_declaration_sha256"
+            ),
+            "classified_snapshot_receipt_sha256": observation.get(
+                "classified_snapshot_receipt_sha256"
+            ),
+            "source_release_id": observation.get("source_release_id"),
+            "source_repo_head": observation.get("source_repo_head"),
+            "target_release_id": observation.get("target_release_id"),
+            "target_repo_head": observation.get("target_repo_head"),
             "publication_schema_transition_sha256": observation.get(
                 "transition_sha256"
             ),
@@ -7297,6 +7412,7 @@ class MidCutoverResumeRuntime:
             cutover_id=self.cutover_id,
             timeout_seconds=self.timeout_seconds,
             progress=self.promotion_progress,
+            snapshot_effect_guard=self.snapshot_effect_guard,
         )
         self.current_selector = promotion["selector"]
         return promotion
@@ -7371,7 +7487,8 @@ class MidCutoverResumeRuntime:
                     "expected_head": expected_head,
                 },
             )
-        release_operator_deployment_admission(observed)
+        with self.snapshot_effect_guard("admission-cleanup"):
+            release_operator_deployment_admission(observed)
         residue = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
         if residue is not None:
             core.fail(
@@ -7391,13 +7508,14 @@ class MidCutoverResumeRuntime:
                 "Green retirement requires a proven canonical promotion",
                 phase="midcutover-retire-green",
             )
-        retirement = _stop_green_operator(self.green_unit)
-        admission_release = None
-        if self.admission_marker is not None:
-            admission_release = release_operator_deployment_admission(
-                self.admission_marker
-            )
-            self.admission_marker = None
+        with self.snapshot_effect_guard("retire-green"):
+            retirement = _stop_green_operator(self.green_unit)
+            admission_release = None
+            if self.admission_marker is not None:
+                admission_release = release_operator_deployment_admission(
+                    self.admission_marker
+                )
+                self.admission_marker = None
         return {**retirement, "admission_release": admission_release}
 
     def final_readback(self) -> dict[str, Any]:
@@ -7723,7 +7841,6 @@ def _midcutover_resume_receipt(
         # revision the recovery code was executed from.
         "expected_head": resume_binding.get("target_head")
         or resume_binding.get("expected_head"),
-        "execution_expected_head": resume_binding.get("expected_head"),
         "resume_phase": resume_binding.get("resume_phase"),
         "source_identity_sha256": resume_binding.get("source_identity_sha256"),
         "green_release_id": resume_binding.get("expected_release_id"),
