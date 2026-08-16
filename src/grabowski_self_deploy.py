@@ -862,6 +862,98 @@ def _deploy_command(
     ]
 
 
+MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH = Path("tools/run_midcutover_resume.py")
+MIDCUTOVER_RESUME_TIMEOUT_SECONDS = 40
+_CUTOVER_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _midcutover_resume_command(
+    repository: Path,
+    runner: Path,
+    expected_head: str,
+    cutover_id: str,
+    resume_binding_sha256: str,
+    *,
+    timeout_seconds: int = MIDCUTOVER_RESUME_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Build the exact argv of a receipt-bound mid-cutover resume.
+
+    Every argument names evidence that already exists.  There is no target to
+    choose, no source kind and no delay: the resume continues one specific
+    cutover or it does nothing at all.
+    """
+    if OBJECT_ID_RE.fullmatch(expected_head) is None:
+        raise ValueError("expected_head must be a lowercase Git object id")
+    if _CUTOVER_ID_RE.fullmatch(cutover_id or "") is None:
+        raise ValueError("cutover_id is invalid")
+    if _SHA256_RE.fullmatch(resume_binding_sha256 or "") is None:
+        raise ValueError("resume_binding_sha256 must be a lowercase SHA-256")
+    if not 5 <= timeout_seconds <= 120:
+        raise ValueError("timeout_seconds must be between 5 and 120")
+    return [
+        "/usr/bin/python3",
+        str(runner),
+        "--repo",
+        str(repository),
+        "--expected-head",
+        expected_head,
+        "--cutover-id",
+        cutover_id,
+        "--resume-binding-sha256",
+        resume_binding_sha256,
+        "--timeout-seconds",
+        str(timeout_seconds),
+    ]
+
+
+def _midcutover_resume_command_fields(command: Any) -> dict[str, str] | None:
+    """Recognise a resume argv; anything unexpected is not one."""
+    if (
+        not isinstance(command, list)
+        or len(command) != 12
+        or not all(isinstance(item, str) for item in command)
+        or command[0] != "/usr/bin/python3"
+    ):
+        return None
+    allowed = {
+        "--repo",
+        "--expected-head",
+        "--cutover-id",
+        "--resume-binding-sha256",
+        "--timeout-seconds",
+    }
+    values: dict[str, str] = {}
+    for index in range(2, len(command), 2):
+        option = command[index]
+        if option not in allowed or option in values:
+            return None
+        values[option] = command[index + 1]
+    if (
+        set(values) != allowed
+        or OBJECT_ID_RE.fullmatch(values["--expected-head"]) is None
+        or _CUTOVER_ID_RE.fullmatch(values["--cutover-id"]) is None
+        or _SHA256_RE.fullmatch(values["--resume-binding-sha256"]) is None
+        or not Path(values["--repo"]).is_absolute()
+    ):
+        return None
+    try:
+        timeout_seconds = int(values["--timeout-seconds"])
+    except ValueError:
+        return None
+    if not 5 <= timeout_seconds <= 120:
+        return None
+    return {
+        "python": command[0],
+        "runner": command[1],
+        "repository": values["--repo"],
+        "expected_head": values["--expected-head"],
+        "cutover_id": values["--cutover-id"],
+        "resume_binding_sha256": values["--resume-binding-sha256"],
+        "timeout_seconds": str(timeout_seconds),
+    }
+
+
 def _deploy_command_sha256(command: list[str]) -> str:
     return operator._argv_hash(command)
 

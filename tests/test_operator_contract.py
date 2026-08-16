@@ -19,6 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src" / "grabowski_operator.py"
 
 
+def _real_capability_catalog() -> tuple[str, ...]:
+    """The canonical capability catalog, read from the module that defines it."""
+    if str(ROOT / "src") not in sys.path:
+        sys.path.insert(0, str(ROOT / "src"))
+    import grabowski_mcp
+
+    return tuple(grabowski_mcp.ALL_CAPABILITIES)
+
+
 class _FakeAsyncLock:
     async def __aenter__(self):
         return self
@@ -119,6 +128,20 @@ def _load_operator_module():
 
     fake_base._load_policy = load_policy
     fake_base._active_profile = active_profile
+    # The capability catalog has exactly one definition, and the double must be
+    # bound to it rather than restate it: a stand-in that drifts from the real
+    # catalog would let a capability regression pass unnoticed here.
+    fake_base.ALL_CAPABILITIES = _real_capability_catalog()
+
+    def effective_capabilities(policy):
+        forbidden = set(policy.get("forbidden_capabilities", []))
+        return {
+            capability
+            for capability in active_profile(policy).get("capabilities", [])
+            if isinstance(capability, str) and capability not in forbidden
+        }
+
+    fake_base._effective_capabilities = effective_capabilities
     fake_base._kill_switch_state = lambda: {"engaged": False}
     fake_base.KILL_SWITCH_PATH = Path(
         "/home/alex/.local/state/grabowski/operator-kill-switch"
