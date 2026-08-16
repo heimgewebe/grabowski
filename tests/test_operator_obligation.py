@@ -947,6 +947,178 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertFalse(migrated["continuation_required"])
         self.assertEqual("historical", migrated["attention_class"])
 
+    def test_reader_rejects_v2_migration_reusing_legacy_prefix_evidence(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "external",
+                        "detail": "External blocker.",
+                        "reference": "probe:external",
+                        "sha256": "e" * 64,
+                    }
+                ],
+                "next_action": "Old next action.",
+            }
+        )
+        legacy_parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "disposition": "deferred",
+            "evidence": [
+                {
+                    "source": "runtime",
+                    "reference": "legacy-evidence",
+                    "sha256": "a" * 64,
+                }
+            ],
+            "next_action": "Legacy next action.",
+        }
+        obligation.resolve_obligation(legacy_parameters)
+        directory = self.root / "goo-example-work-0001"
+        legacy_path = directory / "resolution.json"
+        legacy_record = json.loads(legacy_path.read_text(encoding="utf-8"))
+        legacy_record["schema_version"] = obligation.LEGACY_RESOLUTION_SCHEMA_VERSION
+        legacy_material = {
+            key: value
+            for key, value in legacy_record.items()
+            if key not in {"resolved_at", "material_sha256", "record_sha256"}
+        }
+        legacy_record["material_sha256"] = obligation._sha256(legacy_material)
+        legacy_record["record_sha256"] = obligation._sha256(
+            {key: value for key, value in legacy_record.items() if key != "record_sha256"}
+        )
+        legacy_path.write_text(
+            json.dumps(legacy_record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        _, legacy_file_sha256 = obligation._read_private_json(legacy_path)
+
+        v2_material = {
+            "kind": obligation.RESOLUTION_KIND,
+            "schema_version": obligation.RESOLUTION_SCHEMA_VERSION,
+            "obligation_id": "goo-example-work-0001",
+            "open_file_sha256": legacy_record["open_file_sha256"],
+            "close_file_sha256": legacy_record["close_file_sha256"],
+            "sequence": 2,
+            "predecessor_file_sha256": legacy_file_sha256,
+            "disposition": "deferred",
+            "evidence": legacy_record["evidence"],
+            "delegation_observation": {},
+            "next_action": "This restored migration must fail closed.",
+        }
+        v2_payload = {
+            **v2_material,
+            "resolved_at": obligation._utc_now(),
+            "material_sha256": obligation._sha256(v2_material),
+        }
+        v2_payload["record_sha256"] = obligation._sha256(v2_payload)
+        obligation.private_io.publish_private_create_only_json(
+            directory,
+            directory / "resolution-000002.json",
+            v2_payload,
+            max_bytes=obligation.MAX_RECORD_BYTES,
+            label="test stale schema-v2 migration record",
+        )
+
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationIntegrityError,
+            "schema-v2 migration requires evidence new to legacy prefix",
+        ):
+            obligation.status_obligation("goo-example-work-0001")
+
+    def test_reader_rejects_successor_after_terminal_legacy_disposition(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "external",
+                        "detail": "External blocker.",
+                        "reference": "probe:external",
+                        "sha256": "e" * 64,
+                    }
+                ],
+                "next_action": "Old next action.",
+            }
+        )
+        obligation.resolve_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "disposition": "resolved",
+                "evidence": [
+                    {
+                        "source": "runtime",
+                        "reference": "legacy-terminal",
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+        )
+        directory = self.root / "goo-example-work-0001"
+        legacy_path = directory / "resolution.json"
+        legacy_record = json.loads(legacy_path.read_text(encoding="utf-8"))
+        legacy_record["schema_version"] = obligation.LEGACY_RESOLUTION_SCHEMA_VERSION
+        legacy_material = {
+            key: value
+            for key, value in legacy_record.items()
+            if key not in {"resolved_at", "material_sha256", "record_sha256"}
+        }
+        legacy_record["material_sha256"] = obligation._sha256(legacy_material)
+        legacy_record["record_sha256"] = obligation._sha256(
+            {key: value for key, value in legacy_record.items() if key != "record_sha256"}
+        )
+        legacy_path.write_text(
+            json.dumps(legacy_record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        _, legacy_file_sha256 = obligation._read_private_json(legacy_path)
+
+        v2_material = {
+            "kind": obligation.RESOLUTION_KIND,
+            "schema_version": obligation.RESOLUTION_SCHEMA_VERSION,
+            "obligation_id": "goo-example-work-0001",
+            "open_file_sha256": legacy_record["open_file_sha256"],
+            "close_file_sha256": legacy_record["close_file_sha256"],
+            "sequence": 2,
+            "predecessor_file_sha256": legacy_file_sha256,
+            "disposition": "deferred",
+            "evidence": [
+                {
+                    "source": "runtime",
+                    "reference": "new-but-illegal-after-terminal",
+                    "sha256": "b" * 64,
+                }
+            ],
+            "delegation_observation": {},
+            "next_action": "This successor must fail closed.",
+        }
+        v2_payload = {
+            **v2_material,
+            "resolved_at": obligation._utc_now(),
+            "material_sha256": obligation._sha256(v2_material),
+        }
+        v2_payload["record_sha256"] = obligation._sha256(v2_payload)
+        obligation.private_io.publish_private_create_only_json(
+            directory,
+            directory / "resolution-000002.json",
+            v2_payload,
+            max_bytes=obligation.MAX_RECORD_BYTES,
+            label="test successor after terminal legacy resolution",
+        )
+
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationIntegrityError,
+            "resolution chain continues after terminal legacy disposition",
+        ):
+            obligation.status_obligation("goo-example-work-0001")
+
 
     def test_resolution_status_readback_remains_under_writer_lock(self) -> None:
         obligation.open_obligation(self._open_parameters())

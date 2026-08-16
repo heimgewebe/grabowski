@@ -50,6 +50,8 @@ Bereits vor Einführung dieser Parksemantik erzeugte `resolution.json`-Datensät
 
 Soll eine solche Alt-Resolution bewusst geparkt, als erledigt markiert oder superseded werden, ist eine **neue Evidenzentscheidung** erforderlich. Nur dann darf genau ein nachfolgender Resolution-Datensatz mit Schema v2 und Hashbindung an den v1-Vorgänger angelegt werden. Eine bloße Änderung von `next_action` oder Disposition reicht ausdrücklich nicht aus; mindestens ein Evidenz-Digest muss gegenüber dem **gesamten bisherigen v1-Präfix** neu sein. Der v1-Datensatz bleibt unverändert erhalten; der v2-Nachfolger ist die explizite Migrationsentscheidung. Die Kette ist fail-closed geordnet: Sie darf aus einem beliebig langen v1-Präfix und höchstens einem abschließenden v2-Datensatz bestehen. Nach dem ersten v2 ist **kein weiterer Resolution-Datensatz** zulässig; insbesondere darf ein restaurierter oder manipulierter v1-Datensatz die Projektion nicht wieder auf current zurückdrehen. Bereits historisch terminale v1-Resolutionen (`resolved` oder `superseded`) bleiben unverändert historisch.
 
+Diese Migrationsinvarianten gelten nicht nur am Schreibpfad. Jeder Chain-Read prüft erneut, dass ein v2-Nachfolger nur auf ein noch `deferred`es v1-Präfix folgt und mindestens einen gegenüber dem gesamten v1-Präfix neuen Evidenz-Digest trägt. Ein persistierter oder manuell reparierter Nachfolger nach terminalem v1-`resolved`/`superseded` oder ohne neue Migrationsevidenz ist daher ein Integritätsfehler und darf keine Attention-Projektion erzeugen.
+
 ## Speicher- und Integritätsmodell
 
 Der Standardpfad ist:

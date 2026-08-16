@@ -946,6 +946,8 @@ def _read_resolution_chain(
     chain: list[tuple[dict[str, Any], str, Path]] = []
     predecessor: str | None = None
     seen_schema_v2 = False
+    legacy_evidence: set[str] = set()
+    previous_record: dict[str, Any] | None = None
     for sequence, path in _resolution_entries(directory):
         record, file_sha256 = _read_private_json(path)
         _validate_resolution_record(
@@ -961,10 +963,27 @@ def _read_resolution_chain(
             raise OperatorObligationIntegrityError(
                 "operator obligation resolution schema chain continues after schema v2"
             )
+        if (
+            previous_record is not None
+            and previous_record["schema_version"] == LEGACY_RESOLUTION_SCHEMA_VERSION
+            and previous_record["disposition"] != "deferred"
+        ):
+            raise OperatorObligationIntegrityError(
+                "operator obligation resolution chain continues after terminal legacy disposition"
+            )
         if record["schema_version"] == RESOLUTION_SCHEMA_VERSION:
+            if previous_record is not None:
+                requested_evidence = {_sha256(item) for item in record["evidence"]}
+                if not requested_evidence - legacy_evidence:
+                    raise OperatorObligationIntegrityError(
+                        "schema-v2 migration requires evidence new to legacy prefix"
+                    )
             seen_schema_v2 = True
+        else:
+            legacy_evidence.update(_sha256(item) for item in record["evidence"])
         chain.append((record, file_sha256, path))
         predecessor = file_sha256
+        previous_record = record
     return chain
 
 
