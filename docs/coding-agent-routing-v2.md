@@ -13,7 +13,7 @@ Die Autorität folgt nicht dem Modellnamen. Sie folgt der gebundenen Rolle und d
 
 Für überlappenden Scope gibt es genau einen autoritativen mutierenden Writer. Disjunkte Work Lanes dürfen parallel laufen.
 
-Die Work Lane ist der Autoritäts- und Wirkungscontainer. Agent Workspace ist die Ausführungs- und Verification-Schicht innerhalb einer Lane. Solange lane-backed Workspaces noch nicht produktiv sind, darf der Legacy-Workspace diese Ownership nicht als zweite Wahrheit duplizieren.
+Die Work Lane ist der Autoritäts- und Wirkungscontainer. Agent Workspace ist die Ausführungs- und Verification-Schicht innerhalb einer Lane. Der lane-backed Modus bindet eine exakte `lane_id` plus erwarteten Lane-Receipt-SHA-256 und verwendet ausschließlich deren Repository-, Branch-, Worktree-, Scope-, Writer-, Lease-, Admission- und Checkout-Lifecycle-Autorität. Der historische advisory-contrast-Modus bleibt als eigener Legacy-Pfad erhalten.
 
 ## 2. Maschinenlesbare Quellwahrheit
 
@@ -105,7 +105,18 @@ mit gesetztem `scoped_writer_actor` und `scoped_writer_argv=None`.
 
 Dadurch besitzt die Lane bereits Checkout und Ressourcen, ohne einen zweiten Writer-Lifecycle zu starten.
 
-Bis der lane-backed Agent Workspace implementiert ist, darf `grabowski_agent_workspace_create` nicht als Ersatz für diese Lane-Ownership verwendet werden, weil der Legacy-Pfad eigene Ressourcen und Checkout-Lifecycle reserviert.
+Diese Prepare-only-Grenze ist verpflichtend: Der Lane-Receipt darf weder einen konfigurierten `scoped_writer_command` noch `writer_job` oder sonstigen `writer_start`-Ausführungszustand enthalten. Andernfalls lehnt der lane-backed Workspace die Erstellung ab, bevor er seinen eigenen Writer startet; innerhalb desselben überlappenden Lane-Scopes darf nie ein zweiter mutierender Writer entstehen.
+
+`grabowski_agent_workspace_create` besitzt deshalb zwei disjunkte Modi:
+
+- ohne Lane-Bindung bleibt der bisherige advisory-contrast-Pfad unverändert und besitzt seine bisherigen Workspace-Ressourcen;
+- mit `lane_id` und `expected_lane_receipt_sha256` muss Source, Repository, Base, Branch, Worktree, vollständiger Write Scope, Scoped Writer, jede Live-Lease, die vorhandene Repository-Admission und der aktive Checkout-Lifecycle exakt zur hashgültigen Lane passen.
+
+Der lane-backed Modus ist in dieser Phase ausdrücklich ein Working-Tree-Patch-Modus. Der Writer-Checkout-`HEAD` muss während Erstellung, Revalidierung und Collection unverändert `expected_base_head` bleiben. Ein Commit oder anderer HEAD-Advance wird durch die Live-Lane-Prüfung noch vor der Collection abgewiesen. `Delivery`, `commit_range` und jede Aufweichung dieser HEAD-Bindung liegen außerhalb dieses Vertrags.
+
+Bei der ersten lane-backed Erstellung bindet der Plan außerdem genau eine unveränderliche `runtime_deadline_unix` aus Erstellungszeit plus `runtime_seconds`. Jede Live-Lease der Lane sowie sowohl die quittierte als auch die live beobachtete Checkout-Lifecycle-Retention müssen diese Deadline mindestens erreichen; Gleichheit ist ausreichend. Spätere Lane-Revalidierungen und idempotente Create-Aufrufe verwenden dieselbe gespeicherte Deadline und berechnen sie nicht erneut relativ zu „jetzt“. Der Workspace erhält dadurch weder eine neue State-Ablage noch Renewal-Autorität und verlängert die Lane-Ressourcen nicht selbst.
+
+Der lane-backed Workspace reserviert keine zweite Lease oder Checkout-Generation, führt keine zweite Repository-Admission aus und erzeugt keinen Worktree. Create-Fehler und Workspace-Close erhalten sämtliche Lane-Ressourcen. Seine Close-Receipt weist deshalb `resources_released=false`, `lane_resources_preserved=true` und `workspace_resources_owned=false` aus; dieser Erhalt erfüllt den Workspace-Ausführungsabschluss, ohne einen Lane-Close zu behaupten. Workspace-Cleanup bleibt für diesen Modus gesperrt und verweist auf den separaten Work-Lane-Closeout.
 
 ## 7. Verification
 
@@ -177,14 +188,14 @@ Subscription-gebundene, aktuell attestierte Routen dürfen im vorhandenen Kontin
 
 Ein fehlerhafter externer Status darf keine falsche Writerroute erzeugen. Wenn keine belastbare Writerroute übrig bleibt, ist `executor=controller` der sichere Fallback.
 
-## 11. Noch nicht durch P0 implementiert
+## 11. Noch nicht durch P0 und P1/PR A implementiert
 
 P0 behauptet ausdrücklich noch nicht:
 
-- lane-backed Agent Workspace;
-- getrennten Execution-Close/Lane-Close;
 - offiziellen Candidate-Receipt;
 - Candidate-Digest-Bindung für Test, Review und Integration;
+- Candidate Adoption;
+- ExecutionPlan oder DAG;
 - Revision Rounds;
 - automatische Happy-Path-Komposition bis `integration_ready`;
 - Delivery-Profil für Writer-Commit/Push/PR;
