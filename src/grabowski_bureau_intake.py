@@ -369,20 +369,36 @@ def _git_identity_lines(repository: Path, *arguments: str) -> list[str] | None:
     for name in GIT_REPOSITORY_OVERRIDE_ENV:
         environment.pop(name, None)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             ["git", "-C", str(repository), *arguments],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             env=environment,
-            timeout=CANDIDATE_REPO_IDENTITY_TIMEOUT_SECONDS,
-            check=False,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired):
+        (
+            stdout,
+            _stderr,
+            timed_out,
+            stdout_truncated,
+            stderr_truncated,
+        ) = base._read_limited_process_pipes(
+            process,
+            timeout_seconds=CANDIDATE_REPO_IDENTITY_TIMEOUT_SECONDS,
+            max_output_bytes=CANDIDATE_REPO_IDENTITY_MAX_OUTPUT_BYTES,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    if completed.returncode != 0 or len(completed.stdout) > CANDIDATE_REPO_IDENTITY_MAX_OUTPUT_BYTES:
+    if (
+        process.returncode != 0
+        or timed_out
+        or stdout_truncated
+        or stderr_truncated
+    ):
         return None
     try:
-        text = completed.stdout.decode("utf-8")
+        text = stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
     lines = text.splitlines()

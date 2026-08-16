@@ -583,6 +583,51 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         )
         self.assertIsNone(intake._canonical_bureau_repo_resource(str(repository)))
 
+    def test_git_identity_lines_streams_oversized_origin_under_hard_byte_ceiling(self) -> None:
+        repository = self._git_repository(
+            "oversized-origin", origin="git@github.com:heimgewebe/grabowski.git"
+        )
+        oversized_origin = (
+            "https://github.com/heimgewebe/"
+            + "a" * (intake.CANDIDATE_REPO_IDENTITY_MAX_OUTPUT_BYTES + 4096)
+            + ".git"
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "config",
+                "--local",
+                "remote.origin.url",
+                oversized_origin,
+            ],
+            check=True,
+        )
+        observed: list[tuple[bytes, bytes, bool, bool, bool]] = []
+        original = intake.base._read_limited_process_pipes
+
+        def capture(*args: object, **kwargs: object) -> tuple[bytes, bytes, bool, bool, bool]:
+            result = original(*args, **kwargs)
+            observed.append(result)
+            return result
+
+        with mock.patch.object(
+            intake.base, "_read_limited_process_pipes", side_effect=capture
+        ):
+            self.assertIsNone(
+                intake._git_identity_lines(
+                    repository, "config", "--local", "--get-all", "remote.origin.url"
+                )
+            )
+        self.assertEqual(len(observed), 1)
+        stdout, _stderr, timed_out, stdout_truncated, _stderr_truncated = observed[0]
+        self.assertFalse(timed_out)
+        self.assertTrue(stdout_truncated)
+        self.assertLessEqual(
+            len(stdout), intake.CANDIDATE_REPO_IDENTITY_MAX_OUTPUT_BYTES
+        )
+
     def test_bureau_repo_resource_origin_parser_accepts_only_exact_heimgewebe_origins(self) -> None:
         self.assertEqual(
             "repo.grabowski",
