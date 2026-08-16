@@ -1043,7 +1043,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             **plan,
             "plan_sha256": workspace._sha256_json(plan),
         }
-        (self.state / plan["workspace_id"]).mkdir()
+        (self.state / plan["workspace_id"]).mkdir(mode=0o700)
         workspace._write_manifest(stored_manifest)
         self.assertEqual(
             workspace._existing_lane_runtime_deadline(
