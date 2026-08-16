@@ -60,6 +60,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 import grabowski_mcp as base
+import grabowski_midcutover_resume as midcutover
 import grabowski_operator_core as operator
 import grabowski_privileged as privileged
 import grabowski_recovery as recovery
@@ -92,6 +93,10 @@ DelaySeconds = Annotated[int, Field(ge=5, le=60)]
 
 SCHEMA_VERSION = 1
 GATE_KIND = "grabowski_provenance_recovery_gate"
+RESUME_GATE_KIND = "grabowski_midcutover_resume_gate"
+MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH = (
+    self_deploy.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+)
 
 #: Deployment integrity flags whose failure this lane is allowed to repair.
 REPAIRABLE_INTEGRITY_FLAGS = (
@@ -449,6 +454,102 @@ def _integrity_evidence() -> dict[str, Any]:
     }
 
 
+def _recovery_lane(expected_head: str) -> dict[str, Any]:
+    """Classify which recovery lane the durable blue-green state admits.
+
+    Reading this costs nothing and changes nothing, so it is evaluated for every
+    assessment -- including the ones that will be denied.  An operator who
+    cannot see *why* a lane is closed will reach for a wider tool.
+    """
+    try:
+        return midcutover.classify_from_durable_state(expected_head=expected_head)
+    except Exception as exc:  # noqa: BLE001 - a broken classifier is fail-closed
+        return {
+            "schema_version": midcutover.SCHEMA_VERSION,
+            "kind": midcutover.KIND,
+            "lane": midcutover.LANE_FAIL_CLOSED,
+            "checks": {"classification_available": False},
+            "reasons": ["classification_available"],
+            "error": type(exc).__name__,
+            "resume_binding": None,
+        }
+
+
+def evaluate_resume_gate(expected_head: str) -> dict[str, Any]:
+    """Evaluate the mid-cutover resume lane, read-only.
+
+    The independent evidence is deliberately the same set the deployment repair
+    lane requires -- audit chain, kill switch, blockade, broker, no competing
+    deployment -- because the resume is just as privileged an effect.  What it
+    does *not* require is a build source, a target contract or a clean working
+    tree: it deploys nothing.  Its target is fixed by a receipt that was written
+    before the runtime broke, which is exactly why it can be trusted while the
+    runtime cannot.
+    """
+    audit = base._verify_audit_log(base.AUDIT_LOG)
+    kill_switch = base._kill_switch_state()
+    broker = privileged.grabowski_privileged_broker_status()
+    integrity = _integrity_evidence()
+    blockade = _blockade_evidence(None)
+    competing = _competing_deployment_evidence()
+    lane = _recovery_lane(expected_head)
+    resume_binding = lane.get("resume_binding")
+
+    checks = {
+        "repair_warranted": bool(integrity["repair_warranted"]),
+        "audit_chain_valid": bool(audit.get("valid")),
+        "audit_writable": bool(audit.get("audit_writable", audit.get("valid"))),
+        "kill_switch_clear": not bool(kill_switch.get("engaged")),
+        "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
+        "privileged_broker_ready": bool(broker.get("ready")),
+        "no_competing_deployment": (
+            bool(competing.get("deploy_lock_free"))
+            and not competing.get("inflight_deploy_jobs")
+            and competing.get("error") is None
+        ),
+        "mid_cutover_resume_classified": (
+            lane.get("lane") == midcutover.LANE_MID_CUTOVER_RESUME
+        ),
+        "resume_binding_available": isinstance(resume_binding, dict)
+        and isinstance(resume_binding.get("binding_sha256"), str),
+    }
+    reasons = sorted(name for name, passed in checks.items() if not passed)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": RESUME_GATE_KIND,
+        "checked_at_unix": int(time.time()),
+        "allowed": not reasons,
+        "reasons": reasons,
+        "checks": checks,
+        "expected_head": expected_head,
+        "recovery_lane": lane,
+        "resume_binding": resume_binding,
+        "runtime_integrity": integrity,
+        "audit": {
+            "valid": bool(audit.get("valid")),
+            "writable": bool(audit.get("audit_writable", audit.get("valid"))),
+            "last_record_sha256": audit.get("last_record_sha256"),
+        },
+        "kill_switch": {"engaged": bool(kill_switch.get("engaged"))},
+        "privileged_broker": {"ready": bool(broker.get("ready"))},
+        "operator_blockade": blockade,
+        "competing_deployment": competing,
+        "authority_model": {
+            "derives_from_runtime_provenance": False,
+            "grants_shell_authority": False,
+            "grants_power_worker_authority": False,
+            "grants_new_deployment_authority": False,
+            "effect_scope": "canonical-promotion-of-the-already-switched-green-release",
+        },
+        "does_not_establish": [
+            "that a new deployment may be started",
+            "that the connector snapshot is rebound to green",
+            "that the green runtime is functionally correct",
+            "platform connector catalog publication",
+        ],
+    }
+
+
 def evaluate_gate(
     expected_head: str,
     source_repository: str | None = None,
@@ -484,8 +585,16 @@ def evaluate_gate(
     )
     competing = _competing_deployment_evidence()
     blockade = _blockade_evidence(repository)
+    lane = _recovery_lane(expected_head)
 
     checks = {
+        # A scheduled deployment recovery starts a *new* productive cutover.
+        # Doing that while an already-switched cutover is still unresolved would
+        # stack a fresh promotion on top of an unfinished one -- the exact state
+        # the mid-cutover lane exists to resolve instead.
+        "scheduled_deploy_lane_admitted": (
+            lane.get("lane") == midcutover.LANE_SCHEDULED_DEPLOY
+        ),
         # The lane exists only to repair a runtime that is *proven* broken;
         # indeterminate integrity is not a warrant (see _integrity_evidence).
         "repair_warranted": bool(integrity["repair_warranted"]),
@@ -524,6 +633,7 @@ def evaluate_gate(
         "reasons": reasons,
         "checks": checks,
         "expected_head": expected_head,
+        "recovery_lane": lane,
         "runtime_integrity": integrity,
         "audit": {
             "valid": bool(audit.get("valid")),
@@ -568,12 +678,36 @@ def grabowski_recovery_provenance_assess(
     source_repository: SourceRepository | None = None,
     source_lease_owner_id: SourceLeaseOwner | None = None,
 ) -> dict[str, Any]:
-    """Report whether the provenance repair lane would admit this exact commit."""
+    """Report which recovery lane -- if any -- would admit this exact commit."""
     # Access-policy capability only.  This check reads the active profile and
     # never consults deployment provenance, so requiring it here restricts the
     # lane without reintroducing the circularity it exists to break.
     operator._require_operator_capability("audit_verify")
-    return evaluate_gate(expected_head, source_repository, source_lease_owner_id)
+    gate = evaluate_gate(expected_head, source_repository, source_lease_owner_id)
+    lane = gate["recovery_lane"]
+    # The deployment gate stays exactly where callers already read it. The
+    # resume verdict is added beside it, because a deployment-source verdict
+    # about an operation that builds nothing would otherwise read as a refusal
+    # of the lane that is actually open.
+    resume_gate = (
+        evaluate_resume_gate(expected_head)
+        if lane.get("lane") == midcutover.LANE_MID_CUTOVER_RESUME
+        else None
+    )
+    return {
+        **gate,
+        "recovery_lane_kind": lane.get("lane"),
+        "resume_gate": resume_gate,
+        "dispatch_lane": (
+            midcutover.LANE_MID_CUTOVER_RESUME
+            if resume_gate is not None and resume_gate["allowed"]
+            else (
+                midcutover.LANE_SCHEDULED_DEPLOY
+                if gate["allowed"]
+                else midcutover.LANE_FAIL_CLOSED
+            )
+        ),
+    }
 
 
 @mcp.tool(
@@ -586,11 +720,27 @@ def grabowski_recovery_provenance_repair(
     delay_seconds: DelaySeconds = 8,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Rebuild and activate the runtime from an exact commit, fail-closed.
+    """Repair an integrity-invalid runtime through exactly one classified lane.
 
-    The only privileged action this lane can take.  It grants no shell, command
-    or power-worker authority, and refuses unless the deployed runtime is
-    actually integrity-invalid.
+    Two operations live behind this one tool, and the durable state -- never the
+    caller -- decides which:
+
+    * ``scheduled_deploy_recovery`` rebuilds and activates the named commit.
+    * ``mid_cutover_resume`` continues one already-switched blue-green cutover
+      to canonical.  It builds nothing and can reach no target other than the
+      one its bound receipt already proved.
+
+    Keeping both behind one tool, with no new input, is deliberate twice over.
+    The transport gate already exempts exactly this tool name so a broken
+    runtime can reach its own repair; a second exempt tool would widen that hole
+    for no gain.  And the published connector contract is mid-convergence: an
+    added parameter would change the complete tool-schema identity and force a
+    fresh publication cycle for a recovery convenience nobody needs.  The lane
+    is therefore never selectable from the outside -- callers read it back from
+    grabowski_recovery_provenance_assess instead.
+
+    Grants no shell, command or power-worker authority, and refuses unless the
+    deployed runtime is actually integrity-invalid.
     """
     # Access-policy capabilities only.  Deliberately not
     # _require_operator_mutation: that binds to the blockade *and* provenance
@@ -602,9 +752,160 @@ def grabowski_recovery_provenance_repair(
     # Without it, two concurrent recovery requests could each observe a clear
     # deploy index, then both reserve a unit and start duplicate deployments.
     with self_deploy._deploy_schedule_lock():
+        lane = _recovery_lane(expected_head)
+        if lane.get("lane") == midcutover.LANE_MID_CUTOVER_RESUME:
+            return _resume_under_schedule_lock(expected_head)
         return _repair_under_schedule_lock(
             expected_head, source_repository, source_lease_owner_id, delay_seconds
         )
+
+
+def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
+    """Gate, reserve and dispatch the mid-cutover resume, under the deploy lock."""
+    gate = evaluate_resume_gate(expected_head)
+    if not gate["allowed"]:
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "midcutover-resume-denied",
+                "expected_head": expected_head,
+                "reasons": gate["reasons"],
+                "gate": gate,
+            }
+        )
+        raise ProvenanceRecoveryDenied(gate["reasons"], gate)
+
+    base._require_valid_audit_chain()
+
+    resume_binding = gate["resume_binding"]
+    repository = self_deploy.CANONICAL_REPOSITORY
+    runner = repository / MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+    command = self_deploy._midcutover_resume_command(
+        repository,
+        runner,
+        expected_head,
+        resume_binding["cutover_id"],
+        resume_binding["binding_sha256"],
+    )
+
+    intent = {
+        "timestamp_unix": int(time.time()),
+        "operation": "midcutover-resume-intent",
+        "expected_head": expected_head,
+        "cutover_id": resume_binding["cutover_id"],
+        "resumed_receipt_sha256": resume_binding["resumed_receipt_sha256"],
+        "resume_binding_sha256": resume_binding["binding_sha256"],
+        "classification_sha256": gate["recovery_lane"].get("classification_sha256"),
+        "gate": gate,
+    }
+    intent_sha256 = base._append_audit_with_digest(intent)
+
+    volatile = _volatile_gate_recheck(repository)
+    if volatile["reasons"]:
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "midcutover-resume-aborted-before-dispatch",
+                "expected_head": expected_head,
+                "reasons": volatile["reasons"],
+                "intent_sha256": intent_sha256,
+            }
+        )
+        raise ProvenanceRecoveryDenied(
+            volatile["reasons"], {**gate, "recheck": volatile}
+        )
+
+    jobs_root = operator._jobs_root()
+    reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
+    self_deploy._write_deploy_index(
+        jobs_root,
+        units=self_deploy._deploy_index(jobs_root)["units"],
+        pending_unit=reserved_unit,
+    )
+    try:
+        job = operator._start_job(
+            command,
+            cwd=str(repository),
+            runtime_seconds=3_600,
+            reserved_unit=reserved_unit,
+            allow_reserved_runtime_deploy=True,
+            invoker_tool="grabowski_recovery_provenance_repair",
+        )
+    except operator.JobDispatchUnknown as exc:
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "midcutover-resume-dispatch-outcome-unknown",
+                "expected_head": expected_head,
+                "cutover_id": resume_binding["cutover_id"],
+                "unit": exc.unit,
+                "evidence": exc.evidence,
+                "intent_sha256": intent_sha256,
+            }
+        )
+        raise
+    except Exception:
+        try:
+            self_deploy._write_deploy_index(
+                jobs_root,
+                units=self_deploy._deploy_index(jobs_root)["units"],
+                pending_unit=None,
+            )
+        except Exception:  # noqa: BLE001 - the start failure is the real error
+            pass
+        raise
+
+    post_dispatch_warnings: list[str] = list(job.get("post_dispatch_warnings") or [])
+    try:
+        scheduled_sha256 = base._append_audit_with_digest(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "midcutover-resume-scheduled",
+                "expected_head": expected_head,
+                "cutover_id": resume_binding["cutover_id"],
+                "unit": job["unit"],
+                "argv_sha256": job["argv_sha256"],
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - effect already dispatched
+        scheduled_sha256 = None
+        post_dispatch_warnings.append(f"scheduled audit append failed: {exc}")
+    try:
+        self_deploy._write_deploy_index(
+            jobs_root,
+            units=[*self_deploy._deploy_index(jobs_root)["units"], reserved_unit],
+            pending_unit=None,
+        )
+    except Exception as exc:  # noqa: BLE001 - effect already dispatched
+        post_dispatch_warnings.append(
+            f"deploy index bookkeeping failed, pending_unit may be stale: {exc}"
+        )
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_midcutover_resume_receipt",
+        "lane": midcutover.LANE_MID_CUTOVER_RESUME,
+        "expected_head": expected_head,
+        "cutover_id": resume_binding["cutover_id"],
+        "resumed_receipt_sha256": resume_binding["resumed_receipt_sha256"],
+        "resume_binding_sha256": resume_binding["binding_sha256"],
+        "gate": gate,
+        "job": job,
+        "intent_sha256": intent_sha256,
+        "scheduled_sha256": scheduled_sha256,
+        "post_dispatch_warnings": post_dispatch_warnings,
+        "post_state_readback_required": True,
+        "next_action": (
+            "read back the routing selector and grabowski_deployment_identity once "
+            "the job reaches a terminal state; the durable resume receipt is the "
+            "authority on the outcome"
+        ),
+        "does_not_establish": [
+            "that the resume has completed",
+            "that the connector snapshot was rebound to green",
+            "that a new deployment was performed",
+        ],
+    }
 
 
 def _repair_under_schedule_lock(

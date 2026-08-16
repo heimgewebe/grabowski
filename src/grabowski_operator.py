@@ -140,6 +140,15 @@ GENERIC_JOB_FINAL_STATUSES = frozenset({
     "succeeded", "failed", "timed_out", "signalled", "terminated_unclear",
 })
 RESERVED_RUNTIME_DEPLOY_RUNNER = (HOME / "repos" / "grabowski" / "tools" / "run_scheduled_deploy.py").resolve()
+RESERVED_MIDCUTOVER_RESUME_RUNNER = (
+    HOME / "repos" / "grabowski" / "tools" / "run_midcutover_resume.py"
+).resolve()
+#: Runners that mutate the live runtime and therefore may only be started by the
+#: typed lanes that evaluate their own gates first.  A generic durable job must
+#: never be able to name one of these as its argv.
+RESERVED_RUNTIME_DEPLOY_RUNNERS = frozenset(
+    {RESERVED_RUNTIME_DEPLOY_RUNNER, RESERVED_MIDCUTOVER_RESUME_RUNNER}
+)
 JOB_EXPECTED_HEAD_RE = re.compile(r"[0-9a-f]{40,64}")
 JOB_FINAL_STATUS_NON_CLAIMS = (
     "notification_delivery",
@@ -4072,7 +4081,7 @@ def _reserved_runtime_deploy_command(
                 resolved = path.resolve(strict=False)
             except OSError:
                 resolved = path.absolute()
-            if resolved == RESERVED_RUNTIME_DEPLOY_RUNNER:
+            if resolved in RESERVED_RUNTIME_DEPLOY_RUNNERS:
                 return True
     return False
 

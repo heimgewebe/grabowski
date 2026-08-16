@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "e4365b11db969bdb6b62cccf6809923c205489a0b8217e53f4cfa343e3a002c3",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "85274180e76c927b8622297d467db53c07dc266637011824d02169791c10fe2d",
+  "contract_sha256": "e2752b37cb0f784e1c797fca9c10f529fba7e538cb1fad6ae5e27d1e86ad27a6",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1487,7 +1487,7 @@
     },
     {
       "category": "recovery",
-      "description": "Report whether the provenance repair lane would admit this exact commit.",
+      "description": "Report which recovery lane -- if any -- would admit this exact commit.",
       "effects": [],
       "id": "grabowski_recovery_provenance_assess",
       "purpose": "Assess the fail-closed lane for repairing invalid deployment provenance.",
@@ -1498,7 +1498,7 @@
     },
     {
       "category": "recovery",
-      "description": "Rebuild and activate the runtime from an exact commit, fail-closed.\n\nThe only privileged action this lane can take.  It grants no shell, command\nor power-worker authority, and refuses unless the deployed runtime is\nactually integrity-invalid.",
+      "description": "Repair an integrity-invalid runtime through exactly one classified lane.\n\nTwo operations live behind this one tool, and the durable state -- never the\ncaller -- decides which:\n\n* ``scheduled_deploy_recovery`` rebuilds and activates the named commit.\n* ``mid_cutover_resume`` continues one already-switched blue-green cutover\n  to canonical.  It builds nothing and can reach no target other than the\n  one its bound receipt already proved.\n\nKeeping both behind one tool, with no new input, is deliberate twice over.\nThe transport gate already exempts exactly this tool name so a broken\nruntime can reach its own repair; a second exempt tool would widen that hole\nfor no gain.  And the published connector contract is mid-convergence: an\nadded parameter would change the complete tool-schema identity and force a\nfresh publication cycle for a recovery convenience nobody needs.  The lane\nis therefore never selectable from the outside -- callers read it back from\ngrabowski_recovery_provenance_assess instead.\n\nGrants no shell, command or power-worker authority, and refuses unless the\ndeployed runtime is actually integrity-invalid.",
       "effects": [
         "runtime-deployment",
         "durable-job-start",

@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import hashlib
 from importlib import import_module
@@ -34,6 +34,7 @@ deployment_observer = import_module("grabowski_deployment_observer")
 client_snapshot = import_module("grabowski_client_snapshot")
 connector_contract = import_module("grabowski_connector_contract")
 transport_ingress = import_module("grabowski_transport_ingress")
+midcutover = import_module("grabowski_midcutover_resume")
 
 
 @dataclass(frozen=True)
@@ -272,6 +273,9 @@ OPERATOR_ADMISSION_STATUS_URL = (
     "/_grabowski/deployment-admission"
 )
 OPERATOR_ADMISSION_MARKER_KIND = "grabowski_deployment_admission_drain"
+#: Mirrors grabowski_operator.DEPLOYMENT_ADMISSION_HEAD_RE so a marker written
+#: here is always readable by the gate that consumes it.
+OPERATOR_ADMISSION_HEAD_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 OPERATOR_ADMISSION_MARKER_KEYS = frozenset(
     {
         "schema_version",
@@ -3250,12 +3254,63 @@ def engage_operator_deployment_admission(
     timeout_seconds: int,
     source_identity_sha256: str | None = None,
 ) -> dict[str, Any]:
-    marker_source_identity_sha256 = (
-        _deployment_source_identity_sha256(snapshot)
-        if source_identity_sha256 is None
-        else source_identity_sha256
+    """Close admission for a deployment that owns a build snapshot.
+
+    Signature and authority are unchanged: the deployment path still derives
+    both the expected head and, by default, the source identity from the
+    snapshot it is deploying.  The receipt-bound resume needs the same effect
+    without a snapshot, and gets it through the separate entry point below
+    rather than by loosening this one.
+    """
+    return _engage_operator_deployment_admission(
+        expected_head=snapshot.repo_head,
+        source_identity_sha256=(
+            _deployment_source_identity_sha256(snapshot)
+            if source_identity_sha256 is None
+            else source_identity_sha256
+        ),
+        timeout_seconds=timeout_seconds,
     )
-    if re.fullmatch(r"[0-9a-f]{64}", marker_source_identity_sha256) is None:
+
+
+def engage_receipt_bound_deployment_admission(
+    *,
+    expected_head: str,
+    source_identity_sha256: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Close admission for the mid-cutover resume, which owns no snapshot.
+
+    The resume promotes a release that was built by an earlier deployment, so
+    there is no snapshot here to derive an identity from.  Both values are
+    therefore named explicitly and both come from the hash-bound cutover
+    receipt -- never from a caller and never defaulted.  This is a separate
+    function precisely so the ordinary deployment signature stays exactly as
+    narrow as it was: nothing that already calls the deployment path can reach
+    the snapshot-free variant by omitting an argument.
+    """
+    if not isinstance(expected_head, str) or not isinstance(
+        source_identity_sha256, str
+    ):
+        raise ValueError("receipt-bound admission requires explicit string evidence")
+    return _engage_operator_deployment_admission(
+        expected_head=expected_head,
+        source_identity_sha256=source_identity_sha256,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _engage_operator_deployment_admission(
+    *,
+    expected_head: str,
+    source_identity_sha256: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if OPERATOR_ADMISSION_HEAD_RE.fullmatch(expected_head or "") is None:
+        raise ValueError("deployment admission expected_head is invalid")
+    marker_expected_head = expected_head
+    marker_source_identity_sha256 = source_identity_sha256
+    if re.fullmatch(r"[0-9a-f]{64}", marker_source_identity_sha256 or "") is None:
         raise ValueError("source_identity_sha256 must be a lowercase SHA-256")
     now = int(time.time())
     existing = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
@@ -3272,7 +3327,7 @@ def engage_operator_deployment_admission(
         "schema_version": 1,
         "kind": OPERATOR_ADMISSION_MARKER_KIND,
         "token": secrets.token_hex(32),
-        "expected_head": snapshot.repo_head,
+        "expected_head": marker_expected_head,
         "source_identity_sha256": marker_source_identity_sha256,
         "created_at_unix": now,
         "expires_at_unix": now + lifetime,
@@ -5030,6 +5085,154 @@ def _require_selector_authority(
     }
 
 
+def observe_authoritative_routing() -> dict[str, Any]:
+    """Read back whatever the ingress is authoritatively serving right now.
+
+    Used on every abnormal exit of both the cutover and the resume, so it must
+    answer rather than raise: a receipt that says "the readback failed" is worth
+    more to an operator than an exception that says nothing at all.
+    """
+    try:
+        selector = transport_ingress.read_routing_selector()
+        return _require_selector_authority(
+            expected_selector_sha256=selector["selector_sha256"],
+            expected_slot=selector["selected_slot"],
+            expected_binding_sha256=selector["runtime_binding_sha256"],
+        )
+    except Exception as exc:
+        summary: dict[str, Any] | None = None
+        try:
+            summary = _selector_summary(transport_ingress.read_routing_selector())
+        except Exception:
+            pass
+        return {
+            "authoritative": False,
+            "selector": summary,
+            "error_type": type(exc).__name__,
+            "requires_operator_recovery": True,
+        }
+
+
+@dataclass
+class CanonicalPromotionProgress:
+    """Irreversibility markers, each set *before* the effect it names.
+
+    A promotion that reported "nothing happened" about a pointer it had already
+    replaced would be the single worst answer available, so the marker is set
+    first and cleared never.
+    """
+
+    pointer_promoted: bool = False
+    canonical_selected: bool = False
+    selector: dict[str, Any] | None = None
+
+
+def promote_green_release_to_canonical(
+    *,
+    runtime: Path,
+    release_path: Path,
+    contract: core.RuntimeContract,
+    green_binding: dict[str, str],
+    activation: core.ActivationState,
+    expected_green_selector_sha256: str,
+    expected_green_binding_sha256: str,
+    cutover_id: str,
+    timeout_seconds: int,
+    progress: CanonicalPromotionProgress,
+) -> dict[str, Any]:
+    """The one canonical promotion sequence, shared by cutover and resume.
+
+    Both the productive cutover and the receipt-bound resume arrive at the same
+    place -- green is serving, canonical must become green -- so they must get
+    there by the same code.  Two implementations of this sequence would be two
+    sets of ordering guarantees, and only one of them would be tested.
+
+    Ordering is the guarantee: the stable pointer moves first, the canonical
+    operator is proven to run the promoted release, and only a compare-and-swap
+    that carries the exact green predecessor may select canonical.  Green stays
+    the authoritative route for the entire operator restart.
+    """
+    # Immediately before the first irreversible effect, not merely at the start
+    # of the phase: the deployment lock keeps other deploys out, but the
+    # selector is a separate authority and a stale reading of it must not be
+    # what a pointer swap is justified by.
+    _require_selector_authority(
+        expected_selector_sha256=expected_green_selector_sha256,
+        expected_slot="green",
+        expected_binding_sha256=expected_green_binding_sha256,
+    )
+    progress.pointer_promoted = True
+    core.activate_pointer(activation)
+    # Admission stays engaged through the complete promotion where the caller
+    # engaged it: while it is active neither the old canonical process nor the
+    # transient green may admit a new normal tool call, so no effect can start
+    # on green and then be cut off by retirement.
+    stop_service(OPERATOR_SERVICE)
+    ingress = observe_service(TRANSPORT_INGRESS_SERVICE)
+    if not ingress.confirmed_active:
+        start_service(TRANSPORT_INGRESS_SERVICE)
+    _require_selector_authority(
+        expected_selector_sha256=expected_green_selector_sha256,
+        expected_slot="green",
+        expected_binding_sha256=expected_green_binding_sha256,
+    )
+    start_service(OPERATOR_SERVICE)
+    process = verify_operator_process(runtime, contract, release_hint=release_path)
+    listener = _require_loopback_listener(
+        OPERATOR_LISTENER_PORT, timeout_seconds=timeout_seconds
+    )
+    try:
+        canonical = transport_ingress.publish_routing_selector(
+            expected_selector_sha256=expected_green_selector_sha256,
+            selected_slot="canonical",
+            runtime_binding=green_binding,
+            cutover_id=cutover_id,
+        )
+    except Exception:
+        # The atomic replace may have landed even when its durable readback
+        # failed.  Only an unchanged, readable predecessor proves nothing moved;
+        # every other state is ambiguous and must forbid automatic correction.
+        try:
+            observed = transport_ingress.read_routing_selector()
+        except Exception:
+            progress.canonical_selected = True
+        else:
+            if observed.get("selector_sha256") != expected_green_selector_sha256:
+                progress.selector = observed
+                progress.canonical_selected = True
+        raise
+    progress.selector = canonical
+    progress.canonical_selected = True
+    final_readback = _require_selector_authority(
+        expected_selector_sha256=canonical["selector_sha256"],
+        expected_slot="canonical",
+        expected_binding_sha256=canonical["runtime_binding_sha256"],
+    )
+    # Keep the already-verified green runtime available and admission closed
+    # until canonical proves full MCP readiness through ingress.  Only the exact
+    # read-only minimal status probe is drain-neutral.
+    canonical_readiness = _probe_release_runtime(
+        release_path=release_path,
+        port=TRANSPORT_INGRESS_LISTENER_PORT,
+        auth_mode="ingress",
+        expected_release_id=green_binding["release_id"],
+        expected_repo_head=green_binding["repo_head"],
+        expected_agent_instructions_sha256=green_binding[
+            "agent_instructions_sha256"
+        ],
+        timeout_seconds=timeout_seconds,
+    )
+    return {
+        "promoted": True,
+        "selector": canonical,
+        "final_routing": _selector_summary(canonical),
+        "authoritative_readback": final_readback,
+        "canonical_readiness_sha256": _json_sha256(canonical_readiness),
+        "operator": {"pid": process["pid"], "listener": listener},
+        "activation_steps": list(activation.steps),
+    }
+
+
 @dataclass
 class ProductionBlueGreenRuntime:
     repo: Path
@@ -5055,6 +5258,9 @@ class ProductionBlueGreenRuntime:
     source_complete_schema_sha256: str | None = None
     snapshot_rebind_mode: str = "external_client"
     deployment_source_identity_sha256: str | None = None
+    promotion_progress: CanonicalPromotionProgress = field(
+        default_factory=CanonicalPromotionProgress
+    )
 
     def start_green(self) -> dict[str, Any]:
         core.verify_apply_snapshot_unchanged(
@@ -5334,57 +5540,23 @@ class ProductionBlueGreenRuntime:
         core.verify_apply_snapshot_unchanged(
             self.repo, self.snapshot, self.build.release_path
         )
-        core.activate_pointer(self.activation)
-        # Keep the global admission marker engaged through the complete
-        # promotion. While it is active neither the old canonical process nor
-        # transient Green may admit a new normal tool call. This prevents an
-        # effect from starting on Green and then being cut off by retirement.
-        stop_service(OPERATOR_SERVICE)
-        ingress = observe_service(TRANSPORT_INGRESS_SERVICE)
-        if not ingress.confirmed_active:
-            start_service(TRANSPORT_INGRESS_SERVICE)
-        _require_selector_authority(
-            expected_selector_sha256=self.current_selector["selector_sha256"],
-            expected_slot="green",
-            expected_binding_sha256=self.current_selector[
+        promotion = promote_green_release_to_canonical(
+            runtime=self.runtime,
+            release_path=self.build.release_path,
+            contract=self.snapshot.contract,
+            green_binding=self.green_binding,
+            activation=self.activation,
+            expected_green_selector_sha256=self.current_selector["selector_sha256"],
+            expected_green_binding_sha256=self.current_selector[
                 "runtime_binding_sha256"
             ],
-        )
-        start_service(OPERATOR_SERVICE)
-        verify_operator_process(
-            self.runtime,
-            self.snapshot.contract,
-            release_hint=self.build.release_path,
-        )
-        _require_loopback_listener(
-            OPERATOR_LISTENER_PORT, timeout_seconds=self.timeout_seconds
-        )
-        canonical = transport_ingress.publish_routing_selector(
-            expected_selector_sha256=self.current_selector["selector_sha256"],
-            selected_slot="canonical",
-            runtime_binding=self.green_binding,
             cutover_id=self.cutover_id,
-        )
-        self.current_selector = canonical
-        final_readback = _require_selector_authority(
-            expected_selector_sha256=canonical["selector_sha256"],
-            expected_slot="canonical",
-            expected_binding_sha256=canonical["runtime_binding_sha256"],
-        )
-        # Keep the already-verified Green runtime available and keep mutation
-        # admission closed until canonical proves full MCP readiness through
-        # ingress. Only the exact read-only minimal status probe is drain-neutral.
-        canonical_readiness = _probe_release_runtime(
-            release_path=self.build.release_path,
-            port=TRANSPORT_INGRESS_LISTENER_PORT,
-            auth_mode="ingress",
-            expected_release_id=self.build.release_id,
-            expected_repo_head=self.snapshot.repo_head,
-            expected_agent_instructions_sha256=self.build.agent_instructions[
-                "sha256"
-            ],
             timeout_seconds=self.timeout_seconds,
+            progress=self.promotion_progress,
         )
+        canonical = promotion["selector"]
+        self.current_selector = canonical
+        final_readback = promotion["authoritative_readback"]
         green_retirement = _stop_green_operator(self.green_unit)
         self.green_started = False
         admission_release = None
@@ -5407,15 +5579,9 @@ class ProductionBlueGreenRuntime:
             "blue_operator_replaced": True,
             "green_retirement": green_retirement,
             "admission_release": admission_release,
-            "final_routing": _selector_summary(canonical),
+            "final_routing": promotion["final_routing"],
             "authoritative_readback": final_readback,
-            "canonical_readiness_sha256": hashlib.sha256(
-                json.dumps(
-                    canonical_readiness,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest(),
+            "canonical_readiness_sha256": promotion["canonical_readiness_sha256"],
             "runtime_identity": {
                 "pid": identity["process"]["pid"],
                 "release_id": identity["manifest"]["release_id"],
@@ -5443,27 +5609,7 @@ class ProductionBlueGreenRuntime:
         return result
 
     def authoritative_readback(self) -> dict[str, Any]:
-        try:
-            selector = transport_ingress.read_routing_selector()
-            return _require_selector_authority(
-                expected_selector_sha256=selector["selector_sha256"],
-                expected_slot=selector["selected_slot"],
-                expected_binding_sha256=selector["runtime_binding_sha256"],
-            )
-        except Exception as exc:
-            selector_summary: dict[str, Any] | None = None
-            try:
-                selector_summary = _selector_summary(
-                    transport_ingress.read_routing_selector()
-                )
-            except Exception:
-                pass
-            return {
-                "authoritative": False,
-                "selector": selector_summary,
-                "error_type": type(exc).__name__,
-                "requires_operator_recovery": True,
-            }
+        return observe_authoritative_routing()
 
 
 def prepare_production_blue_green_runtime(
@@ -5710,6 +5856,17 @@ def _json_sha256(value: Any) -> str:
 def _persist_production_blue_green_receipt(
     receipt: dict[str, Any],
 ) -> dict[str, str]:
+    return _persist_blue_green_receipt_document(
+        receipt, identifier=receipt.get("cutover_id"), label="cutover id"
+    )
+
+
+def _persist_blue_green_receipt_document(
+    receipt: dict[str, Any],
+    *,
+    identifier: Any,
+    label: str,
+) -> dict[str, str]:
     root = BLUE_GREEN_RECEIPT_ROOT
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     metadata = root.lstat()
@@ -5724,12 +5881,12 @@ def _persist_production_blue_green_receipt(
             "Blue-green receipt directory is not private and owner-controlled",
             phase="blue-green-receipt",
         )
-    cutover_id = receipt.get("cutover_id")
+    cutover_id = identifier
     if (
         not isinstance(cutover_id, str)
         or re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", cutover_id) is None
     ):
-        core.fail("Blue-green receipt cutover id is invalid")
+        core.fail(f"Blue-green receipt {label} is invalid")
     encoded = (
         json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         + "\n"
@@ -6166,6 +6323,950 @@ def run_production_blue_green_cutover(
 
 
 
+
+
+MIDCUTOVER_RESUME_RECEIPT_KIND = midcutover.RESUME_RECEIPT_KIND
+MIDCUTOVER_RESUME_ID_PREFIX = "bgcr-"
+
+
+class MidCutoverResumeDenied(RuntimeError):
+    """The durable state does not admit a receipt-bound mid-cutover resume."""
+
+    def __init__(self, classification: dict[str, Any]) -> None:
+        self.classification = classification
+        super().__init__(
+            "mid-cutover resume denied: "
+            + ",".join(classification.get("reasons") or ["unclassified"])
+        )
+
+
+RELEASE_ID_CONTRACT_RE = re.compile(r"-contract([0-9a-f]{12})\Z")
+RELEASE_SNAPSHOT_CONTRACT_KEY = "runtime_entrypoint"
+
+
+def _receipt_bound_release_contract(
+    release_path: Path,
+    *,
+    expected_release_id: str,
+    expected_repo_head: str,
+) -> tuple[core.RuntimeContract, dict[str, Any]]:
+    """Derive the promoted contract from the release itself, not from a checkout.
+
+    The first draft parsed the green contract with *this checkout's* canonical
+    validator.  That silently made recovery time-limited: once main moves past
+    the stranded cutover -- which it will, because the stranded cutover is what
+    blocks deploys -- a still-valid green release would stop being resumable
+    for a reason that has nothing to do with green.  Recovery may not expire
+    because the repository moved on.
+
+    The authority is therefore the artifact chain, which is fixed and cannot
+    move:
+
+    * the receipt names ``green_release_id`` and is hash-bound,
+    * the release id itself commits to the contract digest in its
+      ``-contract<12>`` component and to the head in its prefix,
+    * the release ships the immutable contract bytes it was built from, whose
+      digest must equal both the manifest's ``entrypoint_contract_sha256`` and
+      that release-id component,
+    * the manifest's projected ``entrypoint_contract`` must agree with those
+      bytes.
+
+    Nothing from the target release is executed here, and no validator from
+    either side is consulted: structural validity of this contract is not
+    assumed, it is *observed* -- green is authoritatively probed as serving the
+    exact release before any of this is acted on.
+    """
+    evidence: dict[str, Any] = {"release_path": str(release_path)}
+    manifest = core.read_manifest(release_path)
+    if manifest.get("release_id") != expected_release_id:
+        core.fail(
+            "Green release manifest names a different release id",
+            phase="midcutover-resume-preflight",
+            details={"manifest_release_id": manifest.get("release_id")},
+        )
+    if manifest.get("repo_head") != expected_repo_head:
+        core.fail(
+            "Green release manifest names a different repository head",
+            phase="midcutover-resume-preflight",
+            details={"manifest_repo_head": manifest.get("repo_head")},
+        )
+    if manifest.get("completion_status") != "complete":
+        core.fail(
+            "Resumed green release is not a complete deployment artifact",
+            phase="midcutover-resume-preflight",
+            details={"completion_status": manifest.get("completion_status")},
+        )
+    declared = manifest.get("entrypoint_contract_sha256")
+    if not isinstance(declared, str) or re.fullmatch(r"[0-9a-f]{64}", declared) is None:
+        core.fail(
+            "Green release manifest carries no contract digest",
+            phase="midcutover-resume-preflight",
+        )
+    match = RELEASE_ID_CONTRACT_RE.search(expected_release_id)
+    if match is None or not declared.startswith(match.group(1)):
+        core.fail(
+            "Green release id does not commit to the manifest contract digest",
+            phase="midcutover-resume-preflight",
+            details={"entrypoint_contract_sha256": declared},
+        )
+    snapshot_paths = manifest.get("snapshot_paths")
+    contract_path = (
+        snapshot_paths.get(RELEASE_SNAPSHOT_CONTRACT_KEY)
+        if isinstance(snapshot_paths, dict)
+        else None
+    )
+    if not isinstance(contract_path, str):
+        core.fail(
+            "Green release manifest carries no immutable contract snapshot path",
+            phase="midcutover-resume-preflight",
+        )
+    contract_file = core.require_manifest_snapshot_path(
+        manifest,
+        RELEASE_SNAPSHOT_CONTRACT_KEY,
+        Path(contract_path),
+        release_path,
+    )
+    contract_bytes = contract_file.read_bytes()
+    observed = core.sha256_bytes(contract_bytes)
+    if observed != declared:
+        core.fail(
+            "Green release contract snapshot does not match its declared digest",
+            phase="midcutover-resume-preflight",
+            details={"observed_sha256": observed, "declared_sha256": declared},
+        )
+    try:
+        raw = json.loads(contract_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        core.fail(
+            "Green release contract snapshot is not valid JSON",
+            phase="midcutover-resume-preflight",
+            details={"error_type": type(exc).__name__},
+        )
+    projected = manifest.get("entrypoint_contract")
+    if not isinstance(projected, dict) or projected.get("module") != raw.get("module"):
+        core.fail(
+            "Green release manifest contract disagrees with its immutable snapshot",
+            phase="midcutover-resume-preflight",
+        )
+    module = raw.get("module")
+    source = raw.get("source")
+    expected_tools = raw.get("expected_tools")
+    if (
+        not isinstance(module, str)
+        or not module.isidentifier()
+        or not isinstance(source, str)
+        or not isinstance(expected_tools, list)
+        or not all(isinstance(name, str) for name in expected_tools)
+    ):
+        core.fail(
+            "Green release contract snapshot is structurally unusable",
+            phase="midcutover-resume-preflight",
+        )
+    evidence.update(
+        {
+            "release_id": expected_release_id,
+            "repo_head": expected_repo_head,
+            "entrypoint_contract_sha256": declared,
+            "entrypoint_contract_path": str(contract_file),
+            "module": module,
+            "expected_tool_count": len(expected_tools),
+            "judged_by_checkout": False,
+            "executed_release_code": False,
+        }
+    )
+    contract = core.RuntimeContract(
+        schema_version=int(raw.get("schema_version", 1)),
+        mode="module",
+        module=module,
+        source=Path(source),
+        expected_tools=tuple(expected_tools),
+    )
+    return contract, evidence
+
+
+CANONICAL_OPERATOR_LIVE = "canonical_operator_live"
+CANONICAL_OPERATOR_ABSENT = "canonical_operator_absent"
+CANONICAL_OPERATOR_AMBIGUOUS = "canonical_operator_ambiguous"
+
+
+def _listener_present(port: int, *, timeout_seconds: float = 1.0) -> bool:
+    """Soft listener probe used only as classification evidence."""
+    try:
+        with socket.create_connection(
+            (OPERATOR_LISTENER_HOST, port), timeout=timeout_seconds
+        ):
+            return True
+    except OSError:
+        return False
+
+
+def classify_canonical_admission_topology() -> dict[str, Any]:
+    """Decide whether the old canonical operator can still be drained.
+
+    Once green is publicly selected, the old canonical process is no longer
+    load-bearing, and it may well be gone -- that is a normal consequence of the
+    failure that stranded the cutover, not a new fault.  Requiring it to be
+    alive would make recovery depend on the health of the thing being replaced.
+
+    Three states, and only three:
+
+    ``canonical_operator_live``
+        The unit is confirmed active and its admission status answers.  Drain
+        it properly.
+    ``canonical_operator_absent``
+        The unit is confirmed inactive *and* nothing listens on its port.  There
+        is no process that could admit a mutation, so there is nothing to close.
+    ``canonical_operator_ambiguous``
+        Anything else -- active but unreachable, inactive with a live listener,
+        an unusable service query.  Fail closed: an unknown admission state is
+        not an empty one.
+    """
+    observation = observe_service(OPERATOR_SERVICE)
+    listener = _listener_present(OPERATOR_LISTENER_PORT)
+    status_reachable: bool | None = None
+    status_error: str | None = None
+    if observation.confirmed_active:
+        try:
+            _operator_admission_observation()
+            status_reachable = True
+        except core.DeployError as exc:
+            status_reachable = False
+            status_error = str(exc.details.get("failure_class") or exc.phase or "")
+    if observation.confirmed_active and status_reachable:
+        topology = CANONICAL_OPERATOR_LIVE
+    elif observation.confirmed_inactive and not listener:
+        topology = CANONICAL_OPERATOR_ABSENT
+    else:
+        topology = CANONICAL_OPERATOR_AMBIGUOUS
+    return {
+        "topology": topology,
+        "service": observation.to_dict(),
+        "listener_present": listener,
+        "admission_status_reachable": status_reachable,
+        "admission_status_error": status_error,
+        "does_not_establish": [
+            "that no effect is in flight on green",
+            "that the canonical operator will stay in this state",
+        ],
+    }
+
+
+@dataclass
+class MidCutoverResumeRuntime:
+    """The exact continuation of one already-switched blue-green cutover.
+
+    Every field is derived from durable evidence of that cutover.  The class
+    owns no build, allocates no release identity and never writes the routing
+    selector except through the CAS that carries the exact predecessor hash.
+    """
+
+    repo: Path
+    runtime: Path
+    release_path: Path
+    contract: core.RuntimeContract
+    contract_evidence: dict[str, Any]
+    green_binding: dict[str, str]
+    classification: dict[str, Any]
+    resume_binding: dict[str, Any]
+    timeout_seconds: int
+    green_unit: str
+    selector_before: dict[str, Any]
+    admission_marker: dict[str, Any] | None = None
+    admission_topology: dict[str, Any] | None = None
+    activation: core.ActivationState | None = None
+    current_selector: dict[str, Any] | None = None
+    promotion_progress: CanonicalPromotionProgress = field(
+        default_factory=CanonicalPromotionProgress
+    )
+    green_proven: bool = False
+
+    @property
+    def cutover_id(self) -> str:
+        return str(self.resume_binding["cutover_id"])
+
+    @property
+    def pointer_promoted(self) -> bool:
+        return self.promotion_progress.pointer_promoted
+
+    @property
+    def canonical_selected(self) -> bool:
+        return self.promotion_progress.canonical_selected
+
+    def verify_green_serving(self) -> dict[str, Any]:
+        """Prove green authoritatively, before anything irreversible happens.
+
+        A mid-cutover invariant with no counterpart in the ordinary cutover:
+        there, green is a release this process just built and started.  Here it
+        is a process someone else started, that the public route already points
+        at, and that this run is about to make canonical.  A release manifest on
+        disk and a TCP listener are not evidence that *that* process serves
+        *that* release -- only a full MCP identity probe is, and it must come
+        before the pointer moves, not after.
+        """
+        readback = _require_selector_authority(
+            expected_selector_sha256=self.resume_binding["expected_selector_sha256"],
+            expected_slot="green",
+            expected_binding_sha256=self.resume_binding[
+                "expected_runtime_binding_sha256"
+            ],
+        )
+        readiness = _probe_release_runtime(
+            release_path=self.release_path,
+            port=GREEN_OPERATOR_LISTENER_PORT,
+            auth_mode="connector",
+            expected_release_id=self.green_binding["release_id"],
+            expected_repo_head=self.green_binding["repo_head"],
+            expected_agent_instructions_sha256=self.green_binding[
+                "agent_instructions_sha256"
+            ],
+            timeout_seconds=self.timeout_seconds,
+        )
+        self.green_proven = True
+        return {
+            "green_serving": True,
+            "authoritative_readback": readback,
+            "green_readiness_sha256": _json_sha256(readiness),
+            "proves": [
+                "the green process serves the exact resumed release and head",
+                "the ingress route is authoritatively bound to that release",
+            ],
+        }
+
+    def close_mutations(self) -> dict[str, Any]:
+        """Close admission if there is anything left that could admit."""
+        topology = classify_canonical_admission_topology()
+        self.admission_topology = topology
+        kind = topology["topology"]
+        if kind == CANONICAL_OPERATOR_ABSENT:
+            # Nothing to drain: the old canonical process is gone, and green is
+            # the public route either way.  Requiring blue to be alive here would
+            # make recovery depend on the health of what it is replacing.
+            return {
+                "closed": False,
+                "topology": kind,
+                "reason": "no canonical operator process can admit a mutation",
+            }
+        if kind != CANONICAL_OPERATOR_LIVE:
+            core.fail(
+                "Canonical operator admission state is ambiguous",
+                phase="midcutover-admission-topology",
+                details=topology,
+            )
+        self.admission_marker = engage_receipt_bound_deployment_admission(
+            expected_head=self.green_binding["repo_head"],
+            source_identity_sha256=str(
+                self.resume_binding["source_identity_sha256"]
+            ),
+            timeout_seconds=self.timeout_seconds,
+        )
+        return {
+            "closed": True,
+            "topology": kind,
+            "marker_sha256": _json_sha256(self.admission_marker),
+            "expected_head": self.admission_marker["expected_head"],
+        }
+
+    def terminalize_effects(self) -> dict[str, Any]:
+        if self.admission_marker is None:
+            return {
+                "supported": False,
+                "reason": "canonical operator was already absent",
+                "topology": (self.admission_topology or {}).get("topology"),
+                "does_not_establish": ["absence_of_inflight_commands"],
+            }
+        drained = wait_for_operator_deployment_admission(
+            self.admission_marker, timeout_seconds=self.timeout_seconds
+        )
+        final = verify_operator_deployment_admission(self.admission_marker)
+        return {
+            **drained,
+            "final_guard_sha256": _json_sha256(final),
+            "registry_authority": "grabowski_operator_cross_process_status",
+        }
+
+    def promote_canonical(self) -> dict[str, Any]:
+        """Run the shared canonical promotion against the resumed green release."""
+        if not self.green_proven:
+            core.fail(
+                "Canonical promotion requires an authoritative green readiness proof",
+                phase="midcutover-promote-canonical",
+            )
+        self.activation = core.ActivationState(
+            runtime=self.runtime,
+            release_path=self.release_path,
+            previous=core.capture_pointer(self.runtime),
+        )
+        promotion = promote_green_release_to_canonical(
+            runtime=self.runtime,
+            release_path=self.release_path,
+            contract=self.contract,
+            green_binding=self.green_binding,
+            activation=self.activation,
+            expected_green_selector_sha256=self.resume_binding[
+                "expected_selector_sha256"
+            ],
+            expected_green_binding_sha256=self.resume_binding[
+                "expected_runtime_binding_sha256"
+            ],
+            cutover_id=self.cutover_id,
+            timeout_seconds=self.timeout_seconds,
+            progress=self.promotion_progress,
+        )
+        self.current_selector = promotion["selector"]
+        return promotion
+
+    def retire_green(self) -> dict[str, Any]:
+        if not self.canonical_selected:
+            core.fail(
+                "Green retirement requires a proven canonical promotion",
+                phase="midcutover-retire-green",
+            )
+        retirement = _stop_green_operator(self.green_unit)
+        admission_release = None
+        if self.admission_marker is not None:
+            admission_release = release_operator_deployment_admission(
+                self.admission_marker
+            )
+            self.admission_marker = None
+        return {**retirement, "admission_release": admission_release}
+
+    def final_readback(self) -> dict[str, Any]:
+        require_service_active(TRANSPORT_INGRESS_SERVICE)
+        require_service_active(TUNNEL_SERVICE)
+        manifest = core.read_manifest(self.runtime)
+        binding, binding_sha256 = transport_ingress._read_runtime_binding(
+            self.runtime / core.MANIFEST_NAME
+        )
+        if (
+            binding != self.green_binding
+            or binding_sha256 != self.resume_binding["expected_runtime_binding_sha256"]
+        ):
+            core.fail(
+                "Promoted runtime binding does not match the resumed green identity",
+                phase="midcutover-final-readback",
+                details={"observed_runtime_binding_sha256": binding_sha256},
+            )
+        return {
+            "runtime_binding_sha256": binding_sha256,
+            "release_id": manifest.get("release_id"),
+            "repo_head": manifest.get("repo_head"),
+            "completion_status": manifest.get("completion_status"),
+        }
+
+    def release_admission_best_effort(self) -> dict[str, Any]:
+        """Give back the admission gate on a pre-effect abort.
+
+        Deliberately not a rollback: nothing is reverted here.  Leaving the gate
+        engaged after a refusal would keep the runtime closed for mutations for
+        no reason, which is a denial of service rather than a safety property.
+        """
+        if self.admission_marker is None:
+            return {"released": False, "reason": "no_marker_engaged"}
+        try:
+            release_operator_deployment_admission(self.admission_marker)
+        except Exception as exc:  # noqa: BLE001 - abort path must stay reportable
+            return {"released": False, "error": type(exc).__name__}
+        self.admission_marker = None
+        return {"released": True}
+
+    def authoritative_readback(self) -> dict[str, Any]:
+        return observe_authoritative_routing()
+
+
+def classify_midcutover_resume(
+    *,
+    expected_head: str,
+    runtime: Path | None = None,
+    receipt_root: Path | None = None,
+) -> dict[str, Any]:
+    """Classify the live durable state; read-only and safe to call anywhere.
+
+    The verdict comes from the same module the MCP recovery surface uses, so the
+    gate an operator sees and the gate the runner enforces cannot drift apart.
+    """
+    target_runtime = runtime or (core.HOME / ".local/share/grabowski-mcp")
+    return midcutover.classify_from_durable_state(
+        expected_head=expected_head,
+        selector_path=transport_ingress.DEFAULT_SELECTOR_FILE,
+        receipt_root=(
+            receipt_root if receipt_root is not None else BLUE_GREEN_RECEIPT_ROOT
+        ),
+        releases_root=core.releases_root_for(target_runtime),
+    )
+
+
+def prepare_midcutover_resume_runtime(
+    repo: Path,
+    runtime: Path,
+    *,
+    expected_head: str,
+    timeout_seconds: int,
+    receipt_root: Path | None = None,
+    require_resume_binding_sha256: str | None = None,
+) -> MidCutoverResumeRuntime:
+    """Bind one already-switched cutover, or refuse; never build a release."""
+    classification = classify_midcutover_resume(
+        expected_head=expected_head,
+        runtime=runtime,
+        receipt_root=receipt_root,
+    )
+    if (
+        classification.get("lane") != midcutover.LANE_MID_CUTOVER_RESUME
+        or not isinstance(classification.get("resume_binding"), dict)
+    ):
+        raise MidCutoverResumeDenied(classification)
+    resume_binding = classification["resume_binding"]
+    if (
+        require_resume_binding_sha256 is not None
+        and resume_binding.get("binding_sha256") != require_resume_binding_sha256
+    ):
+        # The authorising operator named one exact cutover.  If the durable
+        # state now classifies a different one, that is a new decision, not a
+        # continuation of the approved one.
+        raise MidCutoverResumeDenied(
+            {
+                **classification,
+                "lane": midcutover.LANE_FAIL_CLOSED,
+                "reasons": sorted(
+                    {*(classification.get("reasons") or []), "resume_binding_drifted"}
+                ),
+                "authorized_resume_binding_sha256": require_resume_binding_sha256,
+            }
+        )
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{64}", str(resume_binding.get("source_identity_sha256") or "")
+        )
+        is None
+    ):
+        core.fail(
+            "Resumed cutover receipt carries no scheduler source identity",
+            phase="midcutover-resume-preflight",
+        )
+    require_service_active(TRANSPORT_INGRESS_SERVICE)
+    release_path = (
+        core.releases_root_for(runtime) / resume_binding["expected_release_id"]
+    )
+    contract, contract_evidence = _receipt_bound_release_contract(
+        release_path,
+        expected_release_id=str(resume_binding["expected_release_id"]),
+        expected_repo_head=expected_head,
+    )
+    green_binding, green_binding_sha256 = transport_ingress._read_runtime_binding(
+        release_path / core.MANIFEST_NAME
+    )
+    if (
+        green_binding_sha256 != resume_binding["expected_runtime_binding_sha256"]
+        or green_binding["release_id"] != resume_binding["expected_release_id"]
+        or green_binding["repo_head"] != expected_head
+    ):
+        core.fail(
+            "Resumed green release identity does not match the bound cutover receipt",
+            phase="midcutover-resume-preflight",
+            details={
+                "observed_runtime_binding_sha256": green_binding_sha256,
+                "expected_runtime_binding_sha256": resume_binding[
+                    "expected_runtime_binding_sha256"
+                ],
+            },
+        )
+    selector_before = transport_ingress.read_routing_selector()
+    if selector_before.get("selector_sha256") != resume_binding[
+        "expected_selector_sha256"
+    ]:
+        core.fail(
+            "Routing selector moved between classification and resume preflight",
+            phase="midcutover-resume-preflight",
+            details={"selector": _selector_summary(selector_before)},
+        )
+    return MidCutoverResumeRuntime(
+        repo=repo,
+        runtime=runtime,
+        release_path=release_path,
+        contract=contract,
+        contract_evidence=contract_evidence,
+        green_binding=green_binding,
+        classification=classification,
+        resume_binding=resume_binding,
+        timeout_seconds=timeout_seconds,
+        green_unit=_green_operator_unit(resume_binding["cutover_id"]),
+        selector_before=selector_before,
+    )
+
+
+def _midcutover_resume_receipt(
+    *,
+    resume_id: str,
+    resume_binding: dict[str, Any],
+    classification_sha256: str | None,
+    contract_evidence: dict[str, Any] | None,
+    phase: str,
+    outcome: str,
+    observations: list[dict[str, Any]],
+    green_serving: dict[str, Any] | None,
+    drain: dict[str, Any] | None,
+    pointer_promotion: dict[str, Any] | None,
+    canonical_operator: dict[str, Any] | None,
+    selector_switch: dict[str, Any] | None,
+    retirement: dict[str, Any] | None,
+    final_state: dict[str, Any] | None,
+    readback: dict[str, Any] | None,
+    recovery: dict[str, Any] | None,
+) -> dict[str, Any]:
+    material = {
+        "schema_version": 1,
+        "kind": MIDCUTOVER_RESUME_RECEIPT_KIND,
+        "resume_id": resume_id,
+        "resumed_cutover_id": resume_binding.get("cutover_id"),
+        "resumed_receipt_sha256": resume_binding.get("resumed_receipt_sha256"),
+        "resume_binding_sha256": resume_binding.get("binding_sha256"),
+        "classification_sha256": classification_sha256,
+        "expected_head": resume_binding.get("expected_head"),
+        "source_identity_sha256": resume_binding.get("source_identity_sha256"),
+        "green_release_id": resume_binding.get("expected_release_id"),
+        "resumed_selector_sha256": resume_binding.get("expected_selector_sha256"),
+        "resumed_generation": resume_binding.get("expected_generation"),
+        "target_contract": contract_evidence,
+        "phase": phase,
+        "outcome": outcome,
+        "green_serving": green_serving,
+        "effect_terminalization": drain,
+        "pointer_promotion": pointer_promotion,
+        "canonical_operator": canonical_operator,
+        "selector_switch": selector_switch,
+        "final_routing": (
+            {
+                key: selector_switch.get(key)
+                for key in (
+                    "selector_sha256",
+                    "generation",
+                    "selected_slot",
+                    "upstream_port",
+                    "runtime_binding_sha256",
+                    "release_id",
+                    "repo_head",
+                )
+            }
+            if isinstance(selector_switch, dict)
+            else None
+        ),
+        "retirement": retirement,
+        "final_state": final_state,
+        "authoritative_readback": readback,
+        "observations": observations,
+        "recovery": recovery,
+        "preserves": [
+            "blue_green_receipt_lineage",
+            "deployment_lock",
+            "routing_selector_compare_and_swap",
+            "runtime_manifest_and_provenance",
+            "audit_and_recovery_gates",
+        ],
+        "does_not_establish": [
+            "that a new deployment was performed",
+            "that the connector snapshot was rebound to green",
+            "that the external client refreshed against green",
+            "platform connector catalog publication",
+        ],
+    }
+    return {**material, "receipt_sha256": _json_sha256(material)}
+
+
+def _persist_midcutover_resume_receipt(receipt: dict[str, Any]) -> dict[str, str]:
+    return _persist_blue_green_receipt_document(
+        receipt, identifier=receipt.get("resume_id"), label="resume id"
+    )
+
+
+def resume_production_blue_green_cutover(
+    *,
+    repo: Path,
+    expected_head: str,
+    timeout_seconds: int = 40,
+    runtime: Path | None = None,
+    lock_file: Path | None = None,
+    receipt_root: Path | None = None,
+    resume_id: str | None = None,
+    require_resume_binding_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Continue exactly one already-switched cutover to canonical, under the lock.
+
+    This is not a deployment.  It builds nothing, allocates no release identity
+    and admits no target other than the one the bound receipt already proved.
+    After the first irreversible effect no automatic corrective action is taken:
+    an ambiguous mid-resume state is reported as ``outcome_unknown`` with its
+    complete evidence, never repaired by guessing.
+    """
+    identifier = resume_id or f"{MIDCUTOVER_RESUME_ID_PREFIX}{secrets.token_hex(8)}"
+    if re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", identifier) is None:
+        raise ValueError("resume_id is invalid")
+    target_runtime = runtime or (core.HOME / ".local/share/grabowski-mcp")
+    target_lock = lock_file or core.DEFAULT_LOCK_FILE
+    observations: list[dict[str, Any]] = []
+    context: MidCutoverResumeRuntime | None = None
+    phase = "classify"
+    green_serving: dict[str, Any] | None = None
+    drain: dict[str, Any] | None = None
+    pointer_promotion: dict[str, Any] | None = None
+    canonical_operator: dict[str, Any] | None = None
+    selector_switch: dict[str, Any] | None = None
+    retirement: dict[str, Any] | None = None
+    final_state: dict[str, Any] | None = None
+    readback: dict[str, Any] | None = None
+    recovery: dict[str, Any] | None = None
+    outcome = "denied"
+    error: dict[str, Any] | None = None
+    with core.deployment_lock(target_lock):
+        try:
+            context = prepare_midcutover_resume_runtime(
+                repo,
+                target_runtime,
+                expected_head=expected_head,
+                timeout_seconds=timeout_seconds,
+                receipt_root=receipt_root,
+                require_resume_binding_sha256=require_resume_binding_sha256,
+            )
+        except MidCutoverResumeDenied as exc:
+            _blue_green_observation(
+                observations,
+                phase="denied",
+                details={"reasons": exc.classification.get("reasons")},
+            )
+            receipt = _midcutover_resume_receipt(
+                resume_id=identifier,
+                resume_binding={
+                    "cutover_id": None,
+                    "resumed_receipt_sha256": None,
+                    "binding_sha256": None,
+                    "expected_head": expected_head,
+                    "source_identity_sha256": None,
+                    "expected_release_id": None,
+                    "expected_selector_sha256": None,
+                    "expected_generation": None,
+                },
+                classification_sha256=exc.classification.get("classification_sha256"),
+                contract_evidence=None,
+                phase="denied",
+                outcome="denied",
+                observations=observations,
+                green_serving=None,
+                drain=None,
+                pointer_promotion=None,
+                canonical_operator=None,
+                selector_switch=None,
+                retirement=None,
+                final_state=None,
+                readback=None,
+                recovery={
+                    "action": "repair_or_reclassify_recovery_evidence",
+                    "blue_green_state_unchanged": True,
+                    "classification": exc.classification,
+                },
+            )
+            persisted = _persist_midcutover_resume_receipt(receipt)
+            return {
+                "receipt": receipt,
+                "receipt_path": persisted["path"],
+                "receipt_sha256": persisted["receipt_sha256"],
+                "receipt_persisted": True,
+                "outcome": "denied",
+                "error": None,
+            }
+        except Exception as exc:
+            error = _error_summary(exc)
+            _blue_green_observation(
+                observations,
+                phase="failed_pre_resume",
+                details={"error_type": error.get("type")},
+            )
+            receipt = _midcutover_resume_receipt(
+                resume_id=identifier,
+                resume_binding={
+                    "cutover_id": None,
+                    "resumed_receipt_sha256": None,
+                    "binding_sha256": None,
+                    "expected_head": expected_head,
+                    "source_identity_sha256": None,
+                    "expected_release_id": None,
+                    "expected_selector_sha256": None,
+                    "expected_generation": None,
+                },
+                classification_sha256=None,
+                contract_evidence=None,
+                phase="failed_pre_resume",
+                outcome="failed_pre_resume",
+                observations=observations,
+                green_serving=None,
+                drain=None,
+                pointer_promotion=None,
+                canonical_operator=None,
+                selector_switch=None,
+                retirement=None,
+                final_state=None,
+                readback=None,
+                recovery={
+                    "action": "repair_preflight_evidence_and_retry",
+                    "blue_green_state_unchanged": True,
+                    "error": error,
+                },
+            )
+            persisted = _persist_midcutover_resume_receipt(receipt)
+            return {
+                "receipt": receipt,
+                "receipt_path": persisted["path"],
+                "receipt_sha256": persisted["receipt_sha256"],
+                "receipt_persisted": True,
+                "outcome": "failed_pre_resume",
+                "error": error,
+            }
+        _blue_green_observation(
+            observations,
+            phase=phase,
+            details={
+                "cutover_id": context.cutover_id,
+                "classification_sha256": context.classification.get(
+                    "classification_sha256"
+                ),
+            },
+        )
+        try:
+            phase = "verify_green_serving"
+            green_serving = context.verify_green_serving()
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "green_readiness_sha256": green_serving.get(
+                        "green_readiness_sha256"
+                    )
+                },
+            )
+            phase = "close_mutations"
+            closed = context.close_mutations()
+            drain = context.terminalize_effects()
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={"close": closed, "drain_sha256": _json_sha256(drain)},
+            )
+            phase = "promote_canonical"
+            promotion = context.promote_canonical()
+            pointer_promotion = {
+                "promoted": True,
+                "release_path": str(context.release_path),
+                "steps": promotion["activation_steps"],
+            }
+            canonical_operator = promotion["operator"]
+            selector_switch = {
+                "switched": True,
+                **promotion["final_routing"],
+                "authoritative_readback": promotion["authoritative_readback"],
+                "canonical_readiness_sha256": promotion[
+                    "canonical_readiness_sha256"
+                ],
+            }
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "selector_sha256": selector_switch.get("selector_sha256"),
+                    "generation": selector_switch.get("generation"),
+                },
+            )
+            phase = "retire_green"
+            retirement = context.retire_green()
+            _blue_green_observation(
+                observations, phase=phase, details={"retired": True}
+            )
+            phase = "final_readback"
+            final_state = context.final_readback()
+            readback = context.authoritative_readback()
+            if readback.get("authoritative") is not True:
+                core.fail(
+                    "Final canonical routing readback is not authoritative",
+                    phase="final-routing-readback",
+                )
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={"readback_sha256": readback.get("readback_sha256")},
+            )
+            phase = "completed"
+            outcome = "completed"
+            _blue_green_observation(observations, phase=phase)
+        except Exception as exc:
+            error = _error_summary(exc)
+            readback = context.authoritative_readback()
+            if context.pointer_promoted or context.canonical_selected:
+                # An irreversible effect exists.  Rolling anything back here --
+                # least of all to blue -- would replace a knowable ambiguity with
+                # an invented one.  Record and stop.
+                outcome = "outcome_unknown"
+                phase = "outcome_unknown"
+                recovery = {
+                    "action": "readback_active_runtime_and_recover",
+                    "automatic_rollback_forbidden": True,
+                    "blue_rollback_forbidden": True,
+                    "pointer_promoted": context.pointer_promoted,
+                    "canonical_selected": context.canonical_selected,
+                    "residual_green_unit": (
+                        context.green_unit if retirement is None else None
+                    ),
+                    "error": error,
+                }
+            else:
+                outcome = "failed_pre_resume"
+                phase = "failed_pre_resume"
+                recovery = {
+                    "action": "reclassify_and_retry_resume",
+                    "blue_green_state_unchanged": True,
+                    "automatic_rollback_forbidden": True,
+                    "admission": context.release_admission_best_effort(),
+                    "error": error,
+                }
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "error_type": error.get("type") if isinstance(error, dict) else None,
+                    "readback_sha256": (
+                        readback.get("readback_sha256")
+                        if isinstance(readback, dict)
+                        else None
+                    ),
+                },
+            )
+    assert context is not None
+    receipt = _midcutover_resume_receipt(
+        resume_id=identifier,
+        resume_binding=context.resume_binding,
+        classification_sha256=context.classification.get("classification_sha256"),
+        contract_evidence=context.contract_evidence,
+        phase=phase,
+        outcome=outcome,
+        observations=observations,
+        green_serving=green_serving,
+        drain=drain,
+        pointer_promotion=pointer_promotion,
+        canonical_operator=canonical_operator,
+        selector_switch=selector_switch,
+        retirement=retirement,
+        final_state=final_state,
+        readback=readback,
+        recovery=recovery,
+    )
+    try:
+        persisted = _persist_midcutover_resume_receipt(receipt)
+    except Exception as exc:
+        raise ProductionBlueGreenReceiptPersistenceError(receipt, exc) from exc
+    return {
+        "receipt": receipt,
+        "receipt_path": persisted["path"],
+        "receipt_sha256": persisted["receipt_sha256"],
+        "receipt_persisted": True,
+        "outcome": outcome,
+        "error": error,
+    }
 
 
 def parse_args() -> argparse.Namespace:

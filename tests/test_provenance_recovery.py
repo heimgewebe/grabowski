@@ -89,9 +89,14 @@ def _load_provenance_recovery():
     self_deploy.SourceRepository = str
     self_deploy.SourceLeaseOwner = str
     self_deploy.RUNNER_RELATIVE_PATH = Path("tools/run_scheduled_deploy.py")
+    self_deploy.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH = Path(
+        "tools/run_midcutover_resume.py"
+    )
+    self_deploy.CANONICAL_REPOSITORY = Path("/nonexistent-repo")
     self_deploy.DEPLOY_JOB_PREFIX = "grabowski-job-"
     self_deploy._deployment_source_preflight = lambda *args, **kwargs: None
     self_deploy._deploy_command = lambda *args, **kwargs: ["python3"]
+    self_deploy._midcutover_resume_command = lambda *args, **kwargs: ["python3"]
     self_deploy._deploy_index = lambda root: {"units": [], "pending_unit": None}
     self_deploy._write_deploy_index = lambda *args, **kwargs: None
     self_deploy._deploy_schedule_lock = contextlib.nullcontext
