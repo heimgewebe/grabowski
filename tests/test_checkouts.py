@@ -1725,9 +1725,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(capacity["configured_limit"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO)
         self.assertEqual(capacity["raw_active_rows"], 3)
         self.assertEqual(capacity["unexpired_active_rows"], 1)
+        self.assertEqual(capacity["expired_active_rows"], 2)
         self.assertEqual(capacity["expired_present_active_rows"], 1)
         self.assertEqual(capacity["expired_missing_active_rows"], 1)
         self.assertEqual(capacity["expired_unobservable_active_rows"], 0)
+        self.assertEqual(capacity["expired_unclassified_active_rows"], 0)
+        self.assertTrue(capacity["path_classification_complete"])
+        self.assertEqual(capacity["path_observations_attempted"], 2)
         self.assertEqual(capacity["used"], 1)
         self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO - 1)
         self.assertFalse(capacity["saturated"])
@@ -1866,6 +1870,46 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIsNone(status["dirty"])
         self.assertIsNone(status["returncode"])
         self.assertEqual(status["error"], "git status timed out")
+
+    def test_bounded_inventory_does_not_probe_expired_capacity_paths(self) -> None:
+        binding = self._managed_binding()
+        expired = int(time.time()) - 1
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (expired, binding["checkout_key"]),
+            )
+            connection.commit()
+
+        original_projection = checkouts._active_capacity_projection_from_connection
+
+        def guarded_projection(connection, **kwargs):
+            self.assertEqual(kwargs["max_path_observations"], 0)
+            with patch.object(Path, "lstat", side_effect=AssertionError("capacity path probe escaped budget")):
+                return original_projection(connection, **kwargs)
+
+        with patch.object(
+            checkouts,
+            "_active_capacity_projection_from_connection",
+            side_effect=guarded_projection,
+        ):
+            inventory = checkouts.checkout_inventory(
+                self.repo,
+                include_processes=False,
+                include_tasks=False,
+                include_resources=False,
+                git_timeout_seconds=1.0,
+                observation_budget_seconds=5.0,
+                max_worktrees=1,
+            )
+        capacity = inventory["active_capacity"]
+        self.assertTrue(capacity["available"])
+        self.assertEqual(capacity["used"], 0)
+        self.assertEqual(capacity["expired_active_rows"], 1)
+        self.assertEqual(capacity["expired_unclassified_active_rows"], 1)
+        self.assertFalse(capacity["path_classification_complete"])
+        self.assertEqual(capacity["path_observations_attempted"], 0)
+        self.assertIn("complete_expired_path_presence", capacity["does_not_establish"])
 
     def test_bounded_inventory_prioritizes_main_and_reports_omissions(self) -> None:
         inventory = checkouts.checkout_inventory(

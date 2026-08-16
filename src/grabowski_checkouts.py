@@ -75,6 +75,7 @@ DEFAULT_GIT_READ_TIMEOUT_SECONDS = 30.0
 MIN_GIT_READ_TIMEOUT_SECONDS = 0.1
 MAX_GIT_READ_TIMEOUT_SECONDS = 30.0
 MAX_INVENTORY_PROBE_ERRORS = 32
+MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS = 64
 
 
 def _git_timeout_seconds(value: int | float) -> float:
@@ -624,8 +625,19 @@ def _active_capacity_projection_from_connection(
     *,
     repo_common_dir: Path,
     now: int,
+    max_path_observations: int = MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
-    """Project active creation capacity without granting lifecycle authority."""
+    """Project exact slot use plus bounded, non-authorizing path telemetry."""
+    if (
+        isinstance(max_path_observations, bool)
+        or not isinstance(max_path_observations, int)
+        or not 0 <= max_path_observations <= MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS
+    ):
+        raise ValueError(
+            "max_path_observations must be between 0 and "
+            f"{MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS}"
+        )
     rows = connection.execute(
         """
         SELECT checkout_path, retention_until_unix
@@ -635,14 +647,22 @@ def _active_capacity_projection_from_connection(
         """,
         (str(repo_common_dir),),
     ).fetchall()
-    unexpired = 0
+    unexpired = sum(
+        1 for row in rows if int(row["retention_until_unix"]) > now
+    )
+    expired_rows = [
+        row for row in rows if int(row["retention_until_unix"]) <= now
+    ]
     expired_present = 0
     expired_missing = 0
     expired_unobservable = 0
-    for row in rows:
-        if int(row["retention_until_unix"]) > now:
-            unexpired += 1
-            continue
+    path_observations_attempted = 0
+    for row in expired_rows:
+        if path_observations_attempted >= max_path_observations:
+            break
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            break
+        path_observations_attempted += 1
         try:
             Path(str(row["checkout_path"])).lstat()
         except FileNotFoundError:
@@ -651,8 +671,22 @@ def _active_capacity_projection_from_connection(
             expired_unobservable += 1
         else:
             expired_present += 1
+    classified_expired = (
+        expired_present + expired_missing + expired_unobservable
+    )
+    expired_unclassified = len(expired_rows) - classified_expired
+    classification_complete = expired_unclassified == 0
     limit = _phase_limit("active")
     used = unexpired
+    does_not_establish = [
+        "checkout_terminality",
+        "checkout_cleanup_eligibility",
+        "checkout_path_reuse_authority",
+        "branch_reuse_authority",
+        "dirty_state_safety",
+    ]
+    if not classification_complete:
+        does_not_establish.append("complete_expired_path_presence")
     return {
         "available": True,
         "configured_limit": limit,
@@ -661,16 +695,45 @@ def _active_capacity_projection_from_connection(
         "saturated": used >= limit,
         "raw_active_rows": len(rows),
         "unexpired_active_rows": unexpired,
+        "expired_active_rows": len(expired_rows),
         "expired_present_active_rows": expired_present,
         "expired_missing_active_rows": expired_missing,
         "expired_unobservable_active_rows": expired_unobservable,
+        "expired_unclassified_active_rows": expired_unclassified,
+        "path_classification_complete": classification_complete,
+        "path_observations_attempted": path_observations_attempted,
+        "path_observation_limit": max_path_observations,
+        "capacity_semantics": "unexpired_active_retention",
+        "does_not_establish": does_not_establish,
+    }
+
+
+def _unavailable_active_capacity_projection() -> dict[str, Any]:
+    return {
+        "available": False,
+        "configured_limit": _phase_limit("active"),
+        "used": None,
+        "free": None,
+        "saturated": None,
+        "raw_active_rows": None,
+        "unexpired_active_rows": None,
+        "expired_active_rows": None,
+        "expired_present_active_rows": None,
+        "expired_missing_active_rows": None,
+        "expired_unobservable_active_rows": None,
+        "expired_unclassified_active_rows": None,
+        "path_classification_complete": False,
+        "path_observations_attempted": 0,
+        "path_observation_limit": None,
         "capacity_semantics": "unexpired_active_retention",
         "does_not_establish": [
+            "absence_of_active_bindings",
             "checkout_terminality",
             "checkout_cleanup_eligibility",
             "checkout_path_reuse_authority",
             "branch_reuse_authority",
             "dirty_state_safety",
+            "complete_expired_path_presence",
         ],
     }
 
@@ -679,59 +742,23 @@ def _active_capacity_projection(
     repo_common_dir: Path,
     *,
     now: int,
+    max_path_observations: int = MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Read one repository's active capacity without creating state on absence."""
     connection = _readonly_connection(CHECKOUT_DB)
     if connection is None:
-        return {
-            "available": False,
-            "configured_limit": _phase_limit("active"),
-            "used": None,
-            "free": None,
-            "saturated": None,
-            "raw_active_rows": None,
-            "unexpired_active_rows": None,
-            "expired_present_active_rows": None,
-            "expired_missing_active_rows": None,
-            "expired_unobservable_active_rows": None,
-            "capacity_semantics": "unexpired_active_retention",
-            "does_not_establish": [
-                "absence_of_active_bindings",
-                "checkout_terminality",
-                "checkout_cleanup_eligibility",
-                "checkout_path_reuse_authority",
-                "branch_reuse_authority",
-                "dirty_state_safety",
-            ],
-        }
+        return _unavailable_active_capacity_projection()
     try:
         return _active_capacity_projection_from_connection(
             connection,
             repo_common_dir=repo_common_dir,
             now=now,
+            max_path_observations=max_path_observations,
+            deadline_monotonic=deadline_monotonic,
         )
     except sqlite3.OperationalError:
-        return {
-            "available": False,
-            "configured_limit": _phase_limit("active"),
-            "used": None,
-            "free": None,
-            "saturated": None,
-            "raw_active_rows": None,
-            "unexpired_active_rows": None,
-            "expired_present_active_rows": None,
-            "expired_missing_active_rows": None,
-            "expired_unobservable_active_rows": None,
-            "capacity_semantics": "unexpired_active_retention",
-            "does_not_establish": [
-                "absence_of_active_bindings",
-                "checkout_terminality",
-                "checkout_cleanup_eligibility",
-                "checkout_path_reuse_authority",
-                "branch_reuse_authority",
-                "dirty_state_safety",
-            ],
-        }
+        return _unavailable_active_capacity_projection()
     finally:
         connection.close()
 
@@ -2362,7 +2389,14 @@ def checkout_inventory(
     bindings = _lifecycle_bindings(keys)
     archives = _latest_archives(keys)
     now = _now()
-    active_capacity = _active_capacity_projection(common_dir, now=now)
+    active_capacity = _active_capacity_projection(
+        common_dir,
+        now=now,
+        max_path_observations=(
+            0 if bounded_observation else MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS
+        ),
+        deadline_monotonic=deadline_monotonic,
+    )
 
     def observation_priority(record: dict[str, Any]) -> tuple[int, str]:
         key = str(record["checkout_key"])
