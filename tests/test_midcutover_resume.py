@@ -593,7 +593,8 @@ FIXTURE_CONTRACT_BYTES = json.dumps(
 ).encode("utf-8")
 CONTRACT_SHA256 = hashlib.sha256(FIXTURE_CONTRACT_BYTES).hexdigest()
 CONTRACT_RELEASE = (
-    f"bbbbbbbbbbbb-srcset0011223344-lock5566778899-contract{CONTRACT_SHA256[:12]}"
+    f"{HEAD_GREEN[:12]}-srcset001122334455-lock556677889900"
+    f"-contract{CONTRACT_SHA256[:12]}"
 )
 
 
@@ -660,7 +661,10 @@ class ReceiptBoundContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             release_path = self._release(
                 Path(temporary),
-                release_id="bbbbbbbbbbbb-srcset0011223344-lock5566778899-contractdeadbeef0000",
+                release_id=(
+                f"{HEAD_GREEN[:12]}-srcset001122334455-lock556677889900"
+                "-contractdeadbeef0000"
+            ),
             )
             with self.assertRaises(dual.core.DeployError) as raised:
                 self._derive(release_path)
@@ -1119,6 +1123,113 @@ class TwoHeadBootstrapTests(unittest.TestCase):
             )
         self.assertFalse(decision["resume_required"])
         self.assertEqual(decision["lane"], midcutover.LANE_SCHEDULED_DEPLOY)
+
+
+class ReleaseIdentityAuthorityTests(unittest.TestCase):
+    """One release-id grammar, and it actually binds what it claims to bind."""
+
+    def test_canonical_grammar_decomposes_the_committed_identities(self) -> None:
+        identity = midcutover.parse_release_id(GREEN_RELEASE)
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity["head12"], HEAD_GREEN[:12])
+        self.assertIsNone(identity["attempt"])
+
+    def test_retry_releases_are_a_legitimate_release_id(self) -> None:
+        # A -attemptN release is produced by the ordinary builder; refusing it
+        # would refuse a recovery for a reason unrelated to the cutover.
+        retry = f"{GREEN_RELEASE}-attempt2"
+        identity = midcutover.parse_release_id(retry)
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity["attempt"], 2)
+        self.assertEqual(identity["contract12"], midcutover.parse_release_id(GREEN_RELEASE)["contract12"])
+
+    def test_non_canonical_release_ids_are_refused(self) -> None:
+        for bad in (
+            "not-a-release",
+            "bbbbbbbbbbbb-srcsetzz-lock00-contract00",
+            f"{GREEN_RELEASE}-attempt",
+            f"../{GREEN_RELEASE}",
+            "",
+            None,
+        ):
+            with self.subTest(release_id=bad):
+                self.assertIsNone(midcutover.parse_release_id(bad))
+
+    def test_release_decoder_and_classifier_share_one_grammar(self) -> None:
+        """The decoder must accept exactly what the classifier accepts."""
+        source = (TOOLS / "deploy_runtime_dual.py").read_text(encoding="utf-8")
+        self.assertIn("midcutover.parse_release_id(expected_release_id)", source)
+        self.assertNotIn("RELEASE_ID_CONTRACT_RE", source)
+
+    def test_decoder_binds_both_halves_of_the_identifier(self) -> None:
+        source = (TOOLS / "deploy_runtime_dual.py").read_text(encoding="utf-8")
+        self.assertIn('declared.startswith(identity["contract12"])', source)
+        self.assertIn('expected_repo_head.startswith(identity["head12"])', source)
+
+
+class StablePointerAuthenticityTests(unittest.TestCase):
+    """A symlink is only the pointer if it lands inside the managed root."""
+
+    def _layout(self, root: Path) -> tuple[Path, Path]:
+        releases = root / "releases"
+        outside = root / "elsewhere"
+        for parent in (releases, outside):
+            (parent / GREEN_RELEASE).mkdir(parents=True)
+            manifest = {
+                "release_id": GREEN_RELEASE,
+                "repo_head": HEAD_GREEN,
+                "completion_status": "complete",
+            }
+            (parent / GREEN_RELEASE / "deployment-manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+        return releases, outside
+
+    def test_pointer_into_the_managed_root_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases, _ = self._layout(root)
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(releases / GREEN_RELEASE)
+            observed = midcutover.observe_stable_pointer(runtime, releases)
+        self.assertIsNone(observed["error"])
+        self.assertEqual(observed["release_id"], GREEN_RELEASE)
+
+    def test_same_named_release_outside_the_root_is_refused(self) -> None:
+        """The decisive case: identical name, unmanaged location."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases, outside = self._layout(root)
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(outside / GREEN_RELEASE)
+            observed = midcutover.observe_stable_pointer(runtime, releases)
+        self.assertIsNotNone(observed["error"])
+        self.assertEqual(observed["pointer_kind"], "outside_releases_root")
+        self.assertIsNone(observed["release_id"])
+
+    def test_an_unmanaged_pointer_cannot_fake_a_later_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases, outside = self._layout(root)
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(outside / GREEN_RELEASE)
+            observed = midcutover.observe_stable_pointer(runtime, releases)
+            verdict = classify(
+                selector=canonical_selector(), pointer_observation=observed
+            )
+        # Without containment this would have classified as S2 and retired green.
+        self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
+        self.assertIn("stable_pointer_classifiable", verdict["reasons"])
+
+    def test_pointer_to_a_non_canonical_release_name_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            releases = root / "releases"
+            (releases / "handmade").mkdir(parents=True)
+            runtime = root / "grabowski-mcp"
+            runtime.symlink_to(releases / "handmade")
+            observed = midcutover.observe_stable_pointer(runtime, releases)
+        self.assertIn("canonical release id", str(observed["error"]))
 
 
 class LaneSwitchTests(unittest.TestCase):

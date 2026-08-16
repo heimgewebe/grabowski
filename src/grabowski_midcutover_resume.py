@@ -106,10 +106,37 @@ HEAD_RE = re.compile(r"[0-9a-f]{40,64}\Z")
 CUTOVER_ID_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 #: The canonical release identifier grammar produced by the build:
 #: <head12>-srcset<12>-lock<12>-contract<12>, optionally -attempt<n>.
+#: One definition, used by every layer that has to judge a release id. Two
+#: grammars would eventually disagree about a legitimate retry release, and the
+#: disagreement would surface as a refused recovery rather than as a bug.
 RELEASE_ID_RE = re.compile(
-    r"[0-9a-f]{12}-srcset[0-9a-f]{12}-lock[0-9a-f]{12}-contract[0-9a-f]{12}"
-    r"(?:-attempt[0-9]{1,3})?\Z"
+    r"(?P<head>[0-9a-f]{12})-srcset(?P<srcset>[0-9a-f]{12})"
+    r"-lock(?P<lock>[0-9a-f]{12})-contract(?P<contract>[0-9a-f]{12})"
+    r"(?:-attempt(?P<attempt>[0-9]{1,3}))?\Z"
 )
+
+
+def parse_release_id(release_id: Any) -> dict[str, Any] | None:
+    """Decompose a release id into the identities it commits to.
+
+    The identifier is not opaque: the build encodes the repository head and the
+    contract digest into it, so a release id is itself a binding that can be
+    checked against a receipt rather than trusted because a directory of that
+    name exists.
+    """
+    if not isinstance(release_id, str):
+        return None
+    match = RELEASE_ID_RE.fullmatch(release_id)
+    if match is None:
+        return None
+    return {
+        "release_id": release_id,
+        "head12": match.group("head"),
+        "srcset12": match.group("srcset"),
+        "lock12": match.group("lock"),
+        "contract12": match.group("contract"),
+        "attempt": int(match.group("attempt")) if match.group("attempt") else None,
+    }
 
 
 class MidCutoverEvidenceError(ValueError):
@@ -418,7 +445,9 @@ def observe_green_release(
 DEFAULT_STABLE_RUNTIME = Path.home() / ".local/share/grabowski-mcp"
 
 
-def _pointer_binding(runtime_path: Path) -> dict[str, Any]:
+def _pointer_binding(
+    runtime_path: Path, releases_root: Path | None = None
+) -> dict[str, Any]:
     """What the stable runtime path actually *is*, before reading any manifest.
 
     A manifest found under the path proves what that directory says about
@@ -447,11 +476,30 @@ def _pointer_binding(runtime_path: Path) -> dict[str, Any]:
         binding["error"] = type(exc).__name__
         return binding
     binding["resolved_path"] = str(resolved)
+    if releases_root is not None:
+        try:
+            resolved_root = releases_root.resolve(strict=True)
+        except OSError as exc:
+            binding["error"] = f"releases root is unavailable: {type(exc).__name__}"
+            return binding
+        if resolved.parent != resolved_root:
+            # A same-named release outside the managed root would otherwise let
+            # an unmanaged directory impersonate the promotion target.
+            binding["kind"] = "outside_releases_root"
+            binding["error"] = "stable pointer resolves outside the releases root"
+            return binding
+        binding["releases_root"] = str(resolved_root)
+    if RELEASE_ID_RE.fullmatch(resolved.name) is None:
+        binding["error"] = "stable pointer target is not a canonical release id"
+        return binding
     binding["target_release_id"] = resolved.name
     return binding
 
 
-def observe_stable_pointer(runtime_path: Path = DEFAULT_STABLE_RUNTIME) -> dict[str, Any]:
+def observe_stable_pointer(
+    runtime_path: Path = DEFAULT_STABLE_RUNTIME,
+    releases_root: Path | None = None,
+) -> dict[str, Any]:
     """Which release the stable runtime pointer currently names.
 
     This is the fact that separates "the resume has not started" from "the
@@ -459,7 +507,7 @@ def observe_stable_pointer(runtime_path: Path = DEFAULT_STABLE_RUNTIME) -> dict[
     applied resume is indistinguishable from an untouched one, and the lane
     would either redo an applied effect or refuse forever.
     """
-    binding = _pointer_binding(runtime_path)
+    binding = _pointer_binding(runtime_path, releases_root)
     observation: dict[str, Any] = {
         "runtime_path": str(runtime_path),
         "release_id": None,
@@ -525,6 +573,7 @@ def collect_classification_inputs(
     receipt_root: Path = BLUE_GREEN_RECEIPT_ROOT,
     releases_root: Path = DEFAULT_RELEASES_ROOT,
     runtime_path: Path = DEFAULT_STABLE_RUNTIME,
+    pointer_releases_root: Path | None = None,
     green_unit_observer: Any = None,
 ) -> dict[str, Any]:
     """Gather every durable input the lane verdict is derived from."""
@@ -557,7 +606,9 @@ def collect_classification_inputs(
         "receipts": loaded["receipts"],
         "unreadable_receipts": loaded["unreadable"],
         "green_observation": green_observation,
-        "pointer_observation": observe_stable_pointer(runtime_path),
+        "pointer_observation": observe_stable_pointer(
+            runtime_path, pointer_releases_root
+        ),
         "green_unit_observation": (
             green_unit_observer(green_operator_unit(open_cutover_id))
             if green_unit_observer is not None and open_cutover_id is not None
@@ -573,6 +624,7 @@ def classify_from_durable_state(
     receipt_root: Path = BLUE_GREEN_RECEIPT_ROOT,
     releases_root: Path = DEFAULT_RELEASES_ROOT,
     runtime_path: Path = DEFAULT_STABLE_RUNTIME,
+    pointer_releases_root: Path | None = None,
     green_unit_observer: Any = None,
 ) -> dict[str, Any]:
     inputs = collect_classification_inputs(
@@ -580,6 +632,7 @@ def classify_from_durable_state(
         receipt_root=receipt_root,
         releases_root=releases_root,
         runtime_path=runtime_path,
+        pointer_releases_root=pointer_releases_root,
         green_unit_observer=green_unit_observer,
     )
     return classify_recovery_lane(expected_head=expected_head, **inputs)

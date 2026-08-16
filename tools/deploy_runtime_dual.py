@@ -6368,7 +6368,6 @@ class MidCutoverResumeDenied(RuntimeError):
         )
 
 
-RELEASE_ID_CONTRACT_RE = re.compile(r"-contract([0-9a-f]{12})\Z")
 RELEASE_SNAPSHOT_CONTRACT_KEY = "runtime_entrypoint"
 
 
@@ -6430,12 +6429,32 @@ def _receipt_bound_release_contract(
             "Green release manifest carries no contract digest",
             phase="midcutover-resume-preflight",
         )
-    match = RELEASE_ID_CONTRACT_RE.search(expected_release_id)
-    if match is None or not declared.startswith(match.group(1)):
+    # One grammar for every layer: an -attemptN retry release is a legitimate
+    # release, and a decoder that anchored on -contract<12> would have refused
+    # to resume one for a reason that has nothing to do with the cutover.
+    identity = midcutover.parse_release_id(expected_release_id)
+    if identity is None:
+        core.fail(
+            "Green release id is not a canonical release identifier",
+            phase="midcutover-resume-preflight",
+            details={"release_id": expected_release_id},
+        )
+    if not declared.startswith(identity["contract12"]):
         core.fail(
             "Green release id does not commit to the manifest contract digest",
             phase="midcutover-resume-preflight",
             details={"entrypoint_contract_sha256": declared},
+        )
+    # The identifier commits to the head as well, and until now only the
+    # contract half of that claim was actually checked.
+    if not expected_repo_head.startswith(identity["head12"]):
+        core.fail(
+            "Green release id does not commit to the resumed repository head",
+            phase="midcutover-resume-preflight",
+            details={
+                "release_head12": identity["head12"],
+                "expected_repo_head": expected_repo_head,
+            },
         )
     snapshot_paths = manifest.get("snapshot_paths")
     contract_path = (
@@ -6495,6 +6514,7 @@ def _receipt_bound_release_contract(
             "release_id": expected_release_id,
             "repo_head": expected_repo_head,
             "entrypoint_contract_sha256": declared,
+            "release_identity": identity,
             "entrypoint_contract_path": str(contract_file),
             "module": module,
             "expected_tool_count": len(expected_tools),
@@ -6997,6 +7017,7 @@ def classify_midcutover_resume(
         ),
         releases_root=core.releases_root_for(target_runtime),
         runtime_path=target_runtime,
+        pointer_releases_root=core.releases_root_for(target_runtime),
         green_unit_observer=observe_green_operator_unit,
     )
 
