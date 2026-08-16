@@ -1412,6 +1412,158 @@ def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict
     }
 
 
+class IndexedRuntimeJobConflict(RuntimeError):
+    """An indexed runtime job forbids starting another one right now."""
+
+
+def _classify_indexed_job(entry: Path) -> dict[str, Any]:
+    """Read one indexed durable job into a decided shape.
+
+    Extracted so the scheduler and the recovery lane read the deploy index
+    through the same eyes.  Two readers of one index become two definitions of
+    "is a deployment already running", and the weaker one is the one that lets a
+    second job start.
+    """
+    if entry.is_symlink() or not entry.is_dir():
+        raise IndexedRuntimeJobConflict(
+            f"durable job entry is not a real directory: {entry.name}"
+        )
+    try:
+        metadata = operator._read_job_metadata(entry.name)
+    except (OSError, ValueError, PermissionError) as exc:
+        raise IndexedRuntimeJobConflict(
+            f"durable job metadata is unreadable: {entry.name}"
+        ) from exc
+    candidate_command = metadata.get("argv")
+    if not isinstance(candidate_command, list) or not all(
+        isinstance(item, str) for item in candidate_command
+    ):
+        raise IndexedRuntimeJobConflict(f"durable job argv is malformed: {entry.name}")
+    deploy_fields = _deploy_command_fields(candidate_command)
+    resume_fields = (
+        _midcutover_resume_command_fields(candidate_command)
+        if deploy_fields is None
+        else None
+    )
+    if deploy_fields is None and resume_fields is None:
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job metadata is malformed: {entry.name}"
+        )
+    command_fields = deploy_fields or resume_fields
+    assert command_fields is not None
+    candidate_repository = Path(command_fields["repository"])
+    candidate_runner = str(
+        candidate_repository
+        / (
+            RUNNER_RELATIVE_PATH
+            if deploy_fields is not None
+            else MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+        )
+    )
+    if (
+        candidate_command[0] != "/usr/bin/python3"
+        or candidate_command[1] != candidate_runner
+        or metadata.get("cwd") != str(candidate_repository)
+    ):
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job metadata is malformed: {entry.name}"
+        )
+    argv_sha256 = metadata.get("argv_sha256")
+    if argv_sha256 != _deploy_command_sha256(candidate_command):
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job command hash mismatch: {entry.name}"
+        )
+    status = operator.grabowski_job_status(entry.name)
+    if not isinstance(status, dict):
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job status is unavailable: {entry.name}"
+        )
+    final_status = status.get("final_status")
+    return {
+        "unit": entry.name,
+        "kind": "deploy" if deploy_fields is not None else "midcutover_resume",
+        "argv": candidate_command,
+        "argv_sha256": argv_sha256,
+        "metadata": metadata,
+        "status": status,
+        "final_status": final_status,
+        "fields": command_fields,
+        "terminal": final_status in TERMINAL_JOB_STATUSES,
+        "reusable": final_status in REUSABLE_JOB_STATUSES,
+    }
+
+
+def inflight_runtime_job_evidence(
+    command: list[str] | None = None, *, prune: bool = False
+) -> dict[str, Any]:
+    """Project the deploy index for a gate, without deciding for it.
+
+    The provenance recovery gate previously looked only at ``pending_unit``.
+    That field is cleared the moment a job actually starts, so between the start
+    and the job's own completion the index looked empty and a second identical
+    repair could dispatch a second job -- the double dispatch this lane exists
+    to prevent.  The units list is the durable record; this reads it.
+
+    Identity matters as much as presence: an in-flight job with the *same* argv
+    is this same intent already running and may be coalesced, while any other
+    in-flight deploy, repair or resume is a competitor and must close the gate.
+    """
+    evidence: dict[str, Any] = {
+        "inflight_units": [],
+        "blocking_units": [],
+        "idempotent_match": None,
+        "pruned_units": [],
+        "error": None,
+    }
+    expected_sha256 = _deploy_command_sha256(command) if command else None
+    try:
+        jobs_root = operator._jobs_root()
+        index = _deploy_index(jobs_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        evidence["error"] = f"deployment job index is unreadable: {exc}"
+        return evidence
+    pending = index.get("pending_unit")
+    if pending:
+        # A reservation with no started job yet is still an in-flight intent.
+        evidence["inflight_units"].append(str(pending))
+        evidence["blocking_units"].append(str(pending))
+    retained: list[str] = []
+    for unit in index["units"]:
+        try:
+            classified = _classify_indexed_job(jobs_root / unit)
+        except IndexedRuntimeJobConflict as exc:
+            # Unreadable is not absent.  An entry this reader cannot judge must
+            # close the gate rather than vanish from it.
+            evidence["blocking_units"].append(str(unit))
+            evidence["error"] = str(exc)
+            retained.append(str(unit))
+            continue
+        if classified["terminal"]:
+            evidence["pruned_units"].append(str(unit))
+            continue
+        retained.append(str(unit))
+        evidence["inflight_units"].append(str(unit))
+        if (
+            expected_sha256 is not None
+            and classified["argv_sha256"] == expected_sha256
+            and classified["reusable"]
+        ):
+            evidence["idempotent_match"] = {
+                "unit": classified["unit"],
+                "kind": classified["kind"],
+                "argv_sha256": classified["argv_sha256"],
+                "final_status": classified["final_status"],
+            }
+            continue
+        evidence["blocking_units"].append(str(unit))
+    if prune and evidence["pruned_units"] and evidence["error"] is None:
+        try:
+            _write_deploy_index(jobs_root, units=retained, pending_unit=pending)
+        except (OSError, RuntimeError, ValueError) as exc:
+            evidence["error"] = f"deploy index pruning failed: {exc}"
+    return evidence
+
+
 def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict[str, Any] | None:
     expected_fields = _deploy_command_fields(command)
     if expected_fields is None:

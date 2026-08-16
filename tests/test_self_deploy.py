@@ -11,6 +11,7 @@ import tempfile
 import types
 from typing import get_args
 import unittest
+from unittest import mock
 from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2577,3 +2578,157 @@ class RuntimeDeploySchedulerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IndexedInflightJobEvidenceTests(unittest.TestCase):
+    """The deploy index -- not just its reservation -- decides "already running".
+
+    ``pending_unit`` is cleared the moment a job starts, so a gate that read only
+    that field saw an empty index for the entire life of a running job. Two
+    identical repairs could therefore both dispatch: the double dispatch this
+    covers.
+    """
+
+    DEPLOY_ARGV = [
+        "/usr/bin/python3",
+        "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+        "--repo",
+        "/home/alex/repos/grabowski",
+        "--canonical-repo",
+        "/home/alex/repos/grabowski",
+        "--source-kind",
+        "canonical-main",
+        "--source-identity-sha256",
+        "ab" * 32,
+        "--expected-head",
+        "a" * 40,
+        "--delay-seconds",
+        "8",
+    ]
+
+    def _projection(self, *, units, pending, classify, command=None, prune=False):
+        self_deploy = SELF_DEPLOY
+        with (
+            mock.patch.object(
+                self_deploy.operator, "_jobs_root", return_value=Path("/jobs")
+            ),
+            mock.patch.object(
+                self_deploy,
+                "_deploy_index",
+                return_value={"units": list(units), "pending_unit": pending},
+            ),
+            mock.patch.object(self_deploy, "_write_deploy_index") as write,
+            mock.patch.object(self_deploy, "_classify_indexed_job", side_effect=classify),
+        ):
+            evidence = self_deploy.inflight_runtime_job_evidence(command, prune=prune)
+        return evidence, write
+
+    @staticmethod
+    def _entry(unit, *, kind="deploy", argv_sha256="cd" * 32, final_status="running"):
+        return {
+            "unit": unit,
+            "kind": kind,
+            "argv": [],
+            "argv_sha256": argv_sha256,
+            "metadata": {},
+            "status": {},
+            "final_status": final_status,
+            "fields": {},
+            "terminal": final_status in {"completed", "succeeded", "failed", "launch_failed"},
+            "reusable": final_status == "running",
+        }
+
+    def test_pending_reservation_still_blocks(self) -> None:
+        evidence, _ = self._projection(
+            units=[], pending="grabowski-job-aaaaaaaaaaaa", classify=lambda entry: None
+        )
+        self.assertIn("grabowski-job-aaaaaaaaaaaa", evidence["blocking_units"])
+
+    def test_started_job_blocks_after_the_reservation_is_cleared(self) -> None:
+        """The exact window the old check was blind to."""
+        evidence, _ = self._projection(
+            units=["grabowski-job-bbbbbbbbbbbb"],
+            pending=None,
+            classify=lambda entry: self._entry(entry.name),
+        )
+        self.assertEqual(evidence["blocking_units"], ["grabowski-job-bbbbbbbbbbbb"])
+        self.assertIsNone(evidence["idempotent_match"])
+
+    def test_identical_running_repair_is_coalesced_not_blocked(self) -> None:
+        expected = SELF_DEPLOY._deploy_command_sha256(self.DEPLOY_ARGV)
+        evidence, _ = self._projection(
+            units=["grabowski-job-cccccccccccc"],
+            pending=None,
+            classify=lambda entry: self._entry(entry.name, argv_sha256=expected),
+            command=self.DEPLOY_ARGV,
+        )
+        self.assertEqual(evidence["blocking_units"], [])
+        self.assertEqual(
+            evidence["idempotent_match"]["unit"], "grabowski-job-cccccccccccc"
+        )
+
+    def test_foreign_head_deploy_blocks_fail_closed(self) -> None:
+        evidence, _ = self._projection(
+            units=["grabowski-job-dddddddddddd"],
+            pending=None,
+            classify=lambda entry: self._entry(entry.name, argv_sha256="ef" * 32),
+            command=self.DEPLOY_ARGV,
+        )
+        self.assertEqual(evidence["blocking_units"], ["grabowski-job-dddddddddddd"])
+        self.assertIsNone(evidence["idempotent_match"])
+
+    def test_non_reusable_outcome_is_never_coalesced(self) -> None:
+        expected = SELF_DEPLOY._deploy_command_sha256(self.DEPLOY_ARGV)
+        evidence, _ = self._projection(
+            units=["grabowski-job-eeeeeeeeeeee"],
+            pending=None,
+            classify=lambda entry: self._entry(
+                entry.name, argv_sha256=expected, final_status="outcome_unknown"
+            ),
+            command=self.DEPLOY_ARGV,
+        )
+        # An ambiguous job is not "ours to reuse"; it is a reason to stop.
+        self.assertIsNone(evidence["idempotent_match"])
+        self.assertEqual(evidence["blocking_units"], ["grabowski-job-eeeeeeeeeeee"])
+
+    def test_mid_cutover_resume_coexists_and_blocks_a_deploy(self) -> None:
+        evidence, _ = self._projection(
+            units=["grabowski-job-ffffffffffff"],
+            pending=None,
+            classify=lambda entry: self._entry(entry.name, kind="midcutover_resume"),
+            command=self.DEPLOY_ARGV,
+        )
+        self.assertEqual(evidence["blocking_units"], ["grabowski-job-ffffffffffff"])
+
+    def test_terminal_entries_are_pruned_and_do_not_block(self) -> None:
+        evidence, write = self._projection(
+            units=["grabowski-job-111111111111", "grabowski-job-222222222222"],
+            pending=None,
+            classify=lambda entry: self._entry(
+                entry.name,
+                final_status=(
+                    "completed" if entry.name.endswith("111111111111") else "running"
+                ),
+            ),
+            prune=True,
+        )
+        self.assertEqual(evidence["pruned_units"], ["grabowski-job-111111111111"])
+        self.assertEqual(evidence["blocking_units"], ["grabowski-job-222222222222"])
+        write.assert_called_once()
+        self.assertEqual(
+            write.call_args.kwargs["units"], ["grabowski-job-222222222222"]
+        )
+
+    def test_unreadable_entry_blocks_rather_than_disappears(self) -> None:
+        def explode(entry):
+            raise SELF_DEPLOY.IndexedRuntimeJobConflict("unreadable")
+
+        evidence, write = self._projection(
+            units=["grabowski-job-333333333333"],
+            pending=None,
+            classify=explode,
+            prune=True,
+        )
+        self.assertEqual(evidence["blocking_units"], ["grabowski-job-333333333333"])
+        self.assertIsNotNone(evidence["error"])
+        write.assert_not_called()

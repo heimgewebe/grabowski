@@ -968,3 +968,46 @@ class ToolSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
+    """The recovery gate reports indexed in-flight jobs, not only reservations."""
+
+    def test_gate_reports_indexed_jobs_as_competing(self) -> None:
+        with patch.object(
+            provenance_recovery.self_deploy,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "inflight_units": ["grabowski-job-444444444444"],
+                "blocking_units": ["grabowski-job-444444444444"],
+                "idempotent_match": None,
+                "pruned_units": [],
+                "error": None,
+            },
+            create=True,
+        ):
+            evidence = provenance_recovery._competing_deployment_evidence()
+        self.assertEqual(
+            evidence["inflight_deploy_jobs"], ["grabowski-job-444444444444"]
+        )
+        self.assertIsNone(evidence["idempotent_match"])
+
+    def test_identical_running_intent_is_reported_as_idempotent(self) -> None:
+        match = {"unit": "grabowski-job-555555555555", "kind": "deploy"}
+        with patch.object(
+            provenance_recovery.self_deploy,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "inflight_units": [match["unit"]],
+                "blocking_units": [],
+                "idempotent_match": match,
+                "pruned_units": [],
+                "error": None,
+            },
+            create=True,
+        ):
+            evidence = provenance_recovery._competing_deployment_evidence(["argv"])
+        # Our own running intent must not read as a competitor...
+        self.assertEqual(evidence["inflight_deploy_jobs"], [])
+        # ...but it must be visible, so the dispatch can coalesce onto it.
+        self.assertEqual(evidence["idempotent_match"], match)
