@@ -24,6 +24,8 @@ except ModuleNotFoundError as exc:
 
 
 SCHEMA_VERSION = 1
+LEGACY_RESOLUTION_SCHEMA_VERSION = 1
+RESOLUTION_SCHEMA_VERSION = 2
 OPEN_KIND = "grabowski.operator_obligation"
 CLOSE_KIND = "grabowski.operator_obligation_close"
 RESOLUTION_KIND = "grabowski.operator_obligation_resolution"
@@ -882,7 +884,10 @@ def _validate_resolution_record(
             ) from exc
     if (
         record["kind"] != RESOLUTION_KIND
-        or record["schema_version"] != SCHEMA_VERSION
+        or record["schema_version"] not in {
+            LEGACY_RESOLUTION_SCHEMA_VERSION,
+            RESOLUTION_SCHEMA_VERSION,
+        }
         or record["obligation_id"] != open_record["obligation_id"]
         or record["open_file_sha256"] != open_file_sha256
         or record["close_file_sha256"] != close_file_sha256
@@ -940,6 +945,9 @@ def _read_resolution_chain(
 ) -> list[tuple[dict[str, Any], str, Path]]:
     chain: list[tuple[dict[str, Any], str, Path]] = []
     predecessor: str | None = None
+    seen_schema_v2 = False
+    legacy_evidence: set[str] = set()
+    previous_record: dict[str, Any] | None = None
     for sequence, path in _resolution_entries(directory):
         record, file_sha256 = _read_private_json(path)
         _validate_resolution_record(
@@ -951,8 +959,31 @@ def _read_resolution_chain(
             expected_sequence=sequence,
             expected_predecessor_file_sha256=predecessor,
         )
+        if seen_schema_v2:
+            raise OperatorObligationIntegrityError(
+                "operator obligation resolution schema chain continues after schema v2"
+            )
+        if (
+            previous_record is not None
+            and previous_record["schema_version"] == LEGACY_RESOLUTION_SCHEMA_VERSION
+            and previous_record["disposition"] != "deferred"
+        ):
+            raise OperatorObligationIntegrityError(
+                "operator obligation resolution chain continues after terminal legacy disposition"
+            )
+        if record["schema_version"] == RESOLUTION_SCHEMA_VERSION:
+            if previous_record is not None:
+                requested_evidence = {item["sha256"] for item in record["evidence"]}
+                if not requested_evidence - legacy_evidence:
+                    raise OperatorObligationIntegrityError(
+                        "schema-v2 migration requires evidence new to legacy prefix"
+                    )
+            seen_schema_v2 = True
+        else:
+            legacy_evidence.update(item["sha256"] for item in record["evidence"])
         chain.append((record, file_sha256, path))
         predecessor = file_sha256
+        previous_record = record
     return chain
 
 
@@ -1056,10 +1087,18 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         resolution_record = None
         resolution_file_sha256 = None
     disposition = resolution_record["disposition"] if resolution_record else None
-    continuation_required = outcome != "completed" and disposition not in {
-        "resolved",
-        "superseded",
-    }
+    resolution_schema_version = (
+        resolution_record["schema_version"] if resolution_record else None
+    )
+    deferred_is_parked = (
+        disposition == "deferred"
+        and resolution_schema_version == RESOLUTION_SCHEMA_VERSION
+    )
+    continuation_required = (
+        outcome != "completed"
+        and disposition not in {"resolved", "superseded"}
+        and not deferred_is_parked
+    )
     recommended_next_action = (
         "report acceptance-bound completion"
         if outcome == "completed"
@@ -1082,6 +1121,7 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
             else "historical"
         ),
         "resolution_disposition": disposition,
+        "resolution_schema_version": resolution_schema_version,
         "resolution_evidence": resolution_record["evidence"]
         if resolution_record
         else [],
@@ -1411,14 +1451,40 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
             if _resolution_request_projection(latest) == request_projection:
                 created = False
                 file_sha256 = latest_file_sha256
-            else:
-                if latest["disposition"] != "deferred":
+            elif (
+                latest["disposition"] == "deferred"
+                and latest["schema_version"] == LEGACY_RESOLUTION_SCHEMA_VERSION
+            ):
+                # Schema-v1 deferred records were created under the historical
+                # contract where deferred remained current attention.  Preserve
+                # that meaning on replay.  A v2 successor is a migration decision,
+                # so changing only disposition/next_action is insufficient: at
+                # least one newly bound evidence digest must distinguish it from
+                # the complete legacy v1 prefix; source/reference metadata cannot
+                # manufacture freshness for the same bound evidence.
+                legacy_evidence = {
+                    item["sha256"]
+                    for record, _, _ in chain
+                    if record["schema_version"] == LEGACY_RESOLUTION_SCHEMA_VERSION
+                    for item in record["evidence"]
+                }
+                requested_evidence = {item["sha256"] for item in evidence}
+                if not requested_evidence - legacy_evidence:
                     raise OperatorObligationConflictError(
-                        "operator obligation already has a terminal resolution"
+                        "legacy deferred migration requires new evidence"
                     )
                 sequence = latest["sequence"] + 1
                 predecessor_file_sha256 = latest_file_sha256
                 created = True
+            else:
+                if latest["disposition"] == "deferred":
+                    message = (
+                        "operator obligation already has a deferred resolution; "
+                        "resume deferred work through a new obligation"
+                    )
+                else:
+                    message = "operator obligation already has a terminal resolution"
+                raise OperatorObligationConflictError(message)
         else:
             sequence = 1
             predecessor_file_sha256 = None
@@ -1426,7 +1492,7 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
         if created:
             material = {
                 "kind": RESOLUTION_KIND,
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": RESOLUTION_SCHEMA_VERSION,
                 "obligation_id": obligation_id,
                 "open_file_sha256": open_file_sha256,
                 "close_file_sha256": close_file_sha256,
