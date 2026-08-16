@@ -40,9 +40,15 @@ Eine bereits `blocked` oder `delegated` geschlossene Verpflichtung darf nur übe
 
 1. `resolved`: Der frühere Folgearbeitsbedarf ist durch aktuelle Evidenz historisch erledigt.
 2. `superseded`: Eine andere, konkret belegte Arbeits- oder Wahrheitsquelle hat die Fortsetzung übernommen.
-3. `deferred`: Die Arbeit soll aktuell ausdrücklich nicht fortgesetzt werden. `continuation_required=false` und `attention_class=historical` parken sie aus dem Standard-Attention-Listing; der verpflichtende `next_action` bleibt als Wiederaufnahmekontext erhalten. Dies ist **keine** Fertigstellung: `work_complete=false`, der ursprüngliche `blocked`-/`delegated`-Datensatz bleibt unverändert und ist über seinen expliziten Zustandsfilter weiter lesbar.
+3. `deferred`: Die Arbeit soll aktuell ausdrücklich nicht fortgesetzt werden. Für **Resolution-Schema v2** gilt `continuation_required=false` und `attention_class=historical`; der verpflichtende `next_action` bleibt als Wiederaufnahmekontext erhalten. Dies ist **keine** Fertigstellung: `work_complete=false`, der ursprüngliche `blocked`-/`delegated`-Datensatz bleibt unverändert und ist über seinen expliziten Zustandsfilter weiter lesbar.
 
-`deferred` darf daher nicht als stilles Wegfiltern benutzt werden. Es erfordert eine bewusste, evidenzgebundene Resolution. Eine identische Resolution ist idempotent; eine abweichende zweite Resolution derselben Obligation ist ein Konflikt. Soll deferred Arbeit später wieder aktuell werden, wird eine **neue Obligation mit neuer ID** geöffnet und auf die historische Obligation beziehungsweise deren Evidenz verwiesen. So bleibt die alte Entscheidung auditierbar, während nur der neue Arbeitsauftrag wieder Current Attention erzeugt.
+`deferred` darf daher nicht als stilles Wegfiltern benutzt werden. Es erfordert eine bewusste, evidenzgebundene v2-Resolution. Eine identische v2-Resolution ist idempotent; eine abweichende zweite v2-Resolution derselben Obligation ist ein Konflikt. Soll v2-deferred Arbeit später wieder aktuell werden, wird eine **neue Obligation mit neuer ID** geöffnet und auf die historische Obligation beziehungsweise deren Evidenz verwiesen. So bleibt die alte Entscheidung auditierbar, während nur der neue Arbeitsauftrag wieder Current Attention erzeugt.
+
+### Upgrade- und Grandfather-Regel
+
+Bereits vor Einführung dieser Parksemantik erzeugte `resolution.json`-Datensätze tragen **Resolution-Schema v1**. Ein v1-Datensatz mit `disposition=deferred` wird beim Upgrade **nicht** rückwirkend umgedeutet: Er bleibt `continuation_required=true`, `attention_class=current` und damit im Standard-Attention-Listing. Auch ein identischer Resolve-Aufruf replayt exakt diesen v1-Datensatz und migriert ihn nicht implizit.
+
+Soll eine solche Alt-Resolution bewusst geparkt, als erledigt markiert oder superseded werden, ist eine **neue Evidenzentscheidung** erforderlich. Nur dann darf genau ein nachfolgender Resolution-Datensatz mit Schema v2 und Hashbindung an den v1-Vorgänger angelegt werden. Eine bloße Änderung von `next_action` oder Disposition bei unverändertem Evidenzsatz reicht ausdrücklich nicht aus. Der v1-Datensatz bleibt unverändert erhalten; der v2-Nachfolger ist die explizite Migrationsentscheidung. Danach gilt wieder die create-only-Regel ohne weitere semantische Revisionen. Bereits historisch terminale v1-Resolutionen (`resolved` oder `superseded`) bleiben unverändert historisch.
 
 ## Speicher- und Integritätsmodell
 
@@ -52,7 +58,8 @@ Der Standardpfad ist:
 ~/.local/state/grabowski/operator-obligations/<obligation_id>/
   open.json
   close.json
-  resolution.json        # optional; historical attention decision
+  resolution.json             # optional; erste Resolution, v1 oder v2
+  resolution-NNNNNN.json      # nur vorhandene v1-Ketten bzw. ein v2-Migrationsnachfolger
 ```
 
 Verzeichnisse sind eigentümergebunden mit Modus `0700`, Datensätze mit `0600`. Lese- und Schreibpfade prüfen reguläre Dateien, Eigentümer, Linkzahl, Inodebindung, Größenlimits und Hashbindung. Veröffentlichung erfolgt create-only über die vorhandene private I/O-Primitive; konkurrierende Sieger werden vollständig validiert und niemals überschrieben.
@@ -61,11 +68,11 @@ Ein Interprozess-Lock serialisiert Öffnung und Abschluss. Wiederholung desselbe
 
 ## Grip-Oberfläche
 
-- `operator-obligation-list` – read-only; verwendet standardmäßig den Filter `attention` und findet damit aktuelle Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder. `resolved`, `superseded` und evidenzgebunden `deferred` resolvte Datensätze sind historisch und erscheinen dort nicht; der ursprüngliche Zustand bleibt über explizite Filter wie `state="blocked"` lesbar. Der frühere reine Open-Blick bleibt über `state="open"` unverändert verfügbar.
+- `operator-obligation-list` – read-only; verwendet standardmäßig den Filter `attention` und findet damit aktuelle Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder. `resolved`, `superseded` und evidenzgebunden **v2-`deferred`** resolvte Datensätze sind historisch und erscheinen dort nicht; grandfathered v1-`deferred` bleibt dagegen current. Der ursprüngliche Zustand bleibt über explizite Filter wie `state="blocked"` lesbar. Der frühere reine Open-Blick bleibt über `state="open"` unverändert verfügbar.
 - `operator-obligation-open` – mutierend; legt die unveränderliche Verpflichtung an.
 - `operator-obligation-status` – read-only; entscheidet, ob Fortsetzung erforderlich ist und ob die Antwort enden darf.
 - `operator-obligation-close` – mutierend; akzeptiert nur `completed`, `blocked` oder `delegated` unter den beschriebenen Evidenzregeln.
-- `operator-obligation-resolve` – mutierend; bindet eine bereits `blocked` oder `delegated` geschlossene Verpflichtung evidenzgebunden als `resolved`, `superseded` oder `deferred` in die historische Projektion. Eine deferred Wiederaufnahme erfolgt nicht durch Umschreiben dieser Resolution, sondern durch eine neue Obligation.
+- `operator-obligation-resolve` – mutierend; bindet eine bereits `blocked` oder `delegated` geschlossene Verpflichtung evidenzgebunden als `resolved`, `superseded` oder v2-`deferred` in die historische Projektion. Bei grandfathered v1-`deferred` bleibt ein identischer Replay current; nur neue Evidenz darf den einen v2-Migrationsnachfolger erzeugen. Eine spätere Wiederaufnahme einer v2-geparkten Arbeit erfolgt nicht durch Umschreiben dieser Resolution, sondern durch eine neue Obligation.
 
 Die Agent-Anweisung nennt die exakten Aufrufe `operator-obligation-list`, `operator-obligation-open`, `operator-obligation-status`, `operator-obligation-close` und `operator-obligation-resolve` über `grip_run`. Damit ist der Lifecycle im laufenden MCP-Vertrag sichtbar und nicht nur Dokumentation. Bei `delegated` akzeptiert der Close-Grip vom Aufrufer nur Art und ID; Werkzeug, Status, Beobachtungszeit und Hash werden aus der unmittelbaren Livebeobachtung erzeugt.
 

@@ -24,6 +24,8 @@ except ModuleNotFoundError as exc:
 
 
 SCHEMA_VERSION = 1
+LEGACY_RESOLUTION_SCHEMA_VERSION = 1
+RESOLUTION_SCHEMA_VERSION = 2
 OPEN_KIND = "grabowski.operator_obligation"
 CLOSE_KIND = "grabowski.operator_obligation_close"
 RESOLUTION_KIND = "grabowski.operator_obligation_resolution"
@@ -882,7 +884,10 @@ def _validate_resolution_record(
             ) from exc
     if (
         record["kind"] != RESOLUTION_KIND
-        or record["schema_version"] != SCHEMA_VERSION
+        or record["schema_version"] not in {
+            LEGACY_RESOLUTION_SCHEMA_VERSION,
+            RESOLUTION_SCHEMA_VERSION,
+        }
         or record["obligation_id"] != open_record["obligation_id"]
         or record["open_file_sha256"] != open_file_sha256
         or record["close_file_sha256"] != close_file_sha256
@@ -1056,11 +1061,18 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         resolution_record = None
         resolution_file_sha256 = None
     disposition = resolution_record["disposition"] if resolution_record else None
-    continuation_required = outcome != "completed" and disposition not in {
-        "resolved",
-        "superseded",
-        "deferred",
-    }
+    resolution_schema_version = (
+        resolution_record["schema_version"] if resolution_record else None
+    )
+    deferred_is_parked = (
+        disposition == "deferred"
+        and resolution_schema_version == RESOLUTION_SCHEMA_VERSION
+    )
+    continuation_required = (
+        outcome != "completed"
+        and disposition not in {"resolved", "superseded"}
+        and not deferred_is_parked
+    )
     recommended_next_action = (
         "report acceptance-bound completion"
         if outcome == "completed"
@@ -1083,6 +1095,7 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
             else "historical"
         ),
         "resolution_disposition": disposition,
+        "resolution_schema_version": resolution_schema_version,
         "resolution_evidence": resolution_record["evidence"]
         if resolution_record
         else [],
@@ -1412,6 +1425,25 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
             if _resolution_request_projection(latest) == request_projection:
                 created = False
                 file_sha256 = latest_file_sha256
+            elif (
+                latest["disposition"] == "deferred"
+                and latest["schema_version"] == LEGACY_RESOLUTION_SCHEMA_VERSION
+            ):
+                # Schema-v1 deferred records were created under the historical
+                # contract where deferred remained current attention.  Preserve
+                # that meaning on replay.  A v2 successor is a migration decision,
+                # so changing only disposition/next_action is insufficient: at
+                # least one newly bound evidence item must distinguish it from the
+                # legacy decision.
+                legacy_evidence = {_sha256(item) for item in latest["evidence"]}
+                requested_evidence = {_sha256(item) for item in evidence}
+                if not requested_evidence - legacy_evidence:
+                    raise OperatorObligationConflictError(
+                        "legacy deferred migration requires new evidence"
+                    )
+                sequence = latest["sequence"] + 1
+                predecessor_file_sha256 = latest_file_sha256
+                created = True
             else:
                 if latest["disposition"] == "deferred":
                     message = (
@@ -1428,7 +1460,7 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
         if created:
             material = {
                 "kind": RESOLUTION_KIND,
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": RESOLUTION_SCHEMA_VERSION,
                 "obligation_id": obligation_id,
                 "open_file_sha256": open_file_sha256,
                 "close_file_sha256": close_file_sha256,
