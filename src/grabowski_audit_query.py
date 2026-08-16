@@ -49,6 +49,7 @@ _SCALAR_RECORD_FIELDS = (
     "recovery_required",
     "recovery_checked_at_unix",
     "resource_lease_expires_at_unix",
+    "reclaimed_count",
     "record_sha256",
     "previous_record_sha256",
     "sequence",
@@ -246,6 +247,57 @@ def _validate_filters(filters: dict[str, Any]) -> None:
         raise ValueError("filters.since_unix must be less than or equal to filters.until_unix")
 
 
+def _project_reclamation_evidence(
+    value: Any, *, resource_keys: Any, reclaimed_count: Any
+) -> list[dict[str, Any]] | None:
+    if (
+        not isinstance(value, list)
+        or len(value) > 64
+        or not isinstance(resource_keys, list)
+        or not all(isinstance(item, str) for item in resource_keys)
+        or isinstance(reclaimed_count, bool)
+        or not isinstance(reclaimed_count, int)
+        or reclaimed_count != len(value)
+    ):
+        return None
+    projected: list[dict[str, Any]] = []
+    indices: list[int] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "resource_index",
+            "previous_owner_id",
+            "previous_expires_at_unix",
+        }:
+            return None
+        resource_index = item.get("resource_index")
+        previous_owner_id = item.get("previous_owner_id")
+        previous_expires_at_unix = item.get("previous_expires_at_unix")
+        if (
+            isinstance(resource_index, bool)
+            or not isinstance(resource_index, int)
+            or not 0 <= resource_index < len(resource_keys)
+            or not isinstance(previous_owner_id, str)
+            or not previous_owner_id
+            or len(previous_owner_id) > 128
+            or "\x00" in previous_owner_id
+            or isinstance(previous_expires_at_unix, bool)
+            or not isinstance(previous_expires_at_unix, int)
+            or previous_expires_at_unix < 0
+        ):
+            return None
+        indices.append(resource_index)
+        projected.append(
+            {
+                "resource_index": resource_index,
+                "previous_owner_id": previous_owner_id,
+                "previous_expires_at_unix": previous_expires_at_unix,
+            }
+        )
+    if indices != sorted(set(indices)):
+        return None
+    return projected
+
+
 def _project_record(record: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     projected: dict[str, Any] = {}
     omitted: list[str] = []
@@ -269,6 +321,16 @@ def _project_record(record: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             projected[key] = list(value)
         else:
             omitted.append(key)
+    if "reclamation_evidence" in record:
+        reclamation_evidence = _project_reclamation_evidence(
+            record["reclamation_evidence"],
+            resource_keys=record.get("resource_keys"),
+            reclaimed_count=record.get("reclaimed_count"),
+        )
+        if reclamation_evidence is None:
+            omitted.append("reclamation_evidence")
+        else:
+            projected["reclamation_evidence"] = reclamation_evidence
     return projected, sorted(omitted)
 
 

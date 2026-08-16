@@ -2191,6 +2191,53 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(result["leases"][0]["owner_id"], "owner-b")
         self.assertEqual(result["reclaimed"][0]["previous_owner_id"], "owner-a")
 
+    def test_public_acquire_audits_compact_reclamation_evidence(self) -> None:
+        key = "service:reclamation-audit.service"
+        audit_log = self.root / "audit" / "write-audit.jsonl"
+        audit_log.parent.mkdir(mode=0o700)
+        with patch.object(
+            resources.operator, "_require_operator_mutation"
+        ), patch.object(resources.base, "AUDIT_LOG", audit_log):
+            resources.grabowski_resource_acquire(
+                "owner-a", [key], "first", 60
+            )
+        expired_at = int(time.time()) - 1
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=? WHERE resource_key=?",
+                (expired_at, key),
+            )
+            connection.commit()
+        with patch.object(
+            resources.operator, "_require_operator_mutation"
+        ), patch.object(resources.base, "AUDIT_LOG", audit_log):
+            result = resources.grabowski_resource_acquire(
+                "owner-b", [key], "second", 60
+            )
+
+        audit_records = [
+            json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()
+        ]
+        acquire_records = [
+            record for record in audit_records if record["operation"] == "resource-acquire"
+        ]
+        self.assertNotIn("reclamation_evidence", acquire_records[0])
+        acquire_audit = acquire_records[-1]
+        self.assertEqual(result["reclaimed"][0]["resource_key"], key)
+        self.assertEqual(acquire_audit["resource_keys"], [key])
+        self.assertEqual(acquire_audit["reclaimed_count"], 1)
+        self.assertEqual(
+            acquire_audit["reclamation_evidence"],
+            [
+                {
+                    "resource_index": 0,
+                    "previous_owner_id": "owner-a",
+                    "previous_expires_at_unix": expired_at,
+                }
+            ],
+        )
+        self.assertNotIn("resource_key", acquire_audit["reclamation_evidence"][0])
+
     def test_release_is_owner_bound_and_force_is_explicit(self) -> None:
         resources.acquire_resources("owner-a", ["display:9"], purpose="gui", ttl_seconds=60)
         with self.assertRaises(PermissionError):
