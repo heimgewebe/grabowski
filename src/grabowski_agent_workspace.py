@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Iterable
 
 import grabowski_agent_role as agent_role
+import grabowski_candidate_adoption as candidate_adoption
 import grabowski_candidate_verification as candidate_verification
 import grabowski_mcp as base
 import grabowski_resources as resources
@@ -3866,6 +3867,574 @@ def _persist_verification_evidence(
     return receipts, summary, references
 
 
+
+def _adoption_receipt_paths(
+    manifest: dict[str, Any], *, round_number: int = 1
+) -> dict[str, Path]:
+    if isinstance(round_number, bool) or not isinstance(round_number, int) or round_number < 1:
+        raise AgentWorkspaceError("adoption round must be a positive integer")
+    root = _workspace_dir(str(manifest["workspace_id"]))
+    suffix = f"round-{round_number:04d}.json"
+    return {
+        "intent": root / f"adoption-intent-{suffix}",
+        "receipt": root / f"adoption-receipt-{suffix}",
+    }
+
+
+def _adoption_collection_evidence(
+    manifest: dict[str, Any],
+    *,
+    expected_candidate_id: str,
+    expected_result_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    if not _lane_backed(manifest):
+        raise AgentWorkspaceError("candidate adoption requires a lane-backed workspace")
+    candidate_id = _required_string(
+        expected_candidate_id, "expected_candidate_id", max_length=64
+    ).lower()
+    result_sha256 = _required_string(
+        expected_result_sha256, "expected_result_sha256", max_length=64
+    ).lower()
+    if SHA256_RE.fullmatch(candidate_id) is None or SHA256_RE.fullmatch(result_sha256) is None:
+        raise AgentWorkspaceError("adoption bindings must be canonical SHA-256 values")
+    collection = manifest.get("collection")
+    if not isinstance(collection, dict) or collection.get("state") != "complete":
+        raise AgentWorkspaceError("workspace has no complete collection receipt")
+    integrity = _collection_integrity_status(manifest, collection)
+    if not integrity.get("valid"):
+        raise AgentWorkspaceError("collection receipt integrity is invalid")
+    if collection.get("result_sha256") != result_sha256:
+        raise AgentWorkspaceError("adoption result binding does not match collection receipt")
+    raw_candidate = collection.get("candidate_manifest")
+    raw_receipts = collection.get("verification_receipts")
+    raw_summary = collection.get("verification_summary")
+    if not isinstance(raw_candidate, dict) or not isinstance(raw_receipts, list) or not isinstance(raw_summary, dict):
+        raise AgentWorkspaceError("collection candidate verification evidence is incomplete")
+    try:
+        candidate = candidate_verification.validate_candidate_manifest(raw_candidate)
+        persisted_candidate = candidate_verification.read_immutable_receipt(
+            _candidate_receipt_paths(
+                manifest, round_number=int(candidate["round"])
+            )["candidate"],
+            validator=candidate_verification.validate_candidate_manifest,
+        )
+        if persisted_candidate != candidate:
+            raise candidate_verification.CandidateVerificationError(
+                "collection candidate differs from immutable Candidate receipt"
+            )
+        receipts: list[dict[str, Any]] = []
+        for value in raw_receipts:
+            receipt = candidate_verification.validate_verification_receipt(
+                value,
+                expected_candidate_id=candidate["candidate_id"],
+            )
+            path = _verification_receipt_path(
+                manifest,
+                str(receipt["verifier_kind"]),
+                candidate_round=int(candidate["round"]),
+                verifier_attempt=int(receipt["verifier_attempt"]),
+            )
+            validator = lambda observed, candidate_id=candidate["candidate_id"]: (
+                candidate_verification.validate_verification_receipt(
+                    observed, expected_candidate_id=candidate_id
+                )
+            )
+            persisted_receipt = candidate_verification.read_immutable_receipt(
+                path, validator=validator
+            )
+            if persisted_receipt != receipt:
+                raise candidate_verification.CandidateVerificationError(
+                    "collection verification differs from immutable Verification receipt"
+                )
+            receipts.append(receipt)
+        summary = candidate_verification.validate_verification_summary(
+            raw_summary,
+            candidate_manifest=candidate,
+            verification_receipts=receipts,
+        )
+    except candidate_verification.CandidateVerificationError as exc:
+        raise AgentWorkspaceError(
+            f"candidate verification evidence is invalid: {_error_summary(exc)}"
+        ) from exc
+    if candidate["candidate_id"] != candidate_id or collection.get("candidate_id") != candidate_id:
+        raise AgentWorkspaceError("adoption candidate binding does not match collection receipt")
+    if (
+        candidate.get("workspace_id") != manifest.get("workspace_id")
+        or candidate.get("base_head") != manifest.get("expected_base_head")
+        or candidate.get("lane_id") != _candidate_lane_id(manifest)
+    ):
+        raise AgentWorkspaceError("candidate identity does not match workspace lane authority")
+    if summary.get("outcome") != "PASS" or summary.get("missing_required_verifiers"):
+        raise AgentWorkspaceError("candidate verification is not a complete PASS")
+    writer_result = collection.get("writer_result")
+    if (
+        not isinstance(writer_result, dict)
+        or writer_result.get("type") != "patch"
+        or writer_result.get("sha256") != candidate.get("patch_sha256")
+        or not _verify_patch_artifact(
+            writer_result,
+            expected_path=_writer_patch_path(manifest),
+        )
+    ):
+        raise AgentWorkspaceError("candidate patch artifact is invalid")
+    return collection, candidate, receipts, summary
+
+
+def _require_closed_lane_workspace_for_adoption(
+    manifest: dict[str, Any], collection: dict[str, Any]
+) -> dict[str, Any]:
+    close_receipt = manifest.get("close_receipt")
+    close_status = _close_integrity_status(manifest, close_receipt)
+    if not isinstance(close_receipt, dict) or not close_status.get("valid"):
+        raise AgentWorkspaceError(
+            "candidate adoption requires a valid closed workspace receipt"
+        )
+    if (
+        close_receipt.get("expected_head") != collection.get("writer_head")
+        or close_receipt.get("expected_diff_sha256") != collection.get("diff_sha256")
+        or close_receipt.get("expected_result_sha256") != collection.get("result_sha256")
+        or close_receipt.get("lane_resources_preserved") is not True
+        or close_receipt.get("workspace_resources_owned") is not False
+        or close_receipt.get("resources_released") is not False
+    ):
+        raise AgentWorkspaceError(
+            "closed workspace receipt does not preserve exact Work Lane authority"
+        )
+    return close_receipt
+
+
+def _require_adoption_lane_authority(manifest: dict[str, Any]) -> dict[str, Any]:
+    resources_value = manifest.get("resources")
+    lane_binding = (
+        resources_value.get("lane_binding")
+        if isinstance(resources_value, dict)
+        else None
+    )
+    if not isinstance(lane_binding, dict):
+        raise AgentWorkspaceError("candidate adoption is missing Work Lane authority")
+    lane_id = str(lane_binding.get("lane_id", ""))
+    receipt_sha256 = str(lane_binding.get("receipt_sha256", ""))
+    receipt = _lane_receipt(lane_id, receipt_sha256)
+    inputs = receipt.get("inputs")
+    if (
+        not isinstance(inputs, dict)
+        or receipt.get("inputs_sha256") != lane_binding.get("inputs_sha256")
+        or inputs.get("repo") != manifest.get("repository")
+        or inputs.get("target_path") != manifest.get("writer_worktree")
+        or inputs.get("branch") != manifest.get("writer_branch")
+        or inputs.get("base_head") != manifest.get("expected_base_head")
+        or inputs.get("lease_owner_id") != lane_binding.get("lease_owner_id")
+    ):
+        raise AgentWorkspaceError("candidate adoption Work Lane identity drifted")
+    raw_keys = inputs.get("resource_keys")
+    if not isinstance(raw_keys, list):
+        raise AgentWorkspaceError("candidate adoption Work Lane resource scope is invalid")
+    lease_keys = resources.normalize_resource_keys(raw_keys)
+    observed_at = _now()
+    for key in lease_keys:
+        lease = resources.inspect_resource(key)
+        if (
+            not isinstance(lease, dict)
+            or lease.get("owner_id") != lane_binding.get("lease_owner_id")
+            or isinstance(lease.get("expires_at_unix"), bool)
+            or not isinstance(lease.get("expires_at_unix"), int)
+            or int(lease["expires_at_unix"]) <= observed_at
+        ):
+            raise AgentWorkspaceError(
+                f"candidate adoption Work Lane lease is not live and exact: {key}"
+            )
+    authority = receipt.get("authority")
+    controller = authority.get("controller") if isinstance(authority, dict) else None
+    controller_actor = controller.get("actor") if isinstance(controller, dict) else None
+    if not isinstance(controller_actor, str) or not controller_actor:
+        raise AgentWorkspaceError("candidate adoption controller authority is invalid")
+    return {"lane_binding": lane_binding, "controller_actor": controller_actor}
+
+
+def _adoption_candidate_snapshot(
+    manifest: dict[str, Any],
+    collection: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = _git_snapshot(manifest, _run)
+    if (
+        snapshot.get("writer_head") != candidate.get("base_head")
+        or snapshot.get("writer_branch") != manifest.get("writer_branch")
+        or snapshot.get("writer_branch_matches") is not True
+        or snapshot.get("dirty") is not True
+        or snapshot.get("diff_sha256") != collection.get("diff_sha256")
+        or snapshot.get("changed_paths") != collection.get("changed_paths")
+        or snapshot.get("scope_passed") is not True
+        or snapshot.get("scope_violations") != collection.get("scope_violations")
+    ):
+        raise AgentWorkspaceError("live workspace no longer matches frozen Candidate")
+    if _sha256_json(snapshot.get("untracked_artifacts")) != candidate.get(
+        "untracked_manifest_sha256"
+    ):
+        raise AgentWorkspaceError("live Candidate untracked manifest drifted")
+    scope = manifest.get("scope")
+    if not isinstance(scope, dict):
+        raise AgentWorkspaceError("candidate scope evidence is unavailable")
+    scope_evidence_sha256 = _sha256_json(
+        {
+            "allowed_paths": list(scope.get("allowed_paths", [])),
+            "forbidden_paths": list(scope.get("forbidden_paths", [])),
+            "changed_paths": list(snapshot.get("changed_paths", [])),
+            "scope_passed": snapshot.get("scope_passed"),
+            "scope_violations": list(snapshot.get("scope_violations", [])),
+        }
+    )
+    if scope_evidence_sha256 != candidate.get("scope_evidence_sha256"):
+        raise AgentWorkspaceError("live Candidate scope evidence drifted")
+    writer_attempt = collection.get("writer_final_attempt", 1)
+    if isinstance(writer_attempt, bool) or not isinstance(writer_attempt, int) or writer_attempt < 1:
+        raise AgentWorkspaceError("collection writer attempt binding is invalid")
+    writer_receipt = _role_receipt(manifest, "writer", attempt=writer_attempt)
+    if (
+        not isinstance(writer_receipt, dict)
+        or not _receipt_integrity(writer_receipt)
+        or writer_receipt.get("receipt_sha256") != collection.get("writer_receipt_sha256")
+    ):
+        raise AgentWorkspaceError("Candidate writer evidence drifted")
+    return snapshot
+
+
+def _stage_candidate_for_adoption(
+    manifest: dict[str, Any], collection: dict[str, Any]
+) -> str:
+    worktree = Path(str(manifest["writer_worktree"]))
+    base_head = str(manifest["expected_base_head"])
+    changed_paths = collection.get("changed_paths")
+    if not isinstance(changed_paths, list) or not changed_paths:
+        raise AgentWorkspaceError("Candidate has no bounded changed-path set")
+    _checked(
+        _run,
+        worktree,
+        ["git", "reset", "--mixed", "--quiet", base_head],
+        label="candidate adoption index reset",
+    )
+    _checked(
+        _run,
+        worktree,
+        ["git", "--literal-pathspecs", "add", "--all", "--", *[str(path) for path in changed_paths]],
+        label="candidate adoption stage",
+    )
+    staged = _checked_bytes(
+        worktree,
+        ["git", "diff", "--cached", "--name-only", "-z", "--no-renames"],
+        label="candidate adoption staged paths",
+    )
+    observed_paths = sorted(
+        os.fsdecode(item)
+        for item in bytes(staged["stdout"]).split(b"\x00")
+        if item
+    )
+    if observed_paths != sorted(str(path) for path in changed_paths):
+        raise AgentWorkspaceError("staged Candidate path set differs from collection")
+    unstaged = _checked_bytes(
+        worktree,
+        ["git", "diff", "--name-only", "-z", "--no-renames"],
+        label="candidate adoption unstaged paths",
+    )
+    untracked = _checked_bytes(
+        worktree,
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        label="candidate adoption untracked paths",
+    )
+    if bytes(unstaged["stdout"]) or bytes(untracked["stdout"]):
+        raise AgentWorkspaceError("Candidate could not be fully staged for adoption")
+    tree = str(
+        _checked(_run, worktree, ["git", "write-tree"], label="candidate adoption tree").get(
+            "stdout", ""
+        )
+    ).strip().lower()
+    if SHA40_RE.fullmatch(tree) is None:
+        raise AgentWorkspaceError("candidate adoption tree identity is invalid")
+    return tree
+
+
+def _create_adoption_commit_object(
+    manifest: dict[str, Any], *, candidate_id: str, git_tree_sha: str
+) -> str:
+    worktree = Path(str(manifest["writer_worktree"]))
+    base_head = str(manifest["expected_base_head"])
+    result = _checked(
+        _run,
+        worktree,
+        [
+            "git",
+            "-c",
+            "user.name=Grabowski Controller",
+            "-c",
+            "user.email=grabowski-controller@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            git_tree_sha,
+            "-p",
+            base_head,
+            "-m",
+            f"Adopt candidate {candidate_id[:12]}",
+        ],
+        label="candidate adoption commit object",
+    )
+    commit_sha = str(result.get("stdout", "")).strip().lower()
+    if SHA40_RE.fullmatch(commit_sha) is None:
+        raise AgentWorkspaceError("candidate adoption commit identity is invalid")
+    return commit_sha
+
+
+def _validate_prepared_adoption_commit(
+    manifest: dict[str, Any], intent: dict[str, Any]
+) -> None:
+    worktree = Path(str(manifest["writer_worktree"]))
+    commit_sha = str(intent["expected_commit_sha"])
+    present = _run(worktree, ["git", "cat-file", "-e", f"{commit_sha}^{{commit}}"])
+    if not isinstance(present, dict) or present.get("returncode") != 0:
+        raise AgentWorkspaceError("prepared adoption commit object is unavailable")
+    parents = str(
+        _checked(
+            _run,
+            worktree,
+            ["git", "rev-list", "--parents", "-n", "1", commit_sha],
+            label="prepared adoption commit parent",
+        ).get("stdout", "")
+    ).strip().split()
+    if (
+        len(parents) != 2
+        or parents[0] != commit_sha
+        or parents[1] != intent.get("integration_base_head")
+    ):
+        raise AgentWorkspaceError("prepared adoption commit parent binding is invalid")
+    tree = str(
+        _checked(
+            _run,
+            worktree,
+            ["git", "rev-parse", f"{commit_sha}^{{tree}}"],
+            label="prepared adoption commit tree",
+        ).get("stdout", "")
+    ).strip().lower()
+    if tree != intent.get("expected_git_tree_sha"):
+        raise AgentWorkspaceError("prepared adoption commit tree binding is invalid")
+
+
+def _adoption_git_readback(manifest: dict[str, Any]) -> dict[str, Any]:
+    worktree = Path(str(manifest["writer_worktree"]))
+    head_sha = _git_head(_run, worktree)
+    branch = str(
+        _checked(
+            _run,
+            worktree,
+            ["git", "branch", "--show-current"],
+            label="candidate adoption branch readback",
+        ).get("stdout", "")
+    ).strip()
+    parents = str(
+        _checked(
+            _run,
+            worktree,
+            ["git", "rev-list", "--parents", "-n", "1", head_sha],
+            label="candidate adoption parent readback",
+        ).get("stdout", "")
+    ).strip().split()
+    if len(parents) != 2 or parents[0] != head_sha or SHA40_RE.fullmatch(parents[1]) is None:
+        raise AgentWorkspaceError("candidate adoption commit must have exactly one parent")
+    git_tree_sha = str(
+        _checked(
+            _run,
+            worktree,
+            ["git", "rev-parse", f"{head_sha}^{{tree}}"],
+            label="candidate adoption tree readback",
+        ).get("stdout", "")
+    ).strip().lower()
+    if SHA40_RE.fullmatch(git_tree_sha) is None:
+        raise AgentWorkspaceError("candidate adoption readback tree identity is invalid")
+    status = _checked_bytes(
+        worktree,
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        label="candidate adoption status readback",
+    )
+    status_bytes = bytes(status["stdout"])
+    staged_probe = _run_bytes(worktree, ["git", "diff", "--cached", "--quiet", "--exit-code"])
+    if staged_probe.get("returncode") not in {0, 1}:
+        raise AgentWorkspaceError("candidate adoption staged readback failed")
+    untracked = _checked_bytes(
+        worktree,
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        label="candidate adoption untracked readback",
+    )
+    return {
+        "branch": branch,
+        "head_sha": head_sha,
+        "parent_sha": parents[1],
+        "git_tree_sha": git_tree_sha,
+        "clean": not status_bytes,
+        "staged_changes": staged_probe.get("returncode") == 1,
+        "untracked_changes": bool(bytes(untracked["stdout"])),
+    }
+
+
+def _adoption_intent_evidence(
+    manifest: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> dict[str, Any] | None:
+    paths = _adoption_receipt_paths(manifest, round_number=int(candidate["round"]))
+    stored = manifest.get("adoption_intent")
+    if paths["intent"].exists():
+        observed = candidate_adoption.read_adoption_intent(
+            paths["intent"],
+            candidate_manifest=candidate,
+            verification_receipts=receipts,
+            verification_summary=summary,
+        )
+        if stored is not None and stored != observed:
+            raise AgentWorkspaceError("adoption intent manifest differs from immutable evidence")
+        if stored is None:
+            manifest["adoption_intent"] = observed
+            _write_manifest(manifest)
+        return observed
+    if stored is not None:
+        raise AgentWorkspaceError("adoption intent manifest exists without immutable evidence")
+    return None
+
+
+def _adoption_existing_receipt(
+    manifest: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    summary: dict[str, Any],
+    intent: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    paths = _adoption_receipt_paths(manifest, round_number=int(candidate["round"]))
+    if not paths["receipt"].exists():
+        if manifest.get("adoption") is not None:
+            raise AgentWorkspaceError("adoption manifest exists without immutable receipt")
+        return None
+    if intent is None:
+        raise AgentWorkspaceError("adoption receipt exists without immutable intent")
+    observed = candidate_adoption.read_adoption_receipt(
+        paths["receipt"],
+        candidate_manifest=candidate,
+        verification_receipts=receipts,
+        verification_summary=summary,
+        adoption_intent=intent,
+    )
+    stored = manifest.get("adoption")
+    if stored is not None:
+        if not isinstance(stored, dict) or stored.get("receipt") != observed:
+            raise AgentWorkspaceError("adoption manifest differs from immutable receipt")
+    else:
+        manifest["adoption"] = {
+            "state": "adopted",
+            "candidate_id": candidate["candidate_id"],
+            "intent": intent,
+            "receipt": observed,
+            "intent_path": str(paths["intent"]),
+            "receipt_path": str(paths["receipt"]),
+        }
+        _write_manifest(manifest)
+    return observed
+
+
+def _persist_adoption_success(
+    manifest: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    summary: dict[str, Any],
+    intent: dict[str, Any],
+    readback: dict[str, Any],
+    reconciled: bool,
+) -> dict[str, Any]:
+    paths = _adoption_receipt_paths(manifest, round_number=int(candidate["round"]))
+    receipt = candidate_adoption.build_adoption_receipt(
+        candidate_manifest=candidate,
+        verification_receipts=receipts,
+        verification_summary=summary,
+        adoption_intent=intent,
+        resulting_commit_sha=intent["expected_commit_sha"],
+        resulting_git_tree_sha=intent["expected_git_tree_sha"],
+        integration_readback=readback,
+    )
+    created = candidate_adoption.persist_adoption_receipt(
+        paths["receipt"],
+        receipt,
+        candidate_manifest=candidate,
+        verification_receipts=receipts,
+        verification_summary=summary,
+        adoption_intent=intent,
+    )
+    observed = candidate_adoption.read_adoption_receipt(
+        paths["receipt"],
+        candidate_manifest=candidate,
+        verification_receipts=receipts,
+        verification_summary=summary,
+        adoption_intent=intent,
+    )
+    if observed != receipt:
+        raise AgentWorkspaceError("candidate adoption receipt readback differs from effect")
+    record = {
+        "state": "adopted",
+        "candidate_id": candidate["candidate_id"],
+        "intent": intent,
+        "receipt": observed,
+        "intent_path": str(paths["intent"]),
+        "receipt_path": str(paths["receipt"]),
+    }
+    manifest["adoption"] = record
+    _append_workspace_event(
+        manifest,
+        "candidate_adopted",
+        outcome="reconciled" if reconciled else "adopted",
+        evidence={
+            "candidate_id": candidate["candidate_id"],
+            "receipt_sha256": observed["receipt_sha256"],
+            "resulting_commit_sha": observed["resulting_commit_sha"],
+            "resulting_git_tree_sha": observed["resulting_git_tree_sha"],
+        },
+    )
+    _write_manifest(manifest)
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "agent-workspace-candidate-adopt",
+            "workspace_id": manifest["workspace_id"],
+            "lane_id": candidate["lane_id"],
+            "candidate_id": candidate["candidate_id"],
+            "adoption_receipt_sha256": observed["receipt_sha256"],
+            "resulting_commit_sha": observed["resulting_commit_sha"],
+            "reconciled": reconciled,
+        }
+    )
+    return {
+        "workspace_id": manifest["workspace_id"],
+        "state": "adopted",
+        "candidate_id": candidate["candidate_id"],
+        "adoption_receipt": observed,
+        "adoption_reference": {
+            "path": str(paths["receipt"]),
+            "receipt_sha256": observed["receipt_sha256"],
+            "candidate_id": candidate["candidate_id"],
+            "resulting_commit_sha": observed["resulting_commit_sha"],
+            "created": created,
+        },
+        "reconciled": reconciled,
+        "replayed": False,
+        "lane_closeout_ready": True,
+        "lane_closeout_evidence": {
+            "closeout_state": "candidate_adopted",
+            "lane_id": candidate["lane_id"],
+            "candidate_id": candidate["candidate_id"],
+            "adoption_receipt_sha256": observed["receipt_sha256"],
+            "adoption_commit_sha": observed["resulting_commit_sha"],
+        },
+        "receipt_status": "passed",
+    }
+
 def _verify_patch_artifact(
     result: dict[str, Any],
     *,
@@ -7117,6 +7686,308 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             "outcome_receipt": outcome_receipt,
             "external_closeout_checklist": _external_closeout_checklist(manifest),
         }
+
+
+@mcp.tool(name="grabowski_agent_workspace_adopt", annotations=MUTATING)
+def grabowski_agent_workspace_adopt(
+    workspace_id: str,
+    expected_candidate_id: str,
+    expected_result_sha256: str,
+) -> dict[str, Any]:
+    """Adopt one exact PASS-verified lane Candidate as a controller-owned commit."""
+    operator._require_operator_mutation("durable_job")
+    operator._require_operator_mutation("git_cli")
+    operator._require_operator_mutation("resource_lease")
+    identifier = _required_string(workspace_id, "workspace_id", max_length=80)
+    with _lock(identifier):
+        manifest = _manifest(identifier)
+        collection, candidate, receipts, summary = _adoption_collection_evidence(
+            manifest,
+            expected_candidate_id=expected_candidate_id,
+            expected_result_sha256=expected_result_sha256,
+        )
+        _require_closed_lane_workspace_for_adoption(manifest, collection)
+        try:
+            intent = _adoption_intent_evidence(
+                manifest,
+                candidate=candidate,
+                receipts=receipts,
+                summary=summary,
+            )
+            existing = _adoption_existing_receipt(
+                manifest,
+                candidate=candidate,
+                receipts=receipts,
+                summary=summary,
+                intent=intent,
+            )
+        except candidate_adoption.CandidateAdoptionError as exc:
+            raise AgentWorkspaceError(
+                f"candidate adoption evidence is invalid: {_error_summary(exc)}"
+            ) from exc
+        paths = _adoption_receipt_paths(
+            manifest, round_number=int(candidate["round"])
+        )
+        if existing is not None:
+            live_head = _git_head(_run, Path(str(manifest["writer_worktree"])))
+            if live_head != existing.get("resulting_commit_sha"):
+                return {
+                    "workspace_id": identifier,
+                    "state": "adoption_readback_drifted",
+                    "candidate_id": candidate["candidate_id"],
+                    "adoption_receipt": existing,
+                    "expected_commit_sha": existing["resulting_commit_sha"],
+                    "observed_head": live_head,
+                    "reconcile_required": True,
+                    "replayed": True,
+                    "lane_closeout_ready": False,
+                    "receipt_status": "blocked",
+                }
+            try:
+                live_readback = _adoption_git_readback(manifest)
+            except AgentWorkspaceError as exc:
+                return {
+                    "workspace_id": identifier,
+                    "state": "adoption_readback_unknown",
+                    "candidate_id": candidate["candidate_id"],
+                    "adoption_receipt": existing,
+                    "error": _error_summary(exc),
+                    "reconcile_required": True,
+                    "replayed": True,
+                    "lane_closeout_ready": False,
+                    "receipt_status": "blocked",
+                }
+            if live_readback != existing.get("integration_readback"):
+                return {
+                    "workspace_id": identifier,
+                    "state": "adoption_readback_drifted",
+                    "candidate_id": candidate["candidate_id"],
+                    "adoption_receipt": existing,
+                    "expected_commit_sha": existing["resulting_commit_sha"],
+                    "observed_head": live_readback.get("head_sha"),
+                    "reconcile_required": True,
+                    "replayed": True,
+                    "lane_closeout_ready": False,
+                    "receipt_status": "blocked",
+                }
+            lane_status = _lane_binding_status(manifest, _run)
+            lane_closeout_ready = lane_status.get("valid") is True
+            return {
+                "workspace_id": identifier,
+                "state": "adopted",
+                "candidate_id": candidate["candidate_id"],
+                "adoption_receipt": existing,
+                "adoption_reference": {
+                    "path": str(paths["receipt"]),
+                    "receipt_sha256": existing["receipt_sha256"],
+                    "candidate_id": candidate["candidate_id"],
+                    "resulting_commit_sha": existing["resulting_commit_sha"],
+                    "created": False,
+                },
+                "reconciled": False,
+                "replayed": True,
+                "lane_closeout_ready": lane_closeout_ready,
+                "lane_closeout_evidence": {
+                    "closeout_state": "candidate_adopted",
+                    "lane_id": candidate["lane_id"],
+                    "candidate_id": candidate["candidate_id"],
+                    "adoption_receipt_sha256": existing["receipt_sha256"],
+                    "adoption_commit_sha": existing["resulting_commit_sha"],
+                },
+                "lane_binding_status": lane_status,
+                "receipt_status": "passed",
+            }
+        authority = _require_adoption_lane_authority(manifest)
+        controller_actor = str(authority["controller_actor"])
+        worktree = Path(str(manifest["writer_worktree"]))
+        base_head = str(candidate["base_head"])
+        branch = str(manifest["writer_branch"])
+        intent_preexisting = intent is not None
+        current_head = _git_head(_run, worktree)
+        if intent is not None:
+            if (
+                intent.get("controller_actor") != controller_actor
+                or intent.get("integration_target") != branch
+                or intent.get("integration_base_head") != base_head
+            ):
+                raise AgentWorkspaceError(
+                    "immutable adoption intent differs from current controller authority"
+                )
+        if intent is None:
+            _require_live_lane_binding(manifest, _run)
+            _adoption_candidate_snapshot(manifest, collection, candidate)
+            git_tree_sha = _stage_candidate_for_adoption(manifest, collection)
+            commit_sha = _create_adoption_commit_object(
+                manifest,
+                candidate_id=candidate["candidate_id"],
+                git_tree_sha=git_tree_sha,
+            )
+            intent = candidate_adoption.build_adoption_intent(
+                candidate_manifest=candidate,
+                verification_receipts=receipts,
+                verification_summary=summary,
+                controller_actor=controller_actor,
+                integration_target=branch,
+                expected_git_tree_sha=git_tree_sha,
+                expected_commit_sha=commit_sha,
+            )
+            try:
+                created = candidate_adoption.persist_adoption_intent(
+                    paths["intent"],
+                    intent,
+                    candidate_manifest=candidate,
+                    verification_receipts=receipts,
+                    verification_summary=summary,
+                )
+                observed_intent = candidate_adoption.read_adoption_intent(
+                    paths["intent"],
+                    candidate_manifest=candidate,
+                    verification_receipts=receipts,
+                    verification_summary=summary,
+                )
+            except candidate_adoption.CandidateAdoptionError as exc:
+                restore = _run(
+                    worktree,
+                    ["git", "reset", "--mixed", "--quiet", base_head],
+                )
+                if (
+                    not isinstance(restore, dict)
+                    or restore.get("returncode") != 0
+                ):
+                    raise AgentWorkspaceError(
+                        "candidate adoption intent persistence failed and the "
+                        "pre-effect index could not be restored"
+                    ) from exc
+                raise AgentWorkspaceError(
+                    f"candidate adoption intent could not be persisted: {_error_summary(exc)}"
+                ) from exc
+            if observed_intent != intent:
+                raise AgentWorkspaceError(
+                    "candidate adoption intent readback differs from prepared effect"
+                )
+            manifest["adoption_intent"] = observed_intent
+            _append_workspace_event(
+                manifest,
+                "candidate_adoption_intent_persisted",
+                outcome="created" if created else "reused",
+                evidence={
+                    "candidate_id": candidate["candidate_id"],
+                    "intent_sha256": intent["intent_sha256"],
+                    "expected_commit_sha": intent["expected_commit_sha"],
+                    "expected_git_tree_sha": intent["expected_git_tree_sha"],
+                },
+            )
+            _write_manifest(manifest)
+            current_head = _git_head(_run, worktree)
+        elif current_head == base_head:
+            _require_live_lane_binding(manifest, _run)
+            _checked(
+                _run,
+                worktree,
+                ["git", "reset", "--mixed", "--quiet", base_head],
+                label="candidate adoption reconcile index reset",
+            )
+            _adoption_candidate_snapshot(manifest, collection, candidate)
+            observed_tree = _stage_candidate_for_adoption(manifest, collection)
+            if observed_tree != intent.get("expected_git_tree_sha"):
+                return {
+                    "workspace_id": identifier,
+                    "state": "adoption_outcome_unknown",
+                    "candidate_id": candidate["candidate_id"],
+                    "reconcile_required": True,
+                    "reason": "prepared_tree_drifted_from_immutable_intent",
+                    "intent_sha256": intent["intent_sha256"],
+                    "receipt_status": "blocked",
+                }
+        assert intent is not None
+        try:
+            _validate_prepared_adoption_commit(manifest, intent)
+        except AgentWorkspaceError:
+            return {
+                "workspace_id": identifier,
+                "state": "adoption_outcome_unknown",
+                "candidate_id": candidate["candidate_id"],
+                "reconcile_required": True,
+                "reason": "prepared_commit_evidence_unavailable",
+                "intent_sha256": intent["intent_sha256"],
+                "receipt_status": "blocked",
+            }
+        expected_commit_sha = str(intent["expected_commit_sha"])
+        current_head = _git_head(_run, worktree)
+        update_result: dict[str, Any] | None = None
+        if current_head == base_head:
+            update_result = _run(
+                worktree,
+                [
+                    "git",
+                    "update-ref",
+                    f"refs/heads/{branch}",
+                    expected_commit_sha,
+                    base_head,
+                ],
+            )
+            observed_head = _git_head(_run, worktree)
+            if observed_head == base_head:
+                return {
+                    "workspace_id": identifier,
+                    "state": "adoption_effect_not_applied",
+                    "candidate_id": candidate["candidate_id"],
+                    "intent_sha256": intent["intent_sha256"],
+                    "update_returncode": (
+                        update_result.get("returncode")
+                        if isinstance(update_result, dict)
+                        else None
+                    ),
+                    "retry_safe_after_readback": True,
+                    "receipt_status": "blocked",
+                }
+            if observed_head != expected_commit_sha:
+                return {
+                    "workspace_id": identifier,
+                    "state": "adoption_outcome_unknown",
+                    "candidate_id": candidate["candidate_id"],
+                    "intent_sha256": intent["intent_sha256"],
+                    "observed_head": observed_head,
+                    "reconcile_required": True,
+                    "receipt_status": "blocked",
+                }
+        elif current_head != expected_commit_sha:
+            return {
+                "workspace_id": identifier,
+                "state": "adoption_outcome_unknown",
+                "candidate_id": candidate["candidate_id"],
+                "intent_sha256": intent["intent_sha256"],
+                "observed_head": current_head,
+                "reconcile_required": True,
+                "receipt_status": "blocked",
+            }
+        readback = _adoption_git_readback(manifest)
+        try:
+            return _persist_adoption_success(
+                manifest,
+                candidate=candidate,
+                receipts=receipts,
+                summary=summary,
+                intent=intent,
+                readback=readback,
+                reconciled=(
+                    intent_preexisting
+                    or (
+                        isinstance(update_result, dict)
+                        and update_result.get("returncode") != 0
+                    )
+                ),
+            )
+        except candidate_adoption.CandidateAdoptionError as exc:
+            return {
+                "workspace_id": identifier,
+                "state": "adoption_outcome_unknown",
+                "candidate_id": candidate["candidate_id"],
+                "intent_sha256": intent["intent_sha256"],
+                "error": _error_summary(exc),
+                "reconcile_required": True,
+                "receipt_status": "blocked",
+            }
 
 
 def _bind_writer_handoff_attempt(

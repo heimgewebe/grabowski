@@ -2337,6 +2337,21 @@
     },
     {
       "category": "agent-workspace",
+      "description": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit.",
+      "effects": [
+        "git-ref-update",
+        "receipt-create",
+        "audit-append"
+      ],
+      "id": "grabowski_agent_workspace_adopt",
+      "purpose": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit with immutable intent and readback receipts.",
+      "read_only": false,
+      "reversibility": "preserved-adoption-commit-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_adopt"
+    },
+    {
+      "category": "agent-workspace",
       "description": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
       "effects": [
         "task-start",
@@ -2981,6 +2996,7 @@
       "grabowski_agent_workspace_status",
       "grabowski_agent_workspace_attach",
       "grabowski_agent_workspace_collect",
+      "grabowski_agent_workspace_adopt",
       "grabowski_agent_workspace_role_retry",
       "grabowski_agent_workspace_writer_handoff",
       "grabowski_agent_workspace_close",
@@ -3369,6 +3385,10 @@
         "source": "src/grabowski_candidate_verification.py"
       },
       {
+        "module": "grabowski_candidate_adoption",
+        "source": "src/grabowski_candidate_adoption.py"
+      },
+      {
         "module": "grabowski_agent_role",
         "source": "src/grabowski_agent_role.py"
       },
@@ -3470,7 +3490,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "1620ad4b5d93a3859047ab9c1b7d91125ac5821121a25721733197a570397946"
+      "sha256": "fe56343d96e870df6abdca6e0262456f0ce736d6dc2fac287e016509da31bfb4"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3478,14 +3498,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "62b83f7a71d8cc7bd59fc553992ec8fb3ed50c670e0956cec25f8476fb1a1977"
+      "sha256": "39df47409bc1dd6325b6549f950383cfc18a37a3a13d74652d19665df4783b80"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
       "src/grabowski_agent_competition.py": "e25ad6cd44ddcc4297381b6d374851e46e290f3d580460503d54898a48a69044",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "b29015fe0a6357af86ac93142b14e0779d16ed09ba91c0fdd8acf50cc8790013",
+      "src/grabowski_agent_workspace.py": "b451be48cc75700fd8792eeb0361a8c4d61e0e545ebd7d8e03a063e67299f606",
       "src/grabowski_agent_workspace_observer.py": "f7db154ac20b92e29eb654682f663b5e4f78743bf37e22a62f869df1b9331113",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_alert_outbox.py": "47d43bb27151032be8cd197038f358c27c52ca9066e6ed57530f71cfa793455d",
@@ -3500,8 +3520,9 @@
       "src/grabowski_bureau_launcher_contract.py": "091908c70502dddd0bbe5582a3412b30cd92f5736801f76279bfd061ad141435",
       "src/grabowski_bureau_leases.py": "25965a1d91d8386103b8da033a09488005e943b5b575579a9722ce7e580fc378",
       "src/grabowski_bureau_pickup.py": "da5e5ebad67fc3a82318a6c6acb217c94b63868bcb7b11b221354a20cac1c7cb",
+      "src/grabowski_candidate_adoption.py": "0622c02e1c891dd59c601bff67ab0ca5e2be8c0fd2bdb493f507f9f1b820f291",
       "src/grabowski_candidate_verification.py": "b1abe088b16482bcce5d688463d8d2f8e93b6d20926bb4920e49a4bb3cd26636",
-      "src/grabowski_capabilities.py": "1620ad4b5d93a3859047ab9c1b7d91125ac5821121a25721733197a570397946",
+      "src/grabowski_capabilities.py": "fe56343d96e870df6abdca6e0262456f0ce736d6dc2fac287e016509da31bfb4",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "74845b418561c79196ae7a98ab9e16d1d2e2509b6b037fd1e0381bc64a8b3257",
@@ -3532,7 +3553,7 @@
       "src/grabowski_juno.py": "aeaae6e646638c7c1c6c516ec387bffce78170cf113cc175a627dec745ca9493",
       "src/grabowski_juno_bluetooth.py": "f67bf6b7cea0e859e13cf6dff34f54e1875e94aa11db95f8faafbcd983abb6d9",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
-      "src/grabowski_lane_closeout.py": "7d91d120a35faa836dc4816aa0b574f8007c119dcd7a0df2efe05c7f96c21997",
+      "src/grabowski_lane_closeout.py": "c61009a469dc45e22e7ab80ff56bbaff819cfcc1b57e67ed536f0ce34886b250",
       "src/grabowski_lifecycle_archive.py": "55ca2cfb58bb56a2c068b3a7c34c6bdc21f040492e1c437e5d8300783a23b3ce",
       "src/grabowski_lifecycle_collectors.py": "212dfce41c7764a386bd2124c9df32cf31d7a3cd572d36dcba5e5358be42e4d3",
       "src/grabowski_lifecycle_effect_plan.py": "d6435b8357652fbfc1976be8d861059d684d7e6baf07e4ae8848483b4039e892",
@@ -3540,7 +3561,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "cff13cf254ff82c8acb300cb22b5ccd0a4d4d66a8a936c77b6f5fcacc8d24736",
+      "src/grabowski_mcp.py": "1d11743605bb884c23d1a69af723845163f9712a2de277056259c4581db1d5e9",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "6bb5772e2f54017c367d9c13d63579e0e7a45bfbd8116a035ee0a1da058cf012",
