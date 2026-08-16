@@ -781,7 +781,8 @@ globalThis.fetch = async () => ({
         timeout_probe = result(
             stdout=(
                 "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
-                "Result=timeout\nExecMainStatus=0\n"
+                "Result=timeout\nExecMainCode=1\nExecMainStatus=0\n"
+                "RuntimeMaxUSec=1min\n"
                 "ActiveEnterTimestampMonotonic=1000000\n"
                 "ActiveExitTimestampMonotonic=61000000\n"
             )
@@ -795,6 +796,73 @@ globalThis.fetch = async () => ({
         self.assertIsNone(workers.resources.inspect_resource("port:9224"))
         self.assertFalse(profile.exists())
 
+    def test_planned_runtime_sigterm_is_completed(self) -> None:
+        with patch.object(workers, "_now", return_value=1000), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(str(self.binary), port=9390, runtime_seconds=300)
+        timeout_probe = result(
+            stdout=(
+                "RuntimeMaxUSec=5min\n"
+                "Result=timeout\nExecMainCode=2\nExecMainStatus=15\n"
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "ActiveEnterTimestampMonotonic=423983505569\n"
+                "ActiveExitTimestampMonotonic=424283631535\n"
+            )
+        )
+        with patch.object(workers, "_now", return_value=1300), patch.object(
+            workers.operator, "_run", return_value=timeout_probe
+        ):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["last_observation"]["properties"]["ExecMainStatus"], "15")
+        self.assertIsNone(workers.resources.inspect_resource("port:9390"))
+
+    def test_planned_runtime_sigterm_with_mismatched_runtime_limit_is_failed(self) -> None:
+        with patch.object(workers, "_now", return_value=1000), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(str(self.binary), port=9391, runtime_seconds=300)
+        timeout_probe = result(
+            stdout=(
+                "RuntimeMaxUSec=4min\n"
+                "Result=timeout\nExecMainCode=2\nExecMainStatus=15\n"
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "ActiveEnterTimestampMonotonic=423983505569\n"
+                "ActiveExitTimestampMonotonic=424283631535\n"
+            )
+        )
+        with patch.object(workers, "_now", return_value=1300), patch.object(
+            workers.operator, "_run", return_value=timeout_probe
+        ):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "failed")
+
+    def test_planned_runtime_sigterm_without_runtime_limit_evidence_is_failed(self) -> None:
+        with patch.object(workers, "_now", return_value=1000), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(str(self.binary), port=9392, runtime_seconds=300)
+        timeout_probe = result(
+            stdout=(
+                "Result=timeout\nExecMainCode=2\nExecMainStatus=15\n"
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "ActiveEnterTimestampMonotonic=423983505569\n"
+                "ActiveExitTimestampMonotonic=424283631535\n"
+            )
+        )
+        with patch.object(workers, "_now", return_value=1300), patch.object(
+            workers.operator, "_run", return_value=timeout_probe
+        ):
+            status = workers.worker_status(
+                started["worker"]["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "failed")
+
     def test_timeout_before_planned_runtime_limit_is_failed(self) -> None:
         with patch.object(workers, "_now", return_value=1000), patch.object(
             workers, "_executable", return_value=self.binary.resolve()
@@ -803,7 +871,8 @@ globalThis.fetch = async () => ({
         timeout_probe = result(
             stdout=(
                 "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
-                "Result=timeout\nExecMainStatus=0\n"
+                "Result=timeout\nExecMainCode=1\nExecMainStatus=0\n"
+                "RuntimeMaxUSec=1min\n"
                 "ActiveEnterTimestampMonotonic=1000000\n"
                 "ActiveExitTimestampMonotonic=60000000\n"
             )
@@ -824,7 +893,8 @@ globalThis.fetch = async () => ({
         timeout_probe = result(
             stdout=(
                 "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
-                "Result=timeout\nExecMainStatus=1\n"
+                "Result=timeout\nExecMainCode=1\nExecMainStatus=1\n"
+                "RuntimeMaxUSec=1min\n"
                 "ActiveEnterTimestampMonotonic=1000000\n"
                 "ActiveExitTimestampMonotonic=61000000\n"
             )
