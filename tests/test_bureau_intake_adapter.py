@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 import subprocess
 from pathlib import Path
 import tempfile
@@ -31,6 +32,15 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         for patcher in reversed(self.patches):
             patcher.stop()
         self.temp.cleanup()
+
+    def _git_repository(self, name: str, *, origin: str) -> Path:
+        repository = self.root / name
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repository), "remote", "add", "origin", origin],
+            check=True,
+        )
+        return repository
 
     def _mock_bound_launcher(self) -> mock.MagicMock:
         bound_launcher = mock.MagicMock()
@@ -492,6 +502,114 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual(self.artifacts.stat().st_mode & 0o777, 0o700)
         self.assertEqual(result["status"], "recorded")
         self.assertEqual(request_path.stem, result["adapter_request_sha256"])
+
+    def test_candidate_record_normalizes_exact_heimgewebe_repo_path_before_hashing(self) -> None:
+        repository = self._git_repository(
+            "grabowski", origin="git@github.com:heimgewebe/grabowski.git"
+        )
+        request = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:repo-path:1",
+            "title": "Record candidate",
+            "source_kind": "conversation",
+            "desired_outcome": "Create one task",
+            "repo": str(repository),
+        }
+        expected = {**request, "repo": "repo.grabowski"}
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "kind": "bureau_candidate_record_result",
+                "status": "recorded",
+            },
+        ) as invoke:
+            result = intake.grabowski_bureau_candidate_record(request)
+        request_path = Path(invoke.call_args.args[0][-1])
+        self.assertEqual(json.loads(request_path.read_text()), expected)
+        self.assertEqual(intake._sha256(intake._canonical_json(expected)), request_path.stem)
+        self.assertEqual(request_path.stem, result["adapter_request_sha256"])
+        self.assertEqual(str(repository), request["repo"])
+
+    def test_candidate_repo_path_normalization_fails_closed_for_untrusted_shapes(self) -> None:
+        foreign = self._git_repository(
+            "foreign", origin="git@github.com:other/foreign.git"
+        )
+        self.assertIsNone(intake._canonical_bureau_repo_resource(str(foreign)))
+
+        repository = self._git_repository(
+            "shape-target", origin="https://github.com/heimgewebe/grabowski.git"
+        )
+        subdirectory = repository / "src"
+        subdirectory.mkdir()
+        self.assertIsNone(intake._canonical_bureau_repo_resource(str(subdirectory)))
+
+        linked = self.root / "symlink-repo"
+        linked.symlink_to(repository, target_is_directory=True)
+        self.assertIsNone(intake._canonical_bureau_repo_resource(str(linked)))
+
+    def test_candidate_repo_path_normalization_ignores_inherited_git_overrides(self) -> None:
+        repository = self._git_repository(
+            "override-target", origin="git@github.com:heimgewebe/grabowski.git"
+        )
+        other = self._git_repository(
+            "override-other", origin="git@github.com:other/foreign.git"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)},
+            clear=False,
+        ):
+            self.assertEqual(
+                "repo.grabowski",
+                intake._canonical_bureau_repo_resource(str(repository)),
+            )
+
+    def test_candidate_repo_path_normalization_rejects_multiple_local_origins(self) -> None:
+        repository = self._git_repository(
+            "multiple-origins", origin="git@github.com:heimgewebe/grabowski.git"
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "config",
+                "--add",
+                "remote.origin.url",
+                "https://github.com/heimgewebe/audio.git",
+            ],
+            check=True,
+        )
+        self.assertIsNone(intake._canonical_bureau_repo_resource(str(repository)))
+
+    def test_bureau_repo_resource_origin_parser_accepts_only_exact_heimgewebe_origins(self) -> None:
+        self.assertEqual(
+            "repo.grabowski",
+            intake._bureau_repo_resource_from_origin(
+                "ssh://git@github.com/heimgewebe/grabowski.git"
+            ),
+        )
+        self.assertEqual(
+            "repo.grabowski",
+            intake._bureau_repo_resource_from_origin(
+                "https://github.com/heimgewebe/grabowski"
+            ),
+        )
+        self.assertIsNone(
+            intake._bureau_repo_resource_from_origin(
+                "https://github.com/other/grabowski.git"
+            )
+        )
+        self.assertIsNone(
+            intake._bureau_repo_resource_from_origin(
+                "https://github.com/heimgewebe/Grabowski.git"
+            )
+        )
+        self.assertEqual(
+            {"repo": "repo.grabowski"},
+            intake._normalize_candidate_request({"repo": "repo.grabowski"}),
+        )
 
     def test_candidate_record_carries_valid_refinement_binding(self) -> None:
         request = {

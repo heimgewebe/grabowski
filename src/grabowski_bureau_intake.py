@@ -47,9 +47,26 @@ MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
 AUDIT_FAILURE_REASON_MAX_CHARS = 512
+CANDIDATE_REPO_IDENTITY_TIMEOUT_SECONDS = 5
+CANDIDATE_REPO_IDENTITY_MAX_OUTPUT_BYTES = 8192
 PROPOSAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+BUREAU_REPO_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+HEIMGEWEBE_GITHUB_ORIGIN_PREFIXES = (
+    "git@github.com:heimgewebe/",
+    "https://github.com/heimgewebe/",
+    "ssh://git@github.com/heimgewebe/",
+)
+GIT_REPOSITORY_OVERRIDE_ENV = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
 MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
 
 
@@ -345,6 +362,93 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _git_identity_lines(repository: Path, *arguments: str) -> list[str] | None:
+    environment = dict(os.environ)
+    for name in GIT_REPOSITORY_OVERRIDE_ENV:
+        environment.pop(name, None)
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            timeout=CANDIDATE_REPO_IDENTITY_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0 or len(completed.stdout) > CANDIDATE_REPO_IDENTITY_MAX_OUTPUT_BYTES:
+        return None
+    try:
+        text = completed.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    lines = text.splitlines()
+    if any(not line or "\x00" in line for line in lines):
+        return None
+    return lines
+
+
+def _bureau_repo_resource_from_origin(origin: str) -> str | None:
+    if (
+        not isinstance(origin, str)
+        or not origin
+        or origin.strip() != origin
+        or "\x00" in origin
+        or "\n" in origin
+        or "\r" in origin
+    ):
+        return None
+    for prefix in HEIMGEWEBE_GITHUB_ORIGIN_PREFIXES:
+        if not origin.startswith(prefix):
+            continue
+        repository = origin[len(prefix) :]
+        if repository.endswith("/"):
+            repository = repository[:-1]
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+        if "/" in repository or BUREAU_REPO_SLUG_RE.fullmatch(repository) is None:
+            return None
+        return f"repo.{repository}"
+    return None
+
+
+def _canonical_bureau_repo_resource(value: Any) -> str | None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    repository = Path(value)
+    if not repository.is_absolute() or str(repository) != value:
+        return None
+    try:
+        metadata = repository.lstat()
+        resolved = repository.resolve(strict=True)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != repository
+    ):
+        return None
+    top_level = _git_identity_lines(repository, "rev-parse", "--show-toplevel")
+    if top_level != [value]:
+        return None
+    origins = _git_identity_lines(
+        repository, "config", "--local", "--get-all", "remote.origin.url"
+    )
+    if origins is None or len(origins) != 1:
+        return None
+    return _bureau_repo_resource_from_origin(origins[0])
+
+
+def _normalize_candidate_request(request: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(request)
+    resource = _canonical_bureau_repo_resource(normalized.get("repo"))
+    if resource is not None:
+        normalized["repo"] = resource
+    return normalized
 
 
 def _private_root() -> Path:
@@ -792,6 +896,7 @@ def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]
     operator._require_operator_mutation("terminal_execute")
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
+    request = _normalize_candidate_request(request)
     raw = _canonical_json(request)
     request_id = _sha256(raw)
     request_path = _private_root() / "requests" / f"{request_id}.json"
