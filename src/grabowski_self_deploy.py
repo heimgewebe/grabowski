@@ -1329,6 +1329,15 @@ def _deploy_finalization_retry_block(
     return True
 
 
+def _references_runtime_runner(command: list[str], runner: Path) -> bool:
+    """Does this argv start one of the runners that mutate the live runtime?"""
+    return (
+        len(command) >= 2
+        and command[0] == "/usr/bin/python3"
+        and command[1].endswith(f"/{runner}")
+    )
+
+
 def _bootstrap_deploy_index(
     jobs_root: Path,
     _repository: Path | None = None,
@@ -1350,17 +1359,28 @@ def _bootstrap_deploy_index(
         candidate_command = metadata.get("argv")
         if not isinstance(candidate_command, list) or not all(isinstance(item, str) for item in candidate_command):
             raise RuntimeError(f"durable job argv is malformed: {entry.name}")
-        references_self_deploy = (
-            len(candidate_command) >= 2
-            and candidate_command[0] == "/usr/bin/python3"
-            and candidate_command[1].endswith(f"/{RUNNER_RELATIVE_PATH}")
+        # Both runners mutate the same live runtime, so both belong in the
+        # index this bootstrap rebuilds.  Recognising only the deploy runner
+        # here would drop a live mid-cutover resume before any later reader
+        # sees it, and an ordinary deployment could then be scheduled straight
+        # into the recovery it was supposed to wait for -- the same blindness
+        # this change removes one layer up.
+        references_deploy_runner = _references_runtime_runner(
+            candidate_command, RUNNER_RELATIVE_PATH
         )
+        references_resume_runner = _references_runtime_runner(
+            candidate_command, MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+        )
+        references_runtime_job = references_deploy_runner or references_resume_runner
         unresolved_finalization = (
+            # Only the deploy runner writes the runtime-deploy finalization
+            # receipt this predicate reads; a resume carries its outcome in its
+            # own durable receipt instead.
             _deploy_finalization_retry_block(entry, metadata)
-            if references_self_deploy
+            if references_deploy_runner
             else False
         )
-        if references_self_deploy and (
+        if references_runtime_job and (
             unresolved_finalization
             or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
         ):

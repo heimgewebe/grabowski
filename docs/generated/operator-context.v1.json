@@ -3566,7 +3566,7 @@
       "src/grabowski_runtime.py": "4b9100b1424b89950c16b57f733afa5f618204baa5ace44048a7643ab358cf9a",
       "src/grabowski_runtime_contract.py": "50b602e64c5fe884c2d73b76e769dde0dc157fe25f7bd8645a78979b2962a48b",
       "src/grabowski_runtime_extensions.py": "e618a435abf1f07d5b7a00d07dc59fc8fb844e1ddd52dfa7f025a0d754a66ef8",
-      "src/grabowski_self_deploy.py": "60c6f128773d5994c08d0b93d2b22bcbc0e607e0d01c49d343b880e5ed1a8c7c",
+      "src/grabowski_self_deploy.py": "07bd23d718f67c7508cafc5ef90e7b2df18d60ed7910266092dc1b7a07fd9793",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_system_map.py": "a2f58e6b1419d62c5c070faeed6ce937c3b10ecb87ab6f4b48c2bae7f8edf381",

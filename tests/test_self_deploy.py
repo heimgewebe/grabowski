@@ -2732,3 +2732,84 @@ class IndexedInflightJobEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["blocking_units"], ["grabowski-job-333333333333"])
         self.assertIsNotNone(evidence["error"])
         write.assert_not_called()
+
+
+class BootstrapIndexRunnerRecognitionTests(unittest.TestCase):
+    """A rebuilt index must retain every live runner that touches the runtime.
+
+    The bootstrap runs when the index file is missing. Recognising only the
+    deploy runner there dropped a live mid-cutover resume before any later
+    reader could see it, so an ordinary deployment could be scheduled straight
+    into the recovery it was meant to wait for.
+    """
+
+    def _bootstrap(self, jobs, *, final_status="running"):
+        entries = [Path(f"/jobs/{unit}") for unit in jobs]
+
+        def metadata(unit):
+            return {"argv": jobs[unit], "final_status": final_status}
+
+        root = mock.Mock()
+        root.iterdir.return_value = entries
+        written = {}
+
+        def write(_root, *, units, pending_unit):
+            written["units"] = list(units)
+            written["pending_unit"] = pending_unit
+            return {"units": list(units), "pending_unit": pending_unit}
+
+        with (
+            mock.patch.object(SELF_DEPLOY, "_durable_job_unit", return_value=True),
+            mock.patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", side_effect=metadata
+            ),
+            mock.patch.object(SELF_DEPLOY, "_write_deploy_index", side_effect=write),
+            mock.patch.object(
+                SELF_DEPLOY, "_deploy_finalization_retry_block", return_value=False
+            ),
+            mock.patch.object(Path, "is_symlink", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+        ):
+            SELF_DEPLOY._bootstrap_deploy_index(root)
+        return written
+
+    @staticmethod
+    def _argv(runner):
+        return ["/usr/bin/python3", f"/home/alex/repos/grabowski/{runner}", "--repo", "/x"]
+
+    def test_live_resume_job_is_retained(self) -> None:
+        written = self._bootstrap(
+            {
+                "grabowski-job-aaaaaaaaaaaa": self._argv(
+                    SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+                )
+            }
+        )
+        self.assertEqual(written["units"], ["grabowski-job-aaaaaaaaaaaa"])
+
+    def test_live_deploy_job_is_still_retained(self) -> None:
+        written = self._bootstrap(
+            {
+                "grabowski-job-bbbbbbbbbbbb": self._argv(
+                    SELF_DEPLOY.RUNNER_RELATIVE_PATH
+                )
+            }
+        )
+        self.assertEqual(written["units"], ["grabowski-job-bbbbbbbbbbbb"])
+
+    def test_terminal_resume_job_is_not_retained(self) -> None:
+        written = self._bootstrap(
+            {
+                "grabowski-job-cccccccccccc": self._argv(
+                    SELF_DEPLOY.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+                )
+            },
+            final_status="completed",
+        )
+        self.assertEqual(written["units"], [])
+
+    def test_unrelated_job_is_ignored(self) -> None:
+        written = self._bootstrap(
+            {"grabowski-job-dddddddddddd": ["/usr/bin/python3", "/tmp/other.py"]}
+        )
+        self.assertEqual(written["units"], [])
