@@ -1913,11 +1913,16 @@ globalThis.fetch = async () => ({
         symlink_target = self.root / "semantic-temp-cleanup-target"
         symlink_temp = directory / (".browser-semantic-" + "c" * 32 + ".json")
         unrelated = directory / ".browser-semantic-not-a-token.json"
-        request_temp.write_text("private-request", encoding="utf-8")
-        script_temp.write_text("private-script", encoding="utf-8")
+        group_readable = directory / (".browser-semantic-" + "d" * 32 + ".json")
+        # The adapter creates these through _write_private_action_file at 0o600;
+        # cleanup only removes files that still carry exactly that private mode.
+        workers._write_private_action_file(request_temp, "private-request")
+        workers._write_private_action_file(script_temp, "private-script")
         symlink_target.write_text("preserve-me", encoding="utf-8")
         symlink_temp.symlink_to(symlink_target)
         unrelated.write_text("preserve-unrelated", encoding="utf-8")
+        workers._write_private_action_file(group_readable, "not-ours")
+        group_readable.chmod(0o644)
 
         with patch.object(workers.operator, "_run", return_value=result()):
             stopped = workers.worker_stop(
@@ -1929,10 +1934,12 @@ globalThis.fetch = async () => ({
         self.assertTrue(symlink_temp.is_symlink())
         self.assertEqual(symlink_target.read_text(encoding="utf-8"), "preserve-me")
         self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserve-unrelated")
+        self.assertEqual(group_readable.read_text(encoding="utf-8"), "not-ours")
         cleanup = stopped["worker"]["last_observation"]["terminalization"]["cleanup"]
         self.assertIn(str(request_temp), cleanup["removed"])
         self.assertIn(str(script_temp), cleanup["removed"])
         self.assertIn(str(symlink_temp), cleanup["preserved_evidence"])
+        self.assertIn(str(group_readable), cleanup["preserved_evidence"])
 
     def test_stopped_status_preserves_explicit_state_over_timeout_evidence(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
@@ -2840,6 +2847,19 @@ globalThis.fetch = async () => ({
         self.assertTrue(receipt["ok"])
         self.assertEqual(receipt["navigation_correlation"], "same-document")
         self.assertEqual(receipt["state"]["navigation_entry_id"], "8")
+
+    def test_browser_semantic_node_emits_exactly_one_correlated_receipt(self) -> None:
+        source = workers.BROWSER_SEMANTIC_NODE_SOURCE
+        self.assertIn("if (receiptEmitted) return;", source)
+        for scenario in ("correlated-new-document", "correlated-same-document"):
+            with self.subTest(scenario=scenario):
+                execution, receipt = self._run_browser_semantic_node(scenario)
+                lines = [
+                    line for line in execution.stdout.splitlines() if line.strip()
+                ]
+                self.assertEqual(len(lines), 1, execution.stdout)
+                self.assertEqual(execution.returncode, 0, execution.stderr)
+                self.assertTrue(receipt["ok"])
 
     def test_browser_semantic_node_navigation_failures_never_claim_observation(self) -> None:
         for scenario, result_code in (

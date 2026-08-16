@@ -2165,6 +2165,7 @@ import fs from 'node:fs';
 const request = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 let ws = null;
 let nextId = 1;
+let receiptEmitted = false;
 const pending = new Map();
 const sameDocumentNavigations = [];
 const semanticRoles = new Set([
@@ -2174,6 +2175,8 @@ const semanticRoles = new Set([
 ]);
 
 function emit(payload, status = 0) {
+  if (receiptEmitted) return;
+  receiptEmitted = true;
   const line = JSON.stringify(payload) + '\n';
   process.exitCode = status;
   process.stdout.write(line, () => {
@@ -2253,7 +2256,7 @@ async function readElements() {
   return elements;
 }
 
-async function readState() {
+async function readNavigationIdentity() {
   const frameTree = await call('Page.getFrameTree');
   const mainFrame = frameTree.frameTree && frameTree.frameTree.frame
     ? frameTree.frameTree.frame : null;
@@ -2270,6 +2273,15 @@ async function readState() {
     (typeof currentEntry.id === 'number' || typeof currentEntry.id === 'string')
     ? String(currentEntry.id) : null;
   if (!navigationEntryId) throw new Error('protocol');
+  return {
+    main_frame_id: mainFrameId,
+    loader_id: loaderId,
+    navigation_entry_id: navigationEntryId,
+  };
+}
+
+async function readState() {
+  const identity = await readNavigationIdentity();
   const stateResponse = await call('Runtime.evaluate', {
     expression: `({
       origin: location.origin,
@@ -2286,9 +2298,9 @@ async function readState() {
     origin: state.origin,
     ready_state: String(state.ready_state || ''),
     title: String(state.title || ''),
-    main_frame_id: mainFrameId,
-    loader_id: loaderId,
-    navigation_entry_id: navigationEntryId,
+    main_frame_id: identity.main_frame_id,
+    loader_id: identity.loader_id,
+    navigation_entry_id: identity.navigation_entry_id,
     elements: await readElements(),
   };
 }
@@ -2387,34 +2399,49 @@ try {
       ? navigation.loaderId : null;
     if (!acknowledgedFrameId) throw new Error('navigation-uncorrelated');
     const deadline = Date.now() + request.timeout_ms;
+    let correlation = null;
+    let correlatedState = null;
     while (Date.now() <= deadline) {
-      const state = await readState();
-      const changed = !sameState(before, state);
-      const newDocument = Boolean(
-        acknowledgedLoaderId && changed &&
-        state.main_frame_id === acknowledgedFrameId &&
-        state.loader_id === acknowledgedLoaderId
+      // Gate the expensive full observation on the cheap navigation identity;
+      // the authoritative predicate below still runs against a fresh readState.
+      const identity = await readNavigationIdentity();
+      const identityCorrelated = identity.main_frame_id === acknowledgedFrameId && (
+        acknowledgedLoaderId
+          ? identity.loader_id === acknowledgedLoaderId
+          : identity.navigation_entry_id !== before.navigation_entry_id
       );
-      const sameDocument = Boolean(
-        !acknowledgedLoaderId && changed &&
-        state.main_frame_id === acknowledgedFrameId &&
-        state.navigation_entry_id !== before.navigation_entry_id &&
-        sameDocumentNavigations.some((entry) =>
-          entry.frame_id === acknowledgedFrameId
-        )
-      );
-      if (newDocument || sameDocument) {
-        emit({
-          schema_version: 1,
-          ok: true,
-          result_code: 'ok',
-          state,
-          navigation_correlation: newDocument ? 'new-document' : 'same-document',
-        }, 0);
+      if (identityCorrelated) {
+        const state = await readState();
+        const changed = !sameState(before, state);
+        const newDocument = Boolean(
+          acknowledgedLoaderId && changed &&
+          state.main_frame_id === acknowledgedFrameId &&
+          state.loader_id === acknowledgedLoaderId
+        );
+        const sameDocument = Boolean(
+          !acknowledgedLoaderId && changed &&
+          state.main_frame_id === acknowledgedFrameId &&
+          state.navigation_entry_id !== before.navigation_entry_id &&
+          sameDocumentNavigations.some((entry) =>
+            entry.frame_id === acknowledgedFrameId
+          )
+        );
+        if (newDocument || sameDocument) {
+          correlation = newDocument ? 'new-document' : 'same-document';
+          correlatedState = state;
+          break;
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    throw new Error('navigation-uncorrelated');
+    if (!correlation) throw new Error('navigation-uncorrelated');
+    emit({
+      schema_version: 1,
+      ok: true,
+      result_code: 'ok',
+      state: correlatedState,
+      navigation_correlation: correlation,
+    }, 0);
   } else if (request.op === 'scroll_into_view') {
     const before = await readState();
     if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
