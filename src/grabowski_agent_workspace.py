@@ -25,6 +25,7 @@ import grabowski_checkouts as checkouts
 import grabowski_work_admission as work_admission
 import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
+import grabowski_work_acquire as work_acquire
 from grabowski_agent_sandbox import safe_git_environment
 try:
     import grabowski_operator_core as operator
@@ -126,6 +127,8 @@ ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "antigravity", "opencode", "openhan
 LEGACY_ROUTE_EXTERNAL_AGENTS_V21 = frozenset({"claude", "agy"})
 LEGACY_ROUTE_POLICY_VERSION_V21 = "workspace-routing-v2.1"
 ROUTE_POLICY_VERSION = "direct-first-routing-v3.0"
+WORKSPACE_OWNERSHIP_LEGACY = "workspace"
+WORKSPACE_OWNERSHIP_WORK_LANE = "work_lane"
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 BindingVerifier = Callable[[str, str], dict[str, Any]]
 
@@ -1488,6 +1491,276 @@ def _git_head(runner: CommandRunner, repo: Path) -> str:
     return head
 
 
+def _workspace_ownership_mode(manifest: dict[str, Any]) -> str:
+    value = manifest.get("resources")
+    if not isinstance(value, dict):
+        return WORKSPACE_OWNERSHIP_LEGACY
+    mode = value.get("ownership_mode", WORKSPACE_OWNERSHIP_LEGACY)
+    return mode if isinstance(mode, str) else WORKSPACE_OWNERSHIP_LEGACY
+
+
+def _lane_backed(manifest: dict[str, Any]) -> bool:
+    return _workspace_ownership_mode(manifest) == WORKSPACE_OWNERSHIP_WORK_LANE
+
+
+def _lane_receipt(lane_id: str, expected_receipt_sha256: str) -> dict[str, Any]:
+    identifier = _required_string(lane_id, "lane_id", max_length=32).lower()
+    expected = _required_string(
+        expected_receipt_sha256,
+        "expected_lane_receipt_sha256",
+        max_length=64,
+    ).lower()
+    if re.fullmatch(r"[0-9a-f]{32}", identifier) is None:
+        raise AgentWorkspaceError("lane_id must be a lowercase 32-character hex identity")
+    if SHA256_RE.fullmatch(expected) is None:
+        raise AgentWorkspaceError("expected_lane_receipt_sha256 must be a lowercase SHA-256")
+    try:
+        with work_acquire._lane_lock(identifier) as receipt_path:
+            receipt = work_acquire._read_state(receipt_path)
+    except Exception as exc:
+        raise AgentWorkspaceError(f"work lane receipt is not safely readable: {_error_summary(exc)}") from exc
+    if receipt is None or receipt.get("lane_id") != identifier:
+        raise AgentWorkspaceError("work lane receipt is missing or bound to another lane")
+    if receipt.get("receipt_sha256") != expected:
+        raise AgentWorkspaceError("work lane receipt digest drifted from the expected binding")
+    if receipt.get("state") != "ready":
+        raise AgentWorkspaceError("work lane is not ready")
+    if receipt.get("terminal_closeout") is not None:
+        raise AgentWorkspaceError("work lane already has terminal closeout state")
+    return receipt
+
+
+def _lane_write_scope(inputs: dict[str, Any], repo: Path, worktree: Path) -> list[str]:
+    raw_keys = inputs.get("resource_keys")
+    if not isinstance(raw_keys, list) or any(not isinstance(key, str) for key in raw_keys):
+        raise AgentWorkspaceError("work lane resource scope is invalid")
+    try:
+        keys = resources.normalize_resource_keys(raw_keys)
+    except Exception as exc:
+        raise AgentWorkspaceError(f"work lane resource scope is invalid: {_error_summary(exc)}") from exc
+    repo_prefix = f"path:{repo}{os.sep}"
+    worktree_key = f"path:{worktree}"
+    relative: list[str] = []
+    for key in keys:
+        if key == worktree_key or not key.startswith(repo_prefix):
+            continue
+        candidate = Path(key[len("path:"):])
+        try:
+            relative.append(candidate.relative_to(repo).as_posix())
+        except ValueError as exc:
+            raise AgentWorkspaceError("work lane write scope escapes the repository") from exc
+    return _scope_list(relative, "work lane write scope", nonempty=True)
+
+
+def _validate_work_lane_binding(
+    *,
+    lane_id: str,
+    expected_receipt_sha256: str,
+    binding_kind: str,
+    binding_id: str,
+    repository: Path,
+    expected_base_head: str,
+    writer_branch: str,
+    writer_worktree: Path,
+    allowed_paths: list[str],
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    receipt = _lane_receipt(lane_id, expected_receipt_sha256)
+    inputs = receipt.get("inputs")
+    authority = receipt.get("authority")
+    if not isinstance(inputs, dict) or receipt.get("inputs_sha256") != work_acquire._sha(inputs):
+        raise AgentWorkspaceError("work lane input integrity is invalid")
+    lane_identity = {
+        key: value
+        for key, value in inputs.items()
+        if key not in {"lane_id", "lease_owner_id", "ttl_seconds"}
+    }
+    if (
+        inputs.get("lane_id") != lane_id
+        or inputs.get("lease_owner_id") != f"lane:{lane_id}"
+        or work_acquire._sha(lane_identity)[:32] != lane_id
+    ):
+        raise AgentWorkspaceError("work lane identity digest is invalid")
+    if not isinstance(authority, dict):
+        raise AgentWorkspaceError("work lane authority is missing")
+    source = inputs.get("source")
+    scoped_writer = inputs.get("scoped_writer")
+    if (
+        not isinstance(source, dict)
+        or source.get("kind") != binding_kind
+        or source.get("id") != binding_id
+    ):
+        raise AgentWorkspaceError("workspace binding does not match work lane source authority")
+    if (
+        not isinstance(scoped_writer, dict)
+        or not isinstance(scoped_writer.get("actor"), str)
+        or not scoped_writer.get("actor")
+        or scoped_writer.get("role") != "scoped_writer"
+        or authority.get("scoped_writer") != scoped_writer
+        or authority.get("source") != source
+    ):
+        raise AgentWorkspaceError("work lane scoped-writer authority is invalid")
+    lane_owner = f"lane:{lane_id}"
+    expected_identity = {
+        "repo": str(repository),
+        "base_head": expected_base_head,
+        "branch": writer_branch,
+        "target_path": str(writer_worktree),
+        "lease_owner_id": lane_owner,
+    }
+    for field, expected in expected_identity.items():
+        if inputs.get(field) != expected:
+            raise AgentWorkspaceError(f"workspace {field} does not match work lane authority")
+    lane_scope = _lane_write_scope(inputs, repository, writer_worktree)
+    if lane_scope != allowed_paths:
+        raise AgentWorkspaceError("workspace allowed_paths do not exactly match work lane write scope")
+    raw_keys = inputs.get("resource_keys")
+    assert isinstance(raw_keys, list)
+    lease_keys = resources.normalize_resource_keys(raw_keys)
+    observed_at = _now()
+    for key in lease_keys:
+        try:
+            lease = resources.inspect_resource(key)
+        except Exception as exc:
+            raise AgentWorkspaceError(f"work lane lease is not observable: {key}: {_error_summary(exc)}") from exc
+        if (
+            not isinstance(lease, dict)
+            or lease.get("owner_id") != lane_owner
+            or not isinstance(lease.get("expires_at_unix"), int)
+            or isinstance(lease.get("expires_at_unix"), bool)
+            or int(lease["expires_at_unix"]) <= observed_at
+        ):
+            raise AgentWorkspaceError(f"work lane lease is not live and exactly owned: {key}")
+    worktree_receipt = receipt.get("worktree_receipt")
+    if not isinstance(worktree_receipt, dict) or worktree_receipt.get("result_state") not in {"CREATED", "ALREADY_CORRECT"}:
+        raise AgentWorkspaceError("work lane has no successful checkout receipt")
+    post_state = worktree_receipt.get("post_state")
+    if (
+        not isinstance(post_state, dict)
+        or post_state.get("repo") != str(repository)
+        or post_state.get("target_path") != str(writer_worktree)
+        or post_state.get("requested_head") != expected_base_head
+        or post_state.get("requested_branch") != writer_branch
+        or post_state.get("target_registered") is not True
+        or post_state.get("matches_requested_state") is not True
+    ):
+        raise AgentWorkspaceError("work lane checkout receipt does not match the requested workspace")
+    admission = worktree_receipt.get("work_admission")
+    if (
+        not work_admission.has_verified_isolation_evidence(admission)
+        or not isinstance(admission, dict)
+        or admission.get("owner_id") != lane_owner
+        or admission.get("repository") != str(repository)
+        or admission.get("branch") != writer_branch
+        or admission.get("target_path") != str(writer_worktree)
+    ):
+        raise AgentWorkspaceError("work lane repository admission is missing or mismatched")
+    lifecycle = worktree_receipt.get("lifecycle")
+    if (
+        not isinstance(lifecycle, dict)
+        or lifecycle.get("owner_id") != lane_owner
+        or lifecycle.get("checkout_path") != str(writer_worktree)
+        or lifecycle.get("expected_head") != expected_base_head
+        or lifecycle.get("expected_branch") != writer_branch
+        or lifecycle.get("automatic_cleanup_authorized") is not False
+        or not isinstance(lifecycle.get("checkout_key"), str)
+    ):
+        raise AgentWorkspaceError("work lane checkout lifecycle is missing or mismatched")
+    try:
+        top_level, _common_dir, checkout = checkouts._worktree_for_path(
+            checkouts._resolve_repo(repository), writer_worktree
+        )
+        checkouts._require_linked(checkout)
+        live_lifecycle = checkouts._lifecycle_bindings(
+            [str(lifecycle["checkout_key"])]
+        ).get(str(lifecycle["checkout_key"]))
+    except Exception as exc:
+        raise AgentWorkspaceError(f"work lane checkout is not safely observable: {_error_summary(exc)}") from exc
+    if (
+        top_level != repository
+        or checkout.get("checkout_key") != lifecycle.get("checkout_key")
+        or checkout.get("head") != expected_base_head
+        or checkout.get("branch") != writer_branch
+    ):
+        raise AgentWorkspaceError("live work lane checkout drifted from its receipt")
+    if (
+        not isinstance(live_lifecycle, dict)
+        or live_lifecycle.get("owner_id") != lane_owner
+        or live_lifecycle.get("checkout_path") != str(writer_worktree)
+        or live_lifecycle.get("expected_head") != expected_base_head
+        or live_lifecycle.get("expected_branch") != writer_branch
+        or live_lifecycle.get("phase") != "active"
+        or int(live_lifecycle.get("retention_until_unix") or 0) <= observed_at
+    ):
+        raise AgentWorkspaceError("live work lane checkout lifecycle drifted from its receipt")
+    binding = {
+        "schema_version": 1,
+        "lane_id": lane_id,
+        "receipt_sha256": expected_receipt_sha256,
+        "inputs_sha256": receipt["inputs_sha256"],
+        "lease_owner_id": lane_owner,
+        "lease_keys": lease_keys,
+        "write_paths": lane_scope,
+        "source": source,
+        "scoped_writer": scoped_writer,
+        "repository_admission_sha256": admission.get("assessment_sha256"),
+        "repository_admission": admission,
+        "checkout_lifecycle": lifecycle,
+    }
+    binding["binding_sha256"] = _sha256_json(binding)
+    return binding
+
+
+def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
+    if not _lane_backed(manifest):
+        return {"mode": WORKSPACE_OWNERSHIP_LEGACY, "required": False, "valid": True}
+    resources_value = manifest.get("resources")
+    lane_binding = resources_value.get("lane_binding") if isinstance(resources_value, dict) else None
+    if not isinstance(lane_binding, dict):
+        return {"mode": WORKSPACE_OWNERSHIP_WORK_LANE, "required": True, "valid": False, "error": "lane_binding_missing"}
+    try:
+        observed = _validate_work_lane_binding(
+            lane_id=str(lane_binding.get("lane_id", "")),
+            expected_receipt_sha256=str(lane_binding.get("receipt_sha256", "")),
+            binding_kind=str(manifest.get("binding", {}).get("kind", "")),
+            binding_id=str(manifest.get("binding", {}).get("id", "")),
+            repository=Path(str(manifest.get("repository", ""))),
+            expected_base_head=str(manifest.get("expected_base_head", "")),
+            writer_branch=str(manifest.get("writer_branch", "")),
+            writer_worktree=Path(str(manifest.get("writer_worktree", ""))),
+            allowed_paths=list(manifest.get("scope", {}).get("allowed_paths", [])),
+            runner=runner,
+        )
+        if observed != lane_binding:
+            raise AgentWorkspaceError("live work lane binding differs from immutable workspace binding")
+    except Exception as exc:
+        return {
+            "mode": WORKSPACE_OWNERSHIP_WORK_LANE,
+            "required": True,
+            "valid": False,
+            "lane_id": lane_binding.get("lane_id"),
+            "receipt_sha256": lane_binding.get("receipt_sha256"),
+            "error": _error_summary(exc),
+        }
+    return {
+        "mode": WORKSPACE_OWNERSHIP_WORK_LANE,
+        "required": True,
+        "valid": True,
+        "lane_id": observed["lane_id"],
+        "receipt_sha256": observed["receipt_sha256"],
+        "binding_sha256": observed["binding_sha256"],
+        "lease_owner_id": observed["lease_owner_id"],
+        "checkout_key": observed["checkout_lifecycle"]["checkout_key"],
+    }
+
+
+def _require_live_lane_binding(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
+    status = _lane_binding_status(manifest, runner)
+    if status.get("valid") is not True:
+        raise AgentWorkspaceError(f"work lane binding is not live and exact: {status.get('error')}")
+    return status
+
+
 def _slug(value: str, *, limit: int = 24) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return (normalized or "workspace")[:limit].rstrip("-")
@@ -1502,6 +1775,20 @@ def _workspace_identity(binding_kind: str, binding_id: str, repo: Path, base_hea
         workspace_id = f"gaw-{_slug(repo.name, limit=18)}-{digest}"
     if WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
         raise AgentWorkspaceError("could not derive a valid workspace id")
+    return workspace_id, workspace_id
+
+
+def _lane_workspace_identity(binding_id: str, repo: Path, lane_id: str) -> tuple[str, str]:
+    identifier = _required_string(lane_id, "lane_id", max_length=32).lower()
+    if re.fullmatch(r"[0-9a-f]{32}", identifier) is None:
+        raise AgentWorkspaceError("lane_id must be a lowercase 32-character hex identity")
+    workspace_id = (
+        f"gaw-{_slug(repo.name, limit=18)}-{_slug(binding_id, limit=22)}-{identifier}"
+    )
+    if len(workspace_id) > 80:
+        workspace_id = f"gaw-{_slug(repo.name, limit=18)}-{identifier}"
+    if WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
+        raise AgentWorkspaceError("could not derive a valid lane-backed workspace id")
     return workspace_id, workspace_id
 
 
@@ -2122,15 +2409,29 @@ def _normalize_create(
     runner: CommandRunner,
     binding_verifier: BindingVerifier | None = None,
     route_evidence: dict[str, Any] | None = None,
+    lane_id: str | None = None,
+    expected_lane_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
+    lane_mode = lane_id is not None or expected_lane_receipt_sha256 is not None
+    if lane_mode and (
+        not isinstance(lane_id, str)
+        or not isinstance(expected_lane_receipt_sha256, str)
+    ):
+        raise AgentWorkspaceError(
+            "lane-backed workspace requires lane_id and expected_lane_receipt_sha256 together"
+        )
     kind = _required_string(binding_kind, "binding_kind", max_length=32)
-    if kind not in BINDING_KINDS:
+    if not lane_mode and kind not in BINDING_KINDS:
         raise AgentWorkspaceError(f"binding_kind must be one of {sorted(BINDING_KINDS)}")
     binding = _required_string(binding_id, "binding_id", max_length=256)
-    verifier = _verify_bureau_binding if binding_verifier is None else binding_verifier
-    binding_evidence = verifier(kind, binding)
-    if not isinstance(binding_evidence, dict) or binding_evidence.get("id") != binding:
-        raise AgentWorkspaceError("Bureau binding verifier returned mismatched evidence")
+    binding_evidence: dict[str, Any]
+    if lane_mode:
+        binding_evidence = {}
+    else:
+        verifier = _verify_bureau_binding if binding_verifier is None else binding_verifier
+        binding_evidence = verifier(kind, binding)
+        if not isinstance(binding_evidence, dict) or binding_evidence.get("id") != binding:
+            raise AgentWorkspaceError("Bureau binding verifier returned mismatched evidence")
     repo = _absolute_path(repository, "repository", must_exist=True)
     if _repo_top(runner, repo) != repo:
         raise AgentWorkspaceError("repository must be the canonical checkout root")
@@ -2186,14 +2487,46 @@ def _normalize_create(
     memory = None if memory_max_bytes is None else _positive_int(
         memory_max_bytes, "memory_max_bytes", 16 * 1024 * 1024, 1024**4
     )
-    workspace_id, session = _workspace_identity(kind, binding, repo, base_head)
+    lane_binding: dict[str, Any] | None = None
+    if lane_mode:
+        assert isinstance(lane_id, str)
+        assert isinstance(expected_lane_receipt_sha256, str)
+        lane_binding = _validate_work_lane_binding(
+            lane_id=lane_id,
+            expected_receipt_sha256=expected_lane_receipt_sha256,
+            binding_kind=kind,
+            binding_id=binding,
+            repository=repo,
+            expected_base_head=base_head,
+            writer_branch=branch,
+            writer_worktree=worktree,
+            allowed_paths=allowed,
+            runner=runner,
+        )
+        binding_evidence = {
+            "source": "work-lane-receipt",
+            "kind": kind,
+            "id": binding,
+            "lane_id": lane_binding["lane_id"],
+            "lane_receipt_sha256": lane_binding["receipt_sha256"],
+            "evidence_sha256": lane_binding["binding_sha256"],
+        }
+    workspace_id, session = (
+        _lane_workspace_identity(binding, repo, lane_binding["lane_id"])
+        if lane_binding is not None
+        else _workspace_identity(kind, binding, repo, base_head)
+    )
     repo_hash = hashlib.sha256(str(repo).encode("utf-8")).hexdigest()[:20]
-    lease_keys = resources.normalize_resource_keys(
-        [
-            f"path:{worktree}",
-            f"service:agent-workspace-{workspace_id}",
-            f"service:repo-writer-{repo_hash}",
-        ]
+    lease_keys = (
+        list(lane_binding["lease_keys"])
+        if lane_binding is not None
+        else resources.normalize_resource_keys(
+            [
+                f"path:{worktree}",
+                f"service:agent-workspace-{workspace_id}",
+                f"service:repo-writer-{repo_hash}",
+            ]
+        )
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2216,7 +2549,11 @@ def _normalize_create(
             "writer": {
                 "access": "write_worktree",
                 "merge_authority": False,
-                "authority": "advisory_contrast_only",
+                "authority": (
+                    "lane_scoped_writer"
+                    if lane_binding is not None
+                    else "advisory_contrast_only"
+                ),
             },
             "tests": {"access": "read_only", "merge_authority": False},
             "review": {"access": "read_only", "merge_authority": False},
@@ -2225,23 +2562,48 @@ def _normalize_create(
             "operator_may_coordinate_all_roles": True,
             "single_unisolated_agent_may_not_substitute_for_all_roles": True,
             "captain": "operator_control_plane",
-            "writer": "isolated_advisory_contrast_execution",
-            "authoritative_writer": "chatgpt_operator",
-            "external_agent_authority": "advisory_only",
-            "direct_implementation_required": True,
+            "writer": (
+                "lane_scoped_writer_execution"
+                if lane_binding is not None
+                else "isolated_advisory_contrast_execution"
+            ),
+            "authoritative_writer": (
+                lane_binding["scoped_writer"]["actor"]
+                if lane_binding is not None
+                else "chatgpt_operator"
+            ),
+            "external_agent_authority": (
+                "lane_scoped"
+                if lane_binding is not None
+                else "advisory_only"
+            ),
+            "direct_implementation_required": lane_binding is None,
             "tests": "deterministic_read_only_validation",
             "review": "independently_bound_read_only_review",
             "observer": "optional_read_only_process_analysis",
             "reason": "coordination may be unified, but write, validation and review evidence remain technically isolated to avoid self-confirming success",
         },
         "route_evidence": _normalize_route_evidence(route_evidence),
-        "resources": {
-            "owner_id": f"agent-workspace:{workspace_id}",
-            "lease_keys": lease_keys,
-            "runtime_seconds": runtime,
-            "memory_max_bytes": memory,
-            "task_host": AGENT_WORKSPACE_TASK_HOST,
-        },
+        "resources": (
+            {
+                "ownership_mode": WORKSPACE_OWNERSHIP_WORK_LANE,
+                "owner_id": lane_binding["lease_owner_id"],
+                "lease_keys": lease_keys,
+                "workspace_owned_lease_keys": [],
+                "lane_binding": lane_binding,
+                "runtime_seconds": runtime,
+                "memory_max_bytes": memory,
+                "task_host": AGENT_WORKSPACE_TASK_HOST,
+            }
+            if lane_binding is not None
+            else {
+                "owner_id": f"agent-workspace:{workspace_id}",
+                "lease_keys": lease_keys,
+                "runtime_seconds": runtime,
+                "memory_max_bytes": memory,
+                "task_host": AGENT_WORKSPACE_TASK_HOST,
+            }
+        ),
     }
 
 
@@ -2577,6 +2939,10 @@ def _writer_handoff_eligibility(
 ) -> dict[str, Any]:
     attempts = _writer_attempts(manifest)
     reasons = _writer_task_binding_reasons(manifest, attempts[-1], writer)
+    if _lane_backed(manifest):
+        lane_status = _lane_binding_status(manifest)
+        if lane_status.get("valid") is not True:
+            reasons.append("work_lane_binding_invalid")
     if len(attempts) - 1 >= MAX_WRITER_HANDOFFS:
         reasons.append("handoff_limit_reached")
     if manifest.get("creation_state") != "ready":
@@ -3275,6 +3641,7 @@ def _collection_integrity_status(
         "hash_valid": False,
         "receipt_present": False,
         "receipt_matches_manifest": False,
+        "resource_close_contract_satisfied": False,
     }
     if not isinstance(collection, dict):
         return result
@@ -3389,11 +3756,19 @@ def _close_integrity_status(manifest: dict[str, Any], receipt: Any) -> dict[str,
         return result
     result["receipt_present"] = True
     result["receipt_matches_manifest"] = stored == receipt
+    result["resource_close_contract_satisfied"] = _resource_close_contract_satisfied(
+        manifest, receipt
+    )
+    integrity_requires_resource_contract = _lane_backed(manifest)
     legacy_absence = _legacy_absence_receipt_status(manifest, receipt)
     result["legacy_absence_receipt"] = legacy_absence
     result["valid"] = bool(
         result["hash_valid"]
         and result["receipt_matches_manifest"]
+        and (
+            result["resource_close_contract_satisfied"]
+            or not integrity_requires_resource_contract
+        )
         and legacy_absence["valid"]
     )
     return result
@@ -3688,11 +4063,9 @@ def _external_closeout_checklist(manifest: dict[str, Any]) -> list[dict[str, Any
         isinstance(close_receipt, dict)
         and _close_integrity_status(manifest, close_receipt)["valid"]
     )
-    lease_verified = bool(
+    resource_close_verified = bool(
         close_valid
-        and close_receipt.get("state") == "complete"
-        and close_receipt.get("resources_released") is True
-        and not close_receipt.get("remaining_resource_keys")
+        and _resource_close_contract_satisfied(manifest, close_receipt)
     )
     checkout_decision = (
         close_receipt.get("checkout_lifecycle_decision")
@@ -3704,7 +4077,13 @@ def _external_closeout_checklist(manifest: dict[str, Any]) -> list[dict[str, Any
         and isinstance(checkout_decision, dict)
         and checkout_decision.get("automatic_cleanup_authorized") is False
         and checkout_decision.get("selected_action")
-        in {"retain", "register_or_retain", "archive", "cleanup_dry_run"}
+        in {
+            "retain",
+            "register_or_retain",
+            "archive",
+            "cleanup_dry_run",
+            "preserve_lane_owned",
+        }
     )
     return [
         {
@@ -3729,17 +4108,20 @@ def _external_closeout_checklist(manifest: dict[str, Any]) -> list[dict[str, Any
         {
             "item": "workspace_lease_release",
             "description": (
-                "Release this workspace's resource leases via close, or verify manual release; "
-                "leases block conflicting writers until released."
+                "Preserve Work Lane leases when lane-backed; otherwise release this workspace's "
+                "own leases. Either mode must be proven by the close receipt."
             ),
-            "status": "verified" if lease_verified else "unknown",
+            "status": "verified" if resource_close_verified else "unknown",
             "source_of_truth": "grabowski_resources",
             "evidence": (
                 {
                     "close_receipt_sha256": close_receipt.get("receipt_sha256"),
-                    "resources_released": True,
+                    "resources_released": close_receipt.get("resources_released"),
+                    "lane_resources_preserved": close_receipt.get(
+                        "lane_resources_preserved"
+                    ),
                 }
-                if lease_verified
+                if resource_close_verified
                 else None
             ),
         },
@@ -3953,6 +4335,26 @@ def _known_workspace_tool_calls(manifest: dict[str, Any], phase: str) -> dict[st
 
 
 def _route_gate(manifest: dict[str, Any]) -> tuple[dict[str, Any], bool, bool]:
+    if _lane_backed(manifest):
+        lane_binding = manifest.get("resources", {}).get("lane_binding", {})
+        return (
+            {
+                "schema_version": 1,
+                "status": "work_lane_authority",
+                "recommendation_id": None,
+                "score": None,
+                "recommended_route": None,
+                "actual_route": "lane_backed_workspace",
+                "input_facts": None,
+                "external_candidates": [],
+                "deviation_reason": None,
+                "evidence_complete": True,
+                "lane_id": lane_binding.get("lane_id"),
+                "lane_receipt_sha256": lane_binding.get("receipt_sha256"),
+            },
+            True,
+            False,
+        )
     if "route_evidence" not in manifest:
         return (
             {
@@ -4044,6 +4446,12 @@ def _publish_workspace_outcome(
         "outcome_identity": _outcome_identity(manifest, phase),
         "recorded_at": recorded_at,
         "binding": manifest.get("binding"),
+        "ownership_mode": _workspace_ownership_mode(manifest),
+        "lane_binding": (
+            manifest.get("resources", {}).get("lane_binding")
+            if _lane_backed(manifest)
+            else None
+        ),
         "route_evidence": route_evidence,
         "route_legacy_compatibility": legacy_route,
         "first_pass_role_results": first_pass,
@@ -4058,7 +4466,9 @@ def _publish_workspace_outcome(
         "tool_calls": _known_workspace_tool_calls(manifest, phase),
         "frozen_result_identity": frozen_identity,
         "integration_or_salvage_outcome": (
-            "workspace_closed_patch_preserved_external_truth_pending"
+            "workspace_closed_lane_resources_preserved_external_truth_pending"
+            if phase == "close" and _lane_backed(manifest)
+            else "workspace_closed_patch_preserved_external_truth_pending"
             if phase == "close"
             else "collection_complete_external_truth_pending"
         ),
@@ -4219,9 +4629,7 @@ def _bind_workspace_execution_outcome(
     close_integrity = _close_integrity_status(manifest, close_receipt)
     if (
         not isinstance(close_receipt, dict)
-        or close_receipt.get("state") != "complete"
-        or close_receipt.get("resources_released") is not True
-        or close_receipt.get("remaining_resource_keys") != []
+        or not _resource_close_contract_satisfied(manifest, close_receipt)
         or close_integrity.get("valid") is not True
     ):
         raise AgentWorkspaceActionError(
@@ -4237,6 +4645,16 @@ def _bind_workspace_execution_outcome(
         or _sha256_json(unsigned_outcome) != workspace_outcome_sha256
     ):
         raise AgentWorkspaceActionError("workspace outcome hash is invalid")
+    if _lane_backed(manifest):
+        return {
+            "schema_version": 1,
+            "kind": "agent_workspace_execution_outcome_binding",
+            "workspace_id": manifest["workspace_id"],
+            "phase": "close",
+            "state": "not_applicable_lane_backed",
+            "recorded": False,
+            "does_not_establish": ["execution governor outcome", "learning"],
+        }
     route = outcome.get("route_evidence")
     if not isinstance(route, dict):
         raise AgentWorkspaceError("workspace route evidence is unavailable")
@@ -4506,7 +4924,11 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         and collection.get("writer_head") == snapshot.get("writer_head")
         and collection.get("diff_sha256") == snapshot.get("diff_sha256")
     )
-    creation_ready = manifest.get("creation_state") == "ready"
+    lane_binding_status = _lane_binding_status(manifest, runner)
+    creation_ready = bool(
+        manifest.get("creation_state") == "ready"
+        and lane_binding_status.get("valid") is True
+    )
     route_evidence, route_gate_passed, legacy_route = _route_gate(manifest)
     incomplete_roles = _collection_incomplete_roles(collection) if collection_complete else []
     closeable = bool(
@@ -4578,6 +5000,8 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "creation_state": manifest.get("creation_state"),
         "creation_ready": creation_ready,
         "binding": manifest["binding"],
+        "ownership_mode": _workspace_ownership_mode(manifest),
+        "lane_binding_status": lane_binding_status,
         "route_evidence": route_evidence,
         "route_evidence_complete": route_gate_passed,
         "route_legacy_compatibility": legacy_route,
@@ -4918,6 +5342,79 @@ def _terminal_writer_checkout_decision(
     }
 
 
+def _lane_owned_checkout_decision(
+    manifest: dict[str, Any], snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    lane_status = _require_live_lane_binding(manifest, _run)
+    lifecycle = manifest.get("checkout_lifecycle")
+    if not isinstance(lifecycle, dict):
+        raise AgentWorkspaceError("lane-backed workspace checkout lifecycle is missing")
+    return {
+        "schema_version": 1,
+        "state": "lane_ownership_preserved",
+        "selected_action": "preserve_lane_owned",
+        "reason": "workspace close cannot alter the Work Lane checkout lifecycle",
+        "checkout_key": lifecycle.get("checkout_key"),
+        "checkout_path": lifecycle.get("checkout_path"),
+        "owner_id": lifecycle.get("owner_id"),
+        "lane_id": lane_status.get("lane_id"),
+        "lane_receipt_sha256": lane_status.get("receipt_sha256"),
+        "source": lifecycle.get("source"),
+        "artifact_class": lifecycle.get("artifact_class"),
+        "lifecycle_phase": "active",
+        "task": lifecycle.get("task"),
+        "purpose": lifecycle.get("purpose"),
+        "created_at_unix": lifecycle.get("created_at_unix"),
+        "expires_at_unix": lifecycle.get("expires_at_unix"),
+        "expected_head": lifecycle.get("expected_head"),
+        "expected_branch": lifecycle.get("expected_branch"),
+        "observed_head": snapshot.get("writer_head"),
+        "observed_dirty": snapshot.get("dirty"),
+        "ownership_satisfied": True,
+        "next_action": "continue_lifecycle_only_through_work_lane_closeout",
+        "automatic_cleanup_authorized": False,
+        "does_not_establish": [
+            "permission_to_release_lane_resources",
+            "permission_to_delete_checkout",
+            "pull_request_integration_truth",
+            "bureau_task_completion",
+        ],
+    }
+
+
+def _resource_close_contract_satisfied(
+    manifest: dict[str, Any], close_receipt: Any
+) -> bool:
+    if not isinstance(close_receipt, dict) or close_receipt.get("state") != "complete":
+        return False
+    remaining = close_receipt.get("remaining_resource_keys")
+    if _lane_backed(manifest):
+        resources_value = manifest.get("resources")
+        expected = (
+            sorted(resources_value.get("lease_keys", []))
+            if isinstance(resources_value, dict)
+            and isinstance(resources_value.get("lease_keys"), list)
+            else None
+        )
+        decision = close_receipt.get("checkout_lifecycle_decision")
+        return bool(
+            expected is not None
+            and close_receipt.get("resources_released") is False
+            and close_receipt.get("lane_resources_preserved") is True
+            and close_receipt.get("workspace_resources_owned") is False
+            and close_receipt.get("released_resource_keys") == []
+            and remaining == expected
+            and isinstance(decision, dict)
+            and decision.get("selected_action") == "preserve_lane_owned"
+            and decision.get("ownership_satisfied") is True
+            and decision.get("owner_id") == resources_value.get("owner_id")
+        )
+    return bool(
+        close_receipt.get("resources_released") is True
+        and remaining == []
+    )
+
+
 def _validate_new_workspace_collisions(plan: dict[str, Any], runner: CommandRunner) -> None:
     worktree = Path(str(plan["writer_worktree"]))
     if worktree.exists():
@@ -5078,6 +5575,7 @@ def _existing_workspace_response(
     expected_pane_ids = set(manifest["pane_ids"].values())
     expected_writer_task_id = str(manifest["tasks"]["writer"])
     try:
+        lane_status = _lane_binding_status(manifest, _run)
         live_leases = resources.list_resources(owner_id=owner_id, include_expired=False, limit=MAX_PATHS + 8)
         observed_lease_keys = {str(item.get("resource_key")) for item in live_leases}
         tmux_live = _tmux_has_session(str(plan["session_name"]))
@@ -5094,6 +5592,8 @@ def _existing_workspace_response(
             "receipt_status": "blocked",
         }
     runtime_errors: list[str] = []
+    if lane_status.get("valid") is not True:
+        runtime_errors.append("work_lane_binding_invalid")
     if not expected_lease_keys.issubset(observed_lease_keys):
         runtime_errors.append("workspace_lease_missing")
     if not tmux_live:
@@ -5123,6 +5623,7 @@ def _existing_workspace_response(
             "writer_task": writer_task,
             "writer_identity": writer_identity,
             "live_lease_keys": sorted(observed_lease_keys),
+            "lane_binding_status": lane_status,
             "tmux_live": tmux_live,
             "observed_pane_ids": sorted(observed_pane_ids),
             "idempotent": False,
@@ -5134,6 +5635,7 @@ def _existing_workspace_response(
         "writer_task": writer_task,
         "writer_identity": writer_identity,
         "live_lease_keys": sorted(observed_lease_keys),
+        "lane_binding_status": lane_status,
         "tmux_live": True,
         "observed_pane_ids": sorted(observed_pane_ids),
         "idempotent": True,
@@ -5236,26 +5738,45 @@ def grabowski_agent_workspace_create(
     forbidden_paths: list[str] | None = None,
     runtime_seconds: int = 3600,
     memory_max_bytes: int | None = None,
+    lane_id: str | None = None,
+    expected_lane_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Create one explicit advisory contrast workspace; direct work stays authoritative."""
-    if not isinstance(route_evidence, dict) or route_evidence.get("schema_version") != 2:
-        raise AgentWorkspaceError(
-            "direct-first workspace creation requires schema-v2 advisory route evidence"
-        )
-    normalized_route = _normalize_route_evidence(route_evidence)
-    if (
-        normalized_route.get("status") != "verified"
-        or normalized_route.get("route_policy_version") != ROUTE_POLICY_VERSION
-        or normalized_route.get("actual_route")
-        not in {"workspace_with_contrast", "workspace_with_competition"}
-    ):
-        raise AgentWorkspaceError(
-            "direct-first workspace creation requires verified advisory contrast evidence"
-        )
+    lane_mode = lane_id is not None or expected_lane_receipt_sha256 is not None
+    if lane_mode:
+        if (
+            not isinstance(lane_id, str)
+            or not isinstance(expected_lane_receipt_sha256, str)
+        ):
+            raise AgentWorkspaceError(
+                "lane-backed workspace requires lane_id and expected_lane_receipt_sha256 together"
+            )
+        if route_evidence is not None:
+            raise AgentWorkspaceError(
+                "lane-backed workspace may not combine Work Lane authority with legacy advisory route evidence"
+            )
+    else:
+        if not isinstance(route_evidence, dict) or route_evidence.get("schema_version") != 2:
+            raise AgentWorkspaceError(
+                "direct-first workspace creation requires schema-v2 advisory route evidence"
+            )
+        normalized_route = _normalize_route_evidence(route_evidence)
+        if (
+            normalized_route.get("status") != "verified"
+            or normalized_route.get("route_policy_version") != ROUTE_POLICY_VERSION
+            or normalized_route.get("actual_route")
+            not in {"workspace_with_contrast", "workspace_with_competition"}
+        ):
+            raise AgentWorkspaceError(
+                "direct-first workspace creation requires verified advisory contrast evidence"
+            )
     operator._require_operator_mutation("tmux_interaction")
     operator._require_operator_mutation("durable_job")
     operator._require_operator_mutation("git_cli")
-    operator._require_operator_mutation("resource_lease")
+    if lane_mode:
+        operator._require_operator_capability("resource_lease")
+    else:
+        operator._require_operator_mutation("resource_lease")
     plan = _normalize_create(
         binding_kind=binding_kind,
         binding_id=binding_id,
@@ -5269,6 +5790,8 @@ def grabowski_agent_workspace_create(
         test_argv=test_argv,
         review_argv=review_argv,
         route_evidence=route_evidence,
+        lane_id=lane_id,
+        expected_lane_receipt_sha256=expected_lane_receipt_sha256,
         runtime_seconds=runtime_seconds,
         memory_max_bytes=memory_max_bytes,
         runner=_run,
@@ -5288,7 +5811,10 @@ def grabowski_agent_workspace_create(
             plan=plan,
             plan_sha256=plan_sha256,
         )
-    _validate_new_workspace_collisions(plan, _run)
+    if _lane_backed(plan):
+        _require_live_lane_binding(plan, _run)
+    else:
+        _validate_new_workspace_collisions(plan, _run)
     try:
         directory.mkdir(mode=0o700)
     except FileExistsError:
@@ -5330,87 +5856,119 @@ def grabowski_agent_workspace_create(
         evidence={"plan_sha256": plan_sha256, "binding": manifest["binding"]},
     )
     _write_manifest(manifest)
-    _capture_routing_shadow_prospective_best_effort(manifest)
+    if not _lane_backed(manifest):
+        _capture_routing_shadow_prospective_best_effort(manifest)
     writer_task_argv = _writer_task_argv(manifest)
     writer_task_argv_sha256 = _task_argv_sha256(writer_task_argv)
     try:
-        lease = resources.acquire_resources(
-            str(plan["resources"]["owner_id"]),
-            list(plan["resources"]["lease_keys"]),
-            purpose=f"agent workspace {workspace_id}",
-            ttl_seconds=min(resources.MAX_TTL_SECONDS, int(plan["resources"]["runtime_seconds"]) + 900),
-            metadata={
-                "workspace_id": workspace_id,
-                "binding": plan["binding"],
-                "base_head": plan["expected_base_head"],
-                "plan_sha256": plan_sha256,
-            },
-        )
         repo = Path(str(plan["repository"]))
         worktree = Path(str(plan["writer_worktree"]))
-        try:
-            admission = _assess_new_agent_workspace(plan)
-        except work_admission.WorkAdmissionBlocked as exc:
-            manifest["work_admission"] = exc.assessment
+        if _lane_backed(plan):
+            _require_live_lane_binding(plan, _run)
+            lane_binding = plan["resources"]["lane_binding"]
+            admission = lane_binding["repository_admission"]
+            manifest["work_admission"] = admission
+            manifest["checkout_lifecycle"] = dict(lane_binding["checkout_lifecycle"])
             _append_workspace_event(
                 manifest,
                 "repository_work_admission",
                 role="writer",
-                outcome="blocked",
+                outcome="reused",
                 evidence={
-                    "decision": exc.assessment.get("decision"),
-                    "assessment_sha256": exc.assessment.get(
-                        "assessment_sha256"
-                    ),
-                    "blocker_codes": list(
-                        exc.assessment.get("blocker_codes", [])
-                    ),
+                    "decision": admission.get("decision"),
+                    "assessment_sha256": admission.get("assessment_sha256"),
+                    "lane_id": lane_binding["lane_id"],
+                },
+            )
+            _append_workspace_event(
+                manifest,
+                "writer_checkout_lifecycle_reused",
+                role="writer",
+                outcome="preserved_lane_owned",
+                evidence={
+                    "checkout_key": manifest["checkout_lifecycle"]["checkout_key"],
+                    "owner_id": manifest["checkout_lifecycle"]["owner_id"],
+                    "lane_id": lane_binding["lane_id"],
+                    "automatic_cleanup_authorized": False,
                 },
             )
             _write_manifest(manifest)
-            raise AgentWorkspaceActionError(str(exc)) from exc
-        manifest["work_admission"] = admission
-        _append_workspace_event(
-            manifest,
-            "repository_work_admission",
-            role="writer",
-            outcome="allowed",
-            evidence={
-                "decision": admission.get("decision"),
-                "assessment_sha256": admission.get("assessment_sha256"),
-            },
-        )
-        _write_manifest(manifest)
-        lifecycle_reservation = _reserve_writer_checkout_lifecycle(manifest)
-        _append_workspace_event(
-            manifest,
-            "writer_checkout_lifecycle_reserved",
-            role="writer",
-            outcome="reserved",
-            evidence={
-                "checkout_key": lifecycle_reservation["checkout_key"],
-                "source": lifecycle_reservation["source"],
-                "artifact_class": lifecycle_reservation["artifact_class"],
-                "limit": lifecycle_reservation["limit"],
-            },
-        )
-        _write_manifest(manifest)
-        worktree_create_attempted = True
-        _checked(
-            _run,
-            repo,
-            [
-                "git",
-                "worktree",
-                "add",
-                "-b",
-                str(plan["writer_branch"]),
-                str(worktree),
-                str(plan["expected_base_head"]),
-            ],
-            label="writer worktree creation",
-        )
-        worktree_created = True
+        else:
+            lease = resources.acquire_resources(
+                str(plan["resources"]["owner_id"]),
+                list(plan["resources"]["lease_keys"]),
+                purpose=f"agent workspace {workspace_id}",
+                ttl_seconds=min(resources.MAX_TTL_SECONDS, int(plan["resources"]["runtime_seconds"]) + 900),
+                metadata={
+                    "workspace_id": workspace_id,
+                    "binding": plan["binding"],
+                    "base_head": plan["expected_base_head"],
+                    "plan_sha256": plan_sha256,
+                },
+            )
+            try:
+                admission = _assess_new_agent_workspace(plan)
+            except work_admission.WorkAdmissionBlocked as exc:
+                manifest["work_admission"] = exc.assessment
+                _append_workspace_event(
+                    manifest,
+                    "repository_work_admission",
+                    role="writer",
+                    outcome="blocked",
+                    evidence={
+                        "decision": exc.assessment.get("decision"),
+                        "assessment_sha256": exc.assessment.get(
+                            "assessment_sha256"
+                        ),
+                        "blocker_codes": list(
+                            exc.assessment.get("blocker_codes", [])
+                        ),
+                    },
+                )
+                _write_manifest(manifest)
+                raise AgentWorkspaceActionError(str(exc)) from exc
+            manifest["work_admission"] = admission
+            _append_workspace_event(
+                manifest,
+                "repository_work_admission",
+                role="writer",
+                outcome="allowed",
+                evidence={
+                    "decision": admission.get("decision"),
+                    "assessment_sha256": admission.get("assessment_sha256"),
+                },
+            )
+            _write_manifest(manifest)
+            lifecycle_reservation = _reserve_writer_checkout_lifecycle(manifest)
+            _append_workspace_event(
+                manifest,
+                "writer_checkout_lifecycle_reserved",
+                role="writer",
+                outcome="reserved",
+                evidence={
+                    "checkout_key": lifecycle_reservation["checkout_key"],
+                    "source": lifecycle_reservation["source"],
+                    "artifact_class": lifecycle_reservation["artifact_class"],
+                    "limit": lifecycle_reservation["limit"],
+                },
+            )
+            _write_manifest(manifest)
+            worktree_create_attempted = True
+            _checked(
+                _run,
+                repo,
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "-b",
+                    str(plan["writer_branch"]),
+                    str(worktree),
+                    str(plan["expected_base_head"]),
+                ],
+                label="writer worktree creation",
+            )
+            worktree_created = True
         initial_preflights: dict[str, Any] = {}
         for preflight_role in ("writer", "tests", "review"):
             role_preflight = _role_toolchain_preflight(
@@ -5448,23 +6006,26 @@ def grabowski_agent_workspace_create(
                 raise AgentWorkspaceActionError(
                     f"{preflight_role} toolchain preflight failed: {classification}"
                 )
-        manifest["checkout_lifecycle"] = _bind_writer_checkout_lifecycle(manifest)
-        _append_workspace_event(
-            manifest,
-            "writer_checkout_lifecycle_bound",
-            role="writer",
-            outcome="retained",
-            evidence={
-                "checkout_key": manifest["checkout_lifecycle"]["checkout_key"],
-                "owner_id": manifest["checkout_lifecycle"]["owner_id"],
-                "task": manifest["checkout_lifecycle"]["task"],
-                "expires_at_unix": manifest["checkout_lifecycle"]["expires_at_unix"],
-                "expected_head": manifest["checkout_lifecycle"]["expected_head"],
-                "expected_branch": manifest["checkout_lifecycle"]["expected_branch"],
-                "automatic_cleanup_authorized": False,
-            },
-        )
-        _write_manifest(manifest)
+        if not _lane_backed(plan):
+            manifest["checkout_lifecycle"] = _bind_writer_checkout_lifecycle(manifest)
+            _append_workspace_event(
+                manifest,
+                "writer_checkout_lifecycle_bound",
+                role="writer",
+                outcome="retained",
+                evidence={
+                    "checkout_key": manifest["checkout_lifecycle"]["checkout_key"],
+                    "owner_id": manifest["checkout_lifecycle"]["owner_id"],
+                    "task": manifest["checkout_lifecycle"]["task"],
+                    "expires_at_unix": manifest["checkout_lifecycle"]["expires_at_unix"],
+                    "expected_head": manifest["checkout_lifecycle"]["expected_head"],
+                    "expected_branch": manifest["checkout_lifecycle"]["expected_branch"],
+                    "automatic_cleanup_authorized": False,
+                },
+            )
+            _write_manifest(manifest)
+        else:
+            _require_live_lane_binding(manifest, _run)
         writer_intents = dict(manifest.get("task_start_intents", {}))
         writer_intents["writer"] = {
             "role": "writer",
@@ -5578,8 +6139,13 @@ def grabowski_agent_workspace_create(
             except Exception as cleanup_exc:
                 worktree_cleanup_confirmed = False
                 worktree_cleanup_error = _error_summary(cleanup_exc)
-        checkout_lifecycle_released = True
-        if worktree_cleanup_confirmed and not writer_start_attempted:
+        lane_resources_preserved = _lane_backed(plan)
+        checkout_lifecycle_released = not lane_resources_preserved
+        if (
+            not lane_resources_preserved
+            and worktree_cleanup_confirmed
+            and not writer_start_attempted
+        ):
             try:
                 checkout_lifecycle_released = _release_failed_workspace_checkout_lifecycle(
                     manifest
@@ -5621,8 +6187,12 @@ def grabowski_agent_workspace_create(
             "worktree_cleanup_confirmed": worktree_cleanup_confirmed,
             "worktree_cleanup_error": worktree_cleanup_error,
             "checkout_lifecycle_released": checkout_lifecycle_released,
+            "lane_resources_preserved": lane_resources_preserved,
+            "workspace_resources_owned": not lane_resources_preserved,
             "lease_released": lease_released,
-            "lease_retained": lease is not None and not lease_released,
+            "lease_retained": (
+                lane_resources_preserved or (lease is not None and not lease_released)
+            ),
             "lease_release_error": lease_release_error,
             "worktree_preserved": Path(str(plan["writer_worktree"])).exists(),
             "work_admission": (
@@ -5651,6 +6221,9 @@ def grabowski_agent_workspace_create(
         "workspace": manifest,
         "writer_task": writer_task,
         "resource_lease": lease,
+        "lane_binding": (
+            plan["resources"].get("lane_binding") if _lane_backed(plan) else None
+        ),
         "idempotent": False,
         "tmux_establishes_success": False,
     }
@@ -5692,6 +6265,7 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
     identifier = _required_string(workspace_id, "workspace_id", max_length=80)
     with _lock(identifier):
         manifest = _manifest(identifier)
+        _require_live_lane_binding(manifest, _run)
         _append_workspace_event(manifest, "collection_requested", outcome="observing")
         _write_manifest(manifest)
         if manifest.get("creation_state") != "ready":
@@ -6403,10 +6977,14 @@ def grabowski_agent_workspace_writer_handoff(workspace_id: str, replacement_argv
     """Start one operator-bound replacement writer after a proven terminal failure."""
     operator._require_operator_mutation("durable_job")
     operator._require_operator_mutation("git_cli")
-    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_capability("resource_lease")
     identifier = _required_string(workspace_id, "workspace_id", max_length=80)
     with _lock(identifier):
         manifest = _manifest(identifier)
+        if _lane_backed(manifest):
+            _require_live_lane_binding(manifest, _run)
+        else:
+            operator._require_operator_mutation("resource_lease")
         command = _role_argv(replacement_argv, "replacement_argv", cwd=Path(str(manifest["writer_worktree"])))
         command_sha = _sha256_json(command)
         try:
@@ -6517,25 +7095,39 @@ def grabowski_agent_workspace_writer_handoff(workspace_id: str, replacement_argv
                 "handoff_status": "blocked",
             }
         resources_value = manifest["resources"]
-        renewed = resources.renew_resources(
-            str(resources_value["owner_id"]),
-            list(resources_value["lease_keys"]),
-            ttl_seconds=min(
-                resources.MAX_TTL_SECONDS,
-                int(resources_value["runtime_seconds"]) + 900,
-            ),
-        )
-        _append_workspace_event(
-            manifest,
-            "writer_handoff_leases_renewed",
-            role="writer",
-            outcome="renewed",
-            evidence={
-                "attempt": 2,
-                "expires_at_unix": renewed.get("expires_at_unix"),
-                "lease_count": len(renewed.get("leases", [])),
-            },
-        )
+        if _lane_backed(manifest):
+            lane_status = _require_live_lane_binding(manifest, _run)
+            _append_workspace_event(
+                manifest,
+                "writer_handoff_lane_authority_revalidated",
+                role="writer",
+                outcome="preserved_lane_owned",
+                evidence={
+                    "attempt": 2,
+                    "lane_id": lane_status.get("lane_id"),
+                    "lane_receipt_sha256": lane_status.get("receipt_sha256"),
+                },
+            )
+        else:
+            renewed = resources.renew_resources(
+                str(resources_value["owner_id"]),
+                list(resources_value["lease_keys"]),
+                ttl_seconds=min(
+                    resources.MAX_TTL_SECONDS,
+                    int(resources_value["runtime_seconds"]) + 900,
+                ),
+            )
+            _append_workspace_event(
+                manifest,
+                "writer_handoff_leases_renewed",
+                role="writer",
+                outcome="renewed",
+                evidence={
+                    "attempt": 2,
+                    "expires_at_unix": renewed.get("expires_at_unix"),
+                    "lease_count": len(renewed.get("leases", [])),
+                },
+            )
         output = _role_receipt_path(manifest, "writer", attempt=2)
         if os.path.lexists(output):
             return {"workspace_id": identifier, "state": "writer_handoff_receipt_already_exists", "receipt_path": str(output), "handoff_status": "blocked"}
@@ -6613,6 +7205,7 @@ def grabowski_agent_workspace_role_retry(
         raise AgentWorkspaceError(f"role_retry supports only {sorted(READ_ONLY_ROLES)}; writer may never be retried")
     with _lock(identifier):
         manifest = _manifest(identifier)
+        _require_live_lane_binding(manifest, _run)
         _append_workspace_event(manifest, "retry_decision", role=role_name, outcome="requested")
         _write_manifest(manifest)
         if manifest.get("creation_state") != "ready":
@@ -6869,7 +7462,7 @@ def grabowski_agent_workspace_close(
     """Close one collected workspace without deleting its writer worktree or branch."""
     operator._require_operator_mutation("durable_job")
     operator._require_operator_mutation("tmux_interaction")
-    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_capability("resource_lease")
     identifier = _required_string(workspace_id, "workspace_id", max_length=80)
     head = _required_string(expected_head, "expected_head", max_length=40).lower()
     diff_sha = _required_string(expected_diff_sha256, "expected_diff_sha256", max_length=64).lower()
@@ -6878,6 +7471,11 @@ def grabowski_agent_workspace_close(
         raise AgentWorkspaceError("close bindings must be canonical hashes")
     with _lock(identifier):
         manifest = _manifest(identifier)
+        lane_mode = _lane_backed(manifest)
+        if not lane_mode:
+            operator._require_operator_mutation("resource_lease")
+        elif not isinstance(manifest.get("close_receipt"), dict):
+            _require_live_lane_binding(manifest, _run)
         _append_workspace_event(
             manifest, "close_requested", outcome="requested",
             evidence={"expected_head": head, "expected_diff_sha256": diff_sha, "expected_result_sha256": result_sha, "abandon_failed_roles": abandon_failed_roles},
@@ -7061,7 +7659,9 @@ def grabowski_agent_workspace_close(
             "closure_outcome": "abandoned_failed_roles" if failed_roles else "successful",
         }
         receipt["checkout_lifecycle_decision"] = (
-            _terminal_writer_checkout_decision(manifest, snapshot)
+            _lane_owned_checkout_decision(manifest, snapshot)
+            if lane_mode
+            else _terminal_writer_checkout_decision(manifest, snapshot)
         )
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
         if remove_tmux_session and _tmux_has_session(str(manifest["session_name"])):
@@ -7070,62 +7670,84 @@ def grabowski_agent_workspace_close(
                 raise AgentWorkspaceActionError(str(killed.get("stderr") or "tmux session removal failed"))
             receipt["tmux_removed"] = True
         expected_resource_keys = set(manifest["resources"]["lease_keys"])
-        release_error: str | None = None
-        released_resource_keys: set[str] = set()
-        try:
-            released = resources.release_resources(
-                str(manifest["resources"]["owner_id"]),
-                sorted(expected_resource_keys),
+        if lane_mode:
+            lane_status = _require_live_lane_binding(manifest, _run)
+            receipt["released_resource_keys"] = []
+            receipt["resource_release_error"] = None
+            receipt["remaining_resource_keys"] = sorted(expected_resource_keys)
+            receipt["resources_released"] = False
+            receipt["lane_resources_preserved"] = True
+            receipt["workspace_resources_owned"] = False
+            receipt["resource_release_not_applicable"] = (
+                "Work Lane is the sole lease and checkout lifecycle owner"
             )
-            released_items = released.get("released") if isinstance(released, dict) else None
-            if not isinstance(released_items, list):
-                raise AgentWorkspaceActionError("resource release returned an invalid receipt")
-            released_resource_keys = {
-                str(item.get("resource_key"))
-                for item in released_items
-                if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
-            }
-        except Exception as release_exc:
-            release_error = _error_summary(release_exc)
-        receipt["released_resource_keys"] = sorted(released_resource_keys)
-        receipt["resource_release_error"] = release_error
-        try:
-            live_resources = resources.list_resources(
-                owner_id=str(manifest["resources"]["owner_id"]),
-                include_expired=False,
-                limit=MAX_PATHS + 8,
+            _append_workspace_event(
+                manifest,
+                "lane_resources_preserved",
+                outcome="verified",
+                evidence={
+                    "lane_id": lane_status.get("lane_id"),
+                    "lane_receipt_sha256": lane_status.get("receipt_sha256"),
+                    "preserved_resource_keys": sorted(expected_resource_keys),
+                },
             )
-            observed_live_keys = {
-                str(item.get("resource_key"))
-                for item in live_resources
-                if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
-            }
-        except Exception as observe_exc:
-            receipt["state"] = "resource_release_unverified"
-            receipt["resource_release_observation_error"] = (
-                _error_summary(observe_exc)
+        else:
+            release_error: str | None = None
+            released_resource_keys: set[str] = set()
+            try:
+                released = resources.release_resources(
+                    str(manifest["resources"]["owner_id"]),
+                    sorted(expected_resource_keys),
+                )
+                released_items = released.get("released") if isinstance(released, dict) else None
+                if not isinstance(released_items, list):
+                    raise AgentWorkspaceActionError("resource release returned an invalid receipt")
+                released_resource_keys = {
+                    str(item.get("resource_key"))
+                    for item in released_items
+                    if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
+                }
+            except Exception as release_exc:
+                release_error = _error_summary(release_exc)
+            receipt["released_resource_keys"] = sorted(released_resource_keys)
+            receipt["resource_release_error"] = release_error
+            try:
+                live_resources = resources.list_resources(
+                    owner_id=str(manifest["resources"]["owner_id"]),
+                    include_expired=False,
+                    limit=MAX_PATHS + 8,
+                )
+                observed_live_keys = {
+                    str(item.get("resource_key"))
+                    for item in live_resources
+                    if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
+                }
+            except Exception as observe_exc:
+                receipt["state"] = "resource_release_unverified"
+                receipt["resource_release_observation_error"] = (
+                    _error_summary(observe_exc)
+                )
+                receipt["receipt_sha256"] = _sha256_json(receipt)
+                _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
+                raise AgentWorkspaceActionError(
+                    "resource release outcome is unverified; close remains incomplete"
+                ) from observe_exc
+            remaining_resource_keys = expected_resource_keys & observed_live_keys
+            receipt["remaining_resource_keys"] = sorted(remaining_resource_keys)
+            receipt["resources_released"] = not remaining_resource_keys
+            if remaining_resource_keys:
+                receipt["state"] = "resource_release_incomplete"
+                receipt["receipt_sha256"] = _sha256_json(receipt)
+                _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
+                raise AgentWorkspaceActionError(
+                    "resource release incomplete; remaining keys: "
+                    + ", ".join(sorted(remaining_resource_keys))
+                )
+            _append_workspace_event(
+                manifest, "workspace_lease_release",
+                outcome="verified" if not remaining_resource_keys else "incomplete",
+                evidence={"released_resource_keys": sorted(released_resource_keys), "remaining_resource_keys": sorted(remaining_resource_keys)},
             )
-            receipt["receipt_sha256"] = _sha256_json(receipt)
-            _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
-            raise AgentWorkspaceActionError(
-                "resource release outcome is unverified; close remains incomplete"
-            ) from observe_exc
-        remaining_resource_keys = expected_resource_keys & observed_live_keys
-        receipt["remaining_resource_keys"] = sorted(remaining_resource_keys)
-        receipt["resources_released"] = not remaining_resource_keys
-        if remaining_resource_keys:
-            receipt["state"] = "resource_release_incomplete"
-            receipt["receipt_sha256"] = _sha256_json(receipt)
-            _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
-            raise AgentWorkspaceActionError(
-                "resource release incomplete; remaining keys: "
-                + ", ".join(sorted(remaining_resource_keys))
-            )
-        _append_workspace_event(
-            manifest, "workspace_lease_release",
-            outcome="verified" if not remaining_resource_keys else "incomplete",
-            evidence={"released_resource_keys": sorted(released_resource_keys), "remaining_resource_keys": sorted(remaining_resource_keys)},
-        )
         receipt["state"] = "complete"
         receipt["receipt_sha256"] = _sha256_json(receipt)
         _atomic_json(_workspace_dir(identifier) / "close-receipt.json", receipt)
@@ -7271,8 +7893,8 @@ def _workspace_cleanup_references(
         fully_closed = bool(
             isinstance(close_receipt, dict)
             and close_receipt.get("state") == "complete"
-            and close_receipt.get("resources_released") is True
             and close_integrity["valid"]
+            and _resource_close_contract_satisfied(candidate, close_receipt)
         )
         references.append(
             {
@@ -7315,6 +7937,11 @@ def _closed_workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
         not isinstance(item, str) or not item for item in raw_resource_keys
     ):
         exact_resource_error = "workspace resource lease keys are invalid"
+    elif _lane_backed(manifest):
+        try:
+            exact_resource_keys = resources.normalize_resource_keys(raw_resource_keys)
+        except Exception as exc:
+            exact_resource_error = _error_summary(exc)
     else:
         try:
             exact_resource_keys = resources.normalize_resource_keys(raw_resource_keys)
@@ -7378,7 +8005,12 @@ def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
     resource_owner = manifest.get("resources", {}).get("owner_id")
     live_resource_keys: list[str] = []
     resource_observation_error: str | None = None
-    if isinstance(resource_owner, str) and resource_owner:
+    preserved_lane_resource_keys: list[str] = []
+    if _lane_backed(manifest):
+        raw_keys = manifest.get("resources", {}).get("lease_keys", [])
+        if isinstance(raw_keys, list) and all(isinstance(key, str) for key in raw_keys):
+            preserved_lane_resource_keys = sorted(raw_keys)
+    elif isinstance(resource_owner, str) and resource_owner:
         try:
             observed = resources.list_resources(
                 owner_id=resource_owner,
@@ -7424,6 +8056,7 @@ def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
         "recovery_attention_roles": recovery_attention_roles,
         "task_observation_error_roles": task_observation_error_roles,
         "live_resource_keys": live_resource_keys,
+        "preserved_lane_resource_keys": preserved_lane_resource_keys,
         "resource_observation_error": resource_observation_error,
         "session_live": session_live,
         "operationally_live": operationally_live,
@@ -7437,6 +8070,15 @@ def _stale_workspace_reconciliation_plan(
     manifest: dict[str, Any], liveness: dict[str, Any]
 ) -> dict[str, Any]:
     blockers: list[dict[str, Any]] = []
+    if _lane_backed(manifest):
+        blockers.append(
+            {
+                "code": "work_lane_owns_terminal_reconciliation",
+                "lane_id": manifest.get("resources", {})
+                .get("lane_binding", {})
+                .get("lane_id"),
+            }
+        )
     close_receipt = manifest.get("close_receipt")
     if isinstance(close_receipt, dict):
         blockers.append({"code": "workspace_already_closed"})
@@ -7594,14 +8236,18 @@ def _workspace_cleanup_plan_data(
     repository = str(manifest["repository"])
     writer_worktree = str(manifest["writer_worktree"])
     writer_branch = str(manifest["writer_branch"])
-    owner = _workspace_cleanup_owner(identifier)
+    owner = (
+        str(manifest.get("resources", {}).get("owner_id"))
+        if _lane_backed(manifest)
+        else _workspace_cleanup_owner(identifier)
+    )
     close_receipt = manifest.get("close_receipt")
     close_integrity = _close_integrity_status(manifest, close_receipt)
     fully_closed = bool(
         isinstance(close_receipt, dict)
         and close_receipt.get("state") == "complete"
-        and close_receipt.get("resources_released") is True
         and close_integrity["valid"]
+        and _resource_close_contract_satisfied(manifest, close_receipt)
     )
     liveness = (
         _closed_workspace_liveness(manifest)
@@ -7636,8 +8282,17 @@ def _workspace_cleanup_plan_data(
         )
     elif close_receipt.get("state") != "complete":
         blockers.append({"code": "workspace_not_closed"})
-    elif close_receipt.get("resources_released") is not True:
-        blockers.append({"code": "workspace_resources_not_released"})
+    elif not _resource_close_contract_satisfied(manifest, close_receipt):
+        blockers.append({"code": "workspace_resource_close_contract_unsatisfied"})
+    if fully_closed and _lane_backed(manifest):
+        blockers.append(
+            {
+                "code": "lane_owned_checkout_preserved",
+                "lane_id": manifest.get("resources", {})
+                .get("lane_binding", {})
+                .get("lane_id"),
+            }
+        )
     if fully_closed:
         if liveness.get("resource_observation_error"):
             blockers.append(
@@ -7963,7 +8618,9 @@ def _workspace_cleanup_plan_data(
     cleanup_intent_state = (
         cleanup_intent.get("state") if isinstance(cleanup_intent, dict) else None
     )
-    if cleanup_receipt_valid:
+    if fully_closed and _lane_backed(manifest):
+        lifecycle_state = "lane_owned_preserved"
+    elif cleanup_receipt_valid:
         lifecycle_state = "cleaned"
     elif cleanup_intent_state in {"archived_ready", "waiting_grace"}:
         lifecycle_state = str(archive_lifecycle["state"])
@@ -7984,6 +8641,7 @@ def _workspace_cleanup_plan_data(
         "archived_ready_for_cleanup": "remove-archived-linked-checkout",
         "archive_state_unverified": "verify-archive-state",
         "cleaned": "none",
+        "lane_owned_preserved": "none",
     }.get(lifecycle_state, "reconcile-cleanup-state")
     body = {
         "schema_version": 1,
@@ -8881,8 +9539,8 @@ def _workspace_lifecycle_classification(
         "closed": bool(
             isinstance(close_receipt, dict)
             and close_receipt.get("state") == "complete"
-            and close_receipt.get("resources_released") is True
             and close_integrity["valid"]
+            and _resource_close_contract_satisfied(manifest, close_receipt)
         ),
         "tasks": live_task_states,
         "close_integrity": close_integrity,
@@ -9549,6 +10207,10 @@ def grabowski_agent_workspace_cleanup(
     reconciliation_intent_id: str | None = None
     with _lock(identifier):
         manifest = _manifest(identifier)
+        if _lane_backed(manifest):
+            raise AgentWorkspaceError(
+                "lane-backed workspace cleanup is owned exclusively by Work Lane closeout"
+            )
         existing_receipt = manifest.get("workspace_cleanup_receipt")
         cleanup_integrity = _workspace_cleanup_integrity_status(
             manifest, existing_receipt

@@ -370,6 +370,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.outcome_audit_patch.start()
         self.addCleanup(self.outcome_audit_patch.stop)
         self.checkout_state = self.root / "checkout-state"
+        self.lane_state = self.root / "work-lanes"
         self.checkout_patches = [
             mock.patch.object(
                 workspace.checkouts,
@@ -403,6 +404,11 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.root_patch = mock.patch.object(workspace, "WORKSPACE_ROOT", self.state)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)
+        self.lane_root_patch = mock.patch.object(
+            workspace.work_acquire, "_state_root", return_value=self.lane_state
+        )
+        self.lane_root_patch.start()
+        self.addCleanup(self.lane_root_patch.stop)
         self.preflight_cache = self.root / "preflight-cache"
         self.cache_patch = mock.patch.object(
             workspace, "ROLE_PREFLIGHT_CACHE_ROOT", self.preflight_cache
@@ -499,6 +505,157 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         return value
 
+    def lane_receipt(
+        self,
+        *,
+        source_kind: str = "thread_focus",
+        source_id: str = "thread-1",
+        write_paths: list[str] | None = None,
+    ) -> dict:
+        if not self.git.writer.exists():
+            self.git.add_writer()
+        normalized = workspace.work_acquire._normalize(
+            {
+                "controller_actor": "controller:test",
+                "scoped_writer_actor": "agent:test-writer",
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "repo": str(self.git.repo),
+                "target_path": str(self.git.writer),
+                "branch": "feat/writer",
+                "base_head": self.git.base,
+                "purpose": "test lane-backed workspace",
+                "artifact_class": "implementation-worktree",
+                "retention_until_unix": int(time.time()) + 3600,
+                "ttl_seconds": 3600,
+                "idempotency_key": "test-lane-backed-workspace",
+                "write_paths": write_paths or ["src"],
+            }
+        )
+        normalized.pop("_scoped_writer_argv", None)
+        lane_id = normalized["lane_id"]
+        owner_id = normalized["lease_owner_id"]
+        workspace.resources.acquire_resources(
+            owner_id,
+            normalized["resource_keys"],
+            purpose=normalized["purpose"],
+            ttl_seconds=3600,
+            metadata={"lane_id": lane_id},
+        )
+        lifecycle_manifest = {
+            "workspace_id": "gaw-test-lane-binding",
+            "binding": {"kind": source_kind, "id": source_id},
+            "repository": str(self.git.repo),
+            "writer_worktree": str(self.git.writer),
+            "writer_branch": "feat/writer",
+            "expected_base_head": self.git.base,
+            "resources": {
+                "owner_id": owner_id,
+                "runtime_seconds": 600,
+            },
+        }
+        lifecycle = workspace._bind_writer_checkout_lifecycle(lifecycle_manifest)
+        scope_identity = {
+            "branch": "feat/writer",
+            "target_path": str(self.git.writer),
+        }
+        isolation = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_isolation_evidence",
+            "scope_identity": scope_identity,
+            "nonconflict_verified": True,
+            "signals": [
+                {
+                    "code": "unrelated-dirty-worktree",
+                    "path": str(self.root / "unrelated"),
+                }
+            ],
+        }
+        isolation["evidence_sha256"] = workspace.work_admission._digest(isolation)
+        admission = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_admission",
+            "decision": "isolate_and_execute",
+            "scope_mode": "exact_checkout",
+            "blockers": [],
+            "blocker_codes": [],
+            "owner_id": owner_id,
+            "repository": str(self.git.repo),
+            "branch": "feat/writer",
+            "target_path": str(self.git.writer),
+            "scope_identity": scope_identity,
+            "isolation_evidence": isolation,
+        }
+        admission["assessment_sha256"] = workspace.work_admission._digest(admission)
+        post_state = {
+            "repo": str(self.git.repo),
+            "target_path": str(self.git.writer),
+            "requested_head": self.git.base,
+            "requested_branch": "feat/writer",
+            "actual_head": self.git.base,
+            "actual_branch": "feat/writer",
+            "target_registered": True,
+            "target_path_exists": True,
+            "matches_requested_state": True,
+        }
+        authority = {
+            "controller": normalized["controller"],
+            "scoped_writer": normalized["scoped_writer"],
+            "source": normalized["source"],
+            "lifecycle_source": normalized["source"],
+            "writer_effects": ["implement", "test", "commit", "push"],
+            "controller_only_effects": ["merge", "deployment", "closeout"],
+            "single_writer_scope": "overlapping-resource-lane",
+        }
+        record = {
+            "kind": workspace.work_acquire.LANE_KIND,
+            "schema_version": workspace.work_acquire.SCHEMA_VERSION,
+            "lane_id": lane_id,
+            "state": "ready",
+            "decision": "ISOLATE_AND_EXECUTE",
+            "inputs": normalized,
+            "inputs_sha256": workspace.work_acquire._sha(normalized),
+            "authority": authority,
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "post_state": post_state,
+                "work_admission": admission,
+                "lifecycle": lifecycle,
+            },
+        }
+        with workspace.work_acquire._lane_lock(lane_id) as path:
+            return workspace.work_acquire._write_state(path, record)
+
+    def lane_manifest(self, lane: dict) -> dict:
+        manifest = self.manifest()
+        legacy_directory = self.state / manifest["workspace_id"]
+        plan = workspace._normalize_create(
+            binding_kind="thread_focus",
+            binding_id="thread-1",
+            repository=str(self.git.repo),
+            expected_base_head=self.git.base,
+            writer_branch="feat/writer",
+            writer_worktree=str(self.git.writer),
+            allowed_paths=["src"],
+            forbidden_paths=["secrets"],
+            writer_argv=manifest["commands"]["writer"],
+            test_argv=manifest["commands"]["tests"],
+            review_argv=manifest["commands"]["review"],
+            runtime_seconds=600,
+            memory_max_bytes=None,
+            runner=workspace._run,
+            lane_id=lane["lane_id"],
+            expected_lane_receipt_sha256=lane["receipt_sha256"],
+        )
+        for field in workspace.PLAN_FIELDS:
+            manifest[field] = plan[field]
+        manifest["checkout_lifecycle"] = dict(
+            plan["resources"]["lane_binding"]["checkout_lifecycle"]
+        )
+        legacy_directory.rename(self.state / manifest["workspace_id"])
+        workspace._write_manifest(manifest)
+        return manifest
+
     def test_deterministic_session_name_changes_with_binding(self) -> None:
         first = workspace._workspace_identity("thread_focus", "thread-1", self.git.repo, self.git.base)
         second = workspace._workspace_identity("thread_focus", "thread-1", self.git.repo, self.git.base)
@@ -506,6 +663,61 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
         self.assertRegex(first[0], workspace.WORKSPACE_ID_RE)
+
+    def test_lane_backed_workspace_identity_is_generation_safe(self) -> None:
+        lane_input = {
+            "controller_actor": "controller:test",
+            "scoped_writer_actor": "agent:test-writer",
+            "source_kind": "thread_focus",
+            "source_id": "thread-1",
+            "repo": str(self.git.repo),
+            "target_path": str(self.git.writer),
+            "branch": "feat/writer",
+            "base_head": self.git.base,
+            "purpose": "test lane-backed workspace identity",
+            "artifact_class": "implementation-worktree",
+            "retention_until_unix": int(time.time()) + 3600,
+            "ttl_seconds": 3600,
+            "write_paths": ["src"],
+        }
+        first_lane = workspace.work_acquire._normalize(
+            {**lane_input, "idempotency_key": "lane-generation-one"}
+        )
+        second_lane = workspace.work_acquire._normalize(
+            {**lane_input, "idempotency_key": "lane-generation-two"}
+        )
+        self.assertEqual(first_lane["source"], second_lane["source"])
+        self.assertEqual(first_lane["repo"], second_lane["repo"])
+        self.assertEqual(first_lane["base_head"], second_lane["base_head"])
+        self.assertNotEqual(first_lane["lane_id"], second_lane["lane_id"])
+
+        first = workspace._lane_workspace_identity(
+            "thread-1", self.git.repo, first_lane["lane_id"]
+        )
+        second = workspace._lane_workspace_identity(
+            "thread-1", self.git.repo, second_lane["lane_id"]
+        )
+        self.assertNotEqual(first, second)
+        self.assertTrue(first[0].endswith(first_lane["lane_id"]))
+        self.assertTrue(second[0].endswith(second_lane["lane_id"]))
+        self.assertEqual(first[0], first[1])
+        self.assertEqual(second[0], second[1])
+
+        legacy_digest = hashlib.sha256(
+            "\n".join(
+                ("thread_focus", "thread-1", str(self.git.repo), self.git.base)
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        legacy_id = (
+            f"gaw-{workspace._slug(self.git.repo.name, limit=18)}-thread-1-"
+            f"{legacy_digest}"
+        )
+        self.assertEqual(
+            workspace._workspace_identity(
+                "thread_focus", "thread-1", self.git.repo, self.git.base
+            ),
+            (legacy_id, legacy_id),
+        )
 
     def test_normalize_create_enforces_isolation_roles_and_scope(self) -> None:
         plan = workspace._normalize_create(
@@ -542,6 +754,387 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(any(key.startswith("service:repo-writer-") for key in plan["resources"]["lease_keys"]))
         self.assertEqual(plan["resources"]["task_host"], workspace.AGENT_WORKSPACE_TASK_HOST)
         self.assertEqual(set(plan), set(workspace.PLAN_FIELDS))
+
+    def test_lane_backed_normalize_reuses_exact_lane_authority(self) -> None:
+        lane = self.lane_receipt()
+        plan = workspace._normalize_create(
+            binding_kind="thread_focus",
+            binding_id="thread-1",
+            repository=str(self.git.repo),
+            expected_base_head=self.git.base,
+            writer_branch="feat/writer",
+            writer_worktree=str(self.git.writer),
+            allowed_paths=["src"],
+            forbidden_paths=["secrets"],
+            writer_argv=["true"],
+            test_argv=["true"],
+            review_argv=["true"],
+            runtime_seconds=600,
+            memory_max_bytes=None,
+            runner=workspace._run,
+            lane_id=lane["lane_id"],
+            expected_lane_receipt_sha256=lane["receipt_sha256"],
+        )
+
+        self.assertEqual(
+            plan["resources"]["ownership_mode"],
+            workspace.WORKSPACE_OWNERSHIP_WORK_LANE,
+        )
+        self.assertEqual(plan["resources"]["owner_id"], f"lane:{lane['lane_id']}")
+        self.assertEqual(
+            plan["resources"]["lease_keys"], lane["inputs"]["resource_keys"]
+        )
+        self.assertEqual(plan["resources"]["workspace_owned_lease_keys"], [])
+        self.assertEqual(
+            plan["resources"]["lane_binding"]["receipt_sha256"],
+            lane["receipt_sha256"],
+        )
+        self.assertEqual(plan["roles"]["writer"]["authority"], "lane_scoped_writer")
+        self.assertEqual(
+            plan["role_ownership"]["authoritative_writer"], "agent:test-writer"
+        )
+
+    def test_lane_backed_normalize_fails_closed_on_receipt_or_scope_drift(self) -> None:
+        lane = self.lane_receipt()
+        common = {
+            "binding_kind": "thread_focus",
+            "binding_id": "thread-1",
+            "repository": str(self.git.repo),
+            "expected_base_head": self.git.base,
+            "writer_branch": "feat/writer",
+            "writer_worktree": str(self.git.writer),
+            "forbidden_paths": [],
+            "writer_argv": ["true"],
+            "test_argv": ["true"],
+            "review_argv": ["true"],
+            "runtime_seconds": 600,
+            "memory_max_bytes": None,
+            "runner": workspace._run,
+            "lane_id": lane["lane_id"],
+        }
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "digest drifted"):
+            workspace._normalize_create(
+                **common,
+                allowed_paths=["src"],
+                expected_lane_receipt_sha256="f" * 64,
+            )
+        with self.assertRaisesRegex(workspace.AgentWorkspaceError, "exactly match"):
+            workspace._normalize_create(
+                **common,
+                allowed_paths=["tests"],
+                expected_lane_receipt_sha256=lane["receipt_sha256"],
+            )
+
+    def test_lane_backed_create_failure_preserves_lane_resources(self) -> None:
+        lane = self.lane_receipt()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight", side_effect=missing_module_preflight
+            ),
+            mock.patch.object(workspace.resources, "acquire_resources") as acquire,
+            mock.patch.object(workspace.resources, "release_resources") as release,
+            mock.patch.object(workspace, "_assess_new_agent_workspace") as admission,
+            mock.patch.object(workspace, "_reserve_writer_checkout_lifecycle") as reserve,
+            mock.patch.object(workspace, "_bind_writer_checkout_lifecycle") as bind,
+            mock.patch.object(workspace, "_remove_created_worktree") as remove,
+        ):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError, "writer toolchain preflight failed"
+            ):
+                workspace.grabowski_agent_workspace_create(
+                    binding_kind="thread_focus",
+                    binding_id="thread-1",
+                    repository=str(self.git.repo),
+                    expected_base_head=self.git.base,
+                    writer_branch="feat/writer",
+                    writer_worktree=str(self.git.writer),
+                    allowed_paths=["src"],
+                    writer_argv=["true"],
+                    test_argv=["true"],
+                    review_argv=["true"],
+                    runtime_seconds=600,
+                    lane_id=lane["lane_id"],
+                    expected_lane_receipt_sha256=lane["receipt_sha256"],
+                )
+        acquire.assert_not_called()
+        release.assert_not_called()
+        admission.assert_not_called()
+        reserve.assert_not_called()
+        bind.assert_not_called()
+        remove.assert_not_called()
+        self.assertTrue(self.git.writer.exists())
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
+            observed = workspace.work_acquire._read_state(path)
+        self.assertEqual(observed["receipt_sha256"], lane["receipt_sha256"])
+        failure = workspace._load_json(
+            self.state
+            / workspace._lane_workspace_identity(
+                "thread-1", self.git.repo, lane["lane_id"]
+            )[0]
+            / "create-failure.json"
+        )
+        self.assertTrue(failure["lane_resources_preserved"])
+        self.assertFalse(failure["workspace_resources_owned"])
+        self.assertFalse(failure["worktree_create_attempted"])
+
+    def test_lane_backed_create_reuses_lane_without_second_ownership_lifecycle(self) -> None:
+        lane = self.lane_receipt()
+
+        def fake_task_start(**kwargs):
+            return {
+                "task": {
+                    "task_id": "lane-writer-task",
+                    "host": kwargs["host"],
+                    "attempt": 1,
+                    "resume_policy": "never",
+                    "argv_sha256": workspace._sha256_json(kwargs["argv"]),
+                    "cwd": kwargs["cwd"],
+                }
+            }
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.resources, "acquire_resources") as acquire,
+            mock.patch.object(workspace.resources, "release_resources") as release,
+            mock.patch.object(
+                workspace.work_admission, "require_repository_admission"
+            ) as repository_admission,
+            mock.patch.object(workspace, "_assess_new_agent_workspace") as admission,
+            mock.patch.object(workspace, "_reserve_writer_checkout_lifecycle") as reserve,
+            mock.patch.object(workspace, "_bind_writer_checkout_lifecycle") as bind,
+            mock.patch.object(workspace, "_run", wraps=workspace._run) as runner,
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start", side_effect=fake_task_start
+            ) as task_start,
+            mock.patch.object(
+                workspace,
+                "_create_tmux",
+                return_value={
+                    "captain": "%1",
+                    "writer": "%2",
+                    "tests": "%3",
+                    "review": "%4",
+                },
+            ),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_create(
+                binding_kind="thread_focus",
+                binding_id="thread-1",
+                repository=str(self.git.repo),
+                expected_base_head=self.git.base,
+                writer_branch="feat/writer",
+                writer_worktree=str(self.git.writer),
+                allowed_paths=["src"],
+                writer_argv=["true"],
+                test_argv=["true"],
+                review_argv=["true"],
+                runtime_seconds=600,
+                lane_id=lane["lane_id"],
+                expected_lane_receipt_sha256=lane["receipt_sha256"],
+            )
+
+        acquire.assert_not_called()
+        release.assert_not_called()
+        repository_admission.assert_not_called()
+        admission.assert_not_called()
+        reserve.assert_not_called()
+        bind.assert_not_called()
+        self.assertFalse(
+            any(
+                list(call.args[1])[:3] == ["git", "worktree", "add"]
+                for call in runner.call_args_list
+            )
+        )
+        task_start.assert_called_once()
+        self.assertIsNone(task_start.call_args.kwargs["resource_keys"])
+        manifest = result["workspace"]
+        lane_binding = manifest["resources"]["lane_binding"]
+        self.assertEqual(manifest["creation_state"], "ready")
+        self.assertIsNone(result["resource_lease"])
+        self.assertEqual(manifest["writer_worktree"], str(self.git.writer))
+        self.assertEqual(lane_binding["receipt_sha256"], lane["receipt_sha256"])
+        self.assertEqual(
+            manifest["work_admission"], lane["worktree_receipt"]["work_admission"]
+        )
+        self.assertEqual(
+            manifest["checkout_lifecycle"]["checkout_key"],
+            lane["worktree_receipt"]["lifecycle"]["checkout_key"],
+        )
+        self.assertTrue(workspace._lane_binding_status(manifest)["valid"])
+        for key in lane["inputs"]["resource_keys"]:
+            lease = workspace.resources.inspect_resource(key)
+            self.assertEqual(lease["owner_id"], f"lane:{lane['lane_id']}")
+        self.assertTrue(self.git.writer.exists())
+
+    def test_lane_backed_close_preserves_lane_ownership_and_satisfies_close(self) -> None:
+        lane = self.lane_receipt()
+        manifest = self.lane_manifest(lane)
+        (self.git.writer / "src" / "app.py").write_text("value = 2\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        manifest["tasks"].update({"tests": "tests-task", "review": "review-task"})
+        collection = persist_collection(
+            manifest,
+            {
+                "writer_head": snapshot["writer_head"],
+                "diff_sha256": snapshot["diff_sha256"],
+            },
+        )
+        with (
+            mock.patch.object(
+                workspace, "_task_public", return_value={"state": "completed", "terminal": True}
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.resources, "release_resources") as release,
+            mock.patch.object(
+                workspace.checkouts, "_mark_checkout_completed_retained"
+            ) as lifecycle_mutation,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            result = workspace.grabowski_agent_workspace_close(
+                manifest["workspace_id"],
+                snapshot["writer_head"],
+                snapshot["diff_sha256"],
+                collection["result_sha256"],
+            )
+            cleanup_plan = workspace._workspace_cleanup_plan_data(
+                workspace._manifest(manifest["workspace_id"])
+            )
+        release.assert_not_called()
+        lifecycle_mutation.assert_not_called()
+        receipt = result["close_receipt"]
+        self.assertEqual(receipt["state"], "complete")
+        self.assertFalse(receipt["resources_released"])
+        self.assertTrue(receipt["lane_resources_preserved"])
+        self.assertFalse(receipt["workspace_resources_owned"])
+        self.assertEqual(
+            receipt["remaining_resource_keys"],
+            sorted(lane["inputs"]["resource_keys"]),
+        )
+        self.assertEqual(
+            receipt["checkout_lifecycle_decision"]["selected_action"],
+            "preserve_lane_owned",
+        )
+        self.assertEqual(
+            result["execution_outcome_binding"]["state"],
+            "not_applicable_lane_backed",
+        )
+        self.assertTrue(
+            workspace._close_integrity_status(
+                workspace._manifest(manifest["workspace_id"]), receipt
+            )["valid"]
+        )
+        lease_item = next(
+            item
+            for item in result["external_closeout_checklist"]
+            if item["item"] == "workspace_lease_release"
+        )
+        self.assertEqual(lease_item["status"], "verified")
+        self.assertTrue(cleanup_plan["closed"])
+        self.assertEqual(cleanup_plan["lifecycle_state"], "lane_owned_preserved")
+        self.assertFalse(cleanup_plan["eligible"])
+        self.assertIn(
+            "lane_owned_checkout_preserved",
+            {item["code"] for item in cleanup_plan["blockers"]},
+        )
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "owned exclusively by Work Lane closeout"
+            ):
+                workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    cleanup_plan["plan_sha256"],
+                    confirmation="archive-and-remove-worktree",
+                )
+        self.assertTrue(self.git.writer.exists())
+
+    def test_lane_backed_complete_close_survives_later_lane_terminalization(self) -> None:
+        lane = self.lane_receipt()
+        manifest = self.lane_manifest(lane)
+        owner_id = f"lane:{lane['lane_id']}"
+        close_receipt = signed_receipt(
+            {
+                "schema_version": 1,
+                "workspace_id": manifest["workspace_id"],
+                "state": "complete",
+                "closure_outcome": "successful",
+                "resources_released": False,
+                "lane_resources_preserved": True,
+                "workspace_resources_owned": False,
+                "released_resource_keys": [],
+                "remaining_resource_keys": sorted(lane["inputs"]["resource_keys"]),
+                "checkout_lifecycle_decision": {
+                    "selected_action": "preserve_lane_owned",
+                    "ownership_satisfied": True,
+                    "owner_id": owner_id,
+                },
+            }
+        )
+        manifest["close_receipt"] = close_receipt
+        workspace._atomic_json(
+            workspace._workspace_dir(manifest["workspace_id"])
+            / "close-receipt.json",
+            close_receipt,
+        )
+        workspace._write_manifest(manifest)
+        self.assertTrue(
+            workspace._close_integrity_status(manifest, close_receipt)["valid"]
+        )
+
+        with workspace.work_acquire._lane_lock(lane["lane_id"]) as path:
+            terminal_lane = workspace.work_acquire._read_state(path)
+            terminal_lane["state"] = "closed"
+            terminal_lane["terminal_closeout"] = {"state": "complete"}
+            workspace.work_acquire._write_state(path, terminal_lane)
+        workspace.resources.release_resources(
+            owner_id, lane["inputs"]["resource_keys"]
+        )
+
+        with (
+            mock.patch.object(workspace, "_git_snapshot", return_value={"dirty": False}),
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+        ):
+            status = workspace._status_data(workspace._manifest(manifest["workspace_id"]))
+            cleanup_plan = workspace._workspace_cleanup_plan_data(
+                workspace._manifest(manifest["workspace_id"])
+            )
+
+        self.assertFalse(status["lane_binding_status"]["valid"])
+        self.assertFalse(status["creation_ready"])
+        self.assertTrue(status["close_integrity"]["valid"])
+        self.assertTrue(status["closed"])
+        self.assertFalse(status["closeable"])
+        self.assertFalse(status["success_ready"])
+        self.assertTrue(cleanup_plan["closed"])
+        self.assertEqual(cleanup_plan["lifecycle_state"], "lane_owned_preserved")
+        self.assertFalse(cleanup_plan["eligible"])
+        self.assertIn(
+            "lane_owned_checkout_preserved",
+            {item["code"] for item in cleanup_plan["blockers"]},
+        )
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "work lane binding is not live and exact"
+            ):
+                workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "owned exclusively by Work Lane closeout"
+            ):
+                workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    cleanup_plan["plan_sha256"],
+                    confirmation="archive-and-remove-worktree",
+                )
 
     def test_writer_checkout_lifecycle_binding_is_explicit_and_idempotent(self) -> None:
         manifest = self.manifest()
