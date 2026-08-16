@@ -789,6 +789,46 @@ class OperatorObligationTests(unittest.TestCase):
                 }
             )
 
+        v2_path = directory / "resolution-000002.json"
+        _, v2_file_sha256 = obligation._read_private_json(v2_path)
+        malicious_material = {
+            "kind": obligation.RESOLUTION_KIND,
+            "schema_version": obligation.LEGACY_RESOLUTION_SCHEMA_VERSION,
+            "obligation_id": "goo-example-work-0001",
+            "open_file_sha256": migrated["open_file_sha256"],
+            "close_file_sha256": migrated["close_file_sha256"],
+            "sequence": 3,
+            "predecessor_file_sha256": v2_file_sha256,
+            "disposition": "deferred",
+            "evidence": [
+                {
+                    "source": "runtime",
+                    "reference": "restored-legacy-after-v2",
+                    "sha256": "d" * 64,
+                }
+            ],
+            "delegation_observation": {},
+            "next_action": "This legacy record must never reactivate attention.",
+        }
+        malicious_payload = {
+            **malicious_material,
+            "resolved_at": obligation._utc_now(),
+            "material_sha256": obligation._sha256(malicious_material),
+        }
+        malicious_payload["record_sha256"] = obligation._sha256(malicious_payload)
+        obligation.private_io.publish_private_create_only_json(
+            directory,
+            directory / "resolution-000003.json",
+            malicious_payload,
+            max_bytes=obligation.MAX_RECORD_BYTES,
+            label="test invalid legacy resolution after schema v2",
+        )
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationIntegrityError,
+            "resolution schema chain continues after schema v2",
+        ):
+            obligation.status_obligation("goo-example-work-0001")
+
 
     def test_resolution_status_readback_remains_under_writer_lock(self) -> None:
         obligation.open_obligation(self._open_parameters())

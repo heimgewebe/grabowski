@@ -945,6 +945,7 @@ def _read_resolution_chain(
 ) -> list[tuple[dict[str, Any], str, Path]]:
     chain: list[tuple[dict[str, Any], str, Path]] = []
     predecessor: str | None = None
+    seen_schema_v2 = False
     for sequence, path in _resolution_entries(directory):
         record, file_sha256 = _read_private_json(path)
         _validate_resolution_record(
@@ -956,6 +957,12 @@ def _read_resolution_chain(
             expected_sequence=sequence,
             expected_predecessor_file_sha256=predecessor,
         )
+        if seen_schema_v2:
+            raise OperatorObligationIntegrityError(
+                "operator obligation resolution schema chain continues after schema v2"
+            )
+        if record["schema_version"] == RESOLUTION_SCHEMA_VERSION:
+            seen_schema_v2 = True
         chain.append((record, file_sha256, path))
         predecessor = file_sha256
     return chain
