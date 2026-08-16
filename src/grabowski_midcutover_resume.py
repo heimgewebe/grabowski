@@ -982,6 +982,252 @@ def _resume_phase(
     return None
 
 
+_RESUME_BINDING_V2_KEYS = frozenset(
+    {
+        "resume_binding_schema_version",
+        "cutover_id",
+        "resumed_receipt_sha256",
+        "resume_phase",
+        "cutover_generation",
+        "snapshot_binding_state",
+        "blue_release_id",
+        "blue_repo_head",
+        "target_head",
+        "expected_head",
+        "expected_selector_sha256",
+        "switch_selector_sha256",
+        "expected_generation",
+        "switch_generation",
+        "expected_slot",
+        "pointer_state",
+        "green_retired",
+        "expected_release_id",
+        "expected_runtime_binding_sha256",
+        "expected_upstream_port",
+        "source_identity_sha256",
+        "source_evidence_time",
+        "activation_observation_sha256",
+        "publication_request_id",
+        "registered_tool_count",
+        "registered_names_sha256",
+        "agent_instructions_sha256",
+        "green_readiness",
+        "source_snapshot_receipt_sha256",
+        "source_client_declaration_sha256",
+        "classified_snapshot_receipt_sha256",
+        "binding_sha256",
+    }
+)
+_LEGACY_TERMINAL_BINDING_KEYS = frozenset(
+    _RESUME_BINDING_V2_KEYS
+    - {
+        "resume_binding_schema_version",
+        "source_snapshot_receipt_sha256",
+        "source_client_declaration_sha256",
+        "classified_snapshot_receipt_sha256",
+    }
+)
+_BINDING_SHA256_KEYS = frozenset(
+    {
+        "resumed_receipt_sha256",
+        "expected_selector_sha256",
+        "switch_selector_sha256",
+        "expected_runtime_binding_sha256",
+        "source_identity_sha256",
+        "activation_observation_sha256",
+        "registered_names_sha256",
+        "agent_instructions_sha256",
+        "source_snapshot_receipt_sha256",
+        "source_client_declaration_sha256",
+        "classified_snapshot_receipt_sha256",
+        "binding_sha256",
+    }
+)
+
+
+def _green_readiness_matches_resume_binding(
+    readiness: Any, binding: dict[str, Any]
+) -> bool:
+    """Bind readiness metadata to the exact release surface being resumed."""
+    if not isinstance(readiness, dict) or readiness.get("ready") is not True:
+        return False
+    count = binding["registered_tool_count"]
+    if (
+        readiness.get("release_id") != binding["expected_release_id"]
+        or readiness.get("repo_head") != binding["target_head"]
+        or readiness.get("complete_schema_count") != count
+        or readiness.get("names_sha256") != binding["registered_names_sha256"]
+        or readiness.get("agent_instructions_sha256")
+        != binding["agent_instructions_sha256"]
+    ):
+        return False
+    for optional_count in ("observed_tool_count",):
+        if optional_count in readiness and readiness.get(optional_count) != count:
+            return False
+    for key in (
+        "complete_schema_sha256",
+        "schema_identity_sha256",
+        "names_sha256",
+        "agent_instructions_sha256",
+        "expected_agent_instructions_sha256",
+        "observed_agent_instructions_sha256",
+        "observed_tools_artifact_sha256",
+    ):
+        if key in readiness and SHA256_RE.fullmatch(str(readiness.get(key))) is None:
+            return False
+    schema_hashes = readiness.get("schema_sha256_by_tool")
+    if schema_hashes is not None:
+        if (
+            not isinstance(schema_hashes, dict)
+            or not schema_hashes
+            or any(
+                not isinstance(name, str)
+                or not name
+                or SHA256_RE.fullmatch(str(digest)) is None
+                for name, digest in schema_hashes.items()
+            )
+            or readiness.get("schema_identity_sha256")
+            != canonical_json_sha256(schema_hashes)
+        ):
+            return False
+    return True
+
+
+def _validated_resume_binding(
+    value: Any, *, allow_legacy_terminal: bool = False
+) -> dict[str, Any] | None:
+    """Validate the one authoritative resume-binding schema.
+
+    The legacy branch exists only to keep already-written completed receipts as
+    terminal tombstones.  It is never emitted by new code and never authorises
+    an effect; v2 is the sole binding accepted for a new resume.
+    """
+    if not isinstance(value, dict):
+        return None
+    binding = dict(value)
+    keys = frozenset(binding)
+    is_v2 = binding.get("resume_binding_schema_version") == 2
+    if is_v2:
+        if keys != _RESUME_BINDING_V2_KEYS:
+            return None
+    elif not allow_legacy_terminal or keys != _LEGACY_TERMINAL_BINDING_KEYS:
+        return None
+
+    material = dict(binding)
+    binding_sha256 = material.pop("binding_sha256", None)
+    if canonical_json_sha256(material) != binding_sha256:
+        return None
+    for key in _BINDING_SHA256_KEYS & keys:
+        if SHA256_RE.fullmatch(str(binding.get(key))) is None:
+            return None
+    for key in ("blue_repo_head", "target_head", "expected_head"):
+        if HEAD_RE.fullmatch(str(binding.get(key) or "")) is None:
+            return None
+    for key in (
+        "cutover_generation",
+        "expected_generation",
+        "switch_generation",
+        "expected_upstream_port",
+        "source_evidence_time",
+        "registered_tool_count",
+    ):
+        item = binding.get(key)
+        minimum = 0 if key == "source_evidence_time" else 1
+        if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
+            return None
+    if (
+        CUTOVER_ID_RE.fullmatch(str(binding.get("cutover_id") or "")) is None
+        or CUTOVER_ID_RE.fullmatch(
+            str(binding.get("publication_request_id") or "")
+        )
+        is None
+        or binding.get("expected_head") != binding.get("target_head")
+        or not release_id_binds_head(
+            binding.get("blue_release_id"), binding.get("blue_repo_head")
+        )
+        or not release_id_binds_head(
+            binding.get("expected_release_id"), binding.get("target_head")
+        )
+        or type(binding.get("green_retired")) is not bool
+        or binding.get("expected_slot") not in ROUTING_SLOTS
+        or binding.get("expected_upstream_port")
+        != ROUTING_SLOTS[binding["expected_slot"]]
+        or not _green_readiness_matches_resume_binding(
+            binding.get("green_readiness"), binding
+        )
+    ):
+        return None
+
+    phase_state = {
+        PHASE_REBIND_SNAPSHOT: (
+            GREEN_SLOT,
+            SNAPSHOT_BINDING_PENDING,
+            "blue",
+            False,
+        ),
+        PHASE_PROMOTE_POINTER: (
+            GREEN_SLOT,
+            SNAPSHOT_BINDING_DONE,
+            "blue",
+            False,
+        ),
+        PHASE_SELECT_CANONICAL: (
+            GREEN_SLOT,
+            SNAPSHOT_BINDING_DONE,
+            "target",
+            False,
+        ),
+        PHASE_RETIRE_GREEN: (
+            CANONICAL_SLOT,
+            SNAPSHOT_BINDING_DONE,
+            "target",
+            False,
+        ),
+        PHASE_CLOSEOUT: (
+            CANONICAL_SLOT,
+            SNAPSHOT_BINDING_DONE,
+            "target",
+            True,
+        ),
+    }
+    expected_state = phase_state.get(binding.get("resume_phase"))
+    observed_state = (
+        binding.get("expected_slot"),
+        binding.get("snapshot_binding_state"),
+        binding.get("pointer_state"),
+        binding.get("green_retired"),
+    )
+    if expected_state is None or observed_state != expected_state:
+        return None
+    if binding["expected_slot"] == GREEN_SLOT:
+        if (
+            binding.get("expected_selector_sha256")
+            != binding.get("switch_selector_sha256")
+            or binding.get("expected_generation")
+            != binding.get("switch_generation")
+        ):
+            return None
+    elif (
+        binding.get("expected_generation") != binding.get("switch_generation") + 1
+        or binding.get("expected_selector_sha256")
+        == binding.get("switch_selector_sha256")
+    ):
+        return None
+    if is_v2:
+        if binding["resume_phase"] == PHASE_REBIND_SNAPSHOT:
+            if (
+                binding["classified_snapshot_receipt_sha256"]
+                != binding["source_snapshot_receipt_sha256"]
+            ):
+                return None
+        elif (
+            binding["classified_snapshot_receipt_sha256"]
+            == binding["source_snapshot_receipt_sha256"]
+        ):
+            return None
+    return binding
+
+
 def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None:
     """The full identity a completed resume must carry to resolve a cutover.
 
@@ -995,51 +1241,73 @@ def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None
         return None
     if receipt.get("kind") != RESUME_RECEIPT_KIND:
         return None
-    if receipt.get("outcome") != "completed":
-        return None
-    binding = receipt.get("resume_binding")
-    if not isinstance(binding, dict):
-        return None
-    binding_material = dict(binding)
-    binding_sha256 = binding_material.pop("binding_sha256", None)
     if (
-        canonical_json_sha256(binding_material) != binding_sha256
-        or receipt.get("resume_binding_sha256") != binding_sha256
+        receipt.get("outcome") != "completed"
+        or receipt.get("phase") != "completed"
+        or receipt.get("recovery") is not None
     ):
         return None
-    for digest in (receipt.get("resumed_receipt_sha256"), binding_sha256):
-        if SHA256_RE.fullmatch(str(digest)) is None:
-            return None
+    binding = _validated_resume_binding(
+        receipt.get("resume_binding"), allow_legacy_terminal=True
+    )
+    if binding is None:
+        return None
+    binding_sha256 = binding["binding_sha256"]
+    if receipt.get("resume_binding_sha256") != binding_sha256:
+        return None
+    legacy_terminal = "resume_binding_schema_version" not in binding
     if (
         receipt.get("resumed_cutover_id") != binding.get("cutover_id")
         or receipt.get("resumed_receipt_sha256")
         != binding.get("resumed_receipt_sha256")
-        or receipt.get("expected_head") != binding.get("target_head")
+        or receipt.get("expected_head") != binding.get("expected_head")
         or receipt.get("green_release_id") != binding.get("expected_release_id")
         or receipt.get("resume_phase") != binding.get("resume_phase")
+        or receipt.get("source_identity_sha256")
+        != binding.get("source_identity_sha256")
+        or receipt.get("resumed_selector_sha256")
+        != binding.get("expected_selector_sha256")
+        or receipt.get("resumed_generation") != binding.get("expected_generation")
     ):
         return None
+    # ``execution_expected_head`` was an incorrectly named duplicate in v1:
+    # it carried the target head, not the revision executing the recovery.  A
+    # new v2 receipt must not revive that false authority; a legacy tombstone
+    # must at least agree with the target it historically represented.
     if (
-        HEAD_RE.fullmatch(str(binding.get("target_head") or "")) is None
-        or HEAD_RE.fullmatch(str(binding.get("blue_repo_head") or "")) is None
-        or parse_release_id(binding.get("expected_release_id")) is None
-        or not release_id_binds_head(
-            binding.get("blue_release_id"), binding.get("blue_repo_head")
+        (not legacy_terminal and "execution_expected_head" in receipt)
+        or (
+            legacy_terminal
+            and receipt.get("execution_expected_head") != binding["target_head"]
         )
-        or isinstance(binding.get("cutover_generation"), bool)
-        or not isinstance(binding.get("cutover_generation"), int)
-        or binding["cutover_generation"] < 1
     ):
         return None
-    derived_phase = _resume_phase(
-        slot=str(binding.get("expected_slot")),
-        pointer_promoted=binding.get("pointer_state") == "target",
-        green_retired=binding.get("green_retired") is True,
-        snapshot_rebound=(
-            binding.get("snapshot_binding_state") == SNAPSHOT_BINDING_DONE
-        ),
+    contract = receipt.get("target_contract")
+    contract_identity = (
+        parse_release_id(binding["expected_release_id"])
+        if isinstance(contract, dict)
+        else None
     )
-    if derived_phase != binding.get("resume_phase"):
+    if (
+        not isinstance(contract, dict)
+        or contract.get("release_id") != binding["expected_release_id"]
+        or contract.get("repo_head") != binding["target_head"]
+        or contract.get("expected_tool_count") != binding["registered_tool_count"]
+        or SHA256_RE.fullmatch(str(contract.get("entrypoint_contract_sha256")))
+        is None
+        or SHA256_RE.fullmatch(str(contract.get("decoded_contract_sha256"))) is None
+        or str(contract.get("entrypoint_contract_sha256"))[:12]
+        != contract_identity["contract12"]
+        or contract.get("release_identity") != contract_identity
+        or isinstance(contract.get("schema_version"), bool)
+        or contract.get("schema_version") not in {1, 2, 3, 4}
+        or contract.get("mode") not in {"module", "source"}
+        or not isinstance(contract.get(contract.get("mode")), str)
+        or not contract.get(contract.get("mode"))
+        or contract.get("historical_validator_executed") is not True
+        or contract.get("executed_release_code") is not False
+        or contract.get("judged_by_checkout") is not False
+    ):
         return None
     routing = receipt.get("final_routing")
     if (
@@ -1082,6 +1350,25 @@ def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None
         return None
     if SHA256_RE.fullmatch(str(rebind.get("receipt_sha256"))) is None:
         return None
+    if not legacy_terminal:
+        if (
+            rebind.get("source_snapshot_receipt_sha256")
+            != binding["source_snapshot_receipt_sha256"]
+            or rebind.get("source_client_declaration_sha256")
+            != binding["source_client_declaration_sha256"]
+            or rebind.get("source_release_id") != binding["blue_release_id"]
+            or rebind.get("source_repo_head") != binding["blue_repo_head"]
+            or rebind.get("target_release_id") != binding["expected_release_id"]
+            or rebind.get("target_repo_head") != binding["target_head"]
+            or rebind.get("classified_snapshot_receipt_sha256")
+            != binding["classified_snapshot_receipt_sha256"]
+            or (
+                binding["resume_phase"] != PHASE_REBIND_SNAPSHOT
+                and rebind.get("receipt_sha256")
+                != binding["classified_snapshot_receipt_sha256"]
+            )
+        ):
+            return None
     retirement = receipt.get("retirement")
     admission = receipt.get("admission_state")
     final = receipt.get("final_state")
@@ -1128,6 +1415,15 @@ def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None
         or final_green.get("active") is not False
         or final_green.get("unit") != expected_green_unit
         or final_green.get("error") is not None
+    ):
+        return None
+    if not legacy_terminal and (
+        final_snapshot.get("source_snapshot_receipt_sha256")
+        != binding["source_snapshot_receipt_sha256"]
+        or final_snapshot.get("source_client_declaration_sha256")
+        != binding["source_client_declaration_sha256"]
+        or final_snapshot.get("classified_snapshot_receipt_sha256")
+        != rebind.get("receipt_sha256")
     ):
         return None
     schema_changed = final_snapshot.get("schema_changed")
@@ -1223,6 +1519,8 @@ def _lineage_resolved(
             != activation.get("publication_request_id")
             or binding.get("registered_names_sha256")
             != cutover.get("names_sha256")
+            or binding.get("registered_tool_count")
+            != cutover.get("green_readiness", {}).get("complete_schema_count")
             or binding.get("agent_instructions_sha256")
             != cutover.get("agent_instructions_sha256")
             or binding.get("green_readiness") != cutover.get("green_readiness")
@@ -1608,6 +1906,40 @@ def classify_recovery_lane(
             SNAPSHOT_BINDING_PENDING,
             SNAPSHOT_BINDING_DONE,
         }
+        source_snapshot_receipt_sha256 = (
+            snapshot_observation.get("source_snapshot_receipt_sha256")
+            if isinstance(snapshot_observation, dict)
+            else None
+        )
+        source_client_declaration_sha256 = (
+            snapshot_observation.get("source_client_declaration_sha256")
+            if isinstance(snapshot_observation, dict)
+            else None
+        )
+        classified_snapshot_receipt_sha256 = (
+            snapshot_observation.get("classified_snapshot_receipt_sha256")
+            if isinstance(snapshot_observation, dict)
+            else None
+        )
+        checks["snapshot_identity_digests_authentic"] = all(
+            SHA256_RE.fullmatch(str(value or "")) is not None
+            for value in (
+                source_snapshot_receipt_sha256,
+                source_client_declaration_sha256,
+                classified_snapshot_receipt_sha256,
+            )
+        )
+        checks["classified_snapshot_is_observed_snapshot"] = (
+            classified_snapshot_receipt_sha256
+            == snapshot_observation.get("snapshot_receipt_sha256")
+            if isinstance(snapshot_observation, dict)
+            else False
+        )
+        checks["predecessor_snapshot_identity_is_exact"] = (
+            snapshot_state != SNAPSHOT_BINDING_PENDING
+            or classified_snapshot_receipt_sha256
+            == source_snapshot_receipt_sha256
+        )
         # A cutover whose snapshot rebind never happened is not finishable by
         # promoting canonical: the contract it broke is still broken.
         checks["snapshot_rebind_precedes_promotion"] = (
@@ -1682,6 +2014,7 @@ def classify_recovery_lane(
 
         if all(checks.values()) and phase is not None:
             resume_binding = {
+                "resume_binding_schema_version": 2,
                 "cutover_id": str(candidate["cutover_id"]),
                 "resumed_receipt_sha256": str(candidate["receipt_sha256"]),
                 "resume_phase": phase,
@@ -1719,8 +2052,22 @@ def classify_recovery_lane(
                     "agent_instructions_sha256"
                 ),
                 "green_readiness": candidate.get("green_readiness"),
+                "source_snapshot_receipt_sha256": (
+                    source_snapshot_receipt_sha256
+                ),
+                "source_client_declaration_sha256": (
+                    source_client_declaration_sha256
+                ),
+                "classified_snapshot_receipt_sha256": (
+                    classified_snapshot_receipt_sha256
+                ),
             }
             resume_binding["binding_sha256"] = canonical_json_sha256(resume_binding)
+            checks["resume_binding_schema_valid"] = (
+                _validated_resume_binding(resume_binding) is not None
+            )
+            if not checks["resume_binding_schema_valid"]:
+                resume_binding = None
 
     reasons = sorted(name for name, ok in checks.items() if not ok)
     return _verdict(

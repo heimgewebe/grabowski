@@ -898,6 +898,117 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
         self.assertFalse(foreign["allowed"])
         self.assertFalse(foreign["completion_warrant"])
 
+    def test_published_recovery_tool_dispatches_every_s0_s4_phase_to_resume(self) -> None:
+        for phase in provenance_recovery.midcutover.RESUME_PHASES:
+            with self.subTest(phase=phase):
+                binding = {
+                    "cutover_id": "bgc-cold-reentry",
+                    "resumed_receipt_sha256": "cd" * 32,
+                    "binding_sha256": "ab" * 32,
+                    "resume_phase": phase,
+                }
+                lane = {
+                    "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+                    "resume_binding": binding,
+                    "classification_sha256": "ef" * 32,
+                    "reasons": [],
+                }
+                gate = {
+                    "allowed": True,
+                    "reasons": [],
+                    "resume_binding": binding,
+                    "recovery_lane": lane,
+                }
+                expected_command = [
+                    "/usr/bin/python3",
+                    "/nonexistent-repo/tools/run_midcutover_resume.py",
+                    "--expected-head",
+                    HEAD,
+                    "--resume-binding-sha256",
+                    "ab" * 32,
+                ]
+                with (
+                    patch.object(
+                        provenance_recovery, "_recovery_lane", return_value=lane
+                    ),
+                    patch.object(
+                        provenance_recovery, "evaluate_resume_gate", return_value=gate
+                    ),
+                    patch.object(
+                        provenance_recovery,
+                        "_volatile_gate_recheck",
+                        return_value={"reasons": [], "checks": {}},
+                    ),
+                    patch.object(
+                        provenance_recovery.base,
+                        "_append_audit_with_digest",
+                        return_value="de" * 32,
+                    ),
+                    patch.object(
+                        provenance_recovery.base, "_require_valid_audit_chain"
+                    ),
+                    patch.object(
+                        provenance_recovery.self_deploy,
+                        "_midcutover_resume_command",
+                        return_value=expected_command,
+                    ) as command_builder,
+                    patch.object(
+                        provenance_recovery.self_deploy, "_write_deploy_index"
+                    ),
+                    patch.object(
+                        provenance_recovery.operator,
+                        "_start_job",
+                        return_value={"unit": "grabowski-job-resume", "argv_sha256": "aa" * 32},
+                    ) as start_job,
+                    patch.object(
+                        provenance_recovery, "_repair_under_schedule_lock"
+                    ) as ordinary_repair,
+                ):
+                    result = (
+                        provenance_recovery.grabowski_recovery_provenance_repair(
+                            HEAD
+                        )
+                    )
+
+                command_builder.assert_called_once_with(
+                    provenance_recovery.self_deploy.CANONICAL_REPOSITORY,
+                    provenance_recovery.self_deploy.CANONICAL_REPOSITORY
+                    / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    HEAD,
+                    "bgc-cold-reentry",
+                    "ab" * 32,
+                )
+                start_job.assert_called_once()
+                self.assertEqual(start_job.call_args.args[0], expected_command)
+                self.assertEqual(
+                    start_job.call_args.kwargs["invoker_tool"],
+                    "grabowski_recovery_provenance_repair",
+                )
+                ordinary_repair.assert_not_called()
+                self.assertEqual(result["lane"], lane["lane"])
+
+    def test_fail_closed_public_recovery_lane_starts_no_runner(self) -> None:
+        fail_closed = {
+            "lane": provenance_recovery.midcutover.LANE_FAIL_CLOSED,
+            "resume_binding": None,
+            "reasons": ["durable_state_unclassifiable"],
+        }
+        denied = {
+            "allowed": False,
+            "reasons": ["recovery_lane_classified"],
+            "recovery_lane": fail_closed,
+        }
+        with (
+            patch.object(
+                provenance_recovery, "_recovery_lane", return_value=fail_closed
+            ),
+            patch.object(provenance_recovery, "evaluate_gate", return_value=denied),
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(provenance_recovery.ProvenanceRecoveryDenied):
+                provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+        start_job.assert_not_called()
+
 
 class IntegrityStateTests(unittest.TestCase):
     """Unknown integrity is not a repair warrant."""

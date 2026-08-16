@@ -339,6 +339,68 @@ class OperatorContractTests(unittest.TestCase):
         self.assertTrue(result["called"])
         self.assertTrue(operator._DEPLOYMENT_ADMISSION_GATE_INSTALLED)
 
+    def test_cold_reentry_tools_wait_for_active_marker_then_reenter_after_expiry(
+        self,
+    ) -> None:
+        operator = _load_operator_module()
+        tool_names = (
+            "grabowski_recovery_provenance_repair",
+            "grabowski_runtime_deploy_schedule",
+        )
+        for name in tool_names:
+            operator.mcp._registered_tools[name] = types.SimpleNamespace(
+                is_async=False,
+                context_kwarg=None,
+                annotations=types.SimpleNamespace(readOnlyHint=False),
+            )
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "deployment-admission-drain.json"
+            payload = {
+                "schema_version": 1,
+                "kind": operator.DEPLOYMENT_ADMISSION_MARKER_KIND,
+                "token": "a" * 64,
+                "expected_head": "b" * 40,
+                "source_identity_sha256": "c" * 64,
+                "created_at_unix": now - 60,
+                "expires_at_unix": now + 60,
+            }
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            marker.chmod(0o600)
+            with (
+                patch.object(operator, "DEPLOYMENT_ADMISSION_MARKER_PATH", marker),
+                patch.object(
+                    operator, "_require_transport_roundtrip_for_tool", return_value=None
+                ) as transport_gate,
+            ):
+                operator._configure_http_runtime()
+                for name in tool_names:
+                    with self.subTest(tool=name, marker="active"):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "rejects new tool calls"
+                        ):
+                            operator.asyncio.run(
+                                operator.mcp._tool_manager.call_tool(
+                                    name, {"expected_head": "b" * 40}
+                                )
+                            )
+                transport_gate.assert_not_called()
+
+                payload["expires_at_unix"] = now - 1
+                marker.write_text(json.dumps(payload), encoding="utf-8")
+                marker.chmod(0o600)
+                for name in tool_names:
+                    with self.subTest(tool=name, marker="expired"):
+                        result = operator.asyncio.run(
+                            operator.mcp._tool_manager.call_tool(
+                                name, {"expected_head": "b" * 40}
+                            )
+                        )
+                        self.assertTrue(result["called"])
+
+        self.assertEqual(transport_gate.call_count, len(tool_names))
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
     def test_deployment_admission_gate_offloads_sync_tools_from_event_loop(self) -> None:
         operator = _load_operator_module()
         caller_thread = threading.get_ident()

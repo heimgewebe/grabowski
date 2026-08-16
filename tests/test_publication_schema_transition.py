@@ -252,6 +252,11 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             return client_snapshot.rebind_snapshot_for_midcutover_recovery(
                 **parameters,
                 observation_scope=client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+                source_snapshot_receipt_sha256=self.source["receipt_sha256"],
+                source_client_declaration_sha256=self.source[
+                    "client_declaration_sha256"
+                ],
+                classified_snapshot_receipt_sha256=self.source["receipt_sha256"],
                 receipt_root=self.receipt_root,
             )
 
@@ -259,6 +264,29 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         self.assertEqual(
             json.loads(self.snapshot_path.read_text(encoding="utf-8")), self.source
         )
+
+    def _inspection_parameters(
+        self, request_id: str, *, now_unix: int = 5_000
+    ) -> dict[str, object]:
+        return {
+            "cutover_id": CUTOVER_ID,
+            "cutover_generation": 1,
+            "source_release_id": "blue",
+            "source_repo_head": HEAD_BLUE,
+            "target_release_id": "green",
+            "target_repo_head": HEAD_GREEN,
+            "source_evidence_time": self.now_unix,
+            "publication_request_id": request_id,
+            "registered_tool_count": TOOL_COUNT,
+            "registered_names_sha256": NAMES_SHA256,
+            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "green_readiness": _green_readiness(
+                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
+                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+            ),
+            "path": self.snapshot_path,
+            "now_unix": now_unix,
+        }
 
     # ---- 1: unchanged schema keeps working -------------------------------
 
@@ -456,26 +484,7 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
 
     def test_canonical_inspection_proves_predecessor_and_rebound_lineage(self) -> None:
         prepared = self._prepare_publication()
-        readiness = _green_readiness(
-            schema_by_tool=GREEN_SCHEMA_BY_TOOL,
-            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
-        )
-        parameters = {
-            "cutover_id": CUTOVER_ID,
-            "cutover_generation": 1,
-            "source_release_id": "blue",
-            "source_repo_head": HEAD_BLUE,
-            "target_release_id": "green",
-            "target_repo_head": HEAD_GREEN,
-            "source_evidence_time": self.now_unix,
-            "publication_request_id": prepared["request_id"],
-            "registered_tool_count": TOOL_COUNT,
-            "registered_names_sha256": NAMES_SHA256,
-            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
-            "green_readiness": readiness,
-            "path": self.snapshot_path,
-            "now_unix": 5_000,
-        }
+        parameters = self._inspection_parameters(prepared["request_id"])
         before = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
         self.assertEqual(
             before["state"], client_snapshot.SNAPSHOT_BINDING_PREDECESSOR
@@ -488,6 +497,18 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         after = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
         self.assertEqual(after["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND)
         self.assertEqual(after["snapshot_receipt_sha256"], result["receipt_sha256"])
+        self.assertEqual(
+            result["source_snapshot_receipt_sha256"],
+            before["snapshot_receipt_sha256"],
+        )
+        self.assertEqual(
+            result["source_client_declaration_sha256"],
+            before["source_client_declaration_sha256"],
+        )
+        self.assertEqual(
+            after["classified_snapshot_receipt_sha256"],
+            result["receipt_sha256"],
+        )
 
         tampered = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
         tampered["cutover_binding"]["cutover_generation"] = 2
@@ -496,6 +517,83 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         client_snapshot._write_private_json(self.snapshot_path, tampered)
         foreign = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
         self.assertEqual(foreign["state"], client_snapshot.SNAPSHOT_BINDING_FOREIGN)
+
+    def test_s0_cas_rejects_equivalent_snapshot_replacement_before_write(self) -> None:
+        prepared = self._prepare_publication()
+        parameters = self._inspection_parameters(prepared["request_id"])
+        classified = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
+        self.assertEqual(
+            classified["state"], client_snapshot.SNAPSHOT_BINDING_PREDECESSOR
+        )
+
+        replacement = json.loads(json.dumps(self.source))
+        replacement["client_declaration"]["session_id"] = "session-2"
+        replacement["client_declaration_sha256"] = client_snapshot._sha256_json(
+            replacement["client_declaration"]
+        )
+        replacement.pop("receipt_sha256")
+        replacement["receipt_sha256"] = client_snapshot._sha256_json(replacement)
+        client_snapshot._write_private_json(self.snapshot_path, replacement)
+
+        with self.assertRaisesRegex(
+            client_snapshot.ClientSnapshotError,
+            "classified predecessor snapshot identity changed",
+        ):
+            self._rebind(
+                source_evidence_time=self.now_unix,
+                publication_request_id=prepared["request_id"],
+                now_unix=5_000,
+            )
+        self.assertEqual(
+            json.loads(self.snapshot_path.read_text(encoding="utf-8")), replacement
+        )
+        self.assertIsNone(replacement.get("cutover_transition"))
+
+    def test_later_effect_guard_rejects_rebound_receipt_drift(self) -> None:
+        prepared = self._prepare_publication()
+        first = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_000,
+        )
+        parameters = self._inspection_parameters(prepared["request_id"])
+        classified = client_snapshot.inspect_cutover_snapshot_binding(**parameters)
+        self.assertEqual(
+            classified["classified_snapshot_receipt_sha256"],
+            first["receipt_sha256"],
+        )
+
+        client_snapshot._write_private_json(self.snapshot_path, self.source)
+        second = self._rebind(
+            source_evidence_time=self.now_unix,
+            publication_request_id=prepared["request_id"],
+            now_unix=5_001,
+        )
+        self.assertNotEqual(second["receipt_sha256"], first["receipt_sha256"])
+        effect_reached = False
+        with self.assertRaisesRegex(
+            client_snapshot.ClientSnapshotError,
+            "classified snapshot identity changed",
+        ):
+            with client_snapshot.cutover_snapshot_effect_guard(
+                **{
+                    key: value
+                    for key, value in parameters.items()
+                    if key != "now_unix"
+                },
+                expected_state=client_snapshot.SNAPSHOT_BINDING_REBOUND,
+                source_snapshot_receipt_sha256=classified[
+                    "source_snapshot_receipt_sha256"
+                ],
+                source_client_declaration_sha256=classified[
+                    "source_client_declaration_sha256"
+                ],
+                classified_snapshot_receipt_sha256=classified[
+                    "classified_snapshot_receipt_sha256"
+                ],
+            ):
+                effect_reached = True
+        self.assertFalse(effect_reached)
 
     def test_cold_rebound_inspection_refuses_revoked_current_authorization(self) -> None:
         prepared = self._prepare_publication()
