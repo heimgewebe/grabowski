@@ -14,6 +14,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 import grabowski_capabilities as capabilities
+import grabowski_checkouts as checkouts
 import grabowski_mcp as base
 import grabowski_audit_signal as audit_signal
 import grabowski_consumer_surface as consumer_surface
@@ -1080,6 +1081,26 @@ def grabowski_checkout_summary(
         if next_offset < len(worktrees)
         else None
     )
+    repository = context.get("repository")
+    try:
+        active_capacity = (
+            checkouts.active_capacity_projection(Path(repository))
+            if isinstance(repository, str) and repository
+            else {
+                "available": False,
+                "does_not_establish": ["absence_of_active_bindings"],
+            }
+        )
+    except Exception as exc:  # pragma: no cover - defensive read boundary
+        active_capacity = {
+            "available": False,
+            "error_type": type(exc).__name__,
+            "does_not_establish": [
+                "absence_of_active_bindings",
+                "checkout_terminality",
+                "checkout_cleanup_eligibility",
+            ],
+        }
     warnings: list[dict[str, Any]] = []
     if not bool(context.get("canonical_matches_runtime")):
         warnings.append({"code": "canonical_runtime_head_mismatch"})
@@ -1097,6 +1118,7 @@ def grabowski_checkout_summary(
             context.get("runtime_matching_worktrees", [])
         ),
         "worktree_count": len(worktrees),
+        "active_capacity": active_capacity,
         "worktrees": selected,
         "pagination": {
             "limit": limit,

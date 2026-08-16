@@ -67,6 +67,10 @@ Die Phasen werden read-only wie folgt projiziert:
 - `active` mit wirksamer Retention bleibt `retained`.
 - `active` ohne wirksame Retention wird `managed_active_attention` und fällt
   nicht auf `unclassified_clean` zurück.
+  Für die globale Active-Creation-Kapazität reservieren nur `active`-Bindings
+  mit wirksamer Retention einen der acht Parallelitäts-Slots. Retention-Ablauf
+  lässt Lifecycle-, Dirty-, Pfad- und Branch-Schutz unverändert und erteilt
+  keine Cleanup-, Terminalitäts- oder Wiederverwendungsautorität.
 - `completed_retained` bleibt als terminal-retained und
   archivierungspflichtig sichtbar.
 - `externally_terminal_missing` bezeichnet ausschließlich einen durch
