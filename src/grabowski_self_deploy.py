@@ -1329,6 +1329,15 @@ def _deploy_finalization_retry_block(
     return True
 
 
+def _references_runtime_runner(command: list[str], runner: Path) -> bool:
+    """Does this argv start one of the runners that mutate the live runtime?"""
+    return (
+        len(command) >= 2
+        and command[0] == "/usr/bin/python3"
+        and command[1].endswith(f"/{runner}")
+    )
+
+
 def _bootstrap_deploy_index(
     jobs_root: Path,
     _repository: Path | None = None,
@@ -1350,17 +1359,28 @@ def _bootstrap_deploy_index(
         candidate_command = metadata.get("argv")
         if not isinstance(candidate_command, list) or not all(isinstance(item, str) for item in candidate_command):
             raise RuntimeError(f"durable job argv is malformed: {entry.name}")
-        references_self_deploy = (
-            len(candidate_command) >= 2
-            and candidate_command[0] == "/usr/bin/python3"
-            and candidate_command[1].endswith(f"/{RUNNER_RELATIVE_PATH}")
+        # Both runners mutate the same live runtime, so both belong in the
+        # index this bootstrap rebuilds.  Recognising only the deploy runner
+        # here would drop a live mid-cutover resume before any later reader
+        # sees it, and an ordinary deployment could then be scheduled straight
+        # into the recovery it was supposed to wait for -- the same blindness
+        # this change removes one layer up.
+        references_deploy_runner = _references_runtime_runner(
+            candidate_command, RUNNER_RELATIVE_PATH
         )
+        references_resume_runner = _references_runtime_runner(
+            candidate_command, MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+        )
+        references_runtime_job = references_deploy_runner or references_resume_runner
         unresolved_finalization = (
+            # Only the deploy runner writes the runtime-deploy finalization
+            # receipt this predicate reads; a resume carries its outcome in its
+            # own durable receipt instead.
             _deploy_finalization_retry_block(entry, metadata)
-            if references_self_deploy
+            if references_deploy_runner
             else False
         )
-        if references_self_deploy and (
+        if references_runtime_job and (
             unresolved_finalization
             or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
         ):
@@ -1412,6 +1432,192 @@ def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict
     }
 
 
+class IndexedRuntimeJobConflict(RuntimeError):
+    """An indexed runtime job forbids starting another one right now."""
+
+
+def _classify_indexed_job(entry: Path) -> dict[str, Any]:
+    """Read one indexed durable job into a decided shape.
+
+    Extracted so the scheduler and the recovery lane read the deploy index
+    through the same eyes.  Two readers of one index become two definitions of
+    "is a deployment already running", and the weaker one is the one that lets a
+    second job start.
+    """
+    if entry.is_symlink() or not entry.is_dir():
+        raise IndexedRuntimeJobConflict(
+            f"durable job entry is not a real directory: {entry.name}"
+        )
+    try:
+        metadata = operator._read_job_metadata(entry.name)
+    except (OSError, ValueError, PermissionError) as exc:
+        raise IndexedRuntimeJobConflict(
+            f"durable job metadata is unreadable: {entry.name}"
+        ) from exc
+    candidate_command = metadata.get("argv")
+    if not isinstance(candidate_command, list) or not all(
+        isinstance(item, str) for item in candidate_command
+    ):
+        raise IndexedRuntimeJobConflict(f"durable job argv is malformed: {entry.name}")
+    deploy_fields = _deploy_command_fields(candidate_command)
+    resume_fields = (
+        _midcutover_resume_command_fields(candidate_command)
+        if deploy_fields is None
+        else None
+    )
+    if deploy_fields is None and resume_fields is None:
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job metadata is malformed: {entry.name}"
+        )
+    command_fields = deploy_fields or resume_fields
+    assert command_fields is not None
+    candidate_repository = Path(command_fields["repository"])
+    candidate_runner = str(
+        candidate_repository
+        / (
+            RUNNER_RELATIVE_PATH
+            if deploy_fields is not None
+            else MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+        )
+    )
+    if (
+        candidate_command[0] != "/usr/bin/python3"
+        or candidate_command[1] != candidate_runner
+        or metadata.get("cwd") != str(candidate_repository)
+    ):
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job metadata is malformed: {entry.name}"
+        )
+    argv_sha256 = metadata.get("argv_sha256")
+    if argv_sha256 != _deploy_command_sha256(candidate_command):
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job command hash mismatch: {entry.name}"
+        )
+    status = operator.grabowski_job_status(entry.name)
+    if not isinstance(status, dict):
+        raise IndexedRuntimeJobConflict(
+            f"self deploy job status is unavailable: {entry.name}"
+        )
+    final_status = status.get("final_status")
+    # A job whose finalization receipt says outcome_unknown with blind retry
+    # forbidden is *not* finished in the sense that matters here, however
+    # cleanly its unit exited.  Treating the systemd status as the whole truth
+    # would prune exactly the entry that demands an authoritative runtime
+    # readback before anything else runs.
+    finalization = status.get("finalization_receipt")
+    readback_required = bool(
+        isinstance(finalization, dict)
+        and finalization.get("valid") is True
+        and finalization.get("final_status") == "outcome_unknown"
+        and finalization.get("blind_retry_allowed") is False
+    )
+    return {
+        "unit": entry.name,
+        "kind": "deploy" if deploy_fields is not None else "midcutover_resume",
+        "argv": candidate_command,
+        "argv_sha256": argv_sha256,
+        "metadata": metadata,
+        "status": status,
+        "final_status": final_status,
+        "fields": command_fields,
+        "readback_required": readback_required,
+        "terminal": final_status in TERMINAL_JOB_STATUSES and not readback_required,
+        "reusable": final_status in REUSABLE_JOB_STATUSES and not readback_required,
+    }
+
+
+def inflight_runtime_job_evidence(
+    command: list[str] | None = None, *, prune: bool = False
+) -> dict[str, Any]:
+    """Project the deploy index for a gate, without deciding for it.
+
+    The provenance recovery gate previously looked only at ``pending_unit``.
+    That field is cleared the moment a job actually starts, so between the start
+    and the job's own completion the index looked empty and a second identical
+    repair could dispatch a second job -- the double dispatch this lane exists
+    to prevent.  The units list is the durable record; this reads it.
+
+    Identity matters as much as presence: an in-flight job with the *same* argv
+    is this same intent already running and may be coalesced, while any other
+    in-flight deploy, repair or resume is a competitor and must close the gate.
+    """
+    evidence: dict[str, Any] = {
+        "inflight_units": [],
+        "blocking_units": [],
+        "idempotent_match": None,
+        "ambiguous_identical_units": [],
+        "pruned_units": [],
+        "error": None,
+    }
+    expected_sha256 = _deploy_command_sha256(command) if command else None
+    try:
+        jobs_root = operator._jobs_root()
+        index = _deploy_index(jobs_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        evidence["error"] = f"deployment job index is unreadable: {exc}"
+        return evidence
+    pending = index.get("pending_unit")
+    if pending:
+        # A reservation with no started job yet is still an in-flight intent.
+        evidence["inflight_units"].append(str(pending))
+        evidence["blocking_units"].append(str(pending))
+    retained: list[str] = []
+    for unit in index["units"]:
+        try:
+            classified = _classify_indexed_job(jobs_root / unit)
+        except IndexedRuntimeJobConflict as exc:
+            # Unreadable is not absent.  An entry this reader cannot judge must
+            # close the gate rather than vanish from it.
+            evidence["blocking_units"].append(str(unit))
+            evidence["error"] = str(exc)
+            retained.append(str(unit))
+            continue
+        if classified["terminal"]:
+            evidence["pruned_units"].append(str(unit))
+            continue
+        retained.append(str(unit))
+        evidence["inflight_units"].append(str(unit))
+        if (
+            expected_sha256 is not None
+            and classified["argv_sha256"] == expected_sha256
+            and classified["reusable"]
+        ):
+            if evidence["idempotent_match"] is not None:
+                # Historical double-dispatch residue.  Two identical running
+                # jobs cannot both be "the one we may join", and silently
+                # picking the last would coalesce onto an arbitrary half of an
+                # ambiguity.  Both block instead.
+                evidence["ambiguous_identical_units"] = sorted(
+                    {evidence["idempotent_match"]["unit"], str(unit)}
+                )
+                evidence["blocking_units"].extend(
+                    evidence["ambiguous_identical_units"]
+                )
+                evidence["idempotent_match"] = None
+                evidence["error"] = (
+                    "multiple identical runtime jobs are running: "
+                    + ", ".join(evidence["ambiguous_identical_units"])
+                )
+                continue
+            if evidence.get("ambiguous_identical_units"):
+                evidence["blocking_units"].append(str(unit))
+                continue
+            evidence["idempotent_match"] = {
+                "unit": classified["unit"],
+                "kind": classified["kind"],
+                "argv_sha256": classified["argv_sha256"],
+                "final_status": classified["final_status"],
+            }
+            continue
+        evidence["blocking_units"].append(str(unit))
+    if prune and evidence["pruned_units"] and evidence["error"] is None:
+        try:
+            _write_deploy_index(jobs_root, units=retained, pending_unit=pending)
+        except (OSError, RuntimeError, ValueError) as exc:
+            evidence["error"] = f"deploy index pruning failed: {exc}"
+    return evidence
+
+
 def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict[str, Any] | None:
     expected_fields = _deploy_command_fields(command)
     if expected_fields is None:
@@ -1439,10 +1645,24 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
         ):
             raise RuntimeError(f"durable job argv is malformed: {entry.name}")
         candidate_fields = _deploy_command_fields(candidate_command)
-        if candidate_fields is None:
+        resume_fields = (
+            _midcutover_resume_command_fields(candidate_command)
+            if candidate_fields is None
+            else None
+        )
+        if candidate_fields is None and resume_fields is None:
             raise RuntimeError(f"self deploy job metadata is malformed: {entry.name}")
-        candidate_repository = Path(candidate_fields["repository"])
-        candidate_runner = str(candidate_repository / RUNNER_RELATIVE_PATH)
+        command_fields = candidate_fields or resume_fields
+        assert command_fields is not None
+        candidate_repository = Path(command_fields["repository"])
+        candidate_runner = str(
+            candidate_repository
+            / (
+                RUNNER_RELATIVE_PATH
+                if candidate_fields is not None
+                else MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+            )
+        )
         if (
             candidate_command[0] != "/usr/bin/python3"
             or candidate_command[1] != candidate_runner
@@ -1456,6 +1676,25 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
         if not isinstance(status, dict):
             raise RuntimeError(f"self deploy job status is unavailable: {entry.name}")
         final_status = status.get("final_status")
+        if resume_fields is not None:
+            # The provenance-recovery lane reserves its receipt-bound resume in
+            # this same index so an ordinary deploy cannot race it.  Once that
+            # job is terminal the index has served its concurrency purpose; its
+            # outcome authority remains the durable bgcr receipt and the fresh
+            # recovery classification performed by the scheduled runner before
+            # any deployment effect.  Never reinterpret the resume argv as a
+            # deploy argv, and never discard an in-flight or ambiguous resume.
+            if final_status in TERMINAL_JOB_STATUSES:
+                continue
+            retained_units.append(entry.name)
+            if final_status in REUSABLE_JOB_STATUSES:
+                raise RuntimeError(
+                    f"mid-cutover resume job is still running: {entry.name}"
+                )
+            raise RuntimeError(
+                "mid-cutover resume job has an uncertain non-reusable outcome: "
+                f"{entry.name} ({final_status})"
+            )
         finalization = status.get("finalization_receipt")
         if (
             isinstance(finalization, dict)

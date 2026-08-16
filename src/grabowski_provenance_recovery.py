@@ -335,11 +335,25 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
     return evidence
 
 
-def _competing_deployment_evidence() -> dict[str, Any]:
-    """Detect an in-flight deployment that this lane must not race."""
+def _competing_deployment_evidence(
+    command: list[str] | None = None, *, prune: bool = False
+) -> dict[str, Any]:
+    """Detect an in-flight deployment that this lane must not race.
+
+    This used to consult only ``pending_unit``.  That field exists to cover the
+    window *before* a job starts and is cleared the instant it does, so between
+    a successful dispatch and the job's own completion the index read as empty
+    and a second identical repair could start a second job against the same
+    runtime.  The reservation and the started-unit list are both in-flight
+    evidence, and both are read here now -- through the same classification the
+    scheduler uses, so there is one answer to "is something already running"
+    rather than two that can disagree.
+    """
     evidence: dict[str, Any] = {
         "deploy_lock_free": False,
         "inflight_deploy_jobs": [],
+        "idempotent_match": None,
+        "pruned_units": [],
         "error": None,
     }
     lock_path = Path.home() / ".local/state/grabowski/deploy.lock"
@@ -358,13 +372,13 @@ def _competing_deployment_evidence() -> dict[str, Any]:
             evidence["error"] = f"deploy lock is unreadable: {exc}"
             return evidence
 
-    try:
-        jobs_root = operator._jobs_root()
-        index = self_deploy._deploy_index(jobs_root)
-        if index.get("pending_unit"):
-            evidence["inflight_deploy_jobs"] = [index["pending_unit"]]
-    except (OSError, RuntimeError, ValueError) as exc:
-        evidence["error"] = f"deployment job index is unreadable: {exc}"
+    indexed = self_deploy.inflight_runtime_job_evidence(command, prune=prune)
+    evidence["inflight_deploy_jobs"] = list(indexed["blocking_units"])
+    evidence["inflight_units"] = list(indexed["inflight_units"])
+    evidence["idempotent_match"] = indexed["idempotent_match"]
+    evidence["pruned_units"] = list(indexed["pruned_units"])
+    if indexed["error"] is not None:
+        evidence["error"] = indexed["error"]
     return evidence
 
 
@@ -391,11 +405,16 @@ def _blockade_evidence(repository: Path | None) -> dict[str, Any]:
     return evidence
 
 
-def _volatile_gate_recheck(repository: Path | None) -> dict[str, Any]:
+def _volatile_gate_recheck(
+    repository: Path | None, command: list[str] | None = None
+) -> dict[str, Any]:
     """Re-read the gates that can change between assessment and dispatch."""
     kill_switch = base._kill_switch_state()
     blockade = _blockade_evidence(repository)
-    competing = _competing_deployment_evidence()
+    # Carries the exact argv: the recheck runs under the schedule lock, which is
+    # where an identical intent that started meanwhile must be recognised as
+    # ours rather than dispatched a second time.
+    competing = _competing_deployment_evidence(command, prune=True)
     checks = {
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
@@ -826,7 +845,44 @@ def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
     }
     intent_sha256 = base._append_audit_with_digest(intent)
 
-    volatile = _volatile_gate_recheck(_resume_effect_repository())
+    volatile = _volatile_gate_recheck(_resume_effect_repository(), command)
+    # Absent evidence is not a match: a recheck that carries no competing-job
+    # projection means nothing was recognised as ours, which must dispatch
+    # normally rather than silently coalesce onto nothing.
+    already_running = (volatile.get("competing_deployment") or {}).get(
+        "idempotent_match"
+    )
+    if already_running is not None and not volatile["reasons"]:
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "midcutover-resume-coalesced",
+                "expected_head": expected_head,
+                "cutover_id": resume_binding["cutover_id"],
+                "unit": already_running["unit"],
+                "intent_sha256": intent_sha256,
+            }
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_midcutover_resume_receipt",
+            "lane": midcutover.LANE_MID_CUTOVER_RESUME,
+            "expected_head": expected_head,
+            "cutover_id": resume_binding["cutover_id"],
+            "gate": gate,
+            "job": already_running,
+            "already_dispatched": True,
+            "intent_sha256": intent_sha256,
+            "post_state_readback_required": True,
+            "next_action": (
+                "this exact resume is already running; read back its durable job "
+                "and the resume receipt rather than starting another"
+            ),
+            "does_not_establish": [
+                "that the running resume has completed",
+                "that a second dispatch would have been safe",
+            ],
+        }
     if volatile["reasons"]:
         base._append_audit(
             {
@@ -1002,7 +1058,45 @@ def _repair_under_schedule_lock(
     # switch, a blockade or a competing deployment can appear inside that
     # window.  These three are cheap, so there is no reason to act on a stale
     # reading of them.
-    volatile = _volatile_gate_recheck(repository)
+    volatile = _volatile_gate_recheck(repository, command)
+    # Absent evidence is not a match: a recheck that carries no competing-job
+    # projection means nothing was recognised as ours, which must dispatch
+    # normally rather than silently coalesce onto nothing.
+    already_running = (volatile.get("competing_deployment") or {}).get(
+        "idempotent_match"
+    )
+    if already_running is not None and not volatile["reasons"]:
+        # This exact intent is already in flight.  Starting a second job would
+        # be the historically observed double dispatch, so the existing one is
+        # returned instead: same argv, same target, same receipt lineage.
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "provenance-recovery-coalesced",
+                "expected_head": expected_head,
+                "unit": already_running["unit"],
+                "intent_sha256": intent_sha256,
+            }
+        )
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_provenance_recovery_receipt",
+            "expected_head": expected_head,
+            "gate": gate,
+            "job": already_running,
+            "already_dispatched": True,
+            "intent_sha256": intent_sha256,
+            "repair_intent_id": repair_intent_id,
+            "post_state_readback_required": True,
+            "next_action": (
+                "this exact repair is already running; read back its durable job "
+                "and the deployment identity rather than starting another"
+            ),
+            "does_not_establish": [
+                "that the running repair has completed",
+                "that a second dispatch would have been safe",
+            ],
+        }
     if volatile["reasons"]:
         base._append_audit(
             {
