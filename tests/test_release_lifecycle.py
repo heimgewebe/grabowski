@@ -238,11 +238,16 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
         self.assertEqual(
             browser["semantic_gateway"]["supported_intents"],
-            ["read_state", "scroll_into_view"],
+            ["read_state", "navigate", "scroll_into_view"],
+        )
+        self.assertEqual(browser["semantic_gateway"]["uncovered_intents"], {})
+        self.assertEqual(
+            browser["semantic_gateway"]["public_target_contract"],
+            "opaque-handles-and-validated-navigation-targets",
         )
         self.assertEqual(
-            browser["semantic_gateway"]["uncovered_intents"],
-            {"navigate": "direct-cdp-required"},
+            browser["semantic_gateway"]["implemented_effect_classes"],
+            ["read", "local_ui", "network_navigation"],
         )
         self.assertEqual(
             browser["semantic_gateway"]["fail_closed_effect_classes"],
@@ -320,14 +325,19 @@ class ReleaseLifecycleRejectionTests(unittest.TestCase):
             ),
             ("semantic coverage overclaimed", ["semantic_gateway", "coverage"], "full"),
             (
-                "navigate claimed supported",
+                "navigate support removed",
                 ["semantic_gateway", "supported_intents"],
-                ["read_state", "scroll_into_view", "navigate"],
+                ["read_state", "scroll_into_view"],
             ),
             (
-                "navigate no longer requires direct CDP",
+                "navigate regressed to direct CDP",
                 ["semantic_gateway", "uncovered_intents", "navigate"],
-                "semantic-gateway",
+                "direct-cdp-required",
+            ),
+            (
+                "navigation target contract leaks backend detail",
+                ["semantic_gateway", "public_target_contract"],
+                "cdp-page-navigate-url",
             ),
             (
                 "external mutation enabled",
