@@ -3765,7 +3765,34 @@ def _role_toolchain_identity_for_receipt(
     manifest: dict[str, Any],
     role: str,
     receipt: dict[str, Any],
+    *,
+    verifier_attempt: int,
 ) -> dict[str, Any] | None:
+    attempt_preflights = manifest.get("role_attempt_preflights")
+    if attempt_preflights is not None and not isinstance(attempt_preflights, dict):
+        raise AgentWorkspaceError("role_attempt_preflights must be an object")
+    role_attempts = (
+        attempt_preflights.get(role)
+        if isinstance(attempt_preflights, dict)
+        else None
+    )
+    if role_attempts is not None and not isinstance(role_attempts, dict):
+        raise AgentWorkspaceError(f"{role} role_attempt_preflights must be an object")
+    attempt_preflight = (
+        role_attempts.get(str(verifier_attempt))
+        if isinstance(role_attempts, dict)
+        else None
+    )
+    if attempt_preflight is not None:
+        if not isinstance(attempt_preflight, dict):
+            raise AgentWorkspaceError(
+                f"{role} verifier attempt {verifier_attempt} preflight must be an object"
+            )
+        if attempt_preflight.get("command_sha256") != receipt.get("argv_sha256"):
+            raise AgentWorkspaceError(
+                f"{role} verifier attempt {verifier_attempt} preflight command drift"
+            )
+        return attempt_preflight
     preflights = manifest.get("initial_role_preflights")
     preflight = preflights.get(role) if isinstance(preflights, dict) else None
     if (
@@ -3804,7 +3831,7 @@ def _persist_verification_evidence(
                 else None
             ),
             toolchain_identity=_role_toolchain_identity_for_receipt(
-                manifest, role, source
+                manifest, role, source, verifier_attempt=verifier_attempt
             ),
             verifier_attempt=verifier_attempt,
         )
@@ -7734,6 +7761,22 @@ def grabowski_agent_workspace_role_retry(
         )
         cwd = str(manifest["writer_worktree"])
         host = _bound_task_host(manifest)
+        attempt_preflights = dict(manifest.get("role_attempt_preflights", {}))
+        role_attempt_preflights_value = attempt_preflights.get(role_name, {})
+        if not isinstance(role_attempt_preflights_value, dict):
+            raise AgentWorkspaceError(
+                f"{role_name} role_attempt_preflights must be an object"
+            )
+        role_attempt_preflights = dict(role_attempt_preflights_value)
+        attempt_key = str(attempt_number)
+        existing_attempt_preflight = role_attempt_preflights.get(attempt_key)
+        if existing_attempt_preflight is not None and existing_attempt_preflight != preflight:
+            raise AgentWorkspaceError(
+                f"{role_name} verifier attempt {attempt_number} preflight changed"
+            )
+        role_attempt_preflights[attempt_key] = preflight
+        attempt_preflights[role_name] = role_attempt_preflights
+        manifest["role_attempt_preflights"] = attempt_preflights
         intents = dict(manifest.get("task_start_intents", {}))
         intents[role_name] = {
             "role": role_name,

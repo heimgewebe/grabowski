@@ -217,7 +217,9 @@ def passing_toolchain_preflight(manifest: dict, role_name: str, command: list[st
         "checked_at": "test",
         "sandbox": role.SANDBOX_LABEL,
         "executable": command[0],
+        "resolved_executable": command[0],
         "declared_python_module": role.declared_python_module(command),
+        "environment": {"environment_sha256": "e" * 64},
         "passed": True,
         "missing_executable": False,
         "missing_python_module": False,
@@ -4696,6 +4698,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(persisted["role_final_attempt"]["tests"], 1)
         self.assertEqual(persisted["role_retries"]["tests"]["count"], 1)
         self.assertEqual(len(persisted["role_preflight_blocks"]["tests"]), 1)
+        retry_preflight = persisted["role_attempt_preflights"]["tests"]["1"]
+        self.assertEqual(
+            retry_preflight["command_sha256"],
+            workspace._sha256_json(["python3", "-m", "unittest"]),
+        )
+        self.assertTrue(retry_preflight["passed"])
+        self.assertIsInstance(retry_preflight["environment"], dict)
         self.assertEqual(persisted.get("task_start_intents", {}), {})
         self.assertFalse((self.state / manifest["workspace_id"] / "tests-receipt.json").exists())
         self.assertFalse(
@@ -4787,6 +4796,22 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             set(result["result"]["verification_summary"]["observed_verifiers"]),
             {"review", "tests"},
+        )
+        tests_verification = next(
+            item
+            for item in result["result"]["verification_receipts"]
+            if item["verifier_kind"] == "tests"
+        )
+        self.assertEqual(
+            tests_verification["toolchain_identity"]["source"],
+            "workspace-role-preflight-v1",
+        )
+        self.assertEqual(
+            tests_verification["toolchain_identity"]["command_sha256"],
+            workspace._sha256_json(replacement),
+        )
+        self.assertIsNotNone(
+            tests_verification["toolchain_identity"]["environment_sha256"]
         )
         for key in ("candidate", "tests", "review"):
             if key == "candidate":
@@ -4896,12 +4921,27 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(first_receipts[0]["candidate_id"], candidate["candidate_id"])
 
         replacement = ["python3", "-m", "unittest"]
+        replacement_sha256 = workspace._sha256_json(replacement)
         manifest["role_final_attempt"] = {"tests": 2, "review": 1}
+        manifest["role_attempt_preflights"] = {
+            "tests": {
+                "2": {
+                    "role": "tests",
+                    "command_sha256": replacement_sha256,
+                    "checked_at": "2026-08-16T12:00:00+00:00",
+                    "sandbox": workspace.agent_role.SANDBOX_LABEL,
+                    "passed": True,
+                    "failure_classification": None,
+                    "resolved_executable": "/usr/bin/python3",
+                    "environment": {"environment_sha256": "b" * 64},
+                }
+            }
+        }
         second_tests = signed_role_receipt(
             "tests",
             manifest,
             snapshot,
-            argv_sha256=workspace._sha256_json(replacement),
+            argv_sha256=replacement_sha256,
         )
         second_receipts, second_summary, second_refs = workspace._persist_verification_evidence(
             manifest,
@@ -4917,7 +4957,38 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(first_path.read_bytes(), first_bytes)
         self.assertEqual(second_refs["tests"]["verifier_attempt"], 2)
         self.assertEqual(second_receipts[0]["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(
+            second_receipts[0]["toolchain_identity"]["source"],
+            "workspace-role-preflight-v1",
+        )
+        self.assertEqual(
+            second_receipts[0]["toolchain_identity"]["environment_sha256"],
+            "b" * 64,
+        )
+        self.assertEqual(
+            second_receipts[0]["toolchain_identity"]["resolved_executable"],
+            "/usr/bin/python3",
+        )
         self.assertEqual(first_receipts[1], second_receipts[1])
+
+    def test_verification_attempt_preflight_command_drift_fails_closed(self) -> None:
+        manifest = self.manifest()
+        receipt = {
+            "argv_sha256": "a" * 64,
+        }
+        manifest["role_attempt_preflights"] = {
+            "tests": {
+                "2": {
+                    "command_sha256": "b" * 64,
+                }
+            }
+        }
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "preflight command drift"
+        ):
+            workspace._role_toolchain_identity_for_receipt(
+                manifest, "tests", receipt, verifier_attempt=2
+            )
 
     def test_role_retry_blocks_unresolved_retry_start_intent_before_second_start(self) -> None:
         manifest = self.manifest()
