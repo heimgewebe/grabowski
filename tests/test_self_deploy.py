@@ -1047,6 +1047,90 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(job_dir.name, result["unit"])
         self.assertEqual("1" * 64, result["source_identity_sha256"])
 
+    def test_terminal_midcutover_resume_is_pruned_before_normal_deploy(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        desired = SELF_DEPLOY._deploy_command(
+            repo,
+            repo / "tools/run_scheduled_deploy.py",
+            "b" * 40,
+            8,
+        )
+        resume = SELF_DEPLOY._midcutover_resume_command(
+            repo,
+            repo / "tools/run_midcutover_resume.py",
+            "a" * 40,
+            "bgc-terminal-resume",
+            "1" * 64,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": resume,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(resume),
+                "cwd": str(repo),
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=root
+            ), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={
+                    "units": [job_dir.name], "pending_unit": None
+                }
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "grabowski_job_status",
+                return_value={"final_status": "succeeded"},
+            ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index:
+                self.assertIsNone(
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+                )
+        write_index.assert_called_once_with(root, units=[], pending_unit=None)
+
+    def test_running_midcutover_resume_blocks_normal_deploy(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        desired = SELF_DEPLOY._deploy_command(
+            repo,
+            repo / "tools/run_scheduled_deploy.py",
+            "b" * 40,
+            8,
+        )
+        resume = SELF_DEPLOY._midcutover_resume_command(
+            repo,
+            repo / "tools/run_midcutover_resume.py",
+            "a" * 40,
+            "bgc-running-resume",
+            "1" * 64,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": resume,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(resume),
+                "cwd": str(repo),
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=root
+            ), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={
+                    "units": [job_dir.name], "pending_unit": None
+                }
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "grabowski_job_status",
+                return_value={"final_status": "running"},
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "mid-cutover resume job is still running"
+                ):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
     def test_matching_job_with_unclear_outcome_blocks_duplicate(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"

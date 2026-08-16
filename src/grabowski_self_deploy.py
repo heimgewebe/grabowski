@@ -1439,10 +1439,24 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
         ):
             raise RuntimeError(f"durable job argv is malformed: {entry.name}")
         candidate_fields = _deploy_command_fields(candidate_command)
-        if candidate_fields is None:
+        resume_fields = (
+            _midcutover_resume_command_fields(candidate_command)
+            if candidate_fields is None
+            else None
+        )
+        if candidate_fields is None and resume_fields is None:
             raise RuntimeError(f"self deploy job metadata is malformed: {entry.name}")
-        candidate_repository = Path(candidate_fields["repository"])
-        candidate_runner = str(candidate_repository / RUNNER_RELATIVE_PATH)
+        command_fields = candidate_fields or resume_fields
+        assert command_fields is not None
+        candidate_repository = Path(command_fields["repository"])
+        candidate_runner = str(
+            candidate_repository
+            / (
+                RUNNER_RELATIVE_PATH
+                if candidate_fields is not None
+                else MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+            )
+        )
         if (
             candidate_command[0] != "/usr/bin/python3"
             or candidate_command[1] != candidate_runner
@@ -1456,6 +1470,25 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
         if not isinstance(status, dict):
             raise RuntimeError(f"self deploy job status is unavailable: {entry.name}")
         final_status = status.get("final_status")
+        if resume_fields is not None:
+            # The provenance-recovery lane reserves its receipt-bound resume in
+            # this same index so an ordinary deploy cannot race it.  Once that
+            # job is terminal the index has served its concurrency purpose; its
+            # outcome authority remains the durable bgcr receipt and the fresh
+            # recovery classification performed by the scheduled runner before
+            # any deployment effect.  Never reinterpret the resume argv as a
+            # deploy argv, and never discard an in-flight or ambiguous resume.
+            if final_status in TERMINAL_JOB_STATUSES:
+                continue
+            retained_units.append(entry.name)
+            if final_status in REUSABLE_JOB_STATUSES:
+                raise RuntimeError(
+                    f"mid-cutover resume job is still running: {entry.name}"
+                )
+            raise RuntimeError(
+                "mid-cutover resume job has an uncertain non-reusable outcome: "
+                f"{entry.name} ({final_status})"
+            )
         finalization = status.get("finalization_receipt")
         if (
             isinstance(finalization, dict)
