@@ -571,7 +571,7 @@ class OperatorObligationTests(unittest.TestCase):
         )
 
 
-    def test_deferred_resolution_remains_current_attention(self) -> None:
+    def test_deferred_resolution_parks_attention_and_requires_new_obligation_for_resume(self) -> None:
         obligation.open_obligation(self._open_parameters())
         obligation.close_obligation(
             {
@@ -589,7 +589,7 @@ class OperatorObligationTests(unittest.TestCase):
                 "next_action": "Old next action.",
             }
         )
-        first_parameters = {
+        parameters = {
             "obligation_id": "goo-example-work-0001",
             "disposition": "deferred",
             "evidence": [
@@ -601,57 +601,65 @@ class OperatorObligationTests(unittest.TestCase):
             ],
             "next_action": "Probe again when the target is reachable.",
         }
-        first = obligation.resolve_obligation(first_parameters)
-        replay = obligation.resolve_obligation(first_parameters)
-        second = obligation.resolve_obligation(
-            {
-                "obligation_id": "goo-example-work-0001",
-                "disposition": "deferred",
-                "evidence": [
-                    {
-                        "source": "runtime",
-                        "reference": "second-probe",
-                        "sha256": "c" * 64,
-                    }
-                ],
-                "next_action": "Retry after the second external checkpoint.",
-            }
-        )
-        terminal = obligation.resolve_obligation(
-            {
-                "obligation_id": "goo-example-work-0001",
-                "disposition": "resolved",
-                "evidence": [
-                    {
-                        "source": "runtime",
-                        "reference": "final-probe",
-                        "sha256": "d" * 64,
-                    }
-                ],
-            }
-        )
+        first = obligation.resolve_obligation(parameters)
+        replay = obligation.resolve_obligation(parameters)
 
-        self.assertTrue(first["continuation_required"])
-        self.assertEqual("current", first["attention_class"])
+        self.assertFalse(first["continuation_required"])
+        self.assertEqual("historical", first["attention_class"])
+        self.assertEqual("deferred", first["resolution_disposition"])
+        self.assertEqual(
+            "Probe again when the target is reachable.",
+            first["recommended_next_action"],
+        )
         self.assertEqual(1, first["resolution_sequence"])
         self.assertEqual(1, first["resolution_revision_count"])
         self.assertTrue(replay["replayed"])
-        self.assertEqual(1, replay["resolution_revision_count"])
-        self.assertEqual(2, second["resolution_sequence"])
-        self.assertEqual(2, second["resolution_revision_count"])
         self.assertEqual(
-            "Retry after the second external checkpoint.",
-            second["recommended_next_action"],
+            0, obligation.list_obligations({"state": "attention"})["record_count"]
         )
-        self.assertFalse(terminal["continuation_required"])
-        self.assertEqual("historical", terminal["attention_class"])
-        self.assertEqual(3, terminal["resolution_sequence"])
-        self.assertEqual(3, terminal["resolution_revision_count"])
+        self.assertEqual(
+            1, obligation.list_obligations({"state": "blocked"})["record_count"]
+        )
+
+        with self.assertRaises(obligation.OperatorObligationConflictError):
+            obligation.resolve_obligation(
+                {
+                    **parameters,
+                    "evidence": [
+                        {
+                            "source": "runtime",
+                            "reference": "second-probe",
+                            "sha256": "c" * 64,
+                        }
+                    ],
+                    "next_action": "Retry after a later checkpoint.",
+                }
+            )
+        with self.assertRaises(obligation.OperatorObligationConflictError):
+            obligation.resolve_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "disposition": "resolved",
+                    "evidence": [
+                        {
+                            "source": "runtime",
+                            "reference": "final-probe",
+                            "sha256": "d" * 64,
+                        }
+                    ],
+                }
+            )
+
+        obligation.open_obligation(self._open_parameters("goo-example-work-resume-0002"))
+        resumed = obligation.status_obligation("goo-example-work-resume-0002")
+        attention = obligation.list_obligations({"state": "attention"})
+        self.assertTrue(resumed["continuation_required"])
+        self.assertEqual(1, attention["record_count"])
+        self.assertEqual("goo-example-work-resume-0002", attention["records"][0]["obligation_id"])
+
         directory = self.root / "goo-example-work-0001"
         self.assertTrue((directory / "resolution.json").is_file())
-        self.assertTrue((directory / "resolution-000002.json").is_file())
-        self.assertTrue((directory / "resolution-000003.json").is_file())
-
+        self.assertFalse((directory / "resolution-000002.json").exists())
 
 
     def test_resolution_status_readback_remains_under_writer_lock(self) -> None:

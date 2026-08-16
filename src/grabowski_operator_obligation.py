@@ -1059,6 +1059,7 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
     continuation_required = outcome != "completed" and disposition not in {
         "resolved",
         "superseded",
+        "deferred",
     }
     recommended_next_action = (
         "report acceptance-bound completion"
@@ -1412,13 +1413,14 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
                 created = False
                 file_sha256 = latest_file_sha256
             else:
-                if latest["disposition"] != "deferred":
-                    raise OperatorObligationConflictError(
-                        "operator obligation already has a terminal resolution"
+                if latest["disposition"] == "deferred":
+                    message = (
+                        "operator obligation already has a deferred resolution; "
+                        "resume deferred work through a new obligation"
                     )
-                sequence = latest["sequence"] + 1
-                predecessor_file_sha256 = latest_file_sha256
-                created = True
+                else:
+                    message = "operator obligation already has a terminal resolution"
+                raise OperatorObligationConflictError(message)
         else:
             sequence = 1
             predecessor_file_sha256 = None
