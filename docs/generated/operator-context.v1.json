@@ -3365,6 +3365,10 @@
         "source": "src/grabowski_agent_workspace.py"
       },
       {
+        "module": "grabowski_candidate_verification",
+        "source": "src/grabowski_candidate_verification.py"
+      },
+      {
         "module": "grabowski_agent_role",
         "source": "src/grabowski_agent_role.py"
       },
@@ -3474,14 +3478,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "0569492859243af44933322c9a205014c53a413bccefaf579af61179977dc3aa"
+      "sha256": "62b83f7a71d8cc7bd59fc553992ec8fb3ed50c670e0956cec25f8476fb1a1977"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
       "src/grabowski_agent_competition.py": "e25ad6cd44ddcc4297381b6d374851e46e290f3d580460503d54898a48a69044",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "bc9d694b48bca3b65e69ca2acd57334f516063e140d6f8a3d7eb4e4bf9ee2cd1",
+      "src/grabowski_agent_workspace.py": "b29015fe0a6357af86ac93142b14e0779d16ed09ba91c0fdd8acf50cc8790013",
       "src/grabowski_agent_workspace_observer.py": "f7db154ac20b92e29eb654682f663b5e4f78743bf37e22a62f869df1b9331113",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_alert_outbox.py": "47d43bb27151032be8cd197038f358c27c52ca9066e6ed57530f71cfa793455d",
@@ -3496,6 +3500,7 @@
       "src/grabowski_bureau_launcher_contract.py": "091908c70502dddd0bbe5582a3412b30cd92f5736801f76279bfd061ad141435",
       "src/grabowski_bureau_leases.py": "25965a1d91d8386103b8da033a09488005e943b5b575579a9722ce7e580fc378",
       "src/grabowski_bureau_pickup.py": "da5e5ebad67fc3a82318a6c6acb217c94b63868bcb7b11b221354a20cac1c7cb",
+      "src/grabowski_candidate_verification.py": "b1abe088b16482bcce5d688463d8d2f8e93b6d20926bb4920e49a4bb3cd26636",
       "src/grabowski_capabilities.py": "1620ad4b5d93a3859047ab9c1b7d91125ac5821121a25721733197a570397946",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
