@@ -150,6 +150,14 @@ class AuditQueryTests(unittest.TestCase):
                 "operation": "resource-acquire",
                 "owner_id": "operator:alpha",
                 "resource_keys": ["repo:/srv/example"],
+                "reclaimed_count": 1,
+                "reclamation_evidence": [
+                    {
+                        "resource_index": 0,
+                        "previous_owner_id": "operator:previous",
+                        "previous_expires_at_unix": 9,
+                    }
+                ],
                 "timestamp_unix": 10,
                 "record_sha256": "1" * 64,
                 "secret_token": "must-not-project",
@@ -228,10 +236,36 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(projection["items"][0]["evidence"]["global_ordinal"], 1)
         self.assertEqual(projection["items"][-1]["evidence"]["global_ordinal"], 4)
         self.assertEqual(projection["items"][0]["audit_ref"], f"audit-record-sha256:{'1' * 64}")
-        self.assertNotIn("secret_token", projection["items"][0]["record"])
+        first_record = projection["items"][0]["record"]
+        self.assertNotIn("secret_token", first_record)
+        self.assertEqual(first_record["reclaimed_count"], 1)
+        self.assertEqual(
+            first_record["reclamation_evidence"],
+            [
+                {
+                    "resource_index": 0,
+                    "previous_owner_id": "operator:previous",
+                    "previous_expires_at_unix": 9,
+                }
+            ],
+        )
         self.assertEqual(len(projection["source"]["chain_content_sha256"]), 64)
         self.assertEqual(len(projection["source"]["chain_materialization_sha256"]), 64)
         self.assertIn("causality", projection["does_not_establish"])
+
+    def test_projection_omits_inconsistent_reclamation_evidence(self) -> None:
+        components = self._components()
+        path, data, status = components[1]
+        records = [json.loads(line) for line in data.decode("utf-8").splitlines()]
+        records[0]["reclaimed_count"] = 2
+        malformed = _component(str(path), records)
+        module = self._load_module([components[0], malformed])
+
+        projection = module.build_audit_projection()
+        first = projection["items"][0]
+        self.assertEqual(first["record"]["reclaimed_count"], 2)
+        self.assertNotIn("reclamation_evidence", first["record"])
+        self.assertIn("reclamation_evidence", first["evidence"]["projection_omitted_fields"])
 
     def test_query_filters_across_segments_and_orders_descending(self) -> None:
         module = self._load_module(self._components())
