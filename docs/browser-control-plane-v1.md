@@ -185,6 +185,18 @@ Der Shadow-Vertrag ist absichtlich enger als ein Adapter:
 - Session-ID wird im Report nur als SHA-256 ausgegeben, die WebSocket-URL gar nicht; Timings sind Messwerte des Kandidatenpfads und keine statistische Performance- oder Produktionsparitätsaussage;
 - Fehler enden `failed_closed`, `retry_authorized=false`; ein negativer Lauf beweist weder dauerhafte Transport-Unverfügbarkeit noch eine Berechtigung zum Retry oder Cutover.
 
+### BiDi-Shadow-Matrix
+
+Für Wave B existiert ergänzend `tools/browser_bidi_shadow_matrix.py`. Die Matrix ist ebenfalls ausschließlich tooling-only und erweitert den Einzelbenchmark nicht zu einem Produktionsadapter. Sie führt Chrome/WebDriver-BiDi und Firefox/WebDriver-BiDi wiederholt gegen exakt dieselbe kleine Semantikreferenz aus. Die Chrome/CDP-Referenz wird bewusst von außen geliefert. Die CLI verlangt zusätzlich den SHA-256 des externen Semantic-Gateway-/Observation-Receipts und bindet ihn unverändert in den Report; ohne gültigen 64-Hex-Digest startet keine Matrix. Die Matrix verifiziert nicht selbst, dass Receipt und Referenzbytes zusammengehören: diese Korrespondenz bleibt Aufgabe des produktiven Semantic-Gateway-/Receipt-Pfads und muss außerhalb des Tools revisionsgebunden belegt sein.
+
+- Chrome, ChromeDriver, Firefox und geckodriver werden ausschließlich als explizite Executable-Pfade übergeben; der Runner lädt oder installiert nichts.
+- Beide WebDriver-Server sind loopback-only. ChromeDriver erhält einen temporären `user-data-dir`; Firefox verwendet weiterhin den temporären geckodriver-Profile-Root. Sämtliche Browser-/Driver-Prozesse gehören zur Prozessgruppe des langlebigen Benchmark-Tasks und werden nach jedem Lauf beendet.
+- Die Chrome-BiDi-WebSocket-URL muss eine exakt sessiongebundene Loopback-URL sein. Ein `localhost`-Alias wird nur akzeptiert, wenn seine IPv4-Auflösung ausschließlich `127.0.0.1` ergibt; intern wird anschließend die numerische Loopback-Adresse verwendet.
+- Eine Matrix umfasst 1 bis 5 Wiederholungen je Engine. Ausgegeben werden Einzelmessungen sowie Min/Median/Max für Sessionaufbau und Gesamtdauer. Diese Werte sind ausdrücklich advisory: die Matrix enthält kein Gewinnerfeld und begründet weder Performanceüberlegenheit noch Promotion.
+- Jeder Einzelrun muss dieselbe normalisierte Projektion `ready_state` plus geordnete `role`/`name`-Elemente und denselben Semantikdigest wie die gelieferte Chrome/CDP-Referenz erreichen. Ein Mismatch oder Lifecyclefehler beendet die Matrix fail-closed.
+- `production_adapter_changed=false` und `retry_authorized=false` sind invariant. Die Matrix kann weder Routing umschalten noch einen unbekannten Effekt wiederholen oder Firefox/Chrome-BiDi als Produktionsbackend freischalten.
+- Browser-/WebDriver-Liveproben laufen als langlebige Grabowski/systemd-Tasks. Der synchrone Terminalpfad ist kein gültiger Browserprozess-Lifecycle-Beleg.
+
 Bis ein eigener BiDi-Produktionsadapter mit separaten Tests und Runtime-Acceptance existiert:
 
 - Firefox ist kein Browser-Worker-Backend;
