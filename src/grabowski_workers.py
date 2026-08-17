@@ -705,6 +705,8 @@ def _cleanup_browser_semantic_temps(
         flags |= os.O_NOFOLLOW
     try:
         directory_fd = os.open(directory, flags)
+    except FileNotFoundError:
+        return removed, preserved, errors
     except OSError as exc:
         return removed, preserved, [{"path": str(directory), "error": str(exc)}]
     try:
