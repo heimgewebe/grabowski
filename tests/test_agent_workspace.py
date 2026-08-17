@@ -1032,6 +1032,93 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
 
+    def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
+        real_snapshot = workspace._adoption_candidate_snapshot
+
+        def mutate_after_snapshot(
+            manifest_value: dict,
+            collection_value: dict,
+            candidate_value: dict,
+        ) -> dict:
+            snapshot = real_snapshot(
+                manifest_value, collection_value, candidate_value
+            )
+            (self.git.writer / "src" / "app.py").write_text(
+                "tampered_after_freeze = True\n", encoding="utf-8"
+            )
+            return snapshot
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace,
+                "_adoption_candidate_snapshot",
+                side_effect=mutate_after_snapshot,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "staged Candidate tree differs from immutable Candidate patch",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before_head)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--exit-code"],
+                cwd=self.git.writer,
+                check=False,
+            ).returncode,
+            0,
+        )
+        paths = workspace._adoption_receipt_paths(manifest)
+        self.assertFalse(paths["intent"].exists())
+        self.assertFalse(paths["receipt"].exists())
+
+    def test_lane_candidate_adoption_revalidates_authority_before_ref_mutation(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
+        real_authority = workspace._require_adoption_lane_authority
+        calls: list[int] = []
+
+        def authority_then_handoff(manifest_value: dict) -> dict:
+            calls.append(len(calls) + 1)
+            if len(calls) == 2:
+                raise workspace.AgentWorkspaceError(
+                    "simulated lease handoff before ref mutation"
+                )
+            return real_authority(manifest_value)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace,
+                "_require_adoption_lane_authority",
+                side_effect=authority_then_handoff,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "simulated lease handoff before ref mutation",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before_head)
+        paths = workspace._adoption_receipt_paths(manifest)
+        self.assertTrue(paths["intent"].is_file())
+        self.assertFalse(paths["receipt"].exists())
+
+
+
     def test_lane_backed_workspace_identity_is_generation_safe(self) -> None:
         lane_input = {
             "controller_actor": "controller:test",

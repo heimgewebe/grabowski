@@ -4099,14 +4099,92 @@ def _adoption_candidate_snapshot(
     return snapshot
 
 
+def _candidate_patch_tree_sha(
+    manifest: dict[str, Any],
+    collection: dict[str, Any],
+    candidate: dict[str, Any],
+) -> str:
+    writer_result = collection.get("writer_result")
+    if (
+        not isinstance(writer_result, dict)
+        or writer_result.get("type") != "patch"
+        or writer_result.get("sha256") != candidate.get("patch_sha256")
+        or not _verify_patch_artifact(
+            writer_result,
+            expected_path=_writer_patch_path(manifest),
+        )
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch artifact is invalid")
+    patch_path = Path(str(writer_result["path"]))
+    try:
+        patch_bytes = patch_path.read_bytes()
+    except OSError as exc:
+        raise AgentWorkspaceError(
+            f"immutable Candidate patch could not be read: {_error_summary(exc)}"
+        ) from exc
+    if (
+        len(patch_bytes) > MAX_PATCH_BYTES
+        or hashlib.sha256(patch_bytes).hexdigest() != candidate.get("patch_sha256")
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch bytes drifted")
+
+    worktree = Path(str(manifest["writer_worktree"]))
+    base_head = str(candidate["base_head"])
+    with tempfile.TemporaryDirectory(prefix="grabowski-adoption-index-") as directory:
+        root = Path(directory)
+        index_path = root / "index"
+        patch_copy = root / "candidate.patch"
+        patch_copy.write_bytes(patch_bytes)
+        environment = safe_git_environment()
+        environment["GIT_INDEX_FILE"] = str(index_path)
+
+        def run_index(argv: list[str], *, label: str) -> str:
+            completed = subprocess.run(
+                argv,
+                cwd=worktree,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                check=False,
+                env=environment,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or label).strip()
+                raise AgentWorkspaceError(f"{label} failed: {detail[:2000]}")
+            return completed.stdout.strip()
+
+        run_index(["git", "read-tree", base_head], label="Candidate patch base tree")
+        run_index(
+            [
+                "git",
+                "apply",
+                "--cached",
+                "--binary",
+                "--whitespace=nowarn",
+                "--",
+                str(patch_copy),
+            ],
+            label="Candidate patch isolated apply",
+        )
+        tree = run_index(["git", "write-tree"], label="Candidate patch tree").lower()
+    if SHA40_RE.fullmatch(tree) is None:
+        raise AgentWorkspaceError("immutable Candidate patch tree identity is invalid")
+    return tree
+
+
 def _stage_candidate_for_adoption(
-    manifest: dict[str, Any], collection: dict[str, Any]
+    manifest: dict[str, Any],
+    collection: dict[str, Any],
+    candidate: dict[str, Any],
 ) -> str:
     worktree = Path(str(manifest["writer_worktree"]))
     base_head = str(manifest["expected_base_head"])
     changed_paths = collection.get("changed_paths")
     if not isinstance(changed_paths, list) or not changed_paths:
         raise AgentWorkspaceError("Candidate has no bounded changed-path set")
+    expected_tree = _candidate_patch_tree_sha(manifest, collection, candidate)
     _checked(
         _run,
         worktree,
@@ -4150,6 +4228,21 @@ def _stage_candidate_for_adoption(
     ).strip().lower()
     if SHA40_RE.fullmatch(tree) is None:
         raise AgentWorkspaceError("candidate adoption tree identity is invalid")
+    if tree != expected_tree:
+        restore = _run(
+            worktree,
+            ["git", "reset", "--mixed", "--quiet", base_head],
+        )
+        if (
+            not isinstance(restore, dict)
+            or restore.get("returncode") != 0
+        ):
+            raise AgentWorkspaceError(
+                "staged Candidate tree drifted and the pre-effect index could not be restored"
+            )
+        raise AgentWorkspaceError(
+            "staged Candidate tree differs from immutable Candidate patch"
+        )
     return tree
 
 
@@ -7816,7 +7909,7 @@ def grabowski_agent_workspace_adopt(
         if intent is None:
             _require_live_lane_binding(manifest, _run)
             _adoption_candidate_snapshot(manifest, collection, candidate)
-            git_tree_sha = _stage_candidate_for_adoption(manifest, collection)
+            git_tree_sha = _stage_candidate_for_adoption(manifest, collection, candidate)
             commit_sha = _create_adoption_commit_object(
                 manifest,
                 candidate_id=candidate["candidate_id"],
@@ -7888,7 +7981,7 @@ def grabowski_agent_workspace_adopt(
                 label="candidate adoption reconcile index reset",
             )
             _adoption_candidate_snapshot(manifest, collection, candidate)
-            observed_tree = _stage_candidate_for_adoption(manifest, collection)
+            observed_tree = _stage_candidate_for_adoption(manifest, collection, candidate)
             if observed_tree != intent.get("expected_git_tree_sha"):
                 return {
                     "workspace_id": identifier,
@@ -7916,6 +8009,11 @@ def grabowski_agent_workspace_adopt(
         current_head = _git_head(_run, worktree)
         update_result: dict[str, Any] | None = None
         if current_head == base_head:
+            refreshed_authority = _require_adoption_lane_authority(manifest)
+            if refreshed_authority != authority:
+                raise AgentWorkspaceError(
+                    "candidate adoption Work Lane authority changed before ref mutation"
+                )
             update_result = _run(
                 worktree,
                 [
