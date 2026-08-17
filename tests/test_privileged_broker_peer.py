@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -39,6 +40,31 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         "app.slice/grabowski-operator.service"
     )
 
+    OPERATOR_ARGV = (
+        "/home/alex/.local/share/grabowski-mcp/.venv/bin/python",
+        "-m",
+        "grabowski_operator",
+        "--transport",
+        "streamable-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18181",
+    )
+
+    @classmethod
+    def unit_identity(
+        cls, *, main_pid: int = 1234, control_group: str | None = None
+    ) -> dict[str, object]:
+        return {
+            "main_pid": main_pid,
+            "control_group": control_group or cls.SERVICE_CGROUP,
+            "active_state": "active",
+            "sub_state": "running",
+            "username": "alex",
+            "home": "/home/alex",
+        }
+
     @staticmethod
     def _write_process(
         proc_root: Path,
@@ -55,6 +81,13 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         (process / "stat").write_text(
             f"{pid} (python worker) " + " ".join(fields) + "\n",
             encoding="utf-8",
+        )
+        (process / "cmdline").write_bytes(
+            b"\x00".join(
+                item.encode("utf-8")
+                for item in PrivilegedBrokerPeerTests.OPERATOR_ARGV
+            )
+            + b"\x00"
         )
 
     @staticmethod
@@ -85,7 +118,11 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                 broker_tool, "_socket_peer_credentials", return_value=(1234, 1000, 1000)
             ):
                 result = broker_tool._validate_blockade_lifecycle_peer(
-                    self.execution(), proc_root=proc_root, cgroup_root=cgroup_root
+                    self.execution(),
+                    proc_root=proc_root,
+                    cgroup_root=cgroup_root,
+                    unit_identity=self.unit_identity(),
+                    expected_argv=self.OPERATOR_ARGV,
                 )
         self.assertEqual(result["pid"], 1234)
         self.assertEqual(result["uid"], 1000)
@@ -114,7 +151,11 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                 broker_tool, "_socket_peer_credentials", return_value=(1234, 1000, 1000)
             ):
                 result = broker_tool._validate_blockade_lifecycle_peer(
-                    self.execution(), proc_root=proc_root, cgroup_root=cgroup_root
+                    self.execution(),
+                    proc_root=proc_root,
+                    cgroup_root=cgroup_root,
+                    unit_identity=self.unit_identity(),
+                    expected_argv=self.OPERATOR_ARGV,
                 )
         self.assertEqual(result["pid"], 1234)
         self.assertEqual(result["cgroup_process_count"], 2)
@@ -163,6 +204,8 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                         self.execution(),
                         proc_root=proc_root,
                         cgroup_root=cgroup_root,
+                        unit_identity=self.unit_identity(),
+                        expected_argv=self.OPERATOR_ARGV,
                     )
 
     def test_same_service_child_peer_is_rejected(self) -> None:
@@ -185,9 +228,51 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             with mock.patch.object(
                 broker_tool, "_socket_peer_credentials", return_value=(2345, 1000, 1000)
             ):
-                with self.assertRaisesRegex(PermissionError, "main process"):
+                with self.assertRaisesRegex(PermissionError, "systemd MainPID"):
                     broker_tool._validate_blockade_lifecycle_peer(
-                        self.execution(), proc_root=proc_root, cgroup_root=cgroup_root
+                        self.execution(),
+                        proc_root=proc_root,
+                        cgroup_root=cgroup_root,
+                        unit_identity=self.unit_identity(main_pid=1234),
+                        expected_argv=self.OPERATOR_ARGV,
+                    )
+
+    def test_moved_older_same_uid_process_cannot_replace_systemd_main_pid(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as raw_proc,
+            tempfile.TemporaryDirectory() as raw_cgroup,
+        ):
+            proc_root = Path(raw_proc)
+            cgroup_root = Path(raw_cgroup)
+            self._write_process(
+                proc_root,
+                1234,
+                parent_pid=50,
+                starttime_ticks=200,
+                cgroup=self.SERVICE_CGROUP,
+            )
+            self._write_process(
+                proc_root,
+                2222,
+                parent_pid=60,
+                starttime_ticks=100,
+                cgroup=self.SERVICE_CGROUP,
+            )
+            self._write_cgroup_members(
+                cgroup_root, self.SERVICE_CGROUP, [1234, 2222]
+            )
+            with mock.patch.object(
+                broker_tool,
+                "_socket_peer_credentials",
+                return_value=(2222, 1000, 1000),
+            ):
+                with self.assertRaisesRegex(PermissionError, "systemd MainPID"):
+                    broker_tool._validate_blockade_lifecycle_peer(
+                        self.execution(),
+                        proc_root=proc_root,
+                        cgroup_root=cgroup_root,
+                        unit_identity=self.unit_identity(main_pid=1234),
+                        expected_argv=self.OPERATOR_ARGV,
                     )
 
     def test_service_membership_drift_is_rejected(self) -> None:
@@ -233,6 +318,8 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                         self.execution(),
                         proc_root=proc_root,
                         cgroup_root=cgroup_root,
+                        unit_identity=self.unit_identity(),
+                        expected_argv=self.OPERATOR_ARGV,
                     )
 
     def test_same_uid_tmux_peer_is_rejected(self) -> None:
@@ -253,8 +340,41 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                     PermissionError, "outside the operator service"
                 ):
                     broker_tool._validate_blockade_lifecycle_peer(
-                        self.execution(), proc_root=proc_root
+                        self.execution(),
+                        proc_root=proc_root,
+                        unit_identity=self.unit_identity(),
+                        expected_argv=self.OPERATOR_ARGV,
                     )
+
+    def test_root_broker_reads_authoritative_user_systemd_main_pid(self) -> None:
+        account = mock.Mock(pw_name="alex", pw_dir="/home/alex")
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                b"MainPID=1234\n"
+                b"ControlGroup="
+                + self.SERVICE_CGROUP.encode("utf-8")
+                + b"\nActiveState=active\nSubState=running\n"
+            ),
+            stderr=b"",
+        )
+        with (
+            mock.patch.object(broker_tool.pwd, "getpwuid", return_value=account),
+            mock.patch.object(
+                broker_tool.subprocess, "run", return_value=completed
+            ) as run,
+        ):
+            identity = broker_tool._operator_user_unit_identity(
+                1000, "grabowski-operator.service"
+            )
+        self.assertEqual(identity["main_pid"], 1234)
+        self.assertEqual(identity["control_group"], self.SERVICE_CGROUP)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/systemctl")
+        self.assertIn("--machine=alex@.host", argv)
+        self.assertIn("--property=MainPID", argv)
+        self.assertIn("--property=ControlGroup", argv)
 
     def test_blockade_lifecycle_client_preserves_operator_socket_peer(self) -> None:
         response = json.dumps(
@@ -330,6 +450,60 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         )
         self.assertTrue(result["success"])
         self.assertEqual(result["broker_client_returncode"], 0)
+
+    def test_blockade_lifecycle_oversize_response_is_outcome_unknown(self) -> None:
+        class OversizeSocket:
+            def __init__(self) -> None:
+                self.responses = [b"x" * 250_001]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, _timeout: int) -> None:
+                pass
+
+            def connect(self, _path: str) -> None:
+                pass
+
+            def sendall(self, _payload: bytes) -> None:
+                pass
+
+            def shutdown(self, _how: int) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                return self.responses.pop(0) if self.responses else b""
+
+        with (
+            mock.patch.object(
+                privileged_client,
+                "grabowski_privileged_broker_status",
+                return_value={"ready": True},
+            ),
+            mock.patch.object(
+                privileged_client.socket,
+                "socket",
+                return_value=OversizeSocket(),
+            ),
+            mock.patch.object(privileged_client, "_append_operator_audit") as audit,
+        ):
+            result = privileged_client.run_blockade_lifecycle_reference(
+                {
+                    "operation": "observe",
+                    "transaction_id": "oversize-response-test",
+                    "expected_record_sha256": "0" * 64,
+                    "expected_marker_file_sha256": "0" * 64,
+                },
+                justification="oversize broker response ambiguity test",
+            )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "unknown")
+        self.assertIn("response exceeds output limit", result["failure_reason"])
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args.args[0]["outcome"], "unknown")
 
     @staticmethod
     def reference() -> dict[str, object]:
@@ -462,7 +636,10 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(PermissionError, "UID"):
                     broker_tool._validate_blockade_lifecycle_peer(
-                        self.execution(), proc_root=proc_root
+                        self.execution(),
+                        proc_root=proc_root,
+                        unit_identity=self.unit_identity(),
+                        expected_argv=self.OPERATOR_ARGV,
                     )
             with mock.patch.object(
                 broker_tool,
@@ -471,7 +648,10 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(PermissionError, "not observable"):
                     broker_tool._validate_blockade_lifecycle_peer(
-                        self.execution(), proc_root=proc_root
+                        self.execution(),
+                        proc_root=proc_root,
+                        unit_identity=self.unit_identity(),
+                        expected_argv=self.OPERATOR_ARGV,
                     )
 
 

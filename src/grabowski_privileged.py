@@ -588,7 +588,7 @@ def run_blockade_lifecycle_reference(
     except (socket.timeout, TimeoutError) as exc:
         timed_out = True
         stderr_raw = str(exc).encode("utf-8", errors="replace") or b"privileged broker direct socket timed out"
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         stderr_raw = f"{type(exc).__name__}: {exc}".encode("utf-8", errors="replace")
 
     stdout = _redact_text(stdout_raw.decode("utf-8", errors="replace"))

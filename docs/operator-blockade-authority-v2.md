@@ -70,19 +70,27 @@ spawn the generic privileged-request client, because that would replace the
 operator's `SO_PEERCRED` with a child-process identity.
 
 The socket-activated root process reads kernel `SO_PEERCRED`, requires the exact
-operator UID and verifies that the peer PID belongs to the unified cgroup ending
-in `grabowski-operator.service`. It then binds the decision to cgroup-v2
-`cgroup.procs` plus `/proc/<pid>/stat`: the peer must be the unique oldest
-process in that exact service cgroup, its parent must be outside that cgroup,
-and the membership set must remain unchanged across validation. Thus a same-UID
-terminal/request-client child is rejected even though it inherited the exact
-operator-service cgroup; tmux, login-session, durable-job, persistent-task and
-other-service peers continue to fail the unit boundary earlier.
+operator UID, and independently queries the owning user systemd manager for the
+configured unit's active `MainPID` and `ControlGroup`. The socket peer PID must
+be that exact `MainPID`, its observed cgroup must equal the systemd
+`ControlGroup`, and `/proc/<pid>/cmdline` must equal Grabowski's fixed operator
+entrypoint argv. This means writable user-cgroup membership alone grants no
+authority.
 
-Failure to read peer credentials, cgroup membership, process start identity or
-parent identity; malformed/unbounded process sets; a UID/unit mismatch; a
-non-main peer; or membership drift all block before the single-use claim and
-before any filesystem effect.
+The broker additionally binds the decision to cgroup-v2 `cgroup.procs` plus
+`/proc/<pid>/stat`: the peer must be the unique oldest process in that exact
+service cgroup, its parent must be outside that cgroup, and the membership set
+must remain unchanged across validation. Thus a same-UID terminal/request-client
+child is rejected even though it inherited the exact operator-service cgroup; a
+process manually moved into that writable user cgroup still fails the systemd
+`MainPID` boundary; tmux, login-session, durable-job, persistent-task and
+other-service peers fail earlier.
+
+Failure to read peer credentials, systemd unit identity, command identity, cgroup
+membership, process start identity or parent identity; malformed/unbounded
+process sets; a UID/unit/MainPID/ControlGroup mismatch; a non-main peer; or
+membership drift all block before the single-use claim and before any filesystem
+effect.
 
 This peer check does not claim protection against a compromised kernel, root,
 or arbitrary code injected into the long-lived operator main process itself.
