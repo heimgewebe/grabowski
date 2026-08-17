@@ -2911,9 +2911,8 @@ def checkout_owner_handoff_apply(
     top_level = Path(planned["checkout"]["repo_path"])
     common_dir = Path(planned["checkout"]["repo_common_dir"])
     target_owner = planned["owners"]["target_owner_id"]
-    operation_owner = f"checkout-owner-handoff:{uuid.uuid4().hex[:20]}"
     lease = _acquire_checkout_resources(
-        owner_id=operation_owner,
+        owner_id=target_owner,
         repo_common_dir=common_dir,
         checkout_path=checkout,
         purpose="atomically align checkout lifecycle ownership",
@@ -2923,7 +2922,6 @@ def checkout_owner_handoff_apply(
         metadata={
             "checkout_key": planned["checkout"]["checkout_key"],
             "snapshot_sha256": snapshot_sha256,
-            "durable_target_owner_id": target_owner,
         },
     )
     result: dict[str, Any] | None = None
