@@ -797,29 +797,161 @@ def _cleanup(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _terminalization_core_complete(terminalization: dict[str, Any]) -> bool:
+    release = terminalization.get("release")
+    cleanup = terminalization.get("cleanup")
+    return bool(
+        isinstance(release, dict)
+        and release.get("status") in {"released", "already-absent"}
+        and isinstance(cleanup, dict)
+        and cleanup.get("status") == "completed"
+    )
+
+
+def _failed_unit_evidence(observation: dict[str, Any]) -> bool:
+    candidates = [observation, observation.get("prior_observation")]
+    terminalization = observation.get("terminalization")
+    if isinstance(terminalization, dict):
+        unit_reset = terminalization.get("unit_reset")
+        if isinstance(unit_reset, dict):
+            probe = unit_reset.get("probe")
+            if isinstance(probe, dict):
+                candidates.append(probe)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        properties = candidate.get("properties")
+        if isinstance(properties, dict) and properties.get("ActiveState") == "failed":
+            return True
+    return False
+
+
+def _probe_failed_unit_state(record: dict[str, Any]) -> dict[str, Any]:
+    result = operator._run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            record["unit"],
+            "--no-pager",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+        ],
+        cwd=operator.HOME,
+        timeout_seconds=30,
+        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+    )
+    properties: dict[str, str] = {}
+    for line in result.get("stdout", "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            properties[key] = value
+    active = properties.get("ActiveState")
+    load = properties.get("LoadState")
+    if result.get("returncode") != 0:
+        state = "unknown"
+    elif active == "failed":
+        state = "failed"
+    elif load == "not-found" or active in {"inactive", "deactivating"}:
+        state = "not-failed"
+    else:
+        state = "unknown"
+    return {
+        "status": state,
+        "properties": properties,
+        "result": result,
+    }
+
+
+def _reset_failed_unit(
+    record: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    probe_current: bool = False,
+) -> dict[str, Any]:
+    terminalization = observation.get("terminalization")
+    if not isinstance(terminalization, dict) or not _terminalization_core_complete(
+        terminalization
+    ):
+        return {"status": "deferred"}
+    failed_evidence = _failed_unit_evidence(observation)
+    probe = None
+    if not failed_evidence and probe_current:
+        probe = _probe_failed_unit_state(record)
+        if probe["status"] == "unknown":
+            return {"status": "incomplete", "probe": probe}
+        if probe["status"] == "failed":
+            failed_evidence = True
+        else:
+            return {"status": "not-required", "probe": probe}
+    if not failed_evidence:
+        return {"status": "not-required"}
+    result = operator._run(
+        ["systemctl", "--user", "reset-failed", record["unit"]],
+        cwd=operator.HOME,
+        timeout_seconds=30,
+        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+    )
+    outcome = {
+        "status": "reset" if result.get("returncode") == 0 else "incomplete",
+        "result": result,
+    }
+    if probe is not None:
+        outcome["probe"] = probe
+    return outcome
+
+
+def _terminalization_settled(observation: dict[str, Any]) -> bool:
+    terminalization = observation.get("terminalization")
+    if not isinstance(terminalization, dict) or not _terminalization_core_complete(
+        terminalization
+    ):
+        return False
+    unit_reset = terminalization.get("unit_reset")
+    if isinstance(unit_reset, dict):
+        return unit_reset.get("status") in {"reset", "not-required"}
+    return not _failed_unit_evidence(observation)
+
+
 def _terminalization_action_required(observation: dict[str, Any]) -> bool:
     terminalization = observation.get("terminalization")
     if not isinstance(terminalization, dict):
         return False
     release = terminalization.get("release")
     cleanup = terminalization.get("cleanup")
-    return bool(
+    if bool(
         isinstance(release, dict)
         and release.get("status") in {"blocked", "partial", "incomplete"}
-    ) or bool(isinstance(cleanup, dict) and cleanup.get("status") == "partial")
+    ) or bool(isinstance(cleanup, dict) and cleanup.get("status") == "partial"):
+        return True
+    unit_reset = terminalization.get("unit_reset")
+    if isinstance(unit_reset, dict) and unit_reset.get("status") in {
+        "deferred",
+        "incomplete",
+    }:
+        return True
+    return bool(
+        _terminalization_core_complete(terminalization)
+        and _failed_unit_evidence(observation)
+        and not isinstance(unit_reset, dict)
+    )
 
 
 def _reconcile_record(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     observation = _observe(record)
     stored = _update(record["worker_id"], observation["state"], observation=observation)
     if observation["state"] not in WORKER_ACTIVE_STATES:
+        terminalization = {
+            "release": _release(stored),
+            "cleanup": _cleanup(stored),
+        }
         observation = {
             **observation,
-            "terminalization": {
-                "release": _release(stored),
-                "cleanup": _cleanup(stored),
-            },
+            "terminalization": terminalization,
         }
+        if _terminalization_core_complete(terminalization):
+            terminalization["unit_reset"] = _reset_failed_unit(stored, observation)
         stored = _update(
             record["worker_id"], observation["state"], observation=observation
         )
@@ -1017,8 +1149,21 @@ def _start(
         state = "running" if launcher["returncode"] == 0 else "failed"
         stored = _update(worker_id, state, launcher=launcher)
         if state == "failed":
-            _release(stored)
-            _cleanup(stored)
+            terminalization = {
+                "release": _release(stored),
+                "cleanup": _cleanup(stored),
+            }
+            observation: dict[str, Any] = {
+                "state": "failed",
+                "launcher": launcher,
+                "observed_at_unix": _now(),
+                "terminalization": terminalization,
+            }
+            if _terminalization_core_complete(terminalization):
+                terminalization["unit_reset"] = _reset_failed_unit(
+                    stored, observation, probe_current=True
+                )
+            stored = _update(worker_id, state, observation=observation)
         return {"worker": _public(stored), "launcher": launcher}
     except Exception:
         try:
@@ -3854,19 +3999,36 @@ def _reconcile_stopped_record(
         else {"state": "stopped"}
     )
     terminalization = observation.get("terminalization")
-    if isinstance(terminalization, dict) and not _terminalization_action_required(
-        observation
-    ):
-        return record, observation
+    if isinstance(terminalization, dict):
+        unit_reset = terminalization.get("unit_reset")
+        if isinstance(unit_reset, dict) and _terminalization_settled(observation):
+            return record, observation
+        if _terminalization_core_complete(terminalization):
+            terminalization = dict(terminalization)
+            observation = {**observation, "terminalization": terminalization}
+            terminalization["unit_reset"] = _reset_failed_unit(
+                record,
+                observation,
+                probe_current=not isinstance(unit_reset, dict),
+            )
+            stored = _update(
+                record["worker_id"], "stopped", observation=observation
+            )
+            return stored, observation
+    terminalization = {
+        "release": _release(record),
+        "cleanup": _cleanup(record),
+    }
     observation = {
         **observation,
         "state": "stopped",
         "observed_at_unix": _now(),
-        "terminalization": {
-            "release": _release(record),
-            "cleanup": _cleanup(record),
-        },
+        "terminalization": terminalization,
     }
+    if _terminalization_core_complete(terminalization):
+        terminalization["unit_reset"] = _reset_failed_unit(
+            record, observation, probe_current=True
+        )
     stored = _update(record["worker_id"], "stopped", observation=observation)
     return stored, observation
 
@@ -3877,6 +4039,24 @@ def worker_status(worker_id: str, *, expected_kind: str | None = None) -> dict[s
         raise ValueError(f"Worker is not a {expected_kind} worker")
     if record["state"] == "stopped":
         stored, _observation = _reconcile_stopped_record(record)
+    elif record["state"] in WORKER_HISTORY_STATES and record[
+        "last_observation_json"
+    ]:
+        observation = json.loads(record["last_observation_json"])
+        terminalization = observation.get("terminalization")
+        if _terminalization_settled(observation):
+            stored = record
+        elif isinstance(terminalization, dict) and _terminalization_core_complete(
+            terminalization
+        ):
+            terminalization = dict(terminalization)
+            observation = {**observation, "terminalization": terminalization}
+            terminalization["unit_reset"] = _reset_failed_unit(record, observation)
+            stored = _update(
+                worker_id, record["state"], observation=observation
+            )
+        else:
+            stored, _observation = _reconcile_record(record)
     else:
         stored, _observation = _reconcile_record(record)
     return _public(stored)
@@ -3903,10 +4083,15 @@ def worker_stop(worker_id: str, *, expected_kind: str | None = None) -> dict[str
         observation["prior_observation"] = prior_observation
     stored = _update(worker_id, state, observation=observation)
     if result["returncode"] == 0:
-        observation["terminalization"] = {
+        terminalization = {
             "release": _release(stored),
             "cleanup": _cleanup(stored),
         }
+        observation["terminalization"] = terminalization
+        if _terminalization_core_complete(terminalization):
+            terminalization["unit_reset"] = _reset_failed_unit(
+                stored, observation
+            )
         stored = _update(worker_id, state, observation=observation)
     return {"worker": _public(stored), "result": result}
 

@@ -771,6 +771,194 @@ globalThis.fetch = async () => ({
         self.assertIsNone(workers.resources.inspect_resource("port:9223"))
         self.assertFalse(profile.exists())
 
+    def test_failed_terminalization_resets_exact_unit_after_cleanup(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(
+                str(self.binary), port=9234, runtime_seconds=60
+            )
+        worker = started["worker"]
+        failed_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "Result=exit-code\nExecMainCode=1\nExecMainStatus=1\n"
+            )
+        )
+        with patch.object(
+            workers.operator, "_run", side_effect=[failed_probe, result()]
+        ) as run:
+            status = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+
+        self.assertEqual(status["state"], "failed")
+        terminalization = status["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["release"]["status"], "released")
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertEqual(terminalization["unit_reset"]["status"], "reset")
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["systemctl", "--user", "reset-failed", worker["unit"]],
+        )
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
+        with patch.object(
+            workers,
+            "_observe",
+            side_effect=AssertionError("settled worker must not re-probe"),
+        ), patch.object(
+            workers.operator,
+            "_run",
+            side_effect=AssertionError("settled worker must not re-run systemd"),
+        ):
+            repeated = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(repeated["state"], "failed")
+        self.assertEqual(
+            repeated["last_observation"]["terminalization"]["unit_reset"]["status"],
+            "reset",
+        )
+
+    def test_failed_unit_reset_failure_stays_attention_and_retries_without_reprobe(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(
+                str(self.binary), port=9235, runtime_seconds=60
+            )
+        worker = started["worker"]
+        failed_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "Result=exit-code\nExecMainCode=1\nExecMainStatus=1\n"
+            )
+        )
+        with patch.object(
+            workers.operator,
+            "_run",
+            side_effect=[failed_probe, result(returncode=1)],
+        ):
+            status = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(
+            status["last_observation"]["terminalization"]["unit_reset"]["status"],
+            "incomplete",
+        )
+        current = workers.worker_list("browser", limit=10)
+        self.assertEqual(current["count"], 1)
+        self.assertEqual(
+            current["workers"][0]["projection"]["reason"],
+            "terminalization-incomplete",
+        )
+
+        with patch.object(
+            workers,
+            "_observe",
+            side_effect=AssertionError("reset retry must not re-probe"),
+        ), patch.object(workers.operator, "_run", return_value=result()) as run:
+            retried = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["systemctl", "--user", "reset-failed", worker["unit"]],
+        )
+        self.assertEqual(
+            retried["last_observation"]["terminalization"]["unit_reset"]["status"],
+            "reset",
+        )
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
+    def test_planned_runtime_completion_resets_failed_systemd_unit(self) -> None:
+        with patch.object(workers, "_now", return_value=1000), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(
+                str(self.binary), port=9236, runtime_seconds=60
+            )
+        worker = started["worker"]
+        timeout_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "Result=timeout\nExecMainCode=1\nExecMainStatus=0\n"
+                "RuntimeMaxUSec=1min\n"
+                "ActiveEnterTimestampMonotonic=1000000\n"
+                "ActiveExitTimestampMonotonic=61000000\n"
+            )
+        )
+        with patch.object(workers, "_now", return_value=1060), patch.object(
+            workers.operator, "_run", side_effect=[timeout_probe, result()]
+        ) as run:
+            status = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(
+            status["last_observation"]["terminalization"]["unit_reset"]["status"],
+            "reset",
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["systemctl", "--user", "reset-failed", worker["unit"]],
+        )
+
+    def test_legacy_failed_terminalization_is_migrated_without_reprobe(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(
+                str(self.binary), port=9237, runtime_seconds=60
+            )
+        worker = started["worker"]
+        record = workers._row(worker["worker_id"])
+        terminalization = {
+            "release": workers._release(record),
+            "cleanup": workers._cleanup(record),
+        }
+        legacy_observation = {
+            "state": "failed",
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "failed",
+                "SubState": "failed",
+                "Result": "timeout",
+            },
+            "observed_at_unix": 123456,
+            "terminalization": terminalization,
+        }
+        workers._update(
+            worker["worker_id"], "failed", observation=legacy_observation
+        )
+
+        current = workers.worker_list("browser", limit=10)
+        self.assertEqual(current["count"], 1)
+        self.assertEqual(
+            current["workers"][0]["projection"]["reason"],
+            "terminalization-incomplete",
+        )
+        with patch.object(
+            workers,
+            "_observe",
+            side_effect=AssertionError("legacy migration must not re-probe"),
+        ), patch.object(workers.operator, "_run", return_value=result()) as run:
+            migrated = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["systemctl", "--user", "reset-failed", worker["unit"]],
+        )
+        self.assertEqual(
+            migrated["last_observation"]["terminalization"]["unit_reset"]["status"],
+            "reset",
+        )
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
     def test_planned_runtime_limit_is_completed_and_releases_ephemeral_profile(self) -> None:
         with patch.object(workers, "_now", return_value=1000), patch.object(
             workers, "_executable", return_value=self.binary.resolve()
@@ -1646,12 +1834,52 @@ globalThis.fetch = async () => ({
             f"worker:{worker['worker_id']}",
         )
 
-    def test_launch_failure_releases_worker_leases(self) -> None:
+    def test_launch_failure_releases_worker_leases_and_clears_missing_unit(self) -> None:
+        missing_probe = result(
+            stdout=(
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+            )
+        )
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
-            workers.operator, "_run", return_value=result(returncode=1)
-        ):
+            workers.operator,
+            "_run",
+            side_effect=[result(returncode=1), missing_probe],
+        ) as run:
             started = workers.browser_start(str(self.binary), port=9224, runtime_seconds=60)
         self.assertEqual(started["worker"]["state"], "failed")
+        terminalization = started["worker"]["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["release"]["status"], "released")
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertEqual(terminalization["unit_reset"]["status"], "not-required")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[1].args[0][0:4], [
+            "systemctl", "--user", "show", started["worker"]["unit"]
+        ])
+        self.assertIsNone(workers.resources.inspect_resource("port:9224"))
+
+    def test_launch_failure_resets_exact_failed_unit_after_cleanup(self) -> None:
+        failed_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+            )
+        )
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator,
+            "_run",
+            side_effect=[result(returncode=1), failed_probe, result()],
+        ) as run:
+            started = workers.browser_start(str(self.binary), port=9224, runtime_seconds=60)
+        worker = started["worker"]
+        self.assertEqual(worker["state"], "failed")
+        terminalization = worker["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["release"]["status"], "released")
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertEqual(terminalization["unit_reset"]["status"], "reset")
+        self.assertEqual(terminalization["unit_reset"]["probe"]["status"], "failed")
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            ["systemctl", "--user", "reset-failed", worker["unit"]],
+        )
         self.assertIsNone(workers.resources.inspect_resource("port:9224"))
 
 
@@ -2064,19 +2292,96 @@ globalThis.fetch = async () => ({
             started = workers.browser_start(str(self.binary), port=9353, runtime_seconds=60)
         worker = started["worker"]
         workers._update(worker["worker_id"], "stopped")
+        not_failed_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+            )
+        )
 
         with patch.object(
-            workers, "_observe", side_effect=AssertionError("legacy stopped status must not probe systemd")
-        ):
+            workers, "_observe", side_effect=AssertionError("legacy stopped status must not use full worker probe")
+        ), patch.object(workers.operator, "_run", return_value=not_failed_probe) as run:
             reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
         self.assertEqual(reconciled["state"], "stopped")
         terminalization = reconciled["last_observation"]["terminalization"]
         self.assertEqual(terminalization["release"]["status"], "released")
         self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertEqual(terminalization["unit_reset"]["status"], "not-required")
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "systemctl",
+                "--user",
+                "show",
+                worker["unit"],
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
+        )
         self.assertIsNone(workers.resources.inspect_resource("port:9353"))
         self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
 
-    def test_stopped_status_retries_incomplete_terminalization_without_probe(self) -> None:
+    def test_stopped_status_migrates_legacy_failed_unit_with_exact_probe(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9354, runtime_seconds=60)
+        worker = started["worker"]
+        record = workers._row(worker["worker_id"])
+        terminalization = {
+            "release": workers._release(record),
+            "cleanup": workers._cleanup(record),
+        }
+        workers._update(
+            worker["worker_id"],
+            "stopped",
+            observation={
+                "state": "stopped",
+                "stop": result(),
+                "observed_at_unix": 123456,
+                "terminalization": terminalization,
+            },
+        )
+        failed_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+            )
+        )
+        with patch.object(
+            workers, "_observe", side_effect=AssertionError("legacy stopped migration must not use full worker probe")
+        ), patch.object(
+            workers.operator, "_run", side_effect=[failed_probe, result()]
+        ) as run:
+            migrated = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                "systemctl",
+                "--user",
+                "show",
+                worker["unit"],
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["systemctl", "--user", "reset-failed", worker["unit"]],
+        )
+        unit_reset = migrated["last_observation"]["terminalization"]["unit_reset"]
+        self.assertEqual(unit_reset["status"], "reset")
+        self.assertEqual(unit_reset["probe"]["status"], "failed")
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
+    def test_stopped_status_retries_incomplete_terminalization_without_full_probe(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()
         ):
@@ -2105,11 +2410,21 @@ globalThis.fetch = async () => ({
         )
 
         workers.resources.release_resources("foreign-owner", ["port:9352"])
+        not_failed_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+            )
+        )
         with patch.object(
-            workers, "_observe", side_effect=AssertionError("stopped retry must not probe systemd")
-        ):
+            workers, "_observe", side_effect=AssertionError("stopped retry must not use full worker probe")
+        ), patch.object(workers.operator, "_run", return_value=not_failed_probe) as run:
             reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(run.call_count, 1)
         self.assertEqual(reconciled["state"], "stopped")
+        self.assertEqual(
+            reconciled["last_observation"]["terminalization"]["unit_reset"]["status"],
+            "not-required",
+        )
         self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
 
     def _running_observation(self) -> dict[str, object]:
