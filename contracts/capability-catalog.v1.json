@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "1620ad4b5d93a3859047ab9c1b7d91125ac5821121a25721733197a570397946",
+  "capability_source_sha256": "fe56343d96e870df6abdca6e0262456f0ce736d6dc2fac287e016509da31bfb4",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "62b83f7a71d8cc7bd59fc553992ec8fb3ed50c670e0956cec25f8476fb1a1977",
+  "contract_sha256": "39df47409bc1dd6325b6549f950383cfc18a37a3a13d74652d19665df4783b80",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -2267,6 +2267,21 @@
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_collect"
+    },
+    {
+      "category": "agent-workspace",
+      "description": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit.",
+      "effects": [
+        "git-ref-update",
+        "receipt-create",
+        "audit-append"
+      ],
+      "id": "grabowski_agent_workspace_adopt",
+      "purpose": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit with immutable intent and readback receipts.",
+      "read_only": false,
+      "reversibility": "preserved-adoption-commit-and-receipts",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_adopt"
     },
     {
       "category": "agent-workspace",

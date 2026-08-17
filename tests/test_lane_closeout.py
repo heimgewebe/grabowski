@@ -95,6 +95,95 @@ class LaneCloseoutTests(unittest.TestCase):
         self.assertIn("push_exact_branch_head", result["recovery_actions"])
         self.assertIn("create_or_update_pr", result["recovery_actions"])
 
+    def test_candidate_adopted_is_terminal_before_push_or_pr(self) -> None:
+        result = closeout.classify(
+            self.observation(
+                remote_head_sha=BASE,
+                ahead_commits=1,
+                candidate_id="d" * 64,
+                adoption_receipt_sha256="e" * 64,
+                adoption_commit_sha=HEAD,
+            )
+        )
+        self.assertEqual(result["phase"], "terminal")
+        self.assertEqual(result["closeout_state"], "candidate_adopted")
+        self.assertEqual(result["reason_codes"], ["candidate_adoption_receipt_bound"])
+        self.assertTrue(result["lease_release_ready"])
+        self.assertFalse(result["workspace_cleanup_ready"])
+
+    def test_delivery_closeout_precedes_candidate_adoption_when_already_observed(self) -> None:
+        adoption = {
+            "candidate_id": "d" * 64,
+            "adoption_receipt_sha256": "e" * 64,
+            "adoption_commit_sha": HEAD,
+        }
+        merged = closeout.classify(
+            self.observation(
+                pr_state="merged",
+                pr_number=631,
+                pr_head_sha=HEAD,
+                merged_sha=HEAD,
+                **adoption,
+            )
+        )
+        self.assertEqual(merged["closeout_state"], "pr_merged")
+
+        deployed = closeout.classify(
+            self.observation(
+                pr_state="merged",
+                pr_number=631,
+                pr_head_sha=HEAD,
+                merged_sha=HEAD,
+                deployed_sha=HEAD,
+                **adoption,
+            )
+        )
+        self.assertEqual(deployed["closeout_state"], "deployed")
+
+    def test_candidate_adoption_requires_exact_clean_adopted_head(self) -> None:
+        mismatch = closeout.classify(
+            self.observation(
+                head_sha="f" * 40,
+                remote_head_sha=BASE,
+                ahead_commits=1,
+                candidate_id="d" * 64,
+                adoption_receipt_sha256="e" * 64,
+                adoption_commit_sha=HEAD,
+            )
+        )
+        self.assertNotEqual(mismatch.get("closeout_state"), "candidate_adopted")
+        self.assertFalse(mismatch["lease_release_ready"])
+
+        dirty = closeout.classify(
+            self.observation(
+                git_dirty=True,
+                candidate_id="d" * 64,
+                adoption_receipt_sha256="e" * 64,
+                adoption_commit_sha=HEAD,
+            )
+        )
+        self.assertNotEqual(dirty.get("closeout_state"), "candidate_adopted")
+        self.assertIn("valuable_dirty_state", dirty["reason_codes"])
+
+    def test_candidate_adoption_closeout_binding_must_be_complete(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires candidate_id"):
+            closeout.classify(
+                self.observation(
+                    candidate_id="d" * 64,
+                    adoption_receipt_sha256="e" * 64,
+                )
+            )
+
+    def test_candidate_adoption_hash_bindings_are_strict(self) -> None:
+        with self.assertRaisesRegex(ValueError, "candidate_id"):
+            closeout.classify(
+                self.observation(
+                    candidate_id="not-a-sha",
+                    adoption_receipt_sha256="e" * 64,
+                    adoption_commit_sha=HEAD,
+                )
+            )
+
     def test_no_change_proof_is_terminal(self) -> None:
         result = closeout.classify(
             self.observation(

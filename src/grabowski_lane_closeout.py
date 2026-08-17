@@ -19,6 +19,7 @@ TERMINAL_CLOSEOUT_STATES = frozenset(
         "pr_updated",
         "pr_merged",
         "deployed",
+        "candidate_adopted",
         "no_change_proven",
         "blocked_with_durable_followup",
     }
@@ -67,6 +68,9 @@ class LaneCloseoutObservation:
     merged_sha: str | None = None
     deployed_sha: str | None = None
     no_change_proven: bool = False
+    candidate_id: str | None = None
+    adoption_receipt_sha256: str | None = None
+    adoption_commit_sha: str | None = None
     durable_followup_id: str | None = None
     readback_errors: tuple[str, ...] = ()
 
@@ -125,6 +129,14 @@ def _sha(value: Any, field: str, *, optional: bool = False) -> str | None:
     return value
 
 
+def _sha256(value: Any, field: str, *, optional: bool = False) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a lowercase SHA-256")
+    return value
+
+
 def _boolean(value: Any, field: str, *, allow_null: bool = True) -> bool | None:
     if value is None:
         if allow_null:
@@ -173,7 +185,7 @@ def _validated(observation: LaneCloseoutObservation) -> dict[str, Any]:
         normalized = _identity(value, "readback_error")
         if normalized is not None:
             errors.append(normalized)
-    return {
+    data = {
         "lane_id": _identity(observation.lane_id, "lane_id"),
         "repository": _identity(observation.repository, "repository"),
         "workspace": _identity(observation.workspace, "workspace"),
@@ -207,6 +219,17 @@ def _validated(observation: LaneCloseoutObservation) -> dict[str, Any]:
         "no_change_proven": _boolean(
             observation.no_change_proven, "no_change_proven", allow_null=False
         ),
+        "candidate_id": _sha256(
+            observation.candidate_id, "candidate_id", optional=True
+        ),
+        "adoption_receipt_sha256": _sha256(
+            observation.adoption_receipt_sha256,
+            "adoption_receipt_sha256",
+            optional=True,
+        ),
+        "adoption_commit_sha": _sha(
+            observation.adoption_commit_sha, "adoption_commit_sha", optional=True
+        ),
         "durable_followup_id": _identity(
             observation.durable_followup_id,
             "durable_followup_id",
@@ -214,6 +237,19 @@ def _validated(observation: LaneCloseoutObservation) -> dict[str, Any]:
         ),
         "readback_errors": sorted(set(errors)),
     }
+    adoption_binding = (
+        data["candidate_id"],
+        data["adoption_receipt_sha256"],
+        data["adoption_commit_sha"],
+    )
+    if any(value is not None for value in adoption_binding) and not all(
+        value is not None for value in adoption_binding
+    ):
+        raise ValueError(
+            "candidate adoption closeout requires candidate_id, "
+            "adoption_receipt_sha256, and adoption_commit_sha together"
+        )
+    return data
 
 
 def _terminal_result(
@@ -395,6 +431,23 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
     if open_pr_complete:
         state = "pr_updated" if data["pr_origin"] == "updated" else "pr_opened"
         return _terminal_result(data, state, ["open_pr_exact_head_bound"])
+
+    candidate_adoption_bound = bool(
+        data["candidate_id"] is not None
+        and data["adoption_receipt_sha256"] is not None
+        and data["adoption_commit_sha"] is not None
+    )
+    if (
+        candidate_adoption_bound
+        and data["lease_active"] is True
+        and data["git_dirty"] is False
+        and head == data["adoption_commit_sha"]
+    ):
+        return _terminal_result(
+            data,
+            "candidate_adopted",
+            ["candidate_adoption_receipt_bound"],
+        )
 
     no_change_complete = bool(
         data["no_change_proven"] is True

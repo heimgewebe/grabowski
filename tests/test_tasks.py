@@ -9534,6 +9534,7 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_agent_workspace_status",
             "grabowski_agent_workspace_attach",
             "grabowski_agent_workspace_collect",
+            "grabowski_agent_workspace_adopt",
             "grabowski_agent_workspace_close",
         ):
             self.assertIn(tool, expected)
