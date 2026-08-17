@@ -13,8 +13,11 @@ from typing import Any
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
+SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
 LAUNCH_NONCE = __import__("re").compile(r"^[0-9a-f]{24}$")
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
+MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 def _canonical(value: Any) -> str:
@@ -41,6 +44,89 @@ def _git(repo: Path, *args: str) -> str:
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "git failed").strip())
     return completed.stdout.strip()
+
+
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+        env=safe_git_environment(),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or b"git failed").decode(
+            "utf-8", errors="replace"
+        )
+        raise RuntimeError(detail.strip())
+    return bytes(completed.stdout)
+
+
+def _safe_untracked_file(repo: Path, relative: PurePosixPath) -> Path:
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative.parts[0] == ".git"
+    ):
+        raise RuntimeError(f"invalid untracked writer path: {relative}")
+    target = repo.joinpath(*relative.parts)
+    metadata = target.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+    ):
+        raise RuntimeError(f"unsafe untracked writer file: {relative}")
+    resolved = target.resolve(strict=True)
+    try:
+        resolved.relative_to(repo)
+    except ValueError as exc:
+        raise RuntimeError(f"untracked writer file escapes worktree: {relative}") from exc
+    return target
+
+
+def _dirty_preimage_sha256(repo: Path, base_head: str, head: str, branch: str) -> str:
+    committed = _git_bytes(
+        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"
+    )
+    working = _git_bytes(
+        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"
+    )
+    raw_untracked = _git_bytes(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    untracked: list[dict[str, Any]] = []
+    total = 0
+    for raw in raw_untracked.split(b"\x00"):
+        if not raw:
+            continue
+        relative = PurePosixPath(os.fsdecode(raw))
+        target = _safe_untracked_file(repo, relative)
+        metadata = target.stat()
+        if metadata.st_size > MAX_UNTRACKED_FILE_BYTES:
+            raise RuntimeError(f"untracked writer file exceeds safety boundary: {relative}")
+        total += metadata.st_size
+        if total > MAX_UNTRACKED_TOTAL_BYTES:
+            raise RuntimeError("untracked writer files exceed aggregate safety boundary")
+        untracked.append(
+            {
+                "path": relative.as_posix(),
+                "size": metadata.st_size,
+                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            }
+        )
+    return _digest(
+        {
+            "base_head": base_head,
+            "head": head,
+            "branch": branch,
+            "committed_diff_sha256": hashlib.sha256(committed).hexdigest(),
+            "working_diff_sha256": hashlib.sha256(working).hexdigest(),
+            "untracked": untracked,
+        }
+    )
 
 
 def _write_receipt(path: Path, payload: dict[str, Any]) -> None:
@@ -111,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allowed-path", action="append", default=[])
     parser.add_argument("--output", required=True)
     parser.add_argument("--launch-nonce")
+    parser.add_argument("--expected-dirty-preimage-sha256")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -120,14 +207,31 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("invalid command, base binding or writable scope")
     if args.launch_nonce is not None and LAUNCH_NONCE.fullmatch(args.launch_nonce) is None:
         parser.error("invalid launch nonce")
+    if (
+        args.expected_dirty_preimage_sha256 is not None
+        and SHA256.fullmatch(args.expected_dirty_preimage_sha256) is None
+    ):
+        parser.error("invalid dirty preimage binding")
     repo = Path(args.repository).resolve(strict=True)
     output = Path(args.output).resolve(strict=False)
     writable_paths = [_allowed_path(repo, item) for item in args.allowed_path]
     before_head = _git(repo, "rev-parse", "HEAD").lower()
     before_branch = _git(repo, "branch", "--show-current")
     before_status = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
-    if before_head != args.expected_base_head or before_branch != args.expected_branch or before_status:
-        raise RuntimeError("writer worktree does not match its clean base and branch binding")
+    if before_head != args.expected_base_head or before_branch != args.expected_branch:
+        raise RuntimeError("writer worktree does not match its base and branch binding")
+    observed_dirty_preimage_sha256: str | None = None
+    if args.expected_dirty_preimage_sha256 is None:
+        if before_status:
+            raise RuntimeError("writer worktree does not match its clean base and branch binding")
+    else:
+        if not before_status:
+            raise RuntimeError("revision writer requires the exact dirty Candidate preimage")
+        observed_dirty_preimage_sha256 = _dirty_preimage_sha256(
+            repo, args.expected_base_head, before_head, before_branch
+        )
+        if observed_dirty_preimage_sha256 != args.expected_dirty_preimage_sha256:
+            raise RuntimeError("revision writer dirty Candidate preimage drifted")
     common_raw = _git(repo, "rev-parse", "--git-common-dir")
     common = Path(common_raw)
     if not common.is_absolute():
@@ -159,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         "branch_before": before_branch,
         "command_sha256": _digest(command),
         "launch_nonce": args.launch_nonce,
+        "expected_dirty_preimage_sha256": args.expected_dirty_preimage_sha256,
+        "observed_dirty_preimage_sha256": observed_dirty_preimage_sha256,
         "returncode": completed.returncode,
         "stdout_bytes": completed.stdout_bytes,
         "stderr_bytes": completed.stderr_bytes,

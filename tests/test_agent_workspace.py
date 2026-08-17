@@ -8869,6 +8869,447 @@ class AgentWorkspaceTests(unittest.TestCase):
             "cwd": str(manifest["writer_worktree"]),
         }
 
+    def needs_change_lane_candidate_fixture(
+        self,
+    ) -> tuple[dict, dict, dict, dict, dict, dict]:
+        lane = self.lane_receipt(idempotency_key="p4-needs-change-candidate")
+        manifest = self.lane_manifest(lane)
+        (self.git.writer / "src" / "app.py").write_text(
+            "revision = 1\n", encoding="utf-8"
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(
+            manifest, snapshot, workspace._run
+        )
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, candidate_reference = workspace._persist_candidate_evidence(
+            manifest, snapshot, writer_result, writer_receipt
+        )
+        tests_receipt = signed_role_receipt("tests", manifest, snapshot)
+        findings = [{"code": "p4-needs-change", "message": "revise candidate"}]
+        review_receipt = signed_role_receipt(
+            "review",
+            manifest,
+            snapshot,
+            verdict="NEEDS_CHANGE",
+            findings=findings,
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(
+                manifest, "tests", attempt=1, candidate_round=1
+            ),
+            tests_receipt,
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(
+                manifest, "review", attempt=1, candidate_round=1
+            ),
+            review_receipt,
+        )
+        verification_receipts, verification_summary, verification_references = (
+            workspace._persist_verification_evidence(
+                manifest,
+                candidate,
+                test_receipt=tests_receipt,
+                review_receipt=review_receipt,
+            )
+        )
+        self.assertEqual(verification_summary["outcome"], "NEEDS_CHANGE")
+        manifest["tasks"].update({"tests": "tests-task", "review": "review-task"})
+        writer_task = self._handoff_writer_task(manifest, state="completed")
+        collection = persist_collection(
+            manifest,
+            {
+                "binding": manifest["binding"],
+                "expected_base_head": manifest["expected_base_head"],
+                "writer_head": snapshot["writer_head"],
+                "diff_sha256": snapshot["diff_sha256"],
+                "dirty": snapshot["dirty"],
+                "base_drift": snapshot["base_drift"],
+                "changed_paths": snapshot["changed_paths"],
+                "scope_passed": snapshot["scope_passed"],
+                "scope_violations": snapshot["scope_violations"],
+                "integration_probe": snapshot["integration_probe"],
+                "writer_final_attempt": 1,
+                "writer_receipt_sha256": writer_receipt["receipt_sha256"],
+                "writer_result": writer_result,
+                "candidate_id": candidate["candidate_id"],
+                "candidate_manifest": candidate,
+                "candidate_receipt": candidate_reference,
+                "verification_receipts": verification_receipts,
+                "verification_references": verification_references,
+                "verification_summary": verification_summary,
+                "tests": {
+                    "status": "passed",
+                    "receipt_sha256": tests_receipt["receipt_sha256"],
+                    "returncode": 0,
+                },
+                "review": {
+                    "status": "passed",
+                    "returncode": 0,
+                    "verdict": "NEEDS_CHANGE",
+                    "findings": findings,
+                    "receipt_sha256": review_receipt["receipt_sha256"],
+                },
+                "task_ids": dict(manifest["tasks"]),
+                "writer_task": writer_task,
+                "original_writer_task_id": manifest["tasks"]["writer"],
+                "effective_writer_task_id": manifest["tasks"]["writer"],
+                "writer_attempts": workspace._writer_attempt_refs(manifest),
+                "collected_at": workspace._utc(),
+            },
+        )
+        return lane, workspace._manifest(manifest["workspace_id"]), collection, candidate, snapshot, writer_task
+
+    def test_revision_dirty_preimage_matches_workspace_snapshot_and_detects_drift(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "revision = 1\n", encoding="utf-8"
+        )
+        (self.git.writer / "src" / "new.py").write_text(
+            "new_value = 1\n", encoding="utf-8"
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        observed = writer._dirty_preimage_sha256(
+            self.git.writer,
+            manifest["expected_base_head"],
+            snapshot["writer_head"],
+            snapshot["writer_branch"],
+        )
+        self.assertEqual(observed, snapshot["diff_sha256"])
+        (self.git.writer / "src" / "app.py").write_text(
+            "revision = 2\n", encoding="utf-8"
+        )
+        drifted = writer._dirty_preimage_sha256(
+            self.git.writer,
+            manifest["expected_base_head"],
+            snapshot["writer_head"],
+            snapshot["writer_branch"],
+        )
+        self.assertNotEqual(drifted, observed)
+
+    def test_revision_writer_accepts_only_exact_dirty_preimage_before_agent_effect(self) -> None:
+        manifest = self.manifest()
+        target = self.git.writer / "src" / "app.py"
+        target.write_text("revision = 1\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        expected = snapshot["diff_sha256"]
+        output = self.state / "revision-writer-receipt.json"
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout_bytes=0,
+            stderr_bytes=0,
+            stdout_sha256=hashlib.sha256(b"").hexdigest(),
+            stderr_sha256=hashlib.sha256(b"").hexdigest(),
+            stdout_tail="",
+            stderr_tail="",
+            output_limit_exceeded=False,
+        )
+        prepared = types.SimpleNamespace(
+            command=("true",),
+            extra_read_only=(),
+            extra_directories=(),
+            profile="test",
+        )
+        argv = [
+            "--repository", str(self.git.writer),
+            "--expected-base-head", manifest["expected_base_head"],
+            "--expected-branch", manifest["writer_branch"],
+            "--allowed-path", "src",
+            "--expected-dirty-preimage-sha256", expected,
+            "--output", str(output),
+            "--", "true",
+        ]
+        with (
+            mock.patch.object(writer, "prepare_external_agent_command", return_value=prepared),
+            mock.patch.object(writer, "minimal_sandbox_argv", return_value=["true"]),
+            mock.patch.object(writer, "runtime_sandbox_argv", return_value=["true"]),
+            mock.patch.object(writer, "run_bounded_capture", return_value=completed) as execute,
+        ):
+            self.assertEqual(writer.main(argv), 0)
+        execute.assert_called_once()
+        receipt = json.loads(output.read_text())
+        self.assertEqual(receipt["expected_dirty_preimage_sha256"], expected)
+        self.assertEqual(receipt["observed_dirty_preimage_sha256"], expected)
+
+        stale = expected
+        target.write_text("revision = 2\n", encoding="utf-8")
+        drift_output = self.state / "revision-writer-drift-receipt.json"
+        drift_argv = [
+            "--repository", str(self.git.writer),
+            "--expected-base-head", manifest["expected_base_head"],
+            "--expected-branch", manifest["writer_branch"],
+            "--allowed-path", "src",
+            "--expected-dirty-preimage-sha256", stale,
+            "--output", str(drift_output),
+            "--", "true",
+        ]
+        with (
+            mock.patch.object(writer, "prepare_external_agent_command") as prepare,
+            mock.patch.object(writer, "run_bounded_capture") as execute_drift,
+            self.assertRaisesRegex(RuntimeError, "dirty Candidate preimage drifted"),
+        ):
+            writer.main(drift_argv)
+        prepare.assert_not_called()
+        execute_drift.assert_not_called()
+        self.assertFalse(drift_output.exists())
+
+    def test_candidate_revision_starts_round_two_with_exact_preimage_and_archives_round_one(self) -> None:
+        lane, manifest, collection, candidate, snapshot, writer_task = (
+            self.needs_change_lane_candidate_fixture()
+        )
+        replacement = ["python3", "revision-writer.py"]
+        candidate_path = workspace._candidate_receipt_paths(
+            manifest, round_number=1
+        )["candidate"]
+        candidate_bytes = candidate_path.read_bytes()
+
+        def task_status(task_id: str) -> dict:
+            if task_id == "writer-task":
+                return dict(writer_task)
+            if task_id in {"tests-task", "review-task"}:
+                return {
+                    "task_id": task_id,
+                    "state": "completed",
+                    "terminal": True,
+                }
+            if task_id == "revision-writer-task":
+                current = workspace._manifest(manifest["workspace_id"])
+                attempt = workspace._writer_attempts(current)[1]
+                return {
+                    "task_id": task_id,
+                    "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+                    "state": "running",
+                    "terminal": False,
+                    "attempt": 1,
+                    "resume_policy": "never",
+                    "argv_sha256": attempt["task_argv_sha256"],
+                    "cwd": str(self.git.writer),
+                }
+            raise AssertionError(task_id)
+
+        def task_start(**kwargs) -> dict:
+            return {
+                "task": {
+                    "task_id": "revision-writer-task",
+                    "host": kwargs["host"],
+                    "state": "running",
+                    "attempt": 1,
+                    "resume_policy": "never",
+                    "argv_sha256": workspace._task_argv_sha256(kwargs["argv"]),
+                    "cwd": kwargs["cwd"],
+                }
+            }
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status", side_effect=task_status
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_start", side_effect=task_start
+            ) as start,
+            mock.patch.object(
+                workspace,
+                "_role_toolchain_preflight",
+                side_effect=lambda current, role_name, command: passing_toolchain_preflight(
+                    current, role_name, command
+                ),
+            ),
+            mock.patch.object(
+                workspace,
+                "_require_live_lane_binding",
+                return_value={
+                    "valid": True,
+                    "lane_id": lane["lane_id"],
+                    "receipt_sha256": lane["receipt_sha256"],
+                },
+            ),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            started = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+            repeated = workspace.grabowski_agent_workspace_writer_handoff(
+                manifest["workspace_id"], replacement
+            )
+
+        self.assertEqual(started["state"], "writer_revision_started")
+        self.assertEqual(repeated["state"], "writer_revision_already_started")
+        self.assertEqual(start.call_count, 1)
+        argv = start.call_args.kwargs["argv"]
+        index = argv.index("--expected-dirty-preimage-sha256")
+        self.assertEqual(argv[index + 1], snapshot["diff_sha256"])
+        stored = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual(stored["candidate_round"], 2)
+        self.assertIsNone(stored["collection"])
+        self.assertNotIn("frozen_writer", stored)
+        self.assertEqual(stored["tasks"]["writer"], "writer-task")
+        self.assertIsNone(stored["tasks"]["tests"] )
+        self.assertIsNone(stored["tasks"]["review"] )
+        self.assertEqual(stored["writer_final_attempt"], 2)
+        attempt = stored["writer_attempts"][1]
+        self.assertEqual(attempt["actor"], "candidate_revision")
+        self.assertEqual(attempt["revision_candidate_id"], candidate["candidate_id"])
+        self.assertEqual(attempt["revision_result_sha256"], collection["result_sha256"])
+        self.assertEqual(attempt["revision_preimage_sha256"], snapshot["diff_sha256"])
+        archive_path = workspace._collection_round_receipt_path(
+            stored, round_number=1
+        )
+        self.assertTrue(archive_path.is_file())
+        self.assertEqual(json.loads(archive_path.read_text()), collection)
+        self.assertEqual(candidate_path.read_bytes(), candidate_bytes)
+        self.assertEqual(
+            workspace._writer_patch_path(stored, round_number=2).name,
+            "writer-round-0002.patch",
+        )
+        self.assertEqual(
+            workspace._role_receipt_path(
+                stored, "review", attempt=1, candidate_round=2
+            ).name,
+            "review-receipt.round-0002.json",
+        )
+
+    def test_status_recommends_candidate_revision_for_complete_needs_change(self) -> None:
+        lane, manifest, _collection, candidate, _snapshot, writer_task = (
+            self.needs_change_lane_candidate_fixture()
+        )
+
+        def task_status(task_id: str) -> dict:
+            if task_id == "writer-task":
+                return dict(writer_task)
+            if task_id in {"tests-task", "review-task"}:
+                return {
+                    "task_id": task_id,
+                    "state": "completed",
+                    "terminal": True,
+                }
+            raise AssertionError(task_id)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status", side_effect=task_status
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(
+                workspace,
+                "_lane_binding_status",
+                return_value={
+                    "valid": True,
+                    "lane_id": lane["lane_id"],
+                    "receipt_sha256": lane["receipt_sha256"],
+                },
+            ),
+            mock.patch.object(
+                workspace,
+                "_require_live_lane_binding",
+                return_value={
+                    "valid": True,
+                    "lane_id": lane["lane_id"],
+                    "receipt_sha256": lane["receipt_sha256"],
+                },
+            ),
+        ):
+            status = workspace.grabowski_agent_workspace_status(
+                manifest["workspace_id"]
+            )
+
+        self.assertTrue(status["candidate_revision"]["eligible"])
+        self.assertEqual(
+            status["candidate_revision"]["candidate_id"], candidate["candidate_id"]
+        )
+        self.assertEqual(status["candidate_revision"]["round"], 1)
+        self.assertEqual(status["candidate_revision"]["next_round"], 2)
+        self.assertEqual(status["candidate_revision"]["verification_outcome"], "NEEDS_CHANGE")
+        self.assertEqual(
+            status["recommended_next_action"],
+            "writer_handoff_for_candidate_revision",
+        )
+
+    def test_round_two_collection_rejects_stale_round_one_candidate_for_adoption(self) -> None:
+        _lane, manifest, _collection, first_candidate, _snapshot, _writer_task = (
+            self.needs_change_lane_candidate_fixture()
+        )
+        original = workspace._manifest(manifest["workspace_id"])
+        original["candidate_round"] = 2
+        original["collection"] = None
+        original.pop("frozen_writer", None)
+        workspace._write_manifest(original)
+        (self.git.writer / "src" / "app.py").write_text(
+            "revision = 2\n", encoding="utf-8"
+        )
+        snapshot = workspace._git_snapshot(original, workspace._run)
+        writer_result = workspace._materialize_writer_patch(
+            original, snapshot, workspace._run
+        )
+        writer_receipt = signed_receipt(
+            {
+                "schema_version": 1,
+                "role": "writer",
+                "round": 2,
+                "head": snapshot["writer_head"],
+                "diff_sha256": snapshot["diff_sha256"],
+            }
+        )
+        candidate, candidate_reference = workspace._persist_candidate_evidence(
+            original,
+            snapshot,
+            writer_result,
+            writer_receipt,
+            round_number=2,
+        )
+        tests_receipt = signed_role_receipt("tests", original, snapshot)
+        review_receipt = signed_role_receipt("review", original, snapshot)
+        workspace._atomic_json(
+            workspace._role_receipt_path(
+                original, "tests", attempt=1, candidate_round=2
+            ),
+            tests_receipt,
+        )
+        workspace._atomic_json(
+            workspace._role_receipt_path(
+                original, "review", attempt=1, candidate_round=2
+            ),
+            review_receipt,
+        )
+        receipts, summary, references = workspace._persist_verification_evidence(
+            original,
+            candidate,
+            test_receipt=tests_receipt,
+            review_receipt=review_receipt,
+        )
+        collection = persist_collection(
+            original,
+            {
+                "writer_head": snapshot["writer_head"],
+                "diff_sha256": snapshot["diff_sha256"],
+                "dirty": snapshot["dirty"],
+                "changed_paths": snapshot["changed_paths"],
+                "scope_passed": snapshot["scope_passed"],
+                "scope_violations": snapshot["scope_violations"],
+                "writer_result": writer_result,
+                "writer_receipt_sha256": writer_receipt["receipt_sha256"],
+                "candidate_id": candidate["candidate_id"],
+                "candidate_manifest": candidate,
+                "candidate_receipt": candidate_reference,
+                "verification_receipts": receipts,
+                "verification_references": references,
+                "verification_summary": summary,
+            },
+        )
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError,
+            "adoption candidate binding",
+        ):
+            workspace._adoption_collection_evidence(
+                workspace._manifest(original["workspace_id"]),
+                expected_candidate_id=first_candidate["candidate_id"],
+                expected_result_sha256=collection["result_sha256"],
+            )
+
     def test_writer_attempts_legacy_manifest_synthesizes_redacted_attempt_one(self) -> None:
         manifest = self.manifest()
         attempts = workspace._writer_attempts(manifest)
