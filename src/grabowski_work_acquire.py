@@ -1615,7 +1615,6 @@ def grabowski_work_acquire(
     scoped_writer_argv: list[str] | None = None,
     scoped_writer_runtime_seconds: int = 7200,
     system_convergence: dict[str, Any] | None = None,
-    execution_plan: dict[str, Any] | None = None,
     artifact_class: str = "implementation-worktree",
     ttl_seconds: int = 7200,
     terminal_closeout: dict[str, Any] | None = None,
@@ -1639,7 +1638,6 @@ def grabowski_work_acquire(
         "scoped_writer_argv": scoped_writer_argv,
         "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
         "system_convergence": system_convergence,
-        "execution_plan": execution_plan,
         "artifact_class": artifact_class,
         "ttl_seconds": ttl_seconds,
     }

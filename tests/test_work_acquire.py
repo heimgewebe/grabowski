@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -233,6 +234,33 @@ class WorkAcquireTests(unittest.TestCase):
 
     def acquire(self, owner: str, keys: list[str], **kwargs: object) -> dict[str, object]:
         return self.acquired(owner, keys)
+
+    def test_public_work_acquire_signature_does_not_change_in_p4(self) -> None:
+        parameters = inspect.signature(work_acquire.grabowski_work_acquire).parameters
+        self.assertEqual(
+            list(parameters),
+            [
+                "source_kind",
+                "source_id",
+                "controller_actor",
+                "repo",
+                "base_head",
+                "branch",
+                "target_path",
+                "purpose",
+                "retention_until_unix",
+                "idempotency_key",
+                "resource_keys",
+                "write_paths",
+                "scoped_writer_actor",
+                "scoped_writer_argv",
+                "scoped_writer_runtime_seconds",
+                "system_convergence",
+                "artifact_class",
+                "ttl_seconds",
+                "terminal_closeout",
+            ],
+        )
 
     def test_execution_plan_is_validated_source_scope_and_lane_identity_bound(self) -> None:
         legacy = work_acquire._normalize(self.parameters())
