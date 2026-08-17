@@ -2352,7 +2352,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Start one operator-bound replacement writer after a proven terminal failure.",
+      "description": "Start one bounded writer attempt after terminal failure or one verified NEEDS_CHANGE Candidate.",
       "effects": [
         "task-start",
         "receipt-create",
@@ -3497,9 +3497,9 @@
       "src/grabowski_agent_competition.py": "e25ad6cd44ddcc4297381b6d374851e46e290f3d580460503d54898a48a69044",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "eadb1447b4158f6b466a80203d588c61eb9a4b1d96e454093a268a5f06b6a4a8",
+      "src/grabowski_agent_workspace.py": "3cc0f41373f193226bd2fe08b9b59c4b4372b2e733fccb75edd6aa7d09446f93",
       "src/grabowski_agent_workspace_observer.py": "f7db154ac20b92e29eb654682f663b5e4f78743bf37e22a62f869df1b9331113",
-      "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
+      "src/grabowski_agent_writer.py": "5c7af6d37ad71e40e935144ce3bc96e4360376adf56c029c27260071fca83ffc",
       "src/grabowski_alert_outbox.py": "47d43bb27151032be8cd197038f358c27c52ca9066e6ed57530f71cfa793455d",
       "src/grabowski_artifacts.py": "08925585075c7e77973d70ebf836537d612bc6b111b784cfce9f3025d93fe653",
       "src/grabowski_audit_query.py": "fe6c0dd0ca41c0f9391673eb88e3148827cb18f749b87afbc1ea0e22a9315cb0",
