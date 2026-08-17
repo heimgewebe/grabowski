@@ -191,6 +191,22 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         return binding
 
+    def _completed_owner_drift(self) -> dict[str, object]:
+        binding = self._managed_binding(owner="owner-a")
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=str(binding["checkout_key"]),
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET owner_id='owner-b' WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            )
+            connection.commit()
+        return binding
+
     def test_parent_directory_is_not_a_checkout_process_scope(self) -> None:
         parent = self.root
         self.assertFalse(
@@ -1982,6 +1998,128 @@ class CheckoutLifecycleTests(unittest.TestCase):
             inventory["probe_errors"][0]["error"],
             "git status timed out",
         )
+
+    def test_owner_handoff_preview_and_apply_converges_only_owner_drift(self) -> None:
+        binding = self._completed_owner_drift()
+        preview = checkouts.checkout_owner_handoff_preview(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic",
+        )
+        self.assertEqual(["binding-retention-owner-mismatch"], preview["allowed_drift_reasons"])
+        applied = checkouts.checkout_owner_handoff_apply(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic", preview["snapshot_sha256"], preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual("applied", applied["status"])
+        self.assertEqual("owner-b", applied["after"]["lifecycle"]["owner_id"])
+        self.assertEqual("owner-b", applied["after"]["retention"]["owner_id"])
+        inventory = checkouts.checkout_inventory(
+            self.repo, include_processes=False, include_tasks=False, include_resources=False
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        self.assertNotIn(
+            "binding-retention-owner-mismatch",
+            linked["lifecycle_decision"]["binding_drift_reasons"],
+        )
+        self.assertTrue(self.checkout.is_dir())
+
+    def test_owner_handoff_preserves_deliberately_extended_retention(self) -> None:
+        binding = self._completed_owner_drift()
+        extended_until = int(time.time()) + 30 * 24 * 60 * 60
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET retention_until_unix=? WHERE checkout_key=?",
+                (extended_until, binding["checkout_key"]),
+            )
+            connection.commit()
+        preview = checkouts.checkout_owner_handoff_preview(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic",
+        )
+        applied = checkouts.checkout_owner_handoff_apply(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic", preview["snapshot_sha256"], preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual(extended_until, applied["after"]["retention"]["retention_until_unix"])
+        self.assertNotEqual(
+            applied["after"]["lifecycle"]["retention_until_unix"],
+            applied["after"]["retention"]["retention_until_unix"],
+        )
+        self.assertEqual(["lifecycle_owner_update"], applied["audit"]["effects"])
+
+    def test_owner_handoff_rejects_active_binding(self) -> None:
+        binding = self._managed_binding(owner="owner-a")
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET owner_id='owner-b' WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "completed-retained"):
+            checkouts.checkout_owner_handoff_preview(
+                str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+                self.head, "topic",
+            )
+
+    def test_owner_handoff_audit_failure_requires_readback_after_database_effect(self) -> None:
+        self._completed_owner_drift()
+        preview = checkouts.checkout_owner_handoff_preview(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic",
+        )
+        with patch.object(checkouts.base, "_append_audit", side_effect=OSError("audit down")):
+            with self.assertRaisesRegex(RuntimeError, "readback required"):
+                checkouts.checkout_owner_handoff_apply(
+                    str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+                    self.head, "topic", preview["snapshot_sha256"], preview["observed_at_unix"],
+                    preview["confirmation"],
+                )
+        current = checkouts._lifecycle_bindings([preview["checkout"]["checkout_key"]])[
+            preview["checkout"]["checkout_key"]
+        ]
+        retention = checkouts._retention_records([preview["checkout"]["checkout_key"]])[
+            preview["checkout"]["checkout_key"]
+        ]
+        self.assertEqual("owner-b", current["owner_id"])
+        self.assertEqual("owner-b", retention["owner_id"])
+
+    def test_owner_handoff_rejects_arbitrary_third_owner(self) -> None:
+        self._completed_owner_drift()
+        with self.assertRaisesRegex(PermissionError, "one of the existing durable owners"):
+            checkouts.checkout_owner_handoff_preview(
+                str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-c",
+                self.head, "topic",
+            )
+
+    def test_owner_handoff_rejects_dirty_checkout(self) -> None:
+        self._completed_owner_drift()
+        (self.checkout / "foreign.txt").write_text("foreign\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "must be clean"):
+            checkouts.checkout_owner_handoff_preview(
+                str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+                self.head, "topic",
+            )
+
+    def test_owner_handoff_rejects_snapshot_toctou(self) -> None:
+        binding = self._completed_owner_drift()
+        preview = checkouts.checkout_owner_handoff_preview(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic",
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET purpose='changed', updated_at_unix=updated_at_unix+1 WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+            checkouts.checkout_owner_handoff_apply(
+                str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+                self.head, "topic", preview["snapshot_sha256"], preview["observed_at_unix"],
+                preview["confirmation"],
+            )
 
     def test_lifecycle_source_has_no_forced_filesystem_deletion(self) -> None:
         source = (SRC / "grabowski_checkouts.py").read_text(encoding="utf-8")

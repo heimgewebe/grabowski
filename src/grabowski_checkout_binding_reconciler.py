@@ -217,16 +217,24 @@ def _durable_evidence_drift_reasons(
         for binding_field, archive_field, reason in archive_checks:
             if _text(binding.get(binding_field)) != _text(archive.get(archive_field)):
                 reasons.append(reason)
-        terminal_evidence = retention if isinstance(retention, Mapping) else binding
-        terminal_prefix = "retention-archive" if isinstance(retention, Mapping) else "binding-archive"
         for expected_field, archive_field, suffix in (
             ("expected_head", "head", "head-mismatch"),
             ("expected_branch", "branch", "branch-mismatch"),
         ):
-            if _text(terminal_evidence.get(expected_field)) != _text(
-                archive.get(archive_field)
-            ):
-                reasons.append(f"{terminal_prefix}-{suffix}")
+            archive_value = _text(archive.get(archive_field))
+            binding_value = _text(binding.get(expected_field))
+            if isinstance(retention, Mapping):
+                retention_value = _text(retention.get(expected_field))
+                if retention_value is None:
+                    # None is an exact terminal value when the archive is also None.
+                    # For legacy rows where retention omitted a concrete final
+                    # identity, accept the omission only when binding and archive agree.
+                    if archive_value is not None and binding_value != archive_value:
+                        reasons.append(f"binding-archive-{suffix}")
+                elif retention_value != archive_value:
+                    reasons.append(f"retention-archive-{suffix}")
+            elif binding_value != archive_value:
+                reasons.append(f"binding-archive-{suffix}")
     return reasons
 
 

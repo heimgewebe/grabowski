@@ -221,6 +221,39 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="worktree_admin",
         operation_class="worktree-admin",
     ),
+    "checkout-owner-handoff-preview": GripSpec(
+        name="checkout-owner-handoff-preview",
+        version="1.0",
+        summary="Preview exact owner alignment for one clean managed checkout with only owner drift.",
+        effect=READ_ONLY,
+        required_parameters=(
+            "repo", "checkout_path", "source_lifecycle_owner_id",
+            "source_retention_owner_id", "target_owner_id", "expected_head",
+        ),
+        acceptance_ids=(
+            "exact-checkout-bound", "owner-drift-only", "clean-uncoordinated",
+            "snapshot-bound",
+        ),
+        runner="checkout_owner_handoff_preview",
+    ),
+    "checkout-owner-handoff-apply": GripSpec(
+        name="checkout-owner-handoff-apply",
+        version="1.0",
+        summary="CAS-align lifecycle and retention ownership for one clean managed checkout.",
+        effect=MUTATING,
+        required_parameters=(
+            "repo", "checkout_path", "source_lifecycle_owner_id",
+            "source_retention_owner_id", "target_owner_id", "expected_head",
+            "expected_snapshot_sha256", "preview_created_at_unix", "confirmation",
+        ),
+        acceptance_ids=(
+            "exact-checkout-bound", "snapshot-cas-bound", "owner-drift-only",
+            "ownership-converged", "no-cleanup-effect",
+        ),
+        runner="checkout_owner_handoff_apply",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
+    ),
     "post-merge-sync": GripSpec(
         name="post-merge-sync",
         version="1.0",
@@ -749,6 +782,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "worktree-hygiene-reconcile",
         "checkout-binding-terminal-preview",
         "checkout-binding-terminal-apply",
+        "checkout-owner-handoff-preview",
+        "checkout-owner-handoff-apply",
         "situation",
         "scout",
         "runtime-deploy-check",
@@ -795,6 +830,8 @@ GRIP_SURFACE_TARGETS = {
     "worktree-hygiene-reconcile": "terminal repository worktree lifecycle",
     "checkout-binding-terminal-preview": "one missing managed checkout lifecycle binding",
     "checkout-binding-terminal-apply": "one preview-bound missing checkout lifecycle transition",
+    "checkout-owner-handoff-preview": "one clean managed checkout with lifecycle/retention owner drift",
+    "checkout-owner-handoff-apply": "one snapshot-bound managed checkout owner alignment",
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
@@ -838,6 +875,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "rerun checkout-binding-terminal-preview for the exact checkout key and apply only "
         "a fresh matching digest; never force-release leases, delete refs, or infer terminality "
         "from checkout absence"
+    ),
+    "checkout-owner-handoff-apply": (
+        "rerun checkout-owner-handoff-preview against the exact clean checkout and existing "
+        "owner pair; after outcome_unknown inspect checkout binding reconciliation before retry"
     ),
     "runtime-refresh-lease-release": (
         "re-read the exact runtime-refresh result and inspect retained rows; "
@@ -4990,14 +5031,34 @@ def _run_checkout_binding_terminal_apply(
     if not _is_sha256_hex(source_evidence_sha256):
         raise GripActionError("checkout terminal apply lacks source evidence digest")
     effects = terminal_receipt.get("effects")
-    if effects != ["lifecycle_phase_transition"]:
-        raise GripActionError("checkout terminal apply exceeded lifecycle-only effect")
+    if effects not in (
+        ["lifecycle_phase_transition"],
+        ["lifecycle_phase_transition", "terminal_head_rebind"],
+    ):
+        raise GripActionError("checkout terminal apply exceeded bounded lifecycle effects")
     binding_before = terminal_receipt.get("binding_before")
     binding_after = terminal_receipt.get("binding_after")
     if not isinstance(binding_before, dict) or not isinstance(binding_after, dict):
         raise GripActionError("checkout terminal apply lacks lifecycle before/after state")
     if binding_after.get("phase") != "externally_terminal_missing":
         raise GripActionError("checkout terminal apply post-state is not externally terminal")
+    if "terminal_head_rebind" in effects:
+        rebind = terminal_receipt.get("branch_head_rebind")
+        retention_before = terminal_receipt.get("retention_before")
+        retention_after = terminal_receipt.get("retention_after")
+        if (
+            not isinstance(rebind, dict)
+            or rebind.get("relation") != "descendant"
+            or rebind.get("from_head") != binding_before.get("expected_head")
+            or rebind.get("to_head") != binding_after.get("expected_head")
+            or not isinstance(retention_before, dict)
+            or not isinstance(retention_after, dict)
+            or retention_before.get("expected_head") != rebind.get("from_head")
+            or retention_after.get("expected_head") != rebind.get("to_head")
+            or retention_before.get("owner_id") != retention_after.get("owner_id")
+            or retention_before.get("expected_branch") != retention_after.get("expected_branch")
+        ):
+            raise GripActionError("checkout terminal head rebind receipt is inconsistent")
     receipt_sha256 = terminal_receipt.get("receipt_sha256")
     if not _is_sha256_hex(receipt_sha256):
         raise GripActionError("checkout terminal apply lacks durable receipt digest")
@@ -5018,7 +5079,7 @@ def _run_checkout_binding_terminal_apply(
         "pass",
         str(source_evidence_sha256),
     )
-    _check(receipt, "lifecycle-only-effect", "pass", "lifecycle_phase_transition")
+    _check(receipt, "lifecycle-only-effect", "pass", ",".join(effects))
     _check(
         receipt,
         "active-capacity-transition",
@@ -5035,6 +5096,147 @@ def _run_checkout_binding_terminal_apply(
         },
         "receipt_status": "passed",
     }
+
+
+def _owner_handoff_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    expected_head = _sha_parameter(parameters, "expected_head").lower()
+    if len(expected_head) != 40:
+        raise GripPreflightError("expected_head must be a 40 character Git commit SHA")
+    expected_branch = parameters.get("expected_branch")
+    if expected_branch is not None:
+        if not isinstance(expected_branch, str) or not expected_branch.strip():
+            raise GripPreflightError("expected_branch must be null or a non-empty string")
+        expected_branch = expected_branch.strip()
+    return {
+        "repo": _string_parameter(parameters, "repo"),
+        "checkout_path": _string_parameter(parameters, "checkout_path"),
+        "source_lifecycle_owner_id": _string_parameter(parameters, "source_lifecycle_owner_id"),
+        "source_retention_owner_id": _string_parameter(parameters, "source_retention_owner_id"),
+        "target_owner_id": _string_parameter(parameters, "target_owner_id"),
+        "expected_head": expected_head,
+        "expected_branch": expected_branch,
+    }
+
+
+def _run_checkout_owner_handoff_preview(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    args = _owner_handoff_parameters(parameters)
+    try:
+        output = grabowski_checkouts.checkout_owner_handoff_preview(**args)
+    except (ValueError, PermissionError, RuntimeError, OSError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    checkout = output.get("checkout")
+    owners = output.get("owners")
+    coordination = output.get("coordination")
+    snapshot_sha256 = output.get("snapshot_sha256")
+    if (
+        not isinstance(checkout, dict)
+        or checkout.get("checkout_path") != args["checkout_path"]
+        or checkout.get("head") != args["expected_head"]
+        or not isinstance(owners, dict)
+        or owners.get("target_owner_id") != args["target_owner_id"]
+    ):
+        raise GripActionError("checkout owner handoff preview identity mismatch")
+    if output.get("allowed_drift_reasons") != ["binding-retention-owner-mismatch"]:
+        raise GripActionError("checkout owner handoff preview exceeded owner-only drift")
+    if (
+        checkout.get("dirty") is not False
+        or not isinstance(coordination, dict)
+        or coordination.get("blocking") is not False
+    ):
+        raise GripActionError("checkout owner handoff preview is not clean and uncoordinated")
+    if not _is_sha256_hex(snapshot_sha256) or type(output.get("observed_at_unix")) is not int:
+        raise GripActionError("checkout owner handoff preview lacks exact snapshot binding")
+    _check(receipt, "exact-checkout-bound", "pass", str(checkout["checkout_key"]))
+    _check(receipt, "owner-drift-only", "pass", "binding-retention-owner-mismatch")
+    _check(receipt, "clean-uncoordinated", "pass", "clean=true blocking=false")
+    _check(receipt, "snapshot-bound", "pass", str(snapshot_sha256))
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_checkout_owner_handoff_apply(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    args = _owner_handoff_parameters(parameters)
+    expected_snapshot_sha256 = _string_parameter(parameters, "expected_snapshot_sha256")
+    confirmation = _string_parameter(parameters, "confirmation")
+    observed_at = parameters.get("preview_created_at_unix")
+    if not _is_sha256_hex(expected_snapshot_sha256):
+        raise GripPreflightError("expected_snapshot_sha256 must be a SHA-256 digest")
+    if type(observed_at) is not int or observed_at < 0:
+        raise GripPreflightError("preview_created_at_unix must be a non-negative integer")
+    try:
+        output = grabowski_checkouts.checkout_owner_handoff_apply(
+            **args,
+            expected_snapshot_sha256=expected_snapshot_sha256,
+            preview_created_at_unix=observed_at,
+            confirmation=confirmation,
+        )
+    except (ValueError, PermissionError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except RuntimeError as exc:
+        _check(receipt, "exact-checkout-bound", "pass", args["checkout_path"])
+        _check(receipt, "snapshot-cas-bound", "pass", expected_snapshot_sha256)
+        _check(receipt, "owner-drift-only", "skip", "post-error state requires readback")
+        _check(receipt, "ownership-converged", "skip", "post-error state requires readback")
+        _check(receipt, "no-cleanup-effect", "skip", "post-error state requires readback")
+        return {
+            "schema_version": 1,
+            "kind": "checkout_owner_handoff_grip_outcome",
+            "status": "outcome_unknown",
+            "effect_started": True,
+            "readback_required": True,
+            "required_readback": [f"checkout_binding_reconciliation:{args['repo']}"],
+            "apply_error_type": type(exc).__name__,
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["checkout_owner_handoff_readback_required"],
+            "does_not_establish": ["mutation absence", "ownership convergence", "retry authority"],
+        }
+    before = output.get("before")
+    after = output.get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise GripActionError("checkout owner handoff lacks before/after state")
+    before_lifecycle = before.get("lifecycle")
+    before_retention = before.get("retention")
+    after_lifecycle = after.get("lifecycle")
+    after_retention = after.get("retention")
+    target = args["target_owner_id"]
+    if (
+        not isinstance(before_lifecycle, dict)
+        or not isinstance(before_retention, dict)
+        or before_lifecycle.get("owner_id") == before_retention.get("owner_id")
+        or not isinstance(after_lifecycle, dict)
+        or not isinstance(after_retention, dict)
+        or after_lifecycle.get("owner_id") != target
+        or after_retention.get("owner_id") != target
+    ):
+        raise GripActionError("checkout owner handoff did not converge exact ownership")
+    audit = output.get("audit")
+    if (
+        not isinstance(audit, dict)
+        or audit.get("effects") not in (["lifecycle_owner_update"], ["retention_owner_update"])
+    ):
+        raise GripActionError("checkout owner handoff exceeded one-sided ownership effect")
+    _check(receipt, "exact-checkout-bound", "pass", args["checkout_path"])
+    _check(receipt, "snapshot-cas-bound", "pass", expected_snapshot_sha256)
+    _check(receipt, "owner-drift-only", "pass", "binding-retention-owner-mismatch")
+    _check(receipt, "ownership-converged", "pass", target)
+    _check(receipt, "no-cleanup-effect", "pass", "owner fields only")
+    return {**output, "receipt_status": "passed"}
 
 
 def _run_post_merge_sync(
@@ -9560,6 +9762,8 @@ _RUNNERS = {
     "worktree_hygiene_reconcile": _run_worktree_hygiene_reconcile,
     "checkout_binding_terminal_preview": _run_checkout_binding_terminal_preview,
     "checkout_binding_terminal_apply": _run_checkout_binding_terminal_apply,
+    "checkout_owner_handoff_preview": _run_checkout_owner_handoff_preview,
+    "checkout_owner_handoff_apply": _run_checkout_owner_handoff_apply,
     "post_merge_sync": _run_post_merge_sync,
     "situation": _run_situation,
     "scout": _run_scout,

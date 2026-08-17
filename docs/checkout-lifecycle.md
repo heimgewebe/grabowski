@@ -23,8 +23,17 @@ trennt Inventar, Archivierung und Cleanup.
   Binding-Identität und fehlende Koordination als Evidenzzustand abschließbar ist.
 - `grabowski_checkout_binding_terminal_apply`: übernimmt ausschließlich einen
   frischen, zeitgebundenen Preview-Digest per Compare-and-Swap in
-  `externally_terminal_missing`. Der Aufruf archiviert oder löscht nichts und
-  verändert weder Retention noch Branch oder Ref.
+  `externally_terminal_missing`. Ist der erhaltene Branch-Head ein nachweislicher
+  Descendant des gebundenen Heads, darf derselbe CAS zusätzlich ausschließlich
+  `expected_head` in Binding und Retention auf diesen Descendant rebind-en.
+  Divergenz oder nicht beobachtbare Ancestry bleiben blockierend. Der Aufruf
+  archiviert oder löscht nichts und verändert weder Branch noch Ref.
+- Die Grips `checkout-owner-handoff-preview` und `checkout-owner-handoff-apply`
+  sind ein enger Reconciliation-Pfad für genau `binding-retention-owner-mismatch`:
+  nur sauberer, unkoordinierter Checkout; nur `completed_retained`; kein
+  Archiv; aktive identische Retention; Zielowner muss bereits Lifecycle- oder
+  Retention-Owner sein; Apply ist Snapshot-/Zeit-/Bestätigungs-CAS. Es entsteht
+  keine zusätzliche öffentliche MCP-Tooloberfläche.
 
 ## Inventar-Markierungen
 
@@ -75,7 +84,10 @@ Die Phasen werden read-only wie folgt projiziert:
   archivierungspflichtig sichtbar.
 - `externally_terminal_missing` bezeichnet ausschließlich einen durch
   Quellreceipt und CAS belegten externen Abschluss bei bereits fehlendem Checkout.
-  Dieser Zustand ist weder Archiv noch Cleanup-Kandidat. Ein wieder erschienener
+  Ein inzwischen fortgeschrittener Branch ist nur zulässig, wenn Git den gebundenen
+  Head als Ancestor des aktuellen Branch-Heads bestätigt; dann werden Binding und
+  Retention im selben CAS auf den Descendant-Head rebind-et. Dieser Zustand ist
+  weder Archiv noch Cleanup-Kandidat. Ein wieder erschienener
   Worktree wird erneut blockierende Identitätsdrift.
 - `archived` gelangt mit passendem offenem Recovery-Archiv in
   `archived_blocked` oder `cleanup_candidate`; Apply bleibt jedoch für mindestens
@@ -109,7 +121,7 @@ fehlende Tasks, Prozesse, Leases und Archive. Der Apply verlangt denselben Diges
 mit gebundenem Erstellungs- und Ablaufzeitpunkt, die exakte Bestätigung
 `record-external-terminal-missing`, frische Quell- und Konfliktbeobachtung sowie
 einen unveränderten SQLite-CAS-Readback. Unterstützte Quellen sind Bureau-Task,
-Operator-Verpflichtung, Thread-Fokus und GitHub-Issue.
+Operator-Verpflichtung, Thread-Fokus, GitHub-Issue und Work-Lane.
 Nur wenn ein identitätsgleiches `archived`-Binding zusätzlich einen vollständigen
 Archive-Record mit positivem `cleaned_at_unix` und gebundener `cleanup_plan_id`
 besitzt, wird die frisch beobachtete Checkout-Abwesenheit als `archived_cleaned`
@@ -141,8 +153,10 @@ weiterhin nur nach Archiv- und Dry-Run-Vertrag.
    am Checkout oder am Repository blockieren Apply.
 7. Ein Lifecycle-Binding autorisiert weder automatische Archivierung noch
    Cleanup oder Branch-Löschung.
-8. `externally_terminal_missing` verändert nur Phase und Terminalzeit; Binding,
-   Retention, Branch, Ref, Archiv und Dateisystem bleiben unverändert.
+8. `externally_terminal_missing` verändert Phase und Terminalzeit. Nur bei
+   nachgewiesener Descendant-Branchbewegung darf derselbe CAS außerdem
+   `expected_head` in Binding und Retention auf den beobachteten Descendant setzen;
+   Branch, Ref, Archiv und Dateisystem bleiben unverändert.
 9. `~/repos/merges` bleibt unveränderbare Evidence-Zone.
 10. Es gibt keine direkte oder forcierte Dateisystemlöschung durch den
    Lifecycle-Code.
@@ -164,7 +178,11 @@ auch dann, wenn der Branch später weiterbewegt wird.
 Retention ist owner-gebunden. Solange die Retention aktiv ist, darf Cleanup nur
 vom gleichen `owner_id` geplant und angewendet werden. Resource-Leases sind
 kurzlebige Kollisionskontrolle; der durable Retention-Owner steht in der
-Checkout-Lifecycle-Datenbank.
+Checkout-Lifecycle-Datenbank. Ein historischer Owner-Mismatch wird nicht durch
+`retain` überschrieben: Der Owner-Handoff-Grip darf ausschließlich einen sauberen,
+archive-freien Checkout mit genau diesem einen Driftgrund auf einen der zwei bereits
+durabel vorhandenen Owner konvergieren und bindet die Änderung an einen frischen
+Snapshot.
 
 ## Terminal evidence source contract
 
