@@ -516,6 +516,11 @@ ALL_CAPABILITIES = (
     + RESERVED_DISABLED_CAPABILITIES
 )
 
+# Implemented tools may be staged here until an authentic external connector
+# declaration includes the new name. They keep their internal guards, but are
+# excluded from the registered/public capability projection.
+STAGED_UNPUBLISHED_TOOL_NAMES = frozenset({"grabowski_agent_workspace_adopt"})
+
 TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_status": (),
     "grabowski_context": (),
@@ -1650,9 +1655,14 @@ def _capability_requirement_summary(
 ) -> dict[str, Any]:
     source = _load_policy() if policy is None else policy
     missing: list[dict[str, Any]] = []
-    guarded = {
+    registered_requirements = {
         tool: required
         for tool, required in TOOL_CAPABILITY_REQUIREMENTS.items()
+        if tool not in STAGED_UNPUBLISHED_TOOL_NAMES
+    }
+    guarded = {
+        tool: required
+        for tool, required in registered_requirements.items()
         if required
     }
     for tool, required in sorted(guarded.items()):
@@ -1669,12 +1679,15 @@ def _capability_requirement_summary(
             )
     return {
         "known_tool_requirements": len(TOOL_CAPABILITY_REQUIREMENTS),
-        "registered_tool_requirements": len(TOOL_CAPABILITY_REQUIREMENTS),
+        "registered_tool_requirements": len(registered_requirements),
+        "staged_unpublished_tools": sorted(STAGED_UNPUBLISHED_TOOL_NAMES),
         "guarded_tool_requirements": len(guarded),
-        "operator_semantics_tool_count": len(OPERATOR_CAPABILITY_REQUIREMENT_TOOLS),
+        "operator_semantics_tool_count": len(
+            OPERATOR_CAPABILITY_REQUIREMENT_TOOLS - STAGED_UNPUBLISHED_TOOL_NAMES
+        ),
         "unguarded_registered_tools": [
             tool
-            for tool, required in sorted(TOOL_CAPABILITY_REQUIREMENTS.items())
+            for tool, required in sorted(registered_requirements.items())
             if not required
         ],
         "missing_enabled_requirements": missing,

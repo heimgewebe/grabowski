@@ -1277,13 +1277,6 @@ TOOL_PROFILES.update(
             "effects": ["task-start", "receipt-create", "task-state-refresh"],
             "reversibility": "preserved-worktree-and-receipts",
         },
-        "grabowski_agent_workspace_adopt": {
-            "category": "agent-workspace",
-            "purpose": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit with immutable intent and readback receipts.",
-            "risk_class": "high",
-            "effects": ["git-ref-update", "receipt-create", "audit-append"],
-            "reversibility": "preserved-adoption-commit-and-receipts",
-        },
         "grabowski_agent_workspace_role_retry": {
             "category": "agent-workspace",
             "purpose": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",

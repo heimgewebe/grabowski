@@ -9534,10 +9534,15 @@ class RuntimeContractTests(unittest.TestCase):
             "grabowski_agent_workspace_status",
             "grabowski_agent_workspace_attach",
             "grabowski_agent_workspace_collect",
-            "grabowski_agent_workspace_adopt",
             "grabowski_agent_workspace_close",
         ):
             self.assertIn(tool, expected)
+        self.assertNotIn("grabowski_agent_workspace_adopt", expected)
+        workspace_source = (ROOT / "src" / "grabowski_agent_workspace.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('name="grabowski_agent_workspace_adopt"', workspace_source)
+        self.assertIn("manager.remove_tool(tool_name)", source)
 
 
 class ChronikCodingMemoryToolTests(unittest.TestCase):
