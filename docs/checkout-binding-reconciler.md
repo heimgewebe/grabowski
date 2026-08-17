@@ -16,7 +16,7 @@ Die Ausgabe ist auf höchstens 100 Datensätze je Seite begrenzt. Der Cursor ist
 - `archived_cleaned`: Das Repository ist beobachtbar, der Worktree fehlt und ein identitätsgleiches `archived`-Binding besitzt einen vollständigen Archive-Record mit `cleaned_at_unix` und `cleanup_plan_id`. Der Zustand ist terminal und nicht blockierend.
 - `orphaned_binding`: Das Repository ist beobachtbar, aber für das Binding existiert weder ein aktueller Git-Worktree-Record noch vollständige Cleanup-Evidenz.
 - `repository_unobservable`: Der Repository-Zustand konnte nicht autoritativ beobachtet werden.
-- `binding_identity_drift`: Checkout-Key, Common-Dir, Repository-Pfad, Checkout-Pfad, Branch, Owner oder terminaler Head widersprechen sich.
+- `binding_identity_drift`: Checkout-Key, Common-Dir, Repository-Pfad, Checkout-Pfad, Branch, Owner oder terminaler Head widersprechen sich. Bei archivierten Legacy-Retentions darf eine fehlende terminale Branch-/Head-Angabe nur dann als historische Auslassung gelten, wenn das Lifecycle-Binding und der immutable Archive-Record den konkreten Terminalwert exakt gemeinsam tragen; echte Widersprüche bleiben blockierend.
 
 ## Current Work und Attention
 
@@ -26,7 +26,7 @@ Die direkte Tool-Antwort enthält zusätzlich eine begrenzte `attention`-Projekt
 
 ## Sicherheitsvertrag
 
-Die Projektion ist rein beobachtend. Insbesondere begründen weder ein fehlender Worktree noch Retention- oder Archiv-Evidenz eine Berechtigung zu:
+Die Projektion ist rein beobachtend. Seltene, belegte Reparaturen laufen getrennt über CAS-gebundene Lifecycle-Grips; der Reconciler selbst schreibt weiterhin nichts. Insbesondere begründen weder ein fehlender Worktree noch Retention- oder Archiv-Evidenz eine Berechtigung zu:
 
 - Archivierung,
 - Cleanup,
