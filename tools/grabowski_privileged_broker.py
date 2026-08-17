@@ -31,6 +31,8 @@ CONFIG = Path("/etc/grabowski/privileged-actions.json")
 STATE = Path("/var/lib/grabowski/privileged-broker")
 AUDIT = STATE / "audit.jsonl"
 MAX_OUTPUT_BYTES = 250_000
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+MAX_PEER_CGROUP_PROCESSES = 256
 SAFE_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
     "LANG": "C.UTF-8",
@@ -168,11 +170,72 @@ def _socket_peer_credentials(descriptor: int = 0) -> tuple[int, int, int]:
     return pid, uid, gid
 
 
+def _unified_cgroup_path(pid: int, *, proc_root: Path) -> str:
+    try:
+        cgroup_raw = (proc_root / str(pid) / "cgroup").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PermissionError("blockade lifecycle peer cgroup is not observable") from exc
+    unified_paths: list[str] = []
+    for line in cgroup_raw.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0" and fields[1] == "":
+            unified_paths.append(fields[2])
+    if len(unified_paths) != 1 or not unified_paths[0].startswith("/"):
+        raise PermissionError("blockade lifecycle peer cgroup is not canonical")
+    return unified_paths[0]
+
+
+def _process_identity(pid: int, *, proc_root: Path) -> tuple[int, int]:
+    try:
+        raw = (proc_root / str(pid) / "stat").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise PermissionError("blockade lifecycle peer process identity is not observable") from exc
+    closing = raw.rfind(")")
+    if closing <= 0 or not raw.startswith(f"{pid} ("):
+        raise PermissionError("blockade lifecycle peer process identity is malformed")
+    fields = raw[closing + 1 :].strip().split()
+    if len(fields) < 20:
+        raise PermissionError("blockade lifecycle peer process identity is incomplete")
+    try:
+        parent_pid = int(fields[1])
+        starttime_ticks = int(fields[19])
+    except ValueError as exc:
+        raise PermissionError("blockade lifecycle peer process identity is invalid") from exc
+    if parent_pid <= 0 or starttime_ticks <= 0:
+        raise PermissionError("blockade lifecycle peer process identity is invalid")
+    return parent_pid, starttime_ticks
+
+
+def _cgroup_processes(
+    unified_path: str,
+    *,
+    cgroup_root: Path,
+) -> tuple[int, ...]:
+    relative = Path(unified_path.lstrip("/"))
+    if not relative.parts or ".." in relative.parts:
+        raise PermissionError("blockade lifecycle service cgroup path is invalid")
+    try:
+        raw = (cgroup_root / relative / "cgroup.procs").read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PermissionError("blockade lifecycle service process set is not observable") from exc
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines or len(lines) > MAX_PEER_CGROUP_PROCESSES:
+        raise PermissionError("blockade lifecycle service process set is invalid")
+    try:
+        processes = tuple(sorted({int(line) for line in lines}))
+    except ValueError as exc:
+        raise PermissionError("blockade lifecycle service process set is malformed") from exc
+    if len(processes) != len(lines) or any(pid <= 0 for pid in processes):
+        raise PermissionError("blockade lifecycle service process set is invalid")
+    return processes
+
+
 def _validate_blockade_lifecycle_peer(
     execution: dict[str, object],
     *,
     descriptor: int = 0,
     proc_root: Path = Path("/proc"),
+    cgroup_root: Path = CGROUP_ROOT,
 ) -> dict[str, object]:
     pid, uid, gid = _socket_peer_credentials(descriptor)
     expected_uid = execution.get("allowed_peer_uid")
@@ -185,25 +248,50 @@ def _validate_blockade_lifecycle_peer(
         raise PermissionError("blockade lifecycle peer UID is not authorized")
     if not isinstance(expected_unit, str) or not expected_unit:
         raise PermissionError("blockade lifecycle peer unit is not configured")
-    cgroup_path = proc_root / str(pid) / "cgroup"
-    try:
-        cgroup_raw = cgroup_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise PermissionError("blockade lifecycle peer cgroup is not observable") from exc
+    unified_path = _unified_cgroup_path(pid, proc_root=proc_root)
     expected_suffix = "/" + expected_unit
-    unified_paths = []
-    for line in cgroup_raw.splitlines():
-        fields = line.split(":", 2)
-        if len(fields) == 3 and fields[0] == "0" and fields[1] == "":
-            unified_paths.append(fields[2])
-    if len(unified_paths) != 1 or not unified_paths[0].endswith(expected_suffix):
+    if not unified_path.endswith(expected_suffix):
         raise PermissionError("blockade lifecycle peer is outside the operator service")
+
+    members_before = _cgroup_processes(unified_path, cgroup_root=cgroup_root)
+    if pid not in members_before:
+        raise PermissionError("blockade lifecycle peer is absent from the operator service cgroup")
+    identities = {
+        member: _process_identity(member, proc_root=proc_root)
+        for member in members_before
+    }
+    oldest_starttime = min(identity[1] for identity in identities.values())
+    oldest_members = tuple(
+        member
+        for member in members_before
+        if identities[member][1] == oldest_starttime
+    )
+    if len(oldest_members) != 1:
+        raise PermissionError(
+            "blockade lifecycle operator service main process is ambiguous"
+        )
+    parent_pid, starttime_ticks = identities[pid]
+    if oldest_members[0] != pid:
+        raise PermissionError(
+            "blockade lifecycle peer is not the operator service main process"
+        )
+    try:
+        parent_cgroup = _unified_cgroup_path(parent_pid, proc_root=proc_root)
+    except PermissionError as exc:
+        raise PermissionError("blockade lifecycle peer parent is not observable") from exc
+    if parent_cgroup == unified_path:
+        raise PermissionError("blockade lifecycle peer is a child of the operator service")
+    members_after = _cgroup_processes(unified_path, cgroup_root=cgroup_root)
+    if members_after != members_before:
+        raise PermissionError("blockade lifecycle service process set changed during validation")
     return {
         "pid": pid,
         "uid": uid,
         "gid": gid,
-        "cgroup": unified_paths[0],
+        "cgroup": unified_path,
         "unit": expected_unit,
+        "starttime_ticks": starttime_ticks,
+        "cgroup_process_count": len(members_before),
     }
 
 
@@ -216,10 +304,13 @@ def _lifecycle_audit_base(
     record = {
         **_base_audit_record(reference, execution, started),
         "lifecycle_operation": execution.get("operation"),
+        "peer_pid": peer["pid"],
         "peer_uid": peer["uid"],
         "peer_gid": peer["gid"],
         "peer_cgroup": peer["cgroup"],
         "peer_unit": peer["unit"],
+        "peer_starttime_ticks": peer.get("starttime_ticks"),
+        "peer_cgroup_process_count": peer.get("cgroup_process_count"),
     }
     gate = execution.get("recovery_gate")
     if isinstance(gate, dict):

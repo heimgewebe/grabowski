@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import tempfile
@@ -553,38 +554,42 @@ def run_blockade_lifecycle_reference(
         target=target,
         justification=reason,
     )
-    reference_path = _write_power_reference(reference)
-    client = str(broker["request_client"])
+    # The blockade lifecycle is the one privileged path that must preserve the
+    # kernel identity of the long-lived operator process.  Spawning the generic
+    # request client would replace SO_PEERCRED with a same-cgroup child and make
+    # that child indistinguishable from arbitrary terminal execution.  Send the
+    # immutable reference directly from the MCP process instead.
+    reference_bytes = (
+        json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if not reference_bytes or len(reference_bytes) > 64 * 1024:
+        raise ValueError("blockade lifecycle reference exceeds broker input limit")
     timed_out = False
-    returncode: int | None
+    returncode: int | None = None
+    stdout_raw = b""
+    stderr_raw = b""
     try:
-        completed = subprocess.run(
-            [client, str(reference_path)],
-            cwd="/",
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=45,
-            check=False,
-            env={
-                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-            },
-        )
-        returncode = completed.returncode
-        stdout_raw = completed.stdout
-        stderr_raw = completed.stderr
-    except subprocess.TimeoutExpired as exc:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(45)
+            client.connect(str(BROKER_SOCKET))
+            client.sendall(reference_bytes)
+            client.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 250_000:
+                    raise RuntimeError("privileged broker response exceeds output limit")
+                chunks.append(chunk)
+            stdout_raw = b"".join(chunks)
+    except (socket.timeout, TimeoutError) as exc:
         timed_out = True
-        returncode = None
-        stdout_raw = exc.stdout or b""
-        stderr_raw = exc.stderr or b"privileged broker client timed out"
-    finally:
-        try:
-            reference_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        stderr_raw = str(exc).encode("utf-8", errors="replace") or b"privileged broker direct socket timed out"
+    except OSError as exc:
+        stderr_raw = f"{type(exc).__name__}: {exc}".encode("utf-8", errors="replace")
 
     stdout = _redact_text(stdout_raw.decode("utf-8", errors="replace"))
     stderr = _redact_text(stderr_raw.decode("utf-8", errors="replace"))
@@ -592,6 +597,8 @@ def run_blockade_lifecycle_reference(
         parsed = json.loads(stdout) if stdout.strip() else None
     except json.JSONDecodeError:
         parsed = None
+    if not timed_out and isinstance(parsed, dict):
+        returncode = 0 if parsed.get("returncode") == 0 else 1
     lifecycle = parsed.get("lifecycle") if isinstance(parsed, dict) else None
     success = bool(
         returncode == 0

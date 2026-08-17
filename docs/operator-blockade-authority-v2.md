@@ -63,19 +63,29 @@ transaction-specific quarantine paths and exact hashes.
 
 ## Peer boundary
 
-Lifecycle requests are accepted only from the configured operator service.
+Lifecycle requests are accepted only from the long-lived main process of the
+configured operator service. The typed blockade adapter sends its immutable
+privileged reference directly over the Unix socket; it deliberately does not
+spawn the generic privileged-request client, because that would replace the
+operator's `SO_PEERCRED` with a child-process identity.
+
 The socket-activated root process reads kernel `SO_PEERCRED`, requires the exact
 operator UID and verifies that the peer PID belongs to the unified cgroup ending
-in `grabowski-operator.service`. A same-UID process in tmux, a login session or
-another user service cannot call the marker lifecycle directly.
+in `grabowski-operator.service`. It then binds the decision to cgroup-v2
+`cgroup.procs` plus `/proc/<pid>/stat`: the peer must be the unique oldest
+process in that exact service cgroup, its parent must be outside that cgroup,
+and the membership set must remain unchanged across validation. Thus a same-UID
+terminal/request-client child is rejected even though it inherited the exact
+operator-service cgroup; tmux, login-session, durable-job, persistent-task and
+other-service peers continue to fail the unit boundary earlier.
 
-Failure to read peer credentials or `/proc/<pid>/cgroup`, multiple or malformed
-unified cgroup entries, a UID mismatch or a different unit all block before the
-single-use claim and before any filesystem effect.
+Failure to read peer credentials, cgroup membership, process start identity or
+parent identity; malformed/unbounded process sets; a UID/unit mismatch; a
+non-main peer; or membership drift all block before the single-use claim and
+before any filesystem effect.
 
 This peer check does not claim protection against a compromised kernel, root,
-the operator service itself or code already executing inside the trusted
-operator-service cgroup.
+or arbitrary code injected into the long-lived operator main process itself.
 
 ## Audit and unknown outcomes
 
@@ -145,13 +155,14 @@ source, and the tool contract includes the explicit legacy migration tool.
 This contract does not establish:
 
 - protection against root, kernel or filesystem compromise;
-- safety of arbitrary code already inside the trusted operator-service cgroup;
+- safety of arbitrary code injected into the long-lived operator main process itself;
 - correctness of recovery evidence outside its separately validated contract;
 - automatic migration, disarm, merge or deployment;
 - permission to set the production marker during tests;
 - exactly-once delivery of broker responses.
 
 Tests use temporary directories and test UIDs. Production verification must
-prove the installed ownership, modes, peer rejection from a non-operator
-cgroup, exact operator-service acceptance, legacy migration behavior and that
-the production marker was never created merely for a denial proof.
+prove the installed ownership and modes, rejection from both non-operator and
+same-cgroup child processes, exact main-operator-process acceptance, legacy
+migration behavior and that the production marker was never created merely for
+a denial proof.
