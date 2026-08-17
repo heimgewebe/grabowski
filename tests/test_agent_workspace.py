@@ -667,6 +667,73 @@ class AgentWorkspaceTests(unittest.TestCase):
         workspace._write_manifest(manifest)
         return manifest
 
+    def closed_lane_candidate_fixture(self) -> tuple[dict, dict, dict, dict, dict]:
+        lane = self.lane_receipt(idempotency_key="p3-candidate-adoption")
+        manifest = self.lane_manifest(lane)
+        (self.git.writer / "src" / "app.py").write_text(
+            "adopted = True\n", encoding="utf-8"
+        )
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(
+            manifest, snapshot, workspace._run
+        )
+        writer_receipt = workspace._role_receipt(manifest, "writer")
+        self.assertIsInstance(writer_receipt, dict)
+        candidate, candidate_reference = workspace._persist_candidate_evidence(
+            manifest, snapshot, writer_result, writer_receipt
+        )
+        tests_receipt = signed_role_receipt("tests", manifest, snapshot)
+        review_receipt = signed_role_receipt("review", manifest, snapshot)
+        verification_receipts, verification_summary, verification_references = (
+            workspace._persist_verification_evidence(
+                manifest,
+                candidate,
+                test_receipt=tests_receipt,
+                review_receipt=review_receipt,
+            )
+        )
+        manifest["tasks"].update({"tests": "tests-task", "review": "review-task"})
+        collection = persist_collection(
+            manifest,
+            {
+                "writer_head": snapshot["writer_head"],
+                "diff_sha256": snapshot["diff_sha256"],
+                "dirty": snapshot["dirty"],
+                "changed_paths": snapshot["changed_paths"],
+                "scope_violations": snapshot["scope_violations"],
+                "writer_final_attempt": 1,
+                "writer_receipt_sha256": writer_receipt["receipt_sha256"],
+                "writer_result": writer_result,
+                "candidate_id": candidate["candidate_id"],
+                "candidate_manifest": candidate,
+                "candidate_receipt": candidate_reference,
+                "verification_receipts": verification_receipts,
+                "verification_references": verification_references,
+                "verification_summary": verification_summary,
+            },
+        )
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"state": "completed", "terminal": True},
+            ),
+            mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            closed = workspace.grabowski_agent_workspace_close(
+                manifest["workspace_id"],
+                snapshot["writer_head"],
+                snapshot["diff_sha256"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(closed["close_receipt"]["state"], "complete")
+        self.assertTrue(closed["close_receipt"]["lane_resources_preserved"])
+        return lane, workspace._manifest(manifest["workspace_id"]), collection, candidate, closed
+
+
     def normalize_lane(self, lane: dict, *, runtime_seconds: int = 600) -> dict:
         return workspace._normalize_create(
             binding_kind="thread_focus",
@@ -715,6 +782,342 @@ class AgentWorkspaceTests(unittest.TestCase):
             ),
             candidate,
         )
+
+    def test_lane_candidate_adoption_rejects_valid_immutable_candidate_drift(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        drifted = workspace.candidate_verification.build_candidate_manifest(
+            workspace_id=candidate["workspace_id"],
+            round_number=candidate["round"],
+            base_head=candidate["base_head"],
+            patch_sha256=candidate["patch_sha256"],
+            untracked_manifest_sha256=candidate["untracked_manifest_sha256"],
+            scope_evidence_sha256="f" * 64,
+            resulting_tree_sha256=candidate["resulting_tree_sha256"],
+            writer_evidence_sha256=candidate["writer_evidence_sha256"],
+            lane_id=candidate["lane_id"],
+        )
+        candidate_path = workspace._candidate_receipt_paths(manifest)["candidate"]
+        candidate_path.write_text(
+            workspace.candidate_verification.canonical_json(drifted) + "\n",
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "immutable Candidate receipt",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+
+    def test_lane_candidate_adoption_rejects_missing_immutable_verification_receipt(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        tests_reference = collection["verification_references"]["tests"]
+        Path(tests_reference["path"]).unlink()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "candidate verification evidence is invalid",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+
+    def test_lane_candidate_adoption_materializes_exact_commit_and_is_idempotent(self) -> None:
+        lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            first = workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(first["state"], "adopted")
+        self.assertFalse(first["replayed"])
+        self.assertFalse(first["reconciled"])
+        self.assertTrue(first["lane_closeout_ready"])
+        self.assertEqual(
+            first["lane_closeout_evidence"]["closeout_state"],
+            "candidate_adopted",
+        )
+        self.assertEqual(first["lane_closeout_evidence"]["lane_id"], lane["lane_id"])
+        commit_sha = first["adoption_receipt"]["resulting_commit_sha"]
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), commit_sha)
+        self.assertEqual(
+            run(self.git.writer, "git", "rev-parse", "HEAD^"), self.git.base
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "rev-parse", "HEAD^{tree}"),
+            first["adoption_receipt"]["resulting_git_tree_sha"],
+        )
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=self.git.writer,
+                text=True,
+            ),
+            "",
+        )
+        intent_path = workspace._adoption_receipt_paths(manifest)["intent"]
+        receipt_path = workspace._adoption_receipt_paths(manifest)["receipt"]
+        self.assertEqual(stat.S_IMODE(intent_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(receipt_path.stat().st_mode), 0o600)
+        before = commit_sha
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            second = workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(second["state"], "adopted")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(
+            second["adoption_receipt"]["receipt_sha256"],
+            first["adoption_receipt"]["receipt_sha256"],
+        )
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before)
+
+    def test_lane_candidate_adoption_replay_blocks_after_live_branch_drift(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            first = workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(first["state"], "adopted")
+        run(self.git.writer, "git", "reset", "--hard", self.git.base)
+        with mock.patch.object(workspace.operator, "_require_operator_mutation"):
+            replay = workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(replay["state"], "adoption_readback_drifted")
+        self.assertTrue(replay["replayed"])
+        self.assertFalse(replay["lane_closeout_ready"])
+        self.assertTrue(replay["reconcile_required"])
+        self.assertEqual(replay["observed_head"], self.git.base)
+        self.assertEqual(replay["receipt_status"], "blocked")
+
+    def test_lane_candidate_adoption_requires_closed_workspace_before_branch_effect(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        close_path = workspace._workspace_dir(manifest["workspace_id"]) / "close-receipt.json"
+        close_path.unlink()
+        manifest["close_receipt"] = None
+        workspace._write_manifest(manifest)
+        before = run(self.git.writer, "git", "rev-parse", "HEAD")
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "requires a valid closed workspace receipt"
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before)
+        self.assertFalse(workspace._adoption_receipt_paths(manifest)["intent"].exists())
+
+    def test_lane_candidate_adoption_restores_index_after_intent_write_failure(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
+        before_snapshot = workspace._git_snapshot(manifest, workspace._run)
+        paths = workspace._adoption_receipt_paths(manifest)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.candidate_adoption,
+                "persist_adoption_intent",
+                side_effect=workspace.candidate_adoption.CandidateAdoptionError(
+                    "simulated intent failure"
+                ),
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "intent could not be persisted"
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before_head)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--exit-code"],
+                cwd=self.git.writer,
+                check=False,
+            ).returncode,
+            0,
+        )
+        after_snapshot = workspace._git_snapshot(manifest, workspace._run)
+        self.assertEqual(after_snapshot["diff_sha256"], before_snapshot["diff_sha256"])
+        self.assertEqual(after_snapshot["changed_paths"], before_snapshot["changed_paths"])
+        self.assertTrue(after_snapshot["dirty"])
+        self.assertFalse(paths["intent"].exists())
+        self.assertFalse(paths["receipt"].exists())
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            retry = workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(retry["state"], "adopted")
+        self.assertFalse(retry["replayed"])
+        self.assertTrue(paths["intent"].is_file())
+        self.assertTrue(paths["receipt"].is_file())
+
+    def test_lane_candidate_adoption_reconciles_commit_after_receipt_write_failure(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.base, "_append_audit"),
+            mock.patch.object(
+                workspace.candidate_adoption,
+                "persist_adoption_receipt",
+                side_effect=workspace.candidate_adoption.CandidateAdoptionError(
+                    "simulated receipt failure"
+                ),
+            ),
+        ):
+            first = workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(first["state"], "adoption_outcome_unknown")
+        persisted = workspace._manifest(manifest["workspace_id"])
+        intent = persisted["adoption_intent"]
+        self.assertEqual(
+            run(self.git.writer, "git", "rev-parse", "HEAD"),
+            intent["expected_commit_sha"],
+        )
+        self.assertFalse(
+            workspace._adoption_receipt_paths(manifest)["receipt"].exists()
+        )
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(workspace.base, "_append_audit"),
+        ):
+            reconciled = workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(reconciled["state"], "adopted")
+        self.assertTrue(reconciled["reconciled"])
+        self.assertFalse(reconciled["replayed"])
+        self.assertEqual(
+            reconciled["adoption_receipt"]["resulting_commit_sha"],
+            intent["expected_commit_sha"],
+        )
+
+
+    def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
+        real_snapshot = workspace._adoption_candidate_snapshot
+
+        def mutate_after_snapshot(
+            manifest_value: dict,
+            collection_value: dict,
+            candidate_value: dict,
+        ) -> dict:
+            snapshot = real_snapshot(
+                manifest_value, collection_value, candidate_value
+            )
+            (self.git.writer / "src" / "app.py").write_text(
+                "tampered_after_freeze = True\n", encoding="utf-8"
+            )
+            return snapshot
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace,
+                "_adoption_candidate_snapshot",
+                side_effect=mutate_after_snapshot,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "staged Candidate tree differs from immutable Candidate patch",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before_head)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--exit-code"],
+                cwd=self.git.writer,
+                check=False,
+            ).returncode,
+            0,
+        )
+        paths = workspace._adoption_receipt_paths(manifest)
+        self.assertFalse(paths["intent"].exists())
+        self.assertFalse(paths["receipt"].exists())
+
+    def test_lane_candidate_adoption_revalidates_authority_before_ref_mutation(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        before_head = run(self.git.writer, "git", "rev-parse", "HEAD")
+        real_authority = workspace._require_adoption_lane_authority
+        calls: list[int] = []
+
+        def authority_then_handoff(manifest_value: dict) -> dict:
+            calls.append(len(calls) + 1)
+            if len(calls) == 2:
+                raise workspace.AgentWorkspaceError(
+                    "simulated lease handoff before ref mutation"
+                )
+            return real_authority(manifest_value)
+
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace,
+                "_require_adoption_lane_authority",
+                side_effect=authority_then_handoff,
+            ),
+            self.assertRaisesRegex(
+                workspace.AgentWorkspaceError,
+                "simulated lease handoff before ref mutation",
+            ),
+        ):
+            workspace.grabowski_agent_workspace_adopt(
+                manifest["workspace_id"],
+                candidate["candidate_id"],
+                collection["result_sha256"],
+            )
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(run(self.git.writer, "git", "rev-parse", "HEAD"), before_head)
+        paths = workspace._adoption_receipt_paths(manifest)
+        self.assertTrue(paths["intent"].is_file())
+        self.assertFalse(paths["receipt"].exists())
+
+
 
     def test_lane_backed_workspace_identity_is_generation_safe(self) -> None:
         lane_input = {
