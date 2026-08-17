@@ -3077,6 +3077,18 @@ def _writer_task_binding_reasons(
     return reasons
 
 
+def _checkout_lifecycle_projection_is_active(lifecycle: dict[str, Any]) -> bool:
+    if lifecycle.get("phase") == "active":
+        return True
+    identity = lifecycle.get("identity")
+    return bool(
+        lifecycle.get("state") == "retained"
+        and lifecycle.get("terminal_decision") == "retain"
+        and isinstance(identity, dict)
+        and identity.get("state") == "active"
+    )
+
+
 def _writer_handoff_eligibility(
     manifest: dict[str, Any],
     writer: dict[str, Any],
@@ -3129,7 +3141,7 @@ def _writer_handoff_eligibility(
         lifecycle.get("owner_id") != resources_value.get("owner_id")
         or lifecycle.get("expected_head") != manifest.get("expected_base_head")
         or lifecycle.get("expected_branch") != manifest.get("writer_branch")
-        or lifecycle.get("phase") != "active"
+        or not _checkout_lifecycle_projection_is_active(lifecycle)
         or not isinstance(lifecycle.get("checkout_key"), str)
     ):
         reasons.append("checkout_lifecycle_mismatch")

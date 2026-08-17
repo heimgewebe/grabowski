@@ -9967,6 +9967,37 @@ class AgentWorkspaceTests(unittest.TestCase):
             result = workspace._writer_handoff_eligibility(manifest, writer, snapshot)
         self.assertIn("checkout_lifecycle_unbound", result["reasons"])
 
+    def test_writer_handoff_eligibility_accepts_current_lane_retained_active_projection(self) -> None:
+        manifest, leases = self._handoff_ready_manifest()
+        lifecycle = dict(manifest["checkout_lifecycle"])
+        lifecycle.pop("phase", None)
+        lifecycle["state"] = "retained"
+        lifecycle["terminal_decision"] = "retain"
+        lifecycle["identity"] = {"state": "active"}
+        manifest["checkout_lifecycle"] = lifecycle
+        writer = self._handoff_writer_task(manifest)
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        with mock.patch.object(workspace.resources, "list_resources", return_value=leases):
+            result = workspace._writer_handoff_eligibility(manifest, writer, snapshot)
+        self.assertTrue(result["eligible"], result["reasons"])
+
+        invalid_projections = (
+            {**lifecycle, "terminal_decision": "archive"},
+            {**lifecycle, "state": "archived"},
+            {**lifecycle, "identity": {"state": "terminal"}},
+            {**lifecycle, "identity": None},
+        )
+        for candidate in invalid_projections:
+            with self.subTest(candidate=candidate), mock.patch.object(
+                workspace.resources, "list_resources", return_value=leases
+            ):
+                manifest["checkout_lifecycle"] = candidate
+                result = workspace._writer_handoff_eligibility(
+                    manifest, writer, snapshot
+                )
+                self.assertFalse(result["eligible"])
+                self.assertIn("checkout_lifecycle_mismatch", result["reasons"])
+
     def test_writer_handoff_eligibility_rejects_original_task_binding_drift(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
         snapshot = workspace._git_snapshot(manifest, workspace._run)
