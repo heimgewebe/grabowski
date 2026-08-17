@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
@@ -2777,10 +2778,38 @@ def _remove_created_worktree(
             return False
     return not worktree.exists() and _local_branch_head(repo, branch, runner) is None
 
-def _role_receipt_path(manifest: dict[str, Any], role: str, *, attempt: int = 1) -> Path:
+def _candidate_round(manifest: dict[str, Any]) -> int:
+    value = manifest.get("candidate_round", 1)
+    if isinstance(value, bool) or not isinstance(value, int) or value not in {1, 2}:
+        raise AgentWorkspaceError("candidate_round must be one or two")
+    return value
+
+
+def _role_receipt_path(
+    manifest: dict[str, Any],
+    role: str,
+    *,
+    attempt: int = 1,
+    candidate_round: int | None = None,
+) -> Path:
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         raise AgentWorkspaceError("attempt must be a positive integer")
-    name = f"{role}-receipt.json" if attempt == 1 else f"{role}-receipt.attempt-{attempt}.json"
+    round_number = _candidate_round(manifest) if candidate_round is None else candidate_round
+    if (
+        isinstance(round_number, bool)
+        or not isinstance(round_number, int)
+        or round_number not in {1, 2}
+    ):
+        raise AgentWorkspaceError("candidate receipt round must be one or two")
+    if role in READ_ONLY_ROLES and round_number > 1:
+        stem = f"{role}-receipt.round-{round_number:04d}"
+        name = f"{stem}.json" if attempt == 1 else f"{stem}.attempt-{attempt}.json"
+    else:
+        name = (
+            f"{role}-receipt.json"
+            if attempt == 1
+            else f"{role}-receipt.attempt-{attempt}.json"
+        )
     return _workspace_dir(str(manifest["workspace_id"])) / name
 
 
@@ -2832,8 +2861,14 @@ def _expected_role_argv_sha256(
     return None
 
 
-def _writer_patch_path(manifest: dict[str, Any]) -> Path:
-    return _workspace_dir(str(manifest["workspace_id"])) / "writer.patch"
+def _writer_patch_path(
+    manifest: dict[str, Any], *, round_number: int | None = None
+) -> Path:
+    selected = _candidate_round(manifest) if round_number is None else round_number
+    if isinstance(selected, bool) or not isinstance(selected, int) or selected not in {1, 2}:
+        raise AgentWorkspaceError("writer patch round must be one or two")
+    name = "writer.patch" if selected == 1 else f"writer-round-{selected:04d}.patch"
+    return _workspace_dir(str(manifest["workspace_id"])) / name
 
 
 def _writer_task_argv(
@@ -2842,6 +2877,7 @@ def _writer_task_argv(
     command: list[str] | None = None,
     attempt: int = 1,
     launch_nonce: str | None = None,
+    dirty_preimage_sha256: str | None = None,
 ) -> list[str]:
     allowed_arguments = [
         value
@@ -2849,6 +2885,8 @@ def _writer_task_argv(
         for value in ("--allowed-path", str(relative))
     ]
     selected_command = list(manifest["commands"]["writer"]) if command is None else list(command)
+    if dirty_preimage_sha256 is not None and SHA256_RE.fullmatch(dirty_preimage_sha256) is None:
+        raise AgentWorkspaceError("writer dirty preimage binding is invalid")
     return [
         sys.executable,
         "-m",
@@ -2861,6 +2899,11 @@ def _writer_task_argv(
         str(manifest["writer_branch"]),
         *allowed_arguments,
         *([] if launch_nonce is None else ["--launch-nonce", launch_nonce]),
+        *(
+            []
+            if dirty_preimage_sha256 is None
+            else ["--expected-dirty-preimage-sha256", dirty_preimage_sha256]
+        ),
         "--output",
         str(_role_receipt_path(manifest, "writer", attempt=attempt)),
         "--",
@@ -2900,12 +2943,29 @@ def _writer_attempts(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             raise AgentWorkspaceError("writer attempt one does not match original binding")
     if len(attempts) == 2:
         handoff = attempts[1]
-        if handoff.get("actor") != "operator_handoff":
+        actor = handoff.get("actor")
+        if actor not in {"operator_handoff", "candidate_revision"}:
             raise AgentWorkspaceError("writer handoff actor is invalid")
         if handoff.get("previous_task_id") != first.get("task_id"):
             raise AgentWorkspaceError("writer handoff previous task binding is invalid")
-        if handoff.get("previous_state") not in WRITER_HANDOFF_TERMINAL_STATES:
-            raise AgentWorkspaceError("writer handoff previous state is invalid")
+        if actor == "operator_handoff":
+            if handoff.get("previous_state") not in WRITER_HANDOFF_TERMINAL_STATES:
+                raise AgentWorkspaceError("writer handoff previous state is invalid")
+            if handoff.get("revision_preimage_sha256") is not None:
+                raise AgentWorkspaceError("failure handoff may not carry revision preimage")
+        else:
+            if handoff.get("previous_state") != "completed":
+                raise AgentWorkspaceError("candidate revision requires completed writer attempt one")
+            if handoff.get("candidate_round") != 1 or handoff.get("next_candidate_round") != 2:
+                raise AgentWorkspaceError("candidate revision round binding is invalid")
+            for field in (
+                "revision_candidate_id",
+                "revision_result_sha256",
+                "revision_preimage_sha256",
+            ):
+                value = handoff.get(field)
+                if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+                    raise AgentWorkspaceError(f"candidate revision {field} is invalid")
     return attempts
 
 
@@ -2921,7 +2981,9 @@ def _writer_attempt_refs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         "attempt", "actor", "task_id", "command_sha256", "task_argv_sha256",
         "receipt_path", "expected_base_head", "expected_branch",
         "previous_task_id", "previous_state", "started_at", "start_reconciled",
-        "launch_nonce_sha256",
+        "launch_nonce_sha256", "candidate_round", "next_candidate_round",
+        "revision_candidate_id", "revision_result_sha256",
+        "revision_preimage_sha256",
     )
     return [{key: item.get(key) for key in fields if key in item} for item in _writer_attempts(manifest)]
 
@@ -2948,11 +3010,21 @@ def _effective_writer_attempt(manifest: dict[str, Any]) -> dict[str, Any]:
             raise AgentWorkspaceError("effective writer launch nonce hash mismatch")
     elif launch_nonce is not None:
         raise AgentWorkspaceError("legacy writer attempt may not carry a launch nonce")
+    dirty_preimage_sha256 = selected.get("revision_preimage_sha256")
+    if selected.get("actor") == "candidate_revision":
+        if (
+            not isinstance(dirty_preimage_sha256, str)
+            or SHA256_RE.fullmatch(dirty_preimage_sha256) is None
+        ):
+            raise AgentWorkspaceError("effective revision writer preimage binding is invalid")
+    elif dirty_preimage_sha256 is not None:
+        raise AgentWorkspaceError("non-revision writer may not carry dirty preimage binding")
     argv = _writer_task_argv(
         manifest,
         command=command,
         attempt=final,
         launch_nonce=launch_nonce,
+        dirty_preimage_sha256=dirty_preimage_sha256,
     )
     if selected.get("task_argv_sha256") != _task_argv_sha256(argv):
         raise AgentWorkspaceError("effective writer task argv hash mismatch")
@@ -3132,6 +3204,82 @@ def _safe_untracked_file(root: Path, relative: PurePosixPath) -> Path:
     except (OSError, ValueError) as exc:
         raise AgentWorkspaceActionError(f"untracked path escapes writer worktree: {relative}") from exc
     return resolved
+
+
+def _untracked_file_fingerprint(
+    root: Path, relative: PurePosixPath
+) -> dict[str, Any]:
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise AgentWorkspaceActionError("git returned an unsafe untracked path")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    root_fd = -1
+    current_fd = -1
+    file_fd = -1
+    try:
+        root_fd = os.open(root, directory_flags)
+        current_fd = root_fd
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise AgentWorkspaceActionError(
+                f"untracked path is not a regular file: {relative}"
+            )
+        if before.st_nlink != 1:
+            raise AgentWorkspaceActionError(
+                f"untracked file may not be hardlinked: {relative}"
+            )
+        if before.st_uid != os.getuid() or before.st_size > MAX_UNTRACKED_FILE_BYTES:
+            raise AgentWorkspaceActionError(
+                f"untracked file exceeds safety boundary: {relative}"
+            )
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := os.read(file_fd, 1024 * 1024):
+            total += len(chunk)
+            if total > MAX_UNTRACKED_FILE_BYTES:
+                raise AgentWorkspaceActionError(
+                    f"untracked file exceeds safety boundary: {relative}"
+                )
+            digest.update(chunk)
+        after = os.fstat(file_fd)
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_size")
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise AgentWorkspaceActionError(
+                f"untracked file changed while hashing: {relative}"
+            )
+        if total != before.st_size:
+            raise AgentWorkspaceActionError(
+                f"untracked file size changed while hashing: {relative}"
+            )
+        return {
+            "path": relative.as_posix(),
+            "size": total,
+            "sha256": digest.hexdigest(),
+        }
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise AgentWorkspaceActionError(
+                f"untracked path crosses a symlink: {relative}"
+            ) from exc
+        raise AgentWorkspaceActionError(
+            f"untracked path is not stable: {relative}"
+        ) from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
 
 
 def _writer_create_identity(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, Any]:
@@ -3469,15 +3617,11 @@ def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, 
         if not raw:
             continue
         relative = PurePosixPath(os.fsdecode(raw))
-        target = _safe_untracked_file(worktree, relative)
-        metadata = target.stat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_UNTRACKED_FILE_BYTES:
-            raise AgentWorkspaceActionError(f"untracked file exceeds safety boundary: {relative}")
-        total += metadata.st_size
+        fingerprint = _untracked_file_fingerprint(worktree, relative)
+        total += int(fingerprint["size"])
         if total > MAX_UNTRACKED_TOTAL_BYTES:
             raise AgentWorkspaceActionError("untracked files exceed aggregate safety boundary")
-        digest_value = hashlib.sha256(target.read_bytes()).hexdigest()
-        untracked.append({"path": relative.as_posix(), "size": metadata.st_size, "sha256": digest_value})
+        untracked.append(fingerprint)
     changed = sorted(
         {
             os.fsdecode(raw)
@@ -3978,6 +4122,263 @@ def _adoption_collection_evidence(
     ):
         raise AgentWorkspaceError("candidate patch artifact is invalid")
     return collection, candidate, receipts, summary
+
+
+def _collection_round_receipt_path(
+    manifest: dict[str, Any], *, round_number: int
+) -> Path:
+    if isinstance(round_number, bool) or not isinstance(round_number, int) or round_number not in {1, 2}:
+        raise AgentWorkspaceError("collection round must be one or two")
+    return (
+        _workspace_dir(str(manifest["workspace_id"]))
+        / f"collection-round-{round_number:04d}.json"
+    )
+
+
+def _validate_collection_round_receipt(
+    value: Any, *, workspace_id: str, round_number: int
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("state") != "complete":
+        raise AgentWorkspaceError("revision collection archive must be complete")
+    result_sha256 = value.get("result_sha256")
+    if (
+        not isinstance(result_sha256, str)
+        or SHA256_RE.fullmatch(result_sha256) is None
+        or _collection_result_sha256(value) != result_sha256
+    ):
+        raise AgentWorkspaceError("revision collection archive integrity is invalid")
+    candidate = value.get("candidate_manifest")
+    if not isinstance(candidate, dict):
+        raise AgentWorkspaceError("revision collection archive Candidate is missing")
+    try:
+        validated = candidate_verification.validate_candidate_manifest(candidate)
+    except candidate_verification.CandidateVerificationError as exc:
+        raise AgentWorkspaceError("revision collection archive Candidate is invalid") from exc
+    if (
+        validated.get("workspace_id") != workspace_id
+        or validated.get("round") != round_number
+        or value.get("candidate_id") != validated.get("candidate_id")
+    ):
+        raise AgentWorkspaceError("revision collection archive identity drifted")
+    return value
+
+
+def _persist_collection_round_archive(
+    manifest: dict[str, Any], collection: dict[str, Any], *, round_number: int
+) -> dict[str, Any]:
+    workspace_id = str(manifest["workspace_id"])
+    path = _collection_round_receipt_path(manifest, round_number=round_number)
+    validator = lambda value: _validate_collection_round_receipt(
+        value, workspace_id=workspace_id, round_number=round_number
+    )
+    created = candidate_verification.persist_immutable_receipt(
+        path, collection, validator=validator
+    )
+    observed = candidate_verification.read_immutable_receipt(path, validator=validator)
+    if observed != collection:
+        raise AgentWorkspaceError("revision collection archive readback drifted")
+    return {
+        "path": str(path),
+        "result_sha256": collection["result_sha256"],
+        "candidate_id": collection["candidate_id"],
+        "round": round_number,
+        "created": created,
+    }
+
+
+def _revision_collection_evidence(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    if not _lane_backed(manifest):
+        raise AgentWorkspaceError("candidate revision requires a lane-backed workspace")
+    if _candidate_round(manifest) != 1:
+        raise AgentWorkspaceError("candidate revision is limited to round one -> round two")
+    history = manifest.get("revision_history", [])
+    if history not in (None, []) and (not isinstance(history, list) or history):
+        raise AgentWorkspaceError("candidate revision limit has already been consumed")
+    if manifest.get("close_receipt") is not None:
+        raise AgentWorkspaceError("closed workspace may not start a candidate revision")
+    intents = manifest.get("task_start_intents")
+    if not isinstance(intents, dict):
+        raise AgentWorkspaceError("candidate revision start intents are invalid")
+    foreign_intents = [key for key in intents if key != "writer_handoff"]
+    if foreign_intents:
+        raise AgentWorkspaceError("candidate revision has unresolved task start intents")
+    for role in READ_ONLY_ROLES:
+        if _role_final_attempt(manifest, role) != 1:
+            raise AgentWorkspaceError(
+                "P4 candidate revision requires first-attempt round-one verifiers"
+            )
+    collection = manifest.get("collection")
+    if not isinstance(collection, dict) or collection.get("state") != "complete":
+        raise AgentWorkspaceError("candidate revision requires a complete collection")
+    if not _collection_integrity_status(manifest, collection).get("valid"):
+        raise AgentWorkspaceError("candidate revision collection integrity is invalid")
+    raw_candidate = collection.get("candidate_manifest")
+    raw_receipts = collection.get("verification_receipts")
+    raw_summary = collection.get("verification_summary")
+    if (
+        not isinstance(raw_candidate, dict)
+        or not isinstance(raw_receipts, list)
+        or not isinstance(raw_summary, dict)
+    ):
+        raise AgentWorkspaceError("candidate revision verification evidence is incomplete")
+    try:
+        candidate = candidate_verification.validate_candidate_manifest(raw_candidate)
+        persisted_candidate = candidate_verification.read_immutable_receipt(
+            _candidate_receipt_paths(manifest, round_number=1)["candidate"],
+            validator=candidate_verification.validate_candidate_manifest,
+        )
+        if persisted_candidate != candidate:
+            raise candidate_verification.CandidateVerificationError(
+                "round-one Candidate differs from immutable receipt"
+            )
+        receipts: list[dict[str, Any]] = []
+        for value in raw_receipts:
+            receipt = candidate_verification.validate_verification_receipt(
+                value, expected_candidate_id=candidate["candidate_id"]
+            )
+            path = _verification_receipt_path(
+                manifest,
+                str(receipt["verifier_kind"]),
+                candidate_round=1,
+                verifier_attempt=int(receipt["verifier_attempt"]),
+            )
+            validator = lambda observed, candidate_id=candidate["candidate_id"]: (
+                candidate_verification.validate_verification_receipt(
+                    observed, expected_candidate_id=candidate_id
+                )
+            )
+            persisted = candidate_verification.read_immutable_receipt(
+                path, validator=validator
+            )
+            if persisted != receipt:
+                raise candidate_verification.CandidateVerificationError(
+                    "round-one Verification differs from immutable receipt"
+                )
+            receipts.append(receipt)
+        summary = candidate_verification.validate_verification_summary(
+            raw_summary, candidate_manifest=candidate, verification_receipts=receipts
+        )
+    except candidate_verification.CandidateVerificationError as exc:
+        raise AgentWorkspaceError(
+            f"candidate revision evidence is invalid: {_error_summary(exc)}"
+        ) from exc
+    if (
+        candidate.get("round") != 1
+        or candidate.get("workspace_id") != manifest.get("workspace_id")
+        or candidate.get("base_head") != manifest.get("expected_base_head")
+        or candidate.get("lane_id") != _candidate_lane_id(manifest)
+        or collection.get("candidate_id") != candidate.get("candidate_id")
+    ):
+        raise AgentWorkspaceError("candidate revision identity does not match workspace authority")
+    if summary.get("outcome") != "NEEDS_CHANGE" or summary.get("missing_required_verifiers"):
+        raise AgentWorkspaceError("candidate revision requires complete NEEDS_CHANGE verification")
+    writer_result = collection.get("writer_result")
+    if (
+        not isinstance(writer_result, dict)
+        or writer_result.get("type") != "patch"
+        or writer_result.get("sha256") != candidate.get("patch_sha256")
+        or not _verify_patch_artifact(
+            writer_result, expected_path=_writer_patch_path(manifest, round_number=1)
+        )
+    ):
+        raise AgentWorkspaceError("candidate revision round-one patch artifact is invalid")
+    snapshot = _git_snapshot(manifest, _run)
+    if (
+        snapshot.get("writer_head") != manifest.get("expected_base_head")
+        or snapshot.get("writer_branch_matches") is not True
+        or snapshot.get("dirty") is not True
+        or snapshot.get("diff_sha256") != collection.get("diff_sha256")
+        or snapshot.get("changed_paths") != collection.get("changed_paths")
+        or snapshot.get("scope_passed") is not True
+        or snapshot.get("scope_violations") != collection.get("scope_violations")
+        or snapshot.get("base_drift")
+        or _sha256_json(snapshot.get("untracked_artifacts"))
+        != candidate.get("untracked_manifest_sha256")
+    ):
+        raise AgentWorkspaceError("live workspace no longer matches round-one Candidate")
+    effective = _effective_writer_attempt(manifest)
+    writer = _task_public(str(effective["task_id"]))
+    if (
+        _writer_final_attempt(manifest) != 1
+        or effective.get("actor") != "initial_writer"
+        or writer.get("state") != "completed"
+        or writer.get("terminal") is not True
+        or _writer_task_binding_reasons(manifest, effective, writer)
+    ):
+        raise AgentWorkspaceError("round-one writer is not a completed exact attempt")
+    for role in READ_ONLY_ROLES:
+        task_id = manifest.get("tasks", {}).get(role)
+        role_task = _task_public(task_id)
+        if not role_task.get("terminal"):
+            raise AgentWorkspaceError("candidate revision verifier task is not terminal")
+    _require_live_lane_binding(manifest, _run)
+    result_sha256 = collection.get("result_sha256")
+    preimage_sha256 = collection.get("diff_sha256")
+    if (
+        not isinstance(result_sha256, str)
+        or SHA256_RE.fullmatch(result_sha256) is None
+        or not isinstance(preimage_sha256, str)
+        or SHA256_RE.fullmatch(preimage_sha256) is None
+    ):
+        raise AgentWorkspaceError("candidate revision result or preimage binding is invalid")
+    return collection, candidate, receipts, summary, snapshot
+
+
+def _transition_to_candidate_revision(
+    manifest: dict[str, Any],
+    *,
+    collection: dict[str, Any],
+    candidate: dict[str, Any],
+    preimage_sha256: str,
+) -> dict[str, Any]:
+    archive = _persist_collection_round_archive(manifest, collection, round_number=1)
+    history = manifest.get("revision_history", [])
+    if history is None:
+        history = []
+    if not isinstance(history, list) or history:
+        raise AgentWorkspaceError("candidate revision history is not appendable")
+    history_entry = {
+        "round": 1,
+        "next_round": 2,
+        "candidate_id": candidate["candidate_id"],
+        "result_sha256": collection["result_sha256"],
+        "preimage_sha256": preimage_sha256,
+        "verification_outcome": collection.get("verification_summary", {}).get("outcome"),
+        "collection_archive": archive,
+        "writer_patch": dict(collection.get("writer_result", {})),
+        "task_ids": dict(collection.get("task_ids", {})),
+        "writer_final_attempt": collection.get("writer_final_attempt", 1),
+        "transitioned_at": _utc(),
+    }
+    manifest["revision_history"] = [history_entry]
+    manifest["candidate_round"] = 2
+    manifest["collection"] = None
+    manifest.pop("frozen_writer", None)
+    tasks_map = dict(manifest.get("tasks", {}))
+    tasks_map["tests"] = None
+    tasks_map["review"] = None
+    manifest["tasks"] = tasks_map
+    final_attempts = dict(manifest.get("role_final_attempt", {}))
+    final_attempts.pop("tests", None)
+    final_attempts.pop("review", None)
+    manifest["role_final_attempt"] = final_attempts
+    _append_workspace_event(
+        manifest,
+        "candidate_revision_round_opened",
+        role="writer",
+        outcome="round_2_ready",
+        evidence={
+            "round": 1,
+            "next_round": 2,
+            "candidate_id": candidate["candidate_id"],
+            "result_sha256": collection["result_sha256"],
+            "preimage_sha256": preimage_sha256,
+            "collection_archive_path": archive["path"],
+        },
+    )
+    return history_entry
 
 
 def _require_closed_lane_workspace_for_adoption(
@@ -4982,6 +5383,42 @@ def _prospective_closure_outcome(manifest: dict[str, Any], collection: Any) -> s
     return "would_abandon_failed_roles" if _collection_failed_roles(collection) else "would_be_successful"
 
 
+def _candidate_revision_status(manifest: dict[str, Any]) -> dict[str, Any]:
+    collection = manifest.get("collection")
+    if not isinstance(collection, dict) or collection.get("state") != "complete":
+        return {
+            "eligible": False,
+            "reasons": ["complete_collection_missing"],
+            "max": 1,
+            "used": 1 if _candidate_round(manifest) > 1 else 0,
+        }
+    try:
+        observed, candidate, _receipts, summary, snapshot = (
+            _revision_collection_evidence(manifest)
+        )
+    except Exception as exc:
+        return {
+            "eligible": False,
+            "reasons": ["candidate_revision_preconditions_not_met"],
+            "error": _error_summary(exc),
+            "max": 1,
+            "used": 1 if _candidate_round(manifest) > 1 else 0,
+        }
+    return {
+        "eligible": True,
+        "reasons": [],
+        "max": 1,
+        "used": 0,
+        "candidate_id": candidate["candidate_id"],
+        "round": candidate["round"],
+        "next_round": 2,
+        "verification_outcome": summary["outcome"],
+        "result_sha256": observed["result_sha256"],
+        "preimage_sha256": snapshot["diff_sha256"],
+        "tool": "grabowski_agent_workspace_writer_handoff",
+    }
+
+
 def _recommended_next_action(
     *,
     creation_ready: bool,
@@ -5152,7 +5589,11 @@ def _elapsed_seconds(started_at: Any, ended_at: Any) -> int | None:
 def _role_attempt_summary(manifest: dict[str, Any]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for role in ("writer", "tests", "review"):
-        final_attempt = 1 if role == "writer" else _role_final_attempt(manifest, role)
+        final_attempt = (
+            _writer_final_attempt(manifest)
+            if role == "writer"
+            else _role_final_attempt(manifest, role)
+        )
         retry_state, retry_error = (
             ({"count": 0, "attempts": []}, None)
             if role == "writer"
@@ -5173,17 +5614,31 @@ def _role_attempt_summary(manifest: dict[str, Any]) -> dict[str, Any]:
 def _first_pass_role_results(
     manifest: dict[str, Any], collection: dict[str, Any]
 ) -> dict[str, Any]:
+    first_collection = collection
+    if _candidate_round(manifest) > 1:
+        path = _collection_round_receipt_path(manifest, round_number=1)
+        try:
+            first_collection = _validate_collection_round_receipt(
+                _load_json(path),
+                workspace_id=str(manifest["workspace_id"]),
+                round_number=1,
+            )
+        except Exception:
+            first_collection = {}
     writer = {
         "state": (
-            collection.get("writer_task", {}).get("state")
-            if isinstance(collection.get("writer_task"), dict)
+            first_collection.get("writer_task", {}).get("state")
+            if isinstance(first_collection.get("writer_task"), dict)
             else None
         ),
-        "receipt_sha256": collection.get("writer_receipt_sha256"),
+        "receipt_sha256": first_collection.get("writer_receipt_sha256"),
     }
     result: dict[str, Any] = {"writer": writer}
     for role in ("tests", "review"):
-        receipt = _role_receipt(manifest, role, attempt=1)
+        path = _role_receipt_path(
+            manifest, role, attempt=1, candidate_round=1
+        )
+        receipt = _load_json(path) if path.exists() else None
         if not isinstance(receipt, dict) or not _receipt_integrity(receipt):
             result[role] = {
                 "status": "missing",
@@ -5277,6 +5732,10 @@ def _known_workspace_tool_calls(manifest: dict[str, Any], phase: str) -> dict[st
         "create": event_counts.get("plan_created", 1),
         "collect": event_counts.get("collection_requested", 1),
         "role_retry": event_counts.get("retry_decision", retry_count),
+        "writer_handoff": (
+            event_counts.get("writer_handoff_start_intent", 0)
+            + event_counts.get("candidate_revision_start_intent", 0)
+        ),
         "close": (
             event_counts.get("close_requested", 1) if phase == "close" else 0
         ),
@@ -5939,6 +6398,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         writer_handoff = _writer_handoff_eligibility(manifest, task_state["writer"], snapshot)
     except Exception as exc:
         writer_handoff = {"eligible": False, "reasons": ["writer_attempt_history_invalid"], "error": _error_summary(exc), "max": MAX_WRITER_HANDOFFS, "used": None}
+    candidate_revision = _candidate_revision_status(manifest)
     if writer_terminal_failure and "writer" not in failed_roles:
         failed_roles = ["writer", *failed_roles]
     role_retry = _status_role_retry(manifest)
@@ -5956,6 +6416,8 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
     )
     if isinstance(task_start_intents, dict) and "writer_handoff" in task_start_intents:
         recommended_next_action = "repeat_identical_writer_handoff_to_reconcile_start"
+    elif candidate_revision.get("eligible"):
+        recommended_next_action = "writer_handoff_for_candidate_revision"
     elif writer_handoff.get("eligible"):
         recommended_next_action = "writer_handoff"
     elif "writer_outcome_reconcile_required" in writer_handoff.get("reasons", []):
@@ -5980,6 +6442,9 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "writer_final_attempt": writer_final_attempt,
         "writer_attempt_error": writer_attempt_error,
         "writer_handoff": writer_handoff,
+        "candidate_revision": candidate_revision,
+        "candidate_round": _candidate_round(manifest),
+        "revision_history": manifest.get("revision_history", []),
         "task_start_intents": task_start_intents,
         "role_start_reconcile_required": not start_intents_clear,
         "tmux": {
@@ -6052,6 +6517,9 @@ def _start_role_task(manifest: dict[str, Any], role: str, snapshot: dict[str, An
         str(snapshot["writer_head"]),
         str(snapshot["diff_sha256"]),
         bool(snapshot["dirty"]),
+        output_path=_role_receipt_path(
+            manifest, role, attempt=_role_final_attempt(manifest, role)
+        ),
     )
     cwd = str(manifest["writer_worktree"])
     task = tasks.grabowski_task_start(
@@ -7370,6 +7838,10 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             or writer_receipt.get("sandbox") != "bubblewrap-minimal-root-bounded-writable-paths-v1"
             or writer_receipt.get("git_common_dir_mode") != "read_only"
             or writer_receipt.get("returncode") != 0
+            or writer_receipt.get("expected_dirty_preimage_sha256")
+            != effective_writer.get("revision_preimage_sha256")
+            or writer_receipt.get("observed_dirty_preimage_sha256")
+            != effective_writer.get("revision_preimage_sha256")
         ):
             return {
                 "workspace_id": identifier,
@@ -7479,6 +7951,7 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 snapshot,
                 writer_result,
                 writer_receipt,
+                round_number=_candidate_round(manifest),
             )
         except (
             AgentWorkspaceError,
@@ -7555,6 +8028,9 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                     str(snapshot["writer_head"]),
                     str(snapshot["diff_sha256"]),
                     bool(snapshot["dirty"]),
+                    output_path=_role_receipt_path(
+                        manifest, role, attempt=_role_final_attempt(manifest, role)
+                    ),
                 )
                 intent = {
                     "role": role,
@@ -8100,11 +8576,15 @@ def _bind_writer_handoff_attempt(
     output: Path,
     launch_nonce: str,
     reconciled: bool,
+    actor: str = "operator_handoff",
+    revision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if actor not in {"operator_handoff", "candidate_revision"}:
+        raise AgentWorkspaceError("writer attempt actor is invalid")
     command_sha = _sha256_json(command)
-    record = {
+    record: dict[str, Any] = {
         "attempt": 2,
-        "actor": "operator_handoff",
+        "actor": actor,
         "task_id": public["task_id"],
         "command": command,
         "command_sha256": command_sha,
@@ -8119,8 +8599,44 @@ def _bind_writer_handoff_attempt(
         "launch_nonce": launch_nonce,
         "launch_nonce_sha256": hashlib.sha256(launch_nonce.encode()).hexdigest(),
     }
+    transition: dict[str, Any] | None = None
+    if actor == "candidate_revision":
+        if not isinstance(revision, dict):
+            raise AgentWorkspaceError("candidate revision binding is missing")
+        collection = revision.get("collection")
+        candidate = revision.get("candidate")
+        preimage_sha256 = revision.get("preimage_sha256")
+        if (
+            not isinstance(collection, dict)
+            or not isinstance(candidate, dict)
+            or not isinstance(preimage_sha256, str)
+            or SHA256_RE.fullmatch(preimage_sha256) is None
+            or candidate.get("round") != 1
+            or collection.get("candidate_id") != candidate.get("candidate_id")
+            or collection.get("diff_sha256") != preimage_sha256
+        ):
+            raise AgentWorkspaceError("candidate revision binding is invalid")
+        record.update(
+            {
+                "candidate_round": 1,
+                "next_candidate_round": 2,
+                "revision_candidate_id": candidate["candidate_id"],
+                "revision_result_sha256": collection["result_sha256"],
+                "revision_preimage_sha256": preimage_sha256,
+            }
+        )
+    elif revision is not None:
+        raise AgentWorkspaceError("failure handoff may not carry candidate revision binding")
     manifest["writer_attempts"] = [attempts[0], record]
     manifest["writer_final_attempt"] = 2
+    if actor == "candidate_revision":
+        assert isinstance(revision, dict)
+        transition = _transition_to_candidate_revision(
+            manifest,
+            collection=revision["collection"],
+            candidate=revision["candidate"],
+            preimage_sha256=revision["preimage_sha256"],
+        )
     lifecycle = manifest.get("checkout_lifecycle")
     if isinstance(lifecycle, dict):
         task_binding = dict(lifecycle.get("task") or {})
@@ -8134,52 +8650,74 @@ def _bind_writer_handoff_attempt(
     intents = dict(manifest.get("task_start_intents", {}))
     intents.pop("writer_handoff", None)
     manifest["task_start_intents"] = intents
-    event_type = "writer_handoff_start_reconciled" if reconciled else "writer_handoff_started"
+    if actor == "candidate_revision":
+        event_type = (
+            "candidate_revision_start_reconciled"
+            if reconciled
+            else "candidate_revision_started"
+        )
+        state = (
+            "writer_revision_start_reconciled"
+            if reconciled
+            else "writer_revision_started"
+        )
+        operation = (
+            "agent-workspace-candidate-revision-reconcile"
+            if reconciled
+            else "agent-workspace-candidate-revision"
+        )
+    else:
+        event_type = "writer_handoff_start_reconciled" if reconciled else "writer_handoff_started"
+        state = "writer_handoff_start_reconciled" if reconciled else "writer_handoff_started"
+        operation = (
+            "agent-workspace-writer-handoff-reconcile"
+            if reconciled
+            else "agent-workspace-writer-handoff"
+        )
+    evidence = {
+        "attempt": 2,
+        "actor": actor,
+        "task_id": public["task_id"],
+        "previous_task_id": effective["task_id"],
+        "previous_state": previous_state,
+        "command_sha256": command_sha,
+        "task_argv_sha256": record["task_argv_sha256"],
+    }
+    if actor == "candidate_revision":
+        evidence.update(
+            {
+                "candidate_round": 1,
+                "next_candidate_round": 2,
+                "revision_candidate_id": record["revision_candidate_id"],
+                "revision_result_sha256": record["revision_result_sha256"],
+                "revision_preimage_sha256": record["revision_preimage_sha256"],
+            }
+        )
     _append_workspace_event(
         manifest,
         event_type,
         role="writer",
         outcome="bound" if reconciled else "started",
-        evidence={
-            "attempt": 2,
-            "task_id": public["task_id"],
-            "previous_task_id": effective["task_id"],
-            "previous_state": previous_state,
-            "command_sha256": command_sha,
-            "task_argv_sha256": record["task_argv_sha256"],
-        },
+        evidence=evidence,
     )
     _write_manifest(manifest)
     base._append_audit(
         {
             "timestamp_unix": _now(),
-            "operation": (
-                "agent-workspace-writer-handoff-reconcile"
-                if reconciled
-                else "agent-workspace-writer-handoff"
-            ),
+            "operation": operation,
             "workspace_id": manifest["workspace_id"],
-            "attempt": 2,
-            "task_id": public["task_id"],
-            "previous_task_id": effective["task_id"],
-            "previous_state": previous_state,
-            "command_sha256": command_sha,
-            "task_argv_sha256": record["task_argv_sha256"],
+            **evidence,
         }
     )
     return {
         "workspace_id": manifest["workspace_id"],
-        "state": (
-            "writer_handoff_start_reconciled"
-            if reconciled
-            else "writer_handoff_started"
-        ),
+        "state": state,
         "attempt": 2,
         "task": public,
         "attempt_record": _writer_attempt_refs(manifest)[-1],
+        "revision_transition": transition,
         "handoff_status": "reconciled" if reconciled else "passed",
     }
-
 
 def _reconcile_writer_handoff_start(
     manifest: dict[str, Any],
@@ -8190,8 +8728,23 @@ def _reconcile_writer_handoff_start(
     command: list[str],
     intent: dict[str, Any],
 ) -> dict[str, Any]:
+    del writer
     command_sha = _sha256_json(command)
     launch_nonce = intent.get("launch_nonce")
+    kind = intent.get("kind")
+    if kind == "candidate_revision":
+        actor = "candidate_revision"
+        dirty_preimage_sha256 = intent.get("revision_preimage_sha256")
+    elif kind == "operator_handoff":
+        actor = "operator_handoff"
+        dirty_preimage_sha256 = None
+    else:
+        return {
+            "workspace_id": manifest["workspace_id"],
+            "state": "writer_handoff_start_intent_invalid",
+            "handoff_status": "blocked",
+            "reconcile_required": True,
+        }
     if not isinstance(launch_nonce, str) or len(launch_nonce) != 24:
         return {
             "workspace_id": manifest["workspace_id"],
@@ -8204,20 +8757,64 @@ def _reconcile_writer_handoff_start(
         command=command,
         attempt=2,
         launch_nonce=launch_nonce,
+        dirty_preimage_sha256=(
+            dirty_preimage_sha256 if isinstance(dirty_preimage_sha256, str) else None
+        ),
     )
     expected_task_argv_sha = _task_argv_sha256(task_argv)
     host = _bound_task_host(manifest)
     cwd = str(manifest["writer_worktree"])
+    previous_state = intent.get("previous_state")
+    previous_state_valid = (
+        previous_state == "completed"
+        if actor == "candidate_revision"
+        else previous_state in WRITER_HANDOFF_TERMINAL_STATES
+    )
+    revision: dict[str, Any] | None = None
+    revision_valid = actor != "candidate_revision"
+    if actor == "candidate_revision":
+        collection = manifest.get("collection")
+        raw_candidate = collection.get("candidate_manifest") if isinstance(collection, dict) else None
+        try:
+            candidate = (
+                candidate_verification.validate_candidate_manifest(raw_candidate)
+                if isinstance(raw_candidate, dict)
+                else None
+            )
+        except candidate_verification.CandidateVerificationError:
+            candidate = None
+        revision_valid = bool(
+            isinstance(collection, dict)
+            and collection.get("state") == "complete"
+            and _collection_integrity_status(manifest, collection).get("valid")
+            and isinstance(candidate, dict)
+            and candidate.get("round") == 1
+            and intent.get("candidate_round") == 1
+            and intent.get("next_candidate_round") == 2
+            and intent.get("revision_candidate_id") == candidate.get("candidate_id")
+            and intent.get("revision_result_sha256") == collection.get("result_sha256")
+            and intent.get("revision_preimage_sha256") == collection.get("diff_sha256")
+            and isinstance(dirty_preimage_sha256, str)
+            and SHA256_RE.fullmatch(dirty_preimage_sha256) is not None
+            and collection.get("verification_summary", {}).get("outcome") == "NEEDS_CHANGE"
+        )
+        if revision_valid:
+            revision = {
+                "collection": collection,
+                "candidate": candidate,
+                "preimage_sha256": dirty_preimage_sha256,
+            }
     if (
-        intent.get("kind") != "operator_handoff"
-        or intent.get("attempt") != 2
+        intent.get("attempt") != 2
         or intent.get("command_sha256") != command_sha
         or intent.get("task_argv_sha256") != expected_task_argv_sha
         or intent.get("task_host") != host
         or intent.get("task_cwd") != cwd
         or intent.get("previous_task_id") != effective["task_id"]
-        or intent.get("previous_state") not in WRITER_HANDOFF_TERMINAL_STATES
-        or intent.get("launch_nonce_sha256") != hashlib.sha256(launch_nonce.encode()).hexdigest()
+        or not previous_state_valid
+        or not revision_valid
+        or intent.get("launch_nonce_sha256")
+        != hashlib.sha256(launch_nonce.encode()).hexdigest()
     ):
         return {
             "workspace_id": manifest["workspace_id"],
@@ -8280,7 +8877,11 @@ def _reconcile_writer_handoff_start(
         cursor = pagination.get("next_cursor") if isinstance(pagination, dict) else None
         if not isinstance(cursor, str) or not cursor:
             break
-    unique = {str(item.get("task_id")): item for item in candidates if isinstance(item.get("task_id"), str)}
+    unique = {
+        str(item.get("task_id")): item
+        for item in candidates
+        if isinstance(item.get("task_id"), str)
+    }
     if len(unique) != 1:
         if not unique and exhausted and _now() - created_at_unix >= 10:
             intents = dict(manifest.get("task_start_intents", {}))
@@ -8294,6 +8895,7 @@ def _reconcile_writer_handoff_start(
                 outcome="intent_cleared",
                 evidence={
                     "attempt": 2,
+                    "actor": actor,
                     "intent_sha256": intent_sha256,
                     "task_argv_sha256": expected_task_argv_sha,
                     "scan_exhausted": True,
@@ -8307,6 +8909,7 @@ def _reconcile_writer_handoff_start(
                     "operation": "agent-workspace-writer-handoff-start-absent",
                     "workspace_id": manifest["workspace_id"],
                     "attempt": 2,
+                    "actor": actor,
                     "intent_sha256": intent_sha256,
                     "task_argv_sha256": expected_task_argv_sha,
                 }
@@ -8331,9 +8934,9 @@ def _reconcile_writer_handoff_start(
             "handoff_status": "blocked",
             "reconcile_required": True,
         }
-    candidate = next(iter(unique.values()))
+    candidate_task = next(iter(unique.values()))
     public = _validate_started_task(
-        candidate,
+        candidate_task,
         role="writer",
         expected_host=host,
         expected_argv=task_argv,
@@ -8343,19 +8946,260 @@ def _reconcile_writer_handoff_start(
         manifest,
         attempts=attempts,
         effective=effective,
-        previous_state=str(intent["previous_state"]),
+        previous_state=str(previous_state),
         command=command,
         task_argv=task_argv,
         public=public,
         output=_role_receipt_path(manifest, "writer", attempt=2),
         launch_nonce=launch_nonce,
         reconciled=True,
+        actor=actor,
+        revision=revision,
+    )
+
+
+def _candidate_revision_handoff(
+    manifest: dict[str, Any],
+    *,
+    attempts: list[dict[str, Any]],
+    effective: dict[str, Any],
+    command: list[str],
+) -> dict[str, Any]:
+    identifier = str(manifest["workspace_id"])
+    command_sha = _sha256_json(command)
+    intents_value = manifest.get("task_start_intents", {})
+    if not isinstance(intents_value, dict):
+        return {
+            "workspace_id": identifier,
+            "state": "writer_handoff_start_intents_invalid",
+            "handoff_status": "blocked",
+            "reconcile_required": True,
+        }
+    existing_intent = intents_value.get("writer_handoff")
+    writer = _task_public(str(effective["task_id"]))
+    if existing_intent is not None:
+        if not isinstance(existing_intent, dict):
+            return {
+                "workspace_id": identifier,
+                "state": "writer_handoff_start_intent_invalid",
+                "handoff_status": "blocked",
+                "reconcile_required": True,
+            }
+        return _reconcile_writer_handoff_start(
+            manifest,
+            attempts=attempts,
+            effective=effective,
+            writer=writer,
+            command=command,
+            intent=existing_intent,
+        )
+    try:
+        collection, candidate, _receipts, summary, snapshot = (
+            _revision_collection_evidence(manifest)
+        )
+    except Exception as exc:
+        return {
+            "workspace_id": identifier,
+            "state": "candidate_revision_blocked",
+            "error": _error_summary(exc),
+            "handoff_status": "blocked",
+        }
+    preflight = _role_toolchain_preflight(manifest, "writer", command)
+    _append_workspace_event(
+        manifest,
+        "role_preflight",
+        role="writer",
+        outcome="passed" if preflight["passed"] else "environment_failure",
+        evidence={
+            "command_sha256": preflight.get("command_sha256"),
+            "failure_classification": preflight.get("failure_classification"),
+            "candidate_revision": True,
+            "candidate_id": candidate["candidate_id"],
+            "attempt_consumed": False,
+        },
+    )
+    if not preflight["passed"]:
+        blocks_value = manifest.get("writer_handoff_preflight_blocks", [])
+        if not isinstance(blocks_value, list) or any(
+            not isinstance(item, dict) for item in blocks_value
+        ):
+            return {
+                "workspace_id": identifier,
+                "state": "writer_handoff_preflight_history_invalid",
+                "attempt_consumed": False,
+                "handoff_status": "blocked",
+            }
+        blocks = [
+            *blocks_value,
+            {
+                **preflight,
+                "candidate_revision": True,
+                "candidate_id": candidate["candidate_id"],
+                "attempt_consumed": False,
+                "proposed_attempt": 2,
+            },
+        ][-MAX_WRITER_HANDOFF_PREFLIGHT_BLOCKS:]
+        manifest["writer_handoff_preflight_blocks"] = blocks
+        _write_manifest(manifest)
+        return {
+            "workspace_id": identifier,
+            "state": "writer_toolchain_preflight_failed",
+            "preflight": preflight,
+            "attempt_consumed": False,
+            "candidate_revision": True,
+            "handoff_status": "blocked",
+        }
+    try:
+        re_collection, re_candidate, _re_receipts, re_summary, re_snapshot = (
+            _revision_collection_evidence(manifest)
+        )
+    except Exception as exc:
+        _append_workspace_event(
+            manifest,
+            "candidate_revision_revalidation",
+            role="writer",
+            outcome="blocked",
+            evidence={
+                "candidate_id": candidate["candidate_id"],
+                "command_sha256": command_sha,
+                "error": _error_summary(exc),
+            },
+        )
+        _write_manifest(manifest)
+        return {
+            "workspace_id": identifier,
+            "state": "candidate_revision_revalidation_blocked",
+            "error": _error_summary(exc),
+            "handoff_status": "blocked",
+        }
+    if (
+        re_candidate.get("candidate_id") != candidate.get("candidate_id")
+        or re_collection.get("result_sha256") != collection.get("result_sha256")
+        or re_snapshot.get("diff_sha256") != snapshot.get("diff_sha256")
+        or re_summary.get("outcome") != summary.get("outcome")
+    ):
+        return {
+            "workspace_id": identifier,
+            "state": "candidate_revision_revalidation_drifted",
+            "handoff_status": "blocked",
+        }
+    lane_status = _require_live_lane_binding(manifest, _run)
+    _append_workspace_event(
+        manifest,
+        "writer_handoff_lane_authority_revalidated",
+        role="writer",
+        outcome="preserved_lane_owned",
+        evidence={
+            "attempt": 2,
+            "candidate_revision": True,
+            "lane_id": lane_status.get("lane_id"),
+            "lane_receipt_sha256": lane_status.get("receipt_sha256"),
+        },
+    )
+    output = _role_receipt_path(manifest, "writer", attempt=2)
+    if os.path.lexists(output):
+        return {
+            "workspace_id": identifier,
+            "state": "writer_handoff_receipt_already_exists",
+            "receipt_path": str(output),
+            "handoff_status": "blocked",
+        }
+    preimage_sha256 = str(re_collection["diff_sha256"])
+    launch_nonce = hashlib.sha256(
+        f"{identifier}:writer:revision:{time.time_ns()}".encode()
+    ).hexdigest()[:24]
+    task_argv = _writer_task_argv(
+        manifest,
+        command=command,
+        attempt=2,
+        launch_nonce=launch_nonce,
+        dirty_preimage_sha256=preimage_sha256,
+    )
+    host = _bound_task_host(manifest)
+    cwd = str(manifest["writer_worktree"])
+    intent = {
+        "role": "writer",
+        "kind": "candidate_revision",
+        "attempt": 2,
+        "created_at": _utc(),
+        "created_at_unix": _now(),
+        "nonce": hashlib.sha256(
+            f"{identifier}:writer:revision-intent:{time.time_ns()}".encode()
+        ).hexdigest()[:24],
+        "launch_nonce": launch_nonce,
+        "launch_nonce_sha256": hashlib.sha256(launch_nonce.encode()).hexdigest(),
+        "previous_task_id": effective["task_id"],
+        "previous_state": "completed",
+        "candidate_round": 1,
+        "next_candidate_round": 2,
+        "revision_candidate_id": re_candidate["candidate_id"],
+        "revision_result_sha256": re_collection["result_sha256"],
+        "revision_preimage_sha256": preimage_sha256,
+        "command_sha256": command_sha,
+        "task_argv_sha256": _task_argv_sha256(task_argv),
+        "task_host": host,
+        "task_cwd": cwd,
+    }
+    intents = dict(manifest.get("task_start_intents", {}))
+    intents["writer_handoff"] = intent
+    manifest["task_start_intents"] = intents
+    _append_workspace_event(
+        manifest,
+        "candidate_revision_start_intent",
+        role="writer",
+        outcome="persisted",
+        evidence={
+            "attempt": 2,
+            "candidate_id": re_candidate["candidate_id"],
+            "result_sha256": re_collection["result_sha256"],
+            "preimage_sha256": preimage_sha256,
+            "command_sha256": command_sha,
+            "task_argv_sha256": intent["task_argv_sha256"],
+        },
+    )
+    _write_manifest(manifest)
+    started = tasks.grabowski_task_start(
+        host=host,
+        argv=task_argv,
+        cwd=cwd,
+        runtime_seconds=int(manifest["resources"]["runtime_seconds"]),
+        resume_policy="never",
+        cpu_weight=100,
+        io_weight=100,
+        memory_max_bytes=manifest["resources"]["memory_max_bytes"],
+        resource_keys=None,
+        chronik_outbox=True,
+    )
+    public = _validate_started_task(
+        started.get("task") if isinstance(started, dict) else None,
+        role="writer",
+        expected_host=host,
+        expected_argv=task_argv,
+        expected_cwd=cwd,
+    )
+    return _bind_writer_handoff_attempt(
+        manifest,
+        attempts=attempts,
+        effective=effective,
+        previous_state="completed",
+        command=command,
+        task_argv=task_argv,
+        public=public,
+        output=output,
+        launch_nonce=launch_nonce,
+        reconciled=False,
+        actor="candidate_revision",
+        revision={
+            "collection": re_collection,
+            "candidate": re_candidate,
+            "preimage_sha256": preimage_sha256,
+        },
     )
 
 
 @mcp.tool(name="grabowski_agent_workspace_writer_handoff", annotations=MUTATING)
 def grabowski_agent_workspace_writer_handoff(workspace_id: str, replacement_argv: list[str]) -> dict[str, Any]:
-    """Start one operator-bound replacement writer after a proven terminal failure."""
+    """Start one bounded writer attempt after terminal failure or one verified NEEDS_CHANGE Candidate."""
     operator._require_operator_mutation("durable_job")
     operator._require_operator_mutation("git_cli")
     operator._require_operator_capability("resource_lease")
@@ -8375,7 +9219,11 @@ def grabowski_agent_workspace_writer_handoff(workspace_id: str, replacement_argv
         except Exception as exc:
             return {"workspace_id": identifier, "state": "writer_attempt_binding_invalid", "error": _error_summary(exc), "handoff_status": "blocked"}
         if final > 1:
-            if final == 2 and effective.get("actor") == "operator_handoff" and effective.get("command_sha256") == command_sha:
+            if (
+                final == 2
+                and effective.get("actor") in {"operator_handoff", "candidate_revision"}
+                and effective.get("command_sha256") == command_sha
+            ):
                 writer = _task_public(str(effective["task_id"]))
                 binding_reasons = _writer_task_binding_reasons(
                     manifest, effective, writer
@@ -8391,12 +9239,29 @@ def grabowski_agent_workspace_writer_handoff(workspace_id: str, replacement_argv
                     }
                 return {
                     "workspace_id": identifier,
-                    "state": "writer_handoff_already_started",
+                    "state": (
+                        "writer_revision_already_started"
+                        if effective.get("actor") == "candidate_revision"
+                        else "writer_handoff_already_started"
+                    ),
                     "attempt": 2,
                     "task": writer,
+                    "attempt_record": _writer_attempt_refs(manifest)[-1],
                     "handoff_status": "idempotent",
                 }
-            return {"workspace_id": identifier, "state": "writer_handoff_limit_reached", "handoff_status": "blocked"}
+            return {
+                "workspace_id": identifier,
+                "state": "writer_handoff_limit_reached",
+                "handoff_status": "blocked",
+            }
+        collection_value = manifest.get("collection")
+        if isinstance(collection_value, dict) and collection_value.get("state") == "complete":
+            return _candidate_revision_handoff(
+                manifest,
+                attempts=attempts,
+                effective=effective,
+                command=command,
+            )
         writer = _task_public(str(effective["task_id"]))
         intents_value = manifest.get("task_start_intents", {})
         if not isinstance(intents_value, dict):

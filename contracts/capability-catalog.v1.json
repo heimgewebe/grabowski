@@ -2293,7 +2293,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Start one operator-bound replacement writer after a proven terminal failure.",
+      "description": "Start one bounded writer attempt after terminal failure or one verified NEEDS_CHANGE Candidate.",
       "effects": [
         "task-start",
         "receipt-create",
