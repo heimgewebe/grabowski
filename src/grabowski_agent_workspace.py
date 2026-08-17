@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
@@ -3205,6 +3206,82 @@ def _safe_untracked_file(root: Path, relative: PurePosixPath) -> Path:
     return resolved
 
 
+def _untracked_file_fingerprint(
+    root: Path, relative: PurePosixPath
+) -> dict[str, Any]:
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise AgentWorkspaceActionError("git returned an unsafe untracked path")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    root_fd = -1
+    current_fd = -1
+    file_fd = -1
+    try:
+        root_fd = os.open(root, directory_flags)
+        current_fd = root_fd
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise AgentWorkspaceActionError(
+                f"untracked path is not a regular file: {relative}"
+            )
+        if before.st_nlink != 1:
+            raise AgentWorkspaceActionError(
+                f"untracked file may not be hardlinked: {relative}"
+            )
+        if before.st_uid != os.getuid() or before.st_size > MAX_UNTRACKED_FILE_BYTES:
+            raise AgentWorkspaceActionError(
+                f"untracked file exceeds safety boundary: {relative}"
+            )
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := os.read(file_fd, 1024 * 1024):
+            total += len(chunk)
+            if total > MAX_UNTRACKED_FILE_BYTES:
+                raise AgentWorkspaceActionError(
+                    f"untracked file exceeds safety boundary: {relative}"
+                )
+            digest.update(chunk)
+        after = os.fstat(file_fd)
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_size")
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise AgentWorkspaceActionError(
+                f"untracked file changed while hashing: {relative}"
+            )
+        if total != before.st_size:
+            raise AgentWorkspaceActionError(
+                f"untracked file size changed while hashing: {relative}"
+            )
+        return {
+            "path": relative.as_posix(),
+            "size": total,
+            "sha256": digest.hexdigest(),
+        }
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise AgentWorkspaceActionError(
+                f"untracked path crosses a symlink: {relative}"
+            ) from exc
+        raise AgentWorkspaceActionError(
+            f"untracked path is not stable: {relative}"
+        ) from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 def _writer_create_identity(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, Any]:
     worktree = Path(str(manifest["writer_worktree"]))
     if not worktree.is_dir() or _repo_top(runner, worktree) != worktree:
@@ -3540,15 +3617,11 @@ def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, 
         if not raw:
             continue
         relative = PurePosixPath(os.fsdecode(raw))
-        target = _safe_untracked_file(worktree, relative)
-        metadata = target.stat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_UNTRACKED_FILE_BYTES:
-            raise AgentWorkspaceActionError(f"untracked file exceeds safety boundary: {relative}")
-        total += metadata.st_size
+        fingerprint = _untracked_file_fingerprint(worktree, relative)
+        total += int(fingerprint["size"])
         if total > MAX_UNTRACKED_TOTAL_BYTES:
             raise AgentWorkspaceActionError("untracked files exceed aggregate safety boundary")
-        digest_value = hashlib.sha256(target.read_bytes()).hexdigest()
-        untracked.append({"path": relative.as_posix(), "size": metadata.st_size, "sha256": digest_value})
+        untracked.append(fingerprint)
     changed = sorted(
         {
             os.fsdecode(raw)

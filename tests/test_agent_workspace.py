@@ -4,7 +4,7 @@ import hashlib
 import inspect
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
@@ -9054,6 +9054,28 @@ class AgentWorkspaceTests(unittest.TestCase):
         prepare.assert_not_called()
         execute_drift.assert_not_called()
         self.assertFalse(drift_output.exists())
+
+    def test_untracked_fingerprint_rejects_symlink_and_hardlink_aliases(self) -> None:
+        manifest = self.manifest()
+        root = self.git.writer
+        outside = root / "outside-source.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        symlink = root / "src" / "alias.py"
+        symlink.symlink_to(outside)
+        relative = PurePosixPath("src/alias.py")
+        with self.assertRaises(workspace.AgentWorkspaceActionError):
+            workspace._untracked_file_fingerprint(root, relative)
+        with self.assertRaises(RuntimeError):
+            writer._untracked_file_fingerprint(root, relative)
+        symlink.unlink()
+
+        source = root / "src" / "source.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        os.link(source, symlink)
+        with self.assertRaises(workspace.AgentWorkspaceActionError):
+            workspace._untracked_file_fingerprint(root, relative)
+        with self.assertRaises(RuntimeError):
+            writer._untracked_file_fingerprint(root, relative)
 
     def test_candidate_revision_starts_round_two_with_exact_preimage_and_archives_round_one(self) -> None:
         lane, manifest, collection, candidate, snapshot, writer_task = (

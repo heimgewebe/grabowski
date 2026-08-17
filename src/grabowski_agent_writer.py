@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -64,7 +65,9 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
     return bytes(completed.stdout)
 
 
-def _safe_untracked_file(repo: Path, relative: PurePosixPath) -> Path:
+def _untracked_file_fingerprint(
+    repo: Path, relative: PurePosixPath
+) -> dict[str, Any]:
     if (
         relative.is_absolute()
         or not relative.parts
@@ -72,21 +75,58 @@ def _safe_untracked_file(repo: Path, relative: PurePosixPath) -> Path:
         or relative.parts[0] == ".git"
     ):
         raise RuntimeError(f"invalid untracked writer path: {relative}")
-    target = repo.joinpath(*relative.parts)
-    metadata = target.lstat()
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or metadata.st_uid != os.getuid()
-    ):
-        raise RuntimeError(f"unsafe untracked writer file: {relative}")
-    resolved = target.resolve(strict=True)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    root_fd = os.open(repo, directory_flags)
+    current_fd = root_fd
+    file_fd = -1
     try:
-        resolved.relative_to(repo)
-    except ValueError as exc:
-        raise RuntimeError(f"untracked writer file escapes worktree: {relative}") from exc
-    return target
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"untracked writer path is not a regular file: {relative}")
+        if before.st_nlink != 1:
+            raise RuntimeError(f"untracked writer file may not be hardlinked: {relative}")
+        if before.st_uid != os.getuid() or before.st_size > MAX_UNTRACKED_FILE_BYTES:
+            raise RuntimeError(f"unsafe untracked writer file: {relative}")
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := os.read(file_fd, 1024 * 1024):
+            total += len(chunk)
+            if total > MAX_UNTRACKED_FILE_BYTES:
+                raise RuntimeError(
+                    f"untracked writer file exceeds safety boundary: {relative}"
+                )
+            digest.update(chunk)
+        after = os.fstat(file_fd)
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_size")
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise RuntimeError(f"untracked writer file changed while hashing: {relative}")
+        if total != before.st_size:
+            raise RuntimeError(f"untracked writer file size changed while hashing: {relative}")
+        return {
+            "path": relative.as_posix(),
+            "size": total,
+            "sha256": digest.hexdigest(),
+        }
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RuntimeError(f"untracked writer path crosses a symlink: {relative}") from exc
+        raise RuntimeError(f"untracked writer path is not stable: {relative}") from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
 
 
 def _dirty_preimage_sha256(repo: Path, base_head: str, head: str, branch: str) -> str:
@@ -103,20 +143,11 @@ def _dirty_preimage_sha256(repo: Path, base_head: str, head: str, branch: str) -
         if not raw:
             continue
         relative = PurePosixPath(os.fsdecode(raw))
-        target = _safe_untracked_file(repo, relative)
-        metadata = target.stat()
-        if metadata.st_size > MAX_UNTRACKED_FILE_BYTES:
-            raise RuntimeError(f"untracked writer file exceeds safety boundary: {relative}")
-        total += metadata.st_size
+        fingerprint = _untracked_file_fingerprint(repo, relative)
+        total += int(fingerprint["size"])
         if total > MAX_UNTRACKED_TOTAL_BYTES:
             raise RuntimeError("untracked writer files exceed aggregate safety boundary")
-        untracked.append(
-            {
-                "path": relative.as_posix(),
-                "size": metadata.st_size,
-                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-            }
-        )
+        untracked.append(fingerprint)
     return _digest(
         {
             "base_head": base_head,
