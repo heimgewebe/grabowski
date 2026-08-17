@@ -5580,14 +5580,31 @@ def grabowski_resource_acquire(
         metadata=metadata,
         nonconflict_proof=nonconflict_proof,
     )
+    audited_resource_keys = [item["resource_key"] for item in result["leases"]]
+    resource_index_by_key = {
+        resource_key: index for index, resource_key in enumerate(audited_resource_keys)
+    }
+    reclamation_evidence = [
+        {
+            "resource_index": resource_index_by_key[item["resource_key"]],
+            "previous_owner_id": item["previous_owner_id"],
+            "previous_expires_at_unix": item["previous_expires_at_unix"],
+        }
+        for item in result["reclaimed"]
+    ]
     base._append_audit(
         {
             "timestamp_unix": _now(),
             "operation": "resource-acquire",
             "owner_id": result["owner_id"],
-            "resource_keys": [item["resource_key"] for item in result["leases"]],
+            "resource_keys": audited_resource_keys,
             "expires_at_unix": result["expires_at_unix"],
-            "reclaimed_count": len(result["reclaimed"]),
+            "reclaimed_count": len(reclamation_evidence),
+            **(
+                {"reclamation_evidence": reclamation_evidence}
+                if reclamation_evidence
+                else {}
+            ),
             "bureau_contract": result.get("bureau_contract"),
             "nonconflict_exception": result.get("nonconflict_exception"),
             "merge_guard_nonconflicts": result["merge_guard_nonconflicts"],
