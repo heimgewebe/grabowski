@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "39df47409bc1dd6325b6549f950383cfc18a37a3a13d74652d19665df4783b80"
+    "sha256": "112532bf69ce8224157ae2c153a1d0beb3bc55035b97d8cc6ae33c3f1d53ef6f"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "ac08a9a3fb5f8601c24e82c834b085a0dc0da5611af52fd1961bd1c7b654dc1f"
+    "sha256": "07912f3b1a5087e54c53c678a916835f623eb44fd7d8116a190dfe22abbab955"
   },
   "counts": {
     "core": 22,
-    "full": 197,
-    "operator": 182
+    "full": 196,
+    "operator": 181
   },
   "profiles": {
     "core": [
@@ -215,7 +215,6 @@
       "grabowski_agent_workspace_status",
       "grabowski_agent_workspace_attach",
       "grabowski_agent_workspace_collect",
-      "grabowski_agent_workspace_adopt",
       "grabowski_agent_workspace_role_retry",
       "grabowski_agent_workspace_writer_handoff",
       "grabowski_agent_workspace_close",
@@ -399,7 +398,6 @@
       "grabowski_agent_workspace_status",
       "grabowski_agent_workspace_attach",
       "grabowski_agent_workspace_collect",
-      "grabowski_agent_workspace_adopt",
       "grabowski_agent_workspace_role_retry",
       "grabowski_agent_workspace_writer_handoff",
       "grabowski_agent_workspace_close",

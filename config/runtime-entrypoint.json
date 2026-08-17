@@ -177,7 +177,6 @@
     "grabowski_agent_workspace_status",
     "grabowski_agent_workspace_attach",
     "grabowski_agent_workspace_collect",
-    "grabowski_agent_workspace_adopt",
     "grabowski_agent_workspace_role_retry",
     "grabowski_agent_workspace_writer_handoff",
     "grabowski_agent_workspace_close",
