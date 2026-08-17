@@ -239,7 +239,27 @@ P4 implementiert ausdrücklich **nicht**:
 - automatische Multi-Writer-Konkurrenz;
 - P5-Delivery oder Outcome-Learning.
 
-## 13. Invarianten
+## 13. P5 controller-owned `integration_ready`
+
+P5 beginnt bewusst nicht mit einer universellen Orchestrierung, sondern mit einer begrenzten Controller-Komposition auf den bereits vorhandenen P1-P4-Receipts. Der erste Integrations-Slice startet bei einem **geschlossenen, lane-backed und vollständig `PASS`-verifizierten Candidate**. Die davorliegende autonome Kette `status -> collect -> gegebenenfalls Revision -> close` bleibt ein separater interner P5a-Slice und erzeugt keine konkurrierende Integrationsautorität.
+
+- Der Grip `candidate-integration-ready` ist eine Operation hinter der bestehenden Grip-Oberfläche und **kein neuer öffentlicher MCP-Toolname**. Er akzeptiert Workspace-ID, exakte Candidate-/Collection-Digests sowie PR-Basis und PR-Metadaten; Repository, Work-Branch und Integrations-Commit werden ausschließlich aus der unveränderlichen Workspace-/Lane-/Adoption-Evidenz abgeleitet. Der Caller kann diese Git-Ziele nicht überschreiben.
+- Zuerst wird ausschließlich der aktuelle `PASS`-Candidate über den bestehenden P3-Adoption-Pfad in Controller-Custody übernommen. Ein unklarer Adoptionseffekt beendet den Lauf mit `reconcile_required`; es gibt keinen Blind-Retry.
+- Nach erfolgreicher Adoption wird die Source Work Lane mit frischer Task-, Prozess-, Lease- und Git-Liveness revisionsgebunden als `candidate_adopted` terminalisiert. Damit endet Writer-Autorität vor PR/CI/Merge. Die bereits vorhandenen Lane-Leases dürfen danach nur noch kurz als Koordinationsschutz für die unmittelbar folgende Controller-Publikation gehalten werden.
+- Die Publikation erfindet keine neuen Git-/GitHub-Schreibpfade: Sie verwendet `branch-publish` und `pr-create-or-update` mit dem exakten Adoption-Commit. Ein bereits exakt publizierter Remote-Head wird nach Readback nicht erneut gepusht. Ein bereits exakt offener, nicht-draftiger PR wird ebenfalls nur gelesen und wiederverwendet.
+- Nach exaktem PR-Readback werden die unveränderten Source-Lane-Leases über den bestehenden auditierten, snapshot-gebundenen Resource-Release freigegeben. Scheitert nur diese Hygiene, bleibt `integration_ready=true`, aber `cleanup_complete=false` und der Receipt fordert gezielten Lease-Readback statt die Publikationswirkung zu wiederholen.
+- `integration_ready` ist eine **abgeleitete Projektion** aus CandidateAdoptionReceipt, terminaler Source-Lane-Evidenz, exaktem Remote-Head, exaktem ready PR und Lease-Cleanup. Es entsteht kein zusätzlicher Candidate-, Lane- oder Delivery-StateStore.
+- Push-/PR-Unklarheit hält die Koordinationsleases und liefert eine benannte Reconcile-Aktion. Ein exakter Remote-Readback nach einem früheren Push erlaubt die Fortsetzung beim fehlenden PR, ohne denselben Push erneut auszulösen.
+
+Dieser P5-Slice implementiert ausdrücklich noch nicht:
+
+- Merge oder Deployment; beides bleibt eine spätere Controllerwirkung nach CI/Review;
+- einen universellen Scheduler, eine Queue oder einen zweiten StateStore;
+- automatische Multi-Writer-Konkurrenz;
+- Writer-Commit/Push/PR-Autorität des `effect_profile=delivery`; das gehört in P6;
+- Outcome-Learning; das bleibt P7.
+
+## 14. Invarianten
 
 P0 gilt nur dann als korrekt, wenn für dieselben Routingfacts kein öffentliches Interface gleichzeitig behauptet:
 
