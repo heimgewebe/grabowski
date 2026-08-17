@@ -104,8 +104,14 @@ class BrowserBidiShadowMatrixContractTests(unittest.TestCase):
                 firefox_websocket_port=9502,
                 work_root=Path('/tmp'),
                 reference=matrix.shadow.DEFAULT_REFERENCE,
+                reference_receipt_sha256='a' * 64,
                 repetitions=matrix.MAX_REPETITIONS + 1,
             )
+
+    def test_reference_receipt_sha256_is_fail_closed(self) -> None:
+        with self.assertRaisesRegex(matrix.shadow.BidiShadowError, 'receipt sha256'):
+            matrix._validate_reference_receipt_sha256('not-a-receipt')
+        self.assertEqual(matrix._validate_reference_receipt_sha256('a' * 64), 'a' * 64)
 
 
 class BrowserBidiShadowMatrixRunTests(unittest.TestCase):
@@ -156,6 +162,7 @@ class BrowserBidiShadowMatrixRunTests(unittest.TestCase):
                 firefox_websocket_port=9502,
                 work_root=Path('/tmp'),
                 reference=matrix.shadow.DEFAULT_REFERENCE,
+                reference_receipt_sha256='b' * 64,
                 repetitions=3,
             )
         self.assertEqual(report['state'], 'passed')
@@ -175,7 +182,12 @@ class BrowserBidiShadowMatrixRunTests(unittest.TestCase):
         self.assertFalse(report['retry_authorized'])
         self.assertIn('performance_superiority', report['does_not_establish'])
         self.assertEqual(report['reference']['transport'], 'chrome-cdp')
-        self.assertEqual(report['reference']['source'], 'caller-supplied')
+        self.assertEqual(report['reference']['source'], 'external-receipt-bound')
+        self.assertEqual(report['reference']['receipt_sha256'], 'b' * 64)
+        self.assertIn(
+            'semantic_reference_receipt_correspondence_without_external_verifier',
+            report['does_not_establish'],
+        )
 
     def test_chrome_run_cleans_session_and_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

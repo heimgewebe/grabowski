@@ -31,6 +31,23 @@ SCHEMA_VERSION = 1
 MAX_REPETITIONS = 5
 
 
+def _validate_reference_receipt_sha256(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise shadow.BidiShadowError("reference receipt sha256 is invalid")
+    return value
+
+
+def _reference_receipt(value: str) -> str:
+    try:
+        return _validate_reference_receipt_sha256(value)
+    except shadow.BidiShadowError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _reference(value: str) -> dict[str, Any]:
     try:
         document = json.loads(value)
@@ -312,12 +329,16 @@ def run_shadow_matrix(
     firefox_websocket_port: int,
     work_root: Path,
     reference: dict[str, Any],
+    reference_receipt_sha256: str,
     repetitions: int = 3,
     html: str = shadow.DEFAULT_HTML,
 ) -> dict[str, Any]:
     if isinstance(repetitions, bool) or not 1 <= repetitions <= MAX_REPETITIONS:
         raise shadow.BidiShadowError(f"repetitions must be between 1 and {MAX_REPETITIONS}")
     reference = shadow.normalize_semantic_observation(reference)
+    reference_receipt_sha256 = _validate_reference_receipt_sha256(
+        reference_receipt_sha256
+    )
     base_ports = {chrome_http_port, firefox_http_port, firefox_websocket_port}
     if len(base_ports) != 3:
         raise shadow.BidiShadowError("matrix base ports must be distinct")
@@ -362,7 +383,8 @@ def run_shadow_matrix(
         "state": "passed",
         "reference": {
             "transport": "chrome-cdp",
-            "source": "caller-supplied",
+            "source": "external-receipt-bound",
+            "receipt_sha256": reference_receipt_sha256,
             "semantic_sha256": semantic_sha256,
         },
         "repetitions": repetitions,
@@ -374,7 +396,7 @@ def run_shadow_matrix(
         "retry_authorized": False,
         "timing_comparison_is_advisory": True,
         "does_not_establish": [
-            "reference_provenance_without_external_receipt",
+            "semantic_reference_receipt_correspondence_without_external_verifier",
             "production_backend_promotion",
             "performance_superiority",
             "external_effect_correctness",
@@ -401,6 +423,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--firefox-websocket-port", type=int, required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--reference-json", type=_reference, required=True)
+    parser.add_argument(
+        "--reference-receipt-sha256", type=_reference_receipt, required=True
+    )
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--html", default=shadow.DEFAULT_HTML)
     return parser
@@ -422,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
                 firefox_websocket_port=args.firefox_websocket_port,
                 work_root=args.work_root,
                 reference=args.reference_json,
+                reference_receipt_sha256=args.reference_receipt_sha256,
                 repetitions=args.repetitions,
                 html=args.html,
             )
