@@ -68,6 +68,13 @@ class WatchdogHostAssetProjection:
 
 TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
+OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
+PRIVILEGED_BROKER_SOCKET = Path("/run/grabowski/privileged-broker.sock")
+PRIVILEGED_REFERENCE_TTL_SECONDS = 300
+PRIVILEGED_RESPONSE_MAX_BYTES = 512 * 1024
+OPERATOR_AUTHORITY_ATTESTATION_PATH = Path(
+    "/var/lib/grabowski/operator-authority-attestation.v1.json"
+)
 TRANSPORT_INGRESS_SERVICE = "grabowski-transport-ingress.service"
 SAFETY_OBSERVER_SERVICE = "grabowski-safety-observer.service"
 SAFETY_OBSERVER_UNIT_RELATIVE = Path("systemd/grabowski-safety-observer.service.example")
@@ -2526,11 +2533,100 @@ def require_topology_matches_contract(
     verify_operator_unit_entrypoint(runtime, contract)
 
 
-def observe_service(unit: str) -> core.ServiceObservation:
-    result = core.run(
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _operator_service_control_reference(action: str) -> dict[str, Any]:
+    if action not in {"start", "stop", "restart", "is-active"}:
+        core.fail("Unzulässige Operator-Systemdienst-Aktion")
+    now = int(time.time())
+    reference: dict[str, Any] = {
+        "schema_version": 1,
+        "execution": "unprivileged-reference-only",
+        "may_execute": False,
+        "requires_external_privileged_agent": True,
+        "replay_policy": "single-use-external-broker",
+        "action": OPERATOR_SERVICE_CONTROL_ACTION,
+        "target": action,
+        "justification": "Blue-green canonical operator system-service control",
+        "request_id": secrets.token_hex(16),
+        "created_at_unix": now,
+        "expires_at_unix": now + PRIVILEGED_REFERENCE_TTL_SECONDS,
+    }
+    reference["reference_sha256"] = _canonical_sha256(reference)
+    return reference
+
+
+def _operator_system_service_control(action: str) -> dict[str, Any]:
+    reference = _operator_service_control_reference(action)
+    payload = (
+        json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(
+                max(core.TIMEOUTS["service_start"], core.TIMEOUTS["service_stop"])
+                + 15
+            )
+            client.connect(str(PRIVILEGED_BROKER_SOCKET))
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > PRIVILEGED_RESPONSE_MAX_BYTES:
+                    core.fail("Rootbroker-Service-Control-Antwort überschreitet das Limit")
+                chunks.append(chunk)
+    except (OSError, TimeoutError) as exc:
+        core.fail(
+            "Rootbroker-Service-Control ist nicht beobachtbar",
+            details={"error": type(exc).__name__},
+        )
+    try:
+        response = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        core.fail("Rootbroker-Service-Control lieferte keine gültige Antwort")
+    if (
+        not isinstance(response, dict)
+        or response.get("action") != OPERATOR_SERVICE_CONTROL_ACTION
+        or response.get("request_id") != reference["request_id"]
+        or response.get("returncode") != 0
+        or response.get("timed_out") is not False
+    ):
+        core.fail(
+            "Rootbroker-Service-Control schlug fehl",
+            details={
+                "action": action,
+                "returncode": (
+                    response.get("returncode") if isinstance(response, dict) else None
+                ),
+            },
+        )
+    return {
+        "action": action,
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+    }
+
+
+def _service_show_argv(unit: str) -> list[str]:
+    argv = ["systemctl"]
+    if unit != OPERATOR_SERVICE:
+        argv.append("--user")
+    argv.extend(
         [
-            "systemctl",
-            "--user",
             "show",
             unit,
             "-p",
@@ -2542,7 +2638,14 @@ def observe_service(unit: str) -> core.ServiceObservation:
             "-p",
             "MainPID",
             "--no-pager",
-        ],
+        ]
+    )
+    return argv
+
+
+def observe_service(unit: str) -> core.ServiceObservation:
+    result = core.run(
+        _service_show_argv(unit),
         capture=True,
         check=False,
         timeout=core.TIMEOUTS["systemd_query"],
@@ -2662,7 +2765,6 @@ def operator_unit_argv() -> list[str]:
     result = core.run(
         [
             "systemctl",
-            "--user",
             "show",
             OPERATOR_SERVICE,
             "--no-pager",
@@ -2764,8 +2866,12 @@ def require_operator_listener(
 
 
 def journal_tail(unit: str) -> str:
+    argv = ["journalctl"]
+    if unit != OPERATOR_SERVICE:
+        argv.append("--user")
+    argv.extend(["-u", unit, "-n", "40", "--no-pager"])
     result = core.run(
-        ["journalctl", "--user", "-u", unit, "-n", "40", "--no-pager"],
+        argv,
         check=False,
         capture=True,
         timeout=core.TIMEOUTS["journal"],
@@ -3969,12 +4075,18 @@ def verify_tunnel_drain_final_guard(
 
 
 def stop_service(unit: str) -> core.ServiceObservation:
-    result = core.run(
-        ["systemctl", "--user", "stop", unit],
-        check=False,
-        capture=True,
-        timeout=core.TIMEOUTS["service_stop"],
-    )
+    if unit == OPERATOR_SERVICE:
+        control = _operator_system_service_control("stop")
+        stop_returncode = 0
+    else:
+        result = core.run(
+            ["systemctl", "--user", "stop", unit],
+            check=False,
+            capture=True,
+            timeout=core.TIMEOUTS["service_stop"],
+        )
+        control = None
+        stop_returncode = result.returncode
     observation = wait_for_service(
         unit,
         active=False,
@@ -3984,22 +4096,26 @@ def stop_service(unit: str) -> core.ServiceObservation:
         core.fail(
             f"{unit} wurde nach Stopversuch nicht bestätigt inaktiv",
             details={
-                "stop_returncode": result.returncode,
+                "stop_returncode": stop_returncode,
                 "service": observation.to_dict(),
+                "operator_service_control": control,
             },
         )
     return observation
 
 
 def start_service(unit: str) -> core.ServiceObservation:
-    result = core.run(
-        ["systemctl", "--user", "start", unit],
-        check=False,
-        capture=True,
-        timeout=core.TIMEOUTS["service_start"],
-    )
-    if result.returncode != 0:
-        core.fail(f"{unit} konnte nicht gestartet werden")
+    if unit == OPERATOR_SERVICE:
+        _operator_system_service_control("start")
+    else:
+        result = core.run(
+            ["systemctl", "--user", "start", unit],
+            check=False,
+            capture=True,
+            timeout=core.TIMEOUTS["service_start"],
+        )
+        if result.returncode != 0:
+            core.fail(f"{unit} konnte nicht gestartet werden")
     observation = wait_for_service(
         unit,
         active=True,
@@ -4191,6 +4307,260 @@ def rollback_url(
 
 
 
+def _canonical_line_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _read_root_owned_public_json(
+    path: Path, *, maximum_bytes: int = 64 * 1024
+) -> dict[str, Any]:
+    try:
+        linked = path.lstat()
+    except OSError as exc:
+        core.fail(
+            "Operator-Authority-Attestation fehlt; zuerst Rootbroker-Cutover ausführen",
+            phase="operator-authority-attestation",
+            details={"path": str(path), "error": type(exc).__name__},
+        )
+    if (
+        path.is_symlink()
+        or not statmod.S_ISREG(linked.st_mode)
+        or linked.st_nlink != 1
+        or linked.st_uid != 0
+        or linked.st_gid != 0
+        or statmod.S_IMODE(linked.st_mode) != 0o644
+    ):
+        core.fail(
+            "Operator-Authority-Attestation hat unsichere Ownership/Rechte",
+            phase="operator-authority-attestation",
+        )
+    for parent in path.parents:
+        parent_meta = parent.lstat()
+        if (
+            not statmod.S_ISDIR(parent_meta.st_mode)
+            or parent_meta.st_uid != 0
+            or parent_meta.st_mode & 0o022
+        ):
+            core.fail(
+                "Operator-Authority-Attestation hat unsicheren Elternpfad",
+                phase="operator-authority-attestation",
+                details={"parent": str(parent)},
+            )
+        if parent == Path("/"):
+            break
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_mode != linked.st_mode
+            or opened.st_uid != linked.st_uid
+            or opened.st_gid != linked.st_gid
+            or opened.st_nlink != linked.st_nlink
+            or opened.st_size <= 0
+            or opened.st_size > maximum_bytes
+        ):
+            core.fail(
+                "Operator-Authority-Attestation driftete beim Öffnen",
+                phase="operator-authority-attestation",
+            )
+        data = os.read(descriptor, maximum_bytes + 1)
+        if len(data) != opened.st_size or len(data) > maximum_bytes or os.read(descriptor, 1):
+            core.fail(
+                "Operator-Authority-Attestation hat ungültige Größe",
+                phase="operator-authority-attestation",
+            )
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+            after.st_ctime_ns, after.st_mode, after.st_uid, after.st_gid,
+            after.st_nlink
+        ) != (
+            opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns,
+            opened.st_ctime_ns, opened.st_mode, opened.st_uid, opened.st_gid,
+            opened.st_nlink
+        ):
+            core.fail(
+                "Operator-Authority-Attestation driftete während des Lesens",
+                phase="operator-authority-attestation",
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        core.fail(
+            "Operator-Authority-Attestation ist kein gültiges JSON",
+            phase="operator-authority-attestation",
+        )
+    if not isinstance(value, dict):
+        core.fail(
+            "Operator-Authority-Attestation ist kein Objekt",
+            phase="operator-authority-attestation",
+        )
+    return value
+
+
+def require_operator_authority_anchored(
+    repo: Path,
+    expected_head: str,
+    *,
+    path: Path = OPERATOR_AUTHORITY_ATTESTATION_PATH,
+) -> dict[str, Any]:
+    attestation = _read_root_owned_public_json(path)
+    required = {
+        "schema_version",
+        "kind",
+        "expected_head",
+        "cutover_receipt_sha256",
+        "config_sha256",
+        "artifact_sha256",
+        "action_sha256",
+        "power_peer_binding",
+        "operator_system_unit",
+        "does_not_establish",
+        "attestation_sha256",
+    }
+    if (
+        set(attestation) != required
+        or attestation.get("schema_version") != 1
+        or attestation.get("kind") != "grabowski_operator_authority_attestation"
+        or attestation.get("expected_head") != expected_head
+    ):
+        core.fail(
+            "Operator-Authority-Attestation passt nicht zum Ziel-Commit",
+            phase="operator-authority-attestation",
+            details={
+                "expected_head": expected_head,
+                "observed_head": attestation.get("expected_head"),
+            },
+        )
+    self_hash = attestation.get("attestation_sha256")
+    unsigned = dict(attestation)
+    unsigned.pop("attestation_sha256")
+    if self_hash != _canonical_line_sha256(unsigned):
+        core.fail(
+            "Operator-Authority-Attestation Selbsthash ist ungültig",
+            phase="operator-authority-attestation",
+        )
+    for key in ("cutover_receipt_sha256", "config_sha256"):
+        value = attestation.get(key)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        ):
+            core.fail(
+                "Operator-Authority-Attestation enthält ungültigen Digest",
+                phase="operator-authority-attestation",
+                details={"field": key},
+            )
+
+    relative_artifacts = {
+        "broker_module": Path("src/grabowski_privileged_broker.py"),
+        "broker_wrapper": Path("tools/grabowski_privileged_broker.py"),
+        "cutover_helper": Path("tools/grabowski_rootbroker_cutover.py"),
+        "operator_service": Path("systemd/grabowski-operator.service.example"),
+    }
+    observed_artifacts = attestation.get("artifact_sha256")
+    if not isinstance(observed_artifacts, dict) or set(observed_artifacts) != set(relative_artifacts):
+        core.fail(
+            "Operator-Authority-Attestation Artefaktbindung ist unvollständig",
+            phase="operator-authority-attestation",
+        )
+    expected_artifacts = {
+        label: hashlib.sha256(
+            core.git_show(repo, expected_head, relative)
+        ).hexdigest()
+        for label, relative in relative_artifacts.items()
+    }
+    if observed_artifacts != expected_artifacts:
+        core.fail(
+            "Operator-Authority-Attestation bindet nicht die Ziel-Artefakte",
+            phase="operator-authority-attestation",
+        )
+
+    try:
+        config_blob = core.git_show(
+            repo, expected_head, Path("config/privileged-actions.example.json")
+        )
+        example = json.loads(config_blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        core.fail(
+            "Ziel-Commit besitzt keinen gültigen Privileged-Action-Vertrag",
+            phase="operator-authority-attestation",
+        )
+    actions = example.get("actions") if isinstance(example, dict) else None
+    if not isinstance(actions, dict):
+        core.fail(
+            "Ziel-Commit besitzt keinen Privileged-Action-Katalog",
+            phase="operator-authority-attestation",
+        )
+    lifecycle = actions.get("operator_blockade_marker_lifecycle")
+    service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
+    if not isinstance(lifecycle, dict) or not isinstance(service_control, dict):
+        core.fail(
+            "Ziel-Commit besitzt keinen vollständigen Operator-Authority-Vertrag",
+            phase="operator-authority-attestation",
+        )
+    expected_peer = {
+        "allowed_peer_uid": lifecycle.get("allowed_peer_uid"),
+        "allowed_peer_unit": lifecycle.get("allowed_peer_unit"),
+    }
+    if attestation.get("power_peer_binding") != expected_peer:
+        core.fail(
+            "Operator-Power-Peer-Bindung driftet vom Blockade-Vertrag",
+            phase="operator-authority-attestation",
+        )
+    observed_actions = attestation.get("action_sha256")
+    if not isinstance(observed_actions, dict) or set(observed_actions) != {
+        "operator_power_argv",
+        "operator_blockade_marker_lifecycle",
+        OPERATOR_SERVICE_CONTROL_ACTION,
+    }:
+        core.fail(
+            "Operator-Authority-Attestation Aktionsbindung ist unvollständig",
+            phase="operator-authority-attestation",
+        )
+    if (
+        observed_actions["operator_blockade_marker_lifecycle"]
+        != _canonical_line_sha256(lifecycle)
+        or observed_actions[OPERATOR_SERVICE_CONTROL_ACTION]
+        != _canonical_line_sha256(service_control)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(observed_actions["operator_power_argv"])
+        )
+        is None
+    ):
+        core.fail(
+            "Operator-Authority-Attestation Aktionsdigests stimmen nicht",
+            phase="operator-authority-attestation",
+        )
+    expected_system_unit = {
+        "unit": OPERATOR_SERVICE,
+        "fragment_path": "/etc/systemd/system/grabowski-operator.service",
+        "control_group": f"/system.slice/{OPERATOR_SERVICE}",
+        "run_uid": 1000,
+    }
+    if attestation.get("operator_system_unit") != expected_system_unit:
+        core.fail(
+            "Operator-Authority-Attestation Systemdienstbindung ist ungültig",
+            phase="operator-authority-attestation",
+        )
+    return attestation
+
+
 def _preflight_source_topology(
     repo: Path,
     runtime: Path,
@@ -4211,6 +4581,8 @@ def _preflight_source_topology(
     runtime = core.require_runtime_replaceable(runtime)
     topology = profile_topology(profile_path, runtime)
     require_topology_matches_contract(topology, runtime, snapshot.contract)
+    if topology.kind == "url":
+        require_operator_authority_anchored(repo, snapshot.repo_head)
     return snapshot, runtime, topology
 
 

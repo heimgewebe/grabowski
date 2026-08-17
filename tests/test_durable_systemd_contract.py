@@ -16,6 +16,17 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("--host 127.0.0.1 --port 18181", text)
         self.assertIn("Restart=on-failure", text)
         self.assertIn("KillMode=mixed", text)
+        self.assertIn("User=alex", text)
+        self.assertIn("Group=alex", text)
+        self.assertIn("WorkingDirectory=/home/alex", text)
+        self.assertIn("ExecStart=/home/alex/.local/share/grabowski-mcp/.venv/bin/python", text)
+        self.assertIn("Environment=HOME=/home/alex", text)
+        self.assertIn("Environment=XDG_RUNTIME_DIR=/run/user/1000", text)
+        self.assertIn(
+            "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", text
+        )
+        self.assertIn("WantedBy=multi-user.target", text)
+        self.assertNotIn("%h", text)
         self.assertNotIn("tunnel-client", text)
 
     def test_component_watchdogs_require_both_installed_python_assets(self) -> None:

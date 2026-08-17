@@ -32,11 +32,14 @@ CONFIG = Path("/etc/grabowski/privileged-actions.json")
 STATE = Path("/var/lib/grabowski/privileged-broker")
 AUDIT = STATE / "audit.jsonl"
 MAX_OUTPUT_BYTES = 250_000
+POWER_ACTION = "operator_power_argv"
+BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 RUN_USER_ROOT = Path("/run/user")
 MAX_PEER_CGROUP_PROCESSES = 256
 MAX_SYSTEMD_SHOW_BYTES = 16 * 1024
 SYSTEMCTL = "/usr/bin/systemctl"
+OPERATOR_UNIT_PATH = Path("/etc/systemd/system/grabowski-operator.service")
 SAFE_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
     "LANG": "C.UTF-8",
@@ -234,51 +237,7 @@ def _cgroup_processes(
     return processes
 
 
-def _operator_user_bus_environment(
-    uid: int,
-    gid: int,
-    *,
-    runtime_root: Path = RUN_USER_ROOT,
-) -> dict[str, str]:
-    runtime = runtime_root / str(uid)
-    bus = runtime / "bus"
-    try:
-        runtime_stat = runtime.lstat()
-        bus_stat = bus.lstat()
-    except OSError as exc:
-        raise PermissionError(
-            "blockade lifecycle operator user bus is unavailable"
-        ) from exc
-    if (
-        stat.S_ISLNK(runtime_stat.st_mode)
-        or not stat.S_ISDIR(runtime_stat.st_mode)
-        or runtime_stat.st_uid != uid
-        or runtime_stat.st_gid != gid
-        or stat.S_IMODE(runtime_stat.st_mode) != 0o700
-    ):
-        raise PermissionError(
-            "blockade lifecycle operator runtime directory is unsafe"
-        )
-    if (
-        stat.S_ISLNK(bus_stat.st_mode)
-        or not stat.S_ISSOCK(bus_stat.st_mode)
-        or bus_stat.st_uid != uid
-        or bus_stat.st_gid != gid
-    ):
-        raise PermissionError("blockade lifecycle operator user bus is unsafe")
-    return {
-        **SAFE_ENV,
-        "XDG_RUNTIME_DIR": str(runtime),
-        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
-    }
-
-
-def _operator_user_unit_identity(
-    uid: int,
-    unit: str,
-    *,
-    bus_environment: dict[str, str] | None = None,
-) -> dict[str, object]:
+def _operator_system_unit_identity(uid: int, unit: str) -> dict[str, object]:
     try:
         account = pwd.getpwuid(uid)
     except KeyError as exc:
@@ -287,20 +246,24 @@ def _operator_user_unit_identity(
     if (
         not username
         or len(username) > 64
-        or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in username)
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for character in username
+        )
     ):
         raise PermissionError("blockade lifecycle operator account is invalid")
     completed = subprocess.run(
         [
             SYSTEMCTL,
-            "--user",
-            f"--machine={username}@.host",
             "show",
             unit,
             "--property=MainPID",
             "--property=ControlGroup",
             "--property=ActiveState",
             "--property=SubState",
+            "--property=User",
+            "--property=FragmentPath",
             "--no-pager",
         ],
         cwd="/",
@@ -309,38 +272,56 @@ def _operator_user_unit_identity(
         stderr=subprocess.PIPE,
         timeout=5,
         check=False,
-        env=(
-            _operator_user_bus_environment(uid, account.pw_gid)
-            if bus_environment is None
-            else dict(bus_environment)
-        ),
+        env=SAFE_ENV,
     )
     if completed.returncode != 0 or len(completed.stdout) > MAX_SYSTEMD_SHOW_BYTES:
-        raise PermissionError("blockade lifecycle operator unit identity is unavailable")
+        raise PermissionError("blockade lifecycle operator system unit identity is unavailable")
     try:
         text = completed.stdout.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
-        raise PermissionError("blockade lifecycle operator unit identity is malformed") from exc
+        raise PermissionError("blockade lifecycle operator system unit identity is malformed") from exc
     values: dict[str, str] = {}
     for line in text.splitlines():
         key, separator, value = line.partition("=")
         if not separator or key in values:
-            raise PermissionError("blockade lifecycle operator unit identity is malformed")
+            raise PermissionError("blockade lifecycle operator system unit identity is malformed")
         values[key] = value
-    if set(values) != {"MainPID", "ControlGroup", "ActiveState", "SubState"}:
-        raise PermissionError("blockade lifecycle operator unit identity is incomplete")
+    required = {
+        "MainPID",
+        "ControlGroup",
+        "ActiveState",
+        "SubState",
+        "User",
+        "FragmentPath",
+    }
+    if set(values) != required:
+        raise PermissionError("blockade lifecycle operator system unit identity is incomplete")
     try:
         main_pid = int(values["MainPID"])
     except ValueError as exc:
         raise PermissionError("blockade lifecycle operator MainPID is invalid") from exc
     control_group = values["ControlGroup"]
+    fragment = Path(values["FragmentPath"])
     if (
         main_pid <= 1
-        or not control_group.startswith("/")
+        or not control_group.startswith("/system.slice/")
         or values["ActiveState"] != "active"
         or values["SubState"] != "running"
+        or values["User"] != username
+        or fragment != OPERATOR_UNIT_PATH
     ):
-        raise PermissionError("blockade lifecycle operator unit is not actively running")
+        raise PermissionError("blockade lifecycle operator system unit is not authoritative")
+    try:
+        fragment_meta = fragment.lstat()
+    except OSError as exc:
+        raise PermissionError("blockade lifecycle operator system unit fragment is unavailable") from exc
+    if (
+        fragment.is_symlink()
+        or not stat.S_ISREG(fragment_meta.st_mode)
+        or fragment_meta.st_uid != 0
+        or fragment_meta.st_mode & 0o022
+    ):
+        raise PermissionError("blockade lifecycle operator system unit fragment is unsafe")
     return {
         "main_pid": main_pid,
         "control_group": control_group,
@@ -348,7 +329,32 @@ def _operator_user_unit_identity(
         "sub_state": values["SubState"],
         "username": username,
         "home": account.pw_dir,
+        "fragment_path": str(fragment),
     }
+
+
+def _validate_system_cgroup_authority(
+    unified_path: str, *, cgroup_root: Path
+) -> None:
+    relative = Path(unified_path.lstrip("/"))
+    if not relative.parts or ".." in relative.parts:
+        raise PermissionError("blockade lifecycle operator system cgroup path is invalid")
+    target = cgroup_root / relative
+    try:
+        metadata = target.lstat()
+        procs = (target / "cgroup.procs").lstat()
+    except OSError as exc:
+        raise PermissionError("blockade lifecycle operator system cgroup is unavailable") from exc
+    if (
+        target.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & 0o022
+        or not stat.S_ISREG(procs.st_mode)
+        or procs.st_uid != 0
+        or procs.st_mode & 0o022
+    ):
+        raise PermissionError("blockade lifecycle operator system cgroup is not root-controlled")
 
 
 def _operator_expected_argv(home: str) -> tuple[str, ...]:
@@ -405,7 +411,7 @@ def _validate_blockade_lifecycle_peer(
     if not isinstance(expected_unit, str) or not expected_unit:
         raise PermissionError("blockade lifecycle peer unit is not configured")
     observed_unit = (
-        _operator_user_unit_identity(expected_uid, expected_unit)
+        _operator_system_unit_identity(expected_uid, expected_unit)
         if unit_identity is None
         else dict(unit_identity)
     )
@@ -423,6 +429,9 @@ def _validate_blockade_lifecycle_peer(
         or unified_path != systemd_control_group
     ):
         raise PermissionError("blockade lifecycle peer is outside the operator service")
+    _validate_system_cgroup_authority(
+        unified_path, cgroup_root=cgroup_root
+    )
     effective_expected_argv = (
         _operator_expected_argv(str(observed_unit.get("home", "")))
         if expected_argv is None
@@ -475,15 +484,8 @@ def _validate_blockade_lifecycle_peer(
     }
 
 
-def _lifecycle_audit_base(
-    reference: dict[str, object],
-    execution: dict[str, object],
-    started: float,
-    peer: dict[str, object],
-) -> dict[str, object]:
-    record = {
-        **_base_audit_record(reference, execution, started),
-        "lifecycle_operation": execution.get("operation"),
+def _operator_peer_audit_fields(peer: dict[str, object]) -> dict[str, object]:
+    return {
         "peer_pid": peer["pid"],
         "peer_uid": peer["uid"],
         "peer_gid": peer["gid"],
@@ -493,6 +495,19 @@ def _lifecycle_audit_base(
         "peer_cgroup_process_count": peer.get("cgroup_process_count"),
         "peer_systemd_main_pid": peer.get("systemd_main_pid"),
         "peer_systemd_control_group": peer.get("systemd_control_group"),
+    }
+
+
+def _lifecycle_audit_base(
+    reference: dict[str, object],
+    execution: dict[str, object],
+    started: float,
+    peer: dict[str, object],
+) -> dict[str, object]:
+    record = {
+        **_base_audit_record(reference, execution, started),
+        **_operator_peer_audit_fields(peer),
+        "lifecycle_operation": execution.get("operation"),
     }
     gate = execution.get("recovery_gate")
     if isinstance(gate, dict):
@@ -515,8 +530,9 @@ def _append_lifecycle_audit(record: dict[str, object]) -> dict[str, object]:
 def _run_blockade_lifecycle(
     reference: dict[str, object],
     execution: dict[str, object],
+    *,
+    peer: dict[str, object],
 ) -> int:
-    peer = _validate_blockade_lifecycle_peer(execution)
     claim_once(STATE / "used", str(reference["request_id"]))
     started = time.monotonic()
     intent = _append_lifecycle_audit(
@@ -577,10 +593,16 @@ def main() -> int:
     reference = parse_reference(data)
     config = load_root_config(CONFIG)
     execution = resolve_execution(config, reference)
+    operator_peer: dict[str, object] | None = None
+    if reference.get("action") in {POWER_ACTION, BLOCKADE_LIFECYCLE_ACTION}:
+        operator_peer = _validate_blockade_lifecycle_peer(execution)
     if execution.get("mode") == "recovery-marker-publish":
         return _run_recovery_publication(reference, execution)
     if execution.get("mode") == "blockade-marker-lifecycle":
-        return _run_blockade_lifecycle(reference, execution)
+        assert operator_peer is not None
+        return _run_blockade_lifecycle(
+            reference, execution, peer=operator_peer
+        )
     argv = execution["argv"]
     timeout = execution["timeout_seconds"]
     cwd = execution.get("cwd")
@@ -611,6 +633,11 @@ def main() -> int:
     stderr = stderr_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     record = {
         **_base_audit_record(reference, execution, started),
+        **(
+            _operator_peer_audit_fields(operator_peer)
+            if operator_peer is not None
+            else {}
+        ),
         "returncode": None if timed_out else process.returncode,
         "timed_out": timed_out,
         "stdout_truncated": len(stdout_bytes) > MAX_OUTPUT_BYTES,

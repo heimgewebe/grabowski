@@ -63,40 +63,54 @@ transaction-specific quarantine paths and exact hashes.
 
 ## Peer boundary
 
-Lifecycle requests are accepted only from the long-lived main process of the
-configured operator service. The typed blockade adapter sends its immutable
-privileged reference directly over the Unix socket; it deliberately does not
+The canonical operator is a root-managed **system** unit at
+`/etc/systemd/system/grabowski-operator.service`, while its payload still runs
+as `User=alex`. The unit fragment and its `/system.slice/...` cgroup are root
+controlled. The user manager, `/run/user/<uid>/bus`, user-owned cgroups and
+caller-supplied PID metadata are not authority sources.
+
+The typed blockade adapter and the high-power argv adapter send immutable
+privileged references directly over the Unix socket; they deliberately do not
 spawn the generic privileged-request client, because that would replace the
 operator's `SO_PEERCRED` with a child-process identity.
 
-The socket-activated root process reads kernel `SO_PEERCRED`, requires the exact
-operator UID, and independently queries the owning user systemd manager for the
-configured unit's active `MainPID` and `ControlGroup`. The user-manager bus is
-resolved only from the configured UID: `/run/user/<uid>` must be UID/GID-owned
-mode `0700`, its `bus` endpoint must be an owned Unix socket, and caller-supplied
-`XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` values are ignored. The socket
-peer PID must be that exact `MainPID`, its observed cgroup must equal the systemd
-`ControlGroup`, and `/proc/<pid>/cmdline` must equal Grabowski's fixed operator
-entrypoint argv. This means writable user-cgroup membership alone grants no
-authority.
+For both `operator_blockade_marker_lifecycle` and `operator_power_argv`, the
+socket-activated root broker reads kernel `SO_PEERCRED`, requires the exact
+operator UID, and independently queries the root system manager for the
+configured unit's active `MainPID`, `ControlGroup`, `User` and `FragmentPath`.
+The socket peer PID must be that exact `MainPID`; the systemd `ControlGroup`
+must be `/system.slice/grabowski-operator.service`; the unit fragment must be
+root-owned and not group/world writable; the cgroup directory and
+`cgroup.procs` must be root-owned and not group/world writable; and
+`/proc/<pid>/cmdline` must equal Grabowski's fixed operator entrypoint argv.
 
 The broker additionally binds the decision to cgroup-v2 `cgroup.procs` plus
 `/proc/<pid>/stat`: the peer must be the unique oldest process in that exact
 service cgroup, its parent must be outside that cgroup, and the membership set
-must remain unchanged across validation. Thus a same-UID terminal/request-client
-child is rejected even though it inherited the exact operator-service cgroup; a
-process manually moved into that writable user cgroup still fails the systemd
-`MainPID` boundary; tmux, login-session, durable-job, persistent-task and
-other-service peers fail earlier.
+must remain unchanged across validation. Thus terminal, durable-job,
+persistent-task, tmux and fleet-local children fail even when launched by the
+operator process, and an unrelated same-UID process cannot self-migrate into
+the root-owned system cgroup.
 
-Failure to read peer credentials, systemd unit identity, command identity, cgroup
-membership, process start identity or parent identity; malformed/unbounded
-process sets; a UID/unit/MainPID/ControlGroup mismatch; a non-main peer; or
-membership drift all block before the single-use claim and before any filesystem
-effect.
+Normal blue-green deployment never grants those children broad root authority.
+Only the canonical operator uses the MainPID-gated power action. Deployment
+controls the canonical system unit through the separate fixed
+`operator_system_service_control` template, whose target is limited to the
+service lifecycle of exactly `grabowski-operator.service`; it cannot touch the
+marker or execute caller-selected argv. The legacy user operator and its user
+watchdog are disabled during the rootbroker cutover, with their prior states
+recorded for rollback.
+
+Failure to read peer credentials, root-systemd unit identity, command identity,
+cgroup membership, process start identity or parent identity; malformed or
+unbounded process sets; a UID/unit/MainPID/ControlGroup/fragment mismatch; a
+non-main peer; or membership drift all block before the single-use claim and
+before any protected filesystem or broad-power effect.
 
 This peer check does not claim protection against a compromised kernel, root,
-or arbitrary code injected into the long-lived operator main process itself.
+or arbitrary code already injected into the exact trusted operator main
+process itself. Release/deployment integrity remains a separate authority
+contract and is not inferred from PID identity alone.
 
 ## Audit and unknown outcomes
 

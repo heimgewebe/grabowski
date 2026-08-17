@@ -855,35 +855,43 @@ def grabowski_power_run(
         separators=(",", ":"),
     )
     reference = _create_power_reference(target, reason)
-    reference_path = _write_power_reference(reference)
-    client = str(broker["request_client"])
+    reference_bytes = (
+        json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if not reference_bytes or len(reference_bytes) > 64 * 1024:
+        raise ValueError("power reference exceeds broker input limit")
     started = time.monotonic()
     client_timed_out = False
-    broker_client_returncode: int | None
+    broker_client_returncode: int | None = None
+    stdout_raw = b""
+    stderr_raw = b""
     try:
-        completed = subprocess.run(
-            [client, str(reference_path)],
-            cwd="/",
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout + 15,
-            check=False,
-            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
-        )
-        broker_client_returncode = completed.returncode
-        stdout_raw = completed.stdout
-        stderr_raw = completed.stderr
-    except subprocess.TimeoutExpired as exc:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout + 15)
+            client.connect(str(BROKER_SOCKET))
+            client.sendall(reference_bytes)
+            client.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 512 * 1024:
+                    raise RuntimeError("privileged broker response exceeds output limit")
+                chunks.append(chunk)
+            stdout_raw = b"".join(chunks)
+    except (socket.timeout, TimeoutError) as exc:
         client_timed_out = True
-        broker_client_returncode = None
-        stdout_raw = exc.stdout or b""
-        stderr_raw = exc.stderr or b"privileged broker client timed out"
-    finally:
-        try:
-            reference_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        stderr_raw = (
+            str(exc).encode("utf-8", errors="replace")
+            or b"privileged broker direct socket timed out"
+        )
+    except (OSError, RuntimeError) as exc:
+        stderr_raw = f"{type(exc).__name__}: {exc}".encode(
+            "utf-8", errors="replace"
+        )
 
     stdout = stdout_raw.decode("utf-8", errors="replace")
     stderr = stderr_raw.decode("utf-8", errors="replace")
@@ -908,6 +916,8 @@ def grabowski_power_run(
         parsed = None
 
     broker_returncode = parsed.get("returncode") if isinstance(parsed, dict) else None
+    if not client_timed_out and isinstance(broker_returncode, int):
+        broker_client_returncode = 0 if broker_returncode == 0 else 1
     success = broker_client_returncode == 0 and broker_returncode == 0 and not client_timed_out
     audit_record = {
         "tool": "grabowski_power_run",
