@@ -60,6 +60,15 @@ class OperatorContextTests(unittest.TestCase):
         catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
         tools = [item["tool"] for item in catalog["tools"]]
         self.assertEqual(tools, contract["expected_tools"])
+        self.assertNotIn("grabowski_agent_workspace_adopt", tools)
+        self.assertEqual(
+            catalog["publication_staging"]["implemented_unpublished_tools"],
+            ["grabowski_agent_workspace_adopt"],
+        )
+        context = json.loads(CONTEXT.read_text(encoding="utf-8"))
+        self.assertEqual(
+            context["publication_staging"], catalog["publication_staging"]
+        )
         self.assertTrue(
             all(not values for values in catalog["integrity"].values())
         )

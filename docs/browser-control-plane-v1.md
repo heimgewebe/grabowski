@@ -116,6 +116,22 @@ Browser-Start/Stop-Audit erhält eine begrenzte `browser_control_plane`-Zusammen
 
 Nicht in die neue Auditprojektion gelangen Profilpfad, Cookies, Credentials, Formwerte oder andere Browserinhalte. Bereits vorhandene öffentliche Workerfelder werden durch diesen Vertrag weder erweitert noch als Secret-Quelle umgedeutet.
 
+## Diagnostics-only Core
+
+Console- und Network-Diagnostik bleibt bewusst **außerhalb** des Semantic Browser API. Die tooling-only Slice `src/grabowski_browser_diagnostics.py` mit `tools/browser_diagnostics.py` akzeptiert ausschließlich die ID eines bereits laufenden Grabowski-Browserworkers; Caller können weder CDP-Port noch WebSocket-URL noch Profilpfad als Authority einspeisen. Vor und nach jedem Sample werden Worker-Registry, frische systemd-Beobachtung und die exakten worker-eigenen Port-/Profil-Leases erneut gebunden. Ein unbekannter, terminaler, leasefremder oder während des Samples driftender Worker endet fail-closed.
+
+Der Collector verwendet CDP nur passiv: `Runtime.enable`, `Log.enable` und `Network.enable`. Er ruft weder `Page.navigate`/`Page.reload` noch `Runtime.evaluate`, DOM-/Input-Methoden, Request-/Response-Body-Leser oder Screenshot-Methoden auf. Die Target-Discovery erfolgt direkt per `node:http` an `127.0.0.1`, damit Host-Proxy- oder DNS-Konfiguration keinen Loopback-Read umleiten kann. Ein optionaler späterer DevTools-MCP-Adapter darf diese Grenze nicht erweitern und bleibt der Grabowski-Worker-/Lease-/Outcome-Autorität untergeordnet.
+
+Ausgegeben werden nur hart begrenzte, doppelt normalisierte Metadaten:
+
+- Console-Text und Argumentwerte ausschließlich als SHA-256 plus Byte-Länge und ungefährliche Typmetadaten;
+- URL nur als Scheme, Host-/Path-Digest sowie `query_present`/`fragment_present`; Query- und Fragmentwerte selbst bleiben draußen;
+- Network nur mit Request-ID-Digest, Methode, Resource-/Initiator-Typ, Status, MIME/Protokoll sowie Cache-/Service-Worker-Bools;
+- keine Cookies, Credentials, `Authorization`-Werte, beliebigen Raw-Headers, Post-Daten oder Request-/Response-Bodies;
+- höchstens 50 Events pro Stream und höchstens 16 Console-Argumente je Event.
+
+Screenshot-Diagnostik ist in dieser Slice absichtlich `not_implemented`. Sie wird erst ergänzt, wenn ein eigener bounded Artifact-/Digest-Vertrag vorliegt; unbounded Bildbytes gelangen weder in die normale Textdiagnostik noch in das Semantic Gateway. Der Report setzt invariant `read_only=true`, `page_effects=false`, `production_adapter_changed=false` und `retry_authorized=false`. Damit ist die Diagnostics-Schicht ein Beobachtungsinstrument und keine zweite Browser-Control-Plane.
+
 ## Semantischer Aktionsvertrag (observe → snapshot → act → verify)
 
 Zusätzlich zur bestehenden Control-Plane-Projektion und zum bestehenden `grabowski_browser_worker_stored_form_action` stellt `src/grabowski_workers.py` die backend-neutrale Vertragsschicht `browser_semantic_observe()` und `browser_semantic_act()` bereit. Genau ein öffentliches Gateway, `grabowski_browser_worker_semantic`, macht sie mit den benannten Operationen `observe` und `act` agentenseitig nutzbar. Die interne `CDPAdapter`-Grenze wird für die aktuelle Chrome-/Chromium-Familie kohärent durch `ChromeCDPAdapter` implementiert. Weder CDP-Methodennamen noch CSS-Selektoren oder DOM-/AX-Knoten-IDs werden Teil des semantischen Aufrufervertrags.

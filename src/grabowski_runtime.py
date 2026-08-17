@@ -6,6 +6,7 @@ from typing import Annotated
 from pydantic import Field
 
 import grabowski_operator_core
+import grabowski_mcp
 import grabowski_checkouts
 import grabowski_checkout_binding_reconciler
 import grabowski_current_work as grabowski_current_work_model
@@ -47,6 +48,21 @@ import grabowski_reposkop_context  # noqa: F401
 
 mcp = grabowski_operator_core.mcp
 READ_ONLY = grabowski_operator_core.READ_ONLY
+
+
+def _stage_unpublished_tools() -> None:
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None:
+        raise RuntimeError("FastMCP tool manager is unavailable for publication staging")
+    for tool_name in sorted(grabowski_mcp.STAGED_UNPUBLISHED_TOOL_NAMES):
+        if manager.get_tool(tool_name) is None:
+            raise RuntimeError(
+                f"staged unpublished tool was not registered before runtime assembly: {tool_name}"
+            )
+        manager.remove_tool(tool_name)
+
+
+_stage_unpublished_tools()
 
 
 @mcp.tool(name="grabowski_current_work", annotations=READ_ONLY)

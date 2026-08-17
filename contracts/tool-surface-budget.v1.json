@@ -1,32 +1,5 @@
 {
   "accepted_additions": {
-    "grabowski_agent_workspace_adopt": {
-      "evidence_refs": [
-        "contract:CandidateAdoptionReceipt.v1",
-        "tests:test_agent_workspace.py",
-        "tests:test_candidate_adoption.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool owns only the PASS-verified Candidate-to-controller-custody transition; PR, merge, deploy and source close remain separate.",
-        "evidence": "Immutable intent and adoption receipts, exact branch/base CAS, clean Git readback, recovery tests and early-lane-close tests."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "A generic Git operation cannot bind Candidate, verification, Work Lane controller, immutable pre-effect intent, exact ref CAS and recovery readback in one contract.",
-      "rationale": "Candidate adoption is the explicit authority handoff from one frozen PASS-verified lane Candidate to controller custody with durable evidence.",
-      "tool_contract": {
-        "authority_class": "mutation",
-        "category": "agent-workspace",
-        "effects": [
-          "audit-append",
-          "git-ref-update",
-          "receipt-create"
-        ],
-        "read_only": false,
-        "reversibility": "preserved-adoption-commit-and-receipts",
-        "risk_class": "high",
-        "tool": "grabowski_agent_workspace_adopt"
-      }
-    },
     "grabowski_agent_workspace_reconcile_idle_tmux": {
       "evidence_refs": [
         "contract:idle-tmux-stale-abandonment-v1",

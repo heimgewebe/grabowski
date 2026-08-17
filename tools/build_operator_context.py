@@ -159,6 +159,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         return ", ".join(f"`{item}`" for item in values)
 
     discovered, source_hashes = _discover_tools(contract)
+    staged_unpublished = set(capabilities.STAGED_UNPUBLISHED_TOOL_NAMES)
     expected_tools = list(contract["expected_tools"])
     descriptions = {
         name: record["description"]
@@ -176,10 +177,20 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
     classification = capabilities.classify_contract(expected_tools)
     expected_set = set(expected_tools)
     discovered_set = set(discovered)
+    staged_discovered = sorted(staged_unpublished & discovered_set)
     integrity = {
         **classification,
         "missing_declarations": sorted(expected_set - discovered_set),
-        "undeclared_tools": sorted(discovered_set - expected_set),
+        "undeclared_tools": sorted(
+            (discovered_set - expected_set) - staged_unpublished
+        ),
+        "missing_staged_declarations": sorted(
+            staged_unpublished - discovered_set
+        ),
+    }
+
+    publication_staging = {
+        "implemented_unpublished_tools": staged_discovered,
     }
 
     catalog = {
@@ -189,6 +200,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         "capability_source": "src/grabowski_capabilities.py",
         "capability_source_sha256": _sha256(CAPABILITIES_PATH),
         "tools": records,
+        "publication_staging": publication_staging,
         "integrity": integrity,
     }
     context = {
@@ -240,6 +252,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
             "forbidden_capabilities": policy.get("forbidden_capabilities", []),
         },
         "capabilities": records,
+        "publication_staging": publication_staging,
         "integrity": integrity,
     }
 

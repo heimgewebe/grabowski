@@ -1,14 +1,22 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "fe56343d96e870df6abdca6e0262456f0ce736d6dc2fac287e016509da31bfb4",
+  "capability_source_sha256": "6196f9ab80ed8ab945f3bd502829dceb79857bd36c35a1032c4bffb808497ebe",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "39df47409bc1dd6325b6549f950383cfc18a37a3a13d74652d19665df4783b80",
+  "contract_sha256": "112532bf69ce8224157ae2c153a1d0beb3bc55035b97d8cc6ae33c3f1d53ef6f",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
     "missing_profiles": [],
+    "missing_staged_declarations": [],
+    "missing_staged_profiles": [],
     "orphan_profiles": [],
+    "published_staged_tools": [],
     "undeclared_tools": []
+  },
+  "publication_staging": {
+    "implemented_unpublished_tools": [
+      "grabowski_agent_workspace_adopt"
+    ]
   },
   "schema_version": 1,
   "tools": [
@@ -2267,21 +2275,6 @@
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
       "tool": "grabowski_agent_workspace_collect"
-    },
-    {
-      "category": "agent-workspace",
-      "description": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit.",
-      "effects": [
-        "git-ref-update",
-        "receipt-create",
-        "audit-append"
-      ],
-      "id": "grabowski_agent_workspace_adopt",
-      "purpose": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit with immutable intent and readback receipts.",
-      "read_only": false,
-      "reversibility": "preserved-adoption-commit-and-receipts",
-      "risk_class": "high",
-      "tool": "grabowski_agent_workspace_adopt"
     },
     {
       "category": "agent-workspace",
