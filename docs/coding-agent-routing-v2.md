@@ -210,7 +210,29 @@ P2 implementiert ausdrücklich noch nicht:
 
 Diese späteren Funktionen müssen weiterhin auf Lane, Workspace, Candidate und Receipts aufbauen und dürfen keinen zweiten Lifecycle- oder StateStore einführen.
 
-## 12. Invarianten
+## 12. P3/P4 Adoption + begrenzte Revision
+
+P3 ergänzt den lane-backed Candidate-Pfad um Controller-Adoption: Nur ein vollständig `PASS`-verifizierter Candidate kann nach einem gültig geschlossenen Workspace revisionsgebunden als Controller-Commit übernommen werden. Candidate-, Verification-, Workspace- und Work-Lane-Identität bleiben dabei unverändert referenziert; die Adoption erzeugt weder einen zweiten Lifecycle noch einen neuen StateStore.
+
+P4 ergänzt genau **eine** fachliche Revision und bleibt absichtlich kleiner als ein allgemeiner Ausführungsgraph:
+
+- Die bestehende Oberfläche `grabowski_agent_workspace_writer_handoff` dient weiterhin dem terminalen Writer-Recovery-Fall. Liegt stattdessen eine vollständige lane-backed Collection mit deterministischem `NEEDS_CHANGE` vor, öffnet dieselbe Oberfläche genau den Übergang `Candidate Round 1 -> Writer Attempt 2 -> Candidate Round 2`. Es gibt keinen caller-wählbaren Modus und kein neues öffentliches Tool.
+- `PASS` wird nicht revidiert. `INDETERMINATE`, fehlende Pflichtverifier, Base-Drift, Scope-Verletzungen, offene Start-Intents oder eine bereits verbrauchte Revision blockieren fail-closed. Der P4-Pilot verlangt außerdem first-attempt Verification in Round 1; Verifier-Retry plus fachliche Revision wird erst nach separater Evidenz verallgemeinert.
+- Vor dem zweiten Writer wird die vollständige Round-1-Collection create-only als `collection-round-0001.json` archiviert. Candidate- und Verification-Receipts von Round 1 bleiben unverändert. Round 2 erhält eigene Patch- und Role-Receipt-Pfade. Frühere Evidenz wird weder überschrieben noch als aktueller Candidate umetikettiert.
+- Writer Attempt 2 trägt `actor=candidate_revision` und bindet `revision_candidate_id`, Round-1-`result_sha256` und den exakten Dirty-Preimage-Digest. Der Writer darf auf einem dirty Worktree nur starten, wenn sein live berechneter Digest exakt dieser gebundenen Candidate-Preimage entspricht; der normale Initial-Writer verlangt weiterhin einen clean Base-Checkout.
+- Vor dem Task-Start wird ein revisionsgebundener Start-Intent persistiert. Bei verlorenem oder unklarem Start-Outcome darf nicht blind wiederholt werden; der bestehende Reconcile-Pfad sucht genau den an Host, CWD, argv, Candidate und Preimage gebundenen Task.
+- Nach erfolgreichem Start wird `candidate_round=2`, die aktuelle Collection/Frozen-Writer-Projektion wird für die neue Runde geleert und Tests/Review werden frisch gestartet. Die Round-1-Evidenz bleibt über ihr immutable Archiv adressierbar.
+- Adoption akzeptiert ausschließlich den Candidate der aktuellen Collection. Ein alter Round-1-Candidate kann deshalb nach einer Round-2-Collection nicht als aktuelles Ergebnis adoptiert werden.
+- `grabowski_agent_workspace_status` exponiert die begrenzte Candidate-Revision separat. Bei vollständig verifiziertem `NEEDS_CHANGE` lautet die nächste Aktion `writer_handoff_for_candidate_revision`, nicht `close_with_abandon_failed_roles`.
+
+P4 implementiert ausdrücklich **nicht**:
+
+- mehr als eine fachliche Revision;
+- einen allgemeinen DAG, Scheduler oder Candidate-StateStore;
+- automatische Multi-Writer-Konkurrenz;
+- P5-Delivery oder Outcome-Learning.
+
+## 13. Invarianten
 
 P0 gilt nur dann als korrekt, wenn für dieselben Routingfacts kein öffentliches Interface gleichzeitig behauptet:
 

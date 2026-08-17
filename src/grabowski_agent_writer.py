@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -13,8 +14,11 @@ from typing import Any
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
+SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
 LAUNCH_NONCE = __import__("re").compile(r"^[0-9a-f]{24}$")
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_UNTRACKED_FILE_BYTES = 16 * 1024 * 1024
+MAX_UNTRACKED_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 def _canonical(value: Any) -> str:
@@ -41,6 +45,119 @@ def _git(repo: Path, *args: str) -> str:
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "git failed").strip())
     return completed.stdout.strip()
+
+
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+        env=safe_git_environment(),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or b"git failed").decode(
+            "utf-8", errors="replace"
+        )
+        raise RuntimeError(detail.strip())
+    return bytes(completed.stdout)
+
+
+def _untracked_file_fingerprint(
+    repo: Path, relative: PurePosixPath
+) -> dict[str, Any]:
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative.parts[0] == ".git"
+    ):
+        raise RuntimeError(f"invalid untracked writer path: {relative}")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    root_fd = os.open(repo, directory_flags)
+    current_fd = root_fd
+    file_fd = -1
+    try:
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        file_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"untracked writer path is not a regular file: {relative}")
+        if before.st_nlink != 1:
+            raise RuntimeError(f"untracked writer file may not be hardlinked: {relative}")
+        if before.st_uid != os.getuid() or before.st_size > MAX_UNTRACKED_FILE_BYTES:
+            raise RuntimeError(f"unsafe untracked writer file: {relative}")
+        digest = hashlib.sha256()
+        total = 0
+        while chunk := os.read(file_fd, 1024 * 1024):
+            total += len(chunk)
+            if total > MAX_UNTRACKED_FILE_BYTES:
+                raise RuntimeError(
+                    f"untracked writer file exceeds safety boundary: {relative}"
+                )
+            digest.update(chunk)
+        after = os.fstat(file_fd)
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_size")
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise RuntimeError(f"untracked writer file changed while hashing: {relative}")
+        if total != before.st_size:
+            raise RuntimeError(f"untracked writer file size changed while hashing: {relative}")
+        return {
+            "path": relative.as_posix(),
+            "size": total,
+            "sha256": digest.hexdigest(),
+        }
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RuntimeError(f"untracked writer path crosses a symlink: {relative}") from exc
+        raise RuntimeError(f"untracked writer path is not stable: {relative}") from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _dirty_preimage_sha256(repo: Path, base_head: str, head: str, branch: str) -> str:
+    committed = _git_bytes(
+        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"
+    )
+    working = _git_bytes(
+        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"
+    )
+    raw_untracked = _git_bytes(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    untracked: list[dict[str, Any]] = []
+    total = 0
+    for raw in raw_untracked.split(b"\x00"):
+        if not raw:
+            continue
+        relative = PurePosixPath(os.fsdecode(raw))
+        fingerprint = _untracked_file_fingerprint(repo, relative)
+        total += int(fingerprint["size"])
+        if total > MAX_UNTRACKED_TOTAL_BYTES:
+            raise RuntimeError("untracked writer files exceed aggregate safety boundary")
+        untracked.append(fingerprint)
+    return _digest(
+        {
+            "base_head": base_head,
+            "head": head,
+            "branch": branch,
+            "committed_diff_sha256": hashlib.sha256(committed).hexdigest(),
+            "working_diff_sha256": hashlib.sha256(working).hexdigest(),
+            "untracked": untracked,
+        }
+    )
 
 
 def _write_receipt(path: Path, payload: dict[str, Any]) -> None:
@@ -111,6 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allowed-path", action="append", default=[])
     parser.add_argument("--output", required=True)
     parser.add_argument("--launch-nonce")
+    parser.add_argument("--expected-dirty-preimage-sha256")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = list(args.command)
@@ -120,14 +238,31 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("invalid command, base binding or writable scope")
     if args.launch_nonce is not None and LAUNCH_NONCE.fullmatch(args.launch_nonce) is None:
         parser.error("invalid launch nonce")
+    if (
+        args.expected_dirty_preimage_sha256 is not None
+        and SHA256.fullmatch(args.expected_dirty_preimage_sha256) is None
+    ):
+        parser.error("invalid dirty preimage binding")
     repo = Path(args.repository).resolve(strict=True)
     output = Path(args.output).resolve(strict=False)
     writable_paths = [_allowed_path(repo, item) for item in args.allowed_path]
     before_head = _git(repo, "rev-parse", "HEAD").lower()
     before_branch = _git(repo, "branch", "--show-current")
     before_status = _git(repo, "status", "--porcelain=v1", "--untracked-files=all")
-    if before_head != args.expected_base_head or before_branch != args.expected_branch or before_status:
-        raise RuntimeError("writer worktree does not match its clean base and branch binding")
+    if before_head != args.expected_base_head or before_branch != args.expected_branch:
+        raise RuntimeError("writer worktree does not match its base and branch binding")
+    observed_dirty_preimage_sha256: str | None = None
+    if args.expected_dirty_preimage_sha256 is None:
+        if before_status:
+            raise RuntimeError("writer worktree does not match its clean base and branch binding")
+    else:
+        if not before_status:
+            raise RuntimeError("revision writer requires the exact dirty Candidate preimage")
+        observed_dirty_preimage_sha256 = _dirty_preimage_sha256(
+            repo, args.expected_base_head, before_head, before_branch
+        )
+        if observed_dirty_preimage_sha256 != args.expected_dirty_preimage_sha256:
+            raise RuntimeError("revision writer dirty Candidate preimage drifted")
     common_raw = _git(repo, "rev-parse", "--git-common-dir")
     common = Path(common_raw)
     if not common.is_absolute():
@@ -159,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         "branch_before": before_branch,
         "command_sha256": _digest(command),
         "launch_nonce": args.launch_nonce,
+        "expected_dirty_preimage_sha256": args.expected_dirty_preimage_sha256,
+        "observed_dirty_preimage_sha256": observed_dirty_preimage_sha256,
         "returncode": completed.returncode,
         "stdout_bytes": completed.stdout_bytes,
         "stderr_bytes": completed.stderr_bytes,
