@@ -2135,8 +2135,8 @@ class PublishedRuntimeColdReentryTests(unittest.TestCase):
         self.assertIsNone(runtime_contract.contract_error(contract))
         modules = runtime_contract.contract_modules(contract)
         self.assertIn("grabowski_midcutover_resume", modules)
-        self.assertEqual(len(contract["expected_tools"]), 196)
-        self.assertEqual(len(set(contract["expected_tools"])), 196)
+        self.assertEqual(len(contract["expected_tools"]), 197)
+        self.assertEqual(len(set(contract["expected_tools"])), 197)
         self.assertIn(self.PUBLIC_RECOVERY_TOOL, contract["expected_tools"])
         self.assertIn(self.PUBLIC_SCHEDULE_TOOL, contract["expected_tools"])
         self.assertFalse(
@@ -3700,7 +3700,7 @@ class RecoverySurfaceTests(unittest.TestCase):
 
         Two invariants in one signature: a caller must not be able to pick the
         lane, and the recovery fix must not add an input to a tool whose schema
-        the published 196-tool connector contract is currently converging on.
+        the published connector contract is currently converging on.
         """
         import inspect
 
