@@ -2911,15 +2911,20 @@ def checkout_owner_handoff_apply(
     top_level = Path(planned["checkout"]["repo_path"])
     common_dir = Path(planned["checkout"]["repo_common_dir"])
     target_owner = planned["owners"]["target_owner_id"]
+    operation_owner = f"checkout-owner-handoff:{uuid.uuid4().hex[:20]}"
     lease = _acquire_checkout_resources(
-        owner_id=target_owner,
+        owner_id=operation_owner,
         repo_common_dir=common_dir,
         checkout_path=checkout,
         purpose="atomically align checkout lifecycle ownership",
         retention_until_unix=int(planned["retention"]["retention_until_unix"]),
         repo_path=top_level,
         branch=planned["checkout"]["branch"],
-        metadata={"checkout_key": planned["checkout"]["checkout_key"], "snapshot_sha256": snapshot_sha256},
+        metadata={
+            "checkout_key": planned["checkout"]["checkout_key"],
+            "snapshot_sha256": snapshot_sha256,
+            "durable_target_owner_id": target_owner,
+        },
     )
     result: dict[str, Any] | None = None
     try:

@@ -459,6 +459,9 @@ def apply(
             )
             if not isinstance(rebind_head, str):
                 raise RuntimeError("terminal reconciliation lacks an exact terminal head")
+            lifecycle_updated_at = max(
+                applied_at, int(binding_before["updated_at_unix"]) + 1
+            )
             updated = connection.execute(
                 """
                 UPDATE lifecycle_bindings
@@ -473,7 +476,7 @@ def apply(
                 (
                     rebind_head,
                     applied_at,
-                    applied_at,
+                    lifecycle_updated_at,
                     key,
                     owner,
                     binding_before["phase"],
@@ -484,6 +487,9 @@ def apply(
             if updated.rowcount != 1:
                 raise RuntimeError("checkout lifecycle CAS transition was not applied exactly")
             if rebind_head != retention_before["expected_head"]:
+                retention_updated_at = max(
+                    applied_at, int(retention_before["updated_at_unix"]) + 1
+                )
                 retention_updated = connection.execute(
                     """
                     UPDATE retention
@@ -493,7 +499,7 @@ def apply(
                     """,
                     (
                         rebind_head,
-                        applied_at,
+                        retention_updated_at,
                         key,
                         owner,
                         retention_before["expected_head"],

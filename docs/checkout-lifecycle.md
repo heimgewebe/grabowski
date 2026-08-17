@@ -31,7 +31,8 @@ trennt Inventar, Archivierung und Cleanup.
 - Die Grips `checkout-owner-handoff-preview` und `checkout-owner-handoff-apply`
   sind ein enger Reconciliation-Pfad für genau `binding-retention-owner-mismatch`:
   nur sauberer, unkoordinierter Checkout; nur `completed_retained`; kein
-  Archiv; aktive identische Retention; Zielowner muss bereits Lifecycle- oder
+  Archiv; aktuelle Retention muss aktiv und identitätsgleich außer dem Owner sein;
+  eine historisch kürzere Lifecycle-Retention wird nicht umgeschrieben; Zielowner muss bereits Lifecycle- oder
   Retention-Owner sein; Apply ist Snapshot-/Zeit-/Bestätigungs-CAS. Es entsteht
   keine zusätzliche öffentliche MCP-Tooloberfläche.
 
