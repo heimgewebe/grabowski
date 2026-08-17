@@ -263,12 +263,14 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             ),
             mock.patch.object(privileged_client.socket, "socket", return_value=fake),
             mock.patch.object(privileged_client.subprocess, "run") as subprocess_run,
+            mock.patch.object(privileged_client, "_write_power_reference") as write_reference,
             mock.patch.object(privileged_client, "_append_operator_audit"),
         ):
             result = privileged_client.run_blockade_lifecycle_reference(
                 payload, justification="direct socket identity test"
             )
         subprocess_run.assert_not_called()
+        write_reference.assert_not_called()
         self.assertEqual(fake.connected, str(privileged_client.BROKER_SOCKET))
         sent = json.loads(fake.sent.decode("utf-8"))
         self.assertEqual(sent["action"], privileged_client.BLOCKADE_LIFECYCLE_ACTION)
