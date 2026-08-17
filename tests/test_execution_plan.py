@@ -167,6 +167,42 @@ class ExecutionPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(execution_plan.ExecutionPlanError, "edge shape"):
             writer_verify_plan(edges=edges)
 
+    def test_typed_edge_rejects_unknown_artifact_contract(self) -> None:
+        edges = [
+            {"from": "writer", "to": "tests", "artifact": "UntypedBlob.v1"},
+            {"from": "tests", "to": "reduce", "artifact": "VerificationReceipt.v1"},
+        ]
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError, "unsupported typed edge artifact"
+        ):
+            writer_verify_plan(edges=edges)
+
+    def test_only_controller_or_scoped_writer_nodes_may_mutate(self) -> None:
+        nodes = copy.deepcopy(writer_verify_plan()["nodes"])
+        writer = next(node for node in nodes if node["node_id"] == "writer")
+        verifier = next(node for node in nodes if node["node_id"] == "tests")
+        writer["mutates"] = False
+        writer["write_scope"] = []
+        verifier["mutates"] = True
+        verifier["write_scope"] = ["src/app.py"]
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError,
+            "only controller or scoped_writer execution nodes may mutate",
+        ):
+            writer_verify_plan(nodes=nodes)
+
+    def test_completion_policy_cannot_disable_critical_requirement(self) -> None:
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError, "must require every critical node"
+        ):
+            writer_verify_plan(
+                completion_policy={
+                    "required_nodes": ["writer"],
+                    "require_all_critical": False,
+                    "verifier_quorum": 0,
+                }
+            )
+
     def test_graph_cycle_is_rejected(self) -> None:
         edges = [
             {"from": "writer", "to": "tests", "artifact": "CandidateManifest.v1"},
@@ -293,7 +329,10 @@ class ExecutionPlanTests(unittest.TestCase):
         mutated = copy.deepcopy(nodes)
         mutated[0]["mutates"] = True
         mutated[0]["write_scope"] = ["src/app.py"]
-        with self.assertRaisesRegex(execution_plan.ExecutionPlanError, "separate lanes"):
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError,
+            "only controller or scoped_writer execution nodes may mutate",
+        ):
             execution_plan.build_execution_plan(
                 source_binding={"kind": "direct-user", "id": "fork-test"},
                 route_decision=route_decision(verification_policy="competition"),
@@ -314,6 +353,68 @@ class ExecutionPlanTests(unittest.TestCase):
                 },
                 completion_policy={
                     "required_nodes": ["a", "b", "compare"],
+                    "require_all_critical": True,
+                    "verifier_quorum": 0,
+                },
+            )
+
+    def test_fork_compare_cannot_embed_a_mutating_controller(self) -> None:
+        nodes = [
+            {
+                "node_id": "a",
+                "kind": "alternative",
+                "critical": True,
+                "mutates": False,
+                "write_scope": [],
+            },
+            {
+                "node_id": "b",
+                "kind": "alternative",
+                "critical": True,
+                "mutates": False,
+                "write_scope": [],
+            },
+            {
+                "node_id": "controller",
+                "kind": "controller",
+                "critical": True,
+                "mutates": True,
+                "write_scope": ["src/app.py"],
+            },
+            {
+                "node_id": "compare",
+                "kind": "compare",
+                "critical": True,
+                "mutates": False,
+                "write_scope": [],
+            },
+        ]
+        edges = [
+            {"from": "a", "to": "controller", "artifact": "CandidateManifest.v1"},
+            {"from": "b", "to": "controller", "artifact": "CandidateManifest.v1"},
+            {"from": "controller", "to": "compare", "artifact": "VerificationSummary.v1"},
+        ]
+        with self.assertRaisesRegex(execution_plan.ExecutionPlanError, "fork_compare is read-only"):
+            execution_plan.build_execution_plan(
+                source_binding={"kind": "direct-user", "id": "fork-test"},
+                route_decision=route_decision(verification_policy="competition"),
+                topology="fork_compare",
+                nodes=nodes,
+                edges=edges,
+                write_scope=["src/app.py"],
+                verification_policy="competition",
+                failure_policy={
+                    "on_indeterminate": "block",
+                    "on_unknown_effect": "reconcile",
+                    "revision": "bounded",
+                },
+                budgets={
+                    "max_revisions": 0,
+                    "max_duration_seconds": 3600,
+                    "max_tool_calls": 100,
+                },
+                completion_policy={
+                    "required_nodes": ["a", "b", "controller", "compare"],
                     "require_all_critical": True,
                     "verifier_quorum": 0,
                 },

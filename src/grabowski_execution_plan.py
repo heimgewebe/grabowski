@@ -30,6 +30,16 @@ EXECUTORS = frozenset({"controller", "scoped_writer"})
 EFFECT_PROFILES = frozenset({"candidate", "delivery"})
 UNKNOWN_EFFECT_POLICIES = frozenset({"reconcile"})
 INDETERMINATE_POLICIES = frozenset({"block", "revise"})
+MUTATING_NODE_KINDS = frozenset({"controller", "scoped_writer"})
+EDGE_ARTIFACT_CONTRACTS = frozenset(
+    {
+        "CandidateManifest.v1",
+        "VerificationReceipt.v1",
+        "VerificationSummary.v1",
+        "RevisionRequest.v1",
+        "CandidateAdoptionReceipt.v1",
+    }
+)
 MAX_TEXT = 512
 MAX_NODES = 32
 MAX_EDGES = 96
@@ -206,6 +216,10 @@ def _node(value: Any, *, plan_scope: set[str]) -> dict[str, Any]:
     scope = _write_scope(value.get("write_scope"), f"node[{node_id}].write_scope")
     if not set(scope).issubset(plan_scope):
         raise ExecutionPlanError("node write scope exceeds plan write scope")
+    if value.get("mutates") is True and kind not in MUTATING_NODE_KINDS:
+        raise ExecutionPlanError(
+            "only controller or scoped_writer execution nodes may mutate"
+        )
     if value.get("mutates") is True and not scope:
         raise ExecutionPlanError("mutating execution node requires explicit write scope")
     if value.get("mutates") is False and scope:
@@ -225,6 +239,10 @@ def _edge(value: Any, *, node_ids: set[str]) -> dict[str, str]:
     source = _identifier(value.get("from"), "edge.from")
     target = _identifier(value.get("to"), "edge.to")
     artifact = _identifier(value.get("artifact"), "edge.artifact")
+    if artifact not in EDGE_ARTIFACT_CONTRACTS:
+        raise ExecutionPlanError(
+            f"unsupported typed edge artifact contract: {artifact}"
+        )
     if source == target:
         raise ExecutionPlanError("typed edge may not target its source node")
     if source not in node_ids or target not in node_ids:
@@ -288,9 +306,9 @@ def _validate_topology(
             raise ExecutionPlanError(
                 "fork_compare requires at least two alternatives and one compare node"
             )
-        if any(node["mutates"] for node in nodes if node["kind"] == "alternative"):
+        if any(node["mutates"] for node in nodes):
             raise ExecutionPlanError(
-                "P4 fork_compare alternatives are read-only candidate inputs; competing writers require separate lanes"
+                "P4 fork_compare is read-only; competing writers require separate lanes"
             )
     else:
         raise ExecutionPlanError("execution plan topology is unsupported")
@@ -368,10 +386,12 @@ def _completion_policy(
     if not set(required).issubset(node_ids):
         raise ExecutionPlanError("completion policy references an unknown node")
     require_all_critical = value.get("require_all_critical")
-    if not isinstance(require_all_critical, bool):
-        raise ExecutionPlanError("require_all_critical must be boolean")
+    if require_all_critical is not True:
+        raise ExecutionPlanError(
+            "P4 completion policy must require every critical node"
+        )
     critical = {node["node_id"] for node in nodes if node["critical"]}
-    if require_all_critical and not critical.issubset(set(required)):
+    if not critical.issubset(set(required)):
         raise ExecutionPlanError("completion policy skips a critical node")
     verifier_count = sum(1 for node in nodes if node["kind"] == "verifier")
     quorum = _bounded_int(
