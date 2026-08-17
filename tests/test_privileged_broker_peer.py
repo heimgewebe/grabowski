@@ -190,6 +190,51 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                         self.execution(), proc_root=proc_root, cgroup_root=cgroup_root
                     )
 
+    def test_service_membership_drift_is_rejected(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as raw_proc,
+            tempfile.TemporaryDirectory() as raw_cgroup,
+        ):
+            proc_root = Path(raw_proc)
+            cgroup_root = Path(raw_cgroup)
+            self._write_process(
+                proc_root,
+                1234,
+                parent_pid=50,
+                starttime_ticks=100,
+                cgroup=self.SERVICE_CGROUP,
+            )
+            self._write_process(
+                proc_root,
+                50,
+                parent_pid=1,
+                starttime_ticks=10,
+                cgroup=(
+                    "/user.slice/user-1000.slice/user@1000.service/"
+                    "init.scope"
+                ),
+            )
+            with (
+                mock.patch.object(
+                    broker_tool,
+                    "_socket_peer_credentials",
+                    return_value=(1234, 1000, 1000),
+                ),
+                mock.patch.object(
+                    broker_tool,
+                    "_cgroup_processes",
+                    side_effect=[(1234,), (1234, 2345)],
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError, "changed during validation"
+                ):
+                    broker_tool._validate_blockade_lifecycle_peer(
+                        self.execution(),
+                        proc_root=proc_root,
+                        cgroup_root=cgroup_root,
+                    )
+
     def test_same_uid_tmux_peer_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             proc_root = Path(raw)
