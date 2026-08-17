@@ -9177,6 +9177,31 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(attempt["revision_candidate_id"], candidate["candidate_id"])
         self.assertEqual(attempt["revision_result_sha256"], collection["result_sha256"])
         self.assertEqual(attempt["revision_preimage_sha256"], snapshot["diff_sha256"])
+        revision_request_path = workspace._revision_request_receipt_path(stored)
+        self.assertTrue(revision_request_path.is_file())
+        revision_request = workspace.execution_plan.validate_revision_request(
+            json.loads(revision_request_path.read_text())
+        )
+        self.assertEqual(
+            attempt["revision_request_id"], revision_request["revision_request_id"]
+        )
+        self.assertEqual(
+            attempt["revision_request_sha256"], workspace._sha256_json(revision_request)
+        )
+        self.assertEqual(attempt["revision_request_path"], str(revision_request_path))
+        self.assertEqual(revision_request["candidate_id"], candidate["candidate_id"])
+        self.assertEqual(
+            revision_request["verification_summary_sha256"],
+            collection["verification_summary"]["summary_sha256"],
+        )
+        self.assertEqual(
+            revision_request["findings_sha256"],
+            collection["verification_summary"]["findings_sha256"],
+        )
+        self.assertEqual(
+            stored["revision_history"][0]["revision_request"]["revision_request_id"],
+            revision_request["revision_request_id"],
+        )
         archive_path = workspace._collection_round_receipt_path(
             stored, round_number=1
         )
@@ -9193,6 +9218,13 @@ class AgentWorkspaceTests(unittest.TestCase):
             ).name,
             "review-receipt.round-0002.json",
         )
+        tampered = dict(revision_request)
+        tampered["candidate_id"] = "f" * 64
+        revision_request_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "RevisionRequest.v1"
+        ):
+            workspace._effective_writer_attempt(stored)
 
     def test_status_recommends_candidate_revision_for_complete_needs_change(self) -> None:
         lane, manifest, _collection, candidate, _snapshot, writer_task = (

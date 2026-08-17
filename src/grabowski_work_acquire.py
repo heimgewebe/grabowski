@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Callable, Iterator
 
 import grabowski_checkouts as checkouts
+import grabowski_execution_plan as execution_plan_contract
 import grabowski_lane_closeout as lane_closeout
 import grabowski_operator_core as operator
 import grabowski_resources as resources
@@ -450,6 +451,45 @@ def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:
     return result
 
 
+def _normalized_plan_write_scope(
+    repo: Path, write_path_resources: list[str]
+) -> list[str]:
+    result: list[str] = []
+    for resource_key in write_path_resources:
+        if not resource_key.startswith("path:"):
+            raise RuntimeError("normalized write path resource is invalid")
+        path = Path(resource_key.removeprefix("path:"))
+        try:
+            relative = path.relative_to(repo)
+        except ValueError as exc:
+            raise RuntimeError("normalized write path escaped repository") from exc
+        result.append(relative.as_posix())
+    return sorted(set(result))
+
+
+def _execution_plan_binding(
+    value: Any,
+    *,
+    source_kind: str,
+    source_id: str,
+    repo: Path,
+    write_path_resources: list[str],
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        plan = execution_plan_contract.validate_execution_plan(value)
+    except execution_plan_contract.ExecutionPlanError as exc:
+        raise ValueError(f"execution_plan is invalid: {exc}") from exc
+    expected_source = {"kind": source_kind, "id": source_id}
+    if plan.get("source_binding") != expected_source:
+        raise ValueError("execution_plan source binding does not match work lane source")
+    expected_scope = _normalized_plan_write_scope(repo, write_path_resources)
+    if plan.get("write_scope") != expected_scope:
+        raise ValueError("execution_plan write scope does not match work lane write_paths")
+    return plan
+
+
 def _scoped_writer_argv(value: Any, writer: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -566,6 +606,13 @@ def _normalize(
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise ValueError("resource_keys must be a list of strings")
     path_resources = _write_path_resource_keys(repo, parameters.get("write_paths"))
+    execution_plan = _execution_plan_binding(
+        parameters.get("execution_plan"),
+        source_kind=source_kind,
+        source_id=source_id,
+        repo=repo,
+        write_path_resources=path_resources,
+    )
     writer_argv = _scoped_writer_argv(parameters.get("scoped_writer_argv"), writer)
     writer_runtime = parameters.get("scoped_writer_runtime_seconds", 7200)
     if (
@@ -596,6 +643,8 @@ def _normalize(
         "system_convergence": normalized_system_convergence,
         "system_convergence_plan": normalized_system_convergence_plan,
     }
+    if execution_plan is not None:
+        identity["execution_plan"] = execution_plan
     if writer_argv is not None:
         identity["scoped_writer_command"] = {
             "argv_sha256": _sha(writer_argv),

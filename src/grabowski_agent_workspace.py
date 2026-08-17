@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable
 import grabowski_agent_role as agent_role
 import grabowski_candidate_adoption as candidate_adoption
 import grabowski_candidate_verification as candidate_verification
+import grabowski_execution_plan as execution_plan
 import grabowski_mcp as base
 import grabowski_resources as resources
 import grabowski_tasks as tasks
@@ -2962,10 +2963,14 @@ def _writer_attempts(manifest: dict[str, Any]) -> list[dict[str, Any]]:
                 "revision_candidate_id",
                 "revision_result_sha256",
                 "revision_preimage_sha256",
+                "revision_request_id",
+                "revision_request_sha256",
             ):
                 value = handoff.get(field)
                 if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
                     raise AgentWorkspaceError(f"candidate revision {field} is invalid")
+            if handoff.get("revision_request_path") != str(_revision_request_receipt_path(manifest)):
+                raise AgentWorkspaceError("candidate revision request path is invalid")
     return attempts
 
 
@@ -2983,7 +2988,8 @@ def _writer_attempt_refs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         "previous_task_id", "previous_state", "started_at", "start_reconciled",
         "launch_nonce_sha256", "candidate_round", "next_candidate_round",
         "revision_candidate_id", "revision_result_sha256",
-        "revision_preimage_sha256",
+        "revision_preimage_sha256", "revision_request_id",
+        "revision_request_sha256", "revision_request_path",
     )
     return [{key: item.get(key) for key in fields if key in item} for item in _writer_attempts(manifest)]
 
@@ -3017,6 +3023,19 @@ def _effective_writer_attempt(manifest: dict[str, Any]) -> dict[str, Any]:
             or SHA256_RE.fullmatch(dirty_preimage_sha256) is None
         ):
             raise AgentWorkspaceError("effective revision writer preimage binding is invalid")
+        revision_request, revision_reference = _read_revision_request(manifest)
+        if (
+            selected.get("revision_request_id")
+            != revision_request.get("revision_request_id")
+            or selected.get("revision_request_sha256")
+            != revision_reference["revision_request_sha256"]
+            or selected.get("revision_request_path") != revision_reference["path"]
+            or revision_request.get("candidate_id")
+            != selected.get("revision_candidate_id")
+        ):
+            raise AgentWorkspaceError(
+                "effective revision writer RevisionRequest.v1 binding drifted"
+            )
     elif dirty_preimage_sha256 is not None:
         raise AgentWorkspaceError("non-revision writer may not carry dirty preimage binding")
     argv = _writer_task_argv(
@@ -4135,6 +4154,73 @@ def _collection_round_receipt_path(
     )
 
 
+def _revision_request_receipt_path(manifest: dict[str, Any]) -> Path:
+    return (
+        _workspace_dir(str(manifest["workspace_id"]))
+        / "revision-request-round-0001-to-0002.json"
+    )
+
+
+def _read_revision_request(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    path = _revision_request_receipt_path(manifest)
+    try:
+        request = candidate_verification.read_immutable_receipt(
+            path, validator=execution_plan.validate_revision_request
+        )
+    except (
+        candidate_verification.CandidateVerificationError,
+        execution_plan.ExecutionPlanError,
+    ) as exc:
+        raise AgentWorkspaceError(
+            f"RevisionRequest.v1 receipt is invalid: {_error_summary(exc)}"
+        ) from exc
+    return request, {
+        "path": str(path),
+        "revision_request_id": request["revision_request_id"],
+        "revision_request_sha256": _sha256_json(request),
+    }
+
+
+def _persist_revision_request(
+    manifest: dict[str, Any],
+    *,
+    collection: dict[str, Any],
+    candidate: dict[str, Any],
+    summary: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    scope = manifest.get("scope")
+    allowed_paths = scope.get("allowed_paths") if isinstance(scope, dict) else None
+    if not isinstance(allowed_paths, list) or not allowed_paths:
+        raise AgentWorkspaceError("candidate revision write scope is unavailable")
+    try:
+        request = execution_plan.build_revision_request(
+            candidate_id=str(candidate["candidate_id"]),
+            verification_summary_sha256=str(summary["summary_sha256"]),
+            collection_result_sha256=str(collection["result_sha256"]),
+            findings_sha256=str(summary["findings_sha256"]),
+            findings=summary["findings"],
+            round_number=1,
+            next_round=2,
+            write_scope=allowed_paths,
+            revision_index=1,
+            max_revisions=1,
+        )
+    except (KeyError, TypeError, execution_plan.ExecutionPlanError) as exc:
+        raise AgentWorkspaceError(
+            f"RevisionRequest.v1 construction failed: {_error_summary(exc)}"
+        ) from exc
+    path = _revision_request_receipt_path(manifest)
+    created = candidate_verification.persist_immutable_receipt(
+        path, request, validator=execution_plan.validate_revision_request
+    )
+    observed, reference = _read_revision_request(manifest)
+    if observed != request:
+        raise AgentWorkspaceError("RevisionRequest.v1 immutable readback drifted")
+    return request, {**reference, "created": created}
+
+
 def _validate_collection_round_receipt(
     value: Any, *, workspace_id: str, round_number: int
 ) -> dict[str, Any]:
@@ -4332,6 +4418,7 @@ def _transition_to_candidate_revision(
     collection: dict[str, Any],
     candidate: dict[str, Any],
     preimage_sha256: str,
+    revision_request_reference: dict[str, Any],
 ) -> dict[str, Any]:
     archive = _persist_collection_round_archive(manifest, collection, round_number=1)
     history = manifest.get("revision_history", [])
@@ -4339,6 +4426,18 @@ def _transition_to_candidate_revision(
         history = []
     if not isinstance(history, list) or history:
         raise AgentWorkspaceError("candidate revision history is not appendable")
+    if (
+        not isinstance(revision_request_reference, dict)
+        or set(revision_request_reference)
+        != {"path", "revision_request_id", "revision_request_sha256", "created"}
+        or not isinstance(revision_request_reference.get("created"), bool)
+        or not isinstance(revision_request_reference.get("path"), str)
+        or not isinstance(revision_request_reference.get("revision_request_id"), str)
+        or SHA256_RE.fullmatch(revision_request_reference["revision_request_id"]) is None
+        or not isinstance(revision_request_reference.get("revision_request_sha256"), str)
+        or SHA256_RE.fullmatch(revision_request_reference["revision_request_sha256"]) is None
+    ):
+        raise AgentWorkspaceError("RevisionRequest.v1 transition reference is invalid")
     history_entry = {
         "round": 1,
         "next_round": 2,
@@ -4346,6 +4445,7 @@ def _transition_to_candidate_revision(
         "result_sha256": collection["result_sha256"],
         "preimage_sha256": preimage_sha256,
         "verification_outcome": collection.get("verification_summary", {}).get("outcome"),
+        "revision_request": dict(revision_request_reference),
         "collection_archive": archive,
         "writer_patch": dict(collection.get("writer_result", {})),
         "task_ids": dict(collection.get("task_ids", {})),
@@ -4375,6 +4475,8 @@ def _transition_to_candidate_revision(
             "candidate_id": candidate["candidate_id"],
             "result_sha256": collection["result_sha256"],
             "preimage_sha256": preimage_sha256,
+            "revision_request_id": revision_request_reference["revision_request_id"],
+            "revision_request_sha256": revision_request_reference["revision_request_sha256"],
             "collection_archive_path": archive["path"],
         },
     )
@@ -8606,6 +8708,16 @@ def _bind_writer_handoff_attempt(
         collection = revision.get("collection")
         candidate = revision.get("candidate")
         preimage_sha256 = revision.get("preimage_sha256")
+        revision_request = revision.get("revision_request")
+        revision_request_reference = revision.get("revision_request_reference")
+        try:
+            validated_revision_request = execution_plan.validate_revision_request(
+                revision_request
+            )
+        except execution_plan.ExecutionPlanError as exc:
+            raise AgentWorkspaceError(
+                f"candidate RevisionRequest.v1 binding is invalid: {_error_summary(exc)}"
+            ) from exc
         if (
             not isinstance(collection, dict)
             or not isinstance(candidate, dict)
@@ -8614,6 +8726,18 @@ def _bind_writer_handoff_attempt(
             or candidate.get("round") != 1
             or collection.get("candidate_id") != candidate.get("candidate_id")
             or collection.get("diff_sha256") != preimage_sha256
+            or validated_revision_request.get("candidate_id") != candidate.get("candidate_id")
+            or validated_revision_request.get("collection_result_sha256")
+            != collection.get("result_sha256")
+            or validated_revision_request.get("verification_summary_sha256")
+            != collection.get("verification_summary", {}).get("summary_sha256")
+            or not isinstance(revision_request_reference, dict)
+            or revision_request_reference.get("revision_request_id")
+            != validated_revision_request.get("revision_request_id")
+            or revision_request_reference.get("revision_request_sha256")
+            != _sha256_json(validated_revision_request)
+            or revision_request_reference.get("path")
+            != str(_revision_request_receipt_path(manifest))
         ):
             raise AgentWorkspaceError("candidate revision binding is invalid")
         record.update(
@@ -8623,6 +8747,9 @@ def _bind_writer_handoff_attempt(
                 "revision_candidate_id": candidate["candidate_id"],
                 "revision_result_sha256": collection["result_sha256"],
                 "revision_preimage_sha256": preimage_sha256,
+                "revision_request_id": validated_revision_request["revision_request_id"],
+                "revision_request_sha256": _sha256_json(validated_revision_request),
+                "revision_request_path": str(_revision_request_receipt_path(manifest)),
             }
         )
     elif revision is not None:
@@ -8636,6 +8763,7 @@ def _bind_writer_handoff_attempt(
             collection=revision["collection"],
             candidate=revision["candidate"],
             preimage_sha256=revision["preimage_sha256"],
+            revision_request_reference=revision["revision_request_reference"],
         )
     lifecycle = manifest.get("checkout_lifecycle")
     if isinstance(lifecycle, dict):
@@ -8691,6 +8819,8 @@ def _bind_writer_handoff_attempt(
                 "revision_candidate_id": record["revision_candidate_id"],
                 "revision_result_sha256": record["revision_result_sha256"],
                 "revision_preimage_sha256": record["revision_preimage_sha256"],
+                "revision_request_id": record["revision_request_id"],
+                "revision_request_sha256": record["revision_request_sha256"],
             }
         )
     _append_workspace_event(
@@ -8781,8 +8911,17 @@ def _reconcile_writer_handoff_start(
                 if isinstance(raw_candidate, dict)
                 else None
             )
-        except candidate_verification.CandidateVerificationError:
+            revision_request, revision_request_reference = _read_revision_request(manifest)
+        except (candidate_verification.CandidateVerificationError, AgentWorkspaceError):
             candidate = None
+            revision_request = None
+            revision_request_reference = None
+        summary = (
+            collection.get("verification_summary")
+            if isinstance(collection, dict)
+            and isinstance(collection.get("verification_summary"), dict)
+            else None
+        )
         revision_valid = bool(
             isinstance(collection, dict)
             and collection.get("state") == "complete"
@@ -8796,13 +8935,30 @@ def _reconcile_writer_handoff_start(
             and intent.get("revision_preimage_sha256") == collection.get("diff_sha256")
             and isinstance(dirty_preimage_sha256, str)
             and SHA256_RE.fullmatch(dirty_preimage_sha256) is not None
-            and collection.get("verification_summary", {}).get("outcome") == "NEEDS_CHANGE"
+            and isinstance(summary, dict)
+            and summary.get("outcome") == "NEEDS_CHANGE"
+            and isinstance(revision_request, dict)
+            and isinstance(revision_request_reference, dict)
+            and revision_request.get("candidate_id") == candidate.get("candidate_id")
+            and revision_request.get("collection_result_sha256")
+            == collection.get("result_sha256")
+            and revision_request.get("verification_summary_sha256")
+            == summary.get("summary_sha256")
+            and revision_request.get("findings_sha256") == summary.get("findings_sha256")
+            and intent.get("revision_request_id")
+            == revision_request.get("revision_request_id")
+            and intent.get("revision_request_sha256")
+            == revision_request_reference.get("revision_request_sha256")
+            and intent.get("revision_request_path")
+            == revision_request_reference.get("path")
         )
         if revision_valid:
             revision = {
                 "collection": collection,
                 "candidate": candidate,
                 "preimage_sha256": dirty_preimage_sha256,
+                "revision_request": revision_request,
+                "revision_request_reference": {**revision_request_reference, "created": False},
             }
     if (
         intent.get("attempt") != 2
@@ -9096,6 +9252,32 @@ def _candidate_revision_handoff(
             "lane_receipt_sha256": lane_status.get("receipt_sha256"),
         },
     )
+    try:
+        revision_request, revision_request_reference = _persist_revision_request(
+            manifest,
+            collection=re_collection,
+            candidate=re_candidate,
+            summary=re_summary,
+        )
+    except Exception as exc:
+        _append_workspace_event(
+            manifest,
+            "candidate_revision_request",
+            role="writer",
+            outcome="blocked",
+            evidence={
+                "candidate_id": re_candidate["candidate_id"],
+                "result_sha256": re_collection["result_sha256"],
+                "error": _error_summary(exc),
+            },
+        )
+        _write_manifest(manifest)
+        return {
+            "workspace_id": identifier,
+            "state": "candidate_revision_request_blocked",
+            "error": _error_summary(exc),
+            "handoff_status": "blocked",
+        }
     output = _role_receipt_path(manifest, "writer", attempt=2)
     if os.path.lexists(output):
         return {
@@ -9135,6 +9317,9 @@ def _candidate_revision_handoff(
         "revision_candidate_id": re_candidate["candidate_id"],
         "revision_result_sha256": re_collection["result_sha256"],
         "revision_preimage_sha256": preimage_sha256,
+        "revision_request_id": revision_request["revision_request_id"],
+        "revision_request_sha256": revision_request_reference["revision_request_sha256"],
+        "revision_request_path": revision_request_reference["path"],
         "command_sha256": command_sha,
         "task_argv_sha256": _task_argv_sha256(task_argv),
         "task_host": host,
@@ -9153,6 +9338,8 @@ def _candidate_revision_handoff(
             "candidate_id": re_candidate["candidate_id"],
             "result_sha256": re_collection["result_sha256"],
             "preimage_sha256": preimage_sha256,
+            "revision_request_id": revision_request["revision_request_id"],
+            "revision_request_sha256": revision_request_reference["revision_request_sha256"],
             "command_sha256": command_sha,
             "task_argv_sha256": intent["task_argv_sha256"],
         },
@@ -9193,6 +9380,8 @@ def _candidate_revision_handoff(
             "collection": re_collection,
             "candidate": re_candidate,
             "preimage_sha256": preimage_sha256,
+            "revision_request": revision_request,
+            "revision_request_reference": revision_request_reference,
         },
     )
 
