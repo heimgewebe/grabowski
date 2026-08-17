@@ -903,6 +903,7 @@ class GripFoundationTests(unittest.TestCase):
             {
                 "branch-publish",
                 "candidate-integration-ready",
+                "agent-execution-happy-path",
                 "bureau-pickup-execute",
                 "bureau-pickup-orphan-reconcile",
                 "bureau-pickup-release",
@@ -3509,6 +3510,250 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("target_branch parameter must be a non-empty string", result["output"]["error"])
         self.assertEqual([], fake.calls)
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
+    def _happy_path_closed_status(self, *, valid: bool = True) -> dict[str, object]:
+        candidate_id = "1" * 64
+        result_sha256 = "2" * 64
+        status: dict[str, object] = {
+            "ownership_mode": "work_lane",
+            "closed": True,
+            "closure_outcome": "successful",
+            "close_integrity": {"valid": True},
+            "collection_integrity": {"valid": True},
+            "candidate_round": 1,
+            "failed_roles": [],
+            "incomplete_roles": [],
+            "collection": {
+                "state": "complete",
+                "writer_head": "3" * 40,
+                "diff_sha256": "4" * 64,
+                "result_sha256": result_sha256,
+                "candidate_manifest": {"candidate_id": candidate_id, "round": 1},
+                "verification_summary": {"outcome": "PASS"},
+                "tests": {"status": "passed", "returncode": 0},
+                "review": {
+                    "status": "passed",
+                    "returncode": 0,
+                    "verdict": "PASS",
+                    "findings": [],
+                },
+            },
+        }
+        if not valid:
+            status["collection"]["review"]["findings"] = [{"code": "still-open"}]
+        return status
+
+    def _happy_path_case(
+        self,
+        *,
+        coordinator_state: str = "verified_candidate_closed",
+        status: dict[str, object] | None = None,
+        writer_command: list[str] | None = None,
+        nested_status: str = "passed",
+        nested_output: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        workspace_id = "gaw-p5-happy-path"
+        command = ["codex", "exec", "--model", "gpt-5.6-sol"] if writer_command is None else writer_command
+        workspace_module = types.SimpleNamespace(
+            _manifest=Mock(
+                return_value={
+                    "workspace_id": workspace_id,
+                    "commands": {"writer": command},
+                    "resources": {"lane_binding": {"lane_id": "a" * 32}},
+                }
+            ),
+            _lane_backed=Mock(return_value=True),
+        )
+        coordinated = {
+            "schema_version": 1,
+            "kind": "agent_workspace_candidate_coordinator",
+            "workspace_id": workspace_id,
+            "state": coordinator_state,
+            "reason": "test",
+            "status": status if status is not None else self._happy_path_closed_status(),
+            "owns_state_store": False,
+            "adoption_performed": False,
+            "publication_performed": False,
+        }
+        coordinator_module = types.SimpleNamespace(
+            run_workspace_candidate_coordinator=Mock(return_value=coordinated)
+        )
+        if nested_output is None:
+            nested_output = {
+                "state": "integration_ready",
+                "integration_ready": True,
+                "cleanup_complete": True,
+                "reconcile_required": False,
+                "next_action": "observe_ci_and_review_then_merge_under_controller_authority",
+            }
+        nested = Mock(
+            return_value={
+                "receipt": {"status": nested_status, "receipt_sha256": "5" * 64},
+                "output": nested_output,
+            }
+        )
+        return {
+            "workspace_id": workspace_id,
+            "workspace": workspace_module,
+            "coordinator": coordinator_module,
+            "coordinated": coordinated,
+            "nested": nested,
+            "params": {
+                "workspace_id": workspace_id,
+                "base": "main",
+                "title": "P5 bounded happy path",
+                "body": "Coordinator to integration_ready",
+            },
+        }
+
+    def _run_happy_path_case(
+        self,
+        case: dict[str, object],
+        *,
+        params: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        original_run_grip = grips.run_grip
+        with (
+            patch.object(
+                grips,
+                "_agent_execution_happy_path_modules",
+                return_value=(case["coordinator"], case["workspace"]),
+            ),
+            patch.object(grips, "run_grip", side_effect=case["nested"]),
+        ):
+            return original_run_grip(
+                "agent-execution-happy-path",
+                dict(params or case["params"]),
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+    def test_agent_execution_happy_path_composes_coordinator_to_integration_ready(self) -> None:
+        case = self._happy_path_case()
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("integration_ready", result["output"]["state"])
+        self.assertTrue(result["output"]["integration_ready"])
+        case["coordinator"].run_workspace_candidate_coordinator.assert_called_once_with(
+            case["workspace_id"],
+            revision_argv=["codex", "exec", "--model", "gpt-5.6-sol"],
+            max_polls=4,
+            poll_seconds=0,
+        )
+        case["nested"].assert_called_once()
+        call = case["nested"].call_args
+        self.assertEqual("candidate-integration-ready", call.args[0])
+        self.assertEqual(
+            {
+                "workspace_id": case["workspace_id"],
+                "expected_candidate_id": "1" * 64,
+                "expected_result_sha256": "2" * 64,
+                "base": "main",
+                "title": "P5 bounded happy path",
+                "body": "Coordinator to integration_ready",
+            },
+            call.args[1],
+        )
+        self.assertTrue(call.kwargs["allow_mutation"])
+        self.assertEqual("1" * 64, result["output"]["candidate"]["candidate_id"])
+
+    def test_agent_execution_happy_path_pending_never_runs_candidate_integration(self) -> None:
+        case = self._happy_path_case(coordinator_state="pending")
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("pending", result["output"]["state"])
+        self.assertFalse(result["output"]["integration_ready"])
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_reconcile_never_runs_candidate_integration(self) -> None:
+        case = self._happy_path_case(coordinator_state="reconcile_required")
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertTrue(result["output"]["reconcile_required"])
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_requires_server_bound_writer_command_before_coordinator(self) -> None:
+        case = self._happy_path_case(writer_command=[])
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("bound writer command", result["output"]["error"])
+        case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_nested_failure_requires_readback_before_retry(self) -> None:
+        case = self._happy_path_case(
+            nested_status="failed",
+            nested_output={"error": "candidate adoption did not return a trustworthy outcome"},
+        )
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("integration_reconcile_required", result["output"]["state"])
+        self.assertTrue(result["output"]["reconcile_required"])
+        self.assertEqual(
+            "read_back_candidate_adoption_branch_and_pr_before_retry",
+            result["output"]["next_action"],
+        )
+        case["nested"].assert_called_once()
+
+    def test_agent_execution_happy_path_invalid_closed_candidate_never_integrates(self) -> None:
+        case = self._happy_path_case(status=self._happy_path_closed_status(valid=False))
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("closed_candidate_reconcile_required", result["output"]["state"])
+        self.assertTrue(result["output"]["reconcile_required"])
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_already_closed_candidate_uses_same_idempotent_integration(self) -> None:
+        case = self._happy_path_case(coordinator_state="closed")
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["integration_ready"])
+        case["nested"].assert_called_once()
+
+    def test_agent_execution_happy_path_rejects_caller_selected_effect_identity_before_coordinator(self) -> None:
+        for field, value in (
+            ("repo", "/tmp/other"),
+            ("branch", "feat/other"),
+            ("expected_head", "6" * 40),
+            ("expected_candidate_id", "7" * 64),
+            ("revision_argv", ["other", "writer"]),
+        ):
+            with self.subTest(field=field):
+                case = self._happy_path_case()
+                params = dict(case["params"])
+                params[field] = value
+                result = self._run_happy_path_case(case, params=params)
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertEqual("preflight", result["receipt"]["phase"])
+                case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
+                case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_is_grip_only_and_coordinator_is_runtime_supporting_source(self) -> None:
+        contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
+        contract = json.loads(contract_path.read_text())
+        self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
+        self.assertEqual(196, len(contract["expected_tools"]))
+        supporting = {
+            (item["module"], item["source"])
+            for item in contract["supporting_sources"]
+        }
+        self.assertIn(
+            (
+                "grabowski_execution_coordinator",
+                "src/grabowski_execution_coordinator.py",
+            ),
+            supporting,
+        )
+        self.assertIn("agent-execution-happy-path", grips.GRIP_SURFACE_ALLOWLIST)
 
     def _candidate_integration_case(
         self,
