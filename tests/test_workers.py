@@ -838,14 +838,27 @@ globalThis.fetch = async () => ({
         with patch.object(
             workers.operator,
             "_run",
-            side_effect=[failed_probe, result(returncode=1)],
-        ):
+            side_effect=[failed_probe, result(returncode=1), failed_probe],
+        ) as run:
             status = workers.worker_status(
                 worker["worker_id"], expected_kind="browser"
             )
+        unit_reset = status["last_observation"]["terminalization"]["unit_reset"]
+        self.assertEqual(unit_reset["status"], "incomplete")
+        self.assertEqual(unit_reset["readback"]["status"], "failed")
+        self.assertEqual(run.call_count, 3)
         self.assertEqual(
-            status["last_observation"]["terminalization"]["unit_reset"]["status"],
-            "incomplete",
+            run.call_args_list[2].args[0],
+            [
+                "systemctl",
+                "--user",
+                "show",
+                worker["unit"],
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
         )
         current = workers.worker_list("browser", limit=10)
         self.assertEqual(current["count"], 1)
@@ -870,6 +883,67 @@ globalThis.fetch = async () => ({
         self.assertEqual(
             retried["last_observation"]["terminalization"]["unit_reset"]["status"],
             "reset",
+        )
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
+    def test_failed_unit_reset_retry_settles_when_unit_is_no_longer_loaded(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(
+                str(self.binary), port=9355, runtime_seconds=60
+            )
+        worker = started["worker"]
+        failed_probe = result(
+            stdout="LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+        )
+        with patch.object(
+            workers.operator,
+            "_run",
+            side_effect=[failed_probe, result(returncode=1), failed_probe],
+        ):
+            first = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        self.assertEqual(
+            first["last_observation"]["terminalization"]["unit_reset"]["status"],
+            "incomplete",
+        )
+        not_loaded_probe = result(
+            stdout="LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+        )
+        with patch.object(
+            workers,
+            "_observe",
+            side_effect=AssertionError("reset retry must not use full worker observation"),
+        ), patch.object(
+            workers.operator,
+            "_run",
+            side_effect=[result(returncode=1), not_loaded_probe],
+        ) as run:
+            settled = workers.worker_status(
+                worker["worker_id"], expected_kind="browser"
+            )
+        unit_reset = settled["last_observation"]["terminalization"]["unit_reset"]
+        self.assertEqual(unit_reset["status"], "not-required")
+        self.assertEqual(unit_reset["readback"]["status"], "not-failed")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ["systemctl", "--user", "reset-failed", worker["unit"]],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            [
+                "systemctl",
+                "--user",
+                "show",
+                worker["unit"],
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+            ],
         )
         self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
 

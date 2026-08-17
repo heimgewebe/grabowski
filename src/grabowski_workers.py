@@ -893,10 +893,15 @@ def _reset_failed_unit(
         timeout_seconds=30,
         max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
     )
-    outcome = {
+    outcome: dict[str, Any] = {
         "status": "reset" if result.get("returncode") == 0 else "incomplete",
         "result": result,
     }
+    if result.get("returncode") != 0:
+        readback = _probe_failed_unit_state(record)
+        outcome["readback"] = readback
+        if readback["status"] == "not-failed":
+            outcome["status"] = "not-required"
     if probe is not None:
         outcome["probe"] = probe
     return outcome
