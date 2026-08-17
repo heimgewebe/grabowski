@@ -131,6 +131,25 @@ def _lexical_checkout_path_observation(
     return path, True, []
 
 
+def _branch_head_relation(
+    repo: Path, expected_head: str, branch_head: str | None
+) -> tuple[str, list[str]]:
+    if branch_head is None:
+        return "missing", ["branch-ref-missing"]
+    if branch_head == expected_head:
+        return "exact", []
+    ancestry = checkouts._git_read(
+        repo,
+        ["merge-base", "--is-ancestor", expected_head, branch_head],
+        check=False,
+    )
+    if ancestry.returncode == 0:
+        return "descendant", []
+    if ancestry.returncode == 1:
+        return "diverged", ["branch-head-drift"]
+    return "unobservable", ["branch-head-ancestry-unobservable"]
+
+
 def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     repo = checkouts._resolve_repo(binding["repo_path"])
     common_dir = checkouts._git_common_dir(repo)
@@ -168,10 +187,10 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         check=False,
     )
     branch_head = branch_read.stdout.strip() if branch_read.returncode == 0 else None
-    if branch_head is None:
-        blockers.append("branch-ref-missing")
-    elif branch_head != binding["expected_head"]:
-        blockers.append("branch-head-drift")
+    branch_head_relation, branch_blockers = _branch_head_relation(
+        repo, binding["expected_head"], branch_head
+    )
+    blockers.extend(branch_blockers)
     return {
         "repository": str(top_level),
         "repo_common_dir": str(common_dir),
@@ -181,6 +200,7 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         "worktree_record": record,
         "branch_ref": branch_ref,
         "branch_head": branch_head,
+        "branch_head_relation": branch_head_relation,
         "expected_head": binding["expected_head"],
         "expected_branch": binding["expected_branch"],
         "blockers": sorted(set(blockers)),
@@ -424,39 +444,94 @@ def apply(
             if binding_row is None or retention_row is None:
                 raise RuntimeError("checkout lifecycle state disappeared before apply")
             binding_before = checkouts._lifecycle_public(binding_row)
-            retention = checkouts._retention_public(retention_row)
+            retention_before = checkouts._retention_public(retention_row)
             if (
                 checkouts._sha256_json(binding_before) != planned["binding_sha256"]
-                or checkouts._sha256_json(retention) != planned["retention_sha256"]
+                or checkouts._sha256_json(retention_before) != planned["retention_sha256"]
             ):
                 raise RuntimeError("checkout lifecycle CAS preimage changed")
+            checkout_observation = planned["checkout_observation"]
+            relation = checkout_observation.get("branch_head_relation")
+            rebind_head = (
+                checkout_observation.get("branch_head")
+                if relation == "descendant"
+                else binding_before["expected_head"]
+            )
+            if not isinstance(rebind_head, str):
+                raise RuntimeError("terminal reconciliation lacks an exact terminal head")
+            lifecycle_updated_at = max(
+                applied_at, int(binding_before["updated_at_unix"]) + 1
+            )
             updated = connection.execute(
                 """
                 UPDATE lifecycle_bindings
                 SET phase='externally_terminal_missing',
+                    expected_head=?,
                     terminal_at_unix=COALESCE(terminal_at_unix, ?),
                     archived_at_unix=NULL,
                     updated_at_unix=?
-                WHERE checkout_key=? AND owner_id=? AND phase=? AND updated_at_unix=?
+                WHERE checkout_key=? AND owner_id=? AND phase=?
+                  AND expected_head=? AND updated_at_unix=?
                 """,
                 (
+                    rebind_head,
                     applied_at,
-                    applied_at,
+                    lifecycle_updated_at,
                     key,
                     owner,
                     binding_before["phase"],
+                    binding_before["expected_head"],
                     binding_before["updated_at_unix"],
                 ),
             )
             if updated.rowcount != 1:
                 raise RuntimeError("checkout lifecycle CAS transition was not applied exactly")
+            if rebind_head != retention_before["expected_head"]:
+                retention_updated_at = max(
+                    applied_at, int(retention_before["updated_at_unix"]) + 1
+                )
+                retention_updated = connection.execute(
+                    """
+                    UPDATE retention
+                    SET expected_head=?, updated_at_unix=?
+                    WHERE checkout_key=? AND owner_id=? AND expected_head=?
+                      AND updated_at_unix=?
+                    """,
+                    (
+                        rebind_head,
+                        retention_updated_at,
+                        key,
+                        owner,
+                        retention_before["expected_head"],
+                        retention_before["updated_at_unix"],
+                    ),
+                )
+                if retention_updated.rowcount != 1:
+                    raise RuntimeError("checkout retention head rebind was not applied exactly")
             binding_after_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
                 (key,),
             ).fetchone()
-            if binding_after_row is None:
+            retention_after_row = connection.execute(
+                "SELECT * FROM retention WHERE checkout_key=?",
+                (key,),
+            ).fetchone()
+            if binding_after_row is None or retention_after_row is None:
                 raise RuntimeError("checkout lifecycle post-state disappeared")
             binding_after = checkouts._lifecycle_public(binding_after_row)
+            retention_after = checkouts._retention_public(retention_after_row)
+            branch_head_rebind = (
+                {
+                    "relation": "descendant",
+                    "from_head": binding_before["expected_head"],
+                    "to_head": rebind_head,
+                }
+                if rebind_head != binding_before["expected_head"]
+                else None
+            )
+            effects = ["lifecycle_phase_transition"]
+            if branch_head_rebind is not None:
+                effects.append("terminal_head_rebind")
             receipt_core = {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "checkout_terminal_reconciliation_receipt",
@@ -466,14 +541,19 @@ def apply(
                 "binding_before_sha256": planned["binding_sha256"],
                 "binding_after": binding_after,
                 "binding_after_sha256": checkouts._sha256_json(binding_after),
+                "retention_before": retention_before,
                 "retention_sha256": planned["retention_sha256"],
+                "retention_before_sha256": planned["retention_sha256"],
+                "retention_after": retention_after,
+                "retention_after_sha256": checkouts._sha256_json(retention_after),
+                "branch_head_rebind": branch_head_rebind,
                 "source_evidence": planned["source_evidence"],
                 "source_evidence_sha256": planned["source_evidence"]["evidence_sha256"],
                 "preview_sha256": preview_sha256,
                 "preview_created_at_unix": preview_created_at_unix,
                 "applied_at_unix": applied_at,
                 "resource_keys": resource_keys,
-                "effects": ["lifecycle_phase_transition"],
+                "effects": effects,
                 "does_not_establish": [
                     "archive_or_cleanup_authority",
                     "branch_or_ref_deletion_authority",

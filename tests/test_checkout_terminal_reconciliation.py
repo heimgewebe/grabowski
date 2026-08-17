@@ -155,6 +155,21 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             str(binding["checkout_key"])
         ]
 
+    def _advance_topic_branch(self) -> str:
+        self._git("worktree", "add", str(self.checkout), "topic")
+        (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")
+        self._git("add", "later.txt", cwd=self.checkout)
+        self._git("commit", "-m", "later topic work", cwd=self.checkout)
+        new_head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        self._git("worktree", "remove", str(self.checkout))
+        return new_head
+
+    def _diverge_topic_branch(self) -> str:
+        tree = self._git("rev-parse", f"{self.head}^{{tree}}").stdout.strip()
+        unrelated = self._git("commit-tree", tree, "-m", "unrelated root").stdout.strip()
+        self._git("update-ref", "refs/heads/topic", unrelated)
+        return unrelated
+
     @staticmethod
     def _terminal_source_evidence(binding: dict[str, object]) -> dict[str, object]:
         source = binding["source"]
@@ -267,6 +282,43 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
                     int(preview["preview_created_at_unix"]),
                     reconciliation.CONFIRMATION,
                 )
+
+    def test_descendant_branch_head_is_rebound_during_terminal_apply(self) -> None:
+        binding = self._missing_binding()
+        descendant = self._advance_topic_branch()
+        preview = self._preview(binding)
+        self.assertTrue(preview["safe_to_apply"])
+        self.assertEqual("descendant", preview["checkout_observation"]["branch_head_relation"])
+        self.assertEqual(descendant, preview["checkout_observation"]["branch_head"])
+        result = self._apply(binding, preview)
+        self.assertEqual(
+            ["lifecycle_phase_transition", "terminal_head_rebind"],
+            result["receipt"]["effects"],
+        )
+        self.assertEqual(
+            {"relation": "descendant", "from_head": self.head, "to_head": descendant},
+            result["receipt"]["branch_head_rebind"],
+        )
+        current = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        retention = checkouts._retention_records([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("externally_terminal_missing", current["phase"])
+        self.assertEqual(descendant, current["expected_head"])
+        self.assertEqual(descendant, retention["expected_head"])
+
+    def test_diverged_branch_head_still_blocks_terminal_reconciliation(self) -> None:
+        binding = self._missing_binding()
+        unrelated = self._diverge_topic_branch()
+        preview = self._preview(binding)
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertEqual("diverged", preview["checkout_observation"]["branch_head_relation"])
+        self.assertEqual(unrelated, preview["checkout_observation"]["branch_head"])
+        self.assertIn("branch-head-drift", preview["blockers"])
+        with self.assertRaisesRegex(RuntimeError, "branch-head-drift"):
+            self._apply(binding, preview)
 
     def test_broken_symlink_at_bound_path_blocks_without_mutation(self) -> None:
         binding = self._missing_binding()

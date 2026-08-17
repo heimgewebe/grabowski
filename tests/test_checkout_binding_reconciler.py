@@ -172,6 +172,60 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
             "checkout_absence_as_cleanup_proof", result["does_not_establish"]
         )
 
+    def test_archived_legacy_retention_may_omit_branch_when_binding_and_archive_agree(self) -> None:
+        retention = dict(binding()["retention"])
+        retention["expected_branch"] = None
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                retention=retention,
+                latest_archive={
+                    "archive_id": "archive-legacy-branch",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": HEAD,
+                    "branch": "topic",
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": None,
+                    "cleanup_plan_id": None,
+                },
+            ),
+            worktree(),
+            repository_observable=True,
+        )
+        self.assertEqual("bound_present", result["state"])
+        self.assertFalse(result["blocking"])
+        self.assertEqual([], result["reasons"])
+
+    def test_archived_legacy_retention_omission_does_not_hide_binding_archive_drift(self) -> None:
+        retention = dict(binding()["retention"])
+        retention["expected_branch"] = None
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                retention=retention,
+                latest_archive={
+                    "archive_id": "archive-different-branch",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": HEAD,
+                    "branch": "other-topic",
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": None,
+                    "cleanup_plan_id": None,
+                },
+            ),
+            worktree(),
+            repository_observable=True,
+        )
+        self.assertEqual("binding_identity_drift", result["state"])
+        self.assertTrue(result["blocking"])
+        self.assertIn("binding-archive-branch-mismatch", result["reasons"])
+
     def test_cleaned_archive_uses_terminal_retention_identity(self) -> None:
         final_head = "b" * 40
         retention = dict(binding()["retention"])

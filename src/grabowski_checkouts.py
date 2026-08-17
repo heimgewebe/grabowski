@@ -49,6 +49,8 @@ CHECKOUT_LOCK = Path(
 ).expanduser()
 DRY_RUN_TTL_SECONDS = 15 * 60
 OPERATION_LEASE_TTL_SECONDS = 10 * 60
+OWNER_HANDOFF_PREVIEW_TTL_SECONDS = 5 * 60
+OWNER_HANDOFF_CONFIRMATION = "align-checkout-owner-bindings"
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
 # Cleanup is deliberately delayed so recovery evidence has one full day to surface.
 CHECKOUT_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
@@ -1959,15 +1961,19 @@ def _linked_checkout_coordination(
     include_processes: bool = True,
     include_tasks: bool = True,
     include_resources: bool = True,
+    ignored_lease_owner_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     if owner_id is not None:
         _owner(owner_id)
+    ignored_owners = {_owner(item) for item in ignored_lease_owner_ids}
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
         branch_resource_key = (
             f"repo:{repo_path}:branch:{branch}" if isinstance(branch, str) and branch else None
         )
         for lease in _read_resource_leases():
+            if lease["owner_id"] in ignored_owners:
+                continue
             resource_key = lease["resource_key"]
             if not (
                 _resource_related(resource_key, [checkout_path, repo_common_dir])
@@ -2711,6 +2717,301 @@ def grabowski_checkout_binding_terminal_apply(
         preview_created_at_unix,
         confirmation,
     )
+
+
+def _owner_handoff_state(
+    *,
+    repo: str,
+    checkout_path: str,
+    source_lifecycle_owner_id: str,
+    source_retention_owner_id: str,
+    target_owner_id: str,
+    expected_head: str,
+    expected_branch: str | None,
+    observed_at_unix: int,
+    ignored_lease_owner_ids: Iterable[str] = (),
+) -> dict[str, Any]:
+    lifecycle_owner = _owner(source_lifecycle_owner_id)
+    retention_owner = _owner(source_retention_owner_id)
+    target_owner = _owner(target_owner_id)
+    if lifecycle_owner == retention_owner:
+        raise RuntimeError("checkout owner handoff requires an existing owner mismatch")
+    if target_owner != retention_owner:
+        raise PermissionError("target owner must equal the current retention owner")
+    head = _validate_git_object_id(expected_head, "expected_head")
+    branch = _expected_branch(expected_branch)
+    repo_path = _resolve_repo(repo)
+    checkout = _safe_path(checkout_path, must_exist=True)
+    _reject_evidence_checkout(checkout)
+    top_level, common_dir, record = _worktree_for_path(repo_path, checkout)
+    status = _require_clean_linked(record)
+    _require_expected(record, head, branch)
+    coordination = _linked_checkout_coordination(
+        checkout,
+        top_level,
+        common_dir,
+        branch=record.get("branch"),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+        ignored_lease_owner_ids=ignored_lease_owner_ids,
+    )
+    _require_no_blockers(coordination)
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        raise RuntimeError("Checkout lifecycle database is missing")
+    try:
+        lifecycle_row = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (record["checkout_key"],),
+        ).fetchone()
+        retention_row = connection.execute(
+            "SELECT * FROM retention WHERE checkout_key=?",
+            (record["checkout_key"],),
+        ).fetchone()
+        archive_row = connection.execute(
+            "SELECT archive_id FROM archives WHERE checkout_key=? LIMIT 1",
+            (record["checkout_key"],),
+        ).fetchone()
+    finally:
+        connection.close()
+    if lifecycle_row is None or retention_row is None:
+        raise RuntimeError("Checkout owner handoff requires lifecycle and retention rows")
+    lifecycle = _lifecycle_public(lifecycle_row)
+    retention = _retention_public(retention_row)
+    if lifecycle["owner_id"] != lifecycle_owner:
+        raise PermissionError("Checkout lifecycle source owner changed")
+    if retention["owner_id"] != retention_owner:
+        raise PermissionError("Checkout retention source owner changed")
+    if lifecycle["phase"] != "completed_retained":
+        raise RuntimeError("Checkout owner handoff is limited to completed-retained bindings")
+    if archive_row is not None:
+        raise RuntimeError("Checkout owner handoff is unavailable after archive creation")
+    expected_identity = {
+        "repo_common_dir": str(common_dir),
+        "repo_path": str(top_level),
+        "checkout_path": str(checkout),
+        "expected_head": head,
+        "expected_branch": branch,
+    }
+    for row_name, row in (("lifecycle", lifecycle), ("retention", retention)):
+        for field, expected in expected_identity.items():
+            if row[field] != expected:
+                raise RuntimeError(f"Checkout {row_name} {field} changed before owner handoff")
+    if retention["retention_until_unix"] <= observed_at_unix:
+        raise RuntimeError("Checkout retention expired before owner handoff")
+    consistency = _binding_consistency(
+        record,
+        {"binding": lifecycle, "retention": retention, "latest_archive": None},
+        exists=True,
+    )
+    if consistency["drift_reasons"] != ["binding-retention-owner-mismatch"]:
+        raise RuntimeError(
+            "Checkout owner handoff requires exactly binding-retention-owner-mismatch drift"
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "checkout_owner_handoff_preview",
+        "observed_at_unix": observed_at_unix,
+        "expires_at_unix": observed_at_unix + OWNER_HANDOFF_PREVIEW_TTL_SECONDS,
+        "checkout": {
+            "checkout_key": record["checkout_key"],
+            "repo_common_dir": str(common_dir),
+            "repo_path": str(top_level),
+            "checkout_path": str(checkout),
+            "head": record["head"],
+            "branch": record.get("branch"),
+            "dirty": status["dirty"],
+            "entry_count": status["entry_count"],
+        },
+        "owners": {
+            "source_lifecycle_owner_id": lifecycle_owner,
+            "source_retention_owner_id": retention_owner,
+            "target_owner_id": target_owner,
+        },
+        "lifecycle": lifecycle,
+        "lifecycle_sha256": _sha256_json(lifecycle),
+        "retention": retention,
+        "retention_sha256": _sha256_json(retention),
+        "allowed_drift_reasons": consistency["drift_reasons"],
+        "coordination": coordination,
+        "does_not_establish": [
+            "permission_to_archive",
+            "permission_to_cleanup",
+            "permission_to_delete_checkout",
+            "permission_to_delete_branch",
+            "permission_to_adopt_dirty_work",
+        ],
+    }
+    digest = _sha256_json(material)
+    return {
+        **material,
+        "snapshot_sha256": digest,
+        "confirmation": f"{OWNER_HANDOFF_CONFIRMATION}:{record['checkout_key']}:{digest}",
+    }
+
+
+def checkout_owner_handoff_preview(
+    repo: str,
+    checkout_path: str,
+    source_lifecycle_owner_id: str,
+    source_retention_owner_id: str,
+    target_owner_id: str,
+    expected_head: str,
+    expected_branch: str | None = None,
+) -> dict[str, Any]:
+    operator._require_operator_capability("git_cli")
+    return _owner_handoff_state(
+        repo=repo,
+        checkout_path=checkout_path,
+        source_lifecycle_owner_id=source_lifecycle_owner_id,
+        source_retention_owner_id=source_retention_owner_id,
+        target_owner_id=target_owner_id,
+        expected_head=expected_head,
+        expected_branch=expected_branch,
+        observed_at_unix=_now(),
+    )
+
+
+def checkout_owner_handoff_apply(
+    repo: str,
+    checkout_path: str,
+    source_lifecycle_owner_id: str,
+    source_retention_owner_id: str,
+    target_owner_id: str,
+    expected_head: str,
+    expected_branch: str | None,
+    expected_snapshot_sha256: str,
+    preview_created_at_unix: int,
+    confirmation: str,
+) -> dict[str, Any]:
+    operator._require_operator_mutation("git_cli")
+    operator._require_operator_mutation("resource_lease")
+    snapshot_sha256 = _validate_sha256(expected_snapshot_sha256, "expected_snapshot_sha256")
+    if isinstance(preview_created_at_unix, bool) or not isinstance(preview_created_at_unix, int):
+        raise ValueError("preview_created_at_unix must be an integer")
+    now = _now()
+    if not preview_created_at_unix <= now <= preview_created_at_unix + OWNER_HANDOFF_PREVIEW_TTL_SECONDS:
+        raise RuntimeError("Checkout owner handoff preview expired or is future-dated")
+    planned = _owner_handoff_state(
+        repo=repo,
+        checkout_path=checkout_path,
+        source_lifecycle_owner_id=source_lifecycle_owner_id,
+        source_retention_owner_id=source_retention_owner_id,
+        target_owner_id=target_owner_id,
+        expected_head=expected_head,
+        expected_branch=expected_branch,
+        observed_at_unix=preview_created_at_unix,
+    )
+    if planned["snapshot_sha256"] != snapshot_sha256:
+        raise RuntimeError("Checkout owner handoff snapshot changed")
+    if confirmation != planned["confirmation"]:
+        raise PermissionError("Checkout owner handoff confirmation mismatch")
+    checkout = Path(planned["checkout"]["checkout_path"])
+    top_level = Path(planned["checkout"]["repo_path"])
+    common_dir = Path(planned["checkout"]["repo_common_dir"])
+    target_owner = planned["owners"]["target_owner_id"]
+    lease = _acquire_checkout_resources(
+        owner_id=target_owner,
+        repo_common_dir=common_dir,
+        checkout_path=checkout,
+        purpose="atomically align checkout lifecycle ownership",
+        retention_until_unix=int(planned["retention"]["retention_until_unix"]),
+        repo_path=top_level,
+        branch=planned["checkout"]["branch"],
+        metadata={
+            "checkout_key": planned["checkout"]["checkout_key"],
+            "snapshot_sha256": snapshot_sha256,
+        },
+    )
+    result: dict[str, Any] | None = None
+    try:
+        current = _owner_handoff_state(
+            repo=repo,
+            checkout_path=checkout_path,
+            source_lifecycle_owner_id=source_lifecycle_owner_id,
+            source_retention_owner_id=source_retention_owner_id,
+            target_owner_id=target_owner_id,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
+            observed_at_unix=preview_created_at_unix,
+            ignored_lease_owner_ids=[lease["owner_id"]],
+        )
+        if current["snapshot_sha256"] != snapshot_sha256:
+            raise RuntimeError("Checkout owner handoff snapshot changed after lease acquisition")
+        applied_at = _now()
+        with _operation_lock(), _database() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lifecycle_row = connection.execute(
+                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                (planned["checkout"]["checkout_key"],),
+            ).fetchone()
+            retention_row = connection.execute(
+                "SELECT * FROM retention WHERE checkout_key=?",
+                (planned["checkout"]["checkout_key"],),
+            ).fetchone()
+            if lifecycle_row is None or retention_row is None:
+                raise RuntimeError("Checkout owner handoff state disappeared")
+            lifecycle_before = _lifecycle_public(lifecycle_row)
+            retention_before = _retention_public(retention_row)
+            if (
+                _sha256_json(lifecycle_before) != planned["lifecycle_sha256"]
+                or _sha256_json(retention_before) != planned["retention_sha256"]
+            ):
+                raise RuntimeError("Checkout owner handoff database preimage changed")
+            if retention_before["owner_id"] != target_owner:
+                raise RuntimeError("Checkout retention owner changed before lifecycle owner handoff")
+            lifecycle_updated_at = max(applied_at, int(lifecycle_before["updated_at_unix"]) + 1)
+            lifecycle_update = connection.execute(
+                "UPDATE lifecycle_bindings SET owner_id=?, updated_at_unix=? "
+                "WHERE checkout_key=? AND owner_id=? AND updated_at_unix=?",
+                (target_owner, lifecycle_updated_at, planned["checkout"]["checkout_key"], lifecycle_before["owner_id"], lifecycle_before["updated_at_unix"]),
+            )
+            if lifecycle_update.rowcount != 1:
+                raise RuntimeError("Checkout lifecycle owner handoff lost its exact database binding")
+            effects = ["lifecycle_owner_update"]
+            connection.commit()
+        lifecycle_after = _lifecycle_bindings([planned["checkout"]["checkout_key"]])[planned["checkout"]["checkout_key"]]
+        retention_after = _retention_records([planned["checkout"]["checkout_key"]])[planned["checkout"]["checkout_key"]]
+        if lifecycle_after["owner_id"] != target_owner or retention_after["owner_id"] != target_owner:
+            raise RuntimeError("Checkout owner handoff post-state owner mismatch")
+        audit = {
+            "timestamp_unix": applied_at,
+            "operation": "checkout-owner-handoff",
+            "checkout_key": planned["checkout"]["checkout_key"],
+            "repo": planned["checkout"]["repo_path"],
+            "checkout_path": planned["checkout"]["checkout_path"],
+            "head": planned["checkout"]["head"],
+            "branch": planned["checkout"]["branch"],
+            "source_lifecycle_owner_id": planned["owners"]["source_lifecycle_owner_id"],
+            "source_retention_owner_id": planned["owners"]["source_retention_owner_id"],
+            "target_owner_id": target_owner,
+            "snapshot_sha256": snapshot_sha256,
+            "effects": effects,
+        }
+        try:
+            base._append_audit(audit)
+        except Exception as exc:
+            raise RuntimeError(
+                "Checkout owner handoff audit failed after database update; readback required"
+            ) from exc
+        result = {
+            "schema_version": 1,
+            "kind": "checkout_owner_handoff_result",
+            "status": "applied",
+            "snapshot_sha256": snapshot_sha256,
+            "before": {"lifecycle": lifecycle_before, "retention": retention_before},
+            "after": {"lifecycle": lifecycle_after, "retention": retention_after},
+            "audit": audit,
+            "lease": lease,
+            "does_not_establish": planned["does_not_establish"],
+        }
+    finally:
+        lease_release = _release_checkout_resources(lease)
+    if result is None:
+        raise RuntimeError("Checkout owner handoff produced no result")
+    result["lease_release"] = lease_release
+    return result
 
 
 @mcp.tool(name="grabowski_checkout_inventory", annotations=READ_ONLY)

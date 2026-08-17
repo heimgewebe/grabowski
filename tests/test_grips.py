@@ -916,6 +916,8 @@ class GripFoundationTests(unittest.TestCase):
                 "n8n-workflow-edge-verify",
                 "checkout-binding-terminal-apply",
                 "checkout-binding-terminal-preview",
+                "checkout-owner-handoff-apply",
+                "checkout-owner-handoff-preview",
                 "transport-roundtrip",
                 "convergence-assess",
                 "convergence-state-classify",
@@ -975,6 +977,7 @@ class GripFoundationTests(unittest.TestCase):
             "worktree-ensure",
             "worktree-hygiene-reconcile",
             "checkout-binding-terminal-apply",
+            "checkout-owner-handoff-apply",
         ):
             self.assertEqual("worktree_admin", specs[name]["operation_effect_class"])
             self.assertEqual("worktree-admin", specs[name]["operation_class"])
@@ -1381,6 +1384,101 @@ class GripFoundationTests(unittest.TestCase):
             )
         self.assertEqual("blocked", result["status"])
         terminal_apply.assert_not_called()
+
+    def test_checkout_binding_terminal_apply_accepts_descendant_head_rebind_receipt(self) -> None:
+        checkout_key = "a" * 64
+        old_head = "1" * 40
+        new_head = "2" * 40
+        expected_preview = "c" * 64
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "binding_before": {"phase": "active", "expected_head": old_head},
+            "binding_after": {"phase": "externally_terminal_missing", "expected_head": new_head},
+            "retention_before": {"owner_id": "owner-a", "expected_head": old_head, "expected_branch": "topic"},
+            "retention_after": {"owner_id": "owner-a", "expected_head": new_head, "expected_branch": "topic"},
+            "branch_head_rebind": {"relation": "descendant", "from_head": old_head, "to_head": new_head},
+            "effects": ["lifecycle_phase_transition", "terminal_head_rebind"],
+            "receipt_sha256": "e" * 64,
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={"status": "applied", "receipt": terminal_receipt},
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                {
+                    "checkout_key": checkout_key,
+                    "owner_id": "owner-a",
+                    "expected_preview_sha256": expected_preview,
+                    "preview_created_at_unix": 100,
+                    "confirmation": "reconcile-terminal-missing-checkout",
+                },
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        check = next(item for item in result["receipt"]["checks"] if item["id"] == "lifecycle-only-effect")
+        self.assertEqual("pass", check["status"])
+        self.assertIn("terminal_head_rebind", check["detail"])
+
+    def test_checkout_owner_handoff_preview_grip_delegates_without_new_mcp_surface(self) -> None:
+        snapshot = "d" * 64
+        preview = {
+            "kind": "checkout_owner_handoff_preview",
+            "observed_at_unix": 100,
+            "snapshot_sha256": snapshot,
+            "checkout": {"checkout_key": "e" * 64, "checkout_path": "/tmp/topic", "head": "a" * 40, "dirty": False},
+            "owners": {"target_owner_id": "owner-b"},
+            "allowed_drift_reasons": ["binding-retention-owner-mismatch"],
+            "coordination": {"blocking": False},
+        }
+        parameters = {
+            "repo": "/tmp/repo",
+            "checkout_path": "/tmp/topic",
+            "source_lifecycle_owner_id": "owner-a",
+            "source_retention_owner_id": "owner-b",
+            "target_owner_id": "owner-b",
+            "expected_head": "a" * 40,
+            "expected_branch": "topic",
+        }
+        with patch("grabowski_checkouts.checkout_owner_handoff_preview", return_value=preview) as handoff:
+            result = grips.grip_run("checkout-owner-handoff-preview", parameters)
+        self.assertEqual("passed", result["status"])
+        handoff.assert_called_once()
+        self.assertEqual(snapshot, result["output"]["snapshot_sha256"])
+
+    def test_checkout_owner_handoff_apply_requires_mutation_and_exact_snapshot(self) -> None:
+        parameters = {
+            "repo": "/tmp/repo",
+            "checkout_path": "/tmp/topic",
+            "source_lifecycle_owner_id": "owner-a",
+            "source_retention_owner_id": "owner-b",
+            "target_owner_id": "owner-b",
+            "expected_head": "a" * 40,
+            "expected_branch": "topic",
+            "expected_snapshot_sha256": "d" * 64,
+            "preview_created_at_unix": 100,
+            "confirmation": "align-checkout-owner-bindings:key:digest",
+        }
+        output = {
+            "status": "applied",
+            "before": {"lifecycle": {"owner_id": "owner-a"}, "retention": {"owner_id": "owner-b"}},
+            "after": {"lifecycle": {"owner_id": "owner-b"}, "retention": {"owner_id": "owner-b"}},
+            "audit": {"effects": ["lifecycle_owner_update"]},
+        }
+        with patch("grabowski_checkouts.checkout_owner_handoff_apply", return_value=output) as handoff:
+            blocked = grips.grip_run("checkout-owner-handoff-apply", parameters)
+            self.assertEqual("blocked", blocked["status"])
+            handoff.assert_not_called()
+            result = grips.grip_run("checkout-owner-handoff-apply", parameters, allow_mutation=True)
+        self.assertEqual("passed", result["status"])
+        handoff.assert_called_once()
+        checks = {item["id"]: item for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["ownership-converged"]["status"])
+        self.assertEqual("pass", checks["no-cleanup-effect"]["status"])
 
     def test_work_acquire_grip_exposes_existing_lane_contract(self) -> None:
         parameters = {
