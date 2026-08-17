@@ -71,8 +71,11 @@ operator's `SO_PEERCRED` with a child-process identity.
 
 The socket-activated root process reads kernel `SO_PEERCRED`, requires the exact
 operator UID, and independently queries the owning user systemd manager for the
-configured unit's active `MainPID` and `ControlGroup`. The socket peer PID must
-be that exact `MainPID`, its observed cgroup must equal the systemd
+configured unit's active `MainPID` and `ControlGroup`. The user-manager bus is
+resolved only from the configured UID: `/run/user/<uid>` must be UID/GID-owned
+mode `0700`, its `bus` endpoint must be an owned Unix socket, and caller-supplied
+`XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` values are ignored. The socket
+peer PID must be that exact `MainPID`, its observed cgroup must equal the systemd
 `ControlGroup`, and `/proc/<pid>/cmdline` must equal Grabowski's fixed operator
 entrypoint argv. This means writable user-cgroup membership alone grants no
 authority.

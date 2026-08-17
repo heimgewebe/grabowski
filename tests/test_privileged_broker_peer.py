@@ -347,7 +347,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                     )
 
     def test_root_broker_reads_authoritative_user_systemd_main_pid(self) -> None:
-        account = mock.Mock(pw_name="alex", pw_dir="/home/alex")
+        account = mock.Mock(pw_name="alex", pw_dir="/home/alex", pw_gid=1000)
         completed = subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -365,8 +365,15 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                 broker_tool.subprocess, "run", return_value=completed
             ) as run,
         ):
+            bus_environment = {
+                **broker_tool.SAFE_ENV,
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            }
             identity = broker_tool._operator_user_unit_identity(
-                1000, "grabowski-operator.service"
+                1000,
+                "grabowski-operator.service",
+                bus_environment=bus_environment,
             )
         self.assertEqual(identity["main_pid"], 1234)
         self.assertEqual(identity["control_group"], self.SERVICE_CGROUP)
@@ -375,6 +382,34 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertIn("--machine=alex@.host", argv)
         self.assertIn("--property=MainPID", argv)
         self.assertIn("--property=ControlGroup", argv)
+        self.assertEqual(run.call_args.kwargs["env"], bus_environment)
+
+    def test_operator_user_bus_environment_is_uid_bound_and_fail_closed(self) -> None:
+        uid = broker_tool.os.getuid()
+        gid = broker_tool.os.getgid()
+        with tempfile.TemporaryDirectory() as raw:
+            runtime_root = Path(raw)
+            runtime = runtime_root / str(uid)
+            runtime.mkdir(mode=0o700)
+            bus = runtime / "bus"
+            with broker_tool.socket.socket(
+                broker_tool.socket.AF_UNIX, broker_tool.socket.SOCK_STREAM
+            ) as server:
+                server.bind(str(bus))
+                environment = broker_tool._operator_user_bus_environment(
+                    uid, gid, runtime_root=runtime_root
+                )
+                self.assertEqual(environment["XDG_RUNTIME_DIR"], str(runtime))
+                self.assertEqual(
+                    environment["DBUS_SESSION_BUS_ADDRESS"],
+                    f"unix:path={bus}",
+                )
+                self.assertEqual(environment["PATH"], broker_tool.SAFE_ENV["PATH"])
+                runtime.chmod(0o755)
+                with self.assertRaisesRegex(PermissionError, "runtime directory is unsafe"):
+                    broker_tool._operator_user_bus_environment(
+                        uid, gid, runtime_root=runtime_root
+                    )
 
     def test_blockade_lifecycle_client_preserves_operator_socket_peer(self) -> None:
         response = json.dumps(

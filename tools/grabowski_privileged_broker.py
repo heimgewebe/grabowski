@@ -33,6 +33,7 @@ STATE = Path("/var/lib/grabowski/privileged-broker")
 AUDIT = STATE / "audit.jsonl"
 MAX_OUTPUT_BYTES = 250_000
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+RUN_USER_ROOT = Path("/run/user")
 MAX_PEER_CGROUP_PROCESSES = 256
 MAX_SYSTEMD_SHOW_BYTES = 16 * 1024
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -233,7 +234,51 @@ def _cgroup_processes(
     return processes
 
 
-def _operator_user_unit_identity(uid: int, unit: str) -> dict[str, object]:
+def _operator_user_bus_environment(
+    uid: int,
+    gid: int,
+    *,
+    runtime_root: Path = RUN_USER_ROOT,
+) -> dict[str, str]:
+    runtime = runtime_root / str(uid)
+    bus = runtime / "bus"
+    try:
+        runtime_stat = runtime.lstat()
+        bus_stat = bus.lstat()
+    except OSError as exc:
+        raise PermissionError(
+            "blockade lifecycle operator user bus is unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(runtime_stat.st_mode)
+        or not stat.S_ISDIR(runtime_stat.st_mode)
+        or runtime_stat.st_uid != uid
+        or runtime_stat.st_gid != gid
+        or stat.S_IMODE(runtime_stat.st_mode) != 0o700
+    ):
+        raise PermissionError(
+            "blockade lifecycle operator runtime directory is unsafe"
+        )
+    if (
+        stat.S_ISLNK(bus_stat.st_mode)
+        or not stat.S_ISSOCK(bus_stat.st_mode)
+        or bus_stat.st_uid != uid
+        or bus_stat.st_gid != gid
+    ):
+        raise PermissionError("blockade lifecycle operator user bus is unsafe")
+    return {
+        **SAFE_ENV,
+        "XDG_RUNTIME_DIR": str(runtime),
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={bus}",
+    }
+
+
+def _operator_user_unit_identity(
+    uid: int,
+    unit: str,
+    *,
+    bus_environment: dict[str, str] | None = None,
+) -> dict[str, object]:
     try:
         account = pwd.getpwuid(uid)
     except KeyError as exc:
@@ -264,7 +309,11 @@ def _operator_user_unit_identity(uid: int, unit: str) -> dict[str, object]:
         stderr=subprocess.PIPE,
         timeout=5,
         check=False,
-        env=SAFE_ENV,
+        env=(
+            _operator_user_bus_environment(uid, account.pw_gid)
+            if bus_environment is None
+            else dict(bus_environment)
+        ),
     )
     if completed.returncode != 0 or len(completed.stdout) > MAX_SYSTEMD_SHOW_BYTES:
         raise PermissionError("blockade lifecycle operator unit identity is unavailable")
