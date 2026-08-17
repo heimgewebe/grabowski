@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 from pathlib import Path
 import sys
@@ -13,6 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import grabowski_execution_plan as execution_plan
 import grabowski_lane_closeout as closeout
 import grabowski_work_acquire as work_acquire
 
@@ -55,6 +57,56 @@ class WorkAcquireTests(unittest.TestCase):
             "resource_keys": [],
             "ttl_seconds": 1200,
         }
+
+    def execution_plan(self, *, source_id: str = "chat:authority-p0", write_scope: list[str] | None = None) -> dict[str, object]:
+        scope = ["src/app.py"] if write_scope is None else list(write_scope)
+        route_body = {
+            "schema_version": 2,
+            "routing_contract_version": execution_plan.ROUTING_CONTRACT_VERSION,
+            "executor": "scoped_writer",
+            "writer_route": "codex-sol-high",
+            "effect_profile": "candidate",
+            "verification_policy": "deterministic",
+            "task_class": "complex-patch",
+            "risk": {"flags": [], "novelty": "medium", "critical_task_class": False},
+        }
+        route = {
+            **route_body,
+            "recommendation_sha256": execution_plan.sha256_json(route_body),
+        }
+        nodes = [
+            {
+                "node_id": "writer",
+                "kind": "scoped_writer",
+                "critical": True,
+                "mutates": True,
+                "write_scope": scope,
+            }
+        ]
+        return execution_plan.build_execution_plan(
+            source_binding={"kind": "direct", "id": source_id},
+            route_decision=route,
+            topology="direct",
+            nodes=nodes,
+            edges=[],
+            write_scope=scope,
+            verification_policy="deterministic",
+            failure_policy={
+                "on_indeterminate": "block",
+                "on_unknown_effect": "reconcile",
+                "revision": "bounded",
+            },
+            budgets={
+                "max_revisions": 1,
+                "max_duration_seconds": 1200,
+                "max_tool_calls": 50,
+            },
+            completion_policy={
+                "required_nodes": ["writer"],
+                "require_all_critical": True,
+                "verifier_quorum": 0,
+            },
+        )
 
     def store_lane(self, params: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
         inputs = work_acquire._normalize(params)
@@ -182,6 +234,90 @@ class WorkAcquireTests(unittest.TestCase):
 
     def acquire(self, owner: str, keys: list[str], **kwargs: object) -> dict[str, object]:
         return self.acquired(owner, keys)
+
+    def test_public_work_acquire_signature_does_not_change_in_p4(self) -> None:
+        parameters = inspect.signature(work_acquire.grabowski_work_acquire).parameters
+        self.assertEqual(
+            list(parameters),
+            [
+                "source_kind",
+                "source_id",
+                "controller_actor",
+                "repo",
+                "base_head",
+                "branch",
+                "target_path",
+                "purpose",
+                "retention_until_unix",
+                "idempotency_key",
+                "resource_keys",
+                "write_paths",
+                "scoped_writer_actor",
+                "scoped_writer_argv",
+                "scoped_writer_runtime_seconds",
+                "system_convergence",
+                "artifact_class",
+                "ttl_seconds",
+                "terminal_closeout",
+            ],
+        )
+
+    def test_execution_plan_is_validated_source_scope_and_lane_identity_bound(self) -> None:
+        legacy = work_acquire._normalize(self.parameters())
+        params = self.parameters()
+        params["write_paths"] = [str(self.repo / "src/app.py")]
+        params["execution_plan"] = self.execution_plan()
+        planned = work_acquire._normalize(params)
+        self.assertEqual(planned["execution_plan"], params["execution_plan"])
+        self.assertNotEqual(planned["lane_id"], legacy["lane_id"])
+        self.assertIn(f"path:{self.repo / 'src/app.py'}", planned["resource_keys"])
+
+    def test_execution_plan_none_preserves_legacy_lane_identity(self) -> None:
+        first = work_acquire._normalize(self.parameters())
+        params = self.parameters()
+        params["execution_plan"] = None
+        second = work_acquire._normalize(params)
+        self.assertEqual(first["lane_id"], second["lane_id"])
+        self.assertNotIn("execution_plan", first)
+        self.assertNotIn("execution_plan", second)
+
+    def test_execution_plan_rejects_source_or_write_scope_drift(self) -> None:
+        params = self.parameters()
+        params["write_paths"] = ["src/app.py"]
+        params["execution_plan"] = self.execution_plan(source_id="other-source")
+        with self.assertRaisesRegex(ValueError, "source binding"):
+            work_acquire._normalize(params)
+
+        params["execution_plan"] = self.execution_plan(write_scope=["src/other.py"] )
+        with self.assertRaisesRegex(ValueError, "write scope"):
+            work_acquire._normalize(params)
+
+    def test_execution_plan_rejects_route_decision_tamper_before_lane_identity(self) -> None:
+        params = self.parameters()
+        params["write_paths"] = ["src/app.py"]
+        plan = self.execution_plan()
+        plan["route_binding"]["decision"]["writer_route"] = "forged-route"
+        params["execution_plan"] = plan
+        with self.assertRaisesRegex(ValueError, "execution_plan is invalid"):
+            work_acquire._normalize(params)
+
+    def test_invalid_execution_plan_blocks_before_resource_or_worktree_effect(self) -> None:
+        params = self.parameters()
+        params["write_paths"] = ["src/app.py"]
+        params["execution_plan"] = self.execution_plan(source_id="wrong-source")
+        acquire = Mock()
+        ensure = Mock()
+        with self.assertRaisesRegex(ValueError, "source binding"):
+            work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+        acquire.assert_not_called()
+        ensure.assert_not_called()
 
     def test_acquires_narrow_resources_and_returns_ready_lane(self) -> None:
         seen: dict[str, object] = {}
