@@ -2087,9 +2087,17 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
     def test_owner_handoff_rejects_arbitrary_third_owner(self) -> None:
         self._completed_owner_drift()
-        with self.assertRaisesRegex(PermissionError, "one of the existing durable owners"):
+        with self.assertRaisesRegex(PermissionError, "current retention owner"):
             checkouts.checkout_owner_handoff_preview(
                 str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-c",
+                self.head, "topic",
+            )
+
+    def test_owner_handoff_rejects_reversing_to_legacy_lifecycle_owner(self) -> None:
+        self._completed_owner_drift()
+        with self.assertRaisesRegex(PermissionError, "current retention owner"):
+            checkouts.checkout_owner_handoff_preview(
+                str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-a",
                 self.head, "topic",
             )
 

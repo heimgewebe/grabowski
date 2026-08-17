@@ -2736,8 +2736,8 @@ def _owner_handoff_state(
     target_owner = _owner(target_owner_id)
     if lifecycle_owner == retention_owner:
         raise RuntimeError("checkout owner handoff requires an existing owner mismatch")
-    if target_owner not in {lifecycle_owner, retention_owner}:
-        raise PermissionError("target owner must be one of the existing durable owners")
+    if target_owner != retention_owner:
+        raise PermissionError("target owner must equal the current retention owner")
     head = _validate_git_object_id(expected_head, "expected_head")
     branch = _expected_branch(expected_branch)
     repo_path = _resolve_repo(repo)
@@ -2959,29 +2959,17 @@ def checkout_owner_handoff_apply(
                 or _sha256_json(retention_before) != planned["retention_sha256"]
             ):
                 raise RuntimeError("Checkout owner handoff database preimage changed")
-            effects: list[str] = []
-            if lifecycle_before["owner_id"] != target_owner:
-                lifecycle_updated_at = max(applied_at, int(lifecycle_before["updated_at_unix"]) + 1)
-                lifecycle_update = connection.execute(
-                    "UPDATE lifecycle_bindings SET owner_id=?, updated_at_unix=? "
-                    "WHERE checkout_key=? AND owner_id=? AND updated_at_unix=?",
-                    (target_owner, lifecycle_updated_at, planned["checkout"]["checkout_key"], lifecycle_before["owner_id"], lifecycle_before["updated_at_unix"]),
-                )
-                if lifecycle_update.rowcount != 1:
-                    raise RuntimeError("Checkout lifecycle owner handoff lost its exact database binding")
-                effects.append("lifecycle_owner_update")
             if retention_before["owner_id"] != target_owner:
-                retention_updated_at = max(applied_at, int(retention_before["updated_at_unix"]) + 1)
-                retention_update = connection.execute(
-                    "UPDATE retention SET owner_id=?, updated_at_unix=? "
-                    "WHERE checkout_key=? AND owner_id=? AND updated_at_unix=?",
-                    (target_owner, retention_updated_at, planned["checkout"]["checkout_key"], retention_before["owner_id"], retention_before["updated_at_unix"]),
-                )
-                if retention_update.rowcount != 1:
-                    raise RuntimeError("Checkout retention owner handoff lost its exact database binding")
-                effects.append("retention_owner_update")
-            if not effects:
-                raise RuntimeError("Checkout owner handoff has no ownership effect")
+                raise RuntimeError("Checkout retention owner changed before lifecycle owner handoff")
+            lifecycle_updated_at = max(applied_at, int(lifecycle_before["updated_at_unix"]) + 1)
+            lifecycle_update = connection.execute(
+                "UPDATE lifecycle_bindings SET owner_id=?, updated_at_unix=? "
+                "WHERE checkout_key=? AND owner_id=? AND updated_at_unix=?",
+                (target_owner, lifecycle_updated_at, planned["checkout"]["checkout_key"], lifecycle_before["owner_id"], lifecycle_before["updated_at_unix"]),
+            )
+            if lifecycle_update.rowcount != 1:
+                raise RuntimeError("Checkout lifecycle owner handoff lost its exact database binding")
+            effects = ["lifecycle_owner_update"]
             connection.commit()
         lifecycle_after = _lifecycle_bindings([planned["checkout"]["checkout_key"]])[planned["checkout"]["checkout_key"]]
         retention_after = _retention_records([planned["checkout"]["checkout_key"]])[planned["checkout"]["checkout_key"]]

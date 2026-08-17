@@ -5228,9 +5228,9 @@ def _run_checkout_owner_handoff_apply(
     audit = output.get("audit")
     if (
         not isinstance(audit, dict)
-        or audit.get("effects") not in (["lifecycle_owner_update"], ["retention_owner_update"])
+        or audit.get("effects") != ["lifecycle_owner_update"]
     ):
-        raise GripActionError("checkout owner handoff exceeded one-sided ownership effect")
+        raise GripActionError("checkout owner handoff exceeded lifecycle-owner-only effect")
     _check(receipt, "exact-checkout-bound", "pass", args["checkout_path"])
     _check(receipt, "snapshot-cas-bound", "pass", expected_snapshot_sha256)
     _check(receipt, "owner-drift-only", "pass", "binding-retention-owner-mismatch")

@@ -32,8 +32,9 @@ trennt Inventar, Archivierung und Cleanup.
   sind ein enger Reconciliation-Pfad für genau `binding-retention-owner-mismatch`:
   nur sauberer, unkoordinierter Checkout; nur `completed_retained`; kein
   Archiv; aktuelle Retention muss aktiv und identitätsgleich außer dem Owner sein;
-  eine historisch kürzere Lifecycle-Retention wird nicht umgeschrieben; Zielowner muss bereits Lifecycle- oder
-  Retention-Owner sein; Apply ist Snapshot-/Zeit-/Bestätigungs-CAS. Es entsteht
+  eine historisch kürzere Lifecycle-Retention wird nicht umgeschrieben; Zielowner ist zwingend der
+  aktuell aktive Retention-Owner und nur der Lifecycle-Owner darf geändert werden; Apply ist
+  Snapshot-/Zeit-/Bestätigungs-CAS. Es entsteht
   keine zusätzliche öffentliche MCP-Tooloberfläche.
 
 ## Inventar-Markierungen
