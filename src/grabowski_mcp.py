@@ -39,6 +39,7 @@ except ImportError:
     Context = Any  # Isolated tests install an intentionally minimal module double.
 from mcp.types import ToolAnnotations
 
+import grabowski_capabilities
 import grabowski_consumer_surface as consumer_surface
 import grabowski_runtime_contract
 import grabowski_client_snapshot
@@ -516,10 +517,10 @@ ALL_CAPABILITIES = (
     + RESERVED_DISABLED_CAPABILITIES
 )
 
-# Implemented tools may be staged here until an authentic external connector
-# declaration includes the new name. They keep their internal guards, but are
-# excluded from the registered/public capability projection.
-STAGED_UNPUBLISHED_TOOL_NAMES = frozenset({"grabowski_agent_workspace_adopt"})
+# Implemented tools may be staged until an authentic external connector
+# declaration includes the new name. The capability layer owns this set so
+# runtime assembly and generated publication contracts cannot diverge.
+STAGED_UNPUBLISHED_TOOL_NAMES = grabowski_capabilities.STAGED_UNPUBLISHED_TOOL_NAMES
 
 TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_status": (),

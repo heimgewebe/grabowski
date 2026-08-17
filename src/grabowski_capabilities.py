@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 CATALOG_SCHEMA_VERSION = 1
 CONTEXT_SCHEMA_VERSION = 1
+STAGED_UNPUBLISHED_TOOL_NAMES = frozenset({"grabowski_agent_workspace_adopt"})
 
 
 TOOL_PROFILES: dict[str, dict[str, Any]] = {
@@ -1277,6 +1278,13 @@ TOOL_PROFILES.update(
             "effects": ["task-start", "receipt-create", "task-state-refresh"],
             "reversibility": "preserved-worktree-and-receipts",
         },
+        "grabowski_agent_workspace_adopt": {
+            "category": "agent-workspace",
+            "purpose": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit with immutable intent and readback receipts.",
+            "risk_class": "high",
+            "effects": ["git-ref-update", "receipt-create", "audit-append"],
+            "reversibility": "preserved-adoption-commit-and-receipts",
+        },
         "grabowski_agent_workspace_role_retry": {
             "category": "agent-workspace",
             "purpose": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
@@ -1600,9 +1608,12 @@ def classify_contract(expected_tools: Iterable[str]) -> dict[str, list[str]]:
     names = list(expected_tools)
     expected = set(names)
     catalogued = set(TOOL_PROFILES)
+    staged = set(STAGED_UNPUBLISHED_TOOL_NAMES)
     return {
         "missing_profiles": sorted(expected - catalogued),
-        "orphan_profiles": sorted(catalogued - expected),
+        "orphan_profiles": sorted((catalogued - expected) - staged),
+        "published_staged_tools": sorted(expected & staged),
+        "missing_staged_profiles": sorted(staged - catalogued),
         "duplicate_tools": sorted({name for name in names if names.count(name) > 1}),
     }
 

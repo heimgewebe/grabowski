@@ -2337,21 +2337,6 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit.",
-      "effects": [
-        "git-ref-update",
-        "receipt-create",
-        "audit-append"
-      ],
-      "id": "grabowski_agent_workspace_adopt",
-      "purpose": "Adopt one exact PASS-verified lane Candidate as a controller-owned commit with immutable intent and readback receipts.",
-      "read_only": false,
-      "reversibility": "preserved-adoption-commit-and-receipts",
-      "risk_class": "high",
-      "tool": "grabowski_agent_workspace_adopt"
-    },
-    {
-      "category": "agent-workspace",
       "description": "Retry one collected-but-not-closed read-only role once with an explicit replacement command bound to the frozen writer snapshot.",
       "effects": [
         "task-start",
@@ -2601,7 +2586,10 @@
     "duplicate_tools": [],
     "missing_declarations": [],
     "missing_profiles": [],
+    "missing_staged_declarations": [],
+    "missing_staged_profiles": [],
     "orphan_profiles": [],
+    "published_staged_tools": [],
     "undeclared_tools": []
   },
   "kind": "repository-operator-context",
@@ -2816,6 +2804,11 @@
     ],
     "write_roots": []
   },
+  "publication_staging": {
+    "implemented_unpublished_tools": [
+      "grabowski_agent_workspace_adopt"
+    ]
+  },
   "purpose": "Deterministic repository contract for the Grabowski operator. Live state is returned by the grabowski_context MCP tool.",
   "runtime_contract": {
     "expected_tools": [
@@ -2996,7 +2989,6 @@
       "grabowski_agent_workspace_status",
       "grabowski_agent_workspace_attach",
       "grabowski_agent_workspace_collect",
-      "grabowski_agent_workspace_adopt",
       "grabowski_agent_workspace_role_retry",
       "grabowski_agent_workspace_writer_handoff",
       "grabowski_agent_workspace_close",
@@ -3490,7 +3482,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "fe56343d96e870df6abdca6e0262456f0ce736d6dc2fac287e016509da31bfb4"
+      "sha256": "6196f9ab80ed8ab945f3bd502829dceb79857bd36c35a1032c4bffb808497ebe"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3498,7 +3490,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "39df47409bc1dd6325b6549f950383cfc18a37a3a13d74652d19665df4783b80"
+      "sha256": "112532bf69ce8224157ae2c153a1d0beb3bc55035b97d8cc6ae33c3f1d53ef6f"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3522,7 +3514,7 @@
       "src/grabowski_bureau_pickup.py": "da5e5ebad67fc3a82318a6c6acb217c94b63868bcb7b11b221354a20cac1c7cb",
       "src/grabowski_candidate_adoption.py": "0622c02e1c891dd59c601bff67ab0ca5e2be8c0fd2bdb493f507f9f1b820f291",
       "src/grabowski_candidate_verification.py": "b1abe088b16482bcce5d688463d8d2f8e93b6d20926bb4920e49a4bb3cd26636",
-      "src/grabowski_capabilities.py": "fe56343d96e870df6abdca6e0262456f0ce736d6dc2fac287e016509da31bfb4",
+      "src/grabowski_capabilities.py": "6196f9ab80ed8ab945f3bd502829dceb79857bd36c35a1032c4bffb808497ebe",
       "src/grabowski_checkout_binding_reconciler.py": "e6da419d5b2e313c84eb1d5b90bed0a9f0124a89f73f0af905d2d731f009137b",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "3e5fe76a6c6ba1208229d2f6224345d3091799865ab2bdccc6da18ff9075035e",
@@ -3561,7 +3553,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "1d11743605bb884c23d1a69af723845163f9712a2de277056259c4581db1d5e9",
+      "src/grabowski_mcp.py": "88e394d71eb19ca724845fa0027837b0eb50278b9409c15f769b872f5f418a27",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "6bb5772e2f54017c367d9c13d63579e0e7a45bfbd8116a035ee0a1da058cf012",
@@ -3589,7 +3581,7 @@
       "src/grabowski_reposkop_effectiveness.py": "63ee777d91dd8b8e65043613510fcbb9a37604e7f1ae384b3e8b76126e31b4c9",
       "src/grabowski_reposkop_shadow.py": "257933f6dec5e9877b3fbf5186d7ad3756f313f8313d22cf90a30e9011b1cfab",
       "src/grabowski_resources.py": "db651e7857d8addfc473323d09b2878822973829f18e8490b5f6ed311b4bab13",
-      "src/grabowski_runtime.py": "4b9100b1424b89950c16b57f733afa5f618204baa5ace44048a7643ab358cf9a",
+      "src/grabowski_runtime.py": "e890d2cb681de3f1d743b268a38dffcb627133deaf0c4a9ae02b68665dddaf44",
       "src/grabowski_runtime_contract.py": "50b602e64c5fe884c2d73b76e769dde0dc157fe25f7bd8645a78979b2962a48b",
       "src/grabowski_runtime_extensions.py": "e618a435abf1f07d5b7a00d07dc59fc8fb844e1ddd52dfa7f025a0d754a66ef8",
       "src/grabowski_self_deploy.py": "d4c8c699c49e0df41d4cd917f545117633582f5c2442bf5c0983476d5dc4e923",
