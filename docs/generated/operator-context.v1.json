@@ -3569,7 +3569,7 @@
       "src/grabowski_operator_relay.py": "66d61095b1bc12545e81ec1072fc4330ec88f1f27b460a6487fe8fbbf0ed1bc2",
       "src/grabowski_operator_routing_shadow_capture.py": "1fa2d18cd459873eab3a2535b6e48df5363ae151a24914fbd7693020c29da5b0",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
-      "src/grabowski_privileged.py": "d37394179cfd7136daa717cf355c759568383fc92618249e8543bd244ac398f3",
+      "src/grabowski_privileged.py": "446c2acc9c370ffa43ea3fcb0f1a02e401f554deda1243883a1144c66d4153c3",
       "src/grabowski_privileged_broker.py": "a64fb92d5ecddf73cc08c59ce0a2212481afe8e71a07bfbd1be8c3df0243071a",
       "src/grabowski_provenance_recovery.py": "df0e4144062bce78b34b3021cd594be5624ebc0f1b085a78dd1107799bc4add9",
       "src/grabowski_read_surface.py": "fdd183f49401ff86cc745e5589bb6d90aab9cd66145cd923bc8c29577aad37a9",
