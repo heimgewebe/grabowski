@@ -90,6 +90,319 @@ def _tool_declaration(node: ast.AST) -> tuple[str, bool | None] | None:
     return None
 
 
+SEMANTIC_SOURCE_DIGEST_CONTRACT = "mcp-tool-surface-v1"
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _ast_contract(node: ast.AST | None) -> str | None:
+    if node is None:
+        return None
+    dumped = ast.dump(node, annotate_fields=True, include_attributes=False)
+    # Python 3.12 added ``type_params`` to FunctionDef/AsyncFunctionDef/ClassDef.
+    # An empty field is parser-version metadata, not a source-contract change.
+    # Non-empty type parameters remain in the dump and therefore stay digest-bound.
+    return dumped.replace(", type_params=[]", "")
+
+
+def _bound_names(node: ast.AST | None) -> set[str]:
+    if node is None:
+        return set()
+    return {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+
+
+def _qualified_references(node: ast.AST | None) -> set[tuple[str, str]]:
+    if node is None:
+        return set()
+    references: set[tuple[str, str]] = set()
+    for item in ast.walk(node):
+        if not isinstance(item, ast.Attribute):
+            continue
+        root: ast.AST = item
+        attributes: list[str] = []
+        while isinstance(root, ast.Attribute):
+            attributes.append(root.attr)
+            root = root.value
+        if isinstance(root, ast.Name) and attributes:
+            references.add((root.id, attributes[-1]))
+    return references
+
+
+def _string_annotation_names(node: ast.AST | None) -> set[str]:
+    if node is None:
+        return set()
+    names: set[str] = set()
+    for item in ast.walk(node):
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+            continue
+        try:
+            parsed = ast.parse(item.value, mode="eval")
+        except SyntaxError:
+            continue
+        names.update(_bound_names(parsed))
+    return names
+
+
+def _function_annotation_nodes(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.AST]:
+    arguments = [
+        *node.args.posonlyargs,
+        *node.args.args,
+        *node.args.kwonlyargs,
+    ]
+    if node.args.vararg is not None:
+        arguments.append(node.args.vararg)
+    if node.args.kwarg is not None:
+        arguments.append(node.args.kwarg)
+    annotations = [
+        arg.annotation for arg in arguments if arg.annotation is not None
+    ]
+    if node.returns is not None:
+        annotations.append(node.returns)
+    annotations.extend(getattr(node, "type_params", []))
+    return annotations
+
+
+def _function_contract_reference_nodes(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[ast.AST]:
+    references: list[ast.AST] = []
+    for decorator in node.decorator_list:
+        if (
+            isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Attribute)
+            and decorator.func.attr == "tool"
+        ):
+            references.extend(decorator.args)
+            references.extend(keyword.value for keyword in decorator.keywords)
+        else:
+            references.append(decorator)
+    references.extend(node.args.defaults)
+    references.extend(value for value in node.args.kw_defaults if value is not None)
+    references.extend(_function_annotation_nodes(node))
+    return references
+
+
+def _definition_names(node: ast.AST) -> set[str]:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {node.name}
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names: set[str] = set()
+        for target in targets:
+            for item in ast.walk(target):
+                if isinstance(item, ast.Name):
+                    names.add(item.id)
+        return names
+    type_alias = getattr(ast, "TypeAlias", None)
+    if type_alias is not None and isinstance(node, type_alias):
+        name = getattr(node, "name", None)
+        return {name.id} if isinstance(name, ast.Name) else set()
+    return set()
+
+
+def _source_contract_index(source_text: str, *, filename: str) -> dict[str, Any]:
+    tree = ast.parse(source_text, filename=filename)
+    definitions: dict[str, dict[str, Any]] = {}
+    imports: dict[str, dict[str, Any]] = {}
+    tools: list[dict[str, Any]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            contract_sha256 = _canonical_json_sha256(
+                {"kind": "import", "ast": _ast_contract(node)}
+            )
+            for alias in node.names:
+                local_name = alias.asname or alias.name.split(".", 1)[0]
+                imports[local_name] = {
+                    "contract_sha256": contract_sha256,
+                    "module": alias.name,
+                    "symbol": None,
+                }
+        elif isinstance(node, ast.ImportFrom):
+            contract_sha256 = _canonical_json_sha256(
+                {"kind": "import", "ast": _ast_contract(node)}
+            )
+            module = node.module or ""
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                imports[local_name] = {
+                    "contract_sha256": contract_sha256,
+                    "module": module,
+                    "symbol": alias.name,
+                }
+        else:
+            names = _definition_names(node)
+            if names:
+                contract_sha256 = _canonical_json_sha256(
+                    {"kind": "definition", "ast": _ast_contract(node)}
+                )
+                references = _bound_names(node)
+                qualified = _qualified_references(node)
+                for name in names:
+                    definitions[name] = {
+                        "contract_sha256": contract_sha256,
+                        "references": references - {name},
+                        "qualified": qualified,
+                    }
+
+        declaration = _tool_declaration(node)
+        if declaration is None:
+            continue
+        assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        tool_name, read_only = declaration
+        referenced_names: set[str] = set()
+        qualified: set[tuple[str, str]] = set()
+        for reference in _function_contract_reference_nodes(node):
+            referenced_names.update(_bound_names(reference))
+            qualified.update(_qualified_references(reference))
+        for annotation in _function_annotation_nodes(node):
+            referenced_names.update(_string_annotation_names(annotation))
+        tools.append(
+            {
+                "tool": tool_name,
+                "async": isinstance(node, ast.AsyncFunctionDef),
+                "decorators": [_ast_contract(item) for item in node.decorator_list],
+                "arguments": _ast_contract(node.args),
+                "returns": _ast_contract(node.returns),
+                "type_params": [
+                    _ast_contract(item) for item in getattr(node, "type_params", [])
+                ],
+                "description": ast.get_docstring(node) or "",
+                "read_only": read_only,
+                "references": referenced_names,
+                "qualified": qualified,
+            }
+        )
+    return {
+        "definitions": definitions,
+        "imports": imports,
+        "tools": tools,
+    }
+
+
+def _semantic_source_hashes(
+    source_texts: dict[str, str],
+    module_to_source: dict[str, str],
+) -> dict[str, str]:
+    indexes = {
+        relative: _source_contract_index(text, filename=relative)
+        for relative, text in source_texts.items()
+    }
+    source_by_module = dict(module_to_source)
+    for relative in source_texts:
+        source_by_module.setdefault(Path(relative).stem, relative)
+
+    def dependency_node(
+        relative: str,
+        name: str,
+    ) -> tuple[dict[str, Any], set[tuple[str, str]]] | None:
+        index = indexes.get(relative)
+        if index is None:
+            return None
+        definitions: dict[str, dict[str, Any]] = index["definitions"]
+        imports: dict[str, dict[str, Any]] = index["imports"]
+        definition = definitions.get(name)
+        edges: set[tuple[str, str]] = set()
+        if definition is not None:
+            material = {
+                "source": relative,
+                "name": name,
+                "contract_sha256": definition["contract_sha256"],
+            }
+            for child_name in definition["references"]:
+                if child_name in definitions or child_name in imports:
+                    edges.add((relative, child_name))
+            for root_name, attribute in definition["qualified"]:
+                imported = imports.get(root_name)
+                if not imported or imported["symbol"] is not None:
+                    continue
+                imported_source = source_by_module.get(imported["module"])
+                if imported_source is not None:
+                    edges.add((imported_source, attribute))
+        else:
+            imported = imports.get(name)
+            if imported is None:
+                return None
+            material = {
+                "source": relative,
+                "name": name,
+                "contract_sha256": imported["contract_sha256"],
+            }
+            imported_source = source_by_module.get(imported["module"])
+            target_symbol = imported["symbol"]
+            if imported_source is not None and target_symbol not in {None, "*"}:
+                edges.add((imported_source, str(target_symbol)))
+        return material, edges
+
+    def dependency_closure(relative: str, tool: dict[str, Any]) -> list[dict[str, Any]]:
+        index = indexes[relative]
+        definitions: dict[str, dict[str, Any]] = index["definitions"]
+        imports: dict[str, dict[str, Any]] = index["imports"]
+        initial = {
+            (relative, name)
+            for name in tool["references"]
+            if name in definitions or name in imports
+        }
+        for root_name, attribute in tool["qualified"]:
+            imported = imports.get(root_name)
+            if not imported or imported["symbol"] is not None:
+                continue
+            imported_source = source_by_module.get(imported["module"])
+            if imported_source is not None:
+                initial.add((imported_source, attribute))
+
+        visited: set[tuple[str, str]] = set()
+        pending = sorted(initial, reverse=True)
+        material: list[dict[str, Any]] = []
+        while pending:
+            key = pending.pop()
+            if key in visited:
+                continue
+            visited.add(key)
+            resolved = dependency_node(*key)
+            if resolved is None:
+                continue
+            record, edges = resolved
+            material.append(record)
+            for edge in sorted(edges, reverse=True):
+                if edge not in visited:
+                    pending.append(edge)
+        return sorted(
+            material,
+            key=lambda item: (str(item["source"]), str(item["name"])),
+        )
+
+    hashes: dict[str, str] = {}
+    for relative, index in indexes.items():
+        tools: list[dict[str, Any]] = []
+        for tool in index["tools"]:
+            tools.append(
+                {
+                    key: value
+                    for key, value in tool.items()
+                    if key not in {"references", "qualified"}
+                }
+                | {"dependencies": dependency_closure(relative, tool)}
+            )
+        material = {
+            "schema_version": 1,
+            "contract": SEMANTIC_SOURCE_DIGEST_CONTRACT,
+            "source": relative,
+            "tools": sorted(tools, key=lambda item: item["tool"]),
+        }
+        hashes[relative] = _canonical_json_sha256(material)
+    return dict(sorted(hashes.items()))
+
+
 def _source_records(contract: dict[str, Any]) -> list[dict[str, str]]:
     records = [
         {
@@ -105,12 +418,19 @@ def _discover_tools(
     contract: dict[str, Any],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     tools: dict[str, dict[str, Any]] = {}
-    source_hashes: dict[str, str] = {}
-    for record in _source_records(contract):
+    records = _source_records(contract)
+    source_texts = {
+        str(record["source"]): (ROOT / str(record["source"])).read_text(encoding="utf-8")
+        for record in records
+    }
+    module_to_source = {
+        str(record["module"]): str(record["source"])
+        for record in records
+    }
+    source_hashes = _semantic_source_hashes(source_texts, module_to_source)
+    for record in records:
         relative = str(record["source"])
-        source_path = ROOT / relative
-        source_hashes[relative] = _sha256(source_path)
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=relative)
+        tree = ast.parse(source_texts[relative], filename=relative)
         for node in tree.body:
             declaration = _tool_declaration(node)
             if declaration is None:
@@ -223,6 +543,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
                 "path": "src/grabowski_capabilities.py",
                 "sha256": _sha256(CAPABILITIES_PATH),
             },
+            "runtime_source_digest_contract": SEMANTIC_SOURCE_DIGEST_CONTRACT,
             "runtime_sources": source_hashes,
             "blocked_action_protocol": {
                 "path": "docs/blocked-action-protocol-v0.md",
