@@ -168,6 +168,8 @@ class FakeRunner:
 
     def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
+        if argv == ["/usr/bin/id", "-nu", "1000"]:
+            return _completed(argv, stdout="alex\n")
         if argv[:1] == ["/usr/bin/systemctl"] and "show" in argv:
             user = "--user" in argv
             show_index = argv.index("show")
@@ -255,6 +257,23 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def test_operator_username_is_runner_observed_and_fails_closed_on_drift(self) -> None:
+        calls: list[list[str]] = []
+
+        def matching_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            calls.append(list(argv))
+            return _completed(argv, stdout="alex\n")
+
+        self.assertEqual(cutover._operator_username(matching_runner), "alex")
+        self.assertEqual(calls, [["/usr/bin/id", "-nu", "1000"]])
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError, "identity differs from host contract"
+        ):
+            cutover._operator_username(
+                lambda argv: _completed(argv, stdout="runner\n")
+            )
+
     def test_cutover_artifacts_include_runtime_contract_trust_anchor(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 

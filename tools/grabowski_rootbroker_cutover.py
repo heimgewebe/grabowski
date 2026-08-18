@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import pwd
 import stat
 import subprocess
 import tempfile
@@ -1415,20 +1414,26 @@ def _restore_preimages(
         raise CutoverError("preimage restore incomplete: " + " | ".join(errors))
 
 
-def _operator_username() -> str:
-    try:
-        account = pwd.getpwuid(1000)
-    except KeyError as exc:
-        raise CutoverError("operator account uid 1000 is unavailable") from exc
-    if account.pw_name != "alex":
+def _operator_username(runner: RunCommand) -> str:
+    argv = ["/usr/bin/id", "-nu", "1000"]
+    completed = runner(argv)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "uid lookup failed").strip()
+        raise CutoverError(f"operator account uid 1000 is unavailable: {detail[:500]}")
+    if completed.stdout not in {"alex", "alex\n"}:
         raise CutoverError("operator account identity differs from host contract")
-    return account.pw_name
+    return "alex"
 
 
-def _unit_scope_argv(unit: str, *, user: bool) -> list[str]:
+def _systemctl_scope_prefix(runner: RunCommand, *, user: bool) -> list[str]:
     argv = ["/usr/bin/systemctl"]
     if user:
-        argv.extend(["--user", f"--machine={_operator_username()}@.host"])
+        argv.extend(["--user", f"--machine={_operator_username(runner)}@.host"])
+    return argv
+
+
+def _unit_scope_argv(runner: RunCommand, unit: str, *, user: bool) -> list[str]:
+    argv = _systemctl_scope_prefix(runner, user=user)
     argv.extend(
         [
             "show",
@@ -1445,7 +1450,7 @@ def _unit_scope_argv(unit: str, *, user: bool) -> list[str]:
 def _read_unit_state(
     runner: RunCommand, unit: str, *, user: bool
 ) -> dict[str, object]:
-    completed = runner(_unit_scope_argv(unit, user=user))
+    completed = runner(_unit_scope_argv(runner, unit, user=user))
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "systemctl show failed").strip()
         raise CutoverError(f"cannot inspect service state for {unit}: {detail[:500]}")
@@ -1471,9 +1476,7 @@ def _systemctl_unit_mutation(
 ) -> None:
     if action not in {"start", "stop", "enable", "disable"}:
         raise CutoverError("unsupported service migration action")
-    argv = ["/usr/bin/systemctl"]
-    if user:
-        argv.extend(["--user", f"--machine={_operator_username()}@.host"])
+    argv = _systemctl_scope_prefix(runner, user=user)
     argv.append(action)
     if action in {"enable", "disable"}:
         argv.append("--now")
