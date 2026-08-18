@@ -67,6 +67,10 @@ def _bootstrap_recovery_action() -> dict[str, object]:
     return _bound_action(cutover.BOOTSTRAP_RECOVERY_ACTION)
 
 
+def _operator_service_control_action() -> dict[str, object]:
+    return _bound_action(cutover.OPERATOR_SERVICE_CONTROL_ACTION)
+
+
 def _power_action() -> dict[str, object]:
     return {
         "enabled": True,
@@ -110,6 +114,7 @@ def _example_config_text() -> str:
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
                 cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
+                cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
             },
         },
         sort_keys=True,
@@ -147,9 +152,79 @@ class FakeRunner:
         self.is_active_returncode = is_active_returncode
         self.start_failures = 0
         self.calls: list[list[str]] = []
+        self.user_unit_states = {
+            cutover.OPERATOR_UNIT: {
+                "load": "loaded", "active": True, "enabled": True
+            },
+            cutover.LEGACY_OPERATOR_WATCHDOG_TIMER: {
+                "load": "loaded", "active": True, "enabled": True
+            },
+        }
+        self.system_unit_states = {
+            cutover.OPERATOR_UNIT: {
+                "load": "not-found", "active": False, "enabled": False
+            }
+        }
 
     def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
+        if argv == ["/usr/bin/id", "-nu", "1000"]:
+            return _completed(argv, stdout="alex\n")
+        if argv[:1] == ["/usr/bin/systemctl"] and "show" in argv:
+            user = "--user" in argv
+            show_index = argv.index("show")
+            unit = argv[show_index + 1]
+            states = self.user_unit_states if user else self.system_unit_states
+            state = states.get(
+                unit, {"load": "not-found", "active": False, "enabled": False}
+            )
+            if "--property=LoadState" in argv:
+                return _completed(
+                    argv,
+                    stdout=(
+                        f"LoadState={state['load']}\n"
+                        f"ActiveState={'active' if state['active'] else 'inactive'}\n"
+                        f"UnitFileState={'enabled' if state['enabled'] else 'disabled'}\n"
+                    ),
+                )
+            if unit == cutover.OPERATOR_UNIT and not user:
+                return _completed(
+                    argv,
+                    stdout=(
+                        "MainPID=4242\n"
+                        f"ControlGroup=/system.slice/{cutover.OPERATOR_UNIT}\n"
+                        "User=alex\n"
+                        f"FragmentPath={cutover.OPERATOR_SERVICE_TARGET}\n"
+                    ),
+                )
+        if argv[:1] == ["/usr/bin/systemctl"]:
+            user = "--user" in argv
+            filtered = [
+                item
+                for item in argv[1:]
+                if item != "--user" and not item.startswith("--machine=")
+            ]
+            if filtered and filtered[0] in {"enable", "disable", "start", "stop"}:
+                action = filtered[0]
+                index = 1
+                if index < len(filtered) and filtered[index] == "--now":
+                    index += 1
+                if index < len(filtered):
+                    unit = filtered[index]
+                    if unit not in {cutover.SOCKET_UNIT}:
+                        states = self.user_unit_states if user else self.system_unit_states
+                        state = states.setdefault(
+                            unit, {"load": "loaded", "active": False, "enabled": False}
+                        )
+                        if action == "enable":
+                            state.update(load="loaded", enabled=True, active=True)
+                        elif action == "disable":
+                            state.update(enabled=False, active=False)
+                        elif action == "start":
+                            state.update(load="loaded", active=True)
+                        elif action == "stop":
+                            state.update(active=False)
+                        return _completed(argv)
         if argv[:1] == ["/usr/bin/git"] and argv[-2:] == ["rev-parse", "HEAD"]:
             return _completed(argv, stdout=self.head + "\n")
         if argv[:1] == ["/usr/bin/git"] and "show" in argv:
@@ -182,6 +257,23 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def test_operator_username_is_runner_observed_and_fails_closed_on_drift(self) -> None:
+        calls: list[list[str]] = []
+
+        def matching_runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            calls.append(list(argv))
+            return _completed(argv, stdout="alex\n")
+
+        self.assertEqual(cutover._operator_username(matching_runner), "alex")
+        self.assertEqual(calls, [["/usr/bin/id", "-nu", "1000"]])
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError, "identity differs from host contract"
+        ):
+            cutover._operator_username(
+                lambda argv: _completed(argv, stdout="runner\n")
+            )
+
     def test_cutover_artifacts_include_runtime_contract_trust_anchor(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 
@@ -208,6 +300,98 @@ class RootbrokerCutoverTests(unittest.TestCase):
         )
         self.assertEqual(artifact.mode, 0o755)
         self.assertTrue(artifact.python_source)
+
+    def test_operator_authority_attestation_binds_commit_artifacts_and_peer(self) -> None:
+        power = _power_action()
+        power["allowed_peer_uid"] = 1000
+        power["allowed_peer_unit"] = cutover.OPERATOR_UNIT
+        lifecycle = _lifecycle()
+        service_control = _operator_service_control_action()
+        merged = {
+            "schema_version": 2,
+            "actions": {
+                cutover.POWER_ACTION: power,
+                cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
+                cutover.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
+            },
+        }
+        source_artifacts = {}
+        for label, target in {
+            "broker_module": cutover.BROKER_MODULE_TARGET,
+            "broker_wrapper": cutover.BROKER_WRAPPER_TARGET,
+            "cutover_helper": cutover.CUTOVER_HELPER_TARGET,
+            "operator_service": cutover.OPERATOR_SERVICE_TARGET,
+        }.items():
+            data = (label + "\n").encode("utf-8")
+            source_artifacts[target] = (data, 0o644, hashlib.sha256(data).hexdigest())
+        attestation = cutover._operator_authority_attestation(
+            expected_head=HEAD,
+            source_artifacts=source_artifacts,
+            merged_config=merged,
+            cutover_receipt_sha256="f" * 64,
+        )
+        self.assertEqual(attestation["expected_head"], HEAD)
+        self.assertEqual(
+            attestation["power_peer_binding"],
+            {
+                "allowed_peer_uid": 1000,
+                "allowed_peer_unit": cutover.OPERATOR_UNIT,
+            },
+        )
+        self.assertEqual(
+            attestation["artifact_sha256"]["operator_service"],
+            source_artifacts[cutover.OPERATOR_SERVICE_TARGET][2],
+        )
+        unsigned = dict(attestation)
+        digest = unsigned.pop("attestation_sha256")
+        self.assertEqual(digest, cutover._sha256(cutover._canonical_json(unsigned)))
+
+    def test_operator_authority_attestation_rejects_power_peer_drift(self) -> None:
+        power = _power_action()
+        power["allowed_peer_uid"] = 1000
+        power["allowed_peer_unit"] = "other.service"
+        lifecycle = _lifecycle()
+        merged = {
+            "schema_version": 2,
+            "actions": {
+                cutover.POWER_ACTION: power,
+                cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
+                cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
+            },
+        }
+        source_artifacts = {}
+        for target in (
+            cutover.BROKER_MODULE_TARGET,
+            cutover.BROKER_WRAPPER_TARGET,
+            cutover.CUTOVER_HELPER_TARGET,
+            cutover.OPERATOR_SERVICE_TARGET,
+        ):
+            data = (str(target) + "\n").encode("utf-8")
+            source_artifacts[target] = (data, 0o644, hashlib.sha256(data).hexdigest())
+        with self.assertRaisesRegex(cutover.CutoverError, "peer binding"):
+            cutover._operator_authority_attestation(
+                expected_head=HEAD,
+                source_artifacts=source_artifacts,
+                merged_config=merged,
+                cutover_receipt_sha256="f" * 64,
+            )
+
+    def test_cutover_installs_root_managed_operator_system_unit(self) -> None:
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+        artifact = artifacts[cutover.OPERATOR_SERVICE_TARGET]
+        self.assertEqual(
+            artifact.source_relative, "systemd/grabowski-operator.service.example"
+        )
+        self.assertEqual(artifact.mode, 0o644)
+        unit = (ROOT / artifact.source_relative).read_text(encoding="utf-8")
+        self.assertIn("User=alex", unit)
+        self.assertIn("Group=alex", unit)
+        self.assertIn("WorkingDirectory=/home/alex", unit)
+        self.assertIn(
+            "ExecStart=/home/alex/.local/share/grabowski-mcp/.venv/bin/python", unit
+        )
+        self.assertIn("WantedBy=multi-user.target", unit)
+        self.assertNotIn("%h", unit)
 
     def test_source_artifact_validation_rejects_missing_local_dependency(self) -> None:
         broker_target = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
@@ -734,6 +918,17 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 runner.calls,
             )
             self.assertTrue(runner.active)
+            migration = receipt["operator_service_migration"]
+            self.assertTrue(migration["legacy_operator_before"]["active"])
+            self.assertTrue(migration["legacy_watchdog_before"]["active"])
+            self.assertFalse(migration["system_operator_before"]["active"])
+            self.assertTrue(migration["system_operator_after"]["active"])
+            self.assertTrue(migration["system_operator_after"]["enabled"])
+            self.assertFalse(runner.user_unit_states[cutover.OPERATOR_UNIT]["active"])
+            self.assertFalse(
+                runner.user_unit_states[cutover.LEGACY_OPERATOR_WATCHDOG_TIMER]["active"]
+            )
+            self.assertTrue(runner.system_unit_states[cutover.OPERATOR_UNIT]["active"])
             for path, (data, mode) in layout["desired_data"].items():
                 self.assertEqual(path.read_bytes(), data)
                 self.assertEqual(path.stat().st_mode & 0o777, mode)
@@ -751,6 +946,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
             self.assertEqual(
                 power["gate"]["configured_target"],
                 cutover.CONFIGURED_TARGET,
+            )
+            lifecycle = installed_config["actions"][cutover.BLOCKADE_LIFECYCLE_ACTION]
+            self.assertEqual(power["allowed_peer_uid"], lifecycle["allowed_peer_uid"])
+            self.assertEqual(power["allowed_peer_unit"], lifecycle["allowed_peer_unit"])
+            self.assertEqual(
+                installed_config["actions"][cutover.OPERATOR_SERVICE_CONTROL_ACTION],
+                _operator_service_control_action(),
             )
             self.assertEqual(layout["config_target"].stat().st_mode & 0o777, 0o600)
             receipt_path = Path(receipt["receipt_path"])
@@ -782,6 +984,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 )
 
             self.assertTrue(runner.active)
+            self.assertTrue(runner.user_unit_states[cutover.OPERATOR_UNIT]["active"])
+            self.assertTrue(runner.user_unit_states[cutover.OPERATOR_UNIT]["enabled"])
+            self.assertTrue(
+                runner.user_unit_states[cutover.LEGACY_OPERATOR_WATCHDOG_TIMER]["active"]
+            )
+            self.assertFalse(runner.system_unit_states[cutover.OPERATOR_UNIT]["active"])
+            self.assertFalse(runner.system_unit_states[cutover.OPERATOR_UNIT]["enabled"])
             self.assertEqual(layout["config_target"].read_bytes(), initial_config)
             for path, (data, mode) in layout["originals"].items():
                 self.assertEqual(path.read_bytes(), data)

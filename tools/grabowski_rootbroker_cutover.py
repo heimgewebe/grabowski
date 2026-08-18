@@ -32,16 +32,23 @@ BOOTSTRAP_RECOVERY_TARGET = Path(
 )
 CUTOVER_HELPER_TARGET = Path("/usr/local/libexec/grabowski-rootbroker-cutover")
 BROKER_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-privileged-broker@.service")
+OPERATOR_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-operator.service")
 RECOVERY_SOURCE_DROPIN_TARGET = Path(
     "/etc/systemd/system/grabowski-privileged-broker@.service.d/recovery-source.conf"
 )
 BACKUP_ROOT = Path("/var/lib/grabowski/rootbroker-cutover-backups")
 RECEIPT_ROOT = Path("/var/lib/grabowski/rootbroker-cutover-receipts")
+OPERATOR_AUTHORITY_ATTESTATION_TARGET = Path(
+    "/var/lib/grabowski/operator-authority-attestation.v1.json"
+)
 CUTOVER_LOCK = Path("/run/grabowski/rootbroker-cutover.lock")
 SOCKET_UNIT = "grabowski-privileged-broker.socket"
+OPERATOR_UNIT = "grabowski-operator.service"
+LEGACY_OPERATOR_WATCHDOG_TIMER = "grabowski-operator-watchdog.timer"
 CONFIGURED_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
 PUBLISH_ACTION = "publish_recovery_marker"
 POWER_ACTION = "operator_power_argv"
+OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
@@ -165,6 +172,11 @@ ARTIFACTS = (
     Artifact(
         "systemd/grabowski-privileged-broker@.service",
         BROKER_SERVICE_TARGET,
+        0o644,
+    ),
+    Artifact(
+        "systemd/grabowski-operator.service.example",
+        OPERATOR_SERVICE_TARGET,
         0o644,
     ),
     Artifact(
@@ -782,6 +794,44 @@ def _process_observer_action_from_repository(
     return json.loads(json.dumps(observer))
 
 
+def _operator_service_control_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    action = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
+    if not isinstance(action, dict):
+        raise CutoverError("example catalog has no operator service control action")
+    required = {"enabled", "target_pattern", "argv", "timeout_seconds"}
+    if set(action) != required:
+        raise CutoverError("operator service control action keys are invalid")
+    if action.get("enabled") is not True:
+        raise CutoverError("operator service control action must be enabled")
+    if action.get("target_pattern") != r"(?:start|stop|restart|is-active)":
+        raise CutoverError("operator service control target pattern is invalid")
+    if action.get("argv") != [
+        "/usr/bin/systemctl",
+        "{target}",
+        "grabowski-operator.service",
+    ]:
+        raise CutoverError("operator service control argv is invalid")
+    if action.get("timeout_seconds") != 60:
+        raise CutoverError("operator service control timeout is invalid")
+    return json.loads(json.dumps(action))
+
+
 def _bootstrap_recovery_action_from_repository(
     repository: Path,
     *,
@@ -859,6 +909,7 @@ def merge_privileged_config(
     root_task: dict[str, Any] | None = None,
     process_observer: dict[str, Any] | None = None,
     bootstrap_recovery: dict[str, Any] | None = None,
+    operator_service_control: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(current) != {"schema_version", "actions"}:
         raise CutoverError("installed privileged config has invalid top-level keys")
@@ -894,6 +945,19 @@ def merge_privileged_config(
         merged_actions[BOOTSTRAP_RECOVERY_ACTION] = json.loads(
             json.dumps(bootstrap_recovery)
         )
+    operator_service_control_before = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
+    if operator_service_control is not None:
+        if (
+            operator_service_control_before is not None
+            and operator_service_control_before != operator_service_control
+        ):
+            raise CutoverError(
+                "installed operator service control differs from commit-bound contract"
+            )
+        merged_actions[OPERATOR_SERVICE_CONTROL_ACTION] = json.loads(
+            json.dumps(operator_service_control)
+        )
+
     merged_power = merged_actions[POWER_ACTION]
     merged_gate = merged_power["gate"]
     if lifecycle is None:
@@ -932,6 +996,8 @@ def merge_privileged_config(
         merged_actions[BLOCKADE_LIFECYCLE_ACTION] = json.loads(
             json.dumps(lifecycle)
         )
+        merged_power["allowed_peer_unit"] = lifecycle["allowed_peer_unit"]
+        merged_power["allowed_peer_uid"] = lifecycle["allowed_peer_uid"]
         if lifecycle.get("marker_path") != publisher.get("kill_switch_path"):
             raise CutoverError("lifecycle marker differs from publisher gate")
         if lifecycle.get("legacy_marker_path") != publisher.get(
@@ -972,6 +1038,8 @@ def merge_privileged_config(
         expected_power["gate"]["configured_target"] = CONFIGURED_TARGET
     else:
         expected_power["gate"].update(gate_updates)
+        expected_power["allowed_peer_unit"] = lifecycle["allowed_peer_unit"]
+        expected_power["allowed_peer_uid"] = lifecycle["allowed_peer_uid"]
     if merged_power != expected_power:
         raise CutoverError("operator power action changed beyond gate migration")
 
@@ -984,6 +1052,8 @@ def merge_privileged_config(
         controlled.add(PROCESS_OBSERVER_ACTION)
     if bootstrap_recovery is not None:
         controlled.add(BOOTSTRAP_RECOVERY_ACTION)
+    if operator_service_control is not None:
+        controlled.add(OPERATOR_SERVICE_CONTROL_ACTION)
     evidence = {
         "operator_power_before_sha256": _sha256(_canonical_json(power_before)),
         "operator_power_after_sha256": _sha256(_canonical_json(merged_power)),
@@ -1008,6 +1078,13 @@ def merge_privileged_config(
             _sha256(_canonical_json(bootstrap_recovery))
             if bootstrap_recovery is not None else None
         ),
+        "operator_service_control_sha256": (
+            _sha256(_canonical_json(operator_service_control))
+            if operator_service_control is not None else None
+        ),
+        "operator_service_control_preexisting": (
+            operator_service_control_before is not None
+        ),
         "bootstrap_recovery_preexisting": bootstrap_recovery_before is not None,
         "bootstrap_recovery_before_sha256": (
             _sha256(_canonical_json(bootstrap_recovery_before))
@@ -1026,6 +1103,84 @@ def merge_privileged_config(
         if merged_actions.get(name) != actions.get(name):
             raise CutoverError(f"unrelated action changed: {name}")
     return merged, evidence
+
+
+def _operator_authority_attestation(
+    *,
+    expected_head: str,
+    source_artifacts: dict[Path, tuple[bytes, int, str]],
+    merged_config: dict[str, Any],
+    cutover_receipt_sha256: str,
+) -> dict[str, Any]:
+    required_artifacts = {
+        "broker_module": BROKER_MODULE_TARGET,
+        "broker_wrapper": BROKER_WRAPPER_TARGET,
+        "cutover_helper": CUTOVER_HELPER_TARGET,
+        "operator_service": OPERATOR_SERVICE_TARGET,
+    }
+    artifact_sha256: dict[str, str] = {}
+    for label, target in required_artifacts.items():
+        artifact = source_artifacts.get(target)
+        if artifact is None:
+            raise CutoverError(
+                f"operator authority attestation lacks artifact: {label}"
+            )
+        artifact_sha256[label] = artifact[2]
+
+    actions = merged_config.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("operator authority attestation config is malformed")
+    power = actions.get(POWER_ACTION)
+    lifecycle = actions.get(BLOCKADE_LIFECYCLE_ACTION)
+    service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
+    if not all(isinstance(item, dict) for item in (power, lifecycle, service_control)):
+        raise CutoverError("operator authority attestation actions are incomplete")
+    assert isinstance(power, dict)
+    assert isinstance(lifecycle, dict)
+    assert isinstance(service_control, dict)
+    peer_binding = {
+        "allowed_peer_uid": power.get("allowed_peer_uid"),
+        "allowed_peer_unit": power.get("allowed_peer_unit"),
+    }
+    expected_peer_binding = {
+        "allowed_peer_uid": lifecycle.get("allowed_peer_uid"),
+        "allowed_peer_unit": lifecycle.get("allowed_peer_unit"),
+    }
+    if (
+        peer_binding != expected_peer_binding
+        or peer_binding["allowed_peer_uid"] != 1000
+        or peer_binding["allowed_peer_unit"] != OPERATOR_UNIT
+    ):
+        raise CutoverError("operator authority peer binding is incoherent")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_operator_authority_attestation",
+        "expected_head": expected_head,
+        "cutover_receipt_sha256": cutover_receipt_sha256,
+        "config_sha256": _sha256(_canonical_json(merged_config)),
+        "artifact_sha256": artifact_sha256,
+        "action_sha256": {
+            POWER_ACTION: _sha256(_canonical_json(power)),
+            BLOCKADE_LIFECYCLE_ACTION: _sha256(_canonical_json(lifecycle)),
+            OPERATOR_SERVICE_CONTROL_ACTION: _sha256(
+                _canonical_json(service_control)
+            ),
+        },
+        "power_peer_binding": peer_binding,
+        "operator_system_unit": {
+            "unit": OPERATOR_UNIT,
+            "fragment_path": str(OPERATOR_SERVICE_TARGET),
+            "control_group": f"/system.slice/{OPERATOR_UNIT}",
+            "run_uid": 1000,
+        },
+        "does_not_establish": [
+            "current_operator_main_pid",
+            "runtime_release_integrity",
+            "future_rootbroker_configuration",
+        ],
+    }
+    payload["attestation_sha256"] = _sha256(_canonical_json(payload))
+    return payload
 
 
 def _atomic_install(
@@ -1259,6 +1414,137 @@ def _restore_preimages(
         raise CutoverError("preimage restore incomplete: " + " | ".join(errors))
 
 
+def _operator_username(runner: RunCommand) -> str:
+    argv = ["/usr/bin/id", "-nu", "1000"]
+    completed = runner(argv)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "uid lookup failed").strip()
+        raise CutoverError(f"operator account uid 1000 is unavailable: {detail[:500]}")
+    if completed.stdout not in {"alex", "alex\n"}:
+        raise CutoverError("operator account identity differs from host contract")
+    return "alex"
+
+
+def _systemctl_scope_prefix(runner: RunCommand, *, user: bool) -> list[str]:
+    argv = ["/usr/bin/systemctl"]
+    if user:
+        argv.extend(["--user", f"--machine={_operator_username(runner)}@.host"])
+    return argv
+
+
+def _unit_scope_argv(runner: RunCommand, unit: str, *, user: bool) -> list[str]:
+    argv = _systemctl_scope_prefix(runner, user=user)
+    argv.extend(
+        [
+            "show",
+            unit,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=UnitFileState",
+            "--no-pager",
+        ]
+    )
+    return argv
+
+
+def _read_unit_state(
+    runner: RunCommand, unit: str, *, user: bool
+) -> dict[str, object]:
+    completed = runner(_unit_scope_argv(runner, unit, user=user))
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "systemctl show failed").strip()
+        raise CutoverError(f"cannot inspect service state for {unit}: {detail[:500]}")
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in values:
+            raise CutoverError(f"service state is malformed for {unit}")
+        values[key] = value
+    if set(values) != {"LoadState", "ActiveState", "UnitFileState"}:
+        raise CutoverError(f"service state is incomplete for {unit}")
+    return {
+        "unit": unit,
+        "user": user,
+        "load_state": values["LoadState"],
+        "active": values["ActiveState"] == "active",
+        "enabled": values["UnitFileState"] in {"enabled", "enabled-runtime"},
+    }
+
+
+def _systemctl_unit_mutation(
+    runner: RunCommand, *, user: bool, action: str, unit: str
+) -> None:
+    if action not in {"start", "stop", "enable", "disable"}:
+        raise CutoverError("unsupported service migration action")
+    argv = _systemctl_scope_prefix(runner, user=user)
+    argv.append(action)
+    if action in {"enable", "disable"}:
+        argv.append("--now")
+    argv.append(unit)
+    _checked_run(runner, argv)
+
+
+def _restore_unit_state(
+    runner: RunCommand, state: dict[str, object]
+) -> None:
+    if state.get("load_state") == "not-found":
+        return
+    user = bool(state["user"])
+    unit = str(state["unit"])
+    if bool(state["enabled"]):
+        _systemctl_unit_mutation(runner, user=user, action="enable", unit=unit)
+    else:
+        _systemctl_unit_mutation(runner, user=user, action="disable", unit=unit)
+    if bool(state["active"]):
+        _systemctl_unit_mutation(runner, user=user, action="start", unit=unit)
+    else:
+        _systemctl_unit_mutation(runner, user=user, action="stop", unit=unit)
+
+
+def _verify_system_operator_state(runner: RunCommand) -> dict[str, object]:
+    state = _read_unit_state(runner, OPERATOR_UNIT, user=False)
+    if (
+        state["load_state"] != "loaded"
+        or not state["active"]
+        or not state["enabled"]
+    ):
+        raise CutoverError("root-managed operator service is not active and enabled")
+    completed = runner(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            OPERATOR_UNIT,
+            "--property=MainPID",
+            "--property=ControlGroup",
+            "--property=User",
+            "--property=FragmentPath",
+            "--no-pager",
+        ]
+    )
+    if completed.returncode != 0:
+        raise CutoverError("root-managed operator identity readback failed")
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in values:
+            raise CutoverError("root-managed operator identity readback is malformed")
+        values[key] = value
+    if set(values) != {"MainPID", "ControlGroup", "User", "FragmentPath"}:
+        raise CutoverError("root-managed operator identity readback is incomplete")
+    try:
+        main_pid = int(values["MainPID"])
+    except ValueError as exc:
+        raise CutoverError("root-managed operator MainPID is invalid") from exc
+    if (
+        main_pid <= 1
+        or values["ControlGroup"] != f"/system.slice/{OPERATOR_UNIT}"
+        or values["User"] != "alex"
+        or values["FragmentPath"] != str(OPERATOR_SERVICE_TARGET)
+    ):
+        raise CutoverError("root-managed operator identity differs from contract")
+    return {**state, "main_pid": main_pid, "control_group": values["ControlGroup"]}
+
+
 def _socket_active(runner: RunCommand) -> bool:
     completed = runner(["/usr/bin/systemctl", "is-active", "--quiet", SOCKET_UNIT])
     if completed.returncode == 0:
@@ -1372,6 +1658,9 @@ def _apply_cutover_locked(
     bootstrap_recovery = _bootstrap_recovery_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    operator_service_control = _operator_service_control_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     if artifact_targets is None:
         _validate_recovery_source_dropin(
             source_artifacts,
@@ -1389,8 +1678,19 @@ def _apply_cutover_locked(
         root_task=root_task,
         process_observer=process_observer,
         bootstrap_recovery=bootstrap_recovery,
+        operator_service_control=operator_service_control,
     )
     merged_config_data = _canonical_json(merged_config)
+
+    legacy_operator_state = _read_unit_state(
+        runner, OPERATOR_UNIT, user=True
+    )
+    legacy_watchdog_state = _read_unit_state(
+        runner, LEGACY_OPERATOR_WATCHDOG_TIMER, user=True
+    )
+    system_operator_state_before = _read_unit_state(
+        runner, OPERATOR_UNIT, user=False
+    )
 
     desired: dict[Path, tuple[bytes, int, str]] = dict(source_artifacts)
     desired[config_target] = (
@@ -1405,6 +1705,14 @@ def _apply_cutover_locked(
         _capture_preimage(target, require_root_owned=require_root)
         for target in desired
     ]
+    publish_authority_attestation = artifact_targets is None
+    if publish_authority_attestation:
+        preimages.append(
+            _capture_preimage(
+                OPERATOR_AUTHORITY_ATTESTATION_TARGET,
+                require_root_owned=require_root,
+            )
+        )
     stamp = f"{time.time_ns()}-{expected_head[:12]}"
     backup_directory = backup_root / stamp
     receipt_path = receipt_root / f"{stamp}.json"
@@ -1440,7 +1748,22 @@ def _apply_cutover_locked(
                 gid=install_gid,
                 expected_parent_uid=install_uid,
             )
+        if legacy_watchdog_state["load_state"] != "not-found":
+            _systemctl_unit_mutation(
+                runner,
+                user=True,
+                action="disable",
+                unit=LEGACY_OPERATOR_WATCHDOG_TIMER,
+            )
+        if legacy_operator_state["load_state"] != "not-found":
+            _systemctl_unit_mutation(
+                runner, user=True, action="disable", unit=OPERATOR_UNIT
+            )
         _checked_run(runner, ["/usr/bin/systemctl", "daemon-reload"])
+        _systemctl_unit_mutation(
+            runner, user=False, action="enable", unit=OPERATOR_UNIT
+        )
+        system_operator_state_after = _verify_system_operator_state(runner)
         _checked_run(runner, ["/usr/bin/systemctl", "start", SOCKET_UNIT])
         _checked_run(runner, ["/usr/bin/systemctl", "is-active", "--quiet", SOCKET_UNIT])
         installed: dict[str, Any] = {}
@@ -1476,6 +1799,12 @@ def _apply_cutover_locked(
             "socket_active": True,
             "socket_was_active": was_active,
             "daemon_reload_complete": True,
+            "operator_service_migration": {
+                "legacy_operator_before": legacy_operator_state,
+                "legacy_watchdog_before": legacy_watchdog_state,
+                "system_operator_before": system_operator_state_before,
+                "system_operator_after": system_operator_state_after,
+            },
             "rollback_performed": False,
         }
         _ensure_private_directory(
@@ -1493,6 +1822,39 @@ def _apply_cutover_locked(
         )
         receipt["receipt_path"] = str(receipt_path)
         receipt["receipt_sha256"] = _sha256(receipt_path.read_bytes())
+        if publish_authority_attestation:
+            attestation = _operator_authority_attestation(
+                expected_head=expected_head,
+                source_artifacts=source_artifacts,
+                merged_config=merged_config,
+                cutover_receipt_sha256=receipt["receipt_sha256"],
+            )
+            attestation_data = _canonical_json(attestation)
+            attempted_targets.append(str(OPERATOR_AUTHORITY_ATTESTATION_TARGET))
+            _atomic_install(
+                OPERATOR_AUTHORITY_ATTESTATION_TARGET,
+                attestation_data,
+                mode=0o644,
+                uid=install_uid,
+                gid=install_gid,
+                expected_parent_uid=install_uid,
+            )
+            readback, metadata = _read_regular_file(
+                OPERATOR_AUTHORITY_ATTESTATION_TARGET,
+                require_root_owned=require_root,
+            )
+            if (
+                readback != attestation_data
+                or stat.S_IMODE(metadata.st_mode) != 0o644
+                or metadata.st_uid != install_uid
+                or metadata.st_gid != install_gid
+            ):
+                raise CutoverError("operator authority attestation readback failed")
+            receipt["authority_attestation"] = {
+                "path": str(OPERATOR_AUTHORITY_ATTESTATION_TARGET),
+                "sha256": _sha256(readback),
+                "attestation_sha256": attestation["attestation_sha256"],
+            }
         return receipt
     except Exception as exc:
         rollback_errors: list[str] = []
@@ -1504,6 +1866,12 @@ def _apply_cutover_locked(
                 rollback_errors.append(f"{label}: {rollback_exc}")
 
         attempt(
+            "disable migrated system operator",
+            lambda: _systemctl_unit_mutation(
+                runner, user=False, action="disable", unit=OPERATOR_UNIT
+            ),
+        )
+        attempt(
             "restore preimages",
             lambda: _restore_preimages(
                 preimages,
@@ -1513,6 +1881,18 @@ def _apply_cutover_locked(
         attempt(
             "reload restored systemd units",
             lambda: _checked_run(runner, ["/usr/bin/systemctl", "daemon-reload"]),
+        )
+        attempt(
+            "restore system operator state",
+            lambda: _restore_unit_state(runner, system_operator_state_before),
+        )
+        attempt(
+            "restore legacy operator state",
+            lambda: _restore_unit_state(runner, legacy_operator_state),
+        )
+        attempt(
+            "restore legacy operator watchdog state",
+            lambda: _restore_unit_state(runner, legacy_watchdog_state),
         )
         if was_active:
             attempt(

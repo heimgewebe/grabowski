@@ -1295,58 +1295,89 @@ class PrivilegedBrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "shell"):
             privileged_broker.resolve_execution(config, parsed)
 
-    def test_power_run_tool_builds_reference_and_requires_recovery(self) -> None:
-        class Completed:
-            returncode = 0
-            stdout = json.dumps({
+    def test_power_run_tool_builds_direct_reference_and_requires_recovery(self) -> None:
+        response = json.dumps(
+            {
                 "returncode": 0,
                 "stdout": "uid=0(root)\n",
                 "stderr": "",
                 "audit": {"request_id": "x" * 32},
-            }).encode("utf-8")
-            stderr = b""
+            }
+        ).encode("utf-8")
 
-        with tempfile.TemporaryDirectory() as directory:
-            reference_dir = Path(directory)
-            captured: dict[str, object] = {}
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.sent = b""
+                self.connected: str | None = None
+                self.responses = [response, b""]
 
-            def fake_run(argv: list[str], **kwargs: object) -> Completed:
-                captured["argv"] = argv
-                reference_path = Path(argv[1])
-                captured["reference"] = json.loads(reference_path.read_text(encoding="utf-8"))
-                return Completed()
+            def __enter__(self):
+                return self
 
-            with patch.object(privileged, "POWER_REFERENCE_DIR", reference_dir), patch.object(
-                privileged.operator, "_require_operator_mutation"
-            ), patch.object(
-                privileged, "grabowski_privileged_broker_status",
-                return_value={"ready": True, "request_client": "/usr/local/bin/grabowski-privileged-request"},
-            ), patch.object(
-                privileged, "_power_recovery_status",
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, _timeout: int) -> None:
+                pass
+
+            def connect(self, path: str) -> None:
+                self.connected = path
+
+            def sendall(self, payload: bytes) -> None:
+                self.sent += payload
+
+            def shutdown(self, _how: int) -> None:
+                pass
+
+            def recv(self, _size: int) -> bytes:
+                return self.responses.pop(0)
+
+        fake = FakeSocket()
+        with (
+            patch.object(privileged.operator, "_require_operator_mutation"),
+            patch.object(
+                privileged,
+                "grabowski_privileged_broker_status",
+                return_value={"ready": True},
+            ),
+            patch.object(
+                privileged,
+                "_power_recovery_status",
                 return_value={
                     "ready_for_user_power_worker": True,
                     "ready_for_privileged_actions": True,
                     "checked_at_unix": 1000,
                 },
-            ), patch.object(privileged.subprocess, "run", side_effect=fake_run), patch.object(
-                privileged.operator.base, "_append_audit"
-            ) as append_audit:
-                result = privileged.grabowski_power_run(
-                    ["/usr/bin/id", "-u"],
-                    cwd="/",
-                    timeout_seconds=30,
-                    justification="Check root identity for operator maintenance",
-                )
+            ),
+            patch.object(privileged.socket, "socket", return_value=fake),
+            patch.object(privileged.subprocess, "run") as subprocess_run,
+            patch.object(privileged, "_write_power_reference") as write_reference,
+            patch.object(privileged.operator.base, "_append_audit") as append_audit,
+        ):
+            result = privileged.grabowski_power_run(
+                ["/usr/bin/id", "-u"],
+                cwd="/",
+                timeout_seconds=30,
+                justification="Check root identity for operator maintenance",
+            )
 
-            self.assertTrue(result["success"])
-            self.assertEqual(captured["argv"][0], "/usr/local/bin/grabowski-privileged-request")
-            reference = captured["reference"]
-            self.assertEqual(reference["action"], "operator_power_argv")
-            self.assertEqual(reference["execution"], "unprivileged-reference-only")
-            target = json.loads(reference["target"])
-            self.assertEqual(target, {"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
-            append_audit.assert_called_once()
-            self.assertEqual(list(reference_dir.glob("*.json")), [])
+        self.assertTrue(result["success"])
+        subprocess_run.assert_not_called()
+        write_reference.assert_not_called()
+        self.assertEqual(fake.connected, str(privileged.BROKER_SOCKET))
+        reference = json.loads(fake.sent.decode("utf-8"))
+        self.assertEqual(reference["action"], "operator_power_argv")
+        self.assertEqual(reference["execution"], "unprivileged-reference-only")
+        target = json.loads(reference["target"] )
+        self.assertEqual(
+            target,
+            {
+                "argv": ["/usr/bin/id", "-u"],
+                "cwd": "/",
+                "timeout_seconds": 30,
+            },
+        )
+        append_audit.assert_called_once()
 
     def test_tamper_expiry_disable_and_replay_fail_closed(self) -> None:
         reference = self._reference()

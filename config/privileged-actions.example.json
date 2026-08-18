@@ -108,7 +108,19 @@
         "require_root_owned_gate_files": true,
         "configured_target": "heimberry:rest-server/grabowski-recovery-probe",
         "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
-      }
+      },
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000
+    },
+    "operator_system_service_control": {
+      "enabled": true,
+      "target_pattern": "(?:start|stop|restart|is-active)",
+      "argv": [
+        "/usr/bin/systemctl",
+        "{target}",
+        "grabowski-operator.service"
+      ],
+      "timeout_seconds": 60
     },
     "operator_blockade_marker_lifecycle": {
       "enabled": true,

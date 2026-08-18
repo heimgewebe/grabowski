@@ -1187,7 +1187,7 @@ def _resolve_power_argv_action(
         "enabled", "mode", "target_pattern", "timeout_seconds",
         "cwd_pattern", "max_argv", "allow_shell", "gate",
     }
-    optional = {"allowed_argv_prefixes", "policy_intent"}
+    optional = {"allowed_argv_prefixes", "policy_intent", "allowed_peer_uid", "allowed_peer_unit"}
     candidate_keys = set(candidate)
     if not required.issubset(candidate_keys) or candidate_keys - required - optional or candidate["enabled"] is not True:
         raise PermissionError("privileged action is disabled or malformed")
@@ -1249,6 +1249,19 @@ def _resolve_power_argv_action(
         "configured_timeout_seconds": timeout,
         "gate": gate,
     }
+    peer_uid = candidate.get("allowed_peer_uid")
+    peer_unit = candidate.get("allowed_peer_unit")
+    if peer_uid is not None or peer_unit is not None:
+        if (
+            isinstance(peer_uid, bool)
+            or not isinstance(peer_uid, int)
+            or peer_uid < 0
+            or not isinstance(peer_unit, str)
+            or not peer_unit
+        ):
+            raise PermissionError("power peer identity contract is malformed")
+        execution["allowed_peer_uid"] = peer_uid
+        execution["allowed_peer_unit"] = peer_unit
     if policy_intent is not None:
         execution["policy_intent"] = policy_intent
     if allowed_argv_prefixes:
