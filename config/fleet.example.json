@@ -23,6 +23,15 @@
       "roles": ["dns", "infrastructure"],
       "command_allowlist": ["*"],
       "connect_timeout_seconds": 10
+    },
+    "windows-workstation": {
+      "transport": "ssh",
+      "target": "windows-workstation",
+      "enabled": true,
+      "roles": ["windows", "workstation"],
+      "command_allowlist": ["*"],
+      "connect_timeout_seconds": 10,
+      "remote_command_mode": "windows-powershell"
     }
   }
 }
