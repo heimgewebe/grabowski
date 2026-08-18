@@ -60,6 +60,26 @@ MAX_REVIEW_SCAN_RECORDS = 500_000
 MAX_REVIEW_EVIDENCE_REFS = 20
 EVENT_IDENTITY_INDEX_SCHEMA_VERSION = 1
 EVENT_IDENTITY_INDEX_FILENAME = "reposkop-event-identity-index-v1.sqlite3"
+EFFECTIVENESS_INDEX_SCHEMA_VERSION = 1
+EFFECTIVENESS_INDEX_FILENAME = "reposkop-effectiveness-durable-index-v1.sqlite3"
+MAX_EFFECTIVENESS_INDEX_RECORDS = 100_000
+# The same set `project_records` treats as Reposkop-relevant. The durable
+# effectiveness index only retains records matching this set so it stays a
+# derived, bounded projection of the verified audit chain rather than a
+# second copy of unrelated audit noise.
+REPOSKOP_EFFECTIVENESS_OPERATIONS = frozenset(
+    {
+        "reposkop-evaluation-requested",
+        "reposkop-evaluation-completed",
+        "reposkop-decision-applied",
+        "reposkop-execution-attestation-blocked",
+        "reposkop-task-outcome-observed",
+        "reposkop-review-classification-recorded",
+        "reposkop-checkout-shadow-before-observed",
+        "reposkop-checkout-shadow-terminal-observed",
+        "task-start",
+    }
+)
 TERMINAL_IDENTITY_OPERATION = "reposkop-checkout-shadow-terminal-observed"
 TERMINAL_IDENTITY_FIELDS = (
     "operation",
@@ -894,19 +914,33 @@ def _verified_item_at_global_ordinal(
 def _iter_verified_items_after(
     snapshot: audit_query.VerifiedAuditSnapshot,
     after_global_ordinal: int,
+    *,
+    limit: int | None = None,
 ):
     if after_global_ordinal < 0 or after_global_ordinal > snapshot.total_records:
-        raise RuntimeError("Reposkop identity-index checkpoint is outside the verified audit snapshot")
+        raise RuntimeError(
+            "Reposkop identity-index checkpoint is outside the verified audit snapshot"
+        )
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+    ):
+        raise ValueError("verified audit iteration limit must be a positive integer")
+    yielded = 0
     for segment in snapshot.segments:
         if segment.global_end_ordinal <= after_global_ordinal:
             continue
+        if limit is not None and yielded >= limit:
+            return
         data = audit_query._load_snapshot_segment(segment)
         lines = data.splitlines()
         if len(lines) != segment.records:
             raise RuntimeError("verified audit segment record count changed")
         first = max(0, after_global_ordinal + 1 - segment.global_start_ordinal)
         for index in range(first, len(lines)):
+            if limit is not None and yielded >= limit:
+                return
             ordinal = segment.global_start_ordinal + index
+            yielded += 1
             yield _audit_item_from_raw(lines[index], global_ordinal=ordinal)
 
 
@@ -1077,6 +1111,541 @@ def enrich_attestation(
         }
     )
     return {**material, "execution_binding_sha256": _sha256_json(material)}
+
+
+def _effectiveness_index_path() -> Path:
+    return base.AUDIT_LOG.parent / EFFECTIVENESS_INDEX_FILENAME
+
+
+@contextlib.contextmanager
+def effectiveness_index_lock():
+    """Serialize the single derived effectiveness index writer."""
+    while True:
+        manager = base._audit_coordination_lock(
+            _effectiveness_index_path(),
+            exclusive=True,
+        )
+        try:
+            manager.__enter__()
+        except RuntimeError as exc:
+            if str(exc) != "Audit lock acquisition timed out":
+                raise
+            continue
+        break
+    try:
+        yield
+    finally:
+        manager.__exit__(None, None, None)
+
+
+def _ensure_effectiveness_index_file(path: Path) -> None:
+    parent = path.parent
+    if parent.is_symlink():
+        raise PermissionError(
+            "Reposkop effectiveness-index parent may not be a symlink"
+        )
+    parent_meta = os.stat(parent, follow_symlinks=False)
+    if (
+        not statmod.S_ISDIR(parent_meta.st_mode)
+        or parent_meta.st_uid != os.getuid()
+        or parent_meta.st_gid != os.getgid()
+        or statmod.S_IMODE(parent_meta.st_mode) & 0o077
+    ):
+        raise PermissionError(
+            "Reposkop effectiveness-index parent violates its private contract"
+        )
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        try:
+            descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            descriptor = os.open(path, flags)
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            base._fsync_directory(parent)
+        opened = os.fstat(descriptor)
+        linked = os.stat(path, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or not statmod.S_ISREG(linked.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_uid != os.getuid()
+            or opened.st_gid != os.getgid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise PermissionError(
+                "Reposkop effectiveness index violates its file contract"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _open_effectiveness_index() -> sqlite3.Connection:
+    path = _effectiveness_index_path()
+    _ensure_effectiveness_index_file(path)
+    connection = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if user_version not in {0, EFFECTIVENESS_INDEX_SCHEMA_VERSION}:
+            raise RuntimeError(
+                "Reposkop effectiveness-index schema version is unsupported"
+            )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS checkpoint ("
+            "singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+            "through_global_ordinal INTEGER NOT NULL, "
+            "through_record_sha256 TEXT, "
+            "relevant_records_seen INTEGER NOT NULL, "
+            "dropped_records INTEGER NOT NULL, "
+            "dropped_max_timestamp_unix INTEGER, "
+            "dropped_unknown_timestamps INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS relevant_record ("
+            "global_ordinal INTEGER PRIMARY KEY, "
+            "audit_ref TEXT NOT NULL UNIQUE, "
+            "operation TEXT NOT NULL, "
+            "timestamp_unix INTEGER, "
+            "record_json TEXT NOT NULL, "
+            "payload_sha256 TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO checkpoint("
+            "singleton, through_global_ordinal, through_record_sha256, "
+            "relevant_records_seen, dropped_records, dropped_max_timestamp_unix, "
+            "dropped_unknown_timestamps"
+            ") VALUES(1, 0, NULL, 0, 0, NULL, 0)"
+        )
+        if user_version == 0:
+            connection.execute(
+                f"PRAGMA user_version={EFFECTIVENESS_INDEX_SCHEMA_VERSION}"
+            )
+        connection.commit()
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _reset_effectiveness_index(connection: sqlite3.Connection) -> None:
+    connection.execute("DELETE FROM relevant_record")
+    connection.execute(
+        "UPDATE checkpoint SET through_global_ordinal=0, through_record_sha256=NULL, "
+        "relevant_records_seen=0, dropped_records=0, dropped_max_timestamp_unix=NULL, "
+        "dropped_unknown_timestamps=0 "
+        "WHERE singleton=1"
+    )
+
+
+def _index_effectiveness_item(
+    connection: sqlite3.Connection,
+    item: dict[str, Any],
+) -> bool:
+    record = item["record"]
+    operation = record.get("operation")
+    if operation not in REPOSKOP_EFFECTIVENESS_OPERATIONS:
+        return False
+    record_json = _canonical_json(record)
+    payload_sha256 = hashlib.sha256(record_json.encode("utf-8")).hexdigest()
+    timestamp = record.get("timestamp_unix")
+    timestamp_unix = timestamp if type(timestamp) is int else None
+    existing = connection.execute(
+        "SELECT audit_ref, operation, timestamp_unix, record_json, payload_sha256 "
+        "FROM relevant_record WHERE global_ordinal=?",
+        (item["global_ordinal"],),
+    ).fetchone()
+    expected = (
+        item["audit_ref"],
+        operation,
+        timestamp_unix,
+        record_json,
+        payload_sha256,
+    )
+    if existing is not None:
+        if tuple(existing) != expected:
+            raise RuntimeError("Reposkop effectiveness-index ordinal changed identity")
+        return False
+    duplicate = connection.execute(
+        "SELECT global_ordinal, operation, timestamp_unix, record_json, payload_sha256 "
+        "FROM relevant_record WHERE audit_ref=?",
+        (item["audit_ref"],),
+    ).fetchone()
+    if duplicate is not None:
+        if tuple(duplicate[1:]) != expected[1:]:
+            raise RuntimeError(
+                "Reposkop effectiveness-index audit reference changed payload"
+            )
+        return False
+    connection.execute(
+        "INSERT INTO relevant_record("
+        "global_ordinal, audit_ref, operation, timestamp_unix, record_json, payload_sha256"
+        ") VALUES(?, ?, ?, ?, ?, ?)",
+        (item["global_ordinal"], *expected),
+    )
+    return True
+
+
+def _sync_effectiveness_index_unlocked(
+    snapshot: audit_query.VerifiedAuditSnapshot,
+    connection: sqlite3.Connection,
+    *,
+    scan_limit: int,
+) -> dict[str, Any]:
+    if (
+        isinstance(scan_limit, bool)
+        or not isinstance(scan_limit, int)
+        or scan_limit < 1
+    ):
+        raise ValueError(
+            "Reposkop effectiveness catch-up limit must be a positive integer"
+        )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = connection.execute(
+            "SELECT through_global_ordinal, through_record_sha256, relevant_records_seen, "
+            "dropped_records, dropped_max_timestamp_unix, dropped_unknown_timestamps "
+            "FROM checkpoint WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Reposkop effectiveness-index checkpoint is missing")
+        through = int(row[0])
+        through_sha = row[1]
+        relevant_records_seen = int(row[2])
+        dropped_records = int(row[3])
+        dropped_max_timestamp_unix = row[4]
+        dropped_unknown_timestamps = int(row[5])
+        checkpoint_rebuilt = False
+        checkpoint_valid = 0 <= through <= snapshot.total_records
+        if checkpoint_valid and through:
+            try:
+                anchor = _verified_item_at_global_ordinal(snapshot, through)
+            except RuntimeError:
+                checkpoint_valid = False
+            else:
+                checkpoint_valid = (
+                    anchor["audit_ref"] == f"audit-record-sha256:{through_sha}"
+                )
+        if not checkpoint_valid:
+            _reset_effectiveness_index(connection)
+            through = 0
+            through_sha = None
+            relevant_records_seen = 0
+            dropped_records = 0
+            dropped_max_timestamp_unix = None
+            dropped_unknown_timestamps = 0
+            checkpoint_rebuilt = True
+
+        scanned = 0
+        added = 0
+        last_ordinal = through
+        last_ref = f"audit-record-sha256:{through_sha}" if through else None
+        for item in _iter_verified_items_after(snapshot, through, limit=scan_limit):
+            scanned += 1
+            if _index_effectiveness_item(connection, item):
+                added += 1
+            last_ordinal = int(item["global_ordinal"])
+            last_ref = item["audit_ref"]
+        if snapshot.total_records and last_ref is None:
+            raise RuntimeError(
+                "Reposkop effectiveness-index could not bind scanned audit evidence"
+            )
+        last_sha = last_ref.removeprefix("audit-record-sha256:") if last_ref else None
+        relevant_records_seen += added
+
+        retained_records = int(
+            connection.execute("SELECT COUNT(*) FROM relevant_record").fetchone()[0]
+        )
+        excess = max(0, retained_records - MAX_EFFECTIVENESS_INDEX_RECORDS)
+        if excess:
+            dropped = connection.execute(
+                "SELECT COUNT(*), MAX(timestamp_unix), "
+                "SUM(CASE WHEN timestamp_unix IS NULL THEN 1 ELSE 0 END) FROM ("
+                "SELECT timestamp_unix FROM relevant_record ORDER BY global_ordinal ASC LIMIT ?"
+                ")",
+                (excess,),
+            ).fetchone()
+            dropped_now = int(dropped[0]) if dropped else 0
+            dropped_now_max = dropped[1] if dropped else None
+            dropped_now_unknown = int(dropped[2] or 0) if dropped else 0
+            connection.execute(
+                "DELETE FROM relevant_record WHERE global_ordinal IN ("
+                "SELECT global_ordinal FROM relevant_record ORDER BY global_ordinal ASC LIMIT ?"
+                ")",
+                (excess,),
+            )
+            dropped_records += dropped_now
+            dropped_unknown_timestamps += dropped_now_unknown
+            if dropped_now_max is not None:
+                dropped_max_timestamp_unix = max(
+                    int(dropped_max_timestamp_unix or 0), int(dropped_now_max)
+                )
+            retained_records -= dropped_now
+
+        connection.execute(
+            "UPDATE checkpoint SET through_global_ordinal=?, through_record_sha256=?, "
+            "relevant_records_seen=?, dropped_records=?, dropped_max_timestamp_unix=?, "
+            "dropped_unknown_timestamps=? WHERE singleton=1",
+            (
+                last_ordinal,
+                last_sha,
+                relevant_records_seen,
+                dropped_records,
+                dropped_max_timestamp_unix,
+                dropped_unknown_timestamps,
+            ),
+        )
+        connection.commit()
+        remaining_records = snapshot.total_records - last_ordinal
+        return {
+            "through_global_ordinal": last_ordinal,
+            "through_record_sha256": last_sha,
+            "verified_tail_global_ordinal": snapshot.total_records,
+            "remaining_records": remaining_records,
+            "index_complete": remaining_records == 0,
+            "scanned_records": scanned,
+            "scan_limit": scan_limit,
+            "added_relevant_records": added,
+            "retained_records": retained_records,
+            "relevant_records_seen": relevant_records_seen,
+            "dropped_records": dropped_records,
+            "dropped_max_timestamp_unix": dropped_max_timestamp_unix,
+            "dropped_unknown_timestamps": dropped_unknown_timestamps,
+            "checkpoint_rebuilt": checkpoint_rebuilt,
+            "chain_content_sha256": snapshot.chain_content_sha256,
+            "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+        }
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _read_effectiveness_records_unlocked(
+    snapshot: audit_query.VerifiedAuditSnapshot,
+    connection: sqlite3.Connection,
+    *,
+    since_unix: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    checkpoint = connection.execute(
+        "SELECT through_global_ordinal, relevant_records_seen, dropped_records, "
+        "dropped_max_timestamp_unix, dropped_unknown_timestamps "
+        "FROM checkpoint WHERE singleton=1"
+    ).fetchone()
+    if checkpoint is None:
+        raise RuntimeError("Reposkop effectiveness-index checkpoint is missing")
+    relevant_records_seen = int(checkpoint[1])
+    dropped_records = int(checkpoint[2])
+    expected_retained_records = relevant_records_seen - dropped_records
+    if expected_retained_records < 0:
+        raise RuntimeError(
+            "Reposkop effectiveness-index retention counters are invalid"
+        )
+    actual_retained_records = int(
+        connection.execute("SELECT COUNT(*) FROM relevant_record").fetchone()[0]
+    )
+    if actual_retained_records != expected_retained_records:
+        raise RuntimeError(
+            "Reposkop effectiveness-index retained-record cardinality drifted"
+        )
+    rows = connection.execute(
+        "SELECT global_ordinal, audit_ref, operation, timestamp_unix, record_json, payload_sha256 "
+        "FROM relevant_record WHERE timestamp_unix IS NULL OR timestamp_unix>=? "
+        "ORDER BY global_ordinal DESC",
+        (since_unix,),
+    ).fetchall()
+    records: list[dict[str, Any]] = []
+    retained_from_global_ordinal: int | None = None
+    retained_from_timestamp_unix: int | None = None
+    for (
+        global_ordinal,
+        audit_ref,
+        operation,
+        timestamp_unix,
+        record_json,
+        payload_sha256,
+    ) in rows:
+        if hashlib.sha256(record_json.encode("utf-8")).hexdigest() != payload_sha256:
+            raise RuntimeError(
+                "Reposkop effectiveness-index cached payload integrity failed"
+            )
+        parsed = json.loads(record_json)
+        if not isinstance(parsed, dict):
+            raise RuntimeError(
+                "Reposkop effectiveness-index cached record is not an object"
+            )
+        if parsed.get("operation") != operation:
+            raise RuntimeError("Reposkop effectiveness-index cached operation drifted")
+        parsed_timestamp = parsed.get("timestamp_unix")
+        expected_timestamp = parsed_timestamp if type(parsed_timestamp) is int else None
+        if expected_timestamp != timestamp_unix:
+            raise RuntimeError("Reposkop effectiveness-index cached timestamp drifted")
+        if operation not in REPOSKOP_EFFECTIVENESS_OPERATIONS:
+            raise RuntimeError(
+                "Reposkop effectiveness-index contains an unrelated operation"
+            )
+        digest = parsed.get("record_sha256")
+        if isinstance(digest, str) and SHA256_RE.fullmatch(digest):
+            canonical_digest = base._audit_record_hash(parsed)
+            if (
+                digest != canonical_digest
+                or audit_ref != f"audit-record-sha256:{canonical_digest}"
+            ):
+                raise RuntimeError(
+                    "Reposkop effectiveness-index cached record lost canonical audit-hash binding"
+                )
+        else:
+            authoritative = _verified_item_at_global_ordinal(
+                snapshot, int(global_ordinal)
+            )
+            if (
+                authoritative["audit_ref"] != audit_ref
+                or _canonical_json(authoritative["record"]) != record_json
+            ):
+                raise RuntimeError(
+                    "Reposkop effectiveness-index legacy record lost verified audit binding"
+                )
+        records.append({**parsed, "_audit_ref": audit_ref})
+        ordinal_value = int(global_ordinal)
+        retained_from_global_ordinal = (
+            ordinal_value
+            if retained_from_global_ordinal is None
+            else min(retained_from_global_ordinal, ordinal_value)
+        )
+        if timestamp_unix is not None:
+            retained_from_timestamp_unix = (
+                int(timestamp_unix)
+                if retained_from_timestamp_unix is None
+                else min(retained_from_timestamp_unix, int(timestamp_unix))
+            )
+    dropped_max_timestamp_unix = checkpoint[3]
+    dropped_unknown_timestamps = int(checkpoint[4])
+    since_truncated = bool(
+        dropped_records
+        and (
+            dropped_unknown_timestamps > 0
+            or since_unix == 0
+            or dropped_max_timestamp_unix is None
+            or int(dropped_max_timestamp_unix) >= since_unix
+        )
+    )
+    return records, {
+        "indexed_through_global_ordinal": int(checkpoint[0]),
+        "relevant_records_seen": int(checkpoint[1]),
+        "dropped_records": dropped_records,
+        "dropped_max_timestamp_unix": dropped_max_timestamp_unix,
+        "dropped_unknown_timestamps": dropped_unknown_timestamps,
+        "retained_from_global_ordinal": retained_from_global_ordinal,
+        "retained_from_timestamp_unix": retained_from_timestamp_unix,
+        "returned_records": len(records),
+        "retention_limit": MAX_EFFECTIVENESS_INDEX_RECORDS,
+        "retention_truncated": dropped_records > 0,
+        "since_truncated": since_truncated,
+    }
+
+
+def _durable_effectiveness_records(
+    *,
+    since_unix: int,
+    requested_scan_limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    with effectiveness_index_lock():
+        snapshot = audit_query.capture_verified_audit_snapshot()
+        connection = _open_effectiveness_index()
+        cache_rebuilt = False
+        rebuild_exhausted_budget = False
+        try:
+            sync = _sync_effectiveness_index_unlocked(
+                snapshot,
+                connection,
+                scan_limit=requested_scan_limit,
+            )
+            physical_scanned_records = int(sync["scanned_records"])
+            try:
+                records, retained = _read_effectiveness_records_unlocked(
+                    snapshot,
+                    connection,
+                    since_unix=since_unix,
+                )
+            except (RuntimeError, json.JSONDecodeError):
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _reset_effectiveness_index(connection)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                cache_rebuilt = True
+                rebuild_budget = requested_scan_limit - int(sync["scanned_records"])
+                if rebuild_budget > 0:
+                    sync = _sync_effectiveness_index_unlocked(
+                        snapshot,
+                        connection,
+                        scan_limit=rebuild_budget,
+                    )
+                    physical_scanned_records += int(sync["scanned_records"])
+                else:
+                    rebuild_exhausted_budget = True
+                    sync = {
+                        "through_global_ordinal": 0,
+                        "through_record_sha256": None,
+                        "verified_tail_global_ordinal": snapshot.total_records,
+                        "remaining_records": snapshot.total_records,
+                        "index_complete": snapshot.total_records == 0,
+                        "scanned_records": 0,
+                        "scan_limit": 0,
+                        "added_relevant_records": 0,
+                        "retained_records": 0,
+                        "relevant_records_seen": 0,
+                        "dropped_records": 0,
+                        "dropped_max_timestamp_unix": None,
+                        "dropped_unknown_timestamps": 0,
+                        "checkpoint_rebuilt": True,
+                        "chain_content_sha256": snapshot.chain_content_sha256,
+                        "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+                    }
+                records, retained = _read_effectiveness_records_unlocked(
+                    snapshot,
+                    connection,
+                    since_unix=since_unix,
+                )
+        finally:
+            connection.close()
+    source = {
+        "chain_content_sha256": snapshot.chain_content_sha256,
+        "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+        "total_records": snapshot.total_records,
+        "scanned_records": physical_scanned_records,
+        "scan_limit": requested_scan_limit,
+        "scan_truncated": not sync["index_complete"],
+        "scan_mode": "verified_incremental_effectiveness_index",
+        "index_schema_version": EFFECTIVENESS_INDEX_SCHEMA_VERSION,
+        "index_complete": sync["index_complete"],
+        "checkpoint_audit_ref": (
+            f"audit-record-sha256:{sync['through_record_sha256']}"
+            if sync["through_record_sha256"] is not None
+            else None
+        ),
+        "verified_tail_global_ordinal": sync["verified_tail_global_ordinal"],
+        "remaining_records": sync["remaining_records"],
+        "incremental_scanned_records": physical_scanned_records,
+        "added_relevant_records": sync["added_relevant_records"],
+        "checkpoint_rebuilt": sync["checkpoint_rebuilt"],
+        "cache_rebuilt": cache_rebuilt,
+        "rebuild_exhausted_scan_budget": rebuild_exhausted_budget,
+        **retained,
+    }
+    return records, source
 
 
 def _raw_records(
@@ -1524,17 +2093,9 @@ def project_records(
     *,
     source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    relevant = {
-        "reposkop-evaluation-requested",
-        "reposkop-evaluation-completed",
-        "reposkop-decision-applied",
-        "reposkop-execution-attestation-blocked",
-        "reposkop-task-outcome-observed",
-        "reposkop-review-classification-recorded",
-        "reposkop-checkout-shadow-before-observed",
-        "reposkop-checkout-shadow-terminal-observed",
-        "task-start",
-    }
+    relevant = REPOSKOP_EFFECTIVENESS_OPERATIONS
+    source_material = source or {}
+    evaluation_complete = source_material.get("index_complete") is not False
     requested: dict[str, dict[str, Any]] = {}
     completed: dict[str, dict[str, Any]] = {}
     decisions: dict[str, dict[str, Any]] = {}
@@ -1938,7 +2499,11 @@ def project_records(
         "policy_version": POLICY_VERSION,
         "finding_taxonomy_version": FINDING_TAXONOMY_VERSION,
         "review_schema_version": REVIEW_SCHEMA_VERSION,
-        "source": source or {},
+        "source": source_material,
+        "evaluation_complete": evaluation_complete,
+        "evaluation_status": "complete"
+        if evaluation_complete
+        else "incomplete_audit_catchup",
         "classified_task_starts": len(classified_starts),
         "legacy_unclassified_task_starts": legacy_unclassified,
         "required_task_starts": required_count,
@@ -1987,9 +2552,7 @@ def project_records(
             "unreviewed_decision_changes": len(unreviewed_decision_changes),
             "detectable_category_counts": {
                 classification: dict(sorted(counts.items()))
-                for classification, counts in sorted(
-                    review_category_clusters.items()
-                )
+                for classification, counts in sorted(review_category_clusters.items())
             },
         },
         "prospective": {
@@ -2048,9 +2611,7 @@ def project_records(
                     if value.get("shadow_status") == "unavailable"
                 ),
             },
-            "continuity_state_counts": dict(
-                sorted(shadow_continuity_states.items())
-            ),
+            "continuity_state_counts": dict(sorted(shadow_continuity_states.items())),
             "measurement_class_counts": dict(
                 sorted(shadow_measurement_classes.items())
             ),
@@ -2070,6 +2631,13 @@ def project_records(
             "review_truth_beyond_the_supplied_evidence_refs",
             "unique_value_from_identity_break_without_semantic_review",
             "future_failure_probability",
+            *(
+                []
+                if evaluation_complete
+                else [
+                    "complete_effectiveness_evaluation_while_audit_catchup_incomplete"
+                ]
+            ),
         ],
     }
 
@@ -2082,7 +2650,10 @@ def build_reposkop_effectiveness(
         raise ValueError("since_unix must be a non-negative integer")
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_SCAN_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_SCAN_LIMIT}")
-    records, source = _raw_records(since_unix=since_unix, scan_limit=limit)
+    records, source = _durable_effectiveness_records(
+        since_unix=since_unix,
+        requested_scan_limit=limit,
+    )
     return project_records(records, source=source)
 
 

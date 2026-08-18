@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -42,7 +43,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 
-import grabowski_reposkop_effectiveness as effectiveness
+import grabowski_reposkop_effectiveness as effectiveness  # noqa: E402
 
 
 def _ref(character: str) -> str:
@@ -68,6 +69,19 @@ def _event(
         "_audit_ref": _ref(character),
         **extra,
     }
+
+
+def _verified_audit_payload(records: list[dict[str, object]]) -> bytes:
+    bound: list[dict[str, object]] = []
+    for record in records:
+        material = {
+            key: value for key, value in record.items() if key != "record_sha256"
+        }
+        material["record_sha256"] = effectiveness.base._audit_record_hash(material)
+        bound.append(material)
+    return b"".join(
+        json.dumps(record, sort_keys=True).encode("utf-8") + b"\n" for record in bound
+    )
 
 
 class ReposkopEffectivenessTests(unittest.TestCase):
@@ -1463,6 +1477,734 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["audit_ref"], _ref("2"))
         self.assertEqual(result["global_ordinal"], 2)
+
+    def test_effectiveness_index_preserves_rotated_cohort_beyond_requested_scan_window(
+        self,
+    ) -> None:
+        sample = "a" * 64
+        control = "b" * 64
+        relevant = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": sample,
+                "transaction_id": sample,
+                "timestamp_unix": 100,
+                "effect_profile": "workspace_write",
+                "reposkop_policy": "required",
+                "reposkop_cohort": "prospective_sample",
+                "surface": "task_start",
+                "agent_executable": "codex",
+                "policy_version": 3,
+            },
+            {
+                "operation": "reposkop-evaluation-completed",
+                "evaluation_id": sample,
+                "transaction_id": sample,
+                "timestamp_unix": 101,
+                "duration_ms": 25,
+                "finding_counts": {
+                    "critical": 0,
+                    "error": 0,
+                    "warning": 0,
+                    "information": 1,
+                },
+            },
+            {
+                "operation": "reposkop-decision-applied",
+                "evaluation_id": sample,
+                "transaction_id": sample,
+                "timestamp_unix": 102,
+                "reposkop_cohort": "prospective_sample",
+                "final_decision": "block",
+            },
+            {
+                "operation": "reposkop-execution-attestation-blocked",
+                "evaluation_id": sample,
+                "transaction_id": sample,
+                "timestamp_unix": 103,
+            },
+            {
+                "operation": "reposkop-review-classification-recorded",
+                "evaluation_id": sample,
+                "transaction_id": sample,
+                "timestamp_unix": 104,
+                "classification": "confirmed_prevention",
+                "review_sequence": 1,
+                "reason_codes": ["prevented_regression"],
+            },
+            {
+                "operation": "reposkop-decision-applied",
+                "evaluation_id": control,
+                "transaction_id": control,
+                "timestamp_unix": 105,
+                "reposkop_cohort": "prospective_control",
+                "final_decision": "allow",
+            },
+            {
+                "operation": "reposkop-review-classification-recorded",
+                "evaluation_id": control,
+                "transaction_id": control,
+                "timestamp_unix": 106,
+                "classification": "false_negative",
+                "review_sequence": 1,
+                "reason_codes": ["missed_dirty_state"],
+                "detectable_category": "working_tree_state",
+            },
+            {
+                "operation": "reposkop-task-outcome-observed",
+                "evaluation_id": control,
+                "transaction_id": control,
+                "timestamp_unix": 107,
+                "terminal_state": "completed",
+            },
+        ]
+        noise = [
+            {
+                "operation": f"unrelated-{index}",
+                "timestamp_unix": 200 + index,
+            }
+            for index in range(5)
+        ]
+        active = types.SimpleNamespace(
+            path=Path("active"),
+            records=len(relevant),
+            global_start_ordinal=1,
+            global_end_ordinal=len(relevant),
+        )
+        archive = types.SimpleNamespace(
+            path=Path("archive"),
+            records=len(relevant),
+            global_start_ordinal=1,
+            global_end_ordinal=len(relevant),
+        )
+        tail = types.SimpleNamespace(
+            path=Path("tail"),
+            records=len(noise),
+            global_start_ordinal=len(relevant) + 1,
+            global_end_ordinal=len(relevant) + len(noise),
+        )
+        first_snapshot = types.SimpleNamespace(
+            total_records=len(relevant),
+            segments=(active,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        rotated_snapshot = types.SimpleNamespace(
+            total_records=len(relevant) + len(noise),
+            segments=(archive, tail),
+            chain_content_sha256="c" * 64,
+            chain_materialization_sha256="d" * 64,
+        )
+        payloads = {
+            Path("active"): _verified_audit_payload(relevant),
+            Path("archive"): _verified_audit_payload(relevant),
+            Path("tail"): _verified_audit_payload(noise),
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    side_effect=[first_snapshot] + [rotated_snapshot] * 7,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    side_effect=lambda segment: payloads[segment.path],
+                ),
+            ):
+                first = effectiveness.build_reposkop_effectiveness(limit=2)
+                catchup = [
+                    effectiveness.build_reposkop_effectiveness(limit=2)
+                    for _ in range(6)
+                ]
+                steady = effectiveness.build_reposkop_effectiveness(limit=2)
+
+        self.assertFalse(first["evaluation_complete"])
+        self.assertEqual(first["evaluation_status"], "incomplete_audit_catchup")
+        self.assertEqual(first["source"]["incremental_scanned_records"], 2)
+        self.assertEqual(first["source"]["remaining_records"], len(relevant) - 2)
+        self.assertIn(
+            "complete_effectiveness_evaluation_while_audit_catchup_incomplete",
+            first["does_not_establish"],
+        )
+        final = catchup[-1]
+        self.assertTrue(final["evaluation_complete"])
+        self.assertEqual(final["evaluation_status"], "complete")
+        self.assertEqual(
+            final["source"]["checkpoint_audit_ref"],
+            "audit-record-sha256:" + effectiveness.base._audit_record_hash(noise[-1]),
+        )
+        self.assertEqual(
+            final["source"]["indexed_through_global_ordinal"],
+            len(relevant) + len(noise),
+        )
+        self.assertEqual(final["prospective"]["sample_required"], 1)
+        self.assertEqual(final["required_blocked"], 1)
+        self.assertEqual(final["prospective"]["control_allowed_without_reposkop"], 1)
+        self.assertEqual(final["prospective"]["control_false_negatives"], 1)
+        self.assertEqual(final["prospective"]["sample_confirmed_preventions"], 1)
+        self.assertEqual(final["duration_ms"]["sample_size"], 1)
+        self.assertEqual(
+            final["source"]["scan_mode"],
+            "verified_incremental_effectiveness_index",
+        )
+        self.assertFalse(final["source"]["scan_truncated"])
+        self.assertFalse(final["source"]["retention_truncated"])
+        self.assertLessEqual(final["source"]["incremental_scanned_records"], 2)
+        self.assertTrue(steady["source"]["index_complete"])
+        self.assertEqual(steady["source"]["incremental_scanned_records"], 0)
+        self.assertEqual(steady["source"]["returned_records"], len(relevant))
+
+    def test_effectiveness_index_rebuilds_checkpoint_drift_from_verified_audit(
+        self,
+    ) -> None:
+        evaluation = "a" * 64
+        records = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 100,
+                "reposkop_policy": "required",
+                "reposkop_cohort": "prospective_sample",
+            },
+            {
+                "operation": "reposkop-evaluation-completed",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 101,
+                "duration_ms": 10,
+            },
+            {
+                "operation": "reposkop-decision-applied",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 102,
+                "reposkop_cohort": "prospective_sample",
+                "final_decision": "allow",
+            },
+        ]
+        raw = _verified_audit_payload(records)
+        segment = types.SimpleNamespace(
+            path=Path("segment"),
+            records=len(records),
+            global_start_ordinal=1,
+            global_end_ordinal=len(records),
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=len(records),
+            segments=(segment,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    side_effect=[snapshot, snapshot],
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    return_value=raw,
+                ),
+            ):
+                effectiveness.build_reposkop_effectiveness()
+                import sqlite3
+
+                with sqlite3.connect(index_path) as connection:
+                    connection.execute(
+                        "UPDATE checkpoint SET through_record_sha256=? WHERE singleton=1",
+                        ("f" * 64,),
+                    )
+                    connection.commit()
+                rebuilt = effectiveness.build_reposkop_effectiveness()
+
+        self.assertTrue(rebuilt["source"]["checkpoint_rebuilt"])
+        self.assertTrue(rebuilt["source"]["index_complete"])
+        self.assertEqual(rebuilt["prospective"]["sample_required"], 1)
+        self.assertEqual(rebuilt["duration_ms"]["sample_size"], 1)
+
+    def test_effectiveness_index_rebuilds_tampered_cached_payload(self) -> None:
+        evaluation = "a" * 64
+        records = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 100,
+                "reposkop_policy": "required",
+                "reposkop_cohort": "prospective_sample",
+            },
+            {
+                "operation": "reposkop-decision-applied",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 101,
+                "reposkop_cohort": "prospective_sample",
+                "final_decision": "allow",
+            },
+        ]
+        raw = _verified_audit_payload(records)
+        segment = types.SimpleNamespace(
+            path=Path("segment"),
+            records=len(records),
+            global_start_ordinal=1,
+            global_end_ordinal=len(records),
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=len(records),
+            segments=(segment,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    side_effect=[snapshot, snapshot],
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    return_value=raw,
+                ),
+            ):
+                effectiveness.build_reposkop_effectiveness()
+                import sqlite3
+
+                with sqlite3.connect(index_path) as connection:
+                    connection.execute(
+                        "UPDATE relevant_record SET record_json='{}' WHERE global_ordinal=1"
+                    )
+                    connection.commit()
+                rebuilt = effectiveness.build_reposkop_effectiveness()
+
+        self.assertTrue(rebuilt["source"]["cache_rebuilt"])
+        self.assertTrue(rebuilt["source"]["index_complete"])
+        self.assertEqual(rebuilt["prospective"]["sample_required"], 1)
+
+    def test_effectiveness_index_rebuilds_coherent_cached_payload_tamper(self) -> None:
+        evaluation = "a" * 64
+        records = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 100,
+                "reposkop_policy": "required",
+                "reposkop_cohort": "prospective_sample",
+            },
+            {
+                "operation": "reposkop-decision-applied",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 101,
+                "reposkop_cohort": "prospective_sample",
+                "final_decision": "allow",
+            },
+        ]
+        raw = _verified_audit_payload(records)
+        segment = types.SimpleNamespace(
+            path=Path("segment"),
+            records=len(records),
+            global_start_ordinal=1,
+            global_end_ordinal=len(records),
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=len(records),
+            segments=(segment,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    side_effect=[snapshot, snapshot],
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    return_value=raw,
+                ),
+            ):
+                effectiveness.build_reposkop_effectiveness()
+                import sqlite3
+
+                with sqlite3.connect(index_path) as connection:
+                    record_json = connection.execute(
+                        "SELECT record_json FROM relevant_record WHERE global_ordinal=1"
+                    ).fetchone()[0]
+                    tampered = json.loads(record_json)
+                    tampered["reposkop_cohort"] = "prospective_control"
+                    tampered_json = json.dumps(
+                        tampered,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    local_digest = hashlib.sha256(
+                        tampered_json.encode("utf-8")
+                    ).hexdigest()
+                    connection.execute(
+                        "UPDATE relevant_record SET record_json=?, payload_sha256=? "
+                        "WHERE global_ordinal=1",
+                        (tampered_json, local_digest),
+                    )
+                    connection.commit()
+                rebuilt = effectiveness.build_reposkop_effectiveness()
+
+        self.assertTrue(rebuilt["source"]["cache_rebuilt"])
+        self.assertTrue(rebuilt["source"]["index_complete"])
+        self.assertEqual(rebuilt["prospective"]["sample_required"], 1)
+
+    def test_effectiveness_index_rebuilds_missing_cached_row(self) -> None:
+        evaluation = "a" * 64
+        records = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 100,
+                "reposkop_policy": "required",
+                "reposkop_cohort": "prospective_sample",
+            },
+            {
+                "operation": "reposkop-decision-applied",
+                "evaluation_id": evaluation,
+                "timestamp_unix": 101,
+                "reposkop_cohort": "prospective_sample",
+                "final_decision": "allow",
+            },
+        ]
+        raw = _verified_audit_payload(records)
+        segment = types.SimpleNamespace(
+            path=Path("segment"),
+            records=len(records),
+            global_start_ordinal=1,
+            global_end_ordinal=len(records),
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=len(records),
+            segments=(segment,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    side_effect=[snapshot, snapshot],
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    return_value=raw,
+                ),
+            ):
+                effectiveness.build_reposkop_effectiveness()
+                import sqlite3
+
+                with sqlite3.connect(index_path) as connection:
+                    connection.execute(
+                        "DELETE FROM relevant_record WHERE global_ordinal=1"
+                    )
+                    connection.commit()
+                rebuilt = effectiveness.build_reposkop_effectiveness()
+
+        self.assertTrue(rebuilt["source"]["cache_rebuilt"])
+        self.assertTrue(rebuilt["source"]["index_complete"])
+        self.assertEqual(rebuilt["prospective"]["sample_required"], 1)
+
+    def test_effectiveness_index_corruption_rebuild_respects_scan_budget(self) -> None:
+        first_records = [
+            {
+                "operation": "task-start",
+                "task_id": "one",
+                "timestamp_unix": 100,
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            },
+            {
+                "operation": "task-start",
+                "task_id": "two",
+                "timestamp_unix": 101,
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            },
+        ]
+        later_records = [
+            *first_records,
+            {
+                "operation": "task-start",
+                "task_id": "three",
+                "timestamp_unix": 102,
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            },
+        ]
+        first_segment = types.SimpleNamespace(
+            path=Path("first"),
+            records=2,
+            global_start_ordinal=1,
+            global_end_ordinal=2,
+        )
+        later_segment = types.SimpleNamespace(
+            path=Path("later"),
+            records=3,
+            global_start_ordinal=1,
+            global_end_ordinal=3,
+        )
+        first_snapshot = types.SimpleNamespace(
+            total_records=2,
+            segments=(first_segment,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        later_snapshot = types.SimpleNamespace(
+            total_records=3,
+            segments=(later_segment,),
+            chain_content_sha256="c" * 64,
+            chain_materialization_sha256="d" * 64,
+        )
+        payloads = {
+            Path("first"): _verified_audit_payload(first_records),
+            Path("later"): _verified_audit_payload(later_records),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    side_effect=[first_snapshot, later_snapshot],
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    side_effect=lambda segment: payloads[segment.path],
+                ),
+            ):
+                effectiveness.build_reposkop_effectiveness()
+                import sqlite3
+
+                with sqlite3.connect(index_path) as connection:
+                    record_json = connection.execute(
+                        "SELECT record_json FROM relevant_record WHERE global_ordinal=1"
+                    ).fetchone()[0]
+                    tampered = json.loads(record_json)
+                    tampered["task_id"] = "tampered"
+                    tampered_json = json.dumps(
+                        tampered,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    local_digest = hashlib.sha256(
+                        tampered_json.encode("utf-8")
+                    ).hexdigest()
+                    connection.execute(
+                        "UPDATE relevant_record SET record_json=?, payload_sha256=? "
+                        "WHERE global_ordinal=1",
+                        (tampered_json, local_digest),
+                    )
+                    connection.commit()
+                result = effectiveness.build_reposkop_effectiveness(limit=1)
+
+        self.assertEqual(result["source"]["incremental_scanned_records"], 1)
+        self.assertEqual(result["source"]["scan_limit"], 1)
+        self.assertTrue(result["source"]["cache_rebuilt"])
+        self.assertTrue(result["source"]["rebuild_exhausted_scan_budget"])
+        self.assertIsNone(result["source"]["checkpoint_audit_ref"])
+        self.assertFalse(result["source"]["index_complete"])
+        self.assertEqual(result["source"]["remaining_records"], 3)
+        self.assertFalse(result["evaluation_complete"])
+
+    def test_effectiveness_index_retention_and_since_window_are_visible(self) -> None:
+        records = [
+            {
+                "operation": "task-start",
+                "task_id": f"task-{index}",
+                "timestamp_unix": 100 + index,
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            }
+            for index in range(3)
+        ]
+        raw = _verified_audit_payload(records)
+        segment = types.SimpleNamespace(
+            path=Path("segment"),
+            records=len(records),
+            global_start_ordinal=1,
+            global_end_ordinal=len(records),
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=len(records),
+            segments=(segment,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(effectiveness, "MAX_EFFECTIVENESS_INDEX_RECORDS", 2),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    return_value=raw,
+                ),
+            ):
+                result = effectiveness.build_reposkop_effectiveness(since_unix=0)
+                windowed = effectiveness.build_reposkop_effectiveness(since_unix=102)
+
+        self.assertEqual(result["source"]["retention_limit"], 2)
+        self.assertTrue(result["source"]["retention_truncated"])
+        self.assertTrue(result["source"]["since_truncated"])
+        self.assertEqual(result["source"]["dropped_records"], 1)
+        self.assertEqual(result["source"]["returned_records"], 2)
+        self.assertTrue(windowed["source"]["retention_truncated"])
+        self.assertFalse(windowed["source"]["since_truncated"])
+        self.assertEqual(windowed["source"]["returned_records"], 1)
+
+    def test_effectiveness_index_unknown_dropped_timestamp_keeps_since_fail_closed(
+        self,
+    ) -> None:
+        records = [
+            {
+                "operation": "task-start",
+                "task_id": "unknown-old",
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            },
+            {
+                "operation": "task-start",
+                "task_id": "known-old",
+                "timestamp_unix": 100,
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            },
+            {
+                "operation": "task-start",
+                "task_id": "new-one",
+                "timestamp_unix": 102,
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            },
+            {
+                "operation": "task-start",
+                "task_id": "new-two",
+                "timestamp_unix": 103,
+                "effect_profile": "read_only",
+                "reposkop_policy": "not_required",
+            },
+        ]
+        raw = _verified_audit_payload(records)
+        segment = types.SimpleNamespace(
+            path=Path("segment"),
+            records=len(records),
+            global_start_ordinal=1,
+            global_end_ordinal=len(records),
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=len(records),
+            segments=(segment,),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "effectiveness.sqlite3"
+            with (
+                patch.object(
+                    effectiveness, "_effectiveness_index_path", return_value=index_path
+                ),
+                patch.object(
+                    effectiveness,
+                    "effectiveness_index_lock",
+                    side_effect=contextlib.nullcontext,
+                ),
+                patch.object(effectiveness, "MAX_EFFECTIVENESS_INDEX_RECORDS", 2),
+                patch.object(
+                    effectiveness.audit_query,
+                    "capture_verified_audit_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(
+                    effectiveness.audit_query,
+                    "_load_snapshot_segment",
+                    return_value=raw,
+                ),
+            ):
+                result = effectiveness.build_reposkop_effectiveness(since_unix=102)
+
+        self.assertEqual(result["source"]["dropped_records"], 2)
+        self.assertEqual(result["source"]["dropped_unknown_timestamps"], 1)
+        self.assertTrue(result["source"]["since_truncated"])
+        self.assertEqual(result["source"]["returned_records"], 2)
 
     def test_event_identity_index_lock_retries_transient_timeout(self) -> None:
         attempts = 0
