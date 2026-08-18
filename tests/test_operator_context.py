@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 import os
@@ -15,6 +16,122 @@ CONTEXT = ROOT / "docs" / "generated" / "operator-context.v1.json"
 
 
 class OperatorContextTests(unittest.TestCase):
+    @staticmethod
+    def _builder_module():
+        path = ROOT / "tools" / "build_operator_context.py"
+        spec = importlib.util.spec_from_file_location("operator_context_builder_test", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("could not load operator-context builder")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_semantic_source_digest_ignores_non_contract_function_bodies(self) -> None:
+        builder = self._builder_module()
+        baseline = """\
+from typing import Annotated
+Limit = Annotated[int, 5]
+@mcp.tool(name="sample", annotations=READ_ONLY)
+def sample(limit: Limit = 3) -> dict[str, int]:
+    \"\"\"Read a sample.\"\"\"
+    return {"limit": limit}
+
+def unrelated_helper() -> int:
+    return 1
+"""
+        changed_body = baseline.replace(
+            'return {"limit": limit}',
+            'return {"limit": limit + 1}',
+        ).replace("return 1", "return 2")
+        hashes = builder._semantic_source_hashes
+        first = hashes({"src/sample.py": baseline}, {"sample": "src/sample.py"})
+        second = hashes(
+            {"src/sample.py": changed_body},
+            {"sample": "src/sample.py"},
+        )
+        self.assertEqual(first, second)
+
+    def test_semantic_source_digest_tracks_public_tool_contract(self) -> None:
+        builder = self._builder_module()
+        baseline = """\
+from typing import Annotated
+Limit = Annotated[int, 5]
+@mcp.tool(name="sample", annotations=READ_ONLY)
+def sample(limit: Limit = 3) -> dict[str, int]:
+    \"\"\"Read a sample.\"\"\"
+    return {"limit": limit}
+"""
+        variants = [
+            baseline.replace("Annotated[int, 5]", "Annotated[int, 6]"),
+            baseline.replace("limit: Limit = 3", "limit: Limit = 4"),
+            baseline.replace("Read a sample.", "Read a bounded sample."),
+            baseline.replace("annotations=READ_ONLY", "annotations=MUTATING"),
+            baseline.replace('name="sample"', 'name="sample-v2"'),
+        ]
+        hashes = builder._semantic_source_hashes
+        expected = hashes({"src/sample.py": baseline}, {"sample": "src/sample.py"})
+        for variant in variants:
+            with self.subTest(variant=variant):
+                observed = hashes(
+                    {"src/sample.py": variant},
+                    {"sample": "src/sample.py"},
+                )
+                self.assertNotEqual(expected, observed)
+
+    def test_semantic_source_digest_tracks_imported_contract_dependency(self) -> None:
+        builder = self._builder_module()
+        tool_source = """\
+from shared_contract import Limit
+@mcp.tool(name="sample", annotations=READ_ONLY)
+def sample(limit: Limit) -> dict[str, int]:
+    \"\"\"Read a sample.\"\"\"
+    return {"limit": limit}
+"""
+        shared_v1 = """\
+from typing import Annotated
+Limit = Annotated[int, 5]
+"""
+        shared_v2 = shared_v1.replace("Annotated[int, 5]", "Annotated[int, 6]")
+        module_map = {
+            "sample": "src/sample.py",
+            "shared_contract": "src/shared_contract.py",
+        }
+        first = builder._semantic_source_hashes(
+            {
+                "src/sample.py": tool_source,
+                "src/shared_contract.py": shared_v1,
+            },
+            module_map,
+        )
+        second = builder._semantic_source_hashes(
+            {
+                "src/sample.py": tool_source,
+                "src/shared_contract.py": shared_v2,
+            },
+            module_map,
+        )
+        self.assertNotEqual(first["src/sample.py"], second["src/sample.py"])
+        self.assertEqual(
+            first["src/shared_contract.py"],
+            second["src/shared_contract.py"],
+        )
+
+    def test_semantic_source_digest_is_stable_for_tool_free_support_source(self) -> None:
+        builder = self._builder_module()
+        first = builder._semantic_source_hashes(
+            {"src/support.py": "def helper():\n    return 1\n"},
+            {"support": "src/support.py"},
+        )
+        second = builder._semantic_source_hashes(
+            {"src/support.py": "def helper(value=2):\n    return value * 9\n"},
+            {"support": "src/support.py"},
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first, builder._semantic_source_hashes(
+            {"src/support.py": "def helper():\n    return 1\n"},
+            {"support": "src/support.py"},
+        ))
+
     def test_generated_context_is_current(self) -> None:
         completed = subprocess.run(
             [sys.executable, "tools/build_operator_context.py", "--check"],
