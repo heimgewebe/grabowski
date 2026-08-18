@@ -671,6 +671,11 @@
     },
     {
       "kind": "python_module",
+      "launcher_module": "grabowski_grips",
+      "spawned_module": "grabowski_grips"
+    },
+    {
+      "kind": "python_module",
       "launcher_module": "grabowski_workers",
       "spawned_module": "grabowski_worker_process"
     },
