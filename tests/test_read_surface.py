@@ -61,6 +61,11 @@ def _load_read_surface():
     base._read_limited_process_pipes = lambda *args, **kwargs: (b"", b"", False, False, False)
     capabilities = types.ModuleType("grabowski_capabilities")
     capabilities.classify_contract = lambda expected: {}
+    checkouts = types.ModuleType("grabowski_checkouts")
+    checkouts.active_capacity_projection = lambda repository: {
+        "repository": str(repository),
+        "available": True,
+    }
     runtime_extensions = types.ModuleType("grabowski_runtime_extensions")
     runtime_extensions.LOGICAL_RUNTIME_SERVICE = "grabowski-mcp"
     runtime_extensions.runtime_service_model = lambda deployment: {
@@ -78,8 +83,30 @@ def _load_read_surface():
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load grabowski_read_surface")
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"mcp": fake_mcp, "mcp.types": fake_types, "pydantic": fake_pydantic, "grabowski_operator_core": operator, "grabowski_mcp": base, "grabowski_capabilities": capabilities, "grabowski_runtime_extensions": runtime_extensions, module_name: module}, clear=False):
-        spec.loader.exec_module(module)
+    src_path = str(ROOT / "src")
+    added_src_path = src_path not in sys.path
+    if added_src_path:
+        sys.path.insert(0, src_path)
+    try:
+        with patch.dict(
+            sys.modules,
+            {
+                "mcp": fake_mcp,
+                "mcp.types": fake_types,
+                "pydantic": fake_pydantic,
+                "grabowski_operator_core": operator,
+                "grabowski_mcp": base,
+                "grabowski_capabilities": capabilities,
+                "grabowski_checkouts": checkouts,
+                "grabowski_runtime_extensions": runtime_extensions,
+                module_name: module,
+            },
+            clear=False,
+        ):
+            spec.loader.exec_module(module)
+    finally:
+        if added_src_path:
+            sys.path.remove(src_path)
     return module
 
 read_surface = _load_read_surface()
@@ -479,6 +506,7 @@ class ReadSurfaceTests(unittest.TestCase):
                 "record_sha256": "b" * 64,
                 "bureau_status": "failed",
                 "bureau_code": "request-schema-unsupported",
+                "bureau_retryable": True,
                 "effect_started": False,
             },
             {
@@ -489,6 +517,7 @@ class ReadSurfaceTests(unittest.TestCase):
                 "record_sha256": "c" * 64,
                 "bureau_status": "failed",
                 "bureau_code": "request-schema-unsupported",
+                "bureau_retryable": False,
                 "effect_started": False,
             },
             {
@@ -559,6 +588,12 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(
             result["windows"][0]["resource_activity"]["reclaimed_resource_count"], 2
         )
+        self.assertEqual(
+            result["windows"][0]["resource_activity"][
+                "reclamation_unattributed_resource_count"
+            ],
+            2,
+        )
         self.assertNotIn(
             "repeated_resource_reclamation",
             [item["pattern"] for item in result["candidate_patterns"]],
@@ -573,6 +608,23 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(
             result["candidate_patterns"][0]["top_codes"][0],
             {"code": "request-schema-unsupported", "count": 3},
+        )
+        self.assertEqual(
+            result["candidate_patterns"][0]["failure_retryable_count_7d"], 1
+        )
+        self.assertEqual(
+            result["candidate_patterns"][0]["failure_nonretryable_count_7d"], 1
+        )
+        self.assertEqual(
+            result["candidate_patterns"][0][
+                "failure_retryability_unknown_count_7d"
+            ],
+            1,
+        )
+        self.assertAlmostEqual(
+            result["candidate_patterns"][0]["failure_retryability_coverage"],
+            2 / 3,
+            places=6,
         )
         self.assertNotIn(
             "publication-complete",
@@ -670,6 +722,9 @@ class ReadSurfaceTests(unittest.TestCase):
         activity = result["windows"][0]["resource_activity"]
         self.assertEqual(activity["resource_reclamation_event_count"], 3)
         self.assertEqual(activity["reclaimed_resource_count"], 6)
+        self.assertEqual(activity["reclamation_self_resource_count"], 0)
+        self.assertEqual(activity["reclamation_foreign_resource_count"], 0)
+        self.assertEqual(activity["reclamation_unattributed_resource_count"], 6)
         candidate = next(
             item
             for item in result["candidate_patterns"]
@@ -677,6 +732,94 @@ class ReadSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(candidate["event_count_7d"], 3)
         self.assertEqual(candidate["reclaimed_resource_count_7d"], 6)
+        self.assertEqual(candidate["same_owner_reclaimed_resource_count_7d"], 0)
+        self.assertEqual(candidate["foreign_owner_reclaimed_resource_count_7d"], 0)
+        self.assertEqual(candidate["unattributed_reclaimed_resource_count_7d"], 6)
+        self.assertEqual(candidate["reclamation_attribution_coverage"], 0.0)
+
+    def test_audit_projection_attributes_reclamation_without_exposing_owners(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "resource-acquire",
+                "timestamp": datetime.fromtimestamp(
+                    now - 60, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "1" * 64,
+                "owner_id": "lane:self-a",
+                "resource_keys": ["path:/safe/a", "path:/safe/b"],
+                "reclaimed_count": 2,
+                "reclamation_evidence": [
+                    {"resource_index": 0, "previous_owner_id": "lane:self-a"},
+                    {"resource_index": 1, "previous_owner_id": "lane:foreign-a"},
+                ],
+            },
+            {
+                "operation": "resource-acquire",
+                "timestamp": datetime.fromtimestamp(
+                    now - 120, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "2" * 64,
+                "owner_id": "lane:new-b",
+                "resource_keys": ["path:/safe/c", "path:/safe/d"],
+                "reclaimed_count": 2,
+                "reclamation_evidence": [
+                    {"resource_index": 0, "previous_owner_id": "lane:foreign-b"},
+                    {"resource_index": 0, "previous_owner_id": "lane:duplicate"},
+                    {"resource_index": True, "previous_owner_id": "lane:invalid"},
+                    {"resource_index": 4, "previous_owner_id": "lane:out-of-range"},
+                ],
+            },
+            {
+                "operation": "resource-acquire",
+                "timestamp": datetime.fromtimestamp(
+                    now - 180, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "3" * 64,
+                "owner_id": "lane:self-c",
+                "resource_keys": ["path:/safe/e"],
+                "reclaimed_count": 1,
+                "reclamation_evidence": [
+                    {"resource_index": 0, "previous_owner_id": "lane:self-c"},
+                ],
+            },
+        ]
+        status = {
+            "valid": True,
+            "total_records": 3,
+            "total_legacy_records": 0,
+            "last_record_sha256": "3" * 64,
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection(view="evidence")
+        activity = result["windows"][0]["resource_activity"]
+        self.assertEqual(activity["reclaimed_resource_count"], 5)
+        self.assertEqual(activity["reclamation_self_resource_count"], 2)
+        self.assertEqual(activity["reclamation_foreign_resource_count"], 2)
+        self.assertEqual(activity["reclamation_unattributed_resource_count"], 1)
+        candidate = next(
+            item
+            for item in result["candidate_patterns"]
+            if item["pattern"] == "repeated_resource_reclamation"
+        )
+        self.assertEqual(candidate["same_owner_reclaimed_resource_count_7d"], 2)
+        self.assertEqual(candidate["foreign_owner_reclaimed_resource_count_7d"], 2)
+        self.assertEqual(candidate["unattributed_reclaimed_resource_count_7d"], 1)
+        self.assertEqual(candidate["reclamation_attribution_coverage"], 0.8)
+        self.assertIn("unattributed", candidate["recommendation"])
+        encoded = json.dumps(result)
+        self.assertNotIn("lane:self-a", encoded)
+        self.assertNotIn("lane:foreign-a", encoded)
 
     def test_audit_projection_findings_hash_ignores_window_clock_edges(self) -> None:
         record = {
