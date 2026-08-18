@@ -1982,9 +1982,17 @@ def canonical_execution_route(
                         for route_id, reasons in writer_excluded.items()
                     }
                 )
-                if ranked_writers:
-                    scoped_writer = ranked_writers[0]
-                    scoped_writer_fallbacks = ranked_writers[1:6]
+                execution_writers: list[dict[str, Any]] = []
+                for candidate in ranked_writers:
+                    if candidate.get("execution_eligible_if_separately_authorized") is True:
+                        execution_writers.append(candidate)
+                        continue
+                    excluded[f"scoped-writer:{candidate['route']}"] = [
+                        "quota state permits advisory use only; automatic scoped-writer execution is forbidden"
+                    ]
+                if execution_writers:
+                    scoped_writer = execution_writers[0]
+                    scoped_writer_fallbacks = execution_writers[1:6]
                     scoped_writer_status = "recommended"
                 else:
                     scoped_writer_status = "no-eligible-scoped-writer"

@@ -1211,6 +1211,53 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(result["reviewers"], [])
         self.assertTrue(result["automatic_execution_authorized"])
 
+    def test_quota_opaque_advisory_only_route_cannot_be_automatic_scoped_writer(
+        self,
+    ) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness == "claude"
+        self._write_state()
+
+        result = self._route(
+            "bounded-patch",
+            changed_files=2,
+            duration_minutes=30,
+            novelty="medium",
+        )
+
+        self.assertEqual(result["executor"], "controller")
+        self.assertEqual(result["writer_route"], "grabowski-primary")
+        self.assertIsNone(result["scoped_writer"])
+        self.assertEqual(result["scoped_writer_fallbacks"], [])
+        self.assertEqual(result["scoped_writer_status"], "no-eligible-scoped-writer")
+        for route_id in ("claude-sonnet-5-high", "claude-sonnet-5-medium"):
+            self.assertIn(f"scoped-writer:{route_id}", result["excluded"] )
+            self.assertIn(
+                "automatic scoped-writer execution is forbidden",
+                result["excluded"][f"scoped-writer:{route_id}"][0],
+            )
+
+    def test_known_quota_reenables_automatic_scoped_writer(self) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness == "claude"
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
+
+        result = self._route(
+            "bounded-patch",
+            changed_files=2,
+            duration_minutes=30,
+            novelty="medium",
+        )
+
+        self.assertEqual(result["executor"], "scoped_writer")
+        self.assertEqual(result["scoped_writer_status"], "recommended")
+        self.assertIsNotNone(result["scoped_writer"])
+        self.assertTrue(
+            result["scoped_writer"]["execution_eligible_if_separately_authorized"]
+        )
+        self.assertEqual(result["writer_route"], result["scoped_writer"]["route"])
+
     def test_controller_owned_work_has_no_scoped_writer(self) -> None:
         result = self._route("deployment")
         self.assertEqual(result["decision"], "controller")
@@ -1248,6 +1295,8 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_recommendation_keeps_controller_integration_authoritative(
         self,
     ) -> None:
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
         result = self._route("complex-patch")
         self.assertEqual(result["decision"], "controller")
         self.assertEqual(result["controller"], "grabowski-primary")
