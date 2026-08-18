@@ -63,19 +63,54 @@ transaction-specific quarantine paths and exact hashes.
 
 ## Peer boundary
 
-Lifecycle requests are accepted only from the configured operator service.
-The socket-activated root process reads kernel `SO_PEERCRED`, requires the exact
-operator UID and verifies that the peer PID belongs to the unified cgroup ending
-in `grabowski-operator.service`. A same-UID process in tmux, a login session or
-another user service cannot call the marker lifecycle directly.
+The canonical operator is a root-managed **system** unit at
+`/etc/systemd/system/grabowski-operator.service`, while its payload still runs
+as `User=alex`. The unit fragment and its `/system.slice/...` cgroup are root
+controlled. The user manager, `/run/user/<uid>/bus`, user-owned cgroups and
+caller-supplied PID metadata are not authority sources.
 
-Failure to read peer credentials or `/proc/<pid>/cgroup`, multiple or malformed
-unified cgroup entries, a UID mismatch or a different unit all block before the
-single-use claim and before any filesystem effect.
+The typed blockade adapter and the high-power argv adapter send immutable
+privileged references directly over the Unix socket; they deliberately do not
+spawn the generic privileged-request client, because that would replace the
+operator's `SO_PEERCRED` with a child-process identity.
+
+For both `operator_blockade_marker_lifecycle` and `operator_power_argv`, the
+socket-activated root broker reads kernel `SO_PEERCRED`, requires the exact
+operator UID, and independently queries the root system manager for the
+configured unit's active `MainPID`, `ControlGroup`, `User` and `FragmentPath`.
+The socket peer PID must be that exact `MainPID`; the systemd `ControlGroup`
+must be `/system.slice/grabowski-operator.service`; the unit fragment must be
+root-owned and not group/world writable; the cgroup directory and
+`cgroup.procs` must be root-owned and not group/world writable; and
+`/proc/<pid>/cmdline` must equal Grabowski's fixed operator entrypoint argv.
+
+The broker additionally binds the decision to cgroup-v2 `cgroup.procs` plus
+`/proc/<pid>/stat`: the peer must be the unique oldest process in that exact
+service cgroup, its parent must be outside that cgroup, and the membership set
+must remain unchanged across validation. Thus terminal, durable-job,
+persistent-task, tmux and fleet-local children fail even when launched by the
+operator process, and an unrelated same-UID process cannot self-migrate into
+the root-owned system cgroup.
+
+Normal blue-green deployment never grants those children broad root authority.
+Only the canonical operator uses the MainPID-gated power action. Deployment
+controls the canonical system unit through the separate fixed
+`operator_system_service_control` template, whose target is limited to the
+service lifecycle of exactly `grabowski-operator.service`; it cannot touch the
+marker or execute caller-selected argv. The legacy user operator and its user
+watchdog are disabled during the rootbroker cutover, with their prior states
+recorded for rollback.
+
+Failure to read peer credentials, root-systemd unit identity, command identity,
+cgroup membership, process start identity or parent identity; malformed or
+unbounded process sets; a UID/unit/MainPID/ControlGroup/fragment mismatch; a
+non-main peer; or membership drift all block before the single-use claim and
+before any protected filesystem or broad-power effect.
 
 This peer check does not claim protection against a compromised kernel, root,
-the operator service itself or code already executing inside the trusted
-operator-service cgroup.
+or arbitrary code already injected into the exact trusted operator main
+process itself. Release/deployment integrity remains a separate authority
+contract and is not inferred from PID identity alone.
 
 ## Audit and unknown outcomes
 
@@ -145,13 +180,14 @@ source, and the tool contract includes the explicit legacy migration tool.
 This contract does not establish:
 
 - protection against root, kernel or filesystem compromise;
-- safety of arbitrary code already inside the trusted operator-service cgroup;
+- safety of arbitrary code injected into the long-lived operator main process itself;
 - correctness of recovery evidence outside its separately validated contract;
 - automatic migration, disarm, merge or deployment;
 - permission to set the production marker during tests;
 - exactly-once delivery of broker responses.
 
 Tests use temporary directories and test UIDs. Production verification must
-prove the installed ownership, modes, peer rejection from a non-operator
-cgroup, exact operator-service acceptance, legacy migration behavior and that
-the production marker was never created merely for a denial proof.
+prove the installed ownership and modes, rejection from both non-operator and
+same-cgroup child processes, exact main-operator-process acceptance, legacy
+migration behavior and that the production marker was never created merely for
+a denial proof.
