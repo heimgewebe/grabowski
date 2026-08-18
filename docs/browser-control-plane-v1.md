@@ -158,6 +158,18 @@ Jeder Provider-Receipt bindet Provider-ID, Operation, den frisch gelesenen `read
 
 Diese Slice ist bewusst **Backend 1**. Sie veröffentlicht keinen neuen MCP-/Grip-Namen, ändert keinen Default und promotet keinen Router. Erst wenn mindestens ein zweites reales, revisionsgebunden abgenommenes Backend existiert, darf eine separate Arbeit überhaupt Routing-/Ranking-/Fallback-Policy evaluieren.
 
+### Zweiter realer Backend-Slice: `github.public-web`
+
+`src/grabowski_browser_structured_provider_github_web.py` implementiert genau einen zweiten realen StructuredToolProvider. Er ist fest als `github.public-web` an `https://github.com` gebunden und besitzt ausschließlich `repository.read` mit der bereits autoritativen Effect-Class `read`. Der Aufrufer muss diesen Provider ausdrücklich benennen; das Vorhandensein von nun zwei realen Backends erzeugt weiterhin weder Auswahl, Ranking, Routing, Fallback, Default noch Promotion.
+
+Der Transport akzeptiert ausschließlich die exakte kanonische Form `https://github.com/<owner>/<repo>`. Query, Fragment, Userinfo, alternative Origins, nicht-kanonische Default-Ports, zusätzliche oder leere Pfadsegmente sowie Traversal- und Encodingformen scheitern vor I/O. Ein zulässiger Aufruf führt genau einen anonymen direkten HTTPS-GET an `github.com` mit festem Timeout und ausschließlich provider-eigenen `Accept`-/`User-Agent`-Headern aus. Es gibt keine Token-, Cookie-, `Authorization`-, Caller-Header-, Browserprofil- oder Sessioneingabe und keine Redirect-Folgeautorität.
+
+Vom HTML wird höchstens ein fester früher Prefix von 256 KiB gelesen. Ein erfolgreicher Read verlangt HTTP 200 und `text/html`. Der stdlib-`HTMLParser` führt kein Skript aus und extrahiert ausschließlich die zwei festen öffentlichen GitHub-Metafelder für Repository-Identität und Public-Status. Raw-HTML, Scripts, beliebige Attribute oder Response-Header werden nicht projiziert. Ausgegeben wird nur die begrenzte Identität (`full_name`, Owner-/Repo-Name, `visibility=public`, `private=false`) plus Response-/Projektionsdigests. Fehlende, doppelte, widersprüchliche, nicht öffentliche oder targetfremde Metadaten enden fail-closed.
+
+Receipt und Outcome laufen durch denselben `StructuredToolProviderRegistry.assess(...)`-/`normalize_receipt(...)`-Pfad wie Backend 1. Damit binden sie Provider-ID, Operation, den frisch gelesenen `read`-Effect-Contract-Digest und den kanonischen Target-Digest. Invariant bleiben `automatic_route_selected=false`, `retry_authorized=false`, `authoritative_readback_required=true` und `readback_grants_retry_authority=false`; insbesondere erzeugt weder ein HTTP-/Parserfehler noch ein unbekannter Transportausgang Retry-Autorität.
+
+Backend 2 erfüllt damit die Voraussetzung „mindestens zwei reale, revisionsgebunden abgenommene Backends“ erst nach seinem eigenen Merge und Live-Readback. Daraus folgt ausdrücklich noch keine Routerfreigabe. Eine Routing-/Ranking-/Fallback-Policy bleibt eine separate, später zu begründende Arbeit.
+
 ## Semantischer Aktionsvertrag (observe → snapshot → act → verify)
 
 Zusätzlich zur bestehenden Control-Plane-Projektion und zum bestehenden `grabowski_browser_worker_stored_form_action` stellt `src/grabowski_workers.py` die backend-neutrale Vertragsschicht `browser_semantic_observe()` und `browser_semantic_act()` bereit. Genau ein öffentliches Gateway, `grabowski_browser_worker_semantic`, macht sie mit den benannten Operationen `observe` und `act` agentenseitig nutzbar. Die interne `CDPAdapter`-Grenze wird für die aktuelle Chrome-/Chromium-Familie kohärent durch `ChromeCDPAdapter` implementiert. Weder CDP-Methodennamen noch CSS-Selektoren oder DOM-/AX-Knoten-IDs werden Teil des semantischen Aufrufervertrags.
