@@ -75,6 +75,7 @@ def _prepare_registry_root(
     *,
     refresh: bool,
     mutation: bool,
+    require_current: bool = True,
 ) -> str:
     resolved = Path(registry_root).expanduser().resolve()
     shared_root = bureau_runtime.BUREAU_REPOSITORY_ROOT.resolve()
@@ -92,7 +93,9 @@ def _prepare_registry_root(
         if refresh:
             bureau_runtime.refresh_bureau_control_checkout()
         else:
-            bureau_runtime.inspect_bureau_control_checkout(require_current=True)
+            bureau_runtime.inspect_bureau_control_checkout(
+                require_current=require_current
+            )
     return str(resolved)
 
 
@@ -1246,6 +1249,63 @@ def grabowski_bureau_task_review(
     return {**payload, "adapter_proposal_id": proposal_id}
 
 
+def _task_publication_contract(payload: dict[str, Any]) -> tuple[str, str | None]:
+    if "publication_mode" not in payload:
+        return "git_pr", None
+    mode = payload.get("publication_mode")
+    if mode == "git_pr":
+        return mode, None
+    if mode != "state_store":
+        raise ValueError("publication-mode-contract-invalid")
+    state_root = payload.get("coordination_state_root")
+    if (
+        not isinstance(state_root, str)
+        or not state_root
+        or state_root.strip() != state_root
+        or "\x00" in state_root
+    ):
+        raise ValueError("publication-state-root-contract-invalid")
+    state_path = Path(state_root)
+    if not state_path.is_absolute() or ".." in state_path.parts:
+        raise ValueError("publication-state-root-contract-invalid")
+    return mode, state_root
+
+
+def _task_publication_apply_arguments(
+    *,
+    resolved_root: str,
+    plan_path: Path,
+    binding_path: Path,
+    workspace_root: Path,
+    receipt_path: Path,
+    publication_mode: str,
+    coordination_state_root: str | None,
+) -> list[str]:
+    arguments = ["--root", resolved_root]
+    if publication_mode == "state_store":
+        assert coordination_state_root is not None
+        arguments.extend(["--state-root", coordination_state_root])
+    arguments.extend(
+        [
+            "--json",
+            "--json-envelope",
+            "operator-task-publish",
+            "--plan",
+            str(plan_path),
+            "--apply",
+            "--lease-binding",
+            str(binding_path),
+            "--resource-db",
+            str(resources.RESOURCE_DB),
+            "--workspace-root",
+            str(workspace_root),
+            "--receipt",
+            str(receipt_path),
+        ]
+    )
+    return arguments
+
+
 @mcp.tool(name="grabowski_bureau_task_publish_preview", annotations=READ_ONLY)
 def grabowski_bureau_task_publish_preview(
     proposal_id: str,
@@ -1256,20 +1316,39 @@ def grabowski_bureau_task_publish_preview(
     if not plan_path.is_file() or plan_path.is_symlink():
         raise FileNotFoundError(f"unknown proposal: {proposal_id}")
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=False, mutation=False
+        registry_root,
+        refresh=False,
+        mutation=False,
+        require_current=False,
     )
-    return _invoke_bureau(
-        [
-            "--root",
-            resolved_root,
-            "--json",
-            "--json-envelope",
-            "operator-task-publish",
-            "--plan",
-            str(plan_path),
-            "--preview",
-        ]
-    )
+    arguments = [
+        "--root",
+        resolved_root,
+        "--json",
+        "--json-envelope",
+        "operator-task-publish",
+        "--plan",
+        str(plan_path),
+        "--preview",
+    ]
+    payload = _invoke_bureau(arguments)
+    if (
+        payload.get("kind") == "bureau_task_publication_preview"
+        and payload.get("status") == "ready"
+    ):
+        try:
+            publication_mode, _ = _task_publication_contract(payload)
+        except ValueError as exc:
+            return _adapter_failure(str(exc))
+        if publication_mode == "git_pr":
+            _prepare_registry_root(
+                registry_root,
+                refresh=False,
+                mutation=False,
+                require_current=True,
+            )
+            payload = _invoke_bureau(arguments)
+    return payload
 
 
 @mcp.tool(name="grabowski_bureau_task_publish", annotations=MUTATING)
@@ -1278,13 +1357,16 @@ def grabowski_bureau_task_publish(
     registry_root: str = str(BUREAU_ROOT),
     lease_ttl_seconds: int = 240,
 ) -> dict[str, Any]:
-    """Acquire exact short Bureau leases, publish one reviewed task branch and PR, then release on a clear outcome."""
+    """Publish one reviewed task through the preview-selected Git or StateStore contract."""
     operator._require_operator_mutation(
         "terminal_execute",
         path=str(Path(registry_root).expanduser().resolve()),
     )
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=False
+        registry_root,
+        refresh=False,
+        mutation=False,
+        require_current=False,
     )
     operator._require_operator_mutation("resource_lease")
     if lease_ttl_seconds < 90 or lease_ttl_seconds > 300:
@@ -1305,25 +1387,27 @@ def grabowski_bureau_task_publish(
     _write_bound_json(
         binding_path, {"owner_id": owner_id, "task_id": publishing_task_id}
     )
-    apply_arguments = [
-        "--root",
-        resolved_root,
-        "--json",
-        "--json-envelope",
-        "operator-task-publish",
-        "--plan",
-        str(plan_path),
-        "--apply",
-        "--lease-binding",
-        str(binding_path),
-        "--resource-db",
-        str(resources.RESOURCE_DB),
-        "--workspace-root",
-        str(workspace_root),
-        "--receipt",
-        str(receipt_path),
-    ]
     if receipt_path.is_file() and not receipt_path.is_symlink():
+        receipt_contract = _read_json_object(receipt_path, label="publication receipt")
+        try:
+            publication_mode, coordination_state_root = _task_publication_contract(
+                receipt_contract
+            )
+        except ValueError as exc:
+            return _adapter_failure(str(exc))
+        if publication_mode == "git_pr":
+            resolved_root = _prepare_registry_root(
+                registry_root, refresh=True, mutation=False
+            )
+        apply_arguments = _task_publication_apply_arguments(
+            resolved_root=resolved_root,
+            plan_path=plan_path,
+            binding_path=binding_path,
+            workspace_root=workspace_root,
+            receipt_path=receipt_path,
+            publication_mode=publication_mode,
+            coordination_state_root=coordination_state_root,
+        )
         payload = _invoke_bureau(apply_arguments, timeout_seconds=30)
         _audit(
             "bureau-task-publish-receipt-replay",
@@ -1345,16 +1429,61 @@ def grabowski_bureau_task_publish(
         or preview.get("status") != "ready"
     ):
         return preview
+    try:
+        publication_mode, coordination_state_root = _task_publication_contract(preview)
+    except ValueError as exc:
+        return _adapter_failure(str(exc))
+    if publication_mode == "git_pr":
+        resolved_root = _prepare_registry_root(
+            registry_root, refresh=True, mutation=False
+        )
+        preview = grabowski_bureau_task_publish_preview(proposal_id, resolved_root)
+        if (
+            preview.get("kind") != "bureau_task_publication_preview"
+            or preview.get("status") != "ready"
+        ):
+            return preview
+        try:
+            refreshed_mode, refreshed_state_root = _task_publication_contract(preview)
+        except ValueError as exc:
+            return _adapter_failure(str(exc))
+        if refreshed_mode != "git_pr" or refreshed_state_root is not None:
+            return _adapter_failure("publication-mode-drift")
     resource_keys = preview.get("required_resource_keys")
     if (
         not isinstance(resource_keys, list)
-        or len(resource_keys) != 2
-        or any(not isinstance(key, str) for key in resource_keys)
+        or not resource_keys
+        or any(
+            not isinstance(key, str)
+            or not key
+            or key.strip() != key
+            or "\x00" in key
+            for key in resource_keys
+        )
+        or len(set(resource_keys)) != len(resource_keys)
+        or (publication_mode == "git_pr" and len(resource_keys) != 2)
+        or (
+            publication_mode == "state_store"
+            and f"path:{coordination_state_root}" not in resource_keys
+        )
     ):
         return _adapter_failure("publication-resource-contract-invalid")
+    apply_arguments = _task_publication_apply_arguments(
+        resolved_root=resolved_root,
+        plan_path=plan_path,
+        binding_path=binding_path,
+        workspace_root=workspace_root,
+        receipt_path=receipt_path,
+        publication_mode=publication_mode,
+        coordination_state_root=coordination_state_root,
+    )
     metadata = {
         "task_id": publishing_task_id,
-        "operation": "registry-publication",
+        "operation": (
+            "registry-publication"
+            if publication_mode == "git_pr"
+            else "state-task-publication"
+        ),
         "proposal_sha256": proposal_sha256,
         "bureau_phase": "work",
     }
@@ -1389,16 +1518,25 @@ def grabowski_bureau_task_publish(
             "bureau_contract": acquired.get("bureau_contract"),
         }
     )
-    payload = _invoke_bureau(
-        apply_arguments,
-        timeout_seconds=120,
-        mutation=True,
-        required_readback=[
+    required_readback = (
+        [
             "publication_receipt",
             "remote_branch",
             "pull_request",
             "resource_leases",
-        ],
+        ]
+        if publication_mode == "git_pr"
+        else [
+            "publication_receipt",
+            "task_spec_revision",
+            "resource_leases",
+        ]
+    )
+    payload = _invoke_bureau(
+        apply_arguments,
+        timeout_seconds=120,
+        mutation=True,
+        required_readback=required_readback,
     )
     receipt_readback_attempted = False
     if bool(payload.get("ambiguity")) and receipt_path.is_file():

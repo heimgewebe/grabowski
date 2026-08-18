@@ -1824,7 +1824,7 @@
     },
     {
       "category": "bureau",
-      "description": "Acquire exact short Bureau leases, publish one reviewed task branch and PR, then release on a clear outcome.",
+      "description": "Publish one reviewed task through the preview-selected Git or StateStore contract.",
       "effects": [
         "resource_lease",
         "git_branch",
