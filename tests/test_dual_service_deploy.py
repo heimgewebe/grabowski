@@ -48,6 +48,218 @@ def observation(active: bool) -> core.ServiceObservation:
     )
 
 
+class OperatorAuthorityAttestationTests(unittest.TestCase):
+    HEAD = "a" * 40
+
+    def _fixture(self) -> tuple[dict[str, object], dict[Path, bytes]]:
+        lifecycle = {
+            "enabled": True,
+            "mode": "blockade-marker-lifecycle",
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
+        service_control = {
+            "enabled": True,
+            "target_pattern": "(?:start|stop|restart|is-active)",
+            "argv": [
+                "/usr/bin/systemctl",
+                "{target}",
+                dual.OPERATOR_SERVICE,
+            ],
+            "timeout_seconds": 60,
+        }
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_blockade_marker_lifecycle": lifecycle,
+                dual.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
+            },
+        }
+        blobs = {
+            Path("src/grabowski_privileged_broker.py"): b"broker-module\n",
+            Path("tools/grabowski_privileged_broker.py"): b"broker-wrapper\n",
+            Path("tools/grabowski_rootbroker_cutover.py"): b"cutover-helper\n",
+            Path("systemd/grabowski-operator.service.example"): b"operator-unit\n",
+            Path("config/privileged-actions.example.json"): (
+                json.dumps(config, sort_keys=True) + "\n"
+            ).encode("utf-8"),
+        }
+        artifact_sha256 = {
+            "broker_module": __import__("hashlib").sha256(
+                blobs[Path("src/grabowski_privileged_broker.py")]
+            ).hexdigest(),
+            "broker_wrapper": __import__("hashlib").sha256(
+                blobs[Path("tools/grabowski_privileged_broker.py")]
+            ).hexdigest(),
+            "cutover_helper": __import__("hashlib").sha256(
+                blobs[Path("tools/grabowski_rootbroker_cutover.py")]
+            ).hexdigest(),
+            "operator_service": __import__("hashlib").sha256(
+                blobs[Path("systemd/grabowski-operator.service.example")]
+            ).hexdigest(),
+        }
+        attestation: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski_operator_authority_attestation",
+            "expected_head": self.HEAD,
+            "cutover_receipt_sha256": "b" * 64,
+            "config_sha256": "c" * 64,
+            "artifact_sha256": artifact_sha256,
+            "action_sha256": {
+                "operator_power_argv": "d" * 64,
+                "operator_blockade_marker_lifecycle": dual._canonical_line_sha256(
+                    lifecycle
+                ),
+                dual.OPERATOR_SERVICE_CONTROL_ACTION: dual._canonical_line_sha256(
+                    service_control
+                ),
+            },
+            "power_peer_binding": {
+                "allowed_peer_uid": 1000,
+                "allowed_peer_unit": dual.OPERATOR_SERVICE,
+            },
+            "operator_system_unit": {
+                "unit": dual.OPERATOR_SERVICE,
+                "fragment_path": "/etc/systemd/system/grabowski-operator.service",
+                "control_group": f"/system.slice/{dual.OPERATOR_SERVICE}",
+                "run_uid": 1000,
+            },
+            "does_not_establish": [
+                "current_operator_main_pid",
+                "runtime_release_integrity",
+                "future_rootbroker_configuration",
+            ],
+        }
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(attestation)
+        return attestation, blobs
+
+    def test_commit_bound_attestation_is_accepted(self) -> None:
+        attestation, blobs = self._fixture()
+        with (
+            mock.patch.object(
+                dual, "_read_root_owned_public_json", return_value=attestation
+            ),
+            mock.patch.object(
+                dual.core,
+                "git_show",
+                side_effect=lambda _repo, head, path: blobs[path]
+                if head == self.HEAD
+                else (_ for _ in ()).throw(AssertionError(head)),
+            ),
+        ):
+            observed = dual.require_operator_authority_anchored(
+                ROOT, self.HEAD, path=Path("/ignored")
+            )
+        self.assertEqual(observed["expected_head"], self.HEAD)
+
+    def test_attestation_rejects_head_and_artifact_tamper(self) -> None:
+        for mutation in ("head", "artifact"):
+            with self.subTest(mutation=mutation):
+                attestation, blobs = self._fixture()
+                if mutation == "head":
+                    attestation["expected_head"] = "f" * 40
+                else:
+                    attestation["artifact_sha256"]["broker_wrapper"] = "0" * 64
+                unsigned = dict(attestation)
+                unsigned.pop("attestation_sha256", None)
+                attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+                with (
+                    mock.patch.object(
+                        dual, "_read_root_owned_public_json", return_value=attestation
+                    ),
+                    mock.patch.object(
+                        dual.core, "git_show", side_effect=lambda _r, _h, path: blobs[path]
+                    ),
+                ):
+                    with self.assertRaises(core.DeployError):
+                        dual.require_operator_authority_anchored(
+                            ROOT, self.HEAD, path=Path("/ignored")
+                        )
+
+    def test_user_owned_attestation_file_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "attestation.json"
+            path.write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(core.DeployError):
+                dual._read_root_owned_public_json(path)
+
+
+class SystemOperatorServiceTests(unittest.TestCase):
+    def test_canonical_operator_observation_uses_system_manager_only(self) -> None:
+        self.assertEqual(
+            dual._service_show_argv(dual.OPERATOR_SERVICE)[:3],
+            ["systemctl", "show", dual.OPERATOR_SERVICE],
+        )
+        self.assertNotIn("--user", dual._service_show_argv(dual.OPERATOR_SERVICE))
+        green = "grabowski-operator-green-test.service"
+        self.assertEqual(dual._service_show_argv(green)[:3], ["systemctl", "--user", "show"])
+
+    def test_operator_unit_execstart_read_uses_system_manager(self) -> None:
+        expected = dual.expected_operator_argv(RUNTIME, CONTRACT)
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "ExecStart={ path="
+                + expected[0]
+                + " ; argv[]="
+                + " ".join(expected)
+                + " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(dual.core, "run", return_value=completed) as run:
+            observed = dual.operator_unit_argv()
+        self.assertEqual(observed, expected)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ["systemctl", "show", dual.OPERATOR_SERVICE])
+        self.assertNotIn("--user", argv)
+
+    def test_operator_stop_and_start_use_only_fixed_rootbroker_control(self) -> None:
+        inactive = observation(False)
+        active = observation(True)
+        with (
+            mock.patch.object(
+                dual, "_operator_system_service_control", return_value={"action": "stop"}
+            ) as control,
+            mock.patch.object(dual, "wait_for_service", return_value=inactive),
+            mock.patch.object(dual.core, "run") as run,
+        ):
+            self.assertEqual(dual.stop_service(dual.OPERATOR_SERVICE), inactive)
+        control.assert_called_once_with("stop")
+        run.assert_not_called()
+
+        with (
+            mock.patch.object(
+                dual, "_operator_system_service_control", return_value={"action": "start"}
+            ) as control,
+            mock.patch.object(dual, "wait_for_service", return_value=active),
+            mock.patch.object(dual.core, "run") as run,
+        ):
+            self.assertEqual(dual.start_service(dual.OPERATOR_SERVICE), active)
+        control.assert_called_once_with("start")
+        run.assert_not_called()
+
+    def test_operator_service_control_reference_is_exact_and_hash_bound(self) -> None:
+        reference = dual._operator_service_control_reference("stop")
+        self.assertEqual(reference["action"], dual.OPERATOR_SERVICE_CONTROL_ACTION)
+        self.assertEqual(reference["target"], "stop")
+        digest = reference.pop("reference_sha256")
+        self.assertEqual(digest, dual._canonical_sha256(reference))
+        with self.assertRaises(core.DeployError):
+            dual._operator_service_control_reference("disable")
+
+    def test_operator_journal_uses_system_scope_but_tunnel_remains_user_scope(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(dual.core, "run", return_value=completed) as run:
+            dual.journal_tail(dual.OPERATOR_SERVICE)
+        self.assertEqual(run.call_args.args[0][0:3], ["journalctl", "-u", dual.OPERATOR_SERVICE])
+        self.assertNotIn("--user", run.call_args.args[0])
+        with mock.patch.object(dual.core, "run", return_value=completed) as run:
+            dual.journal_tail(dual.TUNNEL_SERVICE)
+        self.assertEqual(run.call_args.args[0][0:2], ["journalctl", "--user"])
+
+
 class ProfileTopologyTests(unittest.TestCase):
     def topology(self, payload):
         with mock.patch.object(dual, "_load_yaml", return_value=payload):
@@ -2726,6 +2938,11 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(dual, "require_topology_matches_contract"),
             mock.patch.object(
                 dual,
+                "require_operator_authority_anchored",
+                side_effect=lambda *_args, **_kwargs: events.append("authority") or {},
+            ),
+            mock.patch.object(
+                dual,
                 "require_service_active",
                 side_effect=lambda unit: events.append(f"active:{unit}") or observation(True),
             ),
@@ -2750,6 +2967,7 @@ class DeploymentSequenceTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                "authority",
                 f"active:{dual.OPERATOR_SERVICE}",
                 f"active:{dual.TUNNEL_SERVICE}",
                 "verify:operator",
