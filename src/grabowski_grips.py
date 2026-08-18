@@ -742,15 +742,21 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "agent-execution-happy-path": GripSpec(
         name="agent-execution-happy-path",
-        version="1.0",
-        summary="Advance one lane-backed Agent Workspace through the bounded coordinator and, only after exact PASS closure, to integration_ready.",
+        version="1.1",
+        summary=(
+            "Bind one bounded Source request to Route/ExecutionPlan/Work Lane/Agent Workspace, "
+            "or resume an existing lane-backed Workspace, and advance it autonomously to integration_ready."
+        ),
         effect=MUTATING,
-        required_parameters=("workspace_id", "base", "title"),
+        required_parameters=("base", "title"),
         acceptance_ids=(
+            "source-route-plan-bound",
+            "source-lane-workspace-bound",
             "workspace-coordinator-bound",
             "revision-command-server-bound",
             "closed-candidate-exact",
             "candidate-integration-composed",
+            "durable-continuation-bound",
             "unknown-effect-no-retry",
         ),
         runner="agent_execution_happy_path",
@@ -910,7 +916,7 @@ GRIP_SURFACE_TARGETS = {
     "branch-publish": "git branch publication",
     "pr-create-or-update": "GitHub pull request metadata",
     "candidate-integration-ready": "one closed verified Agent Workspace through controller custody to an exact ready PR",
-    "agent-execution-happy-path": "one lane-backed Agent Workspace through bounded coordination to integration_ready",
+    "agent-execution-happy-path": "one bounded Source request or lane-backed Agent Workspace through autonomous coordination to integration_ready",
 }
 GRIP_SURFACE_RECOVERY_PATHS = {
     READ_ONLY: "rerun the grip with the same inputs; no local recovery should be required",
@@ -918,8 +924,9 @@ GRIP_SURFACE_RECOVERY_PATHS = {
 }
 GRIP_RECOVERY_PATHS_BY_NAME = {
     "agent-execution-happy-path": (
-        "read back the exact workspace coordinator status and any nested candidate-integration-ready receipt; "
-        "never replay an unknown collect, revision, close, adoption, push or PR effect without its named authoritative readback"
+        "read back the exact Source-derived Work Lane, Workspace coordinator status, continuation job and any nested "
+        "candidate-integration-ready receipt; never replay an unknown lane/workspace/collect/revision/close/adoption/push/PR "
+        "effect without its named authoritative readback"
     ),
     "candidate-integration-ready": (
         "read back the immutable Candidate adoption, source Work Lane terminal state, remote branch and open PR; "
@@ -978,8 +985,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 # so the published contract carries them explicitly per action.
 GRIP_CONDITIONAL_PRECONDITIONS = {
     "agent-execution-happy-path": (
-        "workspace_id must name a lane-backed Agent Workspace; the bound writer command is read from its immutable manifest and cannot be supplied by the caller",
+        "exactly one mode is required: workspace_id resumes one lane-backed Agent Workspace; otherwise source_kind, source_id, repo, source_revision, write_paths, objective, test_argv and retention_until_unix form one bounded Source request",
+        "Source mode derives branch, target checkout, idempotency identity, canonical route, ExecutionPlan.v1 and route-bound writer/reviewer commands server-side; callers cannot select branch, target, Candidate or revision identities",
+        "Work Lane binds scoped-writer authority but receives no scoped_writer_argv, so Agent Workspace is the only writer-start owner",
         "the internal execution coordinator owns no state store and may only collect, consume the one bounded candidate revision, or close through existing workspace seams",
+        "ordinary pending async progress is handed to one deterministic existing Grabowski job; a continuation runner never creates another continuation job",
         "candidate-integration-ready is invoked only after exact closed PASS Candidate bindings are revalidated from coordinator status",
     ),
     "candidate-integration-ready": (
@@ -5728,6 +5738,781 @@ def _run_pr_create_or_update(
 
 
 
+
+_AGENT_EXECUTION_SOURCE_FIELDS = frozenset(
+    {
+        "source_kind",
+        "source_id",
+        "repo",
+        "source_revision",
+        "write_paths",
+        "objective",
+        "test_argv",
+        "retention_until_unix",
+        "task_class",
+        "duration_minutes",
+        "novelty",
+        "risk_flags",
+        "verification_policy",
+        "review_objective",
+        "runtime_seconds",
+    }
+)
+_AGENT_EXECUTION_CONTINUATION_ENV = "GRABOWSKI_AEF_CONTINUATION"
+
+
+def _agent_execution_frontdoor_modules() -> tuple[Any, Any, Any, Any]:
+    import grabowski_coding_agent_router as router
+    import grabowski_execution_plan as execution_plan
+    import grabowski_work_acquire as work_acquire
+    import grabowski_agent_workspace as workspace
+
+    return router, execution_plan, work_acquire, workspace
+
+
+def _agent_execution_job_operator() -> Any:
+    import grabowski_operator_core as operator
+
+    return operator
+
+
+def _agent_execution_text_parameter(
+    parameters: dict[str, Any], name: str, *, maximum: int = 8192
+) -> str:
+    value = _string_parameter(parameters, name)
+    if len(value.encode("utf-8")) > maximum or "\x00" in value:
+        raise GripPreflightError(f"{name} parameter is too large or contains NUL")
+    return value
+
+
+def _agent_execution_int_parameter(
+    parameters: dict[str, Any],
+    name: str,
+    *,
+    default: int | None = None,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = parameters.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise GripPreflightError(
+            f"{name} parameter must be an integer between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _agent_execution_slug(value: str, *, maximum: int = 28) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return (normalized or "source")[:maximum].rstrip("-") or "source"
+
+
+def _agent_execution_route_command(
+    route: Any,
+    *,
+    prompt: str,
+    role: str,
+) -> list[str]:
+    if not isinstance(route, dict):
+        raise GripPreflightError(f"canonical {role} route is missing")
+    route_id = route.get("route")
+    prefix = route.get("argv_prefix")
+    harness = route.get("harness")
+    if (
+        not isinstance(route_id, str)
+        or not route_id
+        or not isinstance(prefix, list)
+        or not prefix
+        or any(not isinstance(item, str) or not item or "\x00" in item for item in prefix)
+        or not isinstance(harness, str)
+    ):
+        raise GripPreflightError(f"canonical {role} route command contract is invalid")
+    if route.get("paid_only") is True:
+        raise GripPreflightError(f"canonical {role} route requires paid execution")
+    if role == "writer":
+        if route.get("route_role") != "scoped-writer" or route.get("contrast_only") is True:
+            raise GripPreflightError(
+                "canonical writer route is not eligible as the authoritative lane-scoped writer"
+            )
+    elif role == "review":
+        if route.get("route_role") != "reviewer" or route.get("review_only") is not True:
+            raise GripPreflightError("canonical review route is not reviewer-only")
+    else:  # pragma: no cover - private caller contract
+        raise GripPreflightError("unsupported agent execution role")
+
+    command = list(prefix)
+    if harness == "claude":
+        permission = "acceptEdits" if role == "writer" else "plan"
+        if "--permission-mode" in command:
+            index = command.index("--permission-mode")
+            if index + 1 >= len(command) or command[index + 1] != permission:
+                raise GripPreflightError(
+                    f"canonical {role} Claude route has incompatible permission mode"
+                )
+        elif not any(item.startswith("--permission-mode=") for item in command):
+            command.extend(["--permission-mode", permission])
+        for flag in ("-p", "--safe-mode", "--no-session-persistence"):
+            if flag not in command:
+                command.append(flag)
+        command.append(prompt)
+        return command
+    if harness == "codex":
+        if role == "review":
+            return [*command, "exec", "--sandbox", "read-only", prompt]
+        return [*command, "exec", "--sandbox", "workspace-write", prompt]
+    if harness == "opencode" and role == "writer":
+        return [*command, prompt]
+    raise GripPreflightError(
+        f"canonical {role} harness is not supported by the P5 one-shot command binder: {harness}"
+    )
+
+
+def _agent_execution_build_plan(
+    execution_plan: Any,
+    *,
+    source_kind: str,
+    source_id: str,
+    route: dict[str, Any],
+    write_paths: list[str],
+    runtime_seconds: int,
+) -> dict[str, Any]:
+    executor = route.get("executor")
+    verification_policy = route.get("verification_policy")
+    if verification_policy == "competition":
+        raise GripPreflightError(
+            "P5 one-shot does not place competing writers in one Work Lane"
+        )
+    mutating_kind = "scoped_writer" if executor == "scoped_writer" else "controller"
+    mutating_id = "writer" if executor == "scoped_writer" else "controller"
+    topology = "writer_verify_reduce" if executor == "scoped_writer" else "direct"
+    nodes = [
+        {
+            "node_id": mutating_id,
+            "kind": mutating_kind,
+            "critical": True,
+            "mutates": True,
+            "write_scope": write_paths,
+        },
+        {
+            "node_id": "verifier",
+            "kind": "verifier",
+            "critical": True,
+            "mutates": False,
+            "write_scope": [],
+        },
+        {
+            "node_id": "reducer",
+            "kind": "reducer",
+            "critical": True,
+            "mutates": False,
+            "write_scope": [],
+        },
+    ]
+    edges = [
+        {"from": mutating_id, "to": "verifier", "artifact": "CandidateManifest.v1"},
+        {"from": "verifier", "to": "reducer", "artifact": "VerificationReceipt.v1"},
+    ]
+    plan = execution_plan.build_execution_plan(
+        source_binding={"kind": source_kind, "id": source_id},
+        route_decision=route,
+        topology=topology,
+        nodes=nodes,
+        edges=edges,
+        write_scope=write_paths,
+        verification_policy=str(verification_policy),
+        failure_policy={
+            "on_indeterminate": "revise",
+            "on_unknown_effect": "reconcile",
+            "revision": "bounded",
+        },
+        budgets={
+            "max_revisions": 1,
+            "max_duration_seconds": runtime_seconds,
+            "max_tool_calls": min(1000, max(20, len(write_paths) * 20)),
+        },
+        completion_policy={
+            "required_nodes": [mutating_id, "verifier", "reducer"],
+            "require_all_critical": True,
+            "verifier_quorum": 1,
+        },
+    )
+    return execution_plan.validate_execution_plan(plan)
+
+
+def _agent_execution_source_request(
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    router, execution_plan, work_acquire, workspace = _agent_execution_frontdoor_modules()
+    source_kind = _agent_execution_text_parameter(parameters, "source_kind", maximum=32)
+    source_id = _agent_execution_text_parameter(parameters, "source_id", maximum=256)
+    try:
+        repo = Path(
+            _agent_execution_text_parameter(parameters, "repo", maximum=4096)
+        ).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise GripPreflightError("repo must resolve to an existing canonical checkout") from exc
+    top = _git(repo, runner, ["rev-parse", "--show-toplevel"])
+    if str(top.get("stdout", "")).strip() != str(repo):
+        raise GripPreflightError("repo must be the canonical checkout root")
+    source_revision = _sha_parameter(parameters, "source_revision").lower()
+    if len(source_revision) != 40:
+        raise GripPreflightError("source_revision must be one exact 40-character Git commit")
+    head = str(_git(repo, runner, ["rev-parse", "HEAD"]).get("stdout", "")).strip().lower()
+    if head != source_revision:
+        raise GripPreflightError("canonical checkout HEAD drifted from source_revision")
+
+    write_paths = _string_list_parameter(parameters, "write_paths")
+    if not write_paths or len(write_paths) != len(set(write_paths)):
+        raise GripPreflightError("write_paths must be a non-empty duplicate-free list")
+    objective = _agent_execution_text_parameter(parameters, "objective")
+    test_argv = _string_list_parameter(parameters, "test_argv")
+    if not test_argv or any(not item or "\x00" in item for item in test_argv):
+        raise GripPreflightError("test_argv must be a non-empty argv list")
+    runtime_seconds = _agent_execution_int_parameter(
+        parameters, "runtime_seconds", default=7200, minimum=120, maximum=86400
+    )
+    retention_until_unix = _agent_execution_int_parameter(
+        parameters,
+        "retention_until_unix",
+        minimum=1,
+        maximum=2**63 - 1,
+    )
+    if retention_until_unix < int(time.time()) + runtime_seconds + 600:
+        raise GripPreflightError(
+            "retention_until_unix must cover the runtime budget plus a 600-second closeout margin"
+        )
+    task_class = parameters.get("task_class", "bounded-patch")
+    if not isinstance(task_class, str) or not task_class.strip():
+        raise GripPreflightError("task_class must be a non-empty string")
+    duration_minutes = _agent_execution_int_parameter(
+        parameters,
+        "duration_minutes",
+        default=max(15, min(1440, runtime_seconds // 60)),
+        minimum=1,
+        maximum=1440,
+    )
+    novelty = parameters.get("novelty", "medium")
+    if novelty not in {"low", "medium", "high"}:
+        raise GripPreflightError("novelty must be low, medium or high")
+    risk_flags = _string_list_parameter(parameters, "risk_flags")
+    verification_policy = parameters.get("verification_policy", "independent_review")
+    if verification_policy not in {"deterministic", "independent_review"}:
+        raise GripPreflightError(
+            "P5 one-shot verification_policy must be deterministic or independent_review"
+        )
+
+    try:
+        route = router.canonical_execution_route(
+            task_class.strip(),
+            changed_files=len(write_paths),
+            duration_minutes=duration_minutes,
+            novelty=novelty,
+            risk_flags=risk_flags,
+            latency_priority=False,
+            need_review=verification_policy == "independent_review",
+            verification_policy=verification_policy,
+        )
+    except Exception as exc:
+        raise GripPreflightError("canonical execution routing failed") from exc
+    if not isinstance(route, dict) or route.get("effect_profile") != "candidate":
+        raise GripPreflightError("canonical route is not a P5 candidate execution route")
+    try:
+        execution_plan.route_binding_from_decision(route)
+        plan = _agent_execution_build_plan(
+            execution_plan,
+            source_kind=source_kind,
+            source_id=source_id,
+            route=route,
+            write_paths=write_paths,
+            runtime_seconds=runtime_seconds,
+        )
+    except Exception as exc:
+        raise GripPreflightError(
+            "canonical route or ExecutionPlan failed immutable binding validation"
+        ) from exc
+    _check(receipt, "source-route-plan-bound", "pass", str(route.get("recommendation_sha256")))
+
+    source_identity_material = {
+        "source": {"kind": source_kind, "id": source_id},
+        "repo": str(repo),
+        "source_revision": source_revision,
+        "write_paths": sorted(write_paths),
+    }
+    source_identity_sha256 = sha256_json(source_identity_material)
+    request_material = {
+        **source_identity_material,
+        "objective": objective,
+        "test_argv": test_argv,
+        "task_class": task_class.strip(),
+        "duration_minutes": duration_minutes,
+        "novelty": novelty,
+        "risk_flags": sorted(risk_flags),
+        "verification_policy": verification_policy,
+        "runtime_seconds": runtime_seconds,
+        "retention_until_unix": retention_until_unix,
+    }
+    request_sha256 = sha256_json(request_material)
+    branch = f"feat/aef-{_agent_execution_slug(source_id)}-{source_identity_sha256[:10]}"
+    target = repo.parent / f".grabowski-aef-{_agent_execution_slug(repo.name, maximum=16)}-{source_identity_sha256[:12]}"
+    frontdoor = {
+        "schema_version": 1,
+        "kind": "agent_execution_frontdoor",
+        "source": {"kind": source_kind, "id": source_id},
+        "source_revision": source_revision,
+        "source_identity_sha256": source_identity_sha256,
+        "request_sha256": request_sha256,
+        "route_recommendation_sha256": route.get("recommendation_sha256"),
+        "execution_plan_id": plan.get("plan_id"),
+        "executor": route.get("executor"),
+        "writer_route": route.get("writer_route"),
+        "verification_policy": verification_policy,
+        "branch": branch,
+        "target_path": str(target),
+        "workspace_id": None,
+        "lane_id": None,
+        "lane_receipt_sha256": None,
+        "reconcile_required": False,
+    }
+    if route.get("executor") == "controller":
+        _check(
+            receipt,
+            "source-lane-workspace-bound",
+            "skip",
+            "canonical route stops at controller execution boundary",
+        )
+        return {
+            **frontdoor,
+            "state": "controller_handback",
+            "execution_plan": plan,
+            "next_action": "controller_execute_bound_plan",
+            "receipt_status": "passed",
+            "stop": True,
+        }
+
+    selected_writer = route.get("scoped_writer")
+    if not isinstance(selected_writer, dict) or selected_writer.get("route") != route.get("writer_route"):
+        raise GripPreflightError("canonical scoped writer route binding is incomplete")
+    writer_argv = _agent_execution_route_command(
+        selected_writer,
+        prompt=objective,
+        role="writer",
+    )
+    if verification_policy == "independent_review":
+        reviewers = route.get("reviewers")
+        reviewer = reviewers[0] if isinstance(reviewers, list) and reviewers else None
+        review_prompt = parameters.get("review_objective")
+        if review_prompt is None:
+            review_prompt = (
+                "Review the exact frozen Candidate for the bound Source request. Be read-only and adversarial. "
+                "Return only one JSON object with verdict PASS, NEEDS_CHANGE or BLOCK and a findings array. "
+                "Reject authority drift, scope drift, duplicate effects, unbounded revision or unknown-effect retry."
+            )
+        elif not isinstance(review_prompt, str) or not review_prompt.strip():
+            raise GripPreflightError("review_objective must be non-empty text when provided")
+        review_argv = _agent_execution_route_command(
+            reviewer,
+            prompt=str(review_prompt).strip(),
+            role="review",
+        )
+    else:
+        review_argv = [
+            "python3",
+            "-c",
+            "import json; print(json.dumps({'verdict':'PASS','findings':[]}))",
+        ]
+
+    lane_parameters = {
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "controller_actor": "controller:chatgpt",
+        "controller_role": "controller",
+        "scoped_writer_actor": f"scoped-writer:{route['writer_route']}",
+        "repo": str(repo),
+        "base_head": source_revision,
+        "branch": branch,
+        "target_path": str(target),
+        "purpose": f"AEF P5 one-shot {source_kind}:{source_id} {request_sha256[:12]}",
+        "retention_until_unix": retention_until_unix,
+        "artifact_class": "implementation-worktree",
+        "idempotency_key": f"aef-{source_identity_sha256[:20]}-{request_sha256[:20]}",
+        "write_paths": write_paths,
+        "execution_plan": plan,
+        "ttl_seconds": min(86400, max(7200, runtime_seconds + 1800)),
+    }
+    try:
+        work_acquire.operator._require_operator_mutation(
+            "resource_lease", path=str(target), repo=str(repo)
+        )
+        work_acquire.operator._require_operator_capability("git_cli")
+        lane = work_acquire.acquire_work(
+            lane_parameters,
+            audit_fn=work_acquire.operator.base._append_audit,
+        )
+    except Exception as exc:
+        return {
+            **frontdoor,
+            "state": "lane_reconcile_required",
+            "execution_plan": plan,
+            "reconcile_required": True,
+            "next_action": "read_back_source_lane_and_checkout_before_retry",
+            "error": type(exc).__name__,
+            "receipt_status": "blocked",
+            "stop": True,
+        }
+    if not isinstance(lane, dict):
+        return {
+            **frontdoor,
+            "state": "lane_reconcile_required",
+            "execution_plan": plan,
+            "reconcile_required": True,
+            "next_action": "read_back_source_lane_and_checkout_before_retry",
+            "error": "invalid_work_lane_result",
+            "receipt_status": "blocked",
+            "stop": True,
+        }
+    lane_id = lane.get("lane_id")
+    lane_receipt_sha256 = lane.get("receipt_sha256")
+    lane_inputs = lane.get("inputs")
+    expected_writer_actor = f"scoped-writer:{route['writer_route']}"
+    lane_exact = bool(
+        lane.get("state") == "ready"
+        and isinstance(lane_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", lane_id)
+        and isinstance(lane_receipt_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", lane_receipt_sha256)
+        and isinstance(lane_inputs, dict)
+        and lane_inputs.get("execution_plan") == plan
+        and lane_inputs.get("source") == {"kind": source_kind, "id": source_id}
+        and lane_inputs.get("scoped_writer") == {
+            "actor": expected_writer_actor,
+            "role": "scoped_writer",
+        }
+        and not isinstance(lane.get("writer_job"), dict)
+        and not isinstance(lane.get("writer_start"), dict)
+    )
+    if not lane_exact:
+        return {
+            **frontdoor,
+            "state": "lane_reconcile_required",
+            "execution_plan": plan,
+            "lane_id": lane_id,
+            "lane_receipt_sha256": lane_receipt_sha256,
+            "reconcile_required": True,
+            "next_action": "read_back_source_lane_and_checkout_before_retry",
+            "error": "work_lane_binding_not_exact",
+            "receipt_status": "blocked",
+            "stop": True,
+        }
+
+    assert isinstance(lane_id, str)
+    assert isinstance(lane_receipt_sha256, str)
+    expected_workspace_id: str | None = None
+    try:
+        expected_workspace_id, _ = workspace._lane_workspace_identity(source_id, repo, lane_id)
+        created = workspace.grabowski_agent_workspace_create(
+            binding_kind=source_kind,
+            binding_id=source_id,
+            repository=str(repo),
+            expected_base_head=source_revision,
+            writer_branch=branch,
+            writer_worktree=str(target),
+            allowed_paths=write_paths,
+            forbidden_paths=[],
+            writer_argv=writer_argv,
+            test_argv=test_argv,
+            review_argv=review_argv,
+            runtime_seconds=runtime_seconds,
+            memory_max_bytes=None,
+            lane_id=lane_id,
+            expected_lane_receipt_sha256=lane_receipt_sha256,
+        )
+    except Exception as exc:
+        status = None
+        if expected_workspace_id is not None:
+            try:
+                status = workspace.grabowski_agent_workspace_status(expected_workspace_id)
+            except Exception:
+                pass
+        return {
+            **frontdoor,
+            "state": "workspace_reconcile_required",
+            "execution_plan": plan,
+            "lane_id": lane_id,
+            "lane_receipt_sha256": lane_receipt_sha256,
+            "workspace_id": expected_workspace_id,
+            "workspace_status": status,
+            "reconcile_required": True,
+            "next_action": "read_back_lane_backed_workspace_before_retry",
+            "error": type(exc).__name__,
+            "receipt_status": "blocked",
+            "stop": True,
+        }
+    created_workspace = created.get("workspace") if isinstance(created, dict) else None
+    resources_value = created_workspace.get("resources") if isinstance(created_workspace, dict) else None
+    binding = resources_value.get("lane_binding") if isinstance(resources_value, dict) else None
+    workspace_id = created_workspace.get("workspace_id") if isinstance(created_workspace, dict) else None
+    if (
+        workspace_id != expected_workspace_id
+        or not isinstance(binding, dict)
+        or binding.get("lane_id") != lane_id
+        or binding.get("receipt_sha256") != lane_receipt_sha256
+    ):
+        return {
+            **frontdoor,
+            "state": "workspace_reconcile_required",
+            "execution_plan": plan,
+            "lane_id": lane_id,
+            "lane_receipt_sha256": lane_receipt_sha256,
+            "workspace_id": expected_workspace_id,
+            "reconcile_required": True,
+            "next_action": "read_back_lane_backed_workspace_before_retry",
+            "error": "workspace_binding_not_exact",
+            "receipt_status": "blocked",
+            "stop": True,
+        }
+    _check(receipt, "source-lane-workspace-bound", "pass", str(workspace_id))
+    return {
+        **frontdoor,
+        "state": "workspace_ready",
+        "execution_plan": plan,
+        "lane_id": lane_id,
+        "lane_receipt_sha256": lane_receipt_sha256,
+        "workspace_id": workspace_id,
+        "writer_command_sha256": sha256_json(writer_argv),
+        "review_command_sha256": sha256_json(review_argv),
+        "stop": False,
+    }
+
+
+def _agent_execution_start_continuation(
+    workspace: Any,
+    *,
+    workspace_id: str,
+    base: str,
+    title: str,
+    body: str,
+) -> dict[str, Any]:
+    if os.environ.get(_AGENT_EXECUTION_CONTINUATION_ENV) == "1":
+        return {
+            "state": "continuation_runner",
+            "started": False,
+            "reused": True,
+            "unit": None,
+        }
+    try:
+        manifest = workspace._manifest(workspace_id)
+    except Exception as exc:
+        return {
+            "state": "continuation_reconcile_required",
+            "started": False,
+            "reused": False,
+            "unit": None,
+            "error": type(exc).__name__,
+        }
+    resources_value = manifest.get("resources") if isinstance(manifest, dict) else None
+    runtime_identity = manifest.get("runtime_identity") if isinstance(manifest, dict) else None
+    deadline = resources_value.get("runtime_deadline_unix") if isinstance(resources_value, dict) else None
+    repository = manifest.get("repository") if isinstance(manifest, dict) else None
+    runtime_identity_sha256 = (
+        runtime_identity.get("identity_sha256")
+        if isinstance(runtime_identity, dict)
+        else None
+    )
+    if (
+        isinstance(deadline, bool)
+        or not isinstance(deadline, int)
+        or not isinstance(repository, str)
+        or not repository
+        or not isinstance(runtime_identity_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", runtime_identity_sha256) is None
+    ):
+        return {
+            "state": "continuation_reconcile_required",
+            "started": False,
+            "reused": False,
+            "unit": None,
+            "error": "workspace_continuation_binding_invalid",
+        }
+    remaining = deadline - int(time.time())
+    if remaining < 120:
+        return {
+            "state": "continuation_reconcile_required",
+            "started": False,
+            "reused": False,
+            "unit": None,
+            "error": "workspace_runtime_budget_exhausted",
+        }
+    payload = canonical_json(
+        {
+            "workspace_id": workspace_id,
+            "base": base,
+            "title": title,
+            "body": body,
+        }
+    )
+    job_runtime = min(86400, max(120, remaining))
+    command = [
+        sys.executable,
+        "-m",
+        "grabowski_grips",
+        "--aef-continue",
+        payload,
+        str(job_runtime),
+    ]
+    identity = sha256_json(
+        {
+            "payload": payload,
+            "repository": repository,
+            "runtime_identity_sha256": runtime_identity_sha256,
+        }
+    )
+    unit = f"grabowski-job-aef-{identity[:16]}"
+    operator = _agent_execution_job_operator()
+    expected_argv_sha256 = operator._argv_hash(command)
+    try:
+        existing = operator._read_job_metadata(unit)
+    except Exception:
+        existing = None
+    if isinstance(existing, dict):
+        exact_existing = bool(
+            existing.get("argv_sha256") == expected_argv_sha256
+            and existing.get("cwd") == repository
+        )
+        if not exact_existing:
+            return {
+                "state": "continuation_reconcile_required",
+                "started": False,
+                "reused": False,
+                "unit": unit,
+                "error": "existing_continuation_identity_mismatch",
+            }
+        final_status = existing.get("final_status")
+        if final_status in {"launch_submitted", "running"}:
+            return {
+                "state": "continuation_reused",
+                "started": False,
+                "reused": True,
+                "unit": unit,
+                "job_id": existing.get("job_id"),
+                "argv_sha256": expected_argv_sha256,
+                "final_status": final_status,
+            }
+        return {
+            "state": "continuation_reconcile_required",
+            "started": False,
+            "reused": False,
+            "unit": unit,
+            "job_id": existing.get("job_id"),
+            "argv_sha256": expected_argv_sha256,
+            "final_status": final_status,
+            "error": "existing_continuation_is_terminal",
+        }
+    try:
+        operator._require_operator_mutation(
+            "durable_job", path=repository, repo=repository
+        )
+        started = operator._start_job(
+            command,
+            cwd=repository,
+            runtime_seconds=job_runtime,
+            reserved_unit=unit,
+        )
+    except Exception as exc:
+        try:
+            readback = operator._read_job_metadata(unit)
+        except Exception:
+            readback = None
+        if (
+            isinstance(readback, dict)
+            and readback.get("argv_sha256") == expected_argv_sha256
+            and readback.get("cwd") == repository
+        ):
+            return {
+                "state": "continuation_start_reconciled",
+                "started": False,
+                "reused": True,
+                "unit": unit,
+                "job_id": readback.get("job_id"),
+                "argv_sha256": expected_argv_sha256,
+                "final_status": readback.get("final_status"),
+            }
+        return {
+            "state": "continuation_reconcile_required",
+            "started": False,
+            "reused": False,
+            "unit": unit,
+            "error": type(exc).__name__,
+        }
+    if (
+        not isinstance(started, dict)
+        or started.get("unit") != unit
+        or started.get("argv_sha256") != expected_argv_sha256
+    ):
+        return {
+            "state": "continuation_reconcile_required",
+            "started": False,
+            "reused": False,
+            "unit": unit,
+            "error": "continuation_start_receipt_invalid",
+        }
+    return {
+        "state": "continuation_started",
+        "started": True,
+        "reused": False,
+        "unit": unit,
+        "job_id": started.get("job_id"),
+        "argv_sha256": expected_argv_sha256,
+        "final_status": started.get("final_status"),
+    }
+
+
+def _agent_execution_continuation_cli(arguments: list[str] | None = None) -> int:
+    values = list(sys.argv[1:] if arguments is None else arguments)
+    if len(values) != 3 or values[0] != "--aef-continue":
+        return 64
+    try:
+        parameters = json.loads(values[1])
+        runtime_seconds = int(values[2])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return 64
+    if not isinstance(parameters, dict) or not 120 <= runtime_seconds <= 86400:
+        return 64
+    os.environ[_AGENT_EXECUTION_CONTINUATION_ENV] = "1"
+    deadline = time.monotonic() + runtime_seconds
+    while True:
+        result = run_grip(
+            "agent-execution-happy-path",
+            parameters,
+            allow_mutation=True,
+        )
+        receipt = result.get("receipt") if isinstance(result, dict) else None
+        output = result.get("output") if isinstance(result, dict) else None
+        receipt_status = receipt.get("status") if isinstance(receipt, dict) else None
+        state = output.get("state") if isinstance(output, dict) else None
+        print(
+            json.dumps(
+                {
+                    "workspace_id": parameters.get("workspace_id"),
+                    "receipt_status": receipt_status,
+                    "state": state,
+                    "integration_ready": bool(
+                        isinstance(output, dict) and output.get("integration_ready") is True
+                    ),
+                    "reconcile_required": bool(
+                        isinstance(output, dict) and output.get("reconcile_required") is True
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        if state != "pending":
+            return 0 if isinstance(output, dict) and output.get("integration_ready") is True else 2
+        if time.monotonic() + 5 >= deadline:
+            return 75
+        time.sleep(5)
+
 def _agent_execution_happy_path_modules() -> tuple[Any, Any]:
     import grabowski_execution_coordinator as coordinator
     import grabowski_agent_workspace as workspace
@@ -5829,23 +6614,80 @@ def _run_agent_execution_happy_path(
     runner: CommandRunner,
     github_runner: GithubRunner,
 ) -> dict[str, Any]:
-    allowed = {"workspace_id", "base", "title", "body"}
+    allowed = {
+        "workspace_id",
+        "base",
+        "title",
+        "body",
+        *_AGENT_EXECUTION_SOURCE_FIELDS,
+    }
     unknown = sorted(set(parameters) - allowed)
     if unknown:
         raise GripPreflightError(
-            "agent-execution-happy-path does not accept caller-selected repository, branch, head, candidate or revision fields: "
+            "agent-execution-happy-path does not accept caller-selected branch, target, Candidate or revision fields: "
             + ", ".join(unknown)
         )
-    workspace_id = _string_parameter(parameters, "workspace_id")
     base = _short_branch_name(parameters, "base")
     title = _string_parameter(parameters, "title")
     body = parameters.get("body", "")
     if not isinstance(body, str):
         raise GripPreflightError("body parameter must be a string when provided")
 
+    source_fields_present = sorted(set(parameters) & _AGENT_EXECUTION_SOURCE_FIELDS)
+    supplied_workspace_id = parameters.get("workspace_id")
+    frontdoor: dict[str, Any] | None = None
+    if supplied_workspace_id is not None:
+        if source_fields_present:
+            raise GripPreflightError(
+                "workspace_id resume mode may not be combined with Source-mode fields"
+            )
+        workspace_id = _string_parameter(parameters, "workspace_id")
+        _check(
+            receipt,
+            "source-route-plan-bound",
+            "skip",
+            "existing workspace resume mode",
+        )
+        _check(
+            receipt,
+            "source-lane-workspace-bound",
+            "skip",
+            "existing workspace resume mode",
+        )
+    else:
+        missing = sorted(
+            {
+                "source_kind",
+                "source_id",
+                "repo",
+                "source_revision",
+                "write_paths",
+                "objective",
+                "test_argv",
+                "retention_until_unix",
+            }
+            - set(parameters)
+        )
+        if missing:
+            raise GripPreflightError(
+                "Source mode is missing required fields: " + ", ".join(missing)
+            )
+        frontdoor = _agent_execution_source_request(parameters, receipt, runner)
+        if frontdoor.get("stop") is True:
+            return {
+                **frontdoor,
+                "integration_ready": False,
+                "reconcile_required": bool(frontdoor.get("reconcile_required")),
+            }
+        workspace_id = str(frontdoor["workspace_id"])
+
     coordinator, workspace = _agent_execution_happy_path_modules()
     revision_argv = _agent_execution_bound_writer_command(workspace, workspace_id)
     _check(receipt, "revision-command-server-bound", "pass", "workspace manifest writer command")
+
+    def with_frontdoor(value: dict[str, Any]) -> dict[str, Any]:
+        return {**value, **({"frontdoor": frontdoor} if frontdoor is not None else {})}
+
     try:
         coordinated = coordinator.run_workspace_candidate_coordinator(
             workspace_id,
@@ -5855,81 +6697,138 @@ def _run_agent_execution_happy_path(
         )
     except Exception as exc:
         _check(receipt, "workspace-coordinator-bound", "fail", type(exc).__name__)
-        return {
-            "state": "coordinator_reconcile_required",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "coordinator": None,
-            "reconcile_required": True,
-            "next_action": "read_back_workspace_before_any_coordinator_retry",
-            "error": type(exc).__name__,
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "coordinator_reconcile_required",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": None,
+                "reconcile_required": True,
+                "next_action": "read_back_workspace_before_any_coordinator_retry",
+                "error": type(exc).__name__,
+                "receipt_status": "blocked",
+            }
+        )
     if not isinstance(coordinated, dict) or coordinated.get("workspace_id") != workspace_id:
         _check(receipt, "workspace-coordinator-bound", "fail", "invalid coordinator binding")
-        return {
-            "state": "coordinator_reconcile_required",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "coordinator": coordinated,
-            "reconcile_required": True,
-            "next_action": "read_back_workspace_before_any_coordinator_retry",
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "coordinator_reconcile_required",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "reconcile_required": True,
+                "next_action": "read_back_workspace_before_any_coordinator_retry",
+                "receipt_status": "blocked",
+            }
+        )
     _check(receipt, "workspace-coordinator-bound", "pass", str(coordinated.get("state")))
     coordinator_state = coordinated.get("state")
     if coordinator_state == "pending":
-        return {
-            "state": "pending",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "coordinator": coordinated,
-            "reconcile_required": False,
-            "next_action": "invoke_after_workspace_task_state_changes",
-            "receipt_status": "passed",
-        }
+        continuation = _agent_execution_start_continuation(
+            workspace,
+            workspace_id=workspace_id,
+            base=base,
+            title=title,
+            body=body,
+        )
+        if continuation.get("state") == "continuation_reconcile_required":
+            _check(
+                receipt,
+                "durable-continuation-bound",
+                "fail",
+                str(continuation.get("error")),
+            )
+            return with_frontdoor(
+                {
+                    "state": "continuation_reconcile_required",
+                    "integration_ready": False,
+                    "workspace_id": workspace_id,
+                    "coordinator": coordinated,
+                    "continuation": continuation,
+                    "reconcile_required": True,
+                    "next_action": "read_back_continuation_job_and_workspace_before_retry",
+                    "receipt_status": "blocked",
+                }
+            )
+        _check(
+            receipt,
+            "durable-continuation-bound",
+            "pass",
+            str(continuation.get("state")),
+        )
+        return with_frontdoor(
+            {
+                "state": "pending",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "continuation": continuation,
+                "reconcile_required": False,
+                "next_action": (
+                    "continuation_poll"
+                    if continuation.get("state") == "continuation_runner"
+                    else "observe_continuation_job"
+                ),
+                "receipt_status": "passed",
+            }
+        )
+    _check(
+        receipt,
+        "durable-continuation-bound",
+        "skip",
+        "coordinator reached a non-pending state in the current call",
+    )
     if coordinator_state in {"blocked", "revision_required"}:
-        return {
-            "state": "blocked",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "coordinator": coordinated,
-            "reconcile_required": False,
-            "next_action": "inspect_workspace_coordinator_blocker",
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "blocked",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "reconcile_required": False,
+                "next_action": "inspect_workspace_coordinator_blocker",
+                "receipt_status": "blocked",
+            }
+        )
     if coordinator_state == "reconcile_required":
-        return {
-            "state": "reconcile_required",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "coordinator": coordinated,
-            "reconcile_required": True,
-            "next_action": "perform_named_workspace_readback_before_retry",
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "reconcile_required",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "reconcile_required": True,
+                "next_action": "perform_named_workspace_readback_before_retry",
+                "receipt_status": "blocked",
+            }
+        )
     if coordinator_state not in {"closed", "verified_candidate_closed"}:
-        return {
-            "state": "coordinator_reconcile_required",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "coordinator": coordinated,
-            "reconcile_required": True,
-            "next_action": "read_back_workspace_before_any_integration_effect",
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "coordinator_reconcile_required",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "reconcile_required": True,
+                "next_action": "read_back_workspace_before_any_integration_effect",
+                "receipt_status": "blocked",
+            }
+        )
     candidate = _agent_execution_closed_candidate(coordinated.get("status"))
     if candidate is None:
         _check(receipt, "closed-candidate-exact", "fail", "closed PASS Candidate binding invalid")
-        return {
-            "state": "closed_candidate_reconcile_required",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "coordinator": coordinated,
-            "reconcile_required": True,
-            "next_action": "inspect_closed_workspace_candidate_evidence",
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "closed_candidate_reconcile_required",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "coordinator": coordinated,
+                "reconcile_required": True,
+                "next_action": "inspect_closed_workspace_candidate_evidence",
+                "receipt_status": "blocked",
+            }
+        )
     _check(receipt, "closed-candidate-exact", "pass", candidate["candidate_id"])
     integration = run_grip(
         "candidate-integration-ready",
@@ -5950,31 +6849,35 @@ def _run_agent_execution_happy_path(
     nested_status = integration_receipt.get("status") if isinstance(integration_receipt, dict) else None
     if not isinstance(integration_output, dict) or nested_status not in {"passed", "blocked", "failed"}:
         _check(receipt, "candidate-integration-composed", "fail", "nested integration receipt invalid")
-        return {
-            "state": "integration_reconcile_required",
-            "integration_ready": False,
-            "workspace_id": workspace_id,
-            "candidate": candidate,
-            "coordinator": coordinated,
-            "integration": integration,
-            "reconcile_required": True,
-            "next_action": "read_back_candidate_adoption_branch_and_pr_before_retry",
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "integration_reconcile_required",
+                "integration_ready": False,
+                "workspace_id": workspace_id,
+                "candidate": candidate,
+                "coordinator": coordinated,
+                "integration": integration,
+                "reconcile_required": True,
+                "next_action": "read_back_candidate_adoption_branch_and_pr_before_retry",
+                "receipt_status": "blocked",
+            }
+        )
     if nested_status == "failed":
         _check(receipt, "candidate-integration-composed", "fail", "nested integration effect is not safely terminal")
         _check(receipt, "unknown-effect-no-retry", "pass", "failed nested effect requires authoritative readback before retry")
-        return {
-            "state": "integration_reconcile_required",
-            "integration_ready": bool(integration_output.get("integration_ready") is True),
-            "workspace_id": workspace_id,
-            "candidate": candidate,
-            "coordinator": coordinated,
-            "integration": integration,
-            "reconcile_required": True,
-            "next_action": "read_back_candidate_adoption_branch_and_pr_before_retry",
-            "receipt_status": "blocked",
-        }
+        return with_frontdoor(
+            {
+                "state": "integration_reconcile_required",
+                "integration_ready": bool(integration_output.get("integration_ready") is True),
+                "workspace_id": workspace_id,
+                "candidate": candidate,
+                "coordinator": coordinated,
+                "integration": integration,
+                "reconcile_required": True,
+                "next_action": "read_back_candidate_adoption_branch_and_pr_before_retry",
+                "receipt_status": "blocked",
+            }
+        )
     _check(
         receipt,
         "candidate-integration-composed",
@@ -5987,14 +6890,17 @@ def _run_agent_execution_happy_path(
         "pass",
         "coordinator and candidate integration expose named reconcile boundaries",
     )
-    return {
-        **integration_output,
-        "workspace_id": workspace_id,
-        "candidate": candidate,
-        "coordinator": coordinated,
-        "integration": integration,
-        "receipt_status": nested_status,
-    }
+    return with_frontdoor(
+        {
+            **integration_output,
+            "workspace_id": workspace_id,
+            "candidate": candidate,
+            "coordinator": coordinated,
+            "integration": integration,
+            "receipt_status": nested_status,
+        }
+    )
+
 
 def _candidate_integration_modules() -> tuple[Any, Any, Any, Any, Any]:
     import grabowski_agent_workspace as workspace
@@ -10776,3 +11682,7 @@ def grip_run(
         transport_target_dispatcher=transport_target_dispatcher,
         n8n_provider_dispatcher=n8n_provider_dispatcher,
     )
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by durable continuation jobs
+    raise SystemExit(_agent_execution_continuation_cli())
