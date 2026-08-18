@@ -902,6 +902,8 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "branch-publish",
+                "candidate-integration-ready",
+                "agent-execution-happy-path",
                 "bureau-pickup-execute",
                 "bureau-pickup-orphan-reconcile",
                 "bureau-pickup-release",
@@ -3508,6 +3510,670 @@ class GripFoundationTests(unittest.TestCase):
         self.assertIn("target_branch parameter must be a non-empty string", result["output"]["error"])
         self.assertEqual([], fake.calls)
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
+
+    def _happy_path_closed_status(self, *, valid: bool = True) -> dict[str, object]:
+        candidate_id = "1" * 64
+        result_sha256 = "2" * 64
+        status: dict[str, object] = {
+            "ownership_mode": "work_lane",
+            "closed": True,
+            "closure_outcome": "successful",
+            "close_integrity": {"valid": True},
+            "collection_integrity": {"valid": True},
+            "candidate_round": 1,
+            "failed_roles": [],
+            "incomplete_roles": [],
+            "collection": {
+                "state": "complete",
+                "writer_head": "3" * 40,
+                "diff_sha256": "4" * 64,
+                "result_sha256": result_sha256,
+                "candidate_manifest": {"candidate_id": candidate_id, "round": 1},
+                "verification_summary": {"outcome": "PASS"},
+                "tests": {"status": "passed", "returncode": 0},
+                "review": {
+                    "status": "passed",
+                    "returncode": 0,
+                    "verdict": "PASS",
+                    "findings": [],
+                },
+            },
+        }
+        if not valid:
+            status["collection"]["review"]["findings"] = [{"code": "still-open"}]
+        return status
+
+    def _happy_path_case(
+        self,
+        *,
+        coordinator_state: str = "verified_candidate_closed",
+        status: dict[str, object] | None = None,
+        writer_command: list[str] | None = None,
+        nested_status: str = "passed",
+        nested_output: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        workspace_id = "gaw-p5-happy-path"
+        command = ["codex", "exec", "--model", "gpt-5.6-sol"] if writer_command is None else writer_command
+        workspace_module = types.SimpleNamespace(
+            _manifest=Mock(
+                return_value={
+                    "workspace_id": workspace_id,
+                    "commands": {"writer": command},
+                    "resources": {"lane_binding": {"lane_id": "a" * 32}},
+                }
+            ),
+            _lane_backed=Mock(return_value=True),
+        )
+        coordinated = {
+            "schema_version": 1,
+            "kind": "agent_workspace_candidate_coordinator",
+            "workspace_id": workspace_id,
+            "state": coordinator_state,
+            "reason": "test",
+            "status": status if status is not None else self._happy_path_closed_status(),
+            "owns_state_store": False,
+            "adoption_performed": False,
+            "publication_performed": False,
+        }
+        coordinator_module = types.SimpleNamespace(
+            run_workspace_candidate_coordinator=Mock(return_value=coordinated)
+        )
+        if nested_output is None:
+            nested_output = {
+                "state": "integration_ready",
+                "integration_ready": True,
+                "cleanup_complete": True,
+                "reconcile_required": False,
+                "next_action": "observe_ci_and_review_then_merge_under_controller_authority",
+            }
+        nested = Mock(
+            return_value={
+                "receipt": {"status": nested_status, "receipt_sha256": "5" * 64},
+                "output": nested_output,
+            }
+        )
+        return {
+            "workspace_id": workspace_id,
+            "workspace": workspace_module,
+            "coordinator": coordinator_module,
+            "coordinated": coordinated,
+            "nested": nested,
+            "params": {
+                "workspace_id": workspace_id,
+                "base": "main",
+                "title": "P5 bounded happy path",
+                "body": "Coordinator to integration_ready",
+            },
+        }
+
+    def _run_happy_path_case(
+        self,
+        case: dict[str, object],
+        *,
+        params: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        original_run_grip = grips.run_grip
+        with (
+            patch.object(
+                grips,
+                "_agent_execution_happy_path_modules",
+                return_value=(case["coordinator"], case["workspace"]),
+            ),
+            patch.object(grips, "run_grip", side_effect=case["nested"]),
+        ):
+            return original_run_grip(
+                "agent-execution-happy-path",
+                dict(params or case["params"]),
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+    def test_agent_execution_happy_path_composes_coordinator_to_integration_ready(self) -> None:
+        case = self._happy_path_case()
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("integration_ready", result["output"]["state"])
+        self.assertTrue(result["output"]["integration_ready"])
+        case["coordinator"].run_workspace_candidate_coordinator.assert_called_once_with(
+            case["workspace_id"],
+            revision_argv=["codex", "exec", "--model", "gpt-5.6-sol"],
+            max_polls=4,
+            poll_seconds=0,
+        )
+        case["nested"].assert_called_once()
+        call = case["nested"].call_args
+        self.assertEqual("candidate-integration-ready", call.args[0])
+        self.assertEqual(
+            {
+                "workspace_id": case["workspace_id"],
+                "expected_candidate_id": "1" * 64,
+                "expected_result_sha256": "2" * 64,
+                "base": "main",
+                "title": "P5 bounded happy path",
+                "body": "Coordinator to integration_ready",
+            },
+            call.args[1],
+        )
+        self.assertTrue(call.kwargs["allow_mutation"])
+        self.assertEqual("1" * 64, result["output"]["candidate"]["candidate_id"])
+
+    def test_agent_execution_happy_path_pending_never_runs_candidate_integration(self) -> None:
+        case = self._happy_path_case(coordinator_state="pending")
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("pending", result["output"]["state"])
+        self.assertFalse(result["output"]["integration_ready"])
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_reconcile_never_runs_candidate_integration(self) -> None:
+        case = self._happy_path_case(coordinator_state="reconcile_required")
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertTrue(result["output"]["reconcile_required"])
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_requires_server_bound_writer_command_before_coordinator(self) -> None:
+        case = self._happy_path_case(writer_command=[])
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("bound writer command", result["output"]["error"])
+        case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_nested_failure_requires_readback_before_retry(self) -> None:
+        case = self._happy_path_case(
+            nested_status="failed",
+            nested_output={"error": "candidate adoption did not return a trustworthy outcome"},
+        )
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("integration_reconcile_required", result["output"]["state"])
+        self.assertTrue(result["output"]["reconcile_required"])
+        self.assertEqual(
+            "read_back_candidate_adoption_branch_and_pr_before_retry",
+            result["output"]["next_action"],
+        )
+        case["nested"].assert_called_once()
+
+    def test_agent_execution_happy_path_invalid_closed_candidate_never_integrates(self) -> None:
+        case = self._happy_path_case(status=self._happy_path_closed_status(valid=False))
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("closed_candidate_reconcile_required", result["output"]["state"])
+        self.assertTrue(result["output"]["reconcile_required"])
+        case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_already_closed_candidate_uses_same_idempotent_integration(self) -> None:
+        case = self._happy_path_case(coordinator_state="closed")
+        result = self._run_happy_path_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["integration_ready"])
+        case["nested"].assert_called_once()
+
+    def test_agent_execution_happy_path_rejects_caller_selected_effect_identity_before_coordinator(self) -> None:
+        for field, value in (
+            ("repo", "/tmp/other"),
+            ("branch", "feat/other"),
+            ("expected_head", "6" * 40),
+            ("expected_candidate_id", "7" * 64),
+            ("revision_argv", ["other", "writer"]),
+        ):
+            with self.subTest(field=field):
+                case = self._happy_path_case()
+                params = dict(case["params"])
+                params[field] = value
+                result = self._run_happy_path_case(case, params=params)
+                self.assertEqual("blocked", result["receipt"]["status"])
+                self.assertEqual("preflight", result["receipt"]["phase"])
+                case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
+                case["nested"].assert_not_called()
+
+    def test_agent_execution_happy_path_is_grip_only_and_coordinator_is_runtime_supporting_source(self) -> None:
+        contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
+        contract = json.loads(contract_path.read_text())
+        self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
+        self.assertEqual(196, len(contract["expected_tools"]))
+        supporting = {
+            (item["module"], item["source"])
+            for item in contract["supporting_sources"]
+        }
+        self.assertIn(
+            (
+                "grabowski_execution_coordinator",
+                "src/grabowski_execution_coordinator.py",
+            ),
+            supporting,
+        )
+        self.assertIn("agent-execution-happy-path", grips.GRIP_SURFACE_ALLOWLIST)
+
+    def _candidate_integration_case(
+        self,
+        root: str,
+        *,
+        adoption_state: str = "adopted",
+        lane_terminal: bool = False,
+        leases_live: bool = True,
+        remote_exact: bool = False,
+        push_failure: bool = False,
+        github_failure: bool = False,
+    ) -> dict[str, object]:
+        candidate_id = "a" * 64
+        result_sha256 = "b" * 64
+        adopted_commit = "c" * 40
+        adoption_receipt_sha256 = "f" * 64
+        lane_id = "1" * 32
+        lane_receipt_sha256 = "e" * 64
+        branch = "feat/work"
+        owner_id = f"lane:{lane_id}"
+        resource_keys = [
+            f"path:{root}",
+            f"repo:{root}:branch:{branch}",
+        ]
+        events: list[str] = []
+        manifest = {
+            "workspace_id": "gaw-p5-integration-ready",
+            "repository": root,
+            "writer_worktree": root,
+            "writer_branch": branch,
+            "expected_base_head": "9" * 40,
+            "resources": {
+                "lane_binding": {
+                    "lane_id": lane_id,
+                    "receipt_sha256": lane_receipt_sha256,
+                }
+            },
+        }
+        adoption = {
+            "state": adoption_state,
+            "candidate_id": candidate_id,
+            "adoption_receipt": {
+                "candidate_id": candidate_id,
+                "receipt_sha256": adoption_receipt_sha256,
+                "resulting_commit_sha": adopted_commit,
+            },
+        }
+
+        def adopt(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("adopt")
+            return deepcopy(adoption)
+
+        workspace = types.SimpleNamespace(
+            _manifest=Mock(return_value=deepcopy(manifest)),
+            _lane_backed=Mock(return_value=True),
+            grabowski_agent_workspace_adopt=Mock(side_effect=adopt),
+            grabowski_agent_workspace_status=Mock(
+                return_value={
+                    "tasks": {
+                        "writer": {"state": "completed", "terminal": True},
+                        "tests": {"state": "completed", "terminal": True},
+                        "review": {"state": "completed", "terminal": True},
+                    }
+                }
+            ),
+        )
+        record: dict[str, object] = {
+            "lane_id": lane_id,
+            "receipt_sha256": lane_receipt_sha256,
+            "inputs": {
+                "lease_owner_id": owner_id,
+                "resource_keys": resource_keys,
+            },
+        }
+        if lane_terminal:
+            record["terminal_closeout"] = {
+                "closeout_state": "candidate_adopted",
+            }
+
+        terminal_records: list[dict[str, object]] = []
+
+        def persist_terminal_closeout(
+            observed_lane_id: str,
+            assessment: dict[str, object],
+            **kwargs: object,
+        ) -> dict[str, object]:
+            self.assertEqual(lane_id, observed_lane_id)
+            self.assertEqual("candidate_adopted", assessment["closeout_state"])
+            self.assertEqual(lane_receipt_sha256, kwargs["expected_receipt_sha256"])
+            events.append("lane-close")
+            stored = deepcopy(record)
+            stored["terminal_closeout"] = {
+                "closeout_state": "candidate_adopted",
+                "assessment": deepcopy(assessment),
+            }
+            terminal_records.append(stored)
+            return stored
+
+        work_acquire = types.SimpleNamespace(
+            persist_terminal_closeout=Mock(side_effect=persist_terminal_closeout),
+            operator=types.SimpleNamespace(
+                base=types.SimpleNamespace(_append_audit_with_digest=Mock())
+            ),
+            _find_terminal_closeout_audit=Mock(),
+        )
+
+        lease_map = {
+            key: {
+                "resource_key": key,
+                "owner_id": owner_id,
+                "acquired_at_unix": 10,
+                "updated_at_unix": 10,
+                "expires_at_unix": 1000,
+                "metadata_sha256": "7" * 64,
+            }
+            for key in resource_keys
+        } if leases_live else {}
+
+        def inspect_resources(keys: list[str]) -> dict[str, dict[str, object]]:
+            return {
+                key: deepcopy(lease_map[key])
+                for key in keys
+                if key in lease_map
+            }
+
+        def release_resources(
+            observed_owner: str,
+            keys: list[str],
+            *,
+            force: bool,
+            expected_leases: list[dict[str, object]],
+        ) -> dict[str, object]:
+            self.assertEqual(owner_id, observed_owner)
+            self.assertFalse(force)
+            self.assertEqual(set(resource_keys), set(keys))
+            self.assertEqual(set(resource_keys), {item["resource_key"] for item in expected_leases})
+            events.append("release")
+            released = [deepcopy(lease_map[key]) for key in keys]
+            lease_map.clear()
+            return {
+                "owner_id": observed_owner,
+                "released": released,
+                "snapshot_guarded": True,
+            }
+
+        resource_store = types.SimpleNamespace(
+            inspect_resources=Mock(side_effect=inspect_resources),
+            grabowski_resource_release=Mock(side_effect=release_resources),
+        )
+        checkouts = types.SimpleNamespace()
+        lane_closeout = __import__("grabowski_lane_closeout")
+
+        class CandidateGit(FakeGit):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                normalized = list(argv)
+                while len(normalized) >= 2 and normalized[0] == "-c":
+                    normalized = normalized[2:]
+                if normalized == ["push", "origin", f"HEAD:refs/heads/{self.branch}"]:
+                    events.append("push")
+                    if push_failure:
+                        self.calls.append(tuple(argv))
+                        return {"returncode": 2, "stdout": "", "stderr": "push failed"}
+                    self.remote_head = self.head
+                return super().__call__(repo, argv)
+
+        fake_git = CandidateGit(
+            branch=branch,
+            head=adopted_commit,
+            remote_head=adopted_commit if remote_exact else "d" * 40,
+        )
+
+        class CandidateGh(FakeGh):
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv[:2] in (["pr", "create"], ["pr", "edit"], ["pr", "ready"]):
+                    events.append("pr")
+                return super().__call__(repo, argv)
+
+        ready_pr = {
+            "number": 77,
+            "url": "https://github.com/heimgewebe/grabowski/pull/77",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": branch,
+            "headRefOid": adopted_commit,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+        }
+        fake_gh = CandidateGh(
+            existing=(ready_pr if remote_exact and lane_terminal else None),
+            view=ready_pr,
+            failure=github_failure,
+        )
+        return {
+            "candidate_id": candidate_id,
+            "result_sha256": result_sha256,
+            "adopted_commit": adopted_commit,
+            "lane_id": lane_id,
+            "workspace": workspace,
+            "record": record,
+            "work_acquire": work_acquire,
+            "lane_closeout": lane_closeout,
+            "resource_store": resource_store,
+            "checkouts": checkouts,
+            "fake_git": fake_git,
+            "fake_gh": fake_gh,
+            "events": events,
+            "terminal_records": terminal_records,
+            "params": {
+                "workspace_id": manifest["workspace_id"],
+                "expected_candidate_id": candidate_id,
+                "expected_result_sha256": result_sha256,
+                "base": "main",
+                "title": "P5 integration ready",
+                "body": "Exact candidate integration",
+            },
+        }
+
+    def _run_candidate_integration_case(
+        self,
+        case: dict[str, object],
+        *,
+        processes: list[dict[str, object]] | None = None,
+        params: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        modules = (
+            case["workspace"],
+            case["work_acquire"],
+            case["lane_closeout"],
+            case["resource_store"],
+            case["checkouts"],
+        )
+        with (
+            patch.object(grips, "_candidate_integration_modules", return_value=modules),
+            patch.object(grips, "_candidate_lane_record", return_value=case["record"]),
+            patch.object(
+                grips,
+                "_candidate_process_readback",
+                return_value=list(processes or []),
+            ),
+        ):
+            return grips.run_grip(
+                "candidate-integration-ready",
+                dict(params or case["params"]),
+                allow_mutation=True,
+                command_runner=case["fake_git"],
+                github_runner=case["fake_gh"],
+            )
+
+    def test_candidate_integration_ready_composes_exact_happy_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(tmp)
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("integration_ready", result["output"]["state"])
+        self.assertTrue(result["output"]["integration_ready"])
+        self.assertTrue(result["output"]["cleanup_complete"])
+        self.assertEqual(case["candidate_id"], result["output"]["candidate_id"])
+        self.assertEqual(case["adopted_commit"], result["output"]["resulting_commit_sha"])
+        self.assertEqual(["adopt", "lane-close", "push", "pr", "release"], case["events"])
+        self.assertEqual(1, case["work_acquire"].persist_terminal_closeout.call_count)
+        self.assertEqual(1, case["resource_store"].grabowski_resource_release.call_count)
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        for check_id in (
+            "candidate-adoption-bound",
+            "source-lane-terminal",
+            "branch-published",
+            "pr-exact-head",
+            "source-lane-leases-released",
+        ):
+            self.assertEqual("pass", checks[check_id])
+
+    def test_candidate_integration_ready_blocks_unknown_adoption_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp,
+                adoption_state="adoption_outcome_unknown",
+            )
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("adoption_reconcile_required", result["output"]["state"])
+        self.assertEqual(["adopt"], case["events"])
+        self.assertEqual([], case["fake_gh"].calls)
+        case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        case["resource_store"].grabowski_resource_release.assert_not_called()
+
+    def test_candidate_integration_ready_refuses_publication_while_process_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(tmp)
+            result = self._run_candidate_integration_case(
+                case,
+                processes=[{"pid": 1234}],
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("source_lane_reconcile_required", result["output"]["state"])
+        self.assertEqual(["adopt"], case["events"])
+        self.assertEqual([], case["fake_gh"].calls)
+        case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        case["resource_store"].grabowski_resource_release.assert_not_called()
+
+    def test_candidate_integration_ready_preserves_leases_after_push_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(tmp, push_failure=True)
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("branch_publication_reconcile_required", result["output"]["state"])
+        self.assertEqual(["adopt", "lane-close", "push"], case["events"])
+        self.assertTrue(result["output"]["leases_preserved"])
+        case["resource_store"].grabowski_resource_release.assert_not_called()
+        self.assertFalse(any(call[:2] == ("pr", "create") for call in case["fake_gh"].calls))
+
+    def test_candidate_integration_ready_blocks_when_exact_remote_pr_readback_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp,
+                remote_exact=True,
+                github_failure=True,
+            )
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("pr_readback_reconcile_required", result["output"]["state"])
+        self.assertEqual(["adopt", "lane-close"], case["events"])
+        self.assertTrue(result["output"]["leases_preserved"])
+        case["resource_store"].grabowski_resource_release.assert_not_called()
+        self.assertFalse(any("push" in call for call in case["fake_git"].calls))
+        self.assertFalse(any(call[:2] == ("pr", "create") for call in case["fake_gh"].calls))
+
+    def test_candidate_integration_ready_preserves_leases_after_pr_publication_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp,
+                github_failure=True,
+            )
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("pr_publication_reconcile_required", result["output"]["state"])
+        self.assertEqual(["adopt", "lane-close", "push"], case["events"])
+        self.assertTrue(result["output"]["leases_preserved"])
+        case["resource_store"].grabowski_resource_release.assert_not_called()
+
+    def test_candidate_integration_ready_replays_exact_ready_pr_without_repeating_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp,
+                lane_terminal=True,
+                leases_live=False,
+                remote_exact=True,
+            )
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("integration_ready", result["output"]["state"])
+        self.assertEqual(["adopt"], case["events"])
+        case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        case["resource_store"].grabowski_resource_release.assert_not_called()
+        self.assertFalse(any("push" in call for call in case["fake_git"].calls))
+        self.assertFalse(
+            any(
+                call[:2] in (("pr", "create"), ("pr", "edit"), ("pr", "ready"))
+                for call in case["fake_gh"].calls
+            )
+        )
+
+    def test_candidate_integration_ready_does_not_treat_partial_lease_loss_as_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp,
+                lane_terminal=True,
+                remote_exact=True,
+            )
+            inputs = case["record"]["inputs"]
+            resource_keys = list(inputs["resource_keys"])
+            owner_id = str(inputs["lease_owner_id"])
+            case["resource_store"].inspect_resources.side_effect = None
+            case["resource_store"].inspect_resources.return_value = {
+                resource_keys[0]: {
+                    "resource_key": resource_keys[0],
+                    "owner_id": owner_id,
+                    "acquired_at_unix": 10,
+                    "updated_at_unix": 10,
+                    "expires_at_unix": 1000,
+                    "metadata_sha256": "7" * 64,
+                }
+            }
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("integration_ready_cleanup_pending", result["output"]["state"])
+        self.assertTrue(result["output"]["integration_ready"])
+        self.assertFalse(result["output"]["cleanup_complete"])
+        self.assertIn("partial", result["output"]["error"])
+        case["resource_store"].grabowski_resource_release.assert_not_called()
+        self.assertEqual(["adopt"], case["events"])
+
+    def test_candidate_integration_ready_reuses_exact_remote_branch_when_only_pr_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(tmp, remote_exact=True)
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual(["adopt", "lane-close", "pr", "release"], case["events"])
+        self.assertFalse(any("push" in call for call in case["fake_git"].calls))
+
+    def test_candidate_integration_ready_rejects_caller_selected_git_target_before_adoption(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(tmp)
+            params = dict(case["params"])
+            params["repo"] = "/tmp/other"
+            result = self._run_candidate_integration_case(case, params=params)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("caller-selected", result["output"]["error"])
+        self.assertEqual([], case["events"])
+        case["workspace"].grabowski_agent_workspace_adopt.assert_not_called()
 
     def test_branch_publish_requires_allow_mutation(self) -> None:
         result = grips.run_grip(

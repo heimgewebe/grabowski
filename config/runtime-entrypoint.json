@@ -539,6 +539,10 @@
       "source": "src/grabowski_execution_plan.py"
     },
     {
+      "module": "grabowski_execution_coordinator",
+      "source": "src/grabowski_execution_coordinator.py"
+    },
+    {
       "module": "grabowski_candidate_adoption",
       "source": "src/grabowski_candidate_adoption.py"
     },
