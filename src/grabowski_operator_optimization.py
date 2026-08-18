@@ -485,13 +485,24 @@ def _bureau_contract_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
     count = _count(pattern, "count_7d")
     if count <= 0:
         return []
+    retryable = _count(pattern, "failure_retryable_count_7d")
+    nonretryable = _count(pattern, "failure_nonretryable_count_7d")
+    retryability_unknown = _count(pattern, "failure_retryability_unknown_count_7d")
+    retryability_total = retryable + nonretryable + retryability_unknown
+    retryability_coverage = (retryable + nonretryable) / retryability_total if retryability_total else 0.0
+    observation = f"The audit projection grouped {count} contract failures in seven days."
+    if retryability_total:
+        observation += (
+            f" Retryability is attributed for {retryable + nonretryable} of "
+            f"{retryability_total} Bureau failure records ({retryability_coverage:.1%})."
+        )
     return [
         _finding(
             finding_id="repeated_bureau_contract_failures",
             severity="high" if count >= 100 else "medium",
             evidence_scope="7d",
             title="Bureau contract failures repeat at scale",
-            observation=f"The audit projection grouped {count} contract failures in seven days.",
+            observation=observation,
             evidence_count=count,
             evidence_refs=[
                 _evidence_ref(
@@ -502,7 +513,8 @@ def _bureau_contract_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
             ],
             interpretation=(
                 "Caller/runtime schema incompatibility or stale contract identity is "
-                "creating repeated non-productive attempts."
+                "creating repeated non-productive attempts; sparse retryability attribution "
+                "also means historical failures must not be treated as one retry class."
             ),
             alternative_interpretation=(
                 "The failures may span different contract versions and therefore may "
@@ -510,7 +522,8 @@ def _bureau_contract_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
             ),
             recommended_action=(
                 "Group failures by exact caller, runtime and schema identity, then fix "
-                "the largest homogeneous cluster rather than broadening intake."
+                "the largest homogeneous cluster; never retry records explicitly marked "
+                "non-retryable or infer retryability where attribution is absent."
             ),
             does_not_establish=["shared_root_cause", "bureau_task_readiness"],
         )
@@ -523,16 +536,64 @@ def _resource_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
     reclaimed = _count(pattern, "reclaimed_resource_count_7d")
     if event_count <= 0:
         return []
+
+    has_attribution = any(
+        key in pattern
+        for key in (
+            "same_owner_reclaimed_resource_count_7d",
+            "foreign_owner_reclaimed_resource_count_7d",
+            "unattributed_reclaimed_resource_count_7d",
+        )
+    )
+    same_owner = _count(pattern, "same_owner_reclaimed_resource_count_7d")
+    foreign_owner = _count(pattern, "foreign_owner_reclaimed_resource_count_7d")
+    unattributed = _count(pattern, "unattributed_reclaimed_resource_count_7d")
+    attributed = same_owner + foreign_owner
+    coverage = attributed / reclaimed if reclaimed else 0.0
+
+    if not has_attribution:
+        severity = "medium" if event_count >= 20 else "low"
+        title = "Resource reclamation is recurrent"
+        observation = (
+            f"Seven-day evidence contains {event_count} reclamation events "
+            f"covering {reclaimed} resources."
+        )
+        interpretation = (
+            "Lease lifetime, terminalization and release timing may be misaligned."
+        )
+    elif coverage < 0.5:
+        severity = "low"
+        title = "Resource reclamation attribution is incomplete"
+        observation = (
+            f"Seven-day evidence contains {event_count} reclamation events covering "
+            f"{reclaimed} resources; {attributed} are owner-attributed ({coverage:.1%}), "
+            f"including {same_owner} same-owner and {foreign_owner} foreign-owner reclaims, "
+            f"while {unattributed} remain historical or unattributed."
+        )
+        interpretation = (
+            "The aggregate reclamation count currently mixes legacy records with newer "
+            "owner-attributed evidence, so it is insufficient for lease-policy changes."
+        )
+    else:
+        severity = "medium" if foreign_owner >= 20 else "low"
+        title = "Resource reclamation is owner-attributed"
+        observation = (
+            f"Seven-day evidence contains {event_count} reclamation events covering "
+            f"{reclaimed} resources; {same_owner} are same-owner, {foreign_owner} are "
+            f"foreign-owner and {unattributed} are unattributed ({coverage:.1%} coverage)."
+        )
+        interpretation = (
+            "Foreign-owner reclamation is the subset relevant to stale-owner cleanup; "
+            "same-owner reclamation can instead reflect expiry-and-resume behavior."
+        )
+
     return [
         _finding(
             finding_id="repeated_resource_reclamation",
-            severity="medium" if event_count >= 20 else "low",
+            severity=severity,
             evidence_scope="7d",
-            title="Resource reclamation is recurrent",
-            observation=(
-                f"Seven-day evidence contains {event_count} reclamation events "
-                f"covering {reclaimed} resources."
-            ),
+            title=title,
+            observation=observation,
             evidence_count=event_count,
             evidence_refs=[
                 _evidence_ref(
@@ -541,16 +602,15 @@ def _resource_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
                     "#candidate/repeated_resource_reclamation",
                 )
             ],
-            interpretation=(
-                "Lease lifetime, terminalization and release timing may be misaligned."
-            ),
+            interpretation=interpretation,
             alternative_interpretation=(
                 "High reclamation can also demonstrate that cleanup safeguards are "
                 "working as designed."
             ),
             recommended_action=(
-                "Compare terminal timestamps with release and reclamation timestamps "
-                "before changing lease duration or overlap policy."
+                "Inspect provenance-attributed foreign-owner reclaims against expiry, "
+                "terminal and release timing first; treat same-owner reclaims separately "
+                "and do not change lease duration from unattributed aggregate counts."
             ),
             does_not_establish=["lease_bug", "owner_failure"],
         )
