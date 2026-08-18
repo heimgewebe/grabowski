@@ -2313,6 +2313,39 @@ globalThis.fetch = async () => ({
         self.assertIn(str(symlink_temp), cleanup["preserved_evidence"])
         self.assertIn(str(group_readable), cleanup["preserved_evidence"])
 
+    def test_semantic_temp_cleanup_treats_missing_instance_directory_as_clean(self) -> None:
+        missing = self.root / "missing-worker-instance"
+        removed, preserved, errors = workers._cleanup_browser_semantic_temps(missing)
+        self.assertEqual(removed, [])
+        self.assertEqual(preserved, [])
+        self.assertEqual(errors, [])
+
+    def test_stop_converges_when_browser_instance_directory_is_already_absent(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(
+                str(self.binary), port=9386, runtime_seconds=60
+            )
+        worker = started["worker"]
+        record = workers._row(worker["worker_id"])
+        instance_directory = Path(record["config_path"]).parent
+        shutil.rmtree(instance_directory)
+
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(
+                worker["worker_id"], expected_kind="browser"
+            )
+
+        terminalization = stopped["worker"]["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertIn(
+            str(instance_directory / ".semantic-handle-key"),
+            terminalization["cleanup"]["already_absent"],
+        )
+        self.assertEqual(terminalization["unit_reset"]["status"], "not-required")
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
     def test_stopped_status_preserves_explicit_state_over_timeout_evidence(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()
