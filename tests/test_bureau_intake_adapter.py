@@ -1282,6 +1282,171 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertTrue(result["leases_released"])
         self.assertTrue((directory / "publication-receipt.json").exists())
 
+    def test_publish_state_store_mode_uses_state_root_and_single_state_lease(
+        self,
+    ) -> None:
+        proposal_id = "1" * 64
+        directory = self._write_proposal(proposal_id)
+        state_root = "/home/alex/.local/state/bureau"
+        keys = [f"path:{state_root}"]
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready",
+            "publication_mode": "state_store",
+            "coordination_state_root": state_root,
+            "required_resource_keys": keys,
+        }
+
+        def invoke(arguments, **_kwargs):
+            receipt = Path(arguments[arguments.index("--receipt") + 1])
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "kind": "bureau_task_publication_receipt",
+                        "status": "published",
+                        "publication_mode": "state_store",
+                        "coordination_state_root": state_root,
+                    }
+                )
+                + "\n"
+            )
+            return {
+                "kind": "bureau_task_publication_receipt",
+                "status": "published",
+                "publication_mode": "state_store",
+                "coordination_state_root": state_root,
+            }
+
+        acquired = {"expires_at_unix": 200, "bureau_contract": {}}
+        released = {"released": [{"resource_key": key} for key in keys]}
+        with (
+            mock.patch.object(
+                intake, "grabowski_bureau_task_publish_preview", return_value=preview
+            ) as preview_call,
+            mock.patch.object(
+                intake.resources, "acquire_resources", return_value=acquired
+            ) as acquire,
+            mock.patch.object(
+                intake.resources, "release_resources", return_value=released
+            ),
+            mock.patch.object(intake, "_invoke_bureau", side_effect=invoke) as bureau_invoke,
+        ):
+            result = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root), lease_ttl_seconds=240
+            )
+
+        preview_call.assert_called_once()
+        self.assertEqual(acquire.call_args.args[1], keys)
+        self.assertEqual(
+            acquire.call_args.kwargs["metadata"]["operation"],
+            "state-task-publication",
+        )
+        arguments = bureau_invoke.call_args.args[0]
+        self.assertEqual(
+            arguments[arguments.index("--state-root") + 1], state_root
+        )
+        self.assertEqual(
+            bureau_invoke.call_args.kwargs["required_readback"],
+            ["publication_receipt", "task_spec_revision", "resource_leases"],
+        )
+        self.assertTrue(result["leases_released"])
+        self.assertTrue((directory / "publication-receipt.json").exists())
+
+    def test_publish_state_store_receipt_replay_restores_explicit_state_root(
+        self,
+    ) -> None:
+        proposal_id = "2" * 64
+        directory = self._write_proposal(proposal_id)
+        state_root = "/home/alex/.local/state/bureau"
+        (directory / "publication-receipt.json").write_text(
+            json.dumps(
+                {
+                    "kind": "bureau_task_publication_receipt",
+                    "status": "published",
+                    "publication_mode": "state_store",
+                    "coordination_state_root": state_root,
+                }
+            )
+            + "\n"
+        )
+        with (
+            mock.patch.object(
+                intake, "grabowski_bureau_task_publish_preview"
+            ) as preview_call,
+            mock.patch.object(
+                intake,
+                "_invoke_bureau",
+                return_value={
+                    "kind": "bureau_task_publication_receipt",
+                    "status": "published",
+                    "publication_mode": "state_store",
+                },
+            ) as invoke,
+            mock.patch.object(intake.resources, "acquire_resources") as acquire,
+        ):
+            result = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root)
+            )
+
+        preview_call.assert_not_called()
+        acquire.assert_not_called()
+        arguments = invoke.call_args.args[0]
+        self.assertEqual(
+            arguments[arguments.index("--state-root") + 1], state_root
+        )
+        self.assertFalse(result["leases_acquired"])
+        self.assertTrue(result["idempotent_adapter_replay"])
+
+    def test_publish_state_store_rejects_missing_root_before_lease_or_effect(
+        self,
+    ) -> None:
+        proposal_id = "3" * 64
+        self._write_proposal(proposal_id)
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready",
+            "publication_mode": "state_store",
+            "required_resource_keys": ["path:/home/alex/.local/state/bureau"],
+        }
+        with (
+            mock.patch.object(
+                intake, "grabowski_bureau_task_publish_preview", return_value=preview
+            ),
+            mock.patch.object(intake.resources, "acquire_resources") as acquire,
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            result = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root)
+            )
+        self.assertEqual(result["code"], "publication-state-root-contract-invalid")
+        acquire.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_publish_rejects_unknown_publication_mode_before_lease_or_effect(
+        self,
+    ) -> None:
+        proposal_id = "4" * 64
+        self._write_proposal(proposal_id)
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready",
+            "publication_mode": "other",
+            "required_resource_keys": ["path:/a", "path:/b"],
+        }
+        with (
+            mock.patch.object(
+                intake, "grabowski_bureau_task_publish_preview", return_value=preview
+            ),
+            mock.patch.object(intake.resources, "acquire_resources") as acquire,
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            result = intake.grabowski_bureau_task_publish(
+                proposal_id, registry_root=str(self.root)
+            )
+        self.assertEqual(result["code"], "publication-mode-contract-invalid")
+        acquire.assert_not_called()
+        invoke.assert_not_called()
+
     def test_publish_existing_receipt_replays_without_leases(self) -> None:
         proposal_id = "e" * 64
         directory = self._write_proposal(proposal_id)
