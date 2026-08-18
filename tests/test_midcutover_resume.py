@@ -3074,6 +3074,48 @@ class GreenProofBeforeEffectTests(unittest.TestCase):
         self.assertEqual(raised.exception.phase, "midcutover-pointer-cas")
         activate.assert_not_called()
 
+    def test_canonical_process_identity_waits_for_post_start_exec_settle(self) -> None:
+        expected = {"pid": 7}
+        transient = dual.core.DeployError(
+            "Operator-Prozess verwendet nicht exakt den erwarteten Entry-Point"
+        )
+        with (
+            mock.patch.object(
+                dual,
+                "verify_operator_process",
+                side_effect=[transient, expected],
+            ) as verify,
+            mock.patch.object(dual.time, "sleep") as sleep,
+        ):
+            observed = dual._verify_operator_process_after_start(
+                Path("/runtime"),
+                mock.Mock(),
+                release_hint=Path("/release"),
+                settle_timeout_seconds=1.0,
+            )
+        self.assertEqual(observed, expected)
+        self.assertEqual(verify.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_canonical_process_identity_remains_fail_closed_after_settle_deadline(self) -> None:
+        mismatch = dual.core.DeployError(
+            "Operator-Prozess verwendet nicht exakt den erwarteten Entry-Point"
+        )
+        with (
+            mock.patch.object(
+                dual, "verify_operator_process", side_effect=mismatch
+            ),
+            mock.patch.object(dual.time, "monotonic", side_effect=[10.0, 11.0]),
+            mock.patch.object(dual.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(dual.core.DeployError):
+                dual._verify_operator_process_after_start(
+                    Path("/runtime"),
+                    mock.Mock(),
+                    settle_timeout_seconds=0.5,
+                )
+        sleep.assert_not_called()
+
     def test_shared_promotion_reverifies_green_before_the_pointer_moves(self) -> None:
         events: list[str] = []
         progress = dual.CanonicalPromotionProgress()

@@ -2821,6 +2821,33 @@ def verify_operator_process(
     }
 
 
+def _verify_operator_process_after_start(
+    runtime: Path,
+    contract: core.RuntimeContract,
+    *,
+    release_hint: Path | None = None,
+    settle_timeout_seconds: float = 2.0,
+) -> dict[str, Any]:
+    """Wait briefly for systemd's freshly started operator to finish exec().
+
+    ``ActiveState=active`` may become observable before ``/proc/<pid>/cmdline``
+    exposes the final Python module argv.  The strict identity verifier remains
+    unchanged; this helper only repeats that read-only proof for a short bounded
+    settling window immediately after the canonical service was started.
+    """
+    deadline = time.monotonic() + max(0.0, settle_timeout_seconds)
+    while True:
+        try:
+            return verify_operator_process(
+                runtime, contract, release_hint=release_hint
+            )
+        except core.DeployError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.05, remaining))
+
+
 def require_operator_listener(
     *,
     timeout_seconds: int = core.TIMEOUTS["service_start"],
@@ -5606,7 +5633,9 @@ def promote_green_release_to_canonical(
             expected_binding_sha256=expected_green_binding_sha256,
         )
         start_service(OPERATOR_SERVICE)
-        process = verify_operator_process(runtime, contract, release_hint=release_path)
+        process = _verify_operator_process_after_start(
+            runtime, contract, release_hint=release_path
+        )
         listener = _require_loopback_listener(
             OPERATOR_LISTENER_PORT, timeout_seconds=timeout_seconds
         )
