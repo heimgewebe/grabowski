@@ -106,7 +106,11 @@ def _canonical_json_sha256(value: Any) -> str:
 def _ast_contract(node: ast.AST | None) -> str | None:
     if node is None:
         return None
-    return ast.dump(node, annotate_fields=True, include_attributes=False)
+    dumped = ast.dump(node, annotate_fields=True, include_attributes=False)
+    # Python 3.12 added ``type_params`` to FunctionDef/AsyncFunctionDef/ClassDef.
+    # An empty field is parser-version metadata, not a source-contract change.
+    # Non-empty type parameters remain in the dump and therefore stay digest-bound.
+    return dumped.replace(", type_params=[]", "")
 
 
 def _bound_names(node: ast.AST | None) -> set[str]:

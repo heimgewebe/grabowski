@@ -26,6 +26,18 @@ class OperatorContextTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_ast_contract_ignores_empty_parser_version_type_params(self) -> None:
+        builder = self._builder_module()
+        node = builder.ast.parse(
+            "def sample(value: int = 1) -> str:\n    return str(value)\n"
+        ).body[0]
+
+        contract = builder._ast_contract(node)
+
+        self.assertIsNotNone(contract)
+        self.assertNotIn("type_params=[]", contract)
+        self.assertIn("FunctionDef(name='sample'", contract)
+
     def test_semantic_source_digest_ignores_non_contract_function_bodies(self) -> None:
         builder = self._builder_module()
         baseline = """\
