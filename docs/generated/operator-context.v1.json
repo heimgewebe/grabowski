@@ -3029,6 +3029,11 @@
       },
       {
         "kind": "python_module",
+        "launcher_module": "grabowski_grips",
+        "spawned_module": "grabowski_grips"
+      },
+      {
+        "kind": "python_module",
         "launcher_module": "grabowski_workers",
         "spawned_module": "grabowski_worker_process"
       },
@@ -3498,7 +3503,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "ff9f4cb3d6e67c0f3a13bc098eddc4627ae0ec048d100d46465578cd457945b4"
+      "sha256": "6bfd173977cb9fdbce0dfd2579bddfd9fa6464c5c1bc66f26aecab95c4f19d10"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3549,7 +3554,7 @@
       "src/grabowski_forrest_server_exit.py": "9d87add8e0f0de7cd0079831b0b39501fddb62154394791ef1c0240b4666186c",
       "src/grabowski_friction.py": "e45e723bfb22ee1e0aeb85f7d8a1aa36cf6b69d2e3eb73b121a812ae62c4021a",
       "src/grabowski_grip_orchestration.py": "04b6a9844dcaf353a5f4bb9a926cf80fc7ee4e56aab0551a936b7926703851c0",
-      "src/grabowski_grips.py": "4ac0a9be067cb054da27c803c167987cbf160e25d19a696e2bf2b36730824364",
+      "src/grabowski_grips.py": "7be5163d238ba16903715f2b49bf7da9f6ee385de1854f2d637936601e7c5c11",
       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "aeaae6e646638c7c1c6c516ec387bffce78170cf113cc175a627dec745ca9493",
