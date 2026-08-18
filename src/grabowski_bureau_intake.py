@@ -53,6 +53,7 @@ PROPOSAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 BUREAU_REPO_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+BUREAU_AUDIT_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 HEIMGEWEBE_GITHUB_ORIGIN_PREFIXES = (
     "git@github.com:heimgewebe/",
     "https://github.com/heimgewebe/",
@@ -68,6 +69,24 @@ GIT_REPOSITORY_OVERRIDE_ENV = (
     "GIT_PREFIX",
 )
 MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
+BUREAU_FAILURE_IDENTITY_SCHEMA_VERSION = 1
+BUREAU_ADAPTER_SURFACE = "grabowski_bureau_intake"
+BUREAU_ADAPTER_COMMANDS = frozenset(
+    {
+        "operator-candidate-assess",
+        "operator-candidate-record",
+        "operator-task-propose",
+        "operator-task-publish",
+        "operator-task-review",
+    }
+)
+BUREAU_FAILURE_STATUSES = frozenset(
+    {
+        "failed",
+        "stale-runtime-blocked",
+        "publication-unclear",
+    }
+)
 
 
 def _prepare_registry_root(
@@ -365,6 +384,163 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _runtime_contract_identity(
+    binding: ManagedBureauRuntime | None,
+) -> dict[str, Any]:
+    if binding is None:
+        return {"status": "unknown"}
+    source_commit = getattr(binding, "source_commit", None)
+    registry_tree_sha256 = getattr(binding, "registry_tree_sha256", None)
+    launcher_sha256 = getattr(getattr(binding, "launcher", None), "sha256", None)
+    manifest_sha256 = getattr(getattr(binding, "manifest", None), "sha256", None)
+    inventory_sha256 = getattr(getattr(binding, "inventory", None), "sha256", None)
+    if (
+        not isinstance(source_commit, str)
+        or SOURCE_COMMIT_RE.fullmatch(source_commit) is None
+        or not isinstance(registry_tree_sha256, str)
+        or SHA256_RE.fullmatch(registry_tree_sha256) is None
+        or not isinstance(launcher_sha256, str)
+        or SHA256_RE.fullmatch(launcher_sha256) is None
+        or not isinstance(manifest_sha256, str)
+        or SHA256_RE.fullmatch(manifest_sha256) is None
+        or not isinstance(inventory_sha256, str)
+        or SHA256_RE.fullmatch(inventory_sha256) is None
+    ):
+        return {"status": "unknown"}
+    material = {
+        "status": "observed",
+        "source_commit": source_commit,
+        "registry_tree_sha256": registry_tree_sha256,
+        "launcher_sha256": launcher_sha256,
+        "manifest_sha256": manifest_sha256,
+        "inventory_sha256": inventory_sha256,
+    }
+    return {
+        **material,
+        "identity_sha256": _sha256(_canonical_json(material)),
+    }
+
+
+def _adapter_command_contract(arguments: list[str]) -> tuple[str, str]:
+    command = next(
+        (
+            argument
+            for argument in arguments
+            if isinstance(argument, str) and argument in BUREAU_ADAPTER_COMMANDS
+        ),
+        "unknown",
+    )
+    mode = "call"
+    if command == "operator-task-publish":
+        if "--preview" in arguments:
+            mode = "preview"
+        elif "--apply" in arguments:
+            mode = "apply"
+    return command, mode
+
+
+def _adapter_schema_identity(
+    *,
+    command: str,
+    mode: str,
+    direction: str,
+) -> dict[str, str]:
+    schema_id = (
+        f"{BUREAU_ADAPTER_SURFACE}.{command}.{mode}.{direction}.v{SCHEMA_VERSION}"
+    )
+    material = {
+        "schema_version": SCHEMA_VERSION,
+        "surface": BUREAU_ADAPTER_SURFACE,
+        "command": command,
+        "mode": mode,
+        "direction": direction,
+    }
+    return {
+        "id": schema_id,
+        "sha256": _sha256(_canonical_json(material)),
+    }
+
+
+def _result_payload_schema_identity(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_kind = payload.get("kind")
+    kind = (
+        raw_kind
+        if isinstance(raw_kind, str)
+        and BUREAU_AUDIT_LABEL_RE.fullmatch(raw_kind) is not None
+        else "unknown"
+    )
+    raw_version = payload.get("schema_version")
+    schema_version = (
+        raw_version
+        if isinstance(raw_version, int)
+        and not isinstance(raw_version, bool)
+        and 0 < raw_version <= 2_147_483_647
+        else None
+    )
+    material = {
+        "kind": kind,
+        "schema_version": schema_version,
+    }
+    return {
+        **material,
+        "sha256": _sha256(_canonical_json(material)),
+    }
+
+
+def _bureau_contract_identity(
+    arguments: list[str],
+    binding: ManagedBureauRuntime | None = None,
+) -> dict[str, Any]:
+    command, mode = _adapter_command_contract(arguments)
+    runtime = _runtime_contract_identity(binding)
+    completeness = (
+        "complete"
+        if command != "unknown" and runtime.get("status") == "observed"
+        else "partial"
+    )
+    material = {
+        "schema_version": BUREAU_FAILURE_IDENTITY_SCHEMA_VERSION,
+        "kind": "grabowski_bureau_contract_identity",
+        "completeness": completeness,
+        "adapter": {
+            "surface": BUREAU_ADAPTER_SURFACE,
+            "schema_version": SCHEMA_VERSION,
+            "command": command,
+            "mode": mode,
+        },
+        "runtime": runtime,
+        "request_schema": _adapter_schema_identity(
+            command=command, mode=mode, direction="request"
+        ),
+        "result_schema": _adapter_schema_identity(
+            command=command, mode=mode, direction="result"
+        ),
+    }
+    return {
+        **material,
+        "identity_sha256": _sha256(_canonical_json(material)),
+    }
+
+
+def _is_bureau_failure_payload(payload: dict[str, Any]) -> bool:
+    status = payload.get("status")
+    kind = payload.get("kind")
+    return (
+        status in BUREAU_FAILURE_STATUSES
+        or kind == "grabowski_bureau_intake_adapter_failure"
+        or (isinstance(kind, str) and kind.endswith("_failure"))
+    )
+
+
+def _attach_bureau_contract_identity(
+    payload: dict[str, Any],
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    if not _is_bureau_failure_payload(payload):
+        return payload
+    return {**payload, "bureau_contract_identity": identity}
 
 
 def _git_identity_lines(repository: Path, *arguments: str) -> list[str] | None:
@@ -710,8 +886,9 @@ def _adapter_failure(
     ambiguity: bool = False,
     required_readback: list[str] | None = None,
     retryable: bool | None = None,
+    bureau_contract_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_intake_adapter_failure",
         "code": code,
@@ -725,6 +902,9 @@ def _adapter_failure(
         "required_readback": sorted(set(required_readback or [])),
         "details": details or {},
     }
+    if bureau_contract_identity is not None:
+        payload["bureau_contract_identity"] = bureau_contract_identity
+    return payload
 
 
 def _invoke_bureau(
@@ -736,6 +916,7 @@ def _invoke_bureau(
     include_runtime_identity: bool = False,
 ) -> dict[str, Any]:
     readback = sorted(set(required_readback or []))
+    contract_identity = _bureau_contract_identity(arguments)
     try:
         runtime = bureau_runtime._contract_runtime()
         managed_runtime = _managed_runtime_binding()
@@ -743,7 +924,9 @@ def _invoke_bureau(
         return _adapter_failure(
             "bureau-runtime-unavailable",
             details={"error_type": type(exc).__name__},
+            bureau_contract_identity=contract_identity,
         )
+    contract_identity = _bureau_contract_identity(arguments, managed_runtime)
     try:
         bureau_runtime._assert_contract_runtime_unchanged(runtime)
         _assert_managed_runtime_unchanged(managed_runtime)
@@ -752,6 +935,7 @@ def _invoke_bureau(
             "bureau-runtime-drift",
             details={"error_type": type(exc).__name__},
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     try:
         with _bound_launcher_fd(managed_runtime) as (launcher_fd, launcher_argument):
@@ -777,17 +961,20 @@ def _invoke_bureau(
             ambiguity=mutation,
             required_readback=readback,
             retryable=not mutation,
+            bureau_contract_identity=contract_identity,
         )
     except bureau_runtime.BureauLeaseContractError as exc:
         return _adapter_failure(
             "bureau-runtime-drift",
             details={"error_type": type(exc).__name__},
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     except OSError as exc:
         return _adapter_failure(
             "bureau-runtime-unavailable",
             details={"error_type": type(exc).__name__},
+            bureau_contract_identity=contract_identity,
         )
     try:
         bureau_runtime._assert_contract_runtime_unchanged(runtime)
@@ -800,6 +987,7 @@ def _invoke_bureau(
             ambiguity=mutation,
             required_readback=readback,
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     stdout = completed.stdout.encode("utf-8")
     stderr = completed.stderr.encode("utf-8")
@@ -810,6 +998,7 @@ def _invoke_bureau(
             ambiguity=mutation,
             required_readback=readback,
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     if completed.returncode != 0 and not completed.stdout.strip() and completed.stderr.strip():
         return _adapter_failure(
@@ -823,6 +1012,7 @@ def _invoke_bureau(
             ambiguity=mutation,
             required_readback=readback,
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     try:
         value = json.loads(completed.stdout)
@@ -838,6 +1028,7 @@ def _invoke_bureau(
             ambiguity=mutation,
             required_readback=readback,
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     if not isinstance(value, dict):
         return _adapter_failure(
@@ -846,6 +1037,7 @@ def _invoke_bureau(
             ambiguity=mutation,
             required_readback=readback,
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     payload = value.get("result", value)
     if not isinstance(payload, dict):
@@ -855,12 +1047,13 @@ def _invoke_bureau(
             ambiguity=mutation,
             required_readback=readback,
             retryable=False,
+            bureau_contract_identity=contract_identity,
         )
     if include_runtime_identity:
         runtime_identity = value.get("runtime_identity")
         if isinstance(runtime_identity, dict) and "runtime_identity" not in payload:
             payload = {**payload, "runtime_identity": runtime_identity}
-    return payload
+    return _attach_bureau_contract_identity(payload, contract_identity)
 
 
 def _audit_failure_reason(payload: dict[str, Any]) -> str | None:
@@ -885,17 +1078,50 @@ def _audit_failure_reason(payload: dict[str, Any]) -> str | None:
 
 
 def _audit(operation: str, payload: dict[str, Any], **extra: Any) -> None:
+    is_failure = _is_bureau_failure_payload(payload)
+    bureau_status = payload.get("status")
+    if bureau_status in (None, "") and is_failure:
+        bureau_status = "failed"
     record: dict[str, Any] = {
         "operation": operation,
         "bureau_result_kind": payload.get("kind"),
-        "bureau_status": payload.get("status"),
+        "bureau_status": bureau_status,
         "bureau_code": payload.get("code"),
         "effect_started": bool(payload.get("effect_started")),
         "ambiguity": bool(payload.get("ambiguity")),
     }
+    if is_failure:
+        identity = payload.get("bureau_contract_identity")
+        if isinstance(identity, dict):
+            identity_sha256 = identity.get("identity_sha256")
+            if (
+                isinstance(identity_sha256, str)
+                and SHA256_RE.fullmatch(identity_sha256) is not None
+            ):
+                result_schema_identity = _result_payload_schema_identity(payload)
+                failure_identity_material = {
+                    "schema_version": BUREAU_FAILURE_IDENTITY_SCHEMA_VERSION,
+                    "caller_surface": operation,
+                    "contract_identity_sha256": identity_sha256,
+                    "result_schema_identity_sha256": result_schema_identity["sha256"],
+                }
+                record.update(
+                    {
+                        "bureau_failure_identity_schema_version": (
+                            BUREAU_FAILURE_IDENTITY_SCHEMA_VERSION
+                        ),
+                        "bureau_caller_surface": operation,
+                        "bureau_contract_identity": identity,
+                        "bureau_result_schema_identity": result_schema_identity,
+                        "bureau_failure_identity_sha256": _sha256(
+                            _canonical_json(failure_identity_material)
+                        ),
+                    }
+                )
     reason = _audit_failure_reason(payload)
     if reason is not None:
         record["bureau_failure_reason"] = reason
+    if is_failure:
         retryable = payload.get("retryable")
         if isinstance(retryable, bool):
             record["bureau_retryable"] = retryable

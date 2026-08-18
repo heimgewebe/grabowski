@@ -208,6 +208,11 @@ class OperatorOptimizationReportTests(unittest.TestCase):
                     "failure_nonretryable_count_7d": 5,
                     "failure_retryability_unknown_count_7d": 477,
                     "failure_retryability_coverage": round(6 / 483, 6),
+                    "failure_identity_complete_count_7d": 120,
+                    "failure_identity_partial_count_7d": 5,
+                    "failure_identity_unknown_count_7d": 358,
+                    "failure_identity_coverage": round(120 / 483, 6),
+                    "failure_identity_group_count_7d": 4,
                 }
             )
             patterns["repeated_resource_reclamation"].update(
@@ -232,7 +237,13 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         findings = {item["id"]: item for item in result["findings"]}
         bureau = findings["repeated_bureau_contract_failures"]
         self.assertIn("6 of 483", bureau["observation"])
+        self.assertIn("120 of 483", bureau["observation"])
+        self.assertIn("4 exact identity groups", bureau["observation"])
+        self.assertIn("5 are partial", bureau["observation"])
+        self.assertIn("358 remain unknown", bureau["observation"])
         self.assertIn("non-retryable", bureau["recommended_action"])
+        self.assertIn("shared root cause", bureau["recommended_action"])
+        self.assertIn("not causality", bureau["alternative_interpretation"])
 
         reclamation = findings["repeated_resource_reclamation"]
         self.assertEqual(reclamation["severity"], "low")

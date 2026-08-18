@@ -490,11 +490,24 @@ def _bureau_contract_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
     retryability_unknown = _count(pattern, "failure_retryability_unknown_count_7d")
     retryability_total = retryable + nonretryable + retryability_unknown
     retryability_coverage = (retryable + nonretryable) / retryability_total if retryability_total else 0.0
+    identity_complete = _count(pattern, "failure_identity_complete_count_7d")
+    identity_partial = _count(pattern, "failure_identity_partial_count_7d")
+    identity_unknown = _count(pattern, "failure_identity_unknown_count_7d")
+    identity_total = identity_complete + identity_partial + identity_unknown
+    identity_groups = _count(pattern, "failure_identity_group_count_7d")
+    identity_coverage = identity_complete / identity_total if identity_total else 0.0
     observation = f"The audit projection grouped {count} contract failures in seven days."
     if retryability_total:
         observation += (
             f" Retryability is attributed for {retryable + nonretryable} of "
             f"{retryability_total} Bureau failure records ({retryability_coverage:.1%})."
+        )
+    if identity_total:
+        observation += (
+            f" Exact caller/runtime/schema identity is verified for {identity_complete} of "
+            f"{identity_total} failure records ({identity_coverage:.1%}) across "
+            f"{identity_groups} exact identity groups; {identity_partial} are partial and "
+            f"{identity_unknown} remain unknown."
         )
     return [
         _finding(
@@ -512,18 +525,19 @@ def _bureau_contract_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
                 )
             ],
             interpretation=(
-                "Caller/runtime schema incompatibility or stale contract identity is "
-                "creating repeated non-productive attempts; sparse retryability attribution "
-                "also means historical failures must not be treated as one retry class."
+                "Only failures with a verified complete caller/runtime/schema identity may "
+                "be treated as one homogeneous investigation candidate. Partial and unknown "
+                "historical identities remain separate, and sparse retryability attribution "
+                "prevents treating the aggregate as one retry class."
             ),
             alternative_interpretation=(
-                "The failures may span different contract versions and therefore may "
-                "not share one root cause."
+                "Even one exact identity group may contain multiple underlying causes; the "
+                "identity proves correlation boundaries, not causality."
             ),
             recommended_action=(
-                "Group failures by exact caller, runtime and schema identity, then fix "
-                "the largest homogeneous cluster; never retry records explicitly marked "
-                "non-retryable or infer retryability where attribution is absent."
+                "Inspect the largest complete identity group first; keep partial and unknown "
+                "records separate, never retry records explicitly marked non-retryable and "
+                "never infer retryability or shared root cause where attribution is absent."
             ),
             does_not_establish=["shared_root_cause", "bureau_task_readiness"],
         )
