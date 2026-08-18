@@ -1107,6 +1107,107 @@ class OperatorContractTests(unittest.TestCase):
             self.assertNotIn("mail", invoked)
             self.assertNotIn("notify-send", invoked)
 
+    def test_job_start_origin_binds_decision_review_registration(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            locks = state / "decision-review-locks"
+            cwd = root / "cwd"
+            cwd.mkdir(parents=True)
+            fake_uuid = types.SimpleNamespace(hex="a11ce0000000ffffffffffffffffffff")
+            launcher = {
+                "returncode": 0,
+                "stdout": "started",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "0" * 64,
+                "command": "systemd-run",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            decision_binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "Heimgewebe/Vibe-Lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "Reviewer-A",
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(
+                operator.decision_reviews, "LOCKS_ROOT", locks
+            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_run", return_value=launcher
+            ):
+                job = operator.grabowski_job_start(
+                    ["python3", "-c", "print('review')"],
+                    cwd=str(cwd),
+                    runtime_seconds=60,
+                    decision_review_binding=decision_binding,
+                )
+
+            expected = operator.decision_reviews.normalize_binding(decision_binding)
+            self.assertEqual(job["scope"]["decision_bound_review"], expected)
+            self.assertEqual(job["origin"]["scope"]["decision_bound_review"], expected)
+            self.assertEqual(
+                job["decision_review_contract"]["prefix"],
+                operator.decision_reviews.RESULT_PREFIX,
+            )
+            self.assertEqual(
+                job["decision_review_contract"]["required_result"]["slot"],
+                "reviewer-a",
+            )
+            persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["origin"]["scope"]["decision_bound_review"], expected
+            )
+
+    def test_broad_github_wrapper_blocks_merge_bypass_paths(self) -> None:
+        operator = _load_operator_module()
+        self.assertEqual(
+            operator.merge_authority.github_merge_bypass_reason(["pr", "merge", "350"]),
+            "direct_pr_merge",
+        )
+        self.assertEqual(
+            operator.merge_authority.github_merge_bypass_reason(
+                ["-R", "heimgewebe/vibe-lab", "pr", "merge", "350"]
+            ),
+            "direct_pr_merge",
+        )
+        self.assertEqual(
+            operator.merge_authority.github_merge_bypass_reason(
+                ["api", "--method", "PUT", "repos/heimgewebe/vibe-lab/pulls/350/merge"]
+            ),
+            "rest_pull_merge",
+        )
+        self.assertEqual(
+            operator.merge_authority.github_merge_bypass_reason(
+                ["api", "graphql", "-f", "query=mutation { mergePullRequest(input:{}) { clientMutationId } }"]
+            ),
+            "graphql_pull_merge",
+        )
+        self.assertIsNone(
+            operator.merge_authority.github_merge_bypass_reason(
+                ["pr", "view", "350", "--repo", "heimgewebe/vibe-lab"]
+            )
+        )
+        with patch.object(operator, "_run") as run:
+            with self.assertRaisesRegex(PermissionError, "Captain pr-merge"):
+                operator.grabowski_github(["pr", "merge", "350"], cwd=str(ROOT))
+            with self.assertRaisesRegex(PermissionError, "Captain pr-merge"):
+                operator.grabowski_terminal_run(["gh", "pr", "merge", "350"], cwd=str(ROOT))
+            with self.assertRaisesRegex(PermissionError, "Captain pr-merge"):
+                operator.grabowski_job_start(["gh", "pr", "merge", "350"], cwd=str(ROOT))
+        run.assert_not_called()
+
     def test_job_final_status_classification_is_explicit(self) -> None:
         operator = _load_operator_module()
 
