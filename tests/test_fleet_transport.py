@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import inspect
 import json
@@ -146,6 +147,79 @@ class FleetTransportGateTests(unittest.TestCase):
             ):
                 self.assertEqual(module.main(), 2)
         fake._run.assert_not_called()
+
+    def test_windows_powershell_remote_mode_uses_encoded_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            module, fake = _load_fleet_module(Path(tmp))
+            config = json.loads(module.FLEET_CONFIG.read_text(encoding="utf-8"))
+            config["hosts"]["windows"] = {
+                "transport": "ssh",
+                "target": "windows-host",
+                "enabled": True,
+                "roles": ["windows"],
+                "command_allowlist": ["*"],
+                "remote_command_mode": "windows-powershell",
+            }
+            module.FLEET_CONFIG.write_text(json.dumps(config), encoding="utf-8")
+            with patch.object(module.shutil, "which", return_value="/usr/bin/ssh"):
+                module.run_fleet_host(
+                    "windows",
+                    ["tool.exe", "space value", "a&b"],
+                    timeout_seconds=30,
+                    max_output_bytes=64 * 1024,
+                )
+        remote = fake._run.call_args.args[0][-1]
+        self.assertTrue(remote.startswith(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "
+        ))
+        self.assertNotIn("exec ", remote)
+        self.assertNotIn("space value", remote)
+        self.assertNotIn("a&b", remote)
+        encoded_script = remote.rsplit(" ", 1)[1]
+        script = base64.b64decode(encoded_script).decode("utf-16le")
+        marker = "FromBase64String('"
+        payload_start = script.index(marker) + len(marker)
+        payload_end = script.index("')", payload_start)
+        payload = json.loads(
+            base64.b64decode(script[payload_start:payload_end]).decode("utf-8")
+        )
+        self.assertEqual(
+            payload,
+            {"command": "tool.exe", "args": ["space value", "a&b"]},
+        )
+        self.assertIn("$o.command", script)
+        self.assertIn("$o.args", script)
+
+    def test_ssh_remote_mode_defaults_to_posix_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            module, fake = _load_fleet_module(Path(tmp))
+            config = json.loads(module.FLEET_CONFIG.read_text(encoding="utf-8"))
+            config["hosts"]["ssh"] = {
+                "transport": "ssh",
+                "target": "ssh-host",
+                "enabled": True,
+                "roles": ["development"],
+                "command_allowlist": ["*"],
+            }
+            module.FLEET_CONFIG.write_text(json.dumps(config), encoding="utf-8")
+            with patch.object(module.shutil, "which", return_value="/usr/bin/ssh"):
+                module.run_fleet_host(
+                    "ssh",
+                    ["printf", "ok"],
+                    timeout_seconds=30,
+                    max_output_bytes=64 * 1024,
+                )
+        remote = fake._run.call_args.args[0][-1]
+        self.assertEqual(remote, "exec printf ok")
+
+    def test_windows_remote_mode_requires_ssh_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            module, _ = _load_fleet_module(Path(tmp))
+            config = json.loads(module.FLEET_CONFIG.read_text(encoding="utf-8"))
+            config["hosts"]["local"]["remote_command_mode"] = "windows-powershell"
+            module.FLEET_CONFIG.write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires SSH transport"):
+                module.load_fleet()
 
 
 if __name__ == "__main__":

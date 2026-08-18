@@ -3613,12 +3613,22 @@ class GripFoundationTests(unittest.TestCase):
         params: dict[str, object] | None = None,
     ) -> dict[str, object]:
         original_run_grip = grips.run_grip
+        continuation = Mock(
+            return_value={
+                "state": "continuation_started",
+                "started": True,
+                "reused": False,
+                "unit": "grabowski-job-aef-test",
+            }
+        )
+        case["continuation"] = continuation
         with (
             patch.object(
                 grips,
                 "_agent_execution_happy_path_modules",
                 return_value=(case["coordinator"], case["workspace"]),
             ),
+            patch.object(grips, "_agent_execution_start_continuation", continuation),
             patch.object(grips, "run_grip", side_effect=case["nested"]),
         ):
             return original_run_grip(
@@ -3666,6 +3676,8 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("pending", result["output"]["state"])
         self.assertFalse(result["output"]["integration_ready"])
+        self.assertEqual("observe_continuation_job", result["output"]["next_action"])
+        case["continuation"].assert_called_once()
         case["nested"].assert_not_called()
 
     def test_agent_execution_happy_path_reconcile_never_runs_candidate_integration(self) -> None:
@@ -3736,6 +3748,408 @@ class GripFoundationTests(unittest.TestCase):
                 self.assertEqual("preflight", result["receipt"]["phase"])
                 case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
                 case["nested"].assert_not_called()
+
+    def _source_route_decision(self, *, executor: str = "scoped_writer") -> dict[str, object]:
+        writer_route = "claude-sonnet-5-high" if executor == "scoped_writer" else "grabowski-primary"
+        writer = (
+            {
+                "route": "claude-sonnet-5-high",
+                "harness": "claude",
+                "argv_prefix": ["claude", "--model", "sonnet", "--effort", "high"],
+                "route_role": "scoped-writer",
+                "contrast_only": False,
+                "paid_only": False,
+            }
+            if executor == "scoped_writer"
+            else None
+        )
+        reviewer = {
+            "route": "claude-opus-5-high",
+            "harness": "claude",
+            "argv_prefix": [
+                "claude",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "plan",
+            ],
+            "route_role": "reviewer",
+            "review_only": True,
+            "paid_only": False,
+        }
+        body: dict[str, object] = {
+            "schema_version": 2,
+            "routing_contract_version": "agent-execution-fabric-routing-v1",
+            "executor": executor,
+            "writer_route": writer_route,
+            "effect_profile": "candidate",
+            "verification_policy": "independent_review",
+            "task_class": "bounded-patch",
+            "scoped_writer": writer,
+            "reviewers": [reviewer],
+        }
+        return {**body, "recommendation_sha256": grips.sha256_json(body)}
+
+    def test_agent_execution_happy_path_source_mode_binds_route_plan_lane_workspace_without_lane_writer_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            head = "a" * 40
+            route = self._source_route_decision()
+            execution_plan = __import__("grabowski_execution_plan")
+            lane_id = "b" * 32
+            lane_receipt = "c" * 64
+            workspace_id = "gaw-p5-source-frontdoor"
+            acquired: list[dict[str, object]] = []
+
+            def acquire(parameters: dict[str, object], **kwargs: object) -> dict[str, object]:
+                del kwargs
+                acquired.append(deepcopy(parameters))
+                self.assertNotIn("scoped_writer_argv", parameters)
+                return {
+                    "state": "ready",
+                    "lane_id": lane_id,
+                    "receipt_sha256": lane_receipt,
+                    "inputs": {
+                        "execution_plan": deepcopy(parameters["execution_plan"]),
+                        "source": {"kind": "direct-user", "id": "source-1"},
+                        "scoped_writer": {
+                            "actor": "scoped-writer:claude-sonnet-5-high",
+                            "role": "scoped_writer",
+                        },
+                    },
+                }
+
+            work_acquire = types.SimpleNamespace(
+                acquire_work=Mock(side_effect=acquire),
+                operator=types.SimpleNamespace(
+                    _require_operator_mutation=Mock(),
+                    _require_operator_capability=Mock(),
+                    base=types.SimpleNamespace(_append_audit=Mock()),
+                ),
+            )
+            writer_command = [
+                "claude",
+                "--model",
+                "sonnet",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "acceptEdits",
+                "-p",
+                "--safe-mode",
+                "--no-session-persistence",
+                "Implement the bounded source request",
+            ]
+            workspace = types.SimpleNamespace(
+                _lane_workspace_identity=Mock(return_value=(workspace_id, workspace_id)),
+                grabowski_agent_workspace_create=Mock(
+                    return_value={
+                        "workspace": {
+                            "workspace_id": workspace_id,
+                            "resources": {
+                                "lane_binding": {
+                                    "lane_id": lane_id,
+                                    "receipt_sha256": lane_receipt,
+                                }
+                            },
+                        }
+                    }
+                ),
+                _manifest=Mock(
+                    return_value={
+                        "workspace_id": workspace_id,
+                        "repository": str(repo),
+                        "commands": {"writer": writer_command},
+                        "resources": {
+                            "lane_binding": {"lane_id": lane_id},
+                            "runtime_deadline_unix": int(time.time()) + 7200,
+                        },
+                    }
+                ),
+                _lane_backed=Mock(return_value=True),
+            )
+            coordinator = types.SimpleNamespace(
+                run_workspace_candidate_coordinator=Mock(
+                    return_value={
+                        "workspace_id": workspace_id,
+                        "state": "pending",
+                        "status": {},
+                    }
+                )
+            )
+            continuation = Mock(
+                return_value={
+                    "state": "continuation_started",
+                    "started": True,
+                    "reused": False,
+                    "unit": "grabowski-job-aef-source",
+                }
+            )
+            router = types.SimpleNamespace(
+                canonical_execution_route=Mock(return_value=route)
+            )
+            params = {
+                "base": "main",
+                "title": "AEF source one-shot",
+                "source_kind": "direct-user",
+                "source_id": "source-1",
+                "repo": str(repo),
+                "source_revision": head,
+                "write_paths": ["src/grabowski_grips.py"],
+                "objective": "Implement the bounded source request",
+                "test_argv": ["python3", "-m", "pytest", "-q"],
+                "retention_until_unix": int(time.time()) + 9000,
+            }
+            with (
+                patch.object(
+                    grips,
+                    "_agent_execution_frontdoor_modules",
+                    return_value=(router, execution_plan, work_acquire, workspace),
+                ),
+                patch.object(
+                    grips,
+                    "_agent_execution_happy_path_modules",
+                    return_value=(coordinator, workspace),
+                ),
+                patch.object(grips, "_agent_execution_start_continuation", continuation),
+            ):
+                result = grips.run_grip(
+                    "agent-execution-happy-path",
+                    params,
+                    allow_mutation=True,
+                    command_runner=FakeGit(head=head),
+                    github_runner=FakeGh(),
+                )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("pending", result["output"]["state"])
+        self.assertEqual(workspace_id, result["output"]["workspace_id"])
+        self.assertEqual("workspace_ready", result["output"]["frontdoor"]["state"])
+        self.assertEqual(lane_id, result["output"]["frontdoor"]["lane_id"])
+        self.assertEqual(1, len(acquired))
+        self.assertEqual(
+            "claude-sonnet-5-high",
+            acquired[0]["execution_plan"]["route_binding"]["writer_route"],
+        )
+        work_acquire.operator._require_operator_mutation.assert_called_once()
+        workspace.grabowski_agent_workspace_create.assert_called_once()
+        create_kwargs = workspace.grabowski_agent_workspace_create.call_args.kwargs
+        self.assertEqual(lane_id, create_kwargs["lane_id"])
+        self.assertEqual(lane_receipt, create_kwargs["expected_lane_receipt_sha256"])
+        self.assertEqual(writer_command, create_kwargs["writer_argv"])
+        continuation.assert_called_once()
+
+    def test_agent_execution_happy_path_source_mode_returns_at_controller_boundary_without_lane_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            head = "a" * 40
+            route = self._source_route_decision(executor="controller")
+            execution_plan = __import__("grabowski_execution_plan")
+            work_acquire = types.SimpleNamespace(acquire_work=Mock())
+            workspace = types.SimpleNamespace(grabowski_agent_workspace_create=Mock())
+            router = types.SimpleNamespace(
+                canonical_execution_route=Mock(return_value=route)
+            )
+            params = {
+                "base": "main",
+                "title": "Controller boundary",
+                "source_kind": "direct-user",
+                "source_id": "controller-source",
+                "repo": str(repo),
+                "source_revision": head,
+                "write_paths": ["src/grabowski_grips.py"],
+                "objective": "Controller-owned implementation",
+                "test_argv": ["python3", "-m", "pytest", "-q"],
+                "retention_until_unix": int(time.time()) + 9000,
+            }
+            with patch.object(
+                grips,
+                "_agent_execution_frontdoor_modules",
+                return_value=(router, execution_plan, work_acquire, workspace),
+            ):
+                result = grips.run_grip(
+                    "agent-execution-happy-path",
+                    params,
+                    allow_mutation=True,
+                    command_runner=FakeGit(head=head),
+                    github_runner=FakeGh(),
+                )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("controller_handback", result["output"]["state"])
+        self.assertEqual("controller_execute_bound_plan", result["output"]["next_action"])
+        work_acquire.acquire_work.assert_not_called()
+        workspace.grabowski_agent_workspace_create.assert_not_called()
+
+    def test_agent_execution_happy_path_resume_mode_rejects_source_fields(self) -> None:
+        case = self._happy_path_case()
+        params = dict(case["params"])
+        params["source_id"] = "must-not-mix"
+        result = self._run_happy_path_case(case, params=params)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("may not be combined", result["output"]["error"])
+        case["coordinator"].run_workspace_candidate_coordinator.assert_not_called()
+
+    def test_agent_execution_continuation_job_is_deterministic_and_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_id = "gaw-p5-continuation"
+            manifest = {
+                "repository": str(Path(tmp).resolve()),
+                "resources": {"runtime_deadline_unix": int(time.time()) + 1200},
+                "runtime_identity": {"identity_sha256": "9" * 64},
+            }
+            workspace = types.SimpleNamespace(_manifest=Mock(return_value=manifest))
+            metadata: dict[str, object] = {}
+            operator = types.SimpleNamespace()
+            operator._argv_hash = lambda argv: hashlib.sha256(
+                json.dumps(argv, separators=(",", ":")).encode()
+            ).hexdigest()
+            operator._require_operator_mutation = Mock()
+            operator._read_job_metadata = Mock(side_effect=ValueError("missing"))
+
+            def start_job(argv: list[str], **kwargs: object) -> dict[str, object]:
+                unit = str(kwargs["reserved_unit"])
+                result = {
+                    "unit": unit,
+                    "job_id": unit.removeprefix("grabowski-job-"),
+                    "argv_sha256": operator._argv_hash(argv),
+                    "final_status": "launch_submitted",
+                }
+                metadata.update(
+                    {
+                        **result,
+                        "cwd": str(Path(tmp).resolve()),
+                    }
+                )
+                return result
+
+            operator._start_job = Mock(side_effect=start_job)
+            with patch.object(grips, "_agent_execution_job_operator", return_value=operator):
+                first = grips._agent_execution_start_continuation(
+                    workspace,
+                    workspace_id=workspace_id,
+                    base="main",
+                    title="Continue P5",
+                    body="",
+                )
+                operator._read_job_metadata.side_effect = None
+                operator._read_job_metadata.return_value = dict(metadata)
+                second = grips._agent_execution_start_continuation(
+                    workspace,
+                    workspace_id=workspace_id,
+                    base="main",
+                    title="Continue P5",
+                    body="",
+                )
+
+        self.assertEqual("continuation_started", first["state"])
+        self.assertEqual("continuation_reused", second["state"])
+        self.assertEqual(first["unit"], second["unit"])
+        self.assertEqual(1, operator._start_job.call_count)
+        start_argv = operator._start_job.call_args.args[0]
+        self.assertEqual([sys.executable, "-m", "grabowski_grips", "--aef-continue"], start_argv[:4])
+
+    def test_agent_execution_continuation_job_identity_changes_with_workspace_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = str(Path(tmp).resolve())
+            operator = types.SimpleNamespace()
+            operator._argv_hash = lambda argv: hashlib.sha256(
+                json.dumps(argv, separators=(",", ":")).encode()
+            ).hexdigest()
+            operator._require_operator_mutation = Mock()
+            operator._read_job_metadata = Mock(side_effect=ValueError("missing"))
+            operator._start_job = Mock(
+                side_effect=lambda argv, **kwargs: {
+                    "unit": kwargs["reserved_unit"],
+                    "job_id": str(kwargs["reserved_unit"]).removeprefix("grabowski-job-"),
+                    "argv_sha256": operator._argv_hash(argv),
+                    "final_status": "launch_submitted",
+                }
+            )
+            workspace_a = types.SimpleNamespace(
+                _manifest=Mock(
+                    return_value={
+                        "repository": repository,
+                        "resources": {"runtime_deadline_unix": int(time.time()) + 1200},
+                        "runtime_identity": {"identity_sha256": "a" * 64},
+                    }
+                )
+            )
+            workspace_b = types.SimpleNamespace(
+                _manifest=Mock(
+                    return_value={
+                        "repository": repository,
+                        "resources": {"runtime_deadline_unix": int(time.time()) + 1200},
+                        "runtime_identity": {"identity_sha256": "b" * 64},
+                    }
+                )
+            )
+            with patch.object(grips, "_agent_execution_job_operator", return_value=operator):
+                first = grips._agent_execution_start_continuation(
+                    workspace_a, workspace_id="gaw-runtime-bound", base="main", title="P5", body=""
+                )
+                second = grips._agent_execution_start_continuation(
+                    workspace_b, workspace_id="gaw-runtime-bound", base="main", title="P5", body=""
+                )
+
+        self.assertEqual("continuation_started", first["state"])
+        self.assertEqual("continuation_started", second["state"])
+        self.assertNotEqual(first["unit"], second["unit"])
+        self.assertEqual(2, operator._start_job.call_count)
+
+    def test_agent_execution_continuation_refuses_terminal_job_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = str(Path(tmp).resolve())
+            workspace = types.SimpleNamespace(
+                _manifest=Mock(
+                    return_value={
+                        "repository": repository,
+                        "resources": {"runtime_deadline_unix": int(time.time()) + 1200},
+                        "runtime_identity": {"identity_sha256": "c" * 64},
+                    }
+                )
+            )
+            operator = types.SimpleNamespace()
+            operator._argv_hash = lambda argv: hashlib.sha256(
+                json.dumps(argv, separators=(",", ":")).encode()
+            ).hexdigest()
+            operator._require_operator_mutation = Mock()
+            operator._start_job = Mock()
+            operator._read_job_metadata = Mock()
+            with patch.object(grips, "_agent_execution_job_operator", return_value=operator):
+                # First derive the exact command/unit without trusting a stale unrelated identity.
+                operator._read_job_metadata.side_effect = ValueError("missing")
+                operator._start_job.side_effect = lambda argv, **kwargs: {
+                    "unit": kwargs["reserved_unit"],
+                    "job_id": str(kwargs["reserved_unit"]).removeprefix("grabowski-job-"),
+                    "argv_sha256": operator._argv_hash(argv),
+                    "final_status": "launch_submitted",
+                }
+                first = grips._agent_execution_start_continuation(
+                    workspace, workspace_id="gaw-terminal-job", base="main", title="P5", body=""
+                )
+                command = operator._start_job.call_args.args[0]
+                operator._read_job_metadata.side_effect = None
+                operator._read_job_metadata.return_value = {
+                    "unit": first["unit"],
+                    "job_id": first["job_id"],
+                    "argv_sha256": operator._argv_hash(command),
+                    "cwd": repository,
+                    "final_status": "failed",
+                }
+                second = grips._agent_execution_start_continuation(
+                    workspace, workspace_id="gaw-terminal-job", base="main", title="P5", body=""
+                )
+
+        self.assertEqual("continuation_started", first["state"])
+        self.assertEqual("continuation_reconcile_required", second["state"])
+        self.assertEqual("existing_continuation_is_terminal", second["error"])
+        self.assertEqual("failed", second["final_status"])
+        self.assertEqual(1, operator._start_job.call_count)
 
     def test_agent_execution_happy_path_is_grip_only_and_coordinator_is_runtime_supporting_source(self) -> None:
         contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"

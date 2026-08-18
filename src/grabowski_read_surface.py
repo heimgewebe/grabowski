@@ -463,6 +463,9 @@ def _audit_window_projection(
     failure_signal_count = 0
     reclaimed_resource_count = 0
     resource_reclamation_event_count = 0
+    reclamation_self_resource_count = 0
+    reclamation_foreign_resource_count = 0
+    reclamation_unattributed_resource_count = 0
     selected_count = 0
 
     for record, timestamp_unix in records:
@@ -495,6 +498,13 @@ def _audit_window_projection(
                 bureau_code_counts[
                     _audit_label(bureau_code, fallback="unknown")
                 ] += 1
+            retryable = record.get("bureau_retryable")
+            if retryable is True:
+                bureau_activity["failure_retryable_count"] += 1
+            elif retryable is False:
+                bureau_activity["failure_nonretryable_count"] += 1
+            else:
+                bureau_activity["failure_retryability_unknown_count"] += 1
 
         resource_keys = record.get("resource_keys")
         if isinstance(resource_keys, list):
@@ -510,6 +520,35 @@ def _audit_window_projection(
         ):
             reclaimed_resource_count += reclaimed
             resource_reclamation_event_count += 1
+            attributed = 0
+            seen_indexes: set[int] = set()
+            owner_id = record.get("owner_id")
+            evidence = record.get("reclamation_evidence")
+            if isinstance(owner_id, str) and owner_id and isinstance(evidence, list):
+                for item in evidence:
+                    if not isinstance(item, dict):
+                        continue
+                    index = item.get("resource_index")
+                    previous_owner_id = item.get("previous_owner_id")
+                    if (
+                        not isinstance(index, int)
+                        or isinstance(index, bool)
+                        or index < 0
+                        or not isinstance(resource_keys, list)
+                        or index >= len(resource_keys)
+                        or index in seen_indexes
+                        or not isinstance(previous_owner_id, str)
+                        or not previous_owner_id
+                        or attributed >= reclaimed
+                    ):
+                        continue
+                    seen_indexes.add(index)
+                    attributed += 1
+                    if previous_owner_id == owner_id:
+                        reclamation_self_resource_count += 1
+                    else:
+                        reclamation_foreign_resource_count += 1
+            reclamation_unattributed_resource_count += reclaimed - attributed
 
         if operation_key.startswith("task-"):
             task_activity[operation_key] += 1
@@ -551,6 +590,9 @@ def _audit_window_projection(
             **dict(sorted(resource_activity.items())),
             "resource_reclamation_event_count": resource_reclamation_event_count,
             "reclaimed_resource_count": reclaimed_resource_count,
+            "reclamation_self_resource_count": reclamation_self_resource_count,
+            "reclamation_foreign_resource_count": reclamation_foreign_resource_count,
+            "reclamation_unattributed_resource_count": reclamation_unattributed_resource_count,
         },
         "bureau_activity": dict(sorted(bureau_activity.items())),
         "mutation_evidence": dict(sorted(mutation_evidence.items())),
@@ -593,6 +635,9 @@ def _audit_window_projection(
         "mutation_evidence": mutation_evidence,
         "resource_reclamation_event_count": resource_reclamation_event_count,
         "reclaimed_resource_count": reclaimed_resource_count,
+        "reclamation_self_resource_count": reclamation_self_resource_count,
+        "reclamation_foreign_resource_count": reclamation_foreign_resource_count,
+        "reclamation_unattributed_resource_count": reclamation_unattributed_resource_count,
         "failure_signal_count": failure_signal_count,
         "timestamp_quality": timestamp_quality,
     }
@@ -615,6 +660,15 @@ def _audit_projection_candidates(
         key=lambda item: (-item[1], item[0]),
     )
     if repeated_codes:
+        retryable_count = int(seven_day["bureau_activity"].get("failure_retryable_count", 0))
+        nonretryable_count = int(
+            seven_day["bureau_activity"].get("failure_nonretryable_count", 0)
+        )
+        retryability_unknown_count = int(
+            seven_day["bureau_activity"].get("failure_retryability_unknown_count", 0)
+        )
+        retryability_total = retryable_count + nonretryable_count + retryability_unknown_count
+        retryability_attributed = retryable_count + nonretryable_count
         candidates.append(
             {
                 "pattern": "repeated_bureau_contract_failures",
@@ -622,7 +676,15 @@ def _audit_projection_candidates(
                 "top_codes": [
                     {"code": code, "count": count} for code, count in repeated_codes[:5]
                 ],
-                "recommendation": "Inspect caller/runtime schema compatibility and group only evidence with the same contract identity.",
+                "failure_retryable_count_7d": retryable_count,
+                "failure_nonretryable_count_7d": nonretryable_count,
+                "failure_retryability_unknown_count_7d": retryability_unknown_count,
+                "failure_retryability_coverage": (
+                    round(retryability_attributed / retryability_total, 6)
+                    if retryability_total
+                    else 0.0
+                ),
+                "recommendation": "Inspect caller/runtime schema compatibility and group only evidence with the same contract identity; never infer retryability where attribution is absent.",
                 "authority": "proposal_only",
                 "does_not_establish": ["shared_root_cause", "bureau_task_readiness"],
             }
@@ -643,13 +705,41 @@ def _audit_projection_candidates(
         )
     reclamation_events = int(seven_day["resource_reclamation_event_count"])
     reclaimed_resources = int(seven_day["reclaimed_resource_count"])
+    self_reclaimed = int(seven_day["reclamation_self_resource_count"])
+    foreign_reclaimed = int(seven_day["reclamation_foreign_resource_count"])
+    unattributed_reclaimed = int(seven_day["reclamation_unattributed_resource_count"])
+    attributed_reclaimed = self_reclaimed + foreign_reclaimed
     if reclamation_events >= 3:
+        if unattributed_reclaimed:
+            recommendation = (
+                "Separate provenance-attributed same-owner and foreign-owner reclaims; "
+                "do not infer lease-policy defects from unattributed aggregate history."
+            )
+        elif foreign_reclaimed:
+            recommendation = (
+                "Inspect foreign-owner reclaims against expiry, terminal and release timing; "
+                "treat same-owner reacquisition as separate resume behavior before changing "
+                "lease policy."
+            )
+        else:
+            recommendation = (
+                "Attributed reclamation is same-owner only; inspect renewal and resume "
+                "semantics before changing lease policy."
+            )
         candidates.append(
             {
                 "pattern": "repeated_resource_reclamation",
                 "event_count_7d": reclamation_events,
                 "reclaimed_resource_count_7d": reclaimed_resources,
-                "recommendation": "Compare lease lifetime, terminalization and release timing before changing lease policy.",
+                "same_owner_reclaimed_resource_count_7d": self_reclaimed,
+                "foreign_owner_reclaimed_resource_count_7d": foreign_reclaimed,
+                "unattributed_reclaimed_resource_count_7d": unattributed_reclaimed,
+                "reclamation_attribution_coverage": (
+                    round(attributed_reclaimed / reclaimed_resources, 6)
+                    if reclaimed_resources
+                    else 0.0
+                ),
+                "recommendation": recommendation,
                 "authority": "proposal_only",
                 "does_not_establish": ["lease_bug", "owner_failure"],
             }

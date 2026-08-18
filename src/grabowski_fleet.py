@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ FLEET_CONFIG = Path(os.environ.get(
 HOST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 SSH_TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,254}\Z")
 PRODUCTION_ROLE = "production"
+REMOTE_COMMAND_MODES = frozenset({"posix", "windows-powershell"})
 TASK_UNIT_SHOW_OBSERVER = "task-systemd-user-show-v1"
 TASK_UNIT_SHOW_PROPERTIES = (
     "LoadState",
@@ -97,12 +99,13 @@ def load_fleet() -> dict[str, Any]:
             raise ValueError(f"Fleet host {name} must be an object")
         _keys(candidate,
               {"transport", "target", "enabled", "roles", "command_allowlist"},
-              {"connect_timeout_seconds"}, f"Fleet host {name}")
+              {"connect_timeout_seconds", "remote_command_mode"}, f"Fleet host {name}")
         transport = candidate["transport"]
         target = candidate["target"]
         roles = candidate["roles"]
         allowlist = candidate["command_allowlist"]
         timeout = candidate.get("connect_timeout_seconds", 10)
+        remote_command_mode = candidate.get("remote_command_mode", "posix")
         if transport not in {"local", "ssh"}:
             raise ValueError(f"Fleet host {name} has invalid transport")
         if not isinstance(target, str) or not target:
@@ -119,7 +122,15 @@ def load_fleet() -> dict[str, Any]:
             raise ValueError(f"Fleet host {name} has invalid command_allowlist")
         if not isinstance(timeout, int) or not 1 <= timeout <= 30:
             raise ValueError(f"Fleet host {name} has invalid connect timeout")
-        hosts[name] = {**candidate, "connect_timeout_seconds": timeout}
+        if remote_command_mode not in REMOTE_COMMAND_MODES:
+            raise ValueError(f"Fleet host {name} has invalid remote command mode")
+        if transport != "ssh" and remote_command_mode != "posix":
+            raise ValueError(f"Fleet host {name} remote command mode requires SSH transport")
+        hosts[name] = {
+            **candidate,
+            "connect_timeout_seconds": timeout,
+            "remote_command_mode": remote_command_mode,
+        }
     return {"schema_version": 1, "hosts": hosts}
 
 
@@ -140,6 +151,41 @@ def _safe_argv(argv: list[str]) -> list[str]:
     if operator._redact_argv(validated) != validated:
         raise ValueError("argv appears to contain secret material")
     return validated
+
+
+def _windows_powershell_remote_command(command: list[str]) -> str:
+    """Encode argv as inert JSON and reconstruct it inside Windows PowerShell."""
+    payload = base64.b64encode(
+        json.dumps(
+            {"command": command[0], "args": command[1:]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"$j=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'));"
+        "$o=ConvertFrom-Json -InputObject $j;"
+        "$c=[string]$o.command;"
+        "$r=@($o.args);"
+        "if([string]::IsNullOrEmpty($c)){exit 2};"
+        "& $c @r;"
+        "$ok=$?;"
+        "$rc=$LASTEXITCODE;"
+        "if($null -eq $rc){if($ok){exit 0}else{exit 1}};"
+        "exit [int]$rc"
+    )
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return (
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "
+        + encoded
+    )
+
+
+def _ssh_remote_command(host: dict[str, Any], command: list[str]) -> str:
+    if host["remote_command_mode"] == "windows-powershell":
+        return _windows_powershell_remote_command(command)
+    return "exec " + shlex.join(command)
 
 
 def _ensure_command_allowed(name: str, host: dict[str, Any], command: list[str]) -> None:
@@ -169,7 +215,7 @@ def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
         ssh = shutil.which("ssh")
         if not ssh:
             raise RuntimeError("OpenSSH client is not installed")
-        remote_command = "exec " + shlex.join(command)
+        remote_command = _ssh_remote_command(host, command)
         result = operator._run([
             ssh, "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
             "-o", f"ConnectTimeout={host['connect_timeout_seconds']}",
@@ -243,7 +289,7 @@ def run_fleet_task_output_read(
         ssh = shutil.which("ssh")
         if not ssh:
             raise RuntimeError("OpenSSH client is not installed")
-        remote_command = "exec " + shlex.join(command)
+        remote_command = _ssh_remote_command(host, command)
         result = operator._run(
             [
                 ssh,
@@ -344,7 +390,7 @@ def run_fleet_task_output_cleanup(
         ssh = shutil.which("ssh")
         if not ssh:
             raise RuntimeError("OpenSSH client is not installed")
-        remote_command = "exec " + shlex.join(command)
+        remote_command = _ssh_remote_command(host, command)
         result = operator._run(
             [
                 ssh,
@@ -410,7 +456,7 @@ def run_fleet_task_unit_show(
         ssh = shutil.which("ssh")
         if not ssh:
             raise RuntimeError("OpenSSH client is not installed")
-        remote_command = "exec " + shlex.join(command)
+        remote_command = _ssh_remote_command(host, command)
         result = operator._run([
             ssh, "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes",
             "-o", f"ConnectTimeout={host['connect_timeout_seconds']}",

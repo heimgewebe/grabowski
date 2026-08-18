@@ -196,6 +196,54 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         self.assertIn("operator_productivity", result["does_not_establish"])
         self.assertTrue(result["report_sha256"])
 
+    def test_report_uses_bounded_reclamation_and_retryability_attribution(self) -> None:
+        def attributed_audit_provider(**_kwargs) -> dict:
+            payload = audit_provider()
+            patterns = {
+                item["pattern"]: item for item in payload["candidate_patterns"]
+            }
+            patterns["repeated_bureau_contract_failures"].update(
+                {
+                    "failure_retryable_count_7d": 1,
+                    "failure_nonretryable_count_7d": 5,
+                    "failure_retryability_unknown_count_7d": 477,
+                    "failure_retryability_coverage": round(6 / 483, 6),
+                }
+            )
+            patterns["repeated_resource_reclamation"].update(
+                {
+                    "same_owner_reclaimed_resource_count_7d": 39,
+                    "foreign_owner_reclaimed_resource_count_7d": 25,
+                    "unattributed_reclaimed_resource_count_7d": 449,
+                    "reclamation_attribution_coverage": round(64 / 513, 6),
+                }
+            )
+            return payload
+
+        result = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            health_provider=health_provider,
+            audit_provider=attributed_audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+        findings = {item["id"]: item for item in result["findings"]}
+        bureau = findings["repeated_bureau_contract_failures"]
+        self.assertIn("6 of 483", bureau["observation"])
+        self.assertIn("non-retryable", bureau["recommended_action"])
+
+        reclamation = findings["repeated_resource_reclamation"]
+        self.assertEqual(reclamation["severity"], "low")
+        self.assertEqual(
+            reclamation["title"], "Resource reclamation attribution is incomplete"
+        )
+        self.assertIn("39 same-owner", reclamation["observation"])
+        self.assertIn("25 foreign-owner", reclamation["observation"])
+        self.assertIn("449 remain historical or unattributed", reclamation["observation"])
+        self.assertIn("do not change lease duration", reclamation["recommended_action"])
+
     def test_report_compares_normalized_overlapping_window_rates(self) -> None:
         result = self.build(window="7d")
         comparison = result["measurement"]["comparison"]
