@@ -11,7 +11,7 @@ import re
 import stat
 import time
 import uuid
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 import grabowski_consumer_surface as consumer_surface
 import grabowski_private_io as private_io
@@ -1437,6 +1437,59 @@ def _task_archive_classification(
     return classified
 
 
+def build_task_archive_plan(
+    records: Iterable[Mapping[str, Any]],
+    classifications: Mapping[str, Mapping[str, Any]],
+    *,
+    now_unix: int,
+    minimum_age_seconds: int,
+) -> dict[str, Any]:
+    import grabowski_lifecycle_archive as lifecycle
+
+    materialized = [dict(record) for record in records]
+    attention_gate_evidence: dict[str, dict[str, Any]] = {}
+    for record in materialized:
+        state = record.get("state")
+        if state not in TERMINAL_ATTENTION_STATES:
+            continue
+        task_id = record.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task record task_id must be a non-empty string")
+        receipt = record.get("lifecycle_receipt_sha256")
+        try:
+            authoritative_record = tasks._row_raw(task_id)
+            if (
+                authoritative_record.get("state") != state
+                or authoritative_record.get("lifecycle_receipt_sha256") != receipt
+            ):
+                attention_gate_evidence[task_id] = {"status": "binding_mismatch"}
+                continue
+            closeout = terminal_closeout_plan(authoritative_record)
+        except (OSError, ValueError, TaskAttentionError) as exc:
+            attention_gate_evidence[task_id] = {
+                "status": "unavailable",
+                "error_type": type(exc).__name__,
+            }
+            continue
+        attention_gate_evidence[task_id] = {
+            "status": "observed",
+            "task_id": task_id,
+            "state": authoritative_record.get("state"),
+            "lifecycle_receipt_sha256": authoritative_record.get(
+                "lifecycle_receipt_sha256"
+            ),
+            "archive_ready": closeout.get("archive_ready") is True,
+            "closeout_state": closeout.get("closeout_state"),
+        }
+    return lifecycle.build_task_archive_plan(
+        materialized,
+        classifications,
+        now_unix=now_unix,
+        minimum_age_seconds=minimum_age_seconds,
+        attention_gate_evidence=attention_gate_evidence,
+    )
+
+
 def _task_archive_lease_observations(leases: list[dict[str, Any]]) -> list[Any]:
     import grabowski_lifecycle_effect_plan as effect_plan
 
@@ -2814,7 +2867,7 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
         # Wall-clock retention and all live evidence are still checked immediately
         # before planning and again before effect execution. This reference is not
         # an execution timestamp.
-        archive_plan = lifecycle.build_task_archive_plan(
+        archive_plan = build_task_archive_plan(
             [current_archive_record],
             {task_id: classification},
             now_unix=retention_boundary_unix,
