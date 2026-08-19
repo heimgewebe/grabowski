@@ -652,7 +652,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         killpg.assert_called_once_with(4321, signal.SIGKILL)
         process.communicate.assert_called_once_with()
 
-    def test_power_action_without_peer_fields_still_fails_closed_before_spawn(self) -> None:
+    def test_power_action_missing_peer_uid_fails_closed_before_spawn(self) -> None:
         reference = {
             "request_id": "c" * 32,
             "reference_sha256": "d" * 64,
