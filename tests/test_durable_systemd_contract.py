@@ -22,7 +22,7 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("ExecStart=/home/alex/.local/share/grabowski-mcp/.venv/bin/python", text)
         self.assertIn("Environment=HOME=/home/alex", text)
         self.assertIn(
-            "Environment=PATH=/home/alex/.local/bin:/usr/local/bin:/usr/bin:/bin", text
+            "Environment=PATH=/home/alex/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin", text
         )
         self.assertIn("Environment=XDG_RUNTIME_DIR=/run/user/1000", text)
         self.assertIn(
