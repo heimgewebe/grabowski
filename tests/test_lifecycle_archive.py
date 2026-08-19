@@ -183,36 +183,27 @@ class TaskArchivePlanTests(unittest.TestCase):
         record["state"] = "failed"
         classifications = {"failed": {"classification": "terminal_archivable"}}
 
-        with (
-            mock.patch("grabowski_tasks._row_raw", return_value=record),
-            mock.patch(
-                "grabowski_task_attention.terminal_closeout_plan",
-                return_value={"archive_ready": False, "closeout_state": "attention_required"},
-            ),
-        ):
-            required = lifecycle.build_task_archive_plan(
-                [record], classifications, now_unix=1000, minimum_age_seconds=100
+        def plan(*, archive_ready: bool, closeout_state: str) -> dict:
+            return lifecycle.build_task_archive_plan(
+                [record],
+                classifications,
+                now_unix=1000,
+                minimum_age_seconds=100,
+                attention_gate_evidence={
+                    "failed": {
+                        "status": "observed",
+                        "task_id": "failed",
+                        "state": "failed",
+                        "lifecycle_receipt_sha256": "a" * 64,
+                        "archive_ready": archive_ready,
+                        "closeout_state": closeout_state,
+                    }
+                },
             )
-        with (
-            mock.patch("grabowski_tasks._row_raw", return_value=record),
-            mock.patch(
-                "grabowski_task_attention.terminal_closeout_plan",
-                return_value={"archive_ready": False, "closeout_state": "attention_deferred"},
-            ),
-        ):
-            deferred = lifecycle.build_task_archive_plan(
-                [record], classifications, now_unix=1000, minimum_age_seconds=100
-            )
-        with (
-            mock.patch("grabowski_tasks._row_raw", return_value=record),
-            mock.patch(
-                "grabowski_task_attention.terminal_closeout_plan",
-                return_value={"archive_ready": True, "closeout_state": "ready_to_archive"},
-            ),
-        ):
-            closed = lifecycle.build_task_archive_plan(
-                [record], classifications, now_unix=1000, minimum_age_seconds=100
-            )
+
+        required = plan(archive_ready=False, closeout_state="attention_required")
+        deferred = plan(archive_ready=False, closeout_state="attention_deferred")
+        closed = plan(archive_ready=True, closeout_state="ready_to_archive")
 
         self.assertEqual([], required["eligible_task_ids"])
         self.assertIn(
@@ -227,36 +218,54 @@ class TaskArchivePlanTests(unittest.TestCase):
     def test_failed_task_archive_rejects_stale_attention_authority_binding(self) -> None:
         record = self.task("failed", updated_at=100)
         record["state"] = "failed"
-        stale = {**record, "lifecycle_receipt_sha256": "b" * 64}
         classifications = {"failed": {"classification": "terminal_archivable"}}
 
-        with (
-            mock.patch("grabowski_tasks._row_raw", return_value=stale),
-            mock.patch("grabowski_task_attention.terminal_closeout_plan") as closeout_plan,
-        ):
-            plan = lifecycle.build_task_archive_plan(
-                [record], classifications, now_unix=1000, minimum_age_seconds=100
-            )
+        plan = lifecycle.build_task_archive_plan(
+            [record],
+            classifications,
+            now_unix=1000,
+            minimum_age_seconds=100,
+            attention_gate_evidence={"failed": {"status": "binding_mismatch"}},
+        )
 
         self.assertEqual([], plan["eligible_task_ids"])
         self.assertIn(
             "attention_authority_binding_mismatch", plan["blocked"][0]["reason_codes"]
         )
-        closeout_plan.assert_not_called()
 
     def test_failed_task_archive_blocks_when_attention_authority_is_unavailable(self) -> None:
         record = self.task("failed", updated_at=100)
         record["state"] = "failed"
         classifications = {"failed": {"classification": "terminal_archivable"}}
 
-        with mock.patch("grabowski_tasks._row_raw", side_effect=ValueError("missing")):
-            plan = lifecycle.build_task_archive_plan(
-                [record], classifications, now_unix=1000, minimum_age_seconds=100
-            )
+        plan = lifecycle.build_task_archive_plan(
+            [record],
+            classifications,
+            now_unix=1000,
+            minimum_age_seconds=100,
+            attention_gate_evidence={
+                "failed": {"status": "unavailable", "error_type": "ValueError"}
+            },
+        )
 
         self.assertEqual([], plan["eligible_task_ids"])
         self.assertIn(
             "attention_authority_unavailable:ValueError",
+            plan["blocked"][0]["reason_codes"],
+        )
+
+    def test_failed_task_archive_fails_closed_without_attention_evidence(self) -> None:
+        record = self.task("failed", updated_at=100)
+        record["state"] = "failed"
+        classifications = {"failed": {"classification": "terminal_archivable"}}
+
+        plan = lifecycle.build_task_archive_plan(
+            [record], classifications, now_unix=1000, minimum_age_seconds=100
+        )
+
+        self.assertEqual([], plan["eligible_task_ids"])
+        self.assertIn(
+            "attention_authority_unavailable:not_observed",
             plan["blocked"][0]["reason_codes"],
         )
 
