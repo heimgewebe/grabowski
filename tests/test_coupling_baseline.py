@@ -34,6 +34,31 @@ class CouplingBaselineTests(unittest.TestCase):
     def test_plural_resource_module_is_classified(self) -> None:
         self.assertEqual(coupling.domain_for_module("grabowski_resources"), {"resource"})
 
+    def test_current_core_domain_families_are_classified(self) -> None:
+        self.assertEqual(coupling.domain_for_module("grabowski_agent_workspace"), {"execution"})
+        self.assertEqual(coupling.domain_for_module("grabowski_lifecycle_projection"), {"lifecycle"})
+        self.assertEqual(coupling.domain_for_module("grabowski_effect_receipt"), {"effect"})
+        self.assertEqual(coupling.domain_for_module("grabowski_privileged_broker"), {"privileged"})
+        self.assertEqual(coupling.domain_for_module("grabowski_runtime_contract"), {"runtime"})
+        self.assertEqual(coupling.domain_for_module("grabowski_browser_diagnostics"), {"browser"})
+        self.assertEqual(coupling.domain_for_module("grabowski_reposkop_context"), {"repo_context"})
+
+    def test_classification_coverage_keeps_unknown_modules_explicit(self) -> None:
+        graph = {
+            "grabowski_resources": {"grabowski_unknown"},
+            "grabowski_unknown": set(),
+        }
+        incoming = {
+            "grabowski_resources": set(),
+            "grabowski_unknown": {"grabowski_resources"},
+        }
+        coverage = coupling.classification_coverage(graph, incoming)
+        self.assertEqual(coverage["classified_module_count"], 1)
+        self.assertEqual(coverage["unclassified_module_count"], 1)
+        self.assertEqual(coverage["classified_ratio"], 0.5)
+        self.assertEqual(coverage["unclassified_modules"], ["grabowski_unknown"])
+        self.assertEqual(coverage["unclassified_high_coupling"][0]["fan_in"], 1)
+
     def test_tarjan_reports_cycle_and_singleton(self) -> None:
         graph = {"a": {"b"}, "b": {"a"}, "c": set()}
         self.assertEqual(coupling.tarjan_scc(graph), [["a", "b"], ["c"]])
@@ -80,6 +105,8 @@ class CouplingBaselineTests(unittest.TestCase):
             test_files = report["test_coupling"]["most_crosscutting_tests"]
             self.assertEqual(test_files[0]["dependency_count"], 2)
             self.assertTrue(report["report_sha256"])
+            self.assertEqual(report["authority_classification"]["classified_ratio"], 1.0)
+            self.assertEqual(report["authority_classification"]["unclassified_module_count"], 0)
             self.assertEqual(len(report["evidence_gaps"]), 2)
 
     def test_cycle_is_detected(self) -> None:
@@ -113,6 +140,7 @@ class CouplingBaselineTests(unittest.TestCase):
         report = json.loads(result.stdout)
         self.assertEqual(report["schema_version"], 1)
         self.assertEqual(report["kind"], "grabowski-coupling-baseline-v1")
+        self.assertIn("authority_classification", report)
 
 
 if __name__ == "__main__":
