@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,18 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_recovery as recovery
+
+
+ROOTBROKER_MODULE_PATH = ROOT / "tools" / "grabowski_rootbroker_cutover.py"
+ROOTBROKER_MODULE_NAME = "grabowski_rootbroker_cutover_recovery_contract_test"
+ROOTBROKER_SPEC = importlib.util.spec_from_file_location(
+    ROOTBROKER_MODULE_NAME, ROOTBROKER_MODULE_PATH
+)
+if ROOTBROKER_SPEC is None or ROOTBROKER_SPEC.loader is None:
+    raise RuntimeError("grabowski_rootbroker_cutover.py could not be loaded")
+rootbroker_cutover = importlib.util.module_from_spec(ROOTBROKER_SPEC)
+sys.modules[ROOTBROKER_MODULE_NAME] = rootbroker_cutover
+ROOTBROKER_SPEC.loader.exec_module(rootbroker_cutover)
 
 
 def _fresh_server_marker(target: str) -> dict[str, object]:
@@ -140,6 +153,16 @@ class RecoveryToolTests(unittest.TestCase):
         )
         self.alerts.start()
         self.addCleanup(self.alerts.stop)
+
+    def test_default_recovery_target_matches_rootbroker_authority(self) -> None:
+        self.assertEqual(
+            recovery.DEFAULT_SERVER_RECOVERY_TARGET,
+            rootbroker_cutover.CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            recovery.DEFAULT_SERVER_RECOVERY_HOST,
+            rootbroker_cutover.CONFIGURED_TARGET.split(":", 1)[0],
+        )
 
     def test_publication_failure_detail_prefers_structured_reason(self) -> None:
         self.assertEqual(
