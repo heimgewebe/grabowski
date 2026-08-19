@@ -49,6 +49,7 @@ BROWSER_SEMANTIC_TEMP_NAME = re.compile(
     r"\.browser-semantic-[0-9a-f]{32}\.(?:json|mjs)\Z"
 )
 BROWSER_SEMANTIC_TEMP_CLEANUP_LIMIT = 256
+WORKER_LIMIT_CORE_PROPERTY = "--property=LimitCORE=0"
 DEFAULT_BROWSER_EXECUTABLES = (
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
@@ -517,7 +518,7 @@ def _launch_argv(record: dict[str, Any], writable_paths: list[Path]) -> list[str
         "--property=Type=exec",
         "--property=KillMode=control-group",
         "--property=TimeoutStopSec=10s",
-        "--property=LimitCORE=0",
+        WORKER_LIMIT_CORE_PROPERTY,
         "--property=NoNewPrivileges=yes",
         "--property=ProtectSystem=full",
         "--property=ProtectHome=read-only",
@@ -2691,6 +2692,74 @@ class _BrowserSemanticFreshWorkerRequired(RuntimeError):
     """The worker predates semantic handles and must be restarted."""
 
 
+def _browser_semantic_node_runner_argv(
+    *,
+    token: str,
+    node_alias: Path,
+    script_path: Path,
+    request_path: Path,
+    timeout_seconds: int,
+) -> list[str]:
+    """Run the short-lived V8 helper outside the hardened operator process.
+
+    The operator can legitimately run with ``MemoryDenyWriteExecute=yes``. Node/V8
+    needs executable memory even for this bounded helper, so only the transient
+    helper unit receives ``MemoryDenyWriteExecute=no``. All browser/session, effect,
+    readback and audit authority remains in the parent process.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("browser semantic runner token is invalid")
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("browser semantic runner timeout must be positive")
+    if not node_alias.is_absolute():
+        raise ValueError("browser semantic runner node alias must be absolute")
+    unit = f"grabowski-browser-semantic-{token[:20]}.service"
+    # Keep the validated public alias as argv[0]. The canonical Heim Node wrapper
+    # dispatches on that public name; executing its resolved target directly would
+    # change semantics even though the target identity was already validated above.
+    child_argv = [
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "LANG=C.UTF-8",
+        str(node_alias),
+        str(script_path),
+        str(request_path),
+    ]
+    return [
+        "systemd-run",
+        "--user",
+        "--quiet",
+        "--wait",
+        "--collect",
+        "--pipe",
+        "--same-dir",
+        f"--description={operator._systemd_safe_description('browser-semantic', unit, operator._argv_hash(child_argv))}",
+        "--unit",
+        unit,
+        "--slice=grabowski-workers.slice",
+        "--property=Type=exec",
+        "--property=KillMode=control-group",
+        "--property=TimeoutStopSec=3s",
+        WORKER_LIMIT_CORE_PROPERTY,
+        "--property=NoNewPrivileges=yes",
+        "--property=ProtectSystem=full",
+        "--property=ProtectHome=read-only",
+        "--property=PrivateTmp=yes",
+        "--property=MemoryDenyWriteExecute=no",
+        "--property=UMask=0077",
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        f"--property=RuntimeMaxSec={timeout_seconds + 5}s",
+        "--property=MemoryMax=512M",
+        "--",
+        *child_argv,
+    ]
+
+
 def _run_node_browser_semantic(
     record: dict[str, Any],
     request: dict[str, Any],
@@ -2720,7 +2789,13 @@ def _run_node_browser_semantic(
         _write_private_action_file(request_path, _canonical_json(request) + "\n")
         created.append(request_path)
         execution = operator._run(
-            [str(node_path), str(script_path), str(request_path)],
+            _browser_semantic_node_runner_argv(
+                token=token,
+                node_alias=node_path,
+                script_path=script_path,
+                request_path=request_path,
+                timeout_seconds=timeout_seconds,
+            ),
             cwd=directory,
             timeout_seconds=timeout_seconds + 10,
             max_output_bytes=65536,
@@ -2733,7 +2808,12 @@ def _run_node_browser_semantic(
                 pass
     lines = [line for line in execution.get("stdout", "").splitlines() if line.strip()]
     if not lines:
-        raise RuntimeError("browser semantic action returned no receipt")
+        returncode = execution.get("returncode")
+        timed_out = str(bool(execution.get("timed_out"))).lower()
+        raise RuntimeError(
+            "browser semantic action returned no receipt "
+            f"(runner_returncode={returncode}, runner_timed_out={timed_out})"
+        )
     try:
         payload = json.loads(lines[-1])
     except json.JSONDecodeError as exc:
