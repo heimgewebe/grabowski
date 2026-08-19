@@ -799,14 +799,22 @@ def grabowski_recovery_provenance_repair(
     with self_deploy._deploy_schedule_lock():
         lane = _recovery_lane(expected_head)
         if lane.get("lane") == midcutover.LANE_MID_CUTOVER_RESUME:
-            return _resume_under_schedule_lock(expected_head)
+            if source_repository is None and source_lease_owner_id is None:
+                return _resume_under_schedule_lock(expected_head)
+            return _resume_under_schedule_lock(
+                expected_head, source_repository, source_lease_owner_id
+            )
         return _repair_under_schedule_lock(
             expected_head, source_repository, source_lease_owner_id, delay_seconds
         )
 
 
-def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
-    """Gate, reserve and dispatch the mid-cutover resume, under the deploy lock."""
+def _resume_under_schedule_lock(
+    expected_head: str,
+    source_repository: str | None = None,
+    source_lease_owner_id: str | None = None,
+) -> dict[str, Any]:
+    """Gate, source-bind and dispatch the mid-cutover resume under the deploy lock."""
     gate = evaluate_resume_gate(expected_head)
     if not gate["allowed"]:
         base._append_audit(
@@ -822,8 +830,33 @@ def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
 
     base._require_valid_audit_chain()
 
+    try:
+        repository, _deploy_runner, source_identity = (
+            self_deploy._deployment_source_preflight(
+                expected_head, source_repository, source_lease_owner_id
+            )
+        )
+    except (RuntimeError, ValueError, OSError, PermissionError) as exc:
+        reason = "resume_source_identity_bound"
+        source_gate = {
+            **gate,
+            "allowed": False,
+            "reasons": [reason],
+            "source_identity": None,
+            "source_error": str(exc),
+        }
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "midcutover-resume-source-denied",
+                "expected_head": expected_head,
+                "reasons": [reason],
+                "source_error": str(exc),
+            }
+        )
+        raise ProvenanceRecoveryDenied([reason], source_gate) from exc
+
     resume_binding = gate["resume_binding"]
-    repository = self_deploy.CANONICAL_REPOSITORY
     runner = repository / MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
     command = self_deploy._midcutover_resume_command(
         repository,
@@ -841,6 +874,7 @@ def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
         "resumed_receipt_sha256": resume_binding["resumed_receipt_sha256"],
         "resume_binding_sha256": resume_binding["binding_sha256"],
         "classification_sha256": gate["recovery_lane"].get("classification_sha256"),
+        "source_identity_sha256": source_identity["identity_sha256"],
         "gate": gate,
     }
     intent_sha256 = base._append_audit_with_digest(intent)
@@ -873,6 +907,7 @@ def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
             "job": already_running,
             "already_dispatched": True,
             "intent_sha256": intent_sha256,
+            "source_identity_sha256": source_identity["identity_sha256"],
             "post_state_readback_required": True,
             "next_action": (
                 "this exact resume is already running; read back its durable job "
@@ -947,6 +982,7 @@ def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
                 "cutover_id": resume_binding["cutover_id"],
                 "unit": job["unit"],
                 "argv_sha256": job["argv_sha256"],
+                "source_identity_sha256": source_identity["identity_sha256"],
             }
         )
     except Exception as exc:  # noqa: BLE001 - effect already dispatched
@@ -971,6 +1007,7 @@ def _resume_under_schedule_lock(expected_head: str) -> dict[str, Any]:
         "cutover_id": resume_binding["cutover_id"],
         "resumed_receipt_sha256": resume_binding["resumed_receipt_sha256"],
         "resume_binding_sha256": resume_binding["binding_sha256"],
+        "source_identity_sha256": source_identity["identity_sha256"],
         "gate": gate,
         "job": job,
         "intent_sha256": intent_sha256,

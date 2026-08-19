@@ -919,9 +919,20 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                     "resume_binding": binding,
                     "recovery_lane": lane,
                 }
+                source_repository = "/verified-resume-source"
+                source_lease_owner_id = "lane:verified-resume-source"
+                source_path = Path(source_repository)
+                source_identity = {
+                    **_source_identity(source_path),
+                    "source_kind": "detached-worktree",
+                    "canonical_repository": str(
+                        provenance_recovery.self_deploy.CANONICAL_REPOSITORY
+                    ),
+                    "identity_sha256": "12" * 32,
+                }
                 expected_command = [
                     "/usr/bin/python3",
-                    "/nonexistent-repo/tools/run_midcutover_resume.py",
+                    "/verified-resume-source/tools/run_midcutover_resume.py",
                     "--expected-head",
                     HEAD,
                     "--resume-binding-sha256",
@@ -949,6 +960,15 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                     ),
                     patch.object(
                         provenance_recovery.self_deploy,
+                        "_deployment_source_preflight",
+                        return_value=(
+                            source_path,
+                            source_path / provenance_recovery.self_deploy.RUNNER_RELATIVE_PATH,
+                            source_identity,
+                        ),
+                    ) as source_preflight,
+                    patch.object(
+                        provenance_recovery.self_deploy,
                         "_midcutover_resume_command",
                         return_value=expected_command,
                     ) as command_builder,
@@ -966,19 +986,25 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                 ):
                     result = (
                         provenance_recovery.grabowski_recovery_provenance_repair(
-                            HEAD
+                            HEAD,
+                            source_repository=source_repository,
+                            source_lease_owner_id=source_lease_owner_id,
                         )
                     )
 
+                source_preflight.assert_called_once_with(
+                    HEAD, source_repository, source_lease_owner_id
+                )
                 command_builder.assert_called_once_with(
-                    provenance_recovery.self_deploy.CANONICAL_REPOSITORY,
-                    provenance_recovery.self_deploy.CANONICAL_REPOSITORY
+                    source_path,
+                    source_path
                     / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
                     HEAD,
                     "bgc-cold-reentry",
                     "ab" * 32,
                 )
                 start_job.assert_called_once()
+                self.assertEqual(start_job.call_args.kwargs["cwd"], str(source_path))
                 self.assertEqual(start_job.call_args.args[0], expected_command)
                 self.assertEqual(
                     start_job.call_args.kwargs["invoker_tool"],
@@ -986,6 +1012,55 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                 )
                 ordinary_repair.assert_not_called()
                 self.assertEqual(result["lane"], lane["lane"])
+                self.assertEqual(
+                    result["source_identity_sha256"], source_identity["identity_sha256"]
+                )
+
+    def test_midcutover_resume_rejects_source_drift_before_dispatch(self) -> None:
+        binding = {
+            "cutover_id": "bgc-source-drift",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        with (
+            patch.object(provenance_recovery, "_recovery_lane", return_value=lane),
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_deployment_source_preflight",
+                side_effect=RuntimeError(
+                    f"HEAD drift: expected {HEAD}, found {OTHER_HEAD}"
+                ),
+            ) as source_preflight,
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.ProvenanceRecoveryDenied
+            ) as raised:
+                provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+
+        source_preflight.assert_called_once_with(HEAD, None, None)
+        self.assertEqual(raised.exception.reasons, ["resume_source_identity_bound"])
+        self.assertIn("HEAD drift", raised.exception.evidence["source_error"])
+        start_job.assert_not_called()
+        operations = [
+            call.args[0].get("operation") for call in audit.call_args_list if call.args
+        ]
+        self.assertIn("midcutover-resume-source-denied", operations)
 
     def test_fail_closed_public_recovery_lane_starts_no_runner(self) -> None:
         fail_closed = {
