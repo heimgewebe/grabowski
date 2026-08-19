@@ -29,6 +29,22 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertNotIn("%h", text)
         self.assertNotIn("tunnel-client", text)
 
+    def test_operator_unit_grants_exact_bureau_state_root_without_broad_state_write(self) -> None:
+        text = (
+            ROOT / "systemd" / "grabowski-operator.service.example"
+        ).read_text(encoding="utf-8")
+        read_write_line = next(
+            line for line in text.splitlines() if line.startswith("ReadWritePaths=")
+        )
+        read_write_paths = read_write_line.split("=", 1)[1].split()
+        self.assertIn("/home/alex/.local/state/grabowski", read_write_paths)
+        self.assertIn("/home/alex/.local/state/bureau", read_write_paths)
+        self.assertIn("/home/alex/repos", read_write_paths)
+        self.assertIn("/home/alex/grabowski-workspace", read_write_paths)
+        self.assertNotIn("/home/alex/.local/state", read_write_paths)
+        self.assertIn("ProtectSystem=strict", text)
+        self.assertIn("ProtectHome=read-only", text)
+
     def test_component_watchdogs_require_both_installed_python_assets(self) -> None:
         helper_condition = (
             "ConditionPathExists=%h/.local/libexec/grabowski/"
