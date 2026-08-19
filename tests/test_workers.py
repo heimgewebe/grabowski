@@ -2576,6 +2576,110 @@ globalThis.fetch = async () => ({
             },
         }
 
+    def test_browser_semantic_node_runner_isolates_v8_write_execute_from_operator(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            worker = workers.browser_start(
+                str(self.binary), port=9280, args=["--headless=new"], runtime_seconds=60
+            )["worker"]
+        record = workers._row(worker["worker_id"])
+        fake_target = self.root / "heim-node-tool"
+        fake_target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_target.chmod(0o755)
+        fake_node = self.root / "node"
+        fake_node.symlink_to(fake_target)
+        payload = self._semantic_state_payload()
+        with patch.object(workers.shutil, "which", return_value=str(fake_node)), patch.object(
+            workers.operator,
+            "_run",
+            return_value=result(stdout=json.dumps(payload) + "\n"),
+        ) as run:
+            observed = workers._run_node_browser_semantic(
+                record,
+                {
+                    "schema_version": 1,
+                    "port": 9280,
+                    "timeout_ms": 10_000,
+                    "op": "read_state",
+                },
+                timeout_seconds=10,
+            )
+        self.assertEqual(observed, payload)
+        launch = run.call_args.args[0]
+        self.assertEqual(
+            launch[:7],
+            [
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--wait",
+                "--collect",
+                "--pipe",
+                "--same-dir",
+            ],
+        )
+        self.assertIn("--slice=grabowski-workers.slice", launch)
+        self.assertIn("--property=NoNewPrivileges=yes", launch)
+        self.assertIn("--property=ProtectSystem=full", launch)
+        self.assertIn("--property=ProtectHome=read-only", launch)
+        self.assertIn("--property=PrivateTmp=yes", launch)
+        self.assertIn("--property=MemoryDenyWriteExecute=no", launch)
+        self.assertIn(
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", launch
+        )
+        self.assertIn("--property=RuntimeMaxSec=15s", launch)
+        self.assertIn("--property=MemoryMax=512M", launch)
+        separator = launch.index("--")
+        child = launch[separator + 1 :]
+        self.assertEqual(
+            child[:5],
+            [
+                "/usr/bin/env",
+                "-i",
+                "PATH=/usr/bin:/bin",
+                "LANG=C.UTF-8",
+                str(fake_node),
+            ],
+        )
+        self.assertNotIn(str(fake_target.resolve()), child[:5])
+        self.assertTrue(child[-2].endswith(".mjs"))
+        self.assertTrue(child[-1].endswith(".json"))
+        self.assertFalse(Path(child[-2]).exists())
+        self.assertFalse(Path(child[-1]).exists())
+
+    def test_browser_semantic_node_runner_no_receipt_exposes_only_runner_status(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            worker = workers.browser_start(str(self.binary), port=9281, runtime_seconds=60)[
+                "worker"
+            ]
+        record = workers._row(worker["worker_id"])
+        fake_node = self.root / "node-no-receipt"
+        fake_node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_node.chmod(0o755)
+        failed = result(returncode=-5)
+        failed["stderr"] = "sensitive low-level V8 diagnostic"
+        with patch.object(workers.shutil, "which", return_value=str(fake_node)), patch.object(
+            workers.operator, "_run", return_value=failed
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"runner_returncode=-5, runner_timed_out=false",
+            ) as raised:
+                workers._run_node_browser_semantic(
+                    record,
+                    {
+                        "schema_version": 1,
+                        "port": 9281,
+                        "timeout_ms": 10_000,
+                        "op": "read_state",
+                    },
+                    timeout_seconds=10,
+                )
+        self.assertNotIn("sensitive low-level V8 diagnostic", str(raised.exception))
+
     def test_browser_semantic_snapshot_id_is_deterministic_and_dom_bound(self) -> None:
         handle_key = b"k" * 32
         state = workers._bounded_browser_state(
