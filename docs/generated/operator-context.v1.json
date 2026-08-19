@@ -3039,6 +3039,11 @@
       },
       {
         "kind": "python_module",
+        "launcher_module": "grabowski_fleet_mutation",
+        "spawned_module": "grabowski_fleet_mutation"
+      },
+      {
+        "kind": "python_module",
         "launcher_module": "grabowski_job_finalizer",
         "spawned_module": "grabowski_ntfy_dispatch"
       },
@@ -3252,6 +3257,10 @@
       {
         "module": "grabowski_fleet",
         "source": "src/grabowski_fleet.py"
+      },
+      {
+        "module": "grabowski_fleet_mutation",
+        "source": "src/grabowski_fleet_mutation.py"
       },
       {
         "module": "grabowski_operations",
@@ -3511,7 +3520,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "96fcbcdcc6a84514b0cf0bd08fd8d540a1543baf0a8aa5dbcfcb485453f67b55"
+      "sha256": "417d8989983fcf2ef95ddaa2f39ee655049dbfb746e9d456f712afbe0efab494"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3561,6 +3570,7 @@
       "src/grabowski_execution_coordinator.py": "d31054cc2eb0fe90faf3b1fe84f7c23fc33277817ab88b25fc658524a4cdcc2f",
       "src/grabowski_execution_plan.py": "d4c71362493f73714b5d0420c5b5a9f115f39c38cbf203cfa4a5507527fe4a54",
       "src/grabowski_fleet.py": "8142b437eeac7158fca22bb7df105df9fbc0ba824300a5431a7b1827dc1c9db9",
+      "src/grabowski_fleet_mutation.py": "f03f8d44e6ac436ffbe016341e3f3dba4a313cbd7973b1f18929e4fa643d3be9",
       "src/grabowski_forrest_server_exit.py": "f7a709556197a5c15240e1b0be9c2015f35cad198ce29fe98c4b6fe1204f9cea",
       "src/grabowski_friction.py": "524d7839aabd0cbb8b710714b7656214f17aa3bc9504dc635f890231e3a37e4f",
       "src/grabowski_grip_orchestration.py": "b16576878f5e4313e3f16535d4cdb1333ea5cc1e76b58c4c38ffb2fc9ab46ed8",

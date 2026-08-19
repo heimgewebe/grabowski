@@ -86,8 +86,7 @@ def _keys(value: dict[str, Any], required: set[str], optional: set[str], label: 
         raise ValueError(f"{label} key mismatch; missing={missing}, unknown={unknown}")
 
 
-def load_fleet() -> dict[str, Any]:
-    raw = _load_object(FLEET_CONFIG)
+def validate_fleet(raw: dict[str, Any]) -> dict[str, Any]:
     _keys(raw, {"schema_version", "hosts"}, set(), "Fleet registry")
     if raw["schema_version"] != 1 or not isinstance(raw["hosts"], dict):
         raise ValueError("Fleet registry must use schema_version 1 and object hosts")
@@ -132,6 +131,10 @@ def load_fleet() -> dict[str, Any]:
             "remote_command_mode": remote_command_mode,
         }
     return {"schema_version": 1, "hosts": hosts}
+
+
+def load_fleet() -> dict[str, Any]:
+    return validate_fleet(_load_object(FLEET_CONFIG))
 
 
 def fleet_host(name: str) -> dict[str, Any]:

@@ -407,6 +407,10 @@
       "source": "src/grabowski_fleet.py"
     },
     {
+      "module": "grabowski_fleet_mutation",
+      "source": "src/grabowski_fleet_mutation.py"
+    },
+    {
       "module": "grabowski_operations",
       "source": "src/grabowski_operations.py"
     },
@@ -686,6 +690,11 @@
       "kind": "python_module",
       "launcher_module": "grabowski_workers",
       "spawned_module": "grabowski_worker_process"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_fleet_mutation",
+      "spawned_module": "grabowski_fleet_mutation"
     },
     {
       "kind": "python_module",
