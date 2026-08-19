@@ -743,7 +743,7 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         launcher.chmod(0o700)
         patches = [
             patch.object(bureau, "BUREAU_MANAGED_LAUNCHER", launcher),
-            patch.object(bureau, "BUREAU_CONTRACT_PYTHON", self.python),
+            patch.object(bureau, "BUREAU_CONTRACT_EXECUTABLE", self.executable),
         ]
         return launcher, source_commit, patches
 
@@ -981,6 +981,38 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
             result["bureau_contract"]["contract_executable_sha256"],
             hashlib.sha256(launcher.read_bytes()).hexdigest(),
         )
+
+    def test_managed_runtime_rechecks_bound_bureau_python_environment(self) -> None:
+        _launcher, _source_commit, patches = self._install_managed_runtime()
+
+        def mutate_dependency_runtime(argv: list[str], **kwargs):
+            result = self._response(argv)
+            self.cli_module.write_text(
+                "def main(argv=None): return 1\n", encoding="utf-8"
+            )
+            return result
+
+        with (
+            patches[0],
+            patches[1],
+            patch.object(
+                bureau.subprocess,
+                "run",
+                side_effect=mutate_dependency_runtime,
+            ),
+        ):
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.code, "contract-component-changed-during-check"
+        )
+        self.assertEqual(raised.exception.details.get("component"), "bureau_cli")
+        self.assertFalse(self.database.exists())
 
     def test_managed_runtime_accepts_bureau_cycle_systemd_package_tree(self) -> None:
         launcher, source_commit, patches = self._install_managed_runtime(
