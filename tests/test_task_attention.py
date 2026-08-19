@@ -680,6 +680,54 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual("not_required", plan["attention_classification"])
         self.assertIsNone(plan["operator_obligation"])
 
+    def test_task_archive_plan_owns_attention_authority_observation(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        classification = {task_id: {"classification": "terminal_archivable"}}
+        now_unix = int(record["terminalized_at_unix"]) + 1000
+
+        with patch.object(
+            attention,
+            "terminal_closeout_plan",
+            return_value={
+                "archive_ready": True,
+                "closeout_state": "ready_to_archive",
+            },
+        ) as closeout_plan:
+            plan = attention.build_task_archive_plan(
+                [record],
+                classification,
+                now_unix=now_unix,
+                minimum_age_seconds=100,
+            )
+
+        self.assertEqual([task_id], plan["eligible_task_ids"])
+        closeout_plan.assert_called_once()
+
+    def test_task_archive_plan_preserves_stale_binding_fail_closed(self) -> None:
+        record = self._failed_task()
+        task_id = str(record["task_id"])
+        stale = {**record, "lifecycle_receipt_sha256": "b" * 64}
+        classification = {task_id: {"classification": "terminal_archivable"}}
+        now_unix = int(record["terminalized_at_unix"]) + 1000
+
+        with patch.object(tasks, "_row_raw", return_value=stale), patch.object(
+            attention, "terminal_closeout_plan"
+        ) as closeout_plan:
+            plan = attention.build_task_archive_plan(
+                [record],
+                classification,
+                now_unix=now_unix,
+                minimum_age_seconds=100,
+            )
+
+        self.assertEqual([], plan["eligible_task_ids"])
+        self.assertIn(
+            "attention_authority_binding_mismatch",
+            plan["blocked"][0]["reason_codes"],
+        )
+        closeout_plan.assert_not_called()
+
     def test_task_archive_classification_uses_typed_not_applicable_sources(self) -> None:
         record = self._completed_task()
         with patch.object(
