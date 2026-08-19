@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 import grabowski_fleet as fleet
+import grabowski_fleet_mutation as fleet_mutation
 import grabowski_mcp as base
 try:
     import grabowski_operator_core as operator
@@ -28,6 +29,7 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 PARAMETER = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 PLACEHOLDER = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_]{0,63})\}\Z")
 PHASES = {"preflight": 0, "action": 1, "postflight": 2, "rollback": 3}
+FLEET_MUTATION_OPERATION = "fleet-registry-mutate"
 
 
 def _hash(value: Any) -> str:
@@ -163,17 +165,108 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
                                 max_output_bytes=operator.DEFAULT_OUTPUT_BYTES)
 
 
+def _append_fleet_mutation_audit(audit: dict[str, Any]) -> dict[str, Any]:
+    response = dict(audit)
+    try:
+        base._append_audit(audit)
+        response["secondary_audit_recorded"] = True
+    except Exception as exc:
+        # The dedicated mutation receipt is authoritative. Failure of this
+        # secondary projection must not make an already-proven effect appear
+        # unknown to the caller.
+        response["secondary_audit_recorded"] = False
+        response["secondary_audit_error_type"] = type(exc).__name__
+    return response
+
+
+def _run_fleet_registry_mutation(parameters: dict[str, str] | None) -> dict[str, Any]:
+    plan = fleet_mutation.plan_registry_mutation(parameters)
+    public = plan["public"]
+    parameters_sha256 = _hash(parameters or {})
+    operator._require_operator_mutation(
+        "terminal_execute",
+        opaque_command=False,
+    )
+    try:
+        outcome = fleet_mutation.execute_registry_mutation(plan)
+    except Exception as exc:
+        audit = {
+            "timestamp_unix": int(time.time()),
+            "operation": "named-operation-run",
+            "recipe": FLEET_MUTATION_OPERATION,
+            "parameters_sha256": parameters_sha256,
+            "success": False,
+            "failed_phase": "action",
+            "rollback_attempted": False,
+            "rollback_success": False,
+            "fleet_host": public["host"],
+            "registry_before_sha256": public["expected_registry_sha256"],
+            "error_type": type(exc).__name__,
+        }
+        _append_fleet_mutation_audit(audit)
+        raise
+    receipt = outcome["receipt"]
+    success = bool(outcome["success"])
+    rollback = receipt.get("rollback", {})
+    audit = {
+        "timestamp_unix": int(time.time()),
+        "operation": "named-operation-run",
+        "recipe": FLEET_MUTATION_OPERATION,
+        "parameters_sha256": parameters_sha256,
+        "success": success,
+        "failed_phase": None if success else "action",
+        "rollback_attempted": bool(rollback.get("attempted")),
+        "rollback_success": bool(rollback.get("success")),
+        "fleet_host": public["host"],
+        "registry_before_sha256": receipt.get("before_registry_sha256"),
+        "registry_after_sha256": receipt.get("after_registry_sha256"),
+        "receipt_path": receipt.get("receipt_path"),
+        "readback_ok": bool(receipt.get("readback", {}).get("ok")),
+    }
+    audit = _append_fleet_mutation_audit(audit)
+    return {
+        "operation": FLEET_MUTATION_OPERATION,
+        "success": success,
+        "failed_phase": None if success else "action",
+        "results": [{
+            "phase": "action",
+            "target": "local",
+            "typed_action": FLEET_MUTATION_OPERATION,
+            "outcome": outcome,
+        }],
+        "rollback": {
+            "attempted": bool(rollback.get("attempted")),
+            "success": bool(rollback.get("success")),
+            "receipt_path": receipt.get("receipt_path"),
+        },
+        "audit": audit,
+    }
+
+
 @mcp.tool(name="grabowski_operation_list", annotations=READ_ONLY)
 def grabowski_operation_list() -> dict[str, Any]:
     """List validated named operations."""
     operator._require_operator_capability("terminal_execute")
     raw = _load()
+    if FLEET_MUTATION_OPERATION in raw["operations"]:
+        raise ValueError("Operations registry shadows reserved Fleet mutation operation")
     operations = {}
     for name in sorted(raw["operations"]):
         operation = _validated(name)
         operations[name] = {"description": operation["description"],
                             "parameters": sorted(operation["parameters"]),
                             "step_count": len(operation["steps"])}
+    operations[FLEET_MUTATION_OPERATION] = {
+        "description": "Atomically mutate one validated Fleet host with CAS, receipt and readback.",
+        "parameters": [
+            "operation",
+            "host",
+            "expected_registry_sha256",
+            "host_spec_json (add/update only)",
+        ],
+        "step_count": 1,
+        "typed_builtin": True,
+    }
     return {"path": str(OPERATIONS_CONFIG), "operations": operations}
 
 
@@ -182,6 +275,8 @@ def grabowski_operation_plan(operation: str,
                               parameters: dict[str, str] | None = None) -> dict[str, Any]:
     """Render one operation and its rollback path without executing it."""
     operator._require_operator_capability("terminal_execute")
+    if operation == FLEET_MUTATION_OPERATION:
+        return fleet_mutation.plan_registry_mutation(parameters)["public"]
     return _render(operation, parameters)
 
 
@@ -189,6 +284,8 @@ def grabowski_operation_plan(operation: str,
 def grabowski_operation_run(operation: str,
                              parameters: dict[str, str] | None = None) -> dict[str, Any]:
     """Run preflight, action and postflight, then rollback after a failure."""
+    if operation == FLEET_MUTATION_OPERATION:
+        return _run_fleet_registry_mutation(parameters)
     plan = _render(operation, parameters)
     for target in sorted({step["target"] for step in plan["steps"]}):
         operator._require_operator_mutation(
