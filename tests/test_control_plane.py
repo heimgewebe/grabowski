@@ -50,7 +50,16 @@ import grabowski_fleet as fleet
 import grabowski_tasks as tasks
 import grabowski_operations as operations
 import grabowski_privileged as privileged
-import grabowski_privileged_broker as privileged_broker
+
+_BROKER_SPEC = importlib.util.spec_from_file_location(
+    "grabowski_privileged_broker_control_plane_test",
+    SRC / "grabowski_privileged_broker.py",
+)
+if _BROKER_SPEC is None or _BROKER_SPEC.loader is None:
+    raise RuntimeError("privileged broker source module could not be loaded")
+privileged_broker = importlib.util.module_from_spec(_BROKER_SPEC)
+sys.modules[_BROKER_SPEC.name] = privileged_broker
+_BROKER_SPEC.loader.exec_module(privileged_broker)
 
 
 def _write(path: Path, value: object) -> None:
@@ -667,6 +676,134 @@ class PrivilegedBrokerTests(unittest.TestCase):
             ["/usr/bin/systemctl", "restart", "grabowski-mcp.service"],
         )
         self.assertEqual(timeout, 120)
+
+    def test_template_action_can_require_exact_operator_peer(self) -> None:
+        reference = self._reference()
+        reference["action"] = "operator_rootbroker_cutover"
+        reference["target"] = "a" * 40
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_rootbroker_cutover": {
+                    "enabled": True,
+                    "mode": "template",
+                    "target_pattern": r"[0-9a-f]{40}",
+                    "argv": [
+                        "/usr/local/libexec/grabowski-rootbroker-cutover",
+                        "--expected-head",
+                        "{target}",
+                    ],
+                    "timeout_seconds": 600,
+                    "kill_switch_path": "/tmp/rootbroker-peer-stop",
+                    "legacy_kill_switch_path": "/tmp/rootbroker-peer-legacy-stop",
+                    "allowed_peer_uid": 1000,
+                    "allowed_peer_unit": "grabowski-operator.service",
+                }
+            },
+        }
+        execution = privileged_broker.resolve_execution(config, parsed)
+        self.assertEqual(execution["allowed_peer_uid"], 1000)
+        self.assertEqual(
+            execution["allowed_peer_unit"], "grabowski-operator.service"
+        )
+
+    def test_peer_bound_template_honors_kill_switch(self) -> None:
+        reference = self._reference()
+        reference["action"] = "operator_rootbroker_cutover"
+        reference["target"] = "a" * 40
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        marker = Path(self.tmp.name) / "operator-stop"
+        marker.write_text("stop\n", encoding="utf-8")
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_rootbroker_cutover": {
+                    "enabled": True,
+                    "mode": "template",
+                    "target_pattern": r"[0-9a-f]{40}",
+                    "argv": ["/usr/bin/true", "{target}"],
+                    "timeout_seconds": 60,
+                    "kill_switch_path": str(marker),
+                    "legacy_kill_switch_path": str(Path(self.tmp.name) / "legacy-stop"),
+                    "allowed_peer_uid": 1000,
+                    "allowed_peer_unit": "grabowski-operator.service",
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
+            privileged_broker.resolve_execution(config, parsed)
+
+    def test_rootbroker_cutover_requires_peer_and_kill_switch_fields(self) -> None:
+        reference = self._reference()
+        reference["action"] = "operator_rootbroker_cutover"
+        reference["target"] = "a" * 40
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        base = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": r"[0-9a-f]{40}",
+            "argv": ["/usr/bin/true", "{target}"],
+            "timeout_seconds": 60,
+            "kill_switch_path": "/tmp/rootbroker-stop",
+            "legacy_kill_switch_path": "/tmp/rootbroker-legacy-stop",
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        for missing in (
+            "kill_switch_path",
+            "legacy_kill_switch_path",
+            "allowed_peer_uid",
+            "allowed_peer_unit",
+        ):
+            with self.subTest(missing=missing):
+                action = dict(base)
+                action.pop(missing)
+                with self.assertRaisesRegex(PermissionError, "authority contract is incomplete"):
+                    privileged_broker.resolve_execution(
+                        {"schema_version": 2, "actions": {"operator_rootbroker_cutover": action}},
+                        parsed,
+                    )
+
+    def test_template_peer_contract_requires_uid_and_unit_together(self) -> None:
+        reference = self._reference()
+        reference["action"] = "peer_bound_template_test"
+        reference["target"] = "a" * 40
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        for lone_key, lone_value in (
+            ("allowed_peer_uid", 1000),
+            ("allowed_peer_unit", "grabowski-operator.service"),
+        ):
+            with self.subTest(lone_key=lone_key):
+                action = {
+                    "enabled": True,
+                    "mode": "template",
+                    "target_pattern": r"[0-9a-f]{40}",
+                    "argv": ["/usr/bin/true", "{target}"],
+                    "timeout_seconds": 60,
+                    lone_key: lone_value,
+                }
+                with self.assertRaisesRegex(PermissionError, "peer identity"):
+                    privileged_broker.resolve_execution(
+                        {"schema_version": 2, "actions": {"peer_bound_template_test": action}},
+                        parsed,
+                    )
 
     def test_template_target_allows_json_payload_braces(self) -> None:
         reference = self._reference()
@@ -1507,7 +1644,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             ROOT / "tools" / "grabowski_rootbroker_cutover.py",
             "PROCESS_OBSERVER_BIND_PATHS",
         )
-        service_roots = tuple(
+        service_bind_roots = tuple(
             line.removeprefix("BindReadOnlyPaths=-")
             for line in (ROOT / "systemd" / "grabowski-privileged-broker@.service")
             .read_text(encoding="utf-8")
@@ -1515,10 +1652,20 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             if line.startswith("BindReadOnlyPaths=-/home/alex/repos/")
             or line == "BindReadOnlyPaths=-/home/alex/worktrees"
         )
+        automatic_cutover_roots = string_tuple(
+            ROOT / "tools" / "grabowski_rootbroker_cutover.py",
+            "AUTOMATIC_CUTOVER_BIND_PATHS",
+        )
+        service_process_observer_roots = tuple(
+            root for root in service_bind_roots if root not in automatic_cutover_roots
+        )
 
         self.assertEqual(observer_roots, expected)
         self.assertEqual(cutover_roots, expected)
-        self.assertEqual(service_roots, expected)
+        self.assertEqual(service_process_observer_roots, expected)
+        self.assertEqual(automatic_cutover_roots, ("/home/alex/repos/grabowski",))
+        self.assertIn("/home/alex/repos/grabowski", service_bind_roots)
+        self.assertNotIn("/home/alex/repos/grabowski", expected)
         self.assertNotIn("/home/alex/repos", expected)
 
     def test_broker_script_uses_utf8_audit_hash_and_process_group_timeout(self) -> None:

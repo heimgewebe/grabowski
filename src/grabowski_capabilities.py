@@ -1228,7 +1228,7 @@ TOOL_PROFILES.update(
     {
         "grabowski_runtime_deploy_schedule": {
             "category": "deployment",
-            "purpose": "Schedule a validated delayed deployment from the canonical main checkout.",
+            "purpose": "Schedule a validated delayed deployment after fresh public GitHub-main and root-authority verification.",
             "risk_class": "high",
             "effects": [
                 "background-job-start",

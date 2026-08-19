@@ -679,7 +679,7 @@ def require_clean_repo(repo: Path) -> str:
 
 def git_show(repo: Path, head: str, path: Path) -> bytes:
     return run_bytes(
-        ["git", "show", f"{head}:{path.as_posix()}"],
+        ["git", "--no-replace-objects", "show", f"{head}:{path.as_posix()}"],
         cwd=repo,
         timeout=TIMEOUTS["git"],
     )

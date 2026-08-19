@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -52,12 +53,22 @@ def _load_self_deploy():
     read_surface = types.ModuleType("grabowski_read_surface")
     read_surface._git_command = lambda repo, *args: ["git", "-C", str(repo), *args]
     read_surface._run_read = Mock()
+    privileged = types.ModuleType("grabowski_privileged")
+    privileged.ensure_rootbroker_authority = Mock(
+        side_effect=lambda expected_head: {
+            "success": True,
+            "outcome": "already_current",
+            "expected_head": expected_head,
+            "attested_head": expected_head,
+            "effect_started": False,
+        }
+    )
     name = "grabowski_self_deploy_test"
     spec = importlib.util.spec_from_file_location(name, ROOT / "src" / "grabowski_self_deploy.py")
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load self deploy module")
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"mcp": fake_mcp, "mcp.types": fake_types, "pydantic": fake_pydantic, "grabowski_operator_core": operator, "grabowski_mcp": base, "grabowski_read_surface": read_surface, name: module}, clear=False):
+    with patch.dict(sys.modules, {"mcp": fake_mcp, "mcp.types": fake_types, "pydantic": fake_pydantic, "grabowski_operator_core": operator, "grabowski_mcp": base, "grabowski_read_surface": read_surface, "grabowski_privileged": privileged, name: module}, clear=False):
         spec.loader.exec_module(module)
     return module
 
@@ -65,6 +76,10 @@ def _result(stdout: str = "", returncode: int = 0) -> dict[str, object]:
     return {"returncode": returncode, "timed_out": False, "stdout_truncated": False, "stderr_truncated": False, "stdout": stdout, "stderr": ""}
 
 SELF_DEPLOY = _load_self_deploy()
+REAL_FRESH_PUBLIC_GITHUB_MAIN = SELF_DEPLOY._fresh_public_github_main
+SELF_DEPLOY._fresh_public_github_main = Mock(
+    side_effect=lambda expected_head: expected_head
+)
 
 def _source_identity(repo: Path, head: str, *, kind: str = "canonical-main", canonical: Path | None = None) -> dict[str, object]:
     canonical_repo = canonical or repo
@@ -800,6 +815,145 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
         self.assertEqual(result["unit"], unit)
         self.assertEqual(SELF_DEPLOY.base._append_audit.call_count, 2)
+
+    def test_public_github_main_lookup_is_fixed_and_credential_free(self) -> None:
+        expected = "d" * 40
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=f"{expected}\trefs/heads/main\n",
+            stderr="",
+        )
+        with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed) as run:
+            observed = REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+        self.assertEqual(observed, expected)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/git")
+        self.assertIn("credential.helper=", argv)
+        self.assertEqual(argv[-2:], [SELF_DEPLOY.PUBLIC_GITHUB_REPOSITORY_URL, SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF])
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["cwd"], "/")
+        self.assertEqual(kwargs["timeout"], SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS)
+        env = kwargs["env"]
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GIT_ASKPASS"], "/bin/false")
+        self.assertNotIn("HOME", env)
+        self.assertFalse(any("PROXY" in key.upper() for key in env))
+
+    def test_schedule_blocks_when_public_github_main_differs_before_root_effect(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "d" * 40
+        identity = _source_identity(repo, expected)
+        SELF_DEPLOY.privileged.ensure_rootbroker_authority.reset_mock()
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(repo, runner, identity),
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value="e" * 40
+        ):
+            with self.assertRaisesRegex(RuntimeError, "public GitHub main differs"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        SELF_DEPLOY.privileged.ensure_rootbroker_authority.assert_not_called()
+        SELF_DEPLOY.operator._start_job.assert_not_called()
+
+    def test_schedule_blocks_when_public_github_main_drifts_during_root_refresh(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "d" * 40
+        identity = _source_identity(repo, expected)
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(repo, runner, identity),
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, "e" * 40],
+        ), patch.object(
+            SELF_DEPLOY.privileged,
+            "ensure_rootbroker_authority",
+            return_value={
+                "success": True,
+                "outcome": "succeeded",
+                "expected_head": expected,
+                "attested_head": expected,
+                "effect_started": True,
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "GitHub main drifted"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        SELF_DEPLOY.operator._start_job.assert_not_called()
+
+    def test_schedule_blocks_when_rootbroker_authority_refresh_fails(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "d" * 40
+        identity = _source_identity(repo, expected)
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(repo, runner, identity),
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY.privileged,
+            "ensure_rootbroker_authority",
+            return_value={
+                "success": False,
+                "outcome": "failed",
+                "failure_reason": "authority mismatch",
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job"
+        ) as lookup:
+            with self.assertRaisesRegex(RuntimeError, "authority refresh failed"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        lookup.assert_not_called()
+        SELF_DEPLOY.operator._start_job.assert_not_called()
+
+    def test_schedule_rejects_source_identity_drift_during_authority_refresh(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "d" * 40
+        before = _source_identity(repo, expected)
+        after = dict(before)
+        after["identity_sha256"] = "9" * 64
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[(repo, runner, before), (repo, runner, after)],
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY.privileged,
+            "ensure_rootbroker_authority",
+            return_value={
+                "success": True,
+                "outcome": "succeeded",
+                "expected_head": expected,
+                "attested_head": expected,
+                "effect_started": True,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job"
+        ) as lookup:
+            with self.assertRaisesRegex(RuntimeError, "source identity drifted"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        lookup.assert_not_called()
+        SELF_DEPLOY.operator._start_job.assert_not_called()
 
     def test_schedule_reuses_identical_inflight_job_without_starting_another(self) -> None:
         repo = Path("/home/alex/repos/grabowski")

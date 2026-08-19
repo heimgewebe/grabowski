@@ -131,12 +131,23 @@ def parse_reference(data: bytes, *, now: int | None = None) -> dict[str, Any]:
     return value
 
 
+ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+
+
 def _resolve_template_action(
     candidate: dict[str, Any],
     reference: dict[str, Any],
 ) -> dict[str, Any]:
     required = {"enabled", "target_pattern", "argv", "timeout_seconds"}
-    if set(candidate) not in (required, required | {"mode"}):
+    optional = {
+        "mode",
+        "allowed_peer_uid",
+        "allowed_peer_unit",
+        "kill_switch_path",
+        "legacy_kill_switch_path",
+    }
+    candidate_keys = set(candidate)
+    if not required.issubset(candidate_keys) or candidate_keys - required - optional:
         raise PermissionError("privileged action is disabled or malformed")
     if candidate.get("enabled") is not True:
         raise PermissionError("privileged action is disabled or malformed")
@@ -163,12 +174,57 @@ def _resolve_template_action(
     argv = [reference["target"] if token == "{target}" else token for token in template]
     if not Path(argv[0]).is_absolute():
         raise ValueError("privileged executable must be an absolute path")
-    return {
+    execution: dict[str, Any] = {
         "mode": "template",
         "argv": argv,
         "cwd": None,
         "timeout_seconds": timeout,
     }
+    kill_switch_value = candidate.get("kill_switch_path")
+    legacy_kill_switch_value = candidate.get("legacy_kill_switch_path")
+    peer_uid = candidate.get("allowed_peer_uid")
+    peer_unit = candidate.get("allowed_peer_unit")
+    if reference.get("action") == ROOTBROKER_CUTOVER_ACTION and (
+        kill_switch_value is None
+        or legacy_kill_switch_value is None
+        or peer_uid is None
+        or peer_unit is None
+    ):
+        raise PermissionError("automatic Rootbroker cutover authority contract is incomplete")
+    if legacy_kill_switch_value is not None and kill_switch_value is None:
+        raise PermissionError("template kill-switch contract is malformed")
+    if kill_switch_value is not None:
+        kill_switch = _validate_gate_path(
+            kill_switch_value, label="template kill_switch_path"
+        )
+        legacy_kill_switch = (
+            _validate_gate_path(
+                legacy_kill_switch_value, label="template legacy_kill_switch_path"
+            )
+            if legacy_kill_switch_value is not None
+            else None
+        )
+        if os.path.lexists(kill_switch) or (
+            legacy_kill_switch is not None
+            and os.path.lexists(legacy_kill_switch)
+        ):
+            raise PermissionError("template kill-switch is engaged")
+        execution["kill_switch_path"] = str(kill_switch)
+        if legacy_kill_switch is not None:
+            execution["legacy_kill_switch_path"] = str(legacy_kill_switch)
+
+    if peer_uid is not None or peer_unit is not None:
+        if (
+            isinstance(peer_uid, bool)
+            or not isinstance(peer_uid, int)
+            or peer_uid < 0
+            or not isinstance(peer_unit, str)
+            or not peer_unit
+        ):
+            raise PermissionError("template peer identity contract is malformed")
+        execution["allowed_peer_uid"] = peer_uid
+        execution["allowed_peer_unit"] = peer_unit
+    return execution
 
 
 def _validate_power_argv(value: Any, *, max_argv: int, allow_shell: bool) -> list[str]:

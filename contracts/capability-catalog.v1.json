@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "6196f9ab80ed8ab945f3bd502829dceb79857bd36c35a1032c4bffb808497ebe",
+  "capability_source_sha256": "9de19f91440066d577a1836eeeb79c4d7a452502979b6346e4281917c6b953f0",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "96fcbcdcc6a84514b0cf0bd08fd8d540a1543baf0a8aa5dbcfcb485453f67b55",
   "integrity": {
@@ -669,7 +669,7 @@
         "remote-package-read"
       ],
       "id": "grabowski_runtime_deploy_schedule",
-      "purpose": "Schedule a validated delayed deployment from the canonical main checkout.",
+      "purpose": "Schedule a validated delayed deployment after fresh public GitHub-main and root-authority verification.",
       "read_only": null,
       "reversibility": "deployment-rollback",
       "risk_class": "high",

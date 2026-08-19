@@ -71,6 +71,10 @@ def _operator_service_control_action() -> dict[str, object]:
     return _bound_action(cutover.OPERATOR_SERVICE_CONTROL_ACTION)
 
 
+def _rootbroker_cutover_action() -> dict[str, object]:
+    return _bound_action(cutover.ROOTBROKER_CUTOVER_ACTION)
+
+
 def _power_action() -> dict[str, object]:
     return {
         "enabled": True,
@@ -115,6 +119,7 @@ def _example_config_text() -> str:
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
                 cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
+                cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
             },
         },
         sort_keys=True,
@@ -274,6 +279,204 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 lambda argv: _completed(argv, stdout="runner\n")
             )
 
+    def test_automatic_staged_helper_path_is_commit_bound(self) -> None:
+        with patch.object(cutover, "AUTOMATIC_STAGING_ROOT", Path("/root/staging")):
+            self.assertEqual(
+                cutover._automatic_staged_helper_path(HEAD),
+                Path("/root/staging") / f"{HEAD}.py",
+            )
+
+    def test_automatic_staged_exec_preserves_broker_parent_and_continuation_contract(self) -> None:
+        with patch.object(cutover, "AUTOMATIC_STAGING_ROOT", Path("/root/staging")):
+            staged = cutover._automatic_staged_helper_path(HEAD)
+            with patch.object(
+                cutover.os, "execve", side_effect=OSError("blocked for test")
+            ) as execve:
+                with self.assertRaisesRegex(OSError, "blocked for test"):
+                    cutover._exec_staged_automatic_helper(
+                        staged,
+                        repository=Path("/home/alex/repos/grabowski"),
+                        expected_head=HEAD,
+                    )
+        executable, argv, env = execve.call_args.args
+        self.assertEqual(executable, "/usr/bin/python3")
+        self.assertEqual(argv[1], str(staged))
+        self.assertIn("--automatic-continuation", argv)
+        self.assertEqual(argv[argv.index("--expected-head") + 1], HEAD)
+        self.assertEqual(argv[argv.index("--staged-helper-path") + 1], str(staged))
+        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"], "1")
+
+    def test_automatic_staging_requires_root_before_repository_read(self) -> None:
+        with patch.object(cutover.os, "geteuid", return_value=1000):
+            with self.assertRaisesRegex(cutover.CutoverError, "requires root"):
+                cutover._stage_automatic_helper(
+                    Path("/does/not/matter"), expected_head=HEAD
+                )
+
+    def test_termination_signal_becomes_cutover_error_for_rollback(self) -> None:
+        with self.assertRaisesRegex(cutover.CutoverError, "termination signal"):
+            cutover._termination_requested(15, None)
+
+    def test_root_helper_disables_optional_git_locks(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["/usr/bin/git", "--version"], returncode=0, stdout="git version test\n", stderr=""
+        )
+        with patch.object(cutover.subprocess, "run", return_value=completed) as run:
+            observed = cutover._run(["/usr/bin/git", "--version"])
+        self.assertEqual(observed.returncode, 0)
+        self.assertEqual(run.call_args.kwargs["env"]["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(run.call_args.kwargs["env"]["GIT_NO_REPLACE_OBJECTS"], "1")
+        argv = cutover._git_argv(Path("/repo"), "show", f"{HEAD}:README.md")
+        self.assertEqual(argv[:2], ["/usr/bin/git", "--no-replace-objects"])
+
+    def test_automatic_cutover_honors_kill_switch_in_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            canonical = root / "canonical-stop"
+            legacy = root / "legacy-stop"
+            with patch.object(cutover, "CANONICAL_KILL_SWITCH", canonical), patch.object(
+                cutover, "LEGACY_KILL_SWITCH", legacy
+            ):
+                cutover._automatic_kill_switch_clear()
+                canonical.write_text("stop\n", encoding="utf-8")
+                with self.assertRaisesRegex(cutover.CutoverError, "kill-switch"):
+                    cutover._automatic_kill_switch_clear()
+                canonical.unlink()
+                legacy.symlink_to(root / "missing")
+                with self.assertRaisesRegex(cutover.CutoverError, "kill-switch"):
+                    cutover._automatic_kill_switch_clear()
+
+    def test_automatic_repository_preflight_requires_canonical_origin_and_remote_main(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = Path(raw).resolve()
+            calls: list[list[str]] = []
+
+            def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                calls.append(list(argv))
+                if argv[:2] == ["/usr/bin/systemd-run", "--system"] and argv[-1] == "refs/heads/main":
+                    return _completed(argv, stdout=HEAD + "\trefs/heads/main\n")
+                if argv[-3:] == ["remote", "get-url", "origin"]:
+                    return _completed(argv, stdout=cutover.CANONICAL_ORIGIN_URL + "\n")
+                if argv[-3:] == ["rev-parse", "--verify", "refs/remotes/origin/main"]:
+                    return _completed(argv, stdout=HEAD + "\n")
+                if argv[-3:] == ["status", "--porcelain=v1", "--untracked-files=normal"]:
+                    return _completed(argv, stdout="")
+                return _completed(argv, returncode=1, stderr="unexpected")
+
+            with patch.object(cutover, "CANONICAL_REPOSITORY", repository):
+                cutover._automatic_repository_preflight(
+                    repository, expected_head=HEAD, runner=runner
+                )
+
+                def bad_origin(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                    result = runner(argv)
+                    if argv[-3:] == ["remote", "get-url", "origin"]:
+                        return _completed(argv, stdout="git@github.com:evil/grabowski.git\n")
+                    return result
+
+                with self.assertRaisesRegex(cutover.CutoverError, "origin differs"):
+                    cutover._automatic_repository_preflight(
+                        repository, expected_head=HEAD, runner=bad_origin
+                    )
+
+                def stale_main(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                    result = runner(argv)
+                    if argv[-3:] == ["rev-parse", "--verify", "refs/remotes/origin/main"]:
+                        return _completed(argv, stdout="b" * 40 + "\n")
+                    return result
+
+                with self.assertRaisesRegex(cutover.CutoverError, "differs from origin/main"):
+                    cutover._automatic_repository_preflight(
+                        repository, expected_head=HEAD, runner=stale_main
+                    )
+
+                def stale_remote(argv: list[str]) -> subprocess.CompletedProcess[str]:
+                    result = runner(argv)
+                    if argv[:2] == ["/usr/bin/systemd-run", "--system"] and argv[-1] == "refs/heads/main":
+                        return _completed(argv, stdout="b" * 40 + "\trefs/heads/main\n")
+                    return result
+
+                with self.assertRaisesRegex(cutover.CutoverError, "authoritative remote main"):
+                    cutover._automatic_repository_preflight(
+                        repository, expected_head=HEAD, runner=stale_remote
+                    )
+                self.assertFalse(
+                    any("status" in call for call in calls),
+                    "root automatic preflight must not run git status or clean filters",
+                )
+
+    def test_authoritative_remote_main_lookup_is_fixed_and_network_isolated(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            calls.append(list(argv))
+            return _completed(argv, stdout=HEAD + "\trefs/heads/main\n")
+
+        self.assertEqual(cutover._authoritative_remote_main_head(runner), HEAD)
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[:2], ["/usr/bin/systemd-run", "--system"])
+        self.assertIn("--property=DynamicUser=yes", argv)
+        self.assertIn("--property=ProtectHome=yes", argv)
+        self.assertIn("--property=CapabilityBoundingSet=", argv)
+        self.assertIn("--setenv=GIT_TERMINAL_PROMPT=0", argv)
+        self.assertEqual(
+            argv[-7:],
+            [
+                "/usr/bin/git",
+                "-c",
+                "protocol.file.allow=never",
+                "ls-remote",
+                "--exit-code",
+                cutover.CANONICAL_REMOTE_READ_URL,
+                "refs/heads/main",
+            ],
+        )
+
+    def test_automatic_cutover_allows_only_its_invoking_broker_parent(self) -> None:
+        unit = "grabowski-privileged-broker@123.service"
+
+        def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            if "list-units" in argv:
+                return _completed(argv, stdout=f"{unit} loaded active running x\n")
+            if "show" in argv:
+                return _completed(argv, stdout="4321\n")
+            return _completed(argv, returncode=1, stderr="unexpected")
+
+        with patch.object(cutover.os, "getppid", return_value=4321):
+            cutover._require_no_active_broker_instances(
+                runner, allow_invoking_parent=True
+            )
+        with patch.object(cutover.os, "getppid", return_value=9999):
+            with self.assertRaisesRegex(cutover.CutoverError, "not the invoking parent"):
+                cutover._require_no_active_broker_instances(
+                    runner, allow_invoking_parent=True
+                )
+        with self.assertRaisesRegex(cutover.CutoverError, "active Rootbroker"):
+            cutover._require_no_active_broker_instances(
+                runner, allow_invoking_parent=False
+            )
+
+    def test_automatic_cutover_action_contract_is_exact(self) -> None:
+        expected = _rootbroker_cutover_action()
+        runner = FakeRunner()
+        observed = cutover._rootbroker_cutover_action_from_repository(
+            ROOT, expected_head=HEAD, runner=runner
+        )
+        self.assertEqual(observed, expected)
+        drifted = json.loads(_example_config_text())
+        drifted["actions"][cutover.ROOTBROKER_CUTOVER_ACTION]["timeout_seconds"] = 2701
+        bad = FakeRunner(
+            blobs={
+                "config/privileged-actions.example.json": json.dumps(drifted) + "\n"
+            }
+        )
+        with self.assertRaisesRegex(cutover.CutoverError, "timeout"):
+            cutover._rootbroker_cutover_action_from_repository(
+                ROOT, expected_head=HEAD, runner=bad
+            )
+
     def test_cutover_artifacts_include_runtime_contract_trust_anchor(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 
@@ -313,6 +516,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.POWER_ACTION: power,
                 cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
+                cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
             },
         }
         source_artifacts = {}
@@ -357,6 +561,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.POWER_ACTION: power,
                 cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
+                cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
             },
         }
         source_artifacts = {}
@@ -550,6 +755,52 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 bootstrap_recovery=_bootstrap_recovery_action(),
             )
 
+    def test_automatic_merge_updates_only_known_commit_bound_controlled_actions(self) -> None:
+        current = _installed_config()
+        unrelated_before = json.loads(json.dumps(current["actions"]["edit_system_service"]))
+        drifted_bootstrap = _bootstrap_recovery_action()
+        drifted_bootstrap["timeout_seconds"] = 3599
+        current["actions"][cutover.BOOTSTRAP_RECOVERY_ACTION] = drifted_bootstrap
+        drifted_service = _operator_service_control_action()
+        drifted_service["timeout_seconds"] = 59
+        current["actions"][cutover.OPERATOR_SERVICE_CONTROL_ACTION] = drifted_service
+        drifted_cutover = _rootbroker_cutover_action()
+        drifted_cutover["timeout_seconds"] = 2699
+        current["actions"][cutover.ROOTBROKER_CUTOVER_ACTION] = drifted_cutover
+        drifted_root_task = _root_task_action()
+        drifted_root_task["timeout_seconds"] = 59
+        current["actions"][cutover.ROOT_TASK_ACTION] = drifted_root_task
+
+        merged, evidence = cutover.merge_privileged_config(
+            current,
+            publisher=_canonical_publisher(),
+            lifecycle=_lifecycle(),
+            root_task=_root_task_action(),
+            bootstrap_recovery=_bootstrap_recovery_action(),
+            operator_service_control=_operator_service_control_action(),
+            rootbroker_cutover=_rootbroker_cutover_action(),
+            allow_controlled_updates=True,
+        )
+
+        self.assertTrue(evidence["controlled_updates_allowed"])
+        self.assertEqual(
+            merged["actions"][cutover.BOOTSTRAP_RECOVERY_ACTION],
+            _bootstrap_recovery_action(),
+        )
+        self.assertEqual(
+            merged["actions"][cutover.OPERATOR_SERVICE_CONTROL_ACTION],
+            _operator_service_control_action(),
+        )
+        self.assertEqual(
+            merged["actions"][cutover.ROOTBROKER_CUTOVER_ACTION],
+            _rootbroker_cutover_action(),
+        )
+        self.assertEqual(
+            merged["actions"][cutover.ROOT_TASK_ACTION],
+            _root_task_action(),
+        )
+        self.assertEqual(merged["actions"]["edit_system_service"], unrelated_before)
+
     def test_merge_accepts_exact_preexisting_root_task_action(self) -> None:
         current = _installed_config()
         current["actions"][cutover.ROOT_TASK_ACTION] = _root_task_action()
@@ -721,6 +972,16 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover._expected_recovery_source_dropin(publisher),
         )
 
+    def test_automatic_cutover_bind_paths_include_canonical_grabowski_repo(self) -> None:
+        self.assertEqual(
+            cutover.AUTOMATIC_CUTOVER_BIND_PATHS,
+            ("/home/alex/repos/grabowski",),
+        )
+        self.assertNotIn(
+            "/home/alex/repos/grabowski",
+            cutover.PROCESS_OBSERVER_BIND_PATHS,
+        )
+
     def test_process_observer_bind_paths_include_weltgewebe_standalone(self) -> None:
         self.assertIn(
             "/home/alex/repos/.weltgewebe-standalone",
@@ -736,6 +997,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             "BindReadOnlyPaths=/home/alex/.local/state/grabowski/recovery/last-server-recovery.json",
             "BindReadOnlyPaths=-/home/alex/.local/state/grabowski/operator-kill-switch",
         ]
+        expected_lines.extend(
+            f"BindReadOnlyPaths=-{path}"
+            for path in cutover.AUTOMATIC_CUTOVER_BIND_PATHS
+        )
         expected_lines.extend(
             f"BindReadOnlyPaths=-{path}"
             for path in cutover.PROCESS_OBSERVER_BIND_PATHS
@@ -757,6 +1022,11 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover._expected_recovery_source_dropin(publisher),
             expected,
         )
+        for path in cutover.AUTOMATIC_CUTOVER_BIND_PATHS:
+            self.assertIn(
+                f"BindReadOnlyPaths=-{path}\n".encode("utf-8"),
+                expected,
+            )
         for path in cutover.PROCESS_OBSERVER_BIND_PATHS:
             self.assertIn(
                 f"BindReadOnlyPaths=-{path}\n".encode("utf-8"),

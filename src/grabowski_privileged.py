@@ -146,6 +146,10 @@ PROCESS_REFERENCE_ALLOWED_ROOTS = (
 )
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_SYSTEMD_ACTION = "operator_root_task_systemd_unit"
+ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+OPERATOR_AUTHORITY_ATTESTATION_PATH = Path(
+    "/var/lib/grabowski/operator-authority-attestation.v1.json"
+)
 POWER_REFERENCE_TTL_SECONDS = 900
 POWER_MAX_TARGET_BYTES = 48 * 1024
 POWER_REFERENCE_DIR = Path(os.environ.get(
@@ -371,6 +375,181 @@ def _invoke_privileged_reference(
         "stderr": stderr,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
+    }
+
+
+def _operator_authority_attestation_head() -> str | None:
+    path = OPERATOR_AUTHORITY_ATTESTATION_PATH
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) != 0o644
+            or before.st_size <= 0
+            or before.st_size > 64 * 1024
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity_before = (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+        before.st_ctime_ns, before.st_mode, before.st_uid, before.st_gid, before.st_nlink,
+    )
+    identity_after = (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        after.st_ctime_ns, after.st_mode, after.st_uid, after.st_gid, after.st_nlink,
+    )
+    data = b"".join(chunks)
+    if len(data) != before.st_size or identity_before != identity_after:
+        return None
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or value.get("kind") != "grabowski_operator_authority_attestation"
+    ):
+        return None
+    expected_head = value.get("expected_head")
+    if (
+        not isinstance(expected_head, str)
+        or len(expected_head) != 40
+        or any(character not in "0123456789abcdef" for character in expected_head)
+    ):
+        return None
+    observed_hash = value.get("attestation_sha256")
+    unsigned = dict(value)
+    unsigned.pop("attestation_sha256", None)
+    expected_hash = hashlib.sha256(
+        (
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    if observed_hash != expected_hash:
+        return None
+    return expected_head
+
+
+def ensure_rootbroker_authority(expected_head: str) -> dict[str, Any]:
+    """Advance root-owned operator authority to exact main without user interaction."""
+    operator._require_operator_capability("privileged_reference")
+    if (
+        not isinstance(expected_head, str)
+        or len(expected_head) != 40
+        or any(character not in "0123456789abcdef" for character in expected_head)
+    ):
+        raise ValueError("expected_head must be one full SHA-1 commit id")
+    before = _operator_authority_attestation_head()
+    if before == expected_head:
+        return {
+            "success": True,
+            "outcome": "already_current",
+            "expected_head": expected_head,
+            "attested_head": before,
+            "effect_started": False,
+        }
+    broker = _privileged_broker_status()
+    if not broker.get("ready"):
+        raise PermissionError("privileged broker is not ready")
+    reference = _create_privileged_reference(
+        action=ROOTBROKER_CUTOVER_ACTION,
+        target=expected_head,
+        justification="Automatic exact-main Rootbroker authority refresh before runtime deployment",
+    )
+    reference_bytes = (
+        json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if not reference_bytes or len(reference_bytes) > 64 * 1024:
+        raise ValueError("Rootbroker cutover reference exceeds broker input limit")
+    timed_out = False
+    response_raw = b""
+    error = ""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(3615)
+            client.connect(str(BROKER_SOCKET))
+            client.sendall(reference_bytes)
+            client.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            size = 0
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > 512 * 1024:
+                    raise RuntimeError("Rootbroker cutover response exceeds output limit")
+                chunks.append(chunk)
+            response_raw = b"".join(chunks)
+    except (socket.timeout, TimeoutError) as exc:
+        timed_out = True
+        error = str(exc) or "Rootbroker cutover timed out"
+    except (OSError, RuntimeError) as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    response_text = _redact_text(response_raw.decode("utf-8", errors="replace"))
+    try:
+        response = json.loads(response_text) if response_text.strip() else None
+    except json.JSONDecodeError:
+        response = None
+    after = _operator_authority_attestation_head()
+    success = after == expected_head
+    if success:
+        outcome = "succeeded" if not timed_out else "readback_confirmed"
+        failure_reason = None
+    else:
+        outcome = "unknown" if timed_out or response is None else "failed"
+        failure_reason = (
+            error
+            or (response.get("stderr") if isinstance(response, dict) else None)
+            or "Rootbroker authority did not advance to expected_head"
+        )
+    audit_record = {
+        "tool": "ensure_rootbroker_authority",
+        "action": ROOTBROKER_CUTOVER_ACTION,
+        "expected_head": expected_head,
+        "attested_head_before": before,
+        "attested_head_after": after,
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "outcome": outcome,
+        "failure_reason": failure_reason,
+    }
+    _append_operator_audit(audit_record)
+    return {
+        "success": success,
+        "outcome": outcome,
+        "expected_head": expected_head,
+        "attested_head": after,
+        "effect_started": True,
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "failure_reason": failure_reason,
+        "broker_response": response,
     }
 
 
