@@ -410,6 +410,241 @@ def _audit_top(counter: Counter[str], limit: int) -> list[dict[str, Any]]:
     ]
 
 
+def _audit_identity_sha256(value: dict[str, Any]) -> str:
+    raw = (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _audit_digest(value: Any, *, length: int = 64) -> str | None:
+    if (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    ):
+        return value
+    return None
+
+
+def _audit_contract_schema_identity(
+    value: Any,
+    *,
+    command: str,
+    mode: str,
+    direction: str,
+    schema_version: int,
+) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    expected_id = (
+        f"grabowski_bureau_intake.{command}.{mode}.{direction}.v{schema_version}"
+    )
+    material = {
+        "schema_version": schema_version,
+        "surface": "grabowski_bureau_intake",
+        "command": command,
+        "mode": mode,
+        "direction": direction,
+    }
+    expected_sha = _audit_identity_sha256(material)
+    if value.get("id") != expected_id or value.get("sha256") != expected_sha:
+        return None
+    return {"id": expected_id, "sha256": expected_sha}
+
+
+def _audit_result_payload_schema_identity(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    kind = value.get("kind")
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(kind, str)
+        or AUDIT_PROJECTION_LABEL_RE.fullmatch(kind) is None
+        or not (
+            schema_version is None
+            or (
+                isinstance(schema_version, int)
+                and not isinstance(schema_version, bool)
+                and 0 < schema_version <= 2_147_483_647
+            )
+        )
+    ):
+        return None
+    material = {"kind": kind, "schema_version": schema_version}
+    expected_sha = _audit_identity_sha256(material)
+    if value.get("sha256") != expected_sha:
+        return None
+    return {**material, "sha256": expected_sha}
+
+
+def _audit_runtime_contract_identity(value: Any) -> dict[str, Any] | None:
+    if value == {"status": "unknown"}:
+        return {"status": "unknown"}
+    if not isinstance(value, dict) or value.get("status") != "observed":
+        return None
+    source_commit = _audit_digest(value.get("source_commit"), length=40)
+    registry_tree = _audit_digest(value.get("registry_tree_sha256"))
+    launcher = _audit_digest(value.get("launcher_sha256"))
+    manifest = _audit_digest(value.get("manifest_sha256"))
+    inventory = _audit_digest(value.get("inventory_sha256"))
+    if None in {source_commit, registry_tree, launcher, manifest, inventory}:
+        return None
+    material = {
+        "status": "observed",
+        "source_commit": source_commit,
+        "registry_tree_sha256": registry_tree,
+        "launcher_sha256": launcher,
+        "manifest_sha256": manifest,
+        "inventory_sha256": inventory,
+    }
+    expected_sha = _audit_identity_sha256(material)
+    if value.get("identity_sha256") != expected_sha:
+        return None
+    return {**material, "identity_sha256": expected_sha}
+
+
+def _audit_bureau_failure_identity(
+    record: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    identity = record.get("bureau_contract_identity")
+    if not isinstance(identity, dict):
+        return "unknown", None
+    if (
+        identity.get("schema_version") != 1
+        or identity.get("kind") != "grabowski_bureau_contract_identity"
+        or identity.get("completeness") not in {"complete", "partial"}
+    ):
+        return "unknown", None
+    adapter = identity.get("adapter")
+    if not isinstance(adapter, dict):
+        return "unknown", None
+    surface = adapter.get("surface")
+    command = adapter.get("command")
+    mode = adapter.get("mode")
+    adapter_schema = adapter.get("schema_version")
+    if (
+        surface != "grabowski_bureau_intake"
+        or adapter_schema != 1
+        or not isinstance(command, str)
+        or AUDIT_PROJECTION_LABEL_RE.fullmatch(command) is None
+        or mode not in {"call", "preview", "apply"}
+    ):
+        return "unknown", None
+    runtime = _audit_runtime_contract_identity(identity.get("runtime"))
+    if runtime is None:
+        return "unknown", None
+    request_schema = _audit_contract_schema_identity(
+        identity.get("request_schema"),
+        command=command,
+        mode=mode,
+        direction="request",
+        schema_version=adapter_schema,
+    )
+    result_schema = _audit_contract_schema_identity(
+        identity.get("result_schema"),
+        command=command,
+        mode=mode,
+        direction="result",
+        schema_version=adapter_schema,
+    )
+    if request_schema is None or result_schema is None:
+        return "unknown", None
+    completeness = identity["completeness"]
+    expected_completeness = (
+        "complete"
+        if command != "unknown" and runtime.get("status") == "observed"
+        else "partial"
+    )
+    if completeness != expected_completeness:
+        return "unknown", None
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_contract_identity",
+        "completeness": completeness,
+        "adapter": {
+            "surface": surface,
+            "schema_version": adapter_schema,
+            "command": command,
+            "mode": mode,
+        },
+        "runtime": runtime,
+        "request_schema": request_schema,
+        "result_schema": result_schema,
+    }
+    contract_sha = _audit_identity_sha256(material)
+    if identity.get("identity_sha256") != contract_sha:
+        return "unknown", None
+    caller_surface = record.get("bureau_caller_surface")
+    operation = record.get("operation")
+    if (
+        not isinstance(caller_surface, str)
+        or caller_surface != operation
+        or AUDIT_PROJECTION_LABEL_RE.fullmatch(caller_surface) is None
+    ):
+        return "unknown", None
+    result_payload_schema = _audit_result_payload_schema_identity(
+        record.get("bureau_result_schema_identity")
+    )
+    if result_payload_schema is None:
+        return "unknown", None
+    failure_material = {
+        "schema_version": 1,
+        "caller_surface": caller_surface,
+        "contract_identity_sha256": contract_sha,
+        "result_schema_identity_sha256": result_payload_schema["sha256"],
+    }
+    failure_sha = _audit_identity_sha256(failure_material)
+    if (
+        record.get("bureau_failure_identity_schema_version") != 1
+        or record.get("bureau_failure_identity_sha256") != failure_sha
+    ):
+        return "unknown", None
+    safe = {
+        "identity_sha256": failure_sha,
+        "contract_identity_sha256": contract_sha,
+        "caller_surface": caller_surface,
+        "completeness": completeness,
+        "adapter": material["adapter"],
+        "runtime": runtime,
+        "request_schema": request_schema,
+        "result_schema": result_schema,
+        "result_payload_schema": result_payload_schema,
+    }
+    return completeness, safe
+
+
+def _audit_bureau_identity_summary(
+    quality: Counter[str],
+    groups: dict[str, dict[str, Any]],
+    *,
+    top_limit: int,
+    include_groups: bool,
+) -> dict[str, Any]:
+    complete = int(quality.get("complete", 0))
+    partial = int(quality.get("partial", 0))
+    unknown = int(quality.get("unknown", 0))
+    total = complete + partial + unknown
+    exact_groups = [
+        group for group in groups.values() if group.get("completeness") == "complete"
+    ]
+    payload: dict[str, Any] = {
+        "failure_record_count": total,
+        "complete_identity_count": complete,
+        "partial_identity_count": partial,
+        "unknown_identity_count": unknown,
+        "exact_identity_coverage": round(complete / total, 6) if total else 0.0,
+        "identity_group_count": len(groups),
+        "exact_identity_group_count": len(exact_groups),
+    }
+    if include_groups:
+        payload["top_exact_identity_groups"] = sorted(
+            exact_groups,
+            key=lambda item: (-int(item["count"]), str(item["identity_sha256"])),
+        )[:top_limit]
+    return payload
+
+
 def _audit_failure_reasons(record: dict[str, Any]) -> set[str]:
     reasons: set[str] = set()
     returncode = record.get("returncode")
@@ -458,6 +693,8 @@ def _audit_window_projection(
     task_activity: Counter[str] = Counter()
     resource_activity: Counter[str] = Counter()
     bureau_activity: Counter[str] = Counter()
+    bureau_identity_quality: Counter[str] = Counter()
+    bureau_identity_groups: dict[str, dict[str, Any]] = {}
     mutation_evidence: Counter[str] = Counter()
     timestamp_quality: Counter[str] = Counter()
     failure_signal_count = 0
@@ -505,6 +742,32 @@ def _audit_window_projection(
                 bureau_activity["failure_nonretryable_count"] += 1
             else:
                 bureau_activity["failure_retryability_unknown_count"] += 1
+
+            identity_quality, identity = _audit_bureau_failure_identity(record)
+            bureau_identity_quality[identity_quality] += 1
+            if identity is not None:
+                identity_key = identity["identity_sha256"]
+                group = bureau_identity_groups.get(identity_key)
+                if group is None:
+                    group = {
+                        **identity,
+                        "count": 0,
+                        "failure_code_counts": {},
+                        "failure_retryable_count": 0,
+                        "failure_nonretryable_count": 0,
+                        "failure_retryability_unknown_count": 0,
+                    }
+                    bureau_identity_groups[identity_key] = group
+                group["count"] += 1
+                code_key = _audit_label(record.get("bureau_code"), fallback="unknown")
+                code_counts = group["failure_code_counts"]
+                code_counts[code_key] = int(code_counts.get(code_key, 0)) + 1
+                if retryable is True:
+                    group["failure_retryable_count"] += 1
+                elif retryable is False:
+                    group["failure_nonretryable_count"] += 1
+                else:
+                    group["failure_retryability_unknown_count"] += 1
 
         resource_keys = record.get("resource_keys")
         if isinstance(resource_keys, list):
@@ -595,6 +858,12 @@ def _audit_window_projection(
             "reclamation_unattributed_resource_count": reclamation_unattributed_resource_count,
         },
         "bureau_activity": dict(sorted(bureau_activity.items())),
+        "bureau_failure_identity": _audit_bureau_identity_summary(
+            bureau_identity_quality,
+            bureau_identity_groups,
+            top_limit=top_limit,
+            include_groups=view in {"standard", "evidence"},
+        ),
         "mutation_evidence": dict(sorted(mutation_evidence.items())),
     }
     if view in {"standard", "evidence"}:
@@ -632,6 +901,8 @@ def _audit_window_projection(
         "task_activity": task_activity,
         "resource_activity": resource_activity,
         "bureau_activity": bureau_activity,
+        "bureau_identity_quality": bureau_identity_quality,
+        "bureau_identity_groups": bureau_identity_groups,
         "mutation_evidence": mutation_evidence,
         "resource_reclamation_event_count": resource_reclamation_event_count,
         "reclaimed_resource_count": reclaimed_resource_count,
@@ -669,6 +940,12 @@ def _audit_projection_candidates(
         )
         retryability_total = retryable_count + nonretryable_count + retryability_unknown_count
         retryability_attributed = retryable_count + nonretryable_count
+        identity_summary = _audit_bureau_identity_summary(
+            seven_day["bureau_identity_quality"],
+            seven_day["bureau_identity_groups"],
+            top_limit=5,
+            include_groups=True,
+        )
         candidates.append(
             {
                 "pattern": "repeated_bureau_contract_failures",
@@ -684,9 +961,28 @@ def _audit_projection_candidates(
                     if retryability_total
                     else 0.0
                 ),
-                "recommendation": "Inspect caller/runtime schema compatibility and group only evidence with the same contract identity; never infer retryability where attribution is absent.",
+                "failure_identity_complete_count_7d": identity_summary[
+                    "complete_identity_count"
+                ],
+                "failure_identity_partial_count_7d": identity_summary[
+                    "partial_identity_count"
+                ],
+                "failure_identity_unknown_count_7d": identity_summary[
+                    "unknown_identity_count"
+                ],
+                "failure_identity_coverage": identity_summary["exact_identity_coverage"],
+                "failure_identity_group_count_7d": identity_summary[
+                    "exact_identity_group_count"
+                ],
+                "top_identity_groups": identity_summary["top_exact_identity_groups"],
+                "recommendation": "Inspect only complete caller/runtime/schema identity groups as homogeneous candidates; keep partial or unknown historical records separate and never infer retryability where attribution is absent.",
                 "authority": "proposal_only",
-                "does_not_establish": ["shared_root_cause", "bureau_task_readiness"],
+                "does_not_establish": [
+                    "shared_root_cause",
+                    "bureau_task_readiness",
+                    "partial_identity_equivalence",
+                    "unknown_identity_equivalence",
+                ],
             }
         )
     failure_reasons: Counter[str] = seven_day["failure_reason_counts"]

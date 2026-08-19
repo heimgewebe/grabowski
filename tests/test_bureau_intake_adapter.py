@@ -1644,5 +1644,137 @@ class BureauAuditFailureReasonTests(unittest.TestCase):
         self.assertEqual(record["operation"], "bureau-candidate-record")
 
 
+class BureauFailureIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _binding(*, source_commit: str = "a" * 40) -> mock.Mock:
+        return mock.Mock(
+            source_commit=source_commit,
+            registry_tree_sha256="b" * 64,
+            launcher=mock.Mock(sha256="c" * 64),
+            manifest=mock.Mock(sha256="d" * 64),
+            inventory=mock.Mock(sha256="e" * 64),
+        )
+
+    def test_complete_contract_identity_is_bounded_stable_and_path_free(self) -> None:
+        arguments = [
+            "--json",
+            "--json-envelope",
+            "operator-task-publish",
+            "--apply",
+        ]
+        identity = intake._bureau_contract_identity(arguments, self._binding())
+        replay = intake._bureau_contract_identity(arguments, self._binding())
+
+        self.assertEqual(identity["completeness"], "complete")
+        self.assertEqual(identity["adapter"]["command"], "operator-task-publish")
+        self.assertEqual(identity["adapter"]["mode"], "apply")
+        self.assertEqual(identity["runtime"]["source_commit"], "a" * 40)
+        self.assertEqual(identity["identity_sha256"], replay["identity_sha256"])
+        self.assertNotIn("/", json.dumps(identity, sort_keys=True))
+        self.assertNotIn("path", json.dumps(identity, sort_keys=True).casefold())
+
+    def test_runtime_identity_change_separates_contract_identity(self) -> None:
+        arguments = ["operator-candidate-record"]
+        first = intake._bureau_contract_identity(
+            arguments, self._binding(source_commit="a" * 40)
+        )
+        second = intake._bureau_contract_identity(
+            arguments, self._binding(source_commit="f" * 40)
+        )
+
+        self.assertNotEqual(first["runtime"]["identity_sha256"], second["runtime"]["identity_sha256"])
+        self.assertNotEqual(first["identity_sha256"], second["identity_sha256"])
+
+    def test_unobserved_runtime_remains_partial(self) -> None:
+        identity = intake._bureau_contract_identity(["operator-candidate-assess"])
+
+        self.assertEqual(identity["completeness"], "partial")
+        self.assertEqual(identity["runtime"], {"status": "unknown"})
+        self.assertTrue(intake.SHA256_RE.fullmatch(identity["identity_sha256"]))
+
+    def test_failure_audit_identity_binds_caller_surface(self) -> None:
+        identity = intake._bureau_contract_identity(
+            ["operator-candidate-record"], self._binding()
+        )
+        payload = {
+            "kind": "bureau_operator_intake_failure",
+            "status": "failed",
+            "code": "candidate-record-invalid",
+            "message": "bounded failure",
+            "retryable": False,
+            "bureau_contract_identity": identity,
+        }
+        with mock.patch.object(intake.base, "_append_audit") as appended:
+            intake._audit("bureau-candidate-record", payload)
+            intake._audit("bureau-task-propose", payload)
+
+        first = appended.call_args_list[0].args[0]
+        second = appended.call_args_list[1].args[0]
+        self.assertEqual(first["bureau_caller_surface"], "bureau-candidate-record")
+        self.assertEqual(first["bureau_contract_identity"], identity)
+        self.assertEqual(
+            first["bureau_result_schema_identity"]["kind"],
+            "bureau_operator_intake_failure",
+        )
+        self.assertEqual(first["bureau_result_schema_identity"]["schema_version"], None)
+        self.assertTrue(
+            intake.SHA256_RE.fullmatch(first["bureau_failure_identity_sha256"])
+        )
+        self.assertNotEqual(
+            first["bureau_failure_identity_sha256"],
+            second["bureau_failure_identity_sha256"],
+        )
+
+    def test_failure_identity_separates_observed_result_schema_family(self) -> None:
+        identity = intake._bureau_contract_identity(
+            ["operator-candidate-record"], self._binding()
+        )
+        first_payload = {
+            "schema_version": 1,
+            "kind": "bureau_operator_intake_failure",
+            "status": "failed",
+            "code": "candidate-record-invalid",
+            "bureau_contract_identity": identity,
+        }
+        second_payload = {
+            **first_payload,
+            "kind": "grabowski_bureau_intake_adapter_failure",
+        }
+        with mock.patch.object(intake.base, "_append_audit") as appended:
+            intake._audit("bureau-candidate-record", first_payload)
+            intake._audit("bureau-candidate-record", second_payload)
+
+        first = appended.call_args_list[0].args[0]
+        second = appended.call_args_list[1].args[0]
+        self.assertNotEqual(
+            first["bureau_result_schema_identity"]["sha256"],
+            second["bureau_result_schema_identity"]["sha256"],
+        )
+        self.assertNotEqual(
+            first["bureau_failure_identity_sha256"],
+            second["bureau_failure_identity_sha256"],
+        )
+
+    def test_adapter_failure_is_audited_as_failed_with_retryability(self) -> None:
+        identity = intake._bureau_contract_identity(["operator-candidate-assess"])
+        payload = intake._adapter_failure(
+            "bureau-runtime-unavailable",
+            retryable=True,
+            bureau_contract_identity=identity,
+        )
+        with mock.patch.object(intake.base, "_append_audit") as appended:
+            intake._audit("bureau-candidate-assess", payload)
+
+        record = appended.call_args.args[0]
+        self.assertEqual(record["bureau_status"], "failed")
+        self.assertEqual(record["bureau_code"], "bureau-runtime-unavailable")
+        self.assertIs(record["bureau_retryable"], True)
+        self.assertNotIn("bureau_failure_reason", record)
+        self.assertEqual(
+            record["bureau_contract_identity"]["completeness"], "partial"
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()

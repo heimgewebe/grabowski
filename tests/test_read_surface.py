@@ -631,6 +631,17 @@ class ReadSurfaceTests(unittest.TestCase):
             json.dumps(result["windows"][0]["top_bureau_failure_codes"]),
         )
         self.assertEqual(result["candidate_patterns"][0]["authority"], "proposal_only")
+        identity = result["windows"][0]["bureau_failure_identity"]
+        self.assertEqual(identity["failure_record_count"], 3)
+        self.assertEqual(identity["complete_identity_count"], 0)
+        self.assertEqual(identity["partial_identity_count"], 0)
+        self.assertEqual(identity["unknown_identity_count"], 3)
+        self.assertEqual(identity["exact_identity_coverage"], 0.0)
+        self.assertEqual(
+            result["candidate_patterns"][0]["failure_identity_unknown_count_7d"],
+            3,
+        )
+        self.assertEqual(result["candidate_patterns"][0]["failure_identity_coverage"], 0.0)
         self.assertNotIn("owner_id", json.dumps(result))
         self.assertNotIn("/work/demo", json.dumps(result))
 
@@ -1128,6 +1139,223 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertTrue(required.issubset(expected))
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")
+
+
+class BureauFailureIdentityProjectionTests(unittest.TestCase):
+    @staticmethod
+    def _schema(command: str, direction: str) -> dict[str, str]:
+        material = {
+            "schema_version": 1,
+            "surface": "grabowski_bureau_intake",
+            "command": command,
+            "mode": "call",
+            "direction": direction,
+        }
+        return {
+            "id": f"grabowski_bureau_intake.{command}.call.{direction}.v1",
+            "sha256": read_surface._audit_identity_sha256(material),
+        }
+
+    @classmethod
+    def _contract_identity(
+        cls,
+        *,
+        source_commit: str | None,
+        command: str = "operator-candidate-record",
+    ) -> dict:
+        if source_commit is None:
+            runtime = {"status": "unknown"}
+            completeness = "partial"
+        else:
+            runtime_material = {
+                "status": "observed",
+                "source_commit": source_commit,
+                "registry_tree_sha256": "b" * 64,
+                "launcher_sha256": "c" * 64,
+                "manifest_sha256": "d" * 64,
+                "inventory_sha256": "e" * 64,
+            }
+            runtime = {
+                **runtime_material,
+                "identity_sha256": read_surface._audit_identity_sha256(runtime_material),
+            }
+            completeness = "complete"
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_contract_identity",
+            "completeness": completeness,
+            "adapter": {
+                "surface": "grabowski_bureau_intake",
+                "schema_version": 1,
+                "command": command,
+                "mode": "call",
+            },
+            "runtime": runtime,
+            "request_schema": cls._schema(command, "request"),
+            "result_schema": cls._schema(command, "result"),
+        }
+        return {
+            **material,
+            "identity_sha256": read_surface._audit_identity_sha256(material),
+        }
+
+    @classmethod
+    def _record(
+        cls,
+        *,
+        now: int,
+        seconds_ago: int,
+        source_commit: str | None,
+        code: str = "request-schema-unsupported",
+        result_kind: str = "bureau_operator_intake_failure",
+    ) -> dict:
+        operation = "bureau-candidate-record"
+        identity = cls._contract_identity(source_commit=source_commit)
+        result_schema_material = {"kind": result_kind, "schema_version": 1}
+        result_schema_identity = {
+            **result_schema_material,
+            "sha256": read_surface._audit_identity_sha256(result_schema_material),
+        }
+        failure_material = {
+            "schema_version": 1,
+            "caller_surface": operation,
+            "contract_identity_sha256": identity["identity_sha256"],
+            "result_schema_identity_sha256": result_schema_identity["sha256"],
+        }
+        return {
+            "operation": operation,
+            "timestamp": datetime.fromtimestamp(
+                now - seconds_ago, tz=timezone.utc
+            ).isoformat(),
+            "record_sha256": hashlib.sha256(
+                f"{seconds_ago}:{source_commit}".encode()
+            ).hexdigest(),
+            "bureau_status": "failed",
+            "bureau_code": code,
+            "bureau_retryable": False,
+            "effect_started": False,
+            "bureau_failure_identity_schema_version": 1,
+            "bureau_caller_surface": operation,
+            "bureau_contract_identity": identity,
+            "bureau_result_schema_identity": result_schema_identity,
+            "bureau_failure_identity_sha256": read_surface._audit_identity_sha256(
+                failure_material
+            ),
+        }
+
+    @staticmethod
+    def _project(records: list[dict], now: int) -> dict:
+        status = {
+            "valid": True,
+            "total_records": len(records),
+            "total_legacy_records": 0,
+            "last_record_sha256": records[-1]["record_sha256"],
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            return read_surface.grabowski_audit_projection(
+                view="standard", top_limit=10
+            )
+
+    def test_same_code_with_distinct_runtime_identities_stays_two_groups(self) -> None:
+        now = 1_800_000_000
+        records = [
+            self._record(now=now, seconds_ago=60, source_commit="a" * 40),
+            self._record(now=now, seconds_ago=120, source_commit="a" * 40),
+            self._record(now=now, seconds_ago=180, source_commit="f" * 40),
+            self._record(now=now, seconds_ago=240, source_commit="f" * 40),
+        ]
+        result = self._project(records, now)
+        summary = result["windows"][0]["bureau_failure_identity"]
+        pattern = result["candidate_patterns"][0]
+
+        self.assertEqual(summary["complete_identity_count"], 4)
+        self.assertEqual(summary["unknown_identity_count"], 0)
+        self.assertEqual(summary["exact_identity_coverage"], 1.0)
+        self.assertEqual(summary["exact_identity_group_count"], 2)
+        self.assertEqual(len(summary["top_exact_identity_groups"]), 2)
+        self.assertEqual(pattern["failure_identity_group_count_7d"], 2)
+        self.assertEqual(len(pattern["top_identity_groups"]), 2)
+        self.assertEqual(
+            {group["runtime"]["source_commit"] for group in pattern["top_identity_groups"]},
+            {"a" * 40, "f" * 40},
+        )
+        self.assertNotIn("/", json.dumps(pattern["top_identity_groups"], sort_keys=True))
+
+    def test_same_runtime_with_distinct_result_schema_families_stays_two_groups(self) -> None:
+        now = 1_800_000_000
+        records = [
+            self._record(
+                now=now,
+                seconds_ago=60,
+                source_commit="a" * 40,
+                result_kind="bureau_operator_intake_failure",
+            ),
+            self._record(
+                now=now,
+                seconds_ago=120,
+                source_commit="a" * 40,
+                result_kind="grabowski_bureau_intake_adapter_failure",
+            ),
+            self._record(
+                now=now,
+                seconds_ago=180,
+                source_commit="a" * 40,
+                result_kind="bureau_operator_intake_failure",
+            ),
+        ]
+        result = self._project(records, now)
+        summary = result["windows"][0]["bureau_failure_identity"]
+
+        self.assertEqual(summary["complete_identity_count"], 3)
+        self.assertEqual(summary["exact_identity_group_count"], 2)
+        self.assertEqual(
+            {
+                group["result_payload_schema"]["kind"]
+                for group in summary["top_exact_identity_groups"]
+            },
+            {
+                "bureau_operator_intake_failure",
+                "grabowski_bureau_intake_adapter_failure",
+            },
+        )
+
+    def test_partial_identity_is_not_counted_as_exact(self) -> None:
+        now = 1_800_000_000
+        result = self._project(
+            [self._record(now=now, seconds_ago=60, source_commit=None)],
+            now,
+        )
+        summary = result["windows"][0]["bureau_failure_identity"]
+
+        self.assertEqual(summary["failure_record_count"], 1)
+        self.assertEqual(summary["complete_identity_count"], 0)
+        self.assertEqual(summary["partial_identity_count"], 1)
+        self.assertEqual(summary["unknown_identity_count"], 0)
+        self.assertEqual(summary["exact_identity_coverage"], 0.0)
+        self.assertEqual(summary["exact_identity_group_count"], 0)
+
+    def test_malformed_identity_is_conservatively_unknown(self) -> None:
+        now = 1_800_000_000
+        record = self._record(now=now, seconds_ago=60, source_commit="a" * 40)
+        record["bureau_contract_identity"]["runtime"]["manifest_sha256"] = "0" * 64
+        result = self._project([record], now)
+        summary = result["windows"][0]["bureau_failure_identity"]
+
+        self.assertEqual(summary["complete_identity_count"], 0)
+        self.assertEqual(summary["partial_identity_count"], 0)
+        self.assertEqual(summary["unknown_identity_count"], 1)
+        self.assertEqual(summary["identity_group_count"], 0)
+
 
 
 if __name__ == "__main__":
