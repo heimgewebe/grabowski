@@ -71,6 +71,22 @@ class DeployRuntimeTests(unittest.TestCase):
             source_bytes=b"print('snapshot')\n",
         )
 
+    def test_git_show_disables_replace_objects(self) -> None:
+        with patch.object(deploy_runtime, "run_bytes", return_value=b"payload") as run_bytes:
+            observed = deploy_runtime.git_show(
+                Path("/repo"), "a" * 40, Path("src/grabowski_mcp.py")
+            )
+        self.assertEqual(observed, b"payload")
+        self.assertEqual(
+            run_bytes.call_args.args[0],
+            [
+                "git",
+                "--no-replace-objects",
+                "show",
+                f"{'a' * 40}:src/grabowski_mcp.py",
+            ],
+        )
+
     def test_target_schema_must_match_independent_root_anchor(self) -> None:
         expected = b"trusted schema\n"
         with patch.object(

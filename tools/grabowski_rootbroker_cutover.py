@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import subprocess
 import tempfile
@@ -31,6 +32,8 @@ BOOTSTRAP_RECOVERY_TARGET = Path(
     "/usr/local/libexec/grabowski-runtime-bootstrap-recover"
 )
 CUTOVER_HELPER_TARGET = Path("/usr/local/libexec/grabowski-rootbroker-cutover")
+AUTOMATIC_STAGING_ROOT = Path("/var/lib/grabowski/rootbroker-cutover-staging")
+AUTOMATIC_HELPER_SOURCE = "tools/grabowski_rootbroker_cutover.py"
 BROKER_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-privileged-broker@.service")
 OPERATOR_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-operator.service")
 RECOVERY_SOURCE_DROPIN_TARGET = Path(
@@ -46,13 +49,22 @@ SOCKET_UNIT = "grabowski-privileged-broker.socket"
 OPERATOR_UNIT = "grabowski-operator.service"
 LEGACY_OPERATOR_WATCHDOG_TIMER = "grabowski-operator-watchdog.timer"
 CONFIGURED_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
+CANONICAL_REPOSITORY = Path("/home/alex/repos/grabowski")
+CANONICAL_ORIGIN_URL = "git@github.com:heimgewebe/grabowski.git"
+CANONICAL_REMOTE_READ_URL = "https://github.com/heimgewebe/grabowski.git"
+CANONICAL_KILL_SWITCH = Path("/var/lib/grabowski/operator-blockade") / "operator-kill-switch"
+LEGACY_KILL_SWITCH = Path("/home/alex/.local/state/grabowski") / "operator-kill-switch"
 PUBLISH_ACTION = "publish_recovery_marker"
 POWER_ACTION = "operator_power_argv"
 OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
+ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
 BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
+AUTOMATIC_CUTOVER_BIND_PATHS = (
+    "/home/alex/repos/grabowski",
+)
 PROCESS_OBSERVER_BIND_PATHS = (
     "/home/alex/repos/.weltgewebe-audit-implementation",
     "/home/alex/repos/.weltgewebe-audit-main-20260717",
@@ -92,6 +104,10 @@ PROCESS_OBSERVER_BIND_PATHS = (
 
 class CutoverError(RuntimeError):
     pass
+
+
+def _termination_requested(signum: int, _frame: object) -> None:
+    raise CutoverError(f"termination signal received: {signum}")
 
 
 @dataclass(frozen=True)
@@ -379,6 +395,8 @@ def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
             "LC_ALL": "C.UTF-8",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
         },
         timeout=120,
     )
@@ -401,6 +419,7 @@ def _validate_commit_id(value: str, *, label: str) -> str:
 def _git_argv(repository: Path, *arguments: str) -> list[str]:
     return [
         "/usr/bin/git",
+        "--no-replace-objects",
         "-c",
         f"safe.directory={repository}",
         "-c",
@@ -425,6 +444,216 @@ def _repository_head(repository: Path, runner: RunCommand) -> str:
         _git_argv(repository, "rev-parse", "HEAD"),
     )
     return _validate_commit_id(completed.stdout.strip(), label="repository HEAD")
+
+
+def _automatic_kill_switch_clear() -> None:
+    for path in (CANONICAL_KILL_SWITCH, LEGACY_KILL_SWITCH):
+        if os.path.lexists(path):
+            raise CutoverError("automatic Rootbroker cutover blocked by operator kill-switch")
+
+
+def _authoritative_remote_main_head(runner: RunCommand) -> str:
+    argv = [
+        "/usr/bin/systemd-run",
+        "--system",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--quiet",
+        "--service-type=exec",
+        "--property=DynamicUser=yes",
+        "--property=NoNewPrivileges=yes",
+        "--property=PrivateTmp=yes",
+        "--property=PrivateDevices=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes",
+        "--property=ProtectKernelTunables=yes",
+        "--property=ProtectKernelModules=yes",
+        "--property=ProtectKernelLogs=yes",
+        "--property=ProtectControlGroups=yes",
+        "--property=LockPersonality=yes",
+        "--property=MemoryDenyWriteExecute=yes",
+        "--property=RuntimeMaxSec=60s",
+        "--property=TimeoutStopSec=5s",
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "--property=CapabilityBoundingSet=",
+        "--property=AmbientCapabilities=",
+        "--property=WorkingDirectory=/",
+        "--setenv=HOME=/nonexistent",
+        "--setenv=GIT_CONFIG_NOSYSTEM=1",
+        "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
+        "--setenv=GIT_TERMINAL_PROMPT=0",
+        "--setenv=GCM_INTERACTIVE=never",
+        "--setenv=LANG=C.UTF-8",
+        "--setenv=LC_ALL=C.UTF-8",
+        "--",
+        "/usr/bin/git",
+        "-c",
+        "protocol.file.allow=never",
+        "ls-remote",
+        "--exit-code",
+        CANONICAL_REMOTE_READ_URL,
+        "refs/heads/main",
+    ]
+    completed = _checked_run(runner, argv)
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise CutoverError("authoritative remote main lookup returned an invalid result")
+    commit_id, separator, ref = lines[0].partition("\t")
+    if separator != "\t" or ref != "refs/heads/main":
+        raise CutoverError("authoritative remote main lookup returned an invalid ref")
+    return _validate_commit_id(commit_id, label="authoritative remote main")
+
+
+def _automatic_repository_preflight(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> None:
+    canonical = CANONICAL_REPOSITORY.resolve(strict=True)
+    if repository != canonical:
+        raise CutoverError("automatic cutover requires the canonical repository")
+    origin = _checked_run(
+        runner, _git_argv(repository, "remote", "get-url", "origin")
+    ).stdout.strip()
+    if origin != CANONICAL_ORIGIN_URL:
+        raise CutoverError("automatic cutover origin differs from host contract")
+    origin_main = _validate_commit_id(
+        _checked_run(
+            runner,
+            _git_argv(
+                repository,
+                "rev-parse",
+                "--verify",
+                "refs/remotes/origin/main",
+            ),
+        ).stdout.strip(),
+        label="origin/main",
+    )
+    if origin_main != expected_head:
+        raise CutoverError("automatic cutover target differs from origin/main")
+    remote_main = _authoritative_remote_main_head(runner)
+    if remote_main != expected_head:
+        raise CutoverError("automatic cutover target differs from authoritative remote main")
+
+
+def _automatic_staged_helper_path(expected_head: str) -> Path:
+    expected_head = _validate_commit_id(expected_head, label="expected_head")
+    return AUTOMATIC_STAGING_ROOT / f"{expected_head}.py"
+
+
+def _stage_automatic_helper(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand = _run,
+) -> Path:
+    if os.geteuid() != 0:
+        raise CutoverError("automatic helper staging requires root privileges")
+    expected_head = _validate_commit_id(expected_head, label="expected_head")
+    repository = repository.resolve(strict=True)
+    _automatic_kill_switch_clear()
+    _automatic_repository_preflight(
+        repository, expected_head=expected_head, runner=runner
+    )
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=AUTOMATIC_HELPER_SOURCE,
+        runner=runner,
+    )
+    if not data:
+        raise CutoverError("automatic staged helper is empty")
+    target = _automatic_staged_helper_path(expected_head)
+    digest = _sha256(data)
+    _validate_source_artifacts(
+        {target: (data, 0o700, digest)},
+        python_targets={target},
+    )
+    _ensure_private_directory(
+        AUTOMATIC_STAGING_ROOT, expected_uid=0, expected_gid=0
+    )
+    _automatic_kill_switch_clear()
+    _automatic_repository_preflight(
+        repository, expected_head=expected_head, runner=runner
+    )
+    _atomic_install(
+        target,
+        data,
+        mode=0o700,
+        uid=0,
+        gid=0,
+        expected_parent_uid=0,
+    )
+    readback, metadata = _read_regular_file(target, require_root_owned=True)
+    if (
+        readback != data
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+    ):
+        raise CutoverError("automatic staged helper readback failed")
+    return target
+
+
+def _exec_staged_automatic_helper(
+    staged_helper: Path,
+    *,
+    repository: Path,
+    expected_head: str,
+) -> None:
+    expected = _automatic_staged_helper_path(expected_head)
+    if staged_helper != expected:
+        raise CutoverError("automatic staged helper path differs from contract")
+    argv = [
+        "/usr/bin/python3",
+        str(staged_helper),
+        "--repository",
+        str(repository),
+        "--expected-head",
+        expected_head,
+        "--apply",
+        "--automatic",
+        "--automatic-continuation",
+        "--staged-helper-path",
+        str(staged_helper),
+    ]
+    env = {
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    }
+    os.execve(argv[0], argv, env)
+    raise CutoverError("automatic staged helper exec unexpectedly returned")
+
+
+def _cleanup_staged_helper(path: Path) -> None:
+    expected_parent = AUTOMATIC_STAGING_ROOT
+    if path.parent != expected_parent:
+        raise CutoverError("staged helper cleanup path differs from contract")
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+    ):
+        raise CutoverError("staged helper cleanup target is unsafe")
+    path.unlink()
+    directory_fd = os.open(expected_parent, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _repository_blob(
@@ -535,6 +764,9 @@ def _expected_recovery_source_dropin(publisher: dict[str, Any]) -> bytes:
         f"BindReadOnlyPaths={source_path}",
         f"BindReadOnlyPaths=-{legacy_kill_switch_path}",
     ]
+    lines.extend(
+        f"BindReadOnlyPaths=-{path}" for path in AUTOMATIC_CUTOVER_BIND_PATHS
+    )
     lines.extend(
         f"BindReadOnlyPaths=-{path}" for path in PROCESS_OBSERVER_BIND_PATHS
     )
@@ -832,6 +1064,68 @@ def _operator_service_control_action_from_repository(
     return json.loads(json.dumps(action))
 
 
+def _rootbroker_cutover_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    action = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    if not isinstance(action, dict):
+        raise CutoverError("example catalog has no automatic Rootbroker cutover action")
+    required = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "argv",
+        "timeout_seconds",
+        "kill_switch_path",
+        "legacy_kill_switch_path",
+        "allowed_peer_uid",
+        "allowed_peer_unit",
+    }
+    if set(action) != required:
+        raise CutoverError("automatic Rootbroker cutover action keys are invalid")
+    if action.get("enabled") is not True or action.get("mode") != "template":
+        raise CutoverError("automatic Rootbroker cutover must be an enabled template")
+    if action.get("target_pattern") != r"[0-9a-f]{40}":
+        raise CutoverError("automatic Rootbroker cutover target pattern is invalid")
+    if action.get("argv") != [
+        str(CUTOVER_HELPER_TARGET),
+        "--repository",
+        str(CANONICAL_REPOSITORY),
+        "--expected-head",
+        "{target}",
+        "--apply",
+        "--automatic",
+    ]:
+        raise CutoverError("automatic Rootbroker cutover argv is invalid")
+    if action.get("timeout_seconds") != 2700:
+        raise CutoverError("automatic Rootbroker cutover timeout is invalid")
+    if (
+        action.get("kill_switch_path") != str(CANONICAL_KILL_SWITCH)
+        or action.get("legacy_kill_switch_path") != str(LEGACY_KILL_SWITCH)
+    ):
+        raise CutoverError("automatic Rootbroker cutover kill-switch binding is invalid")
+    if (
+        action.get("allowed_peer_uid") != 1000
+        or action.get("allowed_peer_unit") != OPERATOR_UNIT
+    ):
+        raise CutoverError("automatic Rootbroker cutover peer binding is invalid")
+    return json.loads(json.dumps(action))
+
+
 def _bootstrap_recovery_action_from_repository(
     repository: Path,
     *,
@@ -910,6 +1204,8 @@ def merge_privileged_config(
     process_observer: dict[str, Any] | None = None,
     bootstrap_recovery: dict[str, Any] | None = None,
     operator_service_control: dict[str, Any] | None = None,
+    rootbroker_cutover: dict[str, Any] | None = None,
+    allow_controlled_updates: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(current) != {"schema_version", "actions"}:
         raise CutoverError("installed privileged config has invalid top-level keys")
@@ -936,7 +1232,8 @@ def merge_privileged_config(
     bootstrap_recovery_before = actions.get(BOOTSTRAP_RECOVERY_ACTION)
     if bootstrap_recovery is not None:
         if (
-            bootstrap_recovery_before is not None
+            not allow_controlled_updates
+            and bootstrap_recovery_before is not None
             and bootstrap_recovery_before != bootstrap_recovery
         ):
             raise CutoverError(
@@ -948,7 +1245,8 @@ def merge_privileged_config(
     operator_service_control_before = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     if operator_service_control is not None:
         if (
-            operator_service_control_before is not None
+            not allow_controlled_updates
+            and operator_service_control_before is not None
             and operator_service_control_before != operator_service_control
         ):
             raise CutoverError(
@@ -956,6 +1254,20 @@ def merge_privileged_config(
             )
         merged_actions[OPERATOR_SERVICE_CONTROL_ACTION] = json.loads(
             json.dumps(operator_service_control)
+        )
+
+    rootbroker_cutover_before = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    if rootbroker_cutover is not None:
+        if (
+            not allow_controlled_updates
+            and rootbroker_cutover_before is not None
+            and rootbroker_cutover_before != rootbroker_cutover
+        ):
+            raise CutoverError(
+                "installed automatic Rootbroker cutover differs from commit-bound contract"
+            )
+        merged_actions[ROOTBROKER_CUTOVER_ACTION] = json.loads(
+            json.dumps(rootbroker_cutover)
         )
 
     merged_power = merged_actions[POWER_ACTION]
@@ -1027,7 +1339,11 @@ def merge_privileged_config(
             publisher=publisher,
             lifecycle=lifecycle,
         )
-        if root_task_before is not None and root_task_before != root_task:
+        if (
+            not allow_controlled_updates
+            and root_task_before is not None
+            and root_task_before != root_task
+        ):
             raise CutoverError(
                 "installed root task action differs from commit-bound contract"
             )
@@ -1054,7 +1370,10 @@ def merge_privileged_config(
         controlled.add(BOOTSTRAP_RECOVERY_ACTION)
     if operator_service_control is not None:
         controlled.add(OPERATOR_SERVICE_CONTROL_ACTION)
+    if rootbroker_cutover is not None:
+        controlled.add(ROOTBROKER_CUTOVER_ACTION)
     evidence = {
+        "controlled_updates_allowed": allow_controlled_updates,
         "operator_power_before_sha256": _sha256(_canonical_json(power_before)),
         "operator_power_after_sha256": _sha256(_canonical_json(merged_power)),
         "publisher_sha256": _sha256(_canonical_json(publisher)),
@@ -1085,6 +1404,11 @@ def merge_privileged_config(
         "operator_service_control_preexisting": (
             operator_service_control_before is not None
         ),
+        "rootbroker_cutover_sha256": (
+            _sha256(_canonical_json(rootbroker_cutover))
+            if rootbroker_cutover is not None else None
+        ),
+        "rootbroker_cutover_preexisting": rootbroker_cutover_before is not None,
         "bootstrap_recovery_preexisting": bootstrap_recovery_before is not None,
         "bootstrap_recovery_before_sha256": (
             _sha256(_canonical_json(bootstrap_recovery_before))
@@ -1133,11 +1457,16 @@ def _operator_authority_attestation(
     power = actions.get(POWER_ACTION)
     lifecycle = actions.get(BLOCKADE_LIFECYCLE_ACTION)
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
-    if not all(isinstance(item, dict) for item in (power, lifecycle, service_control)):
+    rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    if not all(
+        isinstance(item, dict)
+        for item in (power, lifecycle, service_control, rootbroker_cutover)
+    ):
         raise CutoverError("operator authority attestation actions are incomplete")
     assert isinstance(power, dict)
     assert isinstance(lifecycle, dict)
     assert isinstance(service_control, dict)
+    assert isinstance(rootbroker_cutover, dict)
     peer_binding = {
         "allowed_peer_uid": power.get("allowed_peer_uid"),
         "allowed_peer_unit": power.get("allowed_peer_unit"),
@@ -1164,6 +1493,9 @@ def _operator_authority_attestation(
             BLOCKADE_LIFECYCLE_ACTION: _sha256(_canonical_json(lifecycle)),
             OPERATOR_SERVICE_CONTROL_ACTION: _sha256(
                 _canonical_json(service_control)
+            ),
+            ROOTBROKER_CUTOVER_ACTION: _sha256(
+                _canonical_json(rootbroker_cutover)
             ),
         },
         "power_peer_binding": peer_binding,
@@ -1555,21 +1887,46 @@ def _socket_active(runner: RunCommand) -> bool:
     raise CutoverError(f"cannot determine Rootbroker socket state: {detail[:500]}")
 
 
-def _require_no_active_broker_instances(runner: RunCommand) -> None:
+def _require_no_active_broker_instances(
+    runner: RunCommand, *, allow_invoking_parent: bool = False
+) -> None:
     completed = _checked_run(
         runner,
         [
             "/usr/bin/systemctl",
             "list-units",
             "--type=service",
-            "--state=running",
+            "--state=activating,running",
             "--no-legend",
             "--plain",
             "grabowski-privileged-broker@*.service",
         ],
     )
-    if completed.stdout.strip():
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return
+    if not allow_invoking_parent or len(lines) != 1:
         raise CutoverError("an active Rootbroker request instance blocks cutover")
+    unit = lines[0].split()[0]
+    if not unit.startswith("grabowski-privileged-broker@") or not unit.endswith(".service"):
+        raise CutoverError("automatic cutover broker instance identity is invalid")
+    observed = _checked_run(
+        runner,
+        [
+            "/usr/bin/systemctl",
+            "show",
+            unit,
+            "--property=MainPID",
+            "--value",
+            "--no-pager",
+        ],
+    ).stdout.strip()
+    try:
+        main_pid = int(observed)
+    except ValueError as exc:
+        raise CutoverError("automatic cutover broker MainPID is invalid") from exc
+    if main_pid != os.getppid():
+        raise CutoverError("automatic cutover active broker is not the invoking parent")
 
 
 def apply_cutover(
@@ -1583,6 +1940,7 @@ def apply_cutover(
     lock_path: Path = CUTOVER_LOCK,
     runner: RunCommand = _run,
     require_root: bool = True,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     if require_root and os.geteuid() != 0:
         raise CutoverError("root privileges are required")
@@ -1599,6 +1957,7 @@ def apply_cutover(
             artifact_targets=artifact_targets,
             runner=runner,
             require_root=require_root,
+            automatic=automatic,
         )
 
 
@@ -1612,6 +1971,7 @@ def _apply_cutover_locked(
     artifact_targets: dict[Path, tuple[bytes, int, str]] | None,
     runner: RunCommand,
     require_root: bool,
+    automatic: bool,
 ) -> dict[str, Any]:
     if require_root and os.geteuid() != 0:
         raise CutoverError("root privileges are required")
@@ -1619,7 +1979,12 @@ def _apply_cutover_locked(
     install_gid = 0 if require_root else os.getgid()
     expected_head = _validate_commit_id(expected_head, label="expected_head")
     repository = repository.resolve(strict=True)
-    if _repository_head(repository, runner) != expected_head:
+    if automatic:
+        _automatic_kill_switch_clear()
+        _automatic_repository_preflight(
+            repository, expected_head=expected_head, runner=runner
+        )
+    elif _repository_head(repository, runner) != expected_head:
         raise CutoverError("repository HEAD differs from expected_head")
     source_artifacts = artifact_targets or _source_artifacts(
         repository,
@@ -1635,7 +2000,7 @@ def _apply_cutover_locked(
         source_artifacts,
         python_targets=python_targets,
     )
-    if artifact_targets is None:
+    if artifact_targets is None and not automatic:
         _verify_running_helper(source_artifacts)
     publisher = _publisher_from_repository(
         repository,
@@ -1661,6 +2026,9 @@ def _apply_cutover_locked(
     operator_service_control = _operator_service_control_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    rootbroker_cutover = _rootbroker_cutover_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     if artifact_targets is None:
         _validate_recovery_source_dropin(
             source_artifacts,
@@ -1679,6 +2047,8 @@ def _apply_cutover_locked(
         process_observer=process_observer,
         bootstrap_recovery=bootstrap_recovery,
         operator_service_control=operator_service_control,
+        rootbroker_cutover=rootbroker_cutover,
+        allow_controlled_updates=automatic,
     )
     merged_config_data = _canonical_json(merged_config)
 
@@ -1731,9 +2101,18 @@ def _apply_cutover_locked(
                 preimage,
                 require_root_owned=require_root,
             )
+        if automatic:
+            _automatic_kill_switch_clear()
+            _automatic_repository_preflight(
+                repository, expected_head=expected_head, runner=runner
+            )
         if was_active:
             _checked_run(runner, ["/usr/bin/systemctl", "stop", SOCKET_UNIT])
-        _require_no_active_broker_instances(runner)
+        _require_no_active_broker_instances(
+            runner, allow_invoking_parent=automatic
+        )
+        if automatic:
+            _automatic_kill_switch_clear()
         for target, (data, mode, _digest) in desired.items():
             _assert_preimage_unchanged(
                 preimage_by_target[target],
@@ -1989,6 +2368,12 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
     bootstrap_recovery = _bootstrap_recovery_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    operator_service_control = _operator_service_control_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
+    rootbroker_cutover = _rootbroker_cutover_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     _validate_recovery_source_dropin(
         source_artifacts,
         publisher=publisher,
@@ -2002,6 +2387,8 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         root_task=root_task,
         process_observer=process_observer,
         bootstrap_recovery=bootstrap_recovery,
+        operator_service_control=operator_service_control,
+        rootbroker_cutover=rootbroker_cutover,
     )
     return {
         "schema_version": 1,
@@ -2028,22 +2415,63 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--expected-head", required=True)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--automatic", action="store_true")
+    parser.add_argument("--automatic-continuation", action="store_true")
+    parser.add_argument("--staged-helper-path")
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
     repository = Path(args.repository)
-    if args.apply:
-        result = apply_cutover(
-            repository=repository,
-            expected_head=args.expected_head,
-        )
-    else:
-        result = build_plan(
-            repository=repository,
-            expected_head=args.expected_head,
-        )
+    if args.automatic and not args.apply:
+        raise CutoverError("--automatic requires --apply")
+    if args.automatic_continuation and not (args.automatic and args.apply):
+        raise CutoverError("--automatic-continuation requires --automatic --apply")
+    expected_staged: Path | None = None
+    if args.automatic_continuation:
+        if not args.staged_helper_path:
+            raise CutoverError("automatic continuation requires staged helper path")
+        expected_staged = _automatic_staged_helper_path(args.expected_head)
+        supplied_staged = Path(args.staged_helper_path)
+        if supplied_staged != expected_staged or Path(__file__).resolve() != expected_staged:
+            raise CutoverError("automatic continuation is not running from the staged helper")
+    elif args.staged_helper_path:
+        raise CutoverError("staged helper path is valid only for automatic continuation")
+
+    previous_handlers: dict[int, Any] = {}
+    if args.automatic:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, _termination_requested)
+    try:
+        if args.automatic and args.apply and not args.automatic_continuation:
+            staged = _stage_automatic_helper(
+                repository, expected_head=args.expected_head
+            )
+            try:
+                _exec_staged_automatic_helper(
+                    staged, repository=repository, expected_head=args.expected_head
+                )
+            except Exception:
+                _cleanup_staged_helper(staged)
+                raise
+            raise CutoverError("automatic staged helper handoff unexpectedly returned")
+        if args.apply:
+            result = apply_cutover(
+                repository=repository,
+                expected_head=args.expected_head,
+                automatic=args.automatic,
+            )
+        else:
+            result = build_plan(
+                repository=repository,
+                expected_head=args.expected_head,
+            )
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+        if expected_staged is not None:
+            _cleanup_staged_helper(expected_staged)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("success", result.get("ready", False)) else 1
 

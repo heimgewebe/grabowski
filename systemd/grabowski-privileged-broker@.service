@@ -30,6 +30,7 @@ BindReadOnlyPaths=-/home/alex/repos/.audio-standalone
 BindReadOnlyPaths=-/home/alex/repos/.audio-worktrees
 BindReadOnlyPaths=-/home/alex/repos/.hauski-worktrees
 BindReadOnlyPaths=-/home/alex/repos/.hauski-audio-worktrees
+BindReadOnlyPaths=-/home/alex/repos/grabowski
 BindReadOnlyPaths=-/home/alex/repos/.grabowski-deploy-worktrees
 BindReadOnlyPaths=-/home/alex/repos/.grabowski-standalone
 BindReadOnlyPaths=-/home/alex/repos/.grabowski-worktrees

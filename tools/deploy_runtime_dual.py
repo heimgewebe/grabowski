@@ -69,6 +69,7 @@ class WatchdogHostAssetProjection:
 TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
 OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
+ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 PRIVILEGED_BROKER_SOCKET = Path("/run/grabowski/privileged-broker.sock")
 PRIVILEGED_REFERENCE_TTL_SECONDS = 300
 PRIVILEGED_RESPONSE_MAX_BYTES = 512 * 1024
@@ -4536,11 +4537,18 @@ def require_operator_authority_anchored(
         )
     lifecycle = actions.get("operator_blockade_marker_lifecycle")
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
-    if not isinstance(lifecycle, dict) or not isinstance(service_control, dict):
+    rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    if not all(
+        isinstance(item, dict)
+        for item in (lifecycle, service_control, rootbroker_cutover)
+    ):
         core.fail(
             "Ziel-Commit besitzt keinen vollständigen Operator-Authority-Vertrag",
             phase="operator-authority-attestation",
         )
+    assert isinstance(lifecycle, dict)
+    assert isinstance(service_control, dict)
+    assert isinstance(rootbroker_cutover, dict)
     expected_peer = {
         "allowed_peer_uid": lifecycle.get("allowed_peer_uid"),
         "allowed_peer_unit": lifecycle.get("allowed_peer_unit"),
@@ -4555,6 +4563,7 @@ def require_operator_authority_anchored(
         "operator_power_argv",
         "operator_blockade_marker_lifecycle",
         OPERATOR_SERVICE_CONTROL_ACTION,
+        ROOTBROKER_CUTOVER_ACTION,
     }:
         core.fail(
             "Operator-Authority-Attestation Aktionsbindung ist unvollständig",
@@ -4565,6 +4574,8 @@ def require_operator_authority_anchored(
         != _canonical_line_sha256(lifecycle)
         or observed_actions[OPERATOR_SERVICE_CONTROL_ACTION]
         != _canonical_line_sha256(service_control)
+        or observed_actions[ROOTBROKER_CUTOVER_ACTION]
+        != _canonical_line_sha256(rootbroker_cutover)
         or re.fullmatch(
             r"[0-9a-f]{64}", str(observed_actions["operator_power_argv"])
         )

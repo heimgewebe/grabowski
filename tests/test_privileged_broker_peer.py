@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import signal
 import sys
 import subprocess
 import tempfile
@@ -624,6 +625,99 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         audit.assert_called_once()
         self.assertEqual(audit.call_args.args[0]["outcome"], "unknown")
 
+    def test_rootbroker_timeout_allows_rollback_grace_before_kill(self) -> None:
+        process = mock.Mock()
+        process.pid = 4321
+        process.communicate.return_value = (b"rolled-back", b"")
+        with mock.patch.object(broker_tool.os, "killpg") as killpg:
+            observed = broker_tool._communicate_after_timeout(
+                action=broker_tool.ROOTBROKER_CUTOVER_ACTION,
+                process=process,
+            )
+        self.assertEqual(observed, (b"rolled-back", b""))
+        killpg.assert_called_once_with(4321, signal.SIGTERM)
+        process.communicate.assert_called_once_with(
+            timeout=broker_tool.ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS
+        )
+
+    def test_non_cutover_timeout_remains_immediate_kill(self) -> None:
+        process = mock.Mock()
+        process.pid = 4321
+        process.communicate.return_value = (b"", b"")
+        with mock.patch.object(broker_tool.os, "killpg") as killpg:
+            broker_tool._communicate_after_timeout(
+                action="edit_system_service",
+                process=process,
+            )
+        killpg.assert_called_once_with(4321, signal.SIGKILL)
+        process.communicate.assert_called_once_with()
+
+    def test_power_action_missing_peer_uid_fails_closed_before_spawn(self) -> None:
+        reference = {
+            "request_id": "c" * 32,
+            "reference_sha256": "d" * 64,
+            "action": broker_tool.POWER_ACTION,
+            "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json",
+            "argv": ["/usr/bin/true"],
+            "cwd": "/",
+            "timeout_seconds": 5,
+        }
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool,
+                "_validate_blockade_lifecycle_peer",
+                side_effect=PermissionError("blockade lifecycle peer uid is not configured"),
+            ) as validate_peer,
+            mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(PermissionError, "peer uid"):
+                broker_tool.main()
+        validate_peer.assert_called_once_with(execution)
+        popen.assert_not_called()
+
+    def test_power_action_without_peer_fields_still_fails_closed_before_spawn(self) -> None:
+        reference = {
+            "request_id": "c" * 32,
+            "reference_sha256": "d" * 64,
+            "action": broker_tool.POWER_ACTION,
+            "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json",
+            "argv": ["/usr/bin/true"],
+            "cwd": "/",
+            "timeout_seconds": 5,
+        }
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool,
+                "_validate_blockade_lifecycle_peer",
+                side_effect=PermissionError("operator peer identity contract is incomplete"),
+            ) as validate_peer,
+            mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(PermissionError, "peer identity"):
+                broker_tool.main()
+        validate_peer.assert_called_once_with(execution)
+        popen.assert_not_called()
+
     def test_power_child_peer_is_rejected_before_process_spawn(self) -> None:
         reference = {
             "request_id": "d" * 32,
@@ -636,6 +730,129 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             "argv": ["/usr/bin/true"],
             "cwd": "/",
             "timeout_seconds": 5,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool,
+                "_validate_blockade_lifecycle_peer",
+                side_effect=PermissionError("blockade lifecycle peer is not systemd MainPID"),
+            ),
+            mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(PermissionError, "systemd MainPID"):
+                broker_tool.main()
+        popen.assert_not_called()
+
+    def test_rootbroker_cutover_timeout_allows_bounded_rollback_before_sigkill(self) -> None:
+        reference = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": broker_tool.ROOTBROKER_CUTOVER_ACTION,
+            "target": "c" * 40,
+        }
+        execution = {
+            "mode": "template",
+            "argv": [
+                "/usr/local/libexec/grabowski-rootbroker-cutover",
+                "--expected-head",
+                "c" * 40,
+            ],
+            "cwd": None,
+            "timeout_seconds": 2700,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        process = mock.Mock(pid=4242, returncode=2)
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(execution["argv"], 2700),
+            (b"", b"rolled back"),
+        ]
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
+            ),
+            mock.patch.object(broker_tool, "claim_once"),
+            mock.patch.object(broker_tool, "append_audit"),
+            mock.patch.object(broker_tool.subprocess, "Popen", return_value=process),
+            mock.patch.object(broker_tool.os, "killpg") as killpg,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(broker_tool.main(), 0)
+        self.assertEqual(
+            process.communicate.call_args_list,
+            [
+                mock.call(timeout=2700),
+                mock.call(timeout=broker_tool.ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS),
+            ],
+        )
+        killpg.assert_called_once_with(4242, signal.SIGTERM)
+        self.assertEqual(broker_tool.ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS, 900)
+
+    def test_rootbroker_action_name_requires_peer_validation_even_if_execution_fields_missing(self) -> None:
+        reference = {
+            "request_id": "1" * 32,
+            "reference_sha256": "2" * 64,
+            "action": broker_tool.ROOTBROKER_CUTOVER_ACTION,
+            "target": "a" * 40,
+        }
+        execution = {
+            "mode": "template",
+            "argv": ["/usr/bin/true"],
+            "cwd": None,
+            "timeout_seconds": 5,
+        }
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool,
+                "_validate_blockade_lifecycle_peer",
+                side_effect=PermissionError("operator peer identity contract is incomplete"),
+            ) as validate_peer,
+            mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(PermissionError, "peer identity"):
+                broker_tool.main()
+        validate_peer.assert_called_once_with(execution)
+        popen.assert_not_called()
+
+    def test_peer_bound_template_rejects_non_main_peer_before_spawn(self) -> None:
+        reference = {
+            "request_id": "f" * 32,
+            "reference_sha256": "0" * 64,
+            "action": "operator_rootbroker_cutover",
+            "target": "a" * 40,
+        }
+        execution = {
+            "mode": "template",
+            "argv": [
+                "/usr/local/libexec/grabowski-rootbroker-cutover",
+                "--expected-head",
+                "a" * 40,
+            ],
+            "cwd": None,
+            "timeout_seconds": 600,
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": "grabowski-operator.service",
         }

@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -26,6 +27,7 @@ import grabowski_connector_contract as connector_contract
 import grabowski_mcp as base
 import grabowski_deployment_observer as deployment_observer
 import grabowski_operator_core as operator
+import grabowski_privileged as privileged
 import grabowski_read_surface as read_surface
 import grabowski_serving_process as serving_process
 
@@ -54,6 +56,10 @@ SourceRepository = Annotated[str, Field(min_length=1, max_length=4096)]
 SourceLeaseOwner = Annotated[str, Field(min_length=1, max_length=128, pattern=r"[A-Za-z0-9._:@-]{1,128}")]
 SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
+PUBLIC_GITHUB_REPOSITORY_URL = "https://github.com/heimgewebe/grabowski.git"
+PUBLIC_GITHUB_MAIN_REF = "refs/heads/main"
+PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS = 15
+PUBLIC_GITHUB_LOOKUP_MAX_BYTES = 4096
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 RUNNER_RELATIVE_PATH = Path("tools/run_scheduled_deploy.py")
 DEPLOY_SCHEDULE_LOCK = Path.home() / ".local/state/grabowski/runtime-deploy-schedule.lock"
@@ -2043,6 +2049,63 @@ def _deployment_source_preflight(
     }
 
 
+def _fresh_public_github_main(expected_head: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+        raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
+    argv = [
+        "/usr/bin/git",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
+        "ls-remote",
+        "--refs",
+        PUBLIC_GITHUB_REPOSITORY_URL,
+        PUBLIC_GITHUB_MAIN_REF,
+    ]
+    completed = subprocess.run(
+        argv,
+        cwd="/",
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "/bin/false",
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "fresh public GitHub main lookup failed: "
+            f"git exit {completed.returncode}"
+        )
+    if (
+        len(completed.stdout.encode("utf-8", errors="replace"))
+        > PUBLIC_GITHUB_LOOKUP_MAX_BYTES
+        or len(completed.stderr.encode("utf-8", errors="replace"))
+        > PUBLIC_GITHUB_LOOKUP_MAX_BYTES
+    ):
+        raise RuntimeError("fresh public GitHub main lookup exceeded output bound")
+    lines = completed.stdout.splitlines()
+    if len(lines) != 1:
+        raise RuntimeError("fresh public GitHub main lookup returned an ambiguous result")
+    fields = lines[0].split("\t")
+    if len(fields) != 2 or fields[1] != PUBLIC_GITHUB_MAIN_REF:
+        raise RuntimeError("fresh public GitHub main lookup returned an invalid ref")
+    head = fields[0]
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        raise RuntimeError("fresh public GitHub main lookup returned an invalid commit")
+    return head
+
+
 def _canonical_preflight(expected_head: str) -> tuple[Path, Path]:
     repository, runner, _identity = _deployment_source_preflight(
         expected_head,
@@ -2063,12 +2126,46 @@ def grabowski_runtime_deploy_schedule(
     """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
     operator._require_operator_mutation("durable_job")
     operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("privileged_reference")
     with _deploy_schedule_lock():
         repository, runner, source_identity = _deployment_source_preflight(
             expected_head,
             source_repository,
             source_lease_owner_id,
         )
+        public_github_main_before = _fresh_public_github_main(expected_head)
+        if public_github_main_before != expected_head:
+            raise RuntimeError(
+                "fresh public GitHub main differs from deployment target: "
+                f"expected {expected_head}, found {public_github_main_before}"
+            )
+        authority = privileged.ensure_rootbroker_authority(expected_head)
+        if not authority.get("success"):
+            raise RuntimeError(
+                "Rootbroker authority refresh failed before deployment scheduling: "
+                + str(authority.get("failure_reason") or authority.get("outcome"))
+            )
+        public_github_main_after = _fresh_public_github_main(expected_head)
+        if public_github_main_after != expected_head:
+            raise RuntimeError(
+                "public GitHub main drifted during Rootbroker authority refresh: "
+                f"expected {expected_head}, found {public_github_main_after}"
+            )
+        repository_after, runner_after, source_identity_after = _deployment_source_preflight(
+            expected_head,
+            source_repository,
+            source_lease_owner_id,
+        )
+        if (
+            repository_after != repository
+            or runner_after != runner
+            or source_identity_after["identity_sha256"]
+            != source_identity["identity_sha256"]
+        ):
+            raise RuntimeError("deployment source identity drifted during Rootbroker authority refresh")
+        repository = repository_after
+        runner = runner_after
+        source_identity = source_identity_after
         canonical_repository = Path(source_identity["canonical_repository"])
         command = _deploy_command(
             repository,
@@ -2121,6 +2218,24 @@ def grabowski_runtime_deploy_schedule(
             "delay_seconds": delay_seconds,
             "source_identity": source_identity,
             "source_identity_sha256": source_identity["identity_sha256"],
+            "public_github_main": {
+                "repository": PUBLIC_GITHUB_REPOSITORY_URL,
+                "ref": PUBLIC_GITHUB_MAIN_REF,
+                "before": public_github_main_before,
+                "after": public_github_main_after,
+                "verification": "fresh-public-https-git-ls-remote-v1",
+            },
+            "rootbroker_authority": {
+                key: authority.get(key)
+                for key in (
+                    "outcome",
+                    "expected_head",
+                    "attested_head",
+                    "effect_started",
+                    "request_id",
+                    "reference_sha256",
+                )
+            },
         }
         base._append_audit(intent)
         jobs_root = operator._jobs_root()

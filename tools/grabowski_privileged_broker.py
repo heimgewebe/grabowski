@@ -34,6 +34,8 @@ AUDIT = STATE / "audit.jsonl"
 MAX_OUTPUT_BYTES = 250_000
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
+ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS = 900
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 RUN_USER_ROOT = Path("/run/user")
 MAX_PEER_CGROUP_PROCESSES = 256
@@ -586,6 +588,29 @@ def _run_blockade_lifecycle(
     return 0
 
 
+def _communicate_after_timeout(
+    *,
+    action: object,
+    process: object,
+) -> tuple[bytes, bytes]:
+    if action == ROOTBROKER_CUTOVER_ACTION:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            return process.communicate(
+                timeout=ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return process.communicate()
+
+
 def main() -> int:
     if os.geteuid() != 0:
         raise PermissionError("privileged broker must run as root")
@@ -594,7 +619,15 @@ def main() -> int:
     config = load_root_config(CONFIG)
     execution = resolve_execution(config, reference)
     operator_peer: dict[str, object] | None = None
-    if reference.get("action") in {POWER_ACTION, BLOCKADE_LIFECYCLE_ACTION}:
+    if (
+        reference.get("action") in {
+            POWER_ACTION,
+            BLOCKADE_LIFECYCLE_ACTION,
+            ROOTBROKER_CUTOVER_ACTION,
+        }
+        or execution.get("allowed_peer_uid") is not None
+        or execution.get("allowed_peer_unit") is not None
+    ):
         operator_peer = _validate_blockade_lifecycle_peer(execution)
     if execution.get("mode") == "recovery-marker-publish":
         return _run_recovery_publication(reference, execution)
@@ -624,11 +657,10 @@ def main() -> int:
         stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        stdout_bytes, stderr_bytes = process.communicate()
+        stdout_bytes, stderr_bytes = _communicate_after_timeout(
+            action=reference.get("action"),
+            process=process,
+        )
     stdout = stdout_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     stderr = stderr_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
     record = {

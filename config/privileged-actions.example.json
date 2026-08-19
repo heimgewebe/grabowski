@@ -122,6 +122,25 @@
       ],
       "timeout_seconds": 60
     },
+    "operator_rootbroker_cutover": {
+      "enabled": true,
+      "mode": "template",
+      "target_pattern": "[0-9a-f]{40}",
+      "argv": [
+        "/usr/local/libexec/grabowski-rootbroker-cutover",
+        "--repository",
+        "/home/alex/repos/grabowski",
+        "--expected-head",
+        "{target}",
+        "--apply",
+        "--automatic"
+      ],
+      "timeout_seconds": 2700,
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000
+    },
     "operator_blockade_marker_lifecycle": {
       "enabled": true,
       "mode": "blockade-marker-lifecycle",

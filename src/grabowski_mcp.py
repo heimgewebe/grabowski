@@ -578,7 +578,11 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_github_checks": ("github_cli",),
     "grabowski_service_status": ("user_service_control",),
     "grabowski_service_logs": ("user_service_control",),
-    "grabowski_runtime_deploy_schedule": ("durable_job", "git_cli"),
+    "grabowski_runtime_deploy_schedule": (
+        "durable_job",
+        "git_cli",
+        "privileged_reference",
+    ),
     "grabowski_agent_workspace_create": (
         "durable_job",
         "git_cli",

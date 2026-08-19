@@ -68,11 +68,31 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             ],
             "timeout_seconds": 60,
         }
+        rootbroker_cutover = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": r"[0-9a-f]{40}",
+            "argv": [
+                "/usr/local/libexec/grabowski-rootbroker-cutover",
+                "--repository",
+                "/home/alex/repos/grabowski",
+                "--expected-head",
+                "{target}",
+                "--apply",
+                "--automatic",
+            ],
+            "timeout_seconds": 600,
+            "kill_switch_path": "/var/lib/grabowski/operator-blockade/" + "operator-kill-switch",
+            "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/" + "operator-kill-switch",
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
         config = {
             "schema_version": 2,
             "actions": {
                 "operator_blockade_marker_lifecycle": lifecycle,
                 dual.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
+                dual.ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
             },
         }
         blobs = {
@@ -112,6 +132,9 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 ),
                 dual.OPERATOR_SERVICE_CONTROL_ACTION: dual._canonical_line_sha256(
                     service_control
+                ),
+                dual.ROOTBROKER_CUTOVER_ACTION: dual._canonical_line_sha256(
+                    rootbroker_cutover
                 ),
             },
             "power_peer_binding": {
