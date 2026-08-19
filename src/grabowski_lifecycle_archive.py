@@ -232,16 +232,53 @@ def _validated_task_record(record: Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _attention_archive_gate_reason_codes(
+    record: Mapping[str, Any],
+    evidence: Mapping[str, Any] | None,
+) -> list[str]:
+    state = record.get("state")
+    if state not in ATTENTION_GATED_TASK_STATES:
+        return []
+    identity = record.get("task_id")
+    receipt = record.get("lifecycle_receipt_sha256")
+    if evidence is None:
+        return ["attention_authority_unavailable:not_observed"]
+    status = evidence.get("status")
+    if status == "binding_mismatch":
+        return ["attention_authority_binding_mismatch"]
+    if status == "unavailable":
+        error_type = evidence.get("error_type")
+        if not isinstance(error_type, str) or not error_type:
+            error_type = "unknown"
+        return [f"attention_authority_unavailable:{error_type}"]
+    if status != "observed":
+        return ["attention_authority_unavailable:invalid_evidence"]
+    if (
+        evidence.get("task_id") != identity
+        or evidence.get("state") != state
+        or evidence.get("lifecycle_receipt_sha256") != receipt
+    ):
+        return ["attention_authority_binding_mismatch"]
+    if evidence.get("archive_ready") is not True:
+        closeout_state = evidence.get("closeout_state")
+        if not isinstance(closeout_state, str) or not closeout_state:
+            closeout_state = "invalid"
+        return [f"attention_closeout:{closeout_state}"]
+    return []
+
+
 def build_task_archive_plan(
     records: Iterable[Mapping[str, Any]],
     classifications: Mapping[str, Mapping[str, Any]],
     *,
     now_unix: int,
     minimum_age_seconds: int,
+    attention_gate_evidence: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if minimum_age_seconds < 0:
         raise ValueError("minimum_age_seconds must be non-negative")
     cutoff = now_unix - minimum_age_seconds
+    attention_gate_evidence = attention_gate_evidence or {}
     eligible: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     for raw in records:
@@ -270,26 +307,11 @@ def build_task_archive_plan(
             reason_codes.append("lifecycle_receipt_missing_or_invalid")
         state = record.get("state")
         if state in ATTENTION_GATED_TASK_STATES:
-            import grabowski_task_attention as task_attention
-            import grabowski_tasks as task_store
-
-            try:
-                authoritative_record = task_store._row_raw(identity)
-                if (
-                    authoritative_record.get("state") != state
-                    or authoritative_record.get("lifecycle_receipt_sha256") != receipt
-                ):
-                    reason_codes.append("attention_authority_binding_mismatch")
-                else:
-                    closeout = task_attention.terminal_closeout_plan(authoritative_record)
-                    if not closeout.get("archive_ready"):
-                        reason_codes.append(
-                            f"attention_closeout:{closeout.get('closeout_state') or 'invalid'}"
-                        )
-            except (OSError, ValueError, task_attention.TaskAttentionError) as exc:
-                reason_codes.append(
-                    f"attention_authority_unavailable:{type(exc).__name__}"
+            reason_codes.extend(
+                _attention_archive_gate_reason_codes(
+                    record, attention_gate_evidence.get(identity)
                 )
+            )
         if reason_codes:
             blocked.append({"task_id": identity, "reason_codes": reason_codes})
         else:
