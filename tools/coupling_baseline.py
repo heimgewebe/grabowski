@@ -17,11 +17,19 @@ from typing import Iterable
 SCHEMA_VERSION = 1
 DOMAIN_PREFIXES = {
     "audit": ("grabowski_audit", "grabowski_chronik"),
+    "blockade": ("grabowski_blockade", "grabowski_blockades"),
+    "browser": ("grabowski_browser",),
     "bureau": ("grabowski_bureau",),
     "checkout": ("grabowski_checkout", "grabowski_checkouts", "grabowski_worktree"),
     "deployment": ("grabowski_deploy", "grabowski_deployment", "grabowski_self_deploy", "grabowski_recovery", "grabowski_provenance_recovery"),
+    "effect": ("grabowski_effect",),
+    "execution": ("grabowski_agent", "grabowski_candidate", "grabowski_execution", "grabowski_lane", "grabowski_work_acquire", "grabowski_work_admission"),
+    "lifecycle": ("grabowski_lifecycle", "grabowski_terminal_convergence"),
     "operator": ("grabowski_operator", "grabowski_grips", "grabowski_operations"),
+    "privileged": ("grabowski_privileged",),
+    "repo_context": ("grabowski_repobrief", "grabowski_repoground", "grabowski_reposkop"),
     "resource": ("grabowski_resource", "grabowski_resources", "grabowski_nonconflict"),
+    "runtime": ("grabowski_runtime", "grabowski_serving_process"),
     "task": ("grabowski_task", "grabowski_tasks", "grabowski_workers", "grabowski_worker"),
     "transport": ("grabowski_transport", "grabowski_connector", "grabowski_client_snapshot", "grabowski_mcp"),
 }
@@ -111,6 +119,7 @@ def multi_authority_functions(
         refs = referenced_names(node)
         imported = sorted({aliases[name] for name in refs if name in aliases})
         domains = sorted(set().union(*(domain_for_module(item) for item in imported)) if imported else set())
+        unclassified = sorted(item for item in imported if not domain_for_module(item))
         if len(domains) >= 2:
             result.append(
                 {
@@ -119,6 +128,7 @@ def multi_authority_functions(
                     "lineno": node.lineno,
                     "authority_domains": domains,
                     "project_dependencies": imported,
+                    "unclassified_dependencies": unclassified,
                 }
             )
     return sorted(result, key=lambda item: (str(item["module"]), int(item["lineno"]), str(item["function"])))
@@ -240,6 +250,49 @@ def test_coupling(repo: Path, project_modules: set[str]) -> dict[str, object]:
     }
 
 
+def classification_coverage(
+    graph: dict[str, set[str]], incoming: dict[str, set[str]]
+) -> dict[str, object]:
+    classified: list[str] = []
+    unclassified: list[dict[str, object]] = []
+    domain_counts: Counter[str] = Counter()
+    for name in sorted(graph):
+        domains = sorted(domain_for_module(name))
+        if domains:
+            classified.append(name)
+            domain_counts.update(domains)
+            continue
+        unclassified.append(
+            {
+                "module": name,
+                "fan_in": len(incoming[name]),
+                "fan_out": len(graph[name]),
+            }
+        )
+
+    ratio = len(classified) / len(graph) if graph else 1.0
+    ranked_unknowns = sorted(
+        unclassified,
+        key=lambda item: (
+            -(int(item["fan_in"]) + int(item["fan_out"])),
+            -int(item["fan_in"]),
+            -int(item["fan_out"]),
+            str(item["module"]),
+        ),
+    )
+    return {
+        "classified_module_count": len(classified),
+        "unclassified_module_count": len(unclassified),
+        "classified_ratio": round(ratio, 6),
+        "domain_module_counts": [
+            {"domain": domain, "module_count": count}
+            for domain, count in sorted(domain_counts.items())
+        ],
+        "unclassified_modules": [str(item["module"]) for item in unclassified],
+        "unclassified_high_coupling": ranked_unknowns[:50],
+    }
+
+
 def build_baseline(repo: Path, max_commits: int) -> dict[str, object]:
     repo = repo.resolve()
     files = source_files(repo)
@@ -268,6 +321,7 @@ def build_baseline(repo: Path, max_commits: int) -> dict[str, object]:
                     "authority_domains": domains,
                     "fan_out": len(graph[name]),
                     "dependencies": sorted(graph[name]),
+                    "unclassified_dependencies": sorted(dep for dep in graph[name] if not domain_for_module(dep)),
                 }
             )
         multi_functions.extend(multi_authority_functions(name, trees[name], project_modules))
@@ -275,6 +329,28 @@ def build_baseline(repo: Path, max_commits: int) -> dict[str, object]:
     head = git(repo, "rev-parse", "HEAD").strip()
     dirty = bool(git(repo, "status", "--porcelain").strip())
     modules_by_path = {path.relative_to(repo).as_posix(): name for name, path in modules.items()}
+    classification = classification_coverage(graph, incoming)
+    evidence_gaps: list[dict[str, object]] = [
+        {
+            "kind": "reverse_import_classification",
+            "reason": "No canonical layer contract is defined; guessing a layer order would turn a measurement into an architectural decision.",
+            "needed_for": "hard reverse-import regression gate",
+        },
+        {
+            "kind": "runtime_error_stack_frequency",
+            "reason": "Repository analysis has no authoritative runtime/log corpus.",
+            "needed_for": "ranking seams by observed production failure frequency",
+        },
+    ]
+    if int(classification["unclassified_module_count"]) > 0:
+        evidence_gaps.append(
+            {
+                "kind": "authority_domain_classification_coverage",
+                "reason": "Modules outside the explicit descriptive prefix families remain unclassified rather than being assigned to an authority domain by guesswork.",
+                "needed_for": "treating crosscutting-module and multi-authority-function rankings as complete authority coverage",
+                "observed_unclassified_module_count": classification["unclassified_module_count"],
+            }
+        )
 
     report: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -292,6 +368,7 @@ def build_baseline(repo: Path, max_commits: int) -> dict[str, object]:
             "test_coupling": "static project-module imports from tests/test_*.py",
             "reverse_imports": "not classified without an explicit layer contract; raw directed edges are emitted instead",
             "runtime_stack_frequency": "not inferred from repository state; requires separately bound runtime/log evidence",
+            "authority_classification": "prefix-based descriptive projection with explicit coverage; unknown modules remain unclassified rather than guessed",
         },
         "module_count": len(modules),
         "edge_count": sum(len(targets) for targets in graph.values()),
@@ -315,20 +392,10 @@ def build_baseline(repo: Path, max_commits: int) -> dict[str, object]:
             crosscutting, key=lambda item: (-len(item["authority_domains"]), -int(item["fan_out"]), str(item["module"]))
         ),
         "multi_authority_functions": multi_functions,
+        "authority_classification": classification,
         "git_cochange": cochange(repo, modules_by_path, max_commits),
         "test_coupling": test_coupling(repo, project_modules),
-        "evidence_gaps": [
-            {
-                "kind": "reverse_import_classification",
-                "reason": "No canonical layer contract is defined; guessing a layer order would turn a measurement into an architectural decision.",
-                "needed_for": "hard reverse-import regression gate",
-            },
-            {
-                "kind": "runtime_error_stack_frequency",
-                "reason": "Repository analysis has no authoritative runtime/log corpus.",
-                "needed_for": "ranking seams by observed production failure frequency",
-            },
-        ],
+        "evidence_gaps": evidence_gaps,
     }
     digest_input = dict(report)
     report["report_sha256"] = sha256_bytes(canonical_json(digest_input))

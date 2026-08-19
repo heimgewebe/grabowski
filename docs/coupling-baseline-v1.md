@@ -15,10 +15,26 @@ Die Baseline bindet sich an den exakten Git-HEAD und erfasst:
 - Strongly Connected Components (Tarjan);
 - Module, die mindestens drei klassifizierte Autoritätsdomänen importieren;
 - Funktionen, die importierte Projektmodule aus mindestens zwei Autoritätsdomänen referenzieren;
+- Abdeckung und verbleibende Lücken der deskriptiven Autoritätsklassifikation;
 - Git-Co-Change über einen begrenzten Commit-Horizont;
 - statische Testkopplung aus `tests/test_*.py`.
 
 Die Autoritätsdomänen sind nur ein **Messklassifikator**. Sie verleihen keine Autorität und definieren keine neue Modularchitektur.
+
+### Klassifikationsabdeckung
+
+Die Präfixfamilien decken nur Domänen ab, deren Semantik aus dem bestehenden Systemvertrag hinreichend eindeutig ist. Neben Audit, Bureau, Checkout, Deployment, Operator, Resources, Tasks und Transport werden inzwischen auch Blockade, Browser, Effect, Execution, Lifecycle, Privileged, Repo-Context und Runtime als deskriptive Familien erfasst.
+
+Andere Module werden **nicht** aus Gründen einer schöneren Kennzahl in eine Domäne einsortiert. Der Report enthält deshalb unter `authority_classification`:
+
+- Zahl und Anteil klassifizierter Module;
+- Zahl und Namen unklassifizierter Module;
+- die unklassifizierten Module mit der höchsten strukturellen Kopplung;
+- Modulzahlen je bekannter Domänenfamilie.
+
+Solange unklassifizierte Module existieren, tragen `crosscutting_modules` und `multi_authority_functions` zusätzlich ihre unbekannten Abhängigkeiten. Die strukturellen Import-, SCC-, Fan-in/Fan-out-, Co-Change- und Testmetriken bleiben davon vollständig; nur die Autoritätsprojektion ist entsprechend begrenzt.
+
+Eine verbleibende Abdeckungslücke wird maschinenlesbar als `authority_domain_classification_coverage` in `evidence_gaps` ausgewiesen. Sie ist kein Anlass, neue Architekturgrenzen zu erfinden.
 
 ## Bewusste Nichtbehauptungen
 
@@ -36,7 +52,7 @@ Repositoryzustand ist keine Runtime-Telemetrie. v1 erfindet deshalb keine Produk
 **Fehlt:** revisions- und zeitgebundener Log-/Runtime-Evidenzkorpus.
 **Nötig für:** Priorisierung von Seams nach realer Fehlerhäufigkeit.
 
-Diese Lücken werden maschinenlesbar in `evidence_gaps` ausgegeben.
+Diese Lücken sowie gegebenenfalls die Klassifikationsabdeckung werden maschinenlesbar in `evidence_gaps` ausgegeben.
 
 ## Reproduzierbarer Lauf
 
