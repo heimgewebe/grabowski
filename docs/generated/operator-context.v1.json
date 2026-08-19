@@ -749,7 +749,7 @@
     },
     {
       "category": "command",
-      "description": "Start a durable background command as a transient user systemd unit.",
+      "description": "Start a durable background command as a transient user systemd unit.\n\n``decision_review_binding`` is optional.  When present it is normalized,\norigin-hash-bound before launch, and registered under the same per-PR/head\nlock used by Captain merge dispatch.  Captain then discovers every such job\nitself; callers cannot make a started decision-bound reviewer disappear by\nomitting it from later merge evidence.",
       "effects": [
         "process-start",
         "state-create",
@@ -3166,6 +3166,14 @@
         "source": "src/grabowski_merge_guard.py"
       },
       {
+        "module": "grabowski_decision_reviews",
+        "source": "src/grabowski_decision_reviews.py"
+      },
+      {
+        "module": "grabowski_merge_authority",
+        "source": "src/grabowski_merge_authority.py"
+      },
+      {
         "module": "grabowski_agent_workspace_observer",
         "source": "src/grabowski_agent_workspace_observer.py"
       },
@@ -3503,7 +3511,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "6bfd173977cb9fdbce0dfd2579bddfd9fa6464c5c1bc66f26aecab95c4f19d10"
+      "sha256": "96fcbcdcc6a84514b0cf0bd08fd8d540a1543baf0a8aa5dbcfcb485453f67b55"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3546,6 +3554,7 @@
       "src/grabowski_convergence.py": "9f12a1397767a088bd20c500d307014a870547d9435587a2d04f5a43afb31e19",
       "src/grabowski_current_work.py": "d41765110381118767800c6c332305c2d74d600ffdd8da981e45a6fb1960fdf2",
       "src/grabowski_current_work_surface.py": "1b48a548e25fd1f9adb44d7b7d69edb36886078f75865913d7d3c507a950fe73",
+      "src/grabowski_decision_reviews.py": "764a4fac2827bcca7293d02d38c9e9eea70ac6b364a25c0d4f6c9d9173f9821c",
       "src/grabowski_deployment_observer.py": "3eb7f587f28289630a043a2159c80bacc546e39c245d80b5e71e7883da83f5ab",
       "src/grabowski_effect_interceptor.py": "4864f5280239afce4436985f895cfc068b17344be775a1390e6c529dd136a0d8",
       "src/grabowski_effect_receipt.py": "b3114c0835203a57a42acbea5bbb2843ee0633d8a52e673f1497cc17e87e4a29",
@@ -3570,6 +3579,7 @@
       "src/grabowski_lifecycle_read_surface.py": "ed8a123c80751204ccb095ce1b5ef77b15310e9aed4b555167a60c4a3d51f467",
       "src/grabowski_managed_cargo.py": "153723e0299cf9b1c624cd342ebf73daf9e05b71c695babba4ed1ed2ca59497e",
       "src/grabowski_mcp.py": "24c3b0613f45d2c923d400844cff05a88fa4dfb15e6b1f30fb607dcad96a27b8",
+      "src/grabowski_merge_authority.py": "5bfe922272e0a294a20066f140c453c8f613b077aaca39eb01c0bf2f6c985f28",
       "src/grabowski_merge_delivery.py": "6f11c5c7c49efdba215a2c7c49563f8c43ebd798de9ff915408a837b11dc5064",
       "src/grabowski_merge_delivery_surface.py": "97bf36785d928c7070a1e294d7b510d126cb06f63e6f26f62d5130c96e3a8b5e",
       "src/grabowski_merge_guard.py": "ea3ccd4b8d7c4dfb6c8c6df4574512b4e4ed3f16a8655ade6f6693498b126575",
@@ -3579,7 +3589,7 @@
       "src/grabowski_nonconflict.py": "ea52f020e073a6417bc699edf031db40fb201faee217803e1502529ddc4f0bf2",
       "src/grabowski_ntfy_dispatch.py": "baf5c167603f442fb2672dd108611aa448d9414c59a8a97fad27ab3bc4aea363",
       "src/grabowski_operations.py": "dbefeb9b7623d5ef8e42025b9b9afe604e0c2378fcbb7dcde45eb30ef3fff232",
-      "src/grabowski_operator.py": "111a2232626dc2d0b0a802e476dfe5caedcdd2d6c9260b4acff05afc47469d15",
+      "src/grabowski_operator.py": "c8d0fe7b39ab901afcb6133b3d3f8e8448bac352c10a3854327f3a119ac0d17d",
       "src/grabowski_operator_obligation.py": "2eec8a842f934aeb6cb4d03f507f61be586c82729414575dacf2b10601649586",
       "src/grabowski_operator_optimization.py": "6e21534f87f9646f957c40c7607554b7f54b165b47516170f09fdc9314cd1dbf",
       "src/grabowski_operator_relay.py": "24a9187ef0f7f858a21eb9a7a0bb808b01b8b66b2943be8f9ce2845940916ca5",

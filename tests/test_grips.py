@@ -9223,6 +9223,63 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertEqual([], resources.list_resources())
 
+    def test_atomic_merge_guard_blocks_material_decision_bound_review(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": "e" * 40,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            diff_text=CAPTAIN_DIFF_TEXT,
+        )
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_decision_review_reconciliation",
+            "status": "blocked",
+            "attempt_count": 2,
+            "slot_count": 2,
+            "errors": [
+                "decision_review_material_reject:reviewer-a:grabowski-job-a00000000001"
+            ],
+        }
+        with patch.object(
+            merge_guard.decision_reviews,
+            "reconcile",
+            return_value=reconciliation,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(execution["verification_passed"])
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released",
+            guard["status"],
+        )
+        self.assertEqual(
+            reconciliation,
+            guard["decision_bound_review_reconciliation"],
+        )
+        self.assertIn(
+            "decision_review_material_reject:reviewer-a:grabowski-job-a00000000001",
+            guard["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_atomic_merge_guard_receipt_binds_disjoint_publication_operation(self) -> None:
         worktree = Path.cwd().resolve()
         repository = merge_guard.merge_guard_repository_root(worktree)

@@ -1938,6 +1938,27 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                         secret_data=b"synthetic-value",
                     )
 
+    def test_secret_use_blocks_direct_github_merge_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            with (
+                patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True),
+                patch.object(grabowski_mcp, "_resolve_executable", return_value="/usr/bin/gh"),
+            ):
+                with self.assertRaisesRegex(PermissionError, "Captain pr-merge"):
+                    grabowski_mcp._validate_secret_use_argv(
+                        [
+                            "gh",
+                            "pr",
+                            "merge",
+                            "350",
+                            "--subject",
+                            "{SECRET_FD_PATH}",
+                        ],
+                        cwd=cwd,
+                        secret_data=b"synthetic-value",
+                    )
+
     def test_trusted_owner_secret_use_environment_accepts_nonsecret_extra_keys(self) -> None:
         with patch.object(grabowski_mcp, "_trusted_owner_enabled", return_value=True):
             environment = grabowski_mcp._secret_use_environment(

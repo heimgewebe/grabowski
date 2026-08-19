@@ -319,6 +319,14 @@
       "source": "src/grabowski_merge_guard.py"
     },
     {
+      "module": "grabowski_decision_reviews",
+      "source": "src/grabowski_decision_reviews.py"
+    },
+    {
+      "module": "grabowski_merge_authority",
+      "source": "src/grabowski_merge_authority.py"
+    },
+    {
       "module": "grabowski_agent_workspace_observer",
       "source": "src/grabowski_agent_workspace_observer.py"
     },

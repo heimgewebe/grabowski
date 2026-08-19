@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 import weakref
 
+import grabowski_decision_reviews as decision_reviews
 
 
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -3044,20 +3045,47 @@ class CaptainMergeGuardRunner:
                 ),
             }
         )
-        revalidation_errors = self._revalidate_dispatch_bindings(bindings)
-        revalidation_errors.extend(self._revalidate_repository_policy())
-        if revalidation_errors:
-            self.receipt["status"] = "blocked_after_guard_revalidation"
-            self.receipt["contract_satisfied"] = False
-            self.receipt["errors"] = revalidation_errors
-            raise RuntimeError(
-                "merge lease guard dispatch revalidation blocked: "
-                + "; ".join(revalidation_errors)
+        decision_binding = {
+            "schema_version": decision_reviews.BINDING_SCHEMA_VERSION,
+            "kind": decision_reviews.BINDING_KIND,
+            "repo": str(bindings["repository"]),
+            "pr": int(bindings["pull_request"]),
+            "head_sha": str(bindings["head_sha"]),
+            "base_sha": str(bindings["base_sha"]),
+            "diff_sha256": str(bindings["diff_sha256"]),
+            "slot": "merge-guard-lock",
+        }
+        # The same per-PR/head lock is taken by grabowski_job_start whenever a
+        # reviewer is declared decision-bound.  Holding it through the final
+        # live revalidation and GitHub merge dispatch closes the registration
+        # TOCTOU: a reviewer cannot become decision-bound between reconciliation
+        # and the merge call and then be omitted from this decision.
+        with decision_reviews.decision_review_lock(decision_binding):
+            decision_reconciliation = decision_reviews.reconcile(
+                repo=str(bindings["repository"]),
+                pr=int(bindings["pull_request"]),
+                head_sha=str(bindings["head_sha"]),
+                base_sha=str(bindings["base_sha"]),
+                diff_sha256=str(bindings["diff_sha256"]),
             )
-        self.receipt["dispatch_at_unix_ns"] = time.time_ns()
-        self.receipt["dispatch_called"] = True
-        self.dispatch_called = True
-        return self.github_runner(repo_path, args)
+            self.receipt["decision_bound_review_reconciliation"] = (
+                decision_reconciliation
+            )
+            revalidation_errors = list(decision_reconciliation.get("errors", []))
+            revalidation_errors.extend(self._revalidate_dispatch_bindings(bindings))
+            revalidation_errors.extend(self._revalidate_repository_policy())
+            if revalidation_errors:
+                self.receipt["status"] = "blocked_after_guard_revalidation"
+                self.receipt["contract_satisfied"] = False
+                self.receipt["errors"] = revalidation_errors
+                raise RuntimeError(
+                    "merge lease guard dispatch revalidation blocked: "
+                    + "; ".join(revalidation_errors)
+                )
+            self.receipt["dispatch_at_unix_ns"] = time.time_ns()
+            self.receipt["dispatch_called"] = True
+            self.dispatch_called = True
+            return self.github_runner(repo_path, args)
 
     def _delegated_operator_terminal_evidence(
         self, execution_result: dict[str, Any]

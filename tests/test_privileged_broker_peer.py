@@ -564,6 +564,12 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         sent = json.loads(fake.sent.decode("utf-8"))
         self.assertEqual(sent["action"], privileged_client.POWER_ACTION)
 
+    def test_power_run_rejects_direct_github_merge_before_broker_use(self) -> None:
+        with self.assertRaisesRegex(PermissionError, "Captain pr-merge"):
+            privileged_client._normalize_power_argv(
+                ["/usr/bin/gh", "pr", "merge", "350"]
+            )
+
     def test_blockade_lifecycle_oversize_response_is_outcome_unknown(self) -> None:
         class OversizeSocket:
             def __init__(self) -> None:
