@@ -30,7 +30,6 @@ BUREAU_CONTROL_LOCK_PATH = (
 )
 BUREAU_RUNTIME_ROOT = Path("/home/alex/.local/share/bureau")
 BUREAU_MANAGED_LAUNCHER = Path("/home/alex/.local/bin/bureau")
-BUREAU_CONTRACT_PYTHON = Path(sys.executable)
 BUREAU_CONTRACT_EXECUTABLE = BUREAU_RUNTIME_ROOT / "venv/bin/bureau"
 BROAD_BUREAU_REPOSITORY_KEY = f"repo:{BUREAU_REPOSITORY_ROOT}"
 BUREAU_MERGE_GATE_KEY = f"path:{BUREAU_REPOSITORY_ROOT}/.bureau-scopes/merge-main"
@@ -1125,6 +1124,7 @@ def _managed_contract_runtime() -> dict[str, Any]:
         or not release_id.startswith(f"{source_commit[:12]}-src")
     ):
         raise BureauLeaseContractError("contract-runtime-manifest-identity-invalid")
+    dependency_runtime = _legacy_contract_runtime()
     try:
         runtime_root = BUREAU_RUNTIME_ROOT.resolve(strict=True)
         configured = BUREAU_MANAGED_LAUNCHER
@@ -1142,9 +1142,14 @@ def _managed_contract_runtime() -> dict[str, Any]:
         release_root = release_value.resolve(strict=True)
         module_path = module_value.resolve(strict=True)
         configured_manifest_path = launcher_value.resolve(strict=True)
-        python_launcher = BUREAU_CONTRACT_PYTHON
-        python_interpreter = python_launcher.resolve(strict=True)
-        python_environment = python_launcher.parent.parent / "pyvenv.cfg"
+        # Managed Bureau code still needs the dependency-capable, versioned
+        # Bureau virtualenv.  Using Grabowski's own sys.executable under -I
+        # hides Bureau's declared dependencies (for example jsonschema).
+        # Reuse the already hardened legacy-venv binding rather than weakening
+        # interpreter isolation.
+        python_launcher = dependency_runtime["python_launcher"]
+        python_interpreter = dependency_runtime["python_launcher_target"]
+        python_environment = dependency_runtime["component_paths"]["pyvenv_config"]
     except (OSError, KeyError, TypeError) as exc:
         raise BureauLeaseContractError(
             "contract-managed-runtime-unavailable",
@@ -1232,6 +1237,7 @@ def _managed_contract_runtime() -> dict[str, Any]:
         "identities": identities,
         "package_paths": package_paths,
         "package_identities": package_identities,
+        "managed_python_runtime": dependency_runtime,
         "managed_package_tree_sha256": package_tree_sha256,
         "managed_package_contract": managed_package_contract,
         "managed_package_executable_marker": managed_package_executable_marker,
@@ -1390,6 +1396,14 @@ def _assert_contract_runtime_unchanged(runtime: dict[str, Any]) -> None:
         raise BureauLeaseContractError("contract-release-changed-during-check")
     if launcher_target != runtime["python_launcher_target"]:
         raise BureauLeaseContractError("contract-python-changed-during-check")
+    if runtime["runtime_kind"] == "managed-manifest":
+        managed_python_runtime = runtime.get("managed_python_runtime")
+        if (
+            not isinstance(managed_python_runtime, dict)
+            or managed_python_runtime.get("runtime_kind") != "legacy-venv"
+        ):
+            raise BureauLeaseContractError("contract-managed-python-runtime-invalid")
+        _assert_contract_runtime_unchanged(managed_python_runtime)
     for name, path in runtime["component_paths"].items():
         observed = _regular_file_identity(
             path, label=f"contract-{name.replace('_', '-')}-readback"
