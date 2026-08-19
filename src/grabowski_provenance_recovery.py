@@ -478,6 +478,121 @@ def _resume_effect_repository() -> Path:
     return self_deploy.CANONICAL_REPOSITORY
 
 
+def _resume_source_preflight(
+    expected_head: str,
+    source_repository: str | None,
+    source_lease_owner_id: str | None,
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Bind resume execution to one exact clean source for the cutover head.
+
+    A mid-cutover completion is intentionally allowed to finish an older,
+    already-switched revision after ``origin/main`` has advanced.  Therefore
+    this preflight shares the deployment source's path/common-dir/lease
+    invariants but does *not* require ``origin/main == expected_head``.
+    """
+    if (
+        not isinstance(expected_head, str)
+        or not 40 <= len(expected_head) <= 64
+        or any(character not in "0123456789abcdef" for character in expected_head)
+    ):
+        raise ValueError("expected_head must be a lowercase Git object ID")
+
+    canonical = self_deploy._validated_repository_path(
+        self_deploy.CANONICAL_REPOSITORY,
+        label="canonical repository",
+    )
+    repository = (
+        canonical
+        if source_repository is None
+        else self_deploy._validated_repository_path(
+            Path(source_repository).expanduser(),
+            label="source repository",
+        )
+    )
+    self_deploy._assert_not_repoground_managed_source(repository)
+
+    canonical_common = self_deploy._git_common_directory(canonical)
+    source_common = (
+        canonical_common
+        if repository == canonical
+        else self_deploy._git_common_directory(repository)
+    )
+    if source_common != canonical_common:
+        raise RuntimeError(
+            "source repository does not share the canonical Git common directory"
+        )
+
+    head = self_deploy._required_stdout(
+        self_deploy._git_result(repository, "rev-parse", "--verify", "HEAD"),
+        "resume source HEAD lookup",
+    )
+    branch = self_deploy._required_stdout(
+        self_deploy._git_result(repository, "rev-parse", "--abbrev-ref", "HEAD"),
+        "resume source branch lookup",
+    )
+    status = self_deploy._required_stdout(
+        self_deploy._git_result(
+            repository,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ),
+        "resume source working-tree status",
+    )
+
+    source_kind = "canonical-main" if repository == canonical else "detached-worktree"
+    expected_branch = "main" if source_kind == "canonical-main" else "HEAD"
+    if head != expected_head:
+        raise RuntimeError(f"HEAD drift: expected {expected_head}, found {head}")
+    if branch != expected_branch:
+        raise RuntimeError(
+            f"{source_kind} source has invalid branch state: "
+            f"expected {expected_branch}, found {branch}"
+        )
+    if status:
+        raise RuntimeError("source repository is dirty")
+
+    runner = repository / MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+    if runner.is_symlink() or not runner.is_file():
+        raise RuntimeError(f"mid-cutover resume runner is unavailable: {runner}")
+    committed_runner = _git_bytes(
+        repository,
+        "show",
+        f"{expected_head}:{MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH.as_posix()}",
+    )
+    if committed_runner is None:
+        raise RuntimeError("expected head has no mid-cutover resume runner")
+    try:
+        runner_bytes = runner.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"mid-cutover resume runner is unreadable: {exc}") from exc
+    if runner_bytes != committed_runner:
+        raise RuntimeError("mid-cutover resume runner does not match expected head")
+
+    if source_kind == "detached-worktree" and source_lease_owner_id is None:
+        raise ValueError("detached resume source requires source_lease_owner_id")
+    lease_evidence = self_deploy._source_lease_evidence(
+        repository, source_lease_owner_id
+    )
+    identity = {
+        "schema_version": 1,
+        "kind": "grabowski_midcutover_resume_source_identity",
+        "source_kind": source_kind,
+        "repository": str(repository),
+        "canonical_repository": str(canonical),
+        "git_common_directory": str(source_common),
+        "head": head,
+        "clean": True,
+        "runner_relative_path": MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH.as_posix(),
+        "runner_sha256": hashlib.sha256(runner_bytes).hexdigest(),
+        "lease_evidence": lease_evidence,
+    }
+    return repository, runner, {
+        **identity,
+        "identity_sha256": self_deploy._source_identity_sha256(identity),
+    }
+
+
 def _recovery_lane(expected_head: str) -> dict[str, Any]:
     """Classify which recovery lane the durable blue-green state admits.
 
@@ -831,10 +946,8 @@ def _resume_under_schedule_lock(
     base._require_valid_audit_chain()
 
     try:
-        repository, _deploy_runner, source_identity = (
-            self_deploy._deployment_source_preflight(
-                expected_head, source_repository, source_lease_owner_id
-            )
+        repository, runner, source_identity = _resume_source_preflight(
+            expected_head, source_repository, source_lease_owner_id
         )
     except (RuntimeError, ValueError, OSError, PermissionError) as exc:
         reason = "resume_source_identity_bound"
@@ -857,7 +970,6 @@ def _resume_under_schedule_lock(
         raise ProvenanceRecoveryDenied([reason], source_gate) from exc
 
     resume_binding = gate["resume_binding"]
-    runner = repository / MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
     command = self_deploy._midcutover_resume_command(
         repository,
         runner,

@@ -898,6 +898,112 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
         self.assertFalse(foreign["allowed"])
         self.assertFalse(foreign["completion_warrant"])
 
+    def test_resume_source_preflight_does_not_require_origin_main_to_match(self) -> None:
+        """A historical switched cutover may finish after main advances."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "canonical"
+            source = root / "source"
+            common = root / "common"
+            canonical.mkdir()
+            source.mkdir()
+            common.mkdir()
+            runner = source / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH
+            runner.parent.mkdir(parents=True)
+            runner_bytes = b"historical resume runner\n"
+            runner.write_bytes(runner_bytes)
+
+            def validated(raw, *, label):
+                self.assertIn(label, {"canonical repository", "source repository"})
+                return Path(raw)
+
+            def git_result(repository, *args):
+                return repository, args
+
+            def required_stdout(result, label):
+                _repository, args = result
+                if args == ("rev-parse", "--verify", "HEAD"):
+                    return HEAD
+                if args == ("rev-parse", "--abbrev-ref", "HEAD"):
+                    return "HEAD"
+                if args == ("status", "--porcelain=v1", "--untracked-files=normal"):
+                    return ""
+                self.fail(f"unexpected Git read {args!r} ({label})")
+
+            with (
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "CANONICAL_REPOSITORY",
+                    canonical,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_validated_repository_path",
+                    side_effect=validated,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_assert_not_repoground_managed_source",
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_git_common_directory",
+                    return_value=common,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_git_result",
+                    side_effect=git_result,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_required_stdout",
+                    side_effect=required_stdout,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_source_lease_evidence",
+                    return_value={
+                        "resource_key": f"path:{source}",
+                        "lease": {"owner_id": "lane:historical"},
+                    },
+                    create=True,
+                ) as lease_evidence,
+                patch.object(
+                    provenance_recovery.self_deploy,
+                    "_source_identity_sha256",
+                    return_value="34" * 32,
+                    create=True,
+                ),
+                patch.object(
+                    provenance_recovery,
+                    "_git_bytes",
+                    return_value=runner_bytes,
+                ) as committed_runner,
+            ):
+                repository, observed_runner, identity = (
+                    provenance_recovery._resume_source_preflight(
+                        HEAD, str(source), "lane:historical"
+                    )
+                )
+
+        self.assertEqual(repository, source)
+        self.assertEqual(observed_runner, runner)
+        self.assertEqual(identity["head"], HEAD)
+        self.assertEqual(identity["source_kind"], "detached-worktree")
+        self.assertNotIn("origin_main", identity)
+        lease_evidence.assert_called_once_with(source, "lane:historical")
+        committed_runner.assert_called_once_with(
+            source,
+            "show",
+            f"{HEAD}:{provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH.as_posix()}",
+        )
+
     def test_published_recovery_tool_dispatches_every_s0_s4_phase_to_resume(self) -> None:
         for phase in provenance_recovery.midcutover.RESUME_PHASES:
             with self.subTest(phase=phase):
@@ -959,11 +1065,12 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                         provenance_recovery.base, "_require_valid_audit_chain"
                     ),
                     patch.object(
-                        provenance_recovery.self_deploy,
-                        "_deployment_source_preflight",
+                        provenance_recovery,
+                        "_resume_source_preflight",
                         return_value=(
                             source_path,
-                            source_path / provenance_recovery.self_deploy.RUNNER_RELATIVE_PATH,
+                            source_path
+                            / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
                             source_identity,
                         ),
                     ) as source_preflight,
@@ -1039,8 +1146,8 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
             patch.object(provenance_recovery, "_recovery_lane", return_value=lane),
             patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
             patch.object(
-                provenance_recovery.self_deploy,
-                "_deployment_source_preflight",
+                provenance_recovery,
+                "_resume_source_preflight",
                 side_effect=RuntimeError(
                     f"HEAD drift: expected {HEAD}, found {OTHER_HEAD}"
                 ),
