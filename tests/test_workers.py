@@ -326,9 +326,13 @@ globalThis.fetch = async () => ({
         node = shutil.which("node")
         if node is None:
             self.skipTest("Node.js is required for the browser helper runtime test")
-        helper_path = self.root / "browser-semantic-helper.mjs"
-        preload_path = self.root / "fake-semantic-cdp.mjs"
-        request_path = self.root / "semantic-request.json"
+        fixture_root = Path(
+            tempfile.mkdtemp(prefix=".browser-semantic-test-", dir=ROOT)
+        )
+        self.addCleanup(shutil.rmtree, fixture_root, True)
+        helper_path = fixture_root / "browser-semantic-helper.mjs"
+        preload_path = fixture_root / "fake-semantic-cdp.mjs"
+        request_path = fixture_root / "semantic-request.json"
         helper_path.write_text(workers.BROWSER_SEMANTIC_NODE_SOURCE, encoding="utf-8")
         preload_path.write_text(
             r"""
@@ -479,7 +483,7 @@ globalThis.fetch = async () => ({
         )
         execution = subprocess.run(
             [node, "--import", str(preload_path), str(helper_path), str(request_path)],
-            cwd=self.root,
+            cwd=fixture_root,
             env={**os.environ, "GRABOWSKI_TEST_SCENARIO": scenario},
             text=True,
             capture_output=True,
