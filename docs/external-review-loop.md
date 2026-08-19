@@ -20,6 +20,14 @@ The required controls remain independent:
 6. current-head Codex settlement for high-critical or explicitly selected PRs;
 7. Captain authority and recovery controls where Captain executes the merge.
 
+### Decision-bound local reviewer jobs
+
+A review that is intentionally decision-bound must be declared **before launch** through `grabowski_job_start.decision_review_binding`. The binding names exactly one `repo`, `pr`, `head_sha`, `base_sha`, `diff_sha256` and stable reviewer `slot`. Grabowski normalizes it and places it inside the hash-bound durable job origin; the later merge caller does not supply the reviewer inventory. The started reviewer receives a result contract and must emit exactly one final line beginning with `GRABOWSKI_DECISION_REVIEW_V1=` followed by the bound JSON result. Valid semantic verdicts are `PASS_THIS_REVISION` with `material_findings=0` or `REJECT_THIS_REVISION` with a positive material finding count.
+
+Captain scans the bounded durable-job registry for every matching PR/head immediately before final dispatch. Non-terminal jobs, invalid origin/finalization data, successful jobs without a valid result marker, base/diff drift and any material REJECT block. A terminal infrastructure failure without a semantic marker is retained as an infrastructure attempt and may be followed by a successful replacement in the same slot; it never counts as PASS itself. A later PASS does not erase a prior material REJECT. The same per-PR/head filesystem lock serializes decision-bound job registration with the final reconciliation and merge dispatch, so a cooperating reviewer cannot be registered in the gap after reconciliation.
+
+This contract governs only reviews launched as decision-bound through the typed Grabowski job surface. It does not turn arbitrary external LLM output into merge authority, prove review quality, prevent a non-cooperating external GitHub actor from merging, or claim complete detection of deliberately indirect same-UID execution.
+
 ## Depth policy
 
 | Review tier | Minimum iterations | Trigger |

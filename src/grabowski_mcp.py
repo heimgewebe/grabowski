@@ -55,6 +55,7 @@ import grabowski_blockade_store as blockade_store
 import grabowski_grips
 import grabowski_operator_relay
 import grabowski_merge_guard
+import grabowski_merge_authority as merge_authority
 import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
@@ -2759,6 +2760,13 @@ def _validate_secret_use_argv(
                     continue
                 break
     command = [_resolve_executable(argv[0], cwd), *argv[1:]]
+    merge_bypass_reason = merge_authority.direct_merge_bypass_reason(command)
+    if merge_bypass_reason is not None:
+        raise PermissionError(
+            "direct pull-request merge through secret_use is blocked "
+            f"({merge_bypass_reason}); use Captain pr-merge so review reconciliation "
+            "cannot be bypassed"
+        )
     return command
 
 

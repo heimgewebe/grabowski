@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "6196f9ab80ed8ab945f3bd502829dceb79857bd36c35a1032c4bffb808497ebe",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "6bfd173977cb9fdbce0dfd2579bddfd9fa6464c5c1bc66f26aecab95c4f19d10",
+  "contract_sha256": "96fcbcdcc6a84514b0cf0bd08fd8d540a1543baf0a8aa5dbcfcb485453f67b55",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -690,7 +690,7 @@
     },
     {
       "category": "command",
-      "description": "Start a durable background command as a transient user systemd unit.",
+      "description": "Start a durable background command as a transient user systemd unit.\n\n``decision_review_binding`` is optional.  When present it is normalized,\norigin-hash-bound before launch, and registered under the same per-PR/head\nlock used by Captain merge dispatch.  Captain then discovers every such job\nitself; callers cannot make a started decision-bound reviewer disappear by\nomitting it from later merge evidence.",
       "effects": [
         "process-start",
         "state-create",

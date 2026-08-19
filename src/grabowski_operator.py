@@ -39,6 +39,8 @@ import grabowski_mcp as base
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
 import grabowski_job_origin as job_origin
+import grabowski_decision_reviews as decision_reviews
+import grabowski_merge_authority as merge_authority
 import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 import grabowski_effect_interceptor
@@ -1654,6 +1656,13 @@ def _validate_argv(argv: list[str], *, cwd: Path | None = None) -> list[str]:
     policy = base._load_policy()
     trusted_owner = _trusted_owner_mode(policy)
     executable = Path(argv[0]).name
+    merge_bypass_reason = merge_authority.direct_merge_bypass_reason(argv)
+    if merge_bypass_reason is not None:
+        raise PermissionError(
+            "direct pull-request merge through generic command execution is blocked "
+            f"({merge_bypass_reason}); use Captain pr-merge so live review, CI and "
+            "decision-bound review reconciliation gates cannot be bypassed"
+        )
     if executable in PRIVILEGE_ESCALATORS and not trusted_owner:
         raise PermissionError(
             f"Privilege escalation is not available through Grabowski: "
@@ -4121,6 +4130,7 @@ def _start_job(
     runtime_seconds: int = DEFAULT_JOB_RUNTIME,
     notify_on_done: dict[str, Any] | None = None,
     *,
+    decision_review_binding: dict[str, Any] | None = None,
     finalization_expected_head: str | None = None,
     reserved_unit: str | None = None,
     allow_reserved_runtime_deploy: bool = False,
@@ -4165,6 +4175,10 @@ def _start_job(
         "argv_sha256": argv_sha256,
         "runtime_seconds": runtime,
     }
+    if decision_review_binding is not None:
+        scope["decision_bound_review"] = decision_reviews.normalize_binding(
+            decision_review_binding
+        )
     # The origin record must name the tool that actually authorized the job, so
     # a reserved deploy started by the provenance repair lane is not attributed
     # to the ordinary self-deploy scheduler.  The value is constrained to the
@@ -4447,20 +4461,46 @@ def grabowski_job_start(
     cwd: str | None = None,
     runtime_seconds: int = DEFAULT_JOB_RUNTIME,
     notify_on_done: dict[str, Any] | None = None,
+    decision_review_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Start a durable background command as a transient user systemd unit."""
+    """Start a durable background command as a transient user systemd unit.
+
+    ``decision_review_binding`` is optional.  When present it is normalized,
+    origin-hash-bound before launch, and registered under the same per-PR/head
+    lock used by Captain merge dispatch.  Captain then discovers every such job
+    itself; callers cannot make a started decision-bound reviewer disappear by
+    omitting it from later merge evidence.
+    """
     working_directory = _resolve_cwd(cwd)
     _require_operator_mutation(
         "durable_job",
         path=str(working_directory),
         opaque_command=True,
     )
-    return _start_job(
-        argv,
-        cwd=str(working_directory),
-        runtime_seconds=runtime_seconds,
-        notify_on_done=notify_on_done,
+    normalized_binding = (
+        decision_reviews.normalize_binding(decision_review_binding)
+        if decision_review_binding is not None
+        else None
     )
+    if normalized_binding is None:
+        return _start_job(
+            argv,
+            cwd=str(working_directory),
+            runtime_seconds=runtime_seconds,
+            notify_on_done=notify_on_done,
+        )
+    with decision_reviews.decision_review_lock(normalized_binding):
+        result = _start_job(
+            argv,
+            cwd=str(working_directory),
+            runtime_seconds=runtime_seconds,
+            notify_on_done=notify_on_done,
+            decision_review_binding=normalized_binding,
+        )
+    result["decision_review_contract"] = decision_reviews.result_contract(
+        normalized_binding
+    )
+    return result
 
 
 @mcp.tool(name="grabowski_job_status", annotations=READ_ONLY)
@@ -4789,6 +4829,13 @@ def grabowski_github(
     """Run GitHub CLI with redacted output."""
     if not arguments:
         raise ValueError("GitHub CLI arguments must not be empty")
+    bypass_reason = merge_authority.github_merge_bypass_reason(arguments)
+    if bypass_reason is not None:
+        raise PermissionError(
+            "direct pull-request merge through grabowski_github is blocked "
+            f"({bypass_reason}); use Captain pr-merge so live review, CI and "
+            "decision-bound review reconciliation gates cannot be bypassed"
+        )
     working_directory = _resolve_cwd(cwd)
     _require_operator_mutation("github_cli", path=str(working_directory))
     command = _validate_argv(["gh", *arguments], cwd=working_directory)

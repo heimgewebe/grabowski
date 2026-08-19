@@ -17,6 +17,7 @@ try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
     import grabowski_operator as operator
+import grabowski_merge_authority as merge_authority
 
 mcp = operator.mcp
 READ_ONLY = operator.READ_ONLY
@@ -201,6 +202,13 @@ def _normalize_power_argv(argv: list[str]) -> list[str]:
         normalized.append(item)
     if not Path(normalized[0]).is_absolute():
         raise ValueError("argv[0] must be an absolute executable path")
+    merge_bypass_reason = merge_authority.direct_merge_bypass_reason(normalized)
+    if merge_bypass_reason is not None:
+        raise PermissionError(
+            "direct pull-request merge through privileged command execution is blocked "
+            f"({merge_bypass_reason}); use Captain pr-merge so review reconciliation "
+            "cannot be bypassed"
+        )
     return normalized
 
 
