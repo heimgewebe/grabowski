@@ -48,11 +48,13 @@ CANONICAL_RECOVERY = Path(os.environ.get(
 )).expanduser()
 BACKUP_TIMER = os.environ.get("GRABOWSKI_BACKUP_TIMER", "restic-backup-1930.timer")
 MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(24 * 60 * 60)))
-SERVER_RECOVERY_HOST = os.environ.get("GRABOWSKI_SERVER_RECOVERY_HOST", "heimserver")
+DEFAULT_SERVER_RECOVERY_HOST = "heimberry"
+DEFAULT_SERVER_RECOVERY_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
+SERVER_RECOVERY_HOST = os.environ.get("GRABOWSKI_SERVER_RECOVERY_HOST", DEFAULT_SERVER_RECOVERY_HOST)
 SERVER_RECOVERY_REMOTE_PORT = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_REMOTE_PORT", "18081"))
 SERVER_RECOVERY_REST_USER = os.environ.get("GRABOWSKI_SERVER_RECOVERY_REST_USER", "grabowski")
 SERVER_RECOVERY_REPO_PATH = os.environ.get("GRABOWSKI_SERVER_RECOVERY_REPO_PATH", "grabowski-recovery-probe")
-SERVER_RECOVERY_TARGET = os.environ.get("GRABOWSKI_SERVER_RECOVERY_TARGET", "heimserver:rest-server/grabowski-recovery-probe")
+SERVER_RECOVERY_TARGET = os.environ.get("GRABOWSKI_SERVER_RECOVERY_TARGET", DEFAULT_SERVER_RECOVERY_TARGET)
 SERVER_RECOVERY_HTTP_PASSWORD = Path(os.environ.get(
     "GRABOWSKI_SERVER_RECOVERY_HTTP_PASSWORD_FILE",
     str(operator.HOME / ".config/restic/heimserver-recovery-http-password"),

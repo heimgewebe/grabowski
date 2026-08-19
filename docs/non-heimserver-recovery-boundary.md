@@ -2,18 +2,25 @@
 
 ## Status
 
-Accepted for Grabowski PR #107.
+Accepted for Grabowski PR #107. Runtime-default convergence updated after the Rootbroker authority moved to Heimberry.
 
 ## Context
 
 Grabowski can be runtime-healthy while high-impact recovery-gated paths remain blocked. Runtime health, audit validity, deployment provenance and connector/tool visibility do not prove backup restoreability.
 
-The default recovery evidence path is Heimserver-backed:
+At PR #107 acceptance, the default recovery evidence path was Heimserver-backed:
 
 - `GRABOWSKI_SERVER_RECOVERY_HOST=heimserver`
 - `GRABOWSKI_SERVER_RECOVERY_TARGET=heimserver:rest-server/grabowski-recovery-probe`
 
-When Heimserver is unavailable, this path must stay fail-closed. Do not run Heimserver probes merely to make the gate green.
+When Heimserver is unavailable, that explicit configuration must stay fail-closed. Do not run Heimserver probes merely to make the gate green.
+
+The current default follows the Rootbroker recovery authority on Heimberry:
+
+- `GRABOWSKI_SERVER_RECOVERY_HOST=heimberry`
+- `GRABOWSKI_SERVER_RECOVERY_TARGET=heimberry:rest-server/grabowski-recovery-probe`
+
+Environment overrides remain supported. Choosing another target is still configuration, not recovery evidence: the exact configured target must pass backup, restore-sentinel, repository-check and canonical-publication validation before it can authorize recovery-gated actions. Heimserver remains in the explicit legacy-alias model below; changing the default does not weaken that fail-closed boundary.
 
 ## Decision
 
