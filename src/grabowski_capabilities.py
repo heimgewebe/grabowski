@@ -367,6 +367,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["audit-append", "receipt-create", "resource-lease", "state-change"],
         "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
     },
+    "grabowski_checkout_binding_identity_rebind_preview": {
+        "category": "checkout-lifecycle",
+        "purpose": "Bind one clean, coordination-free and remote-secured linked checkout to its current head and renamed branch without granting mutation authority.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_checkout_binding_identity_rebind_apply": {
+        "category": "checkout-lifecycle",
+        "purpose": "Atomically update only expected head and branch in matching active lifecycle and retention rows after exact preview, remote-security and coordination revalidation.",
+        "risk_class": "medium",
+        "effects": ["audit-append", "resource-lease", "state-change"],
+        "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
+    },
     "grabowski_checkout_retain": {
         "category": "checkout-lifecycle",
         "purpose": "Assign explicit retention ownership to one temporary linked Git checkout.",
