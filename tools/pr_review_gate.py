@@ -12,8 +12,18 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from grabowski_pr_diff import (  # noqa: E402
+    canonicalize_github_pr_diff_identity,
+    github_pr_diff_identity_sha256,
+)
 
 try:
     from review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
@@ -397,8 +407,9 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     pr_diff_text: str | None = None
     pr_diff_error: str | None = None
     try:
-        pr_diff_bytes = _run_bytes(repo, ["gh", "pr", "diff", str(pr)])
-        pr_diff_sha256 = _sha256_bytes(pr_diff_bytes)
+        raw_pr_diff_bytes = _run_bytes(repo, ["gh", "pr", "diff", str(pr)])
+        pr_diff_bytes = canonicalize_github_pr_diff_identity(raw_pr_diff_bytes)
+        pr_diff_sha256 = github_pr_diff_identity_sha256(raw_pr_diff_bytes)
         try:
             pr_diff_text = pr_diff_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -2441,6 +2452,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
         raise GateInputError("cannot write external review packet without PR head SHA")
     output_dir = Path(os.path.abspath(output_dir))
 
+    pr_diff = canonicalize_github_pr_diff_identity(pr_diff)
     diff_sha256 = _sha256_bytes(pr_diff)
     diff_filename = f"pr-{pr_number}-{head[:12]}.diff"
     prompt_filename = f"pr-{pr_number}-{head[:12]}-external-review-prompt.md"

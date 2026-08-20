@@ -15,6 +15,11 @@ from urllib.parse import quote, urlsplit
 import weakref
 
 import grabowski_decision_reviews as decision_reviews
+from grabowski_pr_diff import (
+    GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION,
+    canonicalize_github_pr_diff_identity,
+    github_pr_diff_identity_sha256,
+)
 
 
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -2757,17 +2762,23 @@ class CaptainMergeGuardRunner:
             return None, errors
         diff_info = _merge_guard_result_info(diff_raw)
         if isinstance(diff_info.get("stdout_bytes"), bytes):
-            live_diff_bytes = diff_info["stdout_bytes"]
-            diff_canonicalization = "raw-command-bytes"
+            raw_live_diff_bytes = diff_info["stdout_bytes"]
+            diff_source = "raw-command-bytes"
         else:
-            live_diff_bytes = diff_info["stdout"].encode("utf-8")
-            diff_canonicalization = "utf8-runner-text-exact-fallback"
-        live_diff_sha256 = hashlib.sha256(live_diff_bytes).hexdigest()
+            raw_live_diff_bytes = diff_info["stdout"].encode("utf-8")
+            diff_source = "utf8-runner-text-exact-fallback"
+        live_diff_bytes = canonicalize_github_pr_diff_identity(raw_live_diff_bytes)
+        live_diff_sha256 = github_pr_diff_identity_sha256(raw_live_diff_bytes)
+        diff_canonicalization = diff_source
+        if live_diff_bytes != raw_live_diff_bytes:
+            diff_canonicalization += "+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
         self.receipt["live_diff"] = {
             "command": ["gh", *diff_args],
             "returncode": diff_info["returncode"],
+            "source_bytes": len(raw_live_diff_bytes),
             "bytes": len(live_diff_bytes),
             "canonicalization": diff_canonicalization,
+            "raw_sha256": hashlib.sha256(raw_live_diff_bytes).hexdigest(),
             "sha256": live_diff_sha256,
             "stderr_sha256": hashlib.sha256(diff_info["stderr"].encode()).hexdigest(),
         }

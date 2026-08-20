@@ -443,7 +443,7 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         raise SettlementError("cannot read current PR diff: " + " ".join(detail.split())[:400])
     if not diff_bytes.stdout:
         raise SettlementError("current PR diff is empty")
-    pull_request["diff_sha256"] = hashlib.sha256(diff_bytes.stdout).hexdigest()
+    pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(diff_bytes.stdout)
     return pull_request
 
 
