@@ -124,10 +124,16 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
                 self.assertIn("independent-review", route["task_classes"])
                 self.assertIn("critical-review", route["task_classes"])
 
-    def test_external_codex_routes_remain_contrast_only(self) -> None:
+    def test_external_codex_routes_remain_contrast_only_except_attested_spark_writer(self) -> None:
         routes = [route for route in self.catalog["routes"] if route.get("harness") == "codex"]
         self.assertTrue(routes)
-        self.assertTrue(all(route.get("contrast_only") is True for route in routes))
+        spark = self.routes["codex-spark-low"]
+        self.assertFalse(spark.get("contrast_only", False))
+        self.assertEqual(["openai-codex-spark"], spark["quota_pools"])
+        self.assertEqual(["mechanical", "triage", "docs", "tests"], spark["task_classes"])
+        legacy_routes = [route for route in routes if route["id"] != "codex-spark-low"]
+        self.assertTrue(legacy_routes)
+        self.assertTrue(all(route.get("contrast_only") is True for route in legacy_routes))
 
     def test_runtime_command_prefixes_do_not_duplicate_runner_owned_flags(self) -> None:
         self.assertEqual(
