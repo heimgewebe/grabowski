@@ -66,7 +66,8 @@
       "supported_intents": [
         "read_state",
         "navigate",
-        "scroll_into_view"
+        "scroll_into_view",
+        "activate"
       ],
       "tool": "grabowski_browser_worker_semantic",
       "uncovered_intents": {}
@@ -3524,7 +3525,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "44c126891b6814c80019b27c120a8fc60b83a3b76fc98a91bcc2879ecdd14eb1"
+      "sha256": "9a921131b5cdfbb34003ec05a212c3b8cfe93c6bebc7d58aea858a23b6b749f3"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
