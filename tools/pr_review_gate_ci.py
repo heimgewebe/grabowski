@@ -643,7 +643,7 @@ def load_live_pr(repo_name: str, pr_number: int) -> dict[str, Any]:
 
 def current_diff_sha256(repo_name: str, pr_number: int) -> str:
     diff = _run_bytes(["gh", "pr", "diff", str(pr_number), "--repo", repo_name])
-    return hashlib.sha256(diff).hexdigest()
+    return gate.github_pr_diff_identity_sha256(diff)
 
 
 def collaborator_permission(repo_name: str, actor: str) -> str | None:

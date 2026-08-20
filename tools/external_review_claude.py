@@ -15,6 +15,12 @@ import sys
 import time
 from typing import Any
 
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from grabowski_pr_diff import github_pr_diff_identity_sha256  # noqa: E402
+
 VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 SEVERITIES = {"critical", "high", "medium", "low"}
 DEFAULT_TIMEOUT_MINUTES = 30
@@ -207,7 +213,7 @@ def current_pr_diff_sha256(repo: Path, pr: int) -> str:
         timeout_seconds=180,
         text=False,
     )
-    return sha256_bytes(completed.stdout)
+    return github_pr_diff_identity_sha256(completed.stdout)
 
 
 def build_review_prompt(packet_prompt: str, diff_text: str, prompt_nonce: str) -> str:

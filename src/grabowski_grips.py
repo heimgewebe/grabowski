@@ -1976,6 +1976,7 @@ def _codex_review_evidence_errors(
             and isinstance(pr_number, int)
             and not isinstance(pr_number, bool)
             and _is_hex_sha(evidence.get("head_sha"), lengths=(40,))
+            and _is_hex_sha(evidence.get("base_sha"), lengths=(40,))
             and _is_hex_sha(evidence.get("diff_sha256"), lengths=(64,))
         ):
             request_core = {
@@ -1984,10 +1985,11 @@ def _codex_review_evidence_errors(
                 "repo": repo.strip().lower(),
                 "pr": pr_number,
                 "head_sha": evidence["head_sha"],
+                "base_sha": evidence["base_sha"],
                 "diff_sha256": evidence["diff_sha256"],
             }
             if request_id != sha256_json(request_core)[:32]:
-                errors.append("request.request_id does not bind repo, PR, head and diff")
+                errors.append("request.request_id does not bind repo, PR, base, head and diff")
         request_time = _captain_evidence_time(
             request.get("created_at"), label="request.created_at", errors=errors
         )
@@ -2122,6 +2124,7 @@ def _codex_review_exception_errors(
     evidence: Any,
     *,
     expected_head: str | None,
+    expected_base_sha: str | None,
     expected_diff_sha256: str | None,
     expected_repo: str | None,
     expected_pr: int | None,
@@ -2145,6 +2148,7 @@ def _codex_review_exception_errors(
         errors.append("pr does not match PR target")
     for field, expected, length in (
         ("head_sha", expected_head, 40),
+        ("base_sha", expected_base_sha, 40),
         ("diff_sha256", expected_diff_sha256, 64),
     ):
         value = evidence.get(field)
@@ -7996,6 +8000,7 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                     "repo",
                     "pr",
                     "head_sha",
+                    "base_sha",
                     "diff_sha256",
                     "generated_at",
                     "expires_at",
@@ -8007,9 +8012,9 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                     "schema_version": 1,
                     "kind": "grabowski_codex_review_exception",
                 },
-                binds=("expected_head", "diff_sha256", *common_bindings),
+                binds=("expected_head", "expected_base_sha", "diff_sha256", *common_bindings),
                 purpose=(
-                    "explicit repo/PR/head/diff-bound Codex exception valid for at "
+                    "explicit repo/PR/base/head/diff-bound Codex exception valid for at "
                     "most two hours; it bypasses only the Codex settlement gate"
                 ),
                 required_when=(
@@ -8839,6 +8844,9 @@ def _captain_codex_review_gate(
         errors = _codex_review_exception_errors(
             exception,
             expected_head=expected_head if isinstance(expected_head, str) else None,
+            expected_base_sha=(
+                expected_base_sha if isinstance(expected_base_sha, str) else None
+            ),
             expected_diff_sha256=expected_diff if isinstance(expected_diff, str) else None,
             expected_repo=expected_repo if isinstance(expected_repo, str) else None,
             expected_pr=(

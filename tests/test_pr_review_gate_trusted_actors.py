@@ -36,6 +36,7 @@ def _self_review() -> dict:
         "repo": "heimgewebe/grabowski",
         "pr": 58,
         "head_sha": HEAD,
+        "base_sha": BASE,
         "reviewed_files": ["docs/low_risk_note.md"],
         "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
         "diff_sha256": DIFF_SHA,
