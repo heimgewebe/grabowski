@@ -481,13 +481,16 @@ def _truncation_errors(pr: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _request_payload(repository: str, pr_number: int, head_sha: str, diff_sha256: str) -> dict[str, Any]:
+def _request_payload(
+    repository: str, pr_number: int, head_sha: str, base_sha: str, diff_sha256: str
+) -> dict[str, Any]:
     core = {
         "schema_version": SCHEMA_VERSION,
         "kind": REQUEST_KIND,
         "repo": repository,
         "pr": pr_number,
         "head_sha": head_sha,
+        "base_sha": base_sha,
         "diff_sha256": diff_sha256,
     }
     return {**core, "request_id": _sha256_json(core)[:32]}
@@ -496,8 +499,8 @@ def _request_payload(repository: str, pr_number: int, head_sha: str, diff_sha256
 def _request_body(payload: dict[str, Any]) -> str:
     return (
         "@codex review\n\n"
-        "Please review the exact current pull-request head. Grabowski will accept only "
-        "a Codex result bound to the head and diff recorded below.\n\n"
+        "Please review the exact current pull-request base and head. Grabowski will accept only "
+        "a Codex result bound to the base, head and diff recorded below.\n\n"
         "<!-- grabowski-codex-review-request:v1\n"
         + _canonical_json(payload)
         + "\n-->"
@@ -538,11 +541,13 @@ def _canonical_request_payload(
         "repo",
         "pr",
         "head_sha",
+        "base_sha",
         "diff_sha256",
         "request_id",
     }:
         return None
     head_sha = value.get("head_sha")
+    base_sha = value.get("base_sha")
     diff_sha256 = value.get("diff_sha256")
     if (
         value.get("schema_version") != SCHEMA_VERSION
@@ -551,6 +556,8 @@ def _canonical_request_payload(
         or value.get("pr") != pr_number
         or not isinstance(head_sha, str)
         or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or not isinstance(base_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
         or not isinstance(diff_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", diff_sha256) is None
     ):
@@ -561,6 +568,7 @@ def _canonical_request_payload(
         "repo": repository,
         "pr": pr_number,
         "head_sha": head_sha,
+        "base_sha": base_sha,
         "diff_sha256": diff_sha256,
     }
     if value.get("request_id") != _sha256_json(core)[:32]:
@@ -1077,7 +1085,7 @@ def evaluate(
     base_sha = _current_base(pr)
     diff_sha256 = _current_diff(pr)
     policy = _policy(pr, repository, explicitly_required=explicitly_required)
-    expected_request = _request_payload(repository, pr_number, head_sha, diff_sha256)
+    expected_request = _request_payload(repository, pr_number, head_sha, base_sha, diff_sha256)
     canonical_requests = _canonical_requests(
         pr, repository=repository, pr_number=pr_number
     )
@@ -1302,8 +1310,9 @@ def ensure_request(
             "review_tier": policy["review_tier"],
         }
     head_sha = _current_head(pr)
+    base_sha = _current_base(pr)
     diff_sha256 = _current_diff(pr)
-    payload = _request_payload(repository, pr_number, head_sha, diff_sha256)
+    payload = _request_payload(repository, pr_number, head_sha, base_sha, diff_sha256)
     existing = _matching_requests(pr, payload)
     if existing:
         adequate = existing[0]
@@ -1343,6 +1352,7 @@ def ensure_request(
                 "request_id": payload["request_id"],
                 "comment_id": adequate["databaseId"],
                 "head_sha": head_sha,
+                "base_sha": base_sha,
                 "diff_sha256": diff_sha256,
             }
     response = _run_json(
@@ -1368,6 +1378,7 @@ def ensure_request(
         "request_id": payload["request_id"],
         "comment_id": comment_id,
         "head_sha": head_sha,
+        "base_sha": base_sha,
         "diff_sha256": diff_sha256,
     }
 

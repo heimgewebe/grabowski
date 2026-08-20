@@ -49,7 +49,7 @@ def connection(nodes: list[dict], **page: bool) -> dict:
 
 
 def request_payloads() -> tuple[dict, dict, dict]:
-    payload = settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)
+    payload = settlement._request_payload(REPOSITORY, PR, HEAD, BASE, DIFF)
     body = settlement._request_body(payload)
     graph = {
         "databaseId": 101,

@@ -2118,6 +2118,7 @@ class CaptainMergeGuardRunner:
             "repo": repository,
             "pr": pr_number,
             "head_sha": head_sha,
+            "base_sha": base_sha,
             "diff_sha256": diff_sha256,
         }
         expected_marker = {

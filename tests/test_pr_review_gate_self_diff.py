@@ -6,6 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 HEAD = "a" * 40
+BASE = "b" * 40
 DIFF_SHA = "0" * 64
 OTHER_DIFF_SHA = "1" * 64
 
@@ -34,7 +35,7 @@ def _state(*, diff_sha: str | None = DIFF_SHA, diff_error: str | None = None) ->
             "mergeStateStatus": "CLEAN",
             "mergeable": "MERGEABLE",
             "headRefOid": HEAD,
-            "baseRefOid": "b" * 40,
+            "baseRefOid": BASE,
             "changedFiles": 1,
             "additions": 1,
             "deletions": 0,
@@ -64,6 +65,7 @@ def _self_review(*, diff_sha: str | None = DIFF_SHA) -> dict[str, object]:
         "repo": "heimgewebe/grabowski",
         "pr": 88,
         "head_sha": HEAD,
+        "base_sha": BASE,
         "reviewed_files": ["docs/example.md"],
         "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
         "diff_reviewed": True,
@@ -90,6 +92,13 @@ class SelfReviewDiffBindingTests(unittest.TestCase):
         result = gate.evaluate_review_gate(_state(), self_review=_self_review())
         self.assertEqual(result["verdict"], "PASS")
         self.assertTrue(result["review_sources"]["self_review_diff_bound"])
+
+    def test_self_review_base_sha_mismatch_blocks(self) -> None:
+        review = _self_review()
+        review["base_sha"] = "d" * 40
+        result = gate.evaluate_review_gate(_state(), self_review=review)
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertTrue(_has_failure(result, "self-review base_sha mismatch"), result["failures"])
 
     def test_missing_self_review_diff_hash_blocks(self) -> None:
         result = gate.evaluate_review_gate(_state(), self_review=_self_review(diff_sha=None))

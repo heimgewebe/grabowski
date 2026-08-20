@@ -68,6 +68,7 @@ def _self_review(diff_sha256: str) -> dict[str, object]:
         "repo": "heimgewebe/grabowski",
         "pr": 7,
         "head_sha": HEAD,
+        "base_sha": BASE,
         "diff_sha256": diff_sha256,
         "diff_reviewed": True,
         "reviewed_files": ["tools/pr_review_gate.py"],

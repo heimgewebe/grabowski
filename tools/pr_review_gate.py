@@ -2540,6 +2540,9 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
     head = pr.get("headRefOid")
     if not isinstance(head, str) or not head:
         raise GateInputError("cannot write self-review template without PR head SHA")
+    base = pr.get("baseRefOid")
+    if not isinstance(base, str) or re.fullmatch(r"[0-9a-f]{40}", base) is None:
+        raise GateInputError("cannot write self-review template without PR base SHA")
     diff_sha256 = state.get("pr_diff_sha256")
     if not _valid_sha256(diff_sha256):
         pr_diff_error = state.get("pr_diff_error")
@@ -2558,6 +2561,7 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
         "repo": repo_name,
         "pr": pr_number,
         "head_sha": head,
+        "base_sha": base,
         "diff_sha256": _normalize_sha256(diff_sha256),
         "diff_reviewed": False,
         "reviewed_files": paths,
@@ -2588,6 +2592,7 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
         "repo": repo_name,
         "pr": pr_number,
         "head_sha": head,
+        "base_sha": base,
         "diff_sha256": _normalize_sha256(diff_sha256),
         "required_review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
     }
@@ -3015,6 +3020,11 @@ def evaluate_review_gate(
             self_review_failures.append("PR headRefOid is missing")
         elif self_review.get("head_sha") != head_sha:
             self_review_failures.append("self-review head_sha mismatch")
+        base_sha = pr.get("baseRefOid")
+        if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+            self_review_failures.append("PR baseRefOid is missing or invalid")
+        elif self_review.get("base_sha") != base_sha:
+            self_review_failures.append("self-review base_sha mismatch")
         self_review_workflow_failures = _self_review_workflow_failures(pr, self_review, repo_name=repo_name)
         self_review_failures.extend(self_review_workflow_failures)
         if self_review.get("diff_reviewed") is not True:
