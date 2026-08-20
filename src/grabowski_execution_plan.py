@@ -141,6 +141,10 @@ def route_binding_from_decision(value: Any) -> dict[str, Any]:
     )
     if effect_profile not in EFFECT_PROFILES:
         raise ExecutionPlanError("route effect profile is unsupported")
+    if effect_profile == "delivery" and executor != "scoped_writer":
+        raise ExecutionPlanError(
+            "delivery effect profile requires a scoped_writer route"
+        )
     verification_policy = _required_text(
         route.get("verification_policy"), "route.verification_policy", maximum=32
     )

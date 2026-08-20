@@ -258,10 +258,25 @@ Der P5-Happy-Path ist damit als begrenzte Kette `Workspace Coordinator -> geschl
 - Merge oder Deployment; beides bleibt eine spätere Controllerwirkung nach CI/Review;
 - einen universellen Scheduler, eine Queue oder einen zweiten StateStore;
 - automatische Multi-Writer-Konkurrenz;
-- Writer-Commit/Push/PR-Autorität des `effect_profile=delivery`; das gehört in P6;
+- Writer-Commit/Push/PR-Autorität; diese war in P5 noch nicht aktiv und wird erst durch das nachfolgende P6-Profil explizit freigeschaltet;
 - Outcome-Learning; das bleibt P7.
 
-## 14. Invarianten
+## 14. P6 explizites Delivery-Profil
+
+P6 erweitert ausschließlich die bestehende kanonische Route und den vorhandenen Grip `agent-execution-happy-path`. Es gibt kein neues öffentliches MCP-Tool und keinen zweiten Merge-, Deployment- oder Lifecycle-Pfad. `effect_profile=candidate` bleibt Default und behält den P1-P5-Pfad über `candidate-integration-ready`; Delivery wird nur durch `effect_profile=delivery` in Source-Mode opt-in aktiviert. Resume-Mode akzeptiert keinen caller-gelieferten Profilwechsel, sondern liest das Profil aus dem lane-gebundenen `ExecutionPlan.v1`.
+
+- Delivery ist nur bei `executor=scoped_writer` zulässig. Route und `ExecutionPlan.v1` binden Profil, Writerroute, Source, Write-Scope und Plan-ID unveränderlich. Controller-Routen sowie Lane-, Route-, Plan-, Branch-, Base- oder Scope-Drift blockieren vor Commit oder Publikation.
+- Der Writer-Effekt beginnt erst nach einem gültig geschlossenen, lane-backed Workspace mit erfolgreichem Close-Receipt, integer aktuellem Candidate-Round, integrity-valid aktueller Collection und vollständigem `PASS` aus Tests und Review. Candidate-, Verification- und Collection-Evidenz wird aus den create-only Workspace-Receipts erneut validiert; ein alter Candidate einer früheren Round ist nicht lieferbar.
+- `CandidateDeliveryManifest.v1` ist ein kleiner create-only Manifest-Vertrag für genau einen `commit_range`. Er bindet Candidate-ID und Candidate-Manifest-Digest, Verification-Summary- und exakten Collection-Result-Digest, Workspace-, Lane-, Lane-Receipt-, Route- und Plan-Identität, Write-Scope, Base-/Head-Commit, Candidate-abgeleiteten und Commit-Git-Tree, Writer-/Base-Branch sowie `origin`/Remote-Ref. Deterministische Commit-, Push- und PR-Aktions-IDs binden außerdem PR-Head-SHA, Draft-State, Titel und Body. Exakter Replay wird wiederverwendet; ein abweichender Inhalt im selben Receipt-Slot ist ein Identitätskonflikt.
+- Der Commit wird auf dem bereits serverseitig bestimmten Writer-Branch als genau ein Single-Parent-Commit über dem Candidate-Base erstellt. Vor Ref-CAS wird der Candidate-Patch in einem isolierten Index zum exakten Git-Tree abgeleitet; nach CAS folgt unmittelbarer Branch-/Parent-/Tree-/Clean-Readback. Vor jeder Publikation muss `commit^{tree}` exakt dem Candidate-abgeleiteten Tree entsprechen, und das immutable Delivery-Manifest muss create-only persistiert und wieder gelesen worden sein.
+- Push und PR verwenden weiterhin `branch-publish` und `pr-create-or-update`. Ein autoritativ gelesener exakter Remote-Head wird nicht erneut gepusht. Ein exakter offener PR wird nur wiederverwendet, wenn Base, Head-Branch, Head-SHA, Draft, Titel und Body übereinstimmen; Metadaten-Drift darf über die bestehende Update-Semantik korrigiert und danach exakt gelesen werden. Mehrere offene PRs, anderer Remote-Head oder struktureller PR-Drift blockieren fail-closed.
+- Nach einem unklaren oder fehlgeschlagenen Push-/PR-Aufruf erfolgt immer autoritativer Remote-/PR-Readback. Beweist er den exakten Effekt, wird dieser wiederverwendet. Andernfalls lautet der Zustand `outcome_unknown`, `reconcile_required=true`; die Source-Lane-Leases bleiben erhalten und die benannte Readback-Aktion ist vor jedem Retry Pflicht.
+- Der interne Writer-Delivery-Helfer darf committen, pushen und einen PR erstellen/aktualisieren. Er terminalisiert keine Source Lane, gibt keine Leases frei, merged nicht und deployt nicht. Erst die äußere Controller-Komposition darf nach erneut exaktem Task-, Prozess-, Lease-, Git-, Remote- und PR-Readback den bestehenden `pr_opened`/`pr_updated`-Closeout persistieren und die unveränderten Lane-Leases snapshot-gebunden freigeben.
+- Merge und Deployment bleiben controller-only. Eine spätere CI-Korrektur eröffnet eine neue Work Lane; die geschlossene und terminalisierte Source Lane wird niemals wiederbelebt.
+
+Damit lautet der P6-Happy-Path `Workspace Coordinator -> geschlossener exakter PASS-Candidate -> Candidate-Tree-Commit -> immutable Delivery-Manifest -> exakter Branch/PR -> Controller-Closeout`. Weder das Manifest noch der Effekt führen Merge, Deployment, Source-Terminalisierung durch den Writer oder automatische Lane-Wiederbelebung ein.
+
+## 15. Invarianten
 
 P0 gilt nur dann als korrekt, wenn für dieselben Routingfacts kein öffentliches Interface gleichzeitig behauptet:
 
