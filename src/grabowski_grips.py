@@ -7756,6 +7756,18 @@ def _validate_captain_target(action_name: str, target: dict[str, Any], *, index:
         if type(pr) is not int or pr <= 0:
             raise GripPreflightError(f"actions[{index}].target.pr must be a positive integer")
         _captain_base_branch(target, "base", index=index)
+        merge_method = target.get("merge_method")
+        supported_merge_methods = {
+            method for method, _field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
+        }
+        if merge_method is not None and (
+            not isinstance(merge_method, str)
+            or merge_method not in supported_merge_methods
+        ):
+            raise GripPreflightError(
+                f"actions[{index}].target.merge_method must be one of "
+                f"{sorted(supported_merge_methods)} when provided"
+            )
     elif action_name == "runtime-deploy":
         origin_key, runtime_origin = _captain_exactly_one_target_key(
             target, ("repo", "service"), index=index, action_name="runtime-deploy"
@@ -7893,7 +7905,13 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
         ],
     }
     if action_name == "pr-merge":
-        schema["target_binding"] = {"repo": target.get("repo"), "pr": target.get("pr"), "base": target.get("base")}
+        schema["target_binding"] = {
+            "repo": target.get("repo"),
+            "pr": target.get("pr"),
+            "base": target.get("base"),
+        }
+        if target.get("merge_method") is not None:
+            schema["target_binding"]["merge_method"] = target["merge_method"]
         schema["head_binding"] = {"parameter": "expected_head", "required": True}
         schema["base_sha_binding"] = {"parameter": "expected_base_sha", "required": True}
         schema["diff_binding"] = {"parameter": "diff_sha256", "required": True}
@@ -9785,6 +9803,7 @@ def _captain_repository_merge_policy(
     github_runner: GithubRunner,
     *,
     repo_slug: str,
+    requested_method: str | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
     policy_jq = "{" + ",".join(CAPTAIN_REPOSITORY_MERGE_POLICY_BOOLEAN_FIELDS) + "}"
     policy_args = [
@@ -9834,11 +9853,23 @@ def _captain_repository_merge_policy(
     ]
     if not allowed_methods:
         return None, info, ["repository_all_merge_methods_disabled"]
-    selected_method, selected_field, selected_flag = next(
-        (method, field, flag)
-        for method, field, flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
-        if settings[field]
+
+    requested_entry = next(
+        (entry for entry in CAPTAIN_PR_MERGE_METHOD_PREFERENCE if entry[0] == requested_method),
+        None,
     )
+    if requested_method is not None and requested_entry is None:
+        return None, info, [f"repository_merge_method_invalid:{requested_method}"]
+
+    if requested_entry is not None:
+        selected_method, selected_field, selected_flag = requested_entry
+    else:
+        selected_method, selected_field, selected_flag = next(
+            (method, field, flag)
+            for method, field, flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
+            if settings[field]
+        )
+
     policy = {
         "settings": settings,
         "allowed_methods": allowed_methods,
@@ -9847,6 +9878,11 @@ def _captain_repository_merge_policy(
         "selected_flag": selected_flag,
         "preference_order": [method for method, _field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE],
     }
+    if requested_method is not None:
+        policy["requested_method"] = requested_method
+        policy["selection_source"] = "explicit_target"
+    if requested_method is not None and requested_method not in allowed_methods:
+        return policy, info, [f"repository_merge_method_not_allowed:{requested_method}"]
     return policy, info, []
 
 
@@ -9967,6 +10003,8 @@ def _run_captain_pr_merge(
         "effect_scope_decision": _captain_effect_scope_not_evaluated(),
         "verification_passed": False,
     }
+    if target.get("merge_method") is not None:
+        execution_result["requested_merge_method"] = target["merge_method"]
     pre_view, preflight_summary, preflight_errors = _captain_pr_merge_preflight_view(
         repo_path,
         github_runner,
@@ -10004,6 +10042,7 @@ def _run_captain_pr_merge(
         repo_path,
         github_runner,
         repo_slug=repo_slug,
+        requested_method=target.get("merge_method"),
     )
     execution_result["merge_policy_query"] = merge_policy_query
     execution_result["merge_policy"] = merge_policy
