@@ -739,7 +739,8 @@
       "supported_intents": [
         "read_state",
         "navigate",
-        "scroll_into_view"
+        "scroll_into_view",
+        "activate"
       ],
       "uncovered_intents": {},
       "public_target_contract": "opaque-handles-and-validated-navigation-targets",

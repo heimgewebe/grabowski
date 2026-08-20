@@ -238,7 +238,7 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
         self.assertEqual(
             browser["semantic_gateway"]["supported_intents"],
-            ["read_state", "navigate", "scroll_into_view"],
+            ["read_state", "navigate", "scroll_into_view", "activate"],
         )
         self.assertEqual(browser["semantic_gateway"]["uncovered_intents"], {})
         self.assertEqual(
@@ -274,6 +274,24 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
     def test_builder_and_runtime_share_one_schema_verdict(self) -> None:
         """Both validators must agree field for field, not merely in this release."""
         manifest = self.staged.manifest()
+        self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
+        self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
+
+    def test_validator_keeps_legacy_three_intent_contract_compatible_after_promotion(self) -> None:
+        manifest = self.staged.manifest()
+        semantic = manifest["entrypoint_contract"]["browser_operator_default"][
+            "semantic_gateway"
+        ]
+        self.assertEqual(
+            semantic["supported_intents"],
+            ["read_state", "navigate", "scroll_into_view", "activate"],
+        )
+        semantic["supported_intents"] = [
+            "read_state",
+            "navigate",
+            "scroll_into_view",
+        ]
+
         self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
         self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
 

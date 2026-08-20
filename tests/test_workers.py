@@ -339,6 +339,9 @@ globalThis.fetch = async () => ({
 const scenario = process.env.GRABOWSKI_TEST_SCENARIO;
 let frameTreeCalls = 0;
 let historyCalls = 0;
+let describeCalls = 0;
+const activateScenario = scenario.startsWith('activate-');
+const activateTarget = 'https://private.invalid/issues';
 
 function message(target, payload) {
   if (target.onmessage) target.onmessage({data: JSON.stringify(payload)});
@@ -374,7 +377,7 @@ class FakeWebSocket {
           return;
         }
         const after = frameTreeCalls > 1;
-        const loaderId = scenario === 'correlated-new-document' && after
+        const loaderId = ['correlated-new-document', 'activate-correlated-new-document'].includes(scenario) && after
           ? 'loader-after' : 'loader-before';
         reply({frameTree: {frame: {id: 'main-frame', loaderId}}});
         return;
@@ -397,12 +400,47 @@ class FakeWebSocket {
         reply({nodes: [{
           backendDOMNodeId: 101,
           ignored: false,
-          role: {value: 'button'},
-          name: {value: 'Target'},
+          role: {value: activateScenario ? 'link' : 'button'},
+          name: {value: activateScenario ? 'Issues' : 'Target'},
         }]});
         return;
+      case 'Accessibility.getPartialAXTree':
+        reply({nodes: [{
+          backendDOMNodeId: 101,
+          ignored: false,
+          role: {value: 'link'},
+          name: {value: 'Issues'},
+        }]});
+        return;
+      case 'DOM.resolveNode':
+        reply({object: {objectId: 'link-object'}});
+        return;
+      case 'Runtime.releaseObject':
+        reply();
+        return;
+      case 'DOM.getDocument':
+        reply({root: {
+          baseURL: 'https://before.invalid/repository/',
+          documentURL: 'https://before.invalid/repository/',
+        }});
+        return;
+      case 'DOM.describeNode': {
+        describeCalls += 1;
+        let href = scenario === 'activate-target-drift' && describeCalls > 1
+          ? 'https://private.invalid/pulls' : activateTarget;
+        if (scenario === 'activate-backslash-target') {
+          href = activateTarget + String.fromCharCode(92);
+        }
+        reply({node: {
+          backendDOMNodeId: 101,
+          localName: 'a',
+          nodeName: 'A',
+          attributes: ['href', href],
+        }});
+        return;
+      }
       case 'Page.navigate': {
-        if (scenario === 'stale-before-navigate') {
+        if (['stale-before-navigate', 'activate-target-drift', 'activate-backslash-target'].includes(scenario)) {
           throw new Error('Page.navigate must not run after stale revalidation');
         }
         if (scenario === 'transport-loss') {
@@ -414,7 +452,7 @@ class FakeWebSocket {
           reply({frameId: 'main-frame', errorText: 'ERR_FAILED private-target'});
           return;
         }
-        if (scenario === 'correlated-new-document') {
+        if (['correlated-new-document', 'activate-correlated-new-document'].includes(scenario)) {
           reply({frameId: 'main-frame', loaderId: 'loader-after'});
           return;
         }
@@ -454,31 +492,42 @@ globalThis.fetch = async () => ({
 """,
             encoding="utf-8",
         )
+        activate = scenario.startswith("activate-")
+        expected_element = (
+            self._semantic_link(
+                name="Issues", target="https://private.invalid/issues"
+            )
+            if activate
+            else {
+                "backend_node_id": "101",
+                "role": "button",
+                "name": "Target",
+                "navigation_target_sha256": None,
+            }
+        )
+        request = {
+            "schema_version": 1,
+            "port": 9222,
+            "timeout_ms": 250,
+            "op": "activate" if activate else "navigate",
+            "expected_state": {
+                "origin": "https://before.invalid",
+                "ready_state": "complete",
+                "title": "Before",
+                "main_frame_id": "main-frame",
+                "loader_id": "loader-before",
+                "navigation_entry_id": "7",
+                "elements": [expected_element],
+            },
+        }
+        if activate:
+            request["expected_element"] = expected_element
+        else:
+            request["navigation_target"] = (
+                "https://private.invalid/path?secret=value"
+            )
         request_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "port": 9222,
-                    "timeout_ms": 250,
-                    "op": "navigate",
-                    "navigation_target": "https://private.invalid/path?secret=value",
-                    "expected_state": {
-                        "origin": "https://before.invalid",
-                        "ready_state": "complete",
-                        "title": "Before",
-                        "main_frame_id": "main-frame",
-                        "loader_id": "loader-before",
-                        "navigation_entry_id": "7",
-                        "elements": [
-                            {
-                                "backend_node_id": "101",
-                                "role": "button",
-                                "name": "Target",
-                            }
-                        ],
-                    },
-                }
-            ),
+            json.dumps(request),
             encoding="utf-8",
         )
         execution = subprocess.run(
@@ -2546,6 +2595,20 @@ globalThis.fetch = async () => ({
             "observed_at_unix": 1,
         }
 
+    @staticmethod
+    def _semantic_link(
+        *,
+        name: str = "Next",
+        target: str = "https://example.invalid/next",
+        backend_node_id: str = "101",
+    ) -> dict[str, object]:
+        return {
+            "backend_node_id": backend_node_id,
+            "role": "link",
+            "name": name,
+            "navigation_target_sha256": hashlib.sha256(target.encode("utf-8")).hexdigest(),
+        }
+
     def _semantic_state_payload(
         self,
         *,
@@ -2732,6 +2795,37 @@ globalThis.fetch = async () => ({
         self.assertNotEqual(
             first, workers._browser_snapshot_id("worker-a", changed_dom, handle_key)
         )
+
+    def test_browser_semantic_link_target_digest_is_snapshot_and_handle_bound(self) -> None:
+        handle_key = b"k" * 32
+        first_element = self._semantic_link(
+            name="Issues", target="https://example.invalid/issues"
+        )
+        second_element = self._semantic_link(
+            name="Issues", target="https://example.invalid/pulls"
+        )
+        base = self._semantic_state_payload(elements=[first_element])["state"]
+        changed = self._semantic_state_payload(elements=[second_element])["state"]
+        first_state = workers._bounded_browser_state(base)
+        changed_state = workers._bounded_browser_state(changed)
+        first_snapshot = workers._browser_snapshot_id(
+            "worker-a", first_state, handle_key
+        )
+        changed_snapshot = workers._browser_snapshot_id(
+            "worker-a", changed_state, handle_key
+        )
+        self.assertNotEqual(first_snapshot, changed_snapshot)
+        first_handle = workers._browser_element_id(
+            "worker-a", first_snapshot, first_state["elements"][0], handle_key
+        )
+        changed_handle = workers._browser_element_id(
+            "worker-a", changed_snapshot, changed_state["elements"][0], handle_key
+        )
+        self.assertNotEqual(first_handle, changed_handle)
+        public = workers._browser_observation("worker-a", first_state, handle_key)
+        rendered = json.dumps(public, sort_keys=True)
+        self.assertNotIn("navigation_target_sha256", rendered)
+        self.assertNotIn("example.invalid", rendered)
 
     def test_browser_semantic_element_id_is_keyed_snapshot_and_worker_bound(self) -> None:
         handle_key = b"k" * 32
@@ -3193,8 +3287,12 @@ globalThis.fetch = async () => ({
         self.assertIn(verify, source)
         self.assertIn(effect, source)
         self.assertIn(release, source)
-        self.assertLess(source.index(verify), source.index(effect))
-        self.assertLess(source.index(effect), source.index(release))
+        scroll_section = source.index("request.op === 'scroll_into_view'")
+        verify_index = source.index(verify, scroll_section)
+        effect_index = source.index(effect, scroll_section)
+        release_index = source.index(release, scroll_section)
+        self.assertLess(verify_index, effect_index)
+        self.assertLess(effect_index, release_index)
 
     def test_browser_semantic_act_read_state_performs_no_separate_effect_call(self) -> None:
         worker = self._running_browser(port=9368)
@@ -3220,6 +3318,161 @@ globalThis.fetch = async () => ({
         self.assertIsNone(outcome["requested_element_id"])
         self.assertEqual(outcome["post_action_snapshot_id"], snapshot_id)
         run.assert_called_once()
+
+    def test_browser_semantic_activate_requires_link_role_before_effect(self) -> None:
+        worker = self._running_browser(port=9386)
+        before = self._semantic_state_payload(title="Button page")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "activate",
+                element_id=observation["elements"][0]["element_id"],
+            )
+
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "element_contract")
+        self.assertEqual(outcome["effect_class"], "network_navigation")
+        self.assertEqual(outcome["effect_state"], "not_started")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1]["op"], "read_state")
+
+    def test_browser_semantic_activate_link_uses_correlated_adapter_roundtrip(self) -> None:
+        worker = self._running_browser(port=9387)
+        link = self._semantic_link(name="Issues 20", target="https://github.com/heimgewebe/grabowski/issues")
+        before = self._semantic_state_payload(
+            title="Repository", loader_id="loader-before", elements=[link]
+        )
+        after = self._semantic_state_payload(
+            origin="https://github.com",
+            title="Issues",
+            loader_id="loader-after",
+            navigation_entry_id="entry-after",
+            elements=[link],
+        )
+        after["navigation_correlation"] = "new-document"
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", side_effect=[before, after]
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "activate",
+                element_id=observation["elements"][0]["element_id"],
+            )
+
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["effect_class"], "network_navigation")
+        self.assertEqual(outcome["effect_state"], "observed")
+        self.assertEqual(outcome["requested_element_id"], observation["elements"][0]["element_id"])
+        self.assertIsNone(outcome["target_hmac_sha256"])
+        self.assertNotEqual(outcome["post_action_snapshot_id"], observation["snapshot_id"])
+        self.assertEqual([call.args[1]["op"] for call in run.call_args_list], ["read_state", "activate"])
+        activation_request = run.call_args_list[1].args[1]
+        self.assertNotIn("navigation_target", activation_request)
+        self.assertEqual(activation_request["expected_element"]["role"], "link")
+        self.assertEqual(activation_request["expected_state"], workers._bounded_browser_state(before["state"]))
+
+    def test_browser_semantic_activate_adapter_stale_guard_is_not_started(self) -> None:
+        worker = self._running_browser(port=9388)
+        link = self._semantic_link()
+        before = self._semantic_state_payload(elements=[link])
+        stale = {
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "stale-snapshot",
+            "state": None,
+        }
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", side_effect=[before, stale]
+        ):
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "activate",
+                element_id=observation["elements"][0]["element_id"],
+            )
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "stale_snapshot")
+        self.assertEqual(outcome["effect_state"], "not_started")
+
+    def test_browser_semantic_activate_uncorrelated_is_outcome_unknown(self) -> None:
+        worker = self._running_browser(port=9389)
+        link = self._semantic_link()
+        before = self._semantic_state_payload(elements=[link])
+        uncorrelated = {
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "navigation-uncorrelated",
+            "state": None,
+        }
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", side_effect=[before, uncorrelated]
+        ):
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "activate",
+                element_id=observation["elements"][0]["element_id"],
+            )
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "outcome_unknown")
+        self.assertEqual(outcome["effect_state"], "unknown")
+        self.assertIsNone(outcome["post_action_snapshot_id"])
+
+    def test_browser_semantic_node_activate_is_anchor_navigation_not_click(self) -> None:
+        source = workers.BROWSER_SEMANTIC_NODE_SOURCE
+        self.assertIn("request.op === 'activate'", source)
+        self.assertIn("expected.role !== 'link'", source)
+        self.assertIn("DOM.getDocument", source)
+        self.assertIn("DOM.describeNode", source)
+        self.assertIn("createHash", source)
+        self.assertIn("navigation_target_sha256", source)
+        self.assertIn("rawHref.includes(String.fromCharCode(92))", source)
+        self.assertIn("performCorrelatedNavigation", source)
+        link_start = source.index("async function readLinkNavigationTarget")
+        link_end = source.index("async function performCorrelatedNavigation", link_start)
+        link_source = source[link_start:link_end]
+        self.assertNotIn("this.href", link_source)
+        self.assertNotIn("Runtime.callFunctionOn", link_source)
+        self.assertNotIn("this.click()", source)
+        self.assertNotIn("dispatchEvent(new MouseEvent", source)
 
     def test_browser_semantic_navigate_requires_a_conservative_target(self) -> None:
         snapshot_id = workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64
@@ -3438,6 +3691,38 @@ globalThis.fetch = async () => ({
         self.assertEqual(receipt["navigation_correlation"], "new-document")
         self.assertEqual(receipt["state"]["loader_id"], "loader-after")
 
+    def test_browser_semantic_node_activate_binds_link_target_and_navigation(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "activate-correlated-new-document"
+        )
+
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["navigation_correlation"], "new-document")
+        self.assertEqual(receipt["state"]["loader_id"], "loader-after")
+        element = receipt["state"]["elements"][0]
+        self.assertEqual(element["role"], "link")
+        self.assertRegex(element["navigation_target_sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("private.invalid/issues", json.dumps(receipt, sort_keys=True))
+
+    def test_browser_semantic_node_activate_target_drift_stops_before_navigation(self) -> None:
+        execution, receipt = self._run_browser_semantic_node("activate-target-drift")
+
+        self.assertNotEqual(execution.returncode, 0)
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["result_code"], "stale-snapshot")
+        self.assertIsNone(receipt["state"])
+
+    def test_browser_semantic_node_activate_rejects_backslash_target_before_navigation(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "activate-backslash-target"
+        )
+
+        self.assertNotEqual(execution.returncode, 0)
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["result_code"], "stale-snapshot")
+        self.assertIsNone(receipt["state"])
+
     def test_browser_semantic_node_binds_same_document_navigation_to_backend_event(self) -> None:
         execution, receipt = self._run_browser_semantic_node(
             "correlated-same-document"
@@ -3567,6 +3852,12 @@ globalThis.fetch = async () => ({
             result_payload["semantic_catalog"]["intents"]["navigate"]
             ["requires_navigation_target"]
         )
+        activate = result_payload["semantic_catalog"]["intents"]["activate"]
+        self.assertEqual(activate["effect_class"], "network_navigation")
+        self.assertTrue(activate["requires_element"])
+        self.assertFalse(activate["requires_navigation_target"])
+        self.assertTrue(activate["requires_bound_navigation_target"])
+        self.assertEqual(activate["admission"], "implemented")
         self.assertEqual(
             result_payload["semantic_catalog"]["intents"]["navigate"][
                 "effect_class"
@@ -3692,6 +3983,78 @@ globalThis.fetch = async () => ({
         )
         self.assertEqual(outcome["audit"]["intent"]["record_sha256"], "a" * 64)
         self.assertEqual(outcome["audit"]["outcome"]["record_sha256"], "b" * 64)
+
+    def test_browser_semantic_gateway_activate_preserves_link_binding_and_readback(self) -> None:
+        worker = self._running_browser(port=9390)
+        link = self._semantic_link(name="Issues 20", target="https://github.com/heimgewebe/grabowski/issues")
+        before = self._semantic_state_payload(
+            title="Repository", loader_id="loader-before", elements=[link]
+        )
+        after = self._semantic_state_payload(
+            origin="https://github.com",
+            title="Issues",
+            loader_id="loader-after",
+            navigation_entry_id="entry-after",
+            elements=[link],
+        )
+        after["navigation_correlation"] = "new-document"
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=before
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        element_id = observation["elements"][0]["element_id"]
+
+        with patch.object(
+            workers.operator, "_require_operator_capability"
+        ), patch.object(
+            workers.operator, "_require_operator_mutation"
+        ) as require_mutation, patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", side_effect=[before, after]
+        ), patch.object(
+            workers.base,
+            "_append_audit_with_digest",
+            side_effect=["a" * 64, "b" * 64],
+        ) as append_audit:
+            outcome = workers.grabowski_browser_worker_semantic(
+                worker["worker_id"],
+                "act",
+                snapshot_id=observation["snapshot_id"],
+                action_kind="activate",
+                element_id=element_id,
+            )
+
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["intent"], "activate")
+        self.assertEqual(outcome["effect_class"], "network_navigation")
+        self.assertEqual(outcome["effect_state"], "observed")
+        self.assertEqual(outcome["requested_element_id"], element_id)
+        self.assertIsNone(outcome["target_hmac_sha256"])
+        self.assertEqual(
+            outcome["retry_readback"]["authoritative_readback_state"],
+            "authoritative_post_action_observation",
+        )
+        self.assertFalse(outcome["retry_readback"]["retry_authorized"])
+        self.assertFalse(outcome["retry_readback"]["readback_grants_retry_authority"])
+        self.assertEqual(
+            outcome["observation"]["snapshot_id"], outcome["post_action_snapshot_id"]
+        )
+        require_mutation.assert_called_once_with("browser_worker")
+        audit_records = [call.args[0] for call in append_audit.call_args_list]
+        self.assertEqual(
+            [record["requested_element_id"] for record in audit_records],
+            [element_id, element_id],
+        )
+        self.assertEqual(
+            [record["target_hmac_sha256"] for record in audit_records],
+            [None, None],
+        )
+        audit_rendered = json.dumps(audit_records, sort_keys=True)
+        self.assertNotIn("Issues 20", audit_rendered)
+        self.assertNotIn('"name"', audit_rendered)
 
     def test_browser_semantic_gateway_navigate_redacts_target_and_requires_readback(self) -> None:
         worker = self._running_browser(port=9381)
