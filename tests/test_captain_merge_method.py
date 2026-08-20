@@ -94,6 +94,54 @@ def _merge_queue_rule(method: str) -> dict[str, object]:
     }
 
 
+
+
+class _BranchRulesGh:
+    def __init__(self, payloads: list[object]) -> None:
+        self.payloads = list(payloads)
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, _repo: Path, argv: list[str]) -> dict[str, object]:
+        self.calls.append(tuple(argv))
+        payload = self.payloads.pop(0)
+        return {
+            "returncode": 0,
+            "stdout": json.dumps(payload),
+            "stderr": "",
+        }
+
+
+def _branch_rules_args() -> list[str]:
+    return [
+        "api",
+        "--method",
+        "GET",
+        "--paginate",
+        "--slurp",
+        "-f",
+        "per_page=100",
+        "repos/heimgewebe/grabowski/rules/branches/main",
+    ]
+
+
+def _branch_guard_runner(gh: _BranchRulesGh, *, explicit: bool = True):
+    runner = object.__new__(grips.grabowski_merge_guard.CaptainMergeGuardRunner)
+    target: dict[str, object] = {
+        "repo": "heimgewebe/grabowski",
+        "pr": 96,
+        "base": "main",
+    }
+    if explicit:
+        target["merge_method"] = "squash"
+    runner.action = {"target": target}
+    runner.github_runner = gh
+    runner.repo_path = Path.cwd()
+    runner.receipt = {}
+    runner.branch_merge_policy_args = None
+    runner.branch_merge_policy_snapshot = None
+    return runner
+
+
 class CaptainMergeMethodTests(unittest.TestCase):
     def test_explicit_squash_overrides_repository_preference(self) -> None:
         policy, _query, errors = grips._captain_repository_merge_policy(
@@ -189,6 +237,75 @@ class CaptainMergeMethodTests(unittest.TestCase):
         self.assertEqual(policy["selected_method"], "squash")
         self.assertIs(policy["branch_merge_policy"]["merge_queue_present"], True)
         self.assertEqual(policy["branch_merge_policy"]["merge_queue_method"], "squash")
+
+    def test_merge_guard_revalidates_explicit_branch_policy_snapshot(self) -> None:
+        initial_rules = [
+            _pull_request_rule("squash", "rebase"),
+            _merge_queue_rule("SQUASH"),
+        ]
+        reordered_rules = list(reversed(initial_rules))
+        gh = _BranchRulesGh([[initial_rules], [reordered_rules]])
+        runner = _branch_guard_runner(gh)
+
+        runner(Path.cwd(), _branch_rules_args())
+        errors = runner._revalidate_branch_merge_policy()
+
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(runner.branch_merge_policy_snapshot)
+        self.assertIs(runner.receipt["branch_merge_policy_revalidation"]["matched"], True)
+        self.assertEqual(len(gh.calls), 2)
+
+    def test_merge_guard_ignores_unrelated_branch_rule_drift(self) -> None:
+        pull_rule = _pull_request_rule("squash", "rebase")
+        initial_unrelated = {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "validate"}]},
+        }
+        drifted_unrelated = {
+            "type": "required_status_checks",
+            "parameters": {"required_status_checks": [{"context": "validate-2"}]},
+        }
+        gh = _BranchRulesGh([
+            [[pull_rule, initial_unrelated]],
+            [[pull_rule, drifted_unrelated]],
+        ])
+        runner = _branch_guard_runner(gh)
+
+        runner(Path.cwd(), _branch_rules_args())
+        errors = runner._revalidate_branch_merge_policy()
+
+        self.assertEqual(errors, [])
+        self.assertIs(runner.receipt["branch_merge_policy_revalidation"]["matched"], True)
+
+    def test_merge_guard_blocks_explicit_branch_policy_drift(self) -> None:
+        initial_rules = [
+            _pull_request_rule("squash", "rebase"),
+            _merge_queue_rule("SQUASH"),
+        ]
+        drifted_rules = [
+            _pull_request_rule("squash", "rebase"),
+            _merge_queue_rule("REBASE"),
+        ]
+        gh = _BranchRulesGh([[initial_rules], [drifted_rules]])
+        runner = _branch_guard_runner(gh)
+
+        runner(Path.cwd(), _branch_rules_args())
+        errors = runner._revalidate_branch_merge_policy()
+
+        self.assertEqual(errors, ["merge_guard_branch_merge_policy_drift"])
+        self.assertIs(runner.receipt["branch_merge_policy_revalidation"]["matched"], False)
+
+    def test_merge_guard_legacy_path_does_not_capture_branch_policy(self) -> None:
+        rules = [_pull_request_rule("squash", "rebase")]
+        gh = _BranchRulesGh([[rules]])
+        runner = _branch_guard_runner(gh, explicit=False)
+
+        runner(Path.cwd(), _branch_rules_args())
+
+        self.assertIsNone(runner.branch_merge_policy_args)
+        self.assertIsNone(runner.branch_merge_policy_snapshot)
+        self.assertEqual(runner._revalidate_branch_merge_policy(), [])
+        self.assertNotIn("branch_merge_policy_revalidation", runner.receipt)
 
     def test_pr_merge_target_rejects_noncanonical_or_unknown_method(self) -> None:
         for merge_method in ("SQUASH", "octopus", " squash"):

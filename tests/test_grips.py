@@ -11611,6 +11611,81 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("executed_with_guard_cleanup_failure", result["output"]["decision"])
         self.assertEqual("failed", result["receipt"]["status"])
 
+    def test_atomic_merge_guard_blocks_explicit_branch_policy_drift_at_dispatch(self) -> None:
+        strict_rule = deepcopy(FakeGh().active_rules[0])
+        pull_request_rule = {
+            "type": "pull_request",
+            "parameters": {"allowed_merge_methods": ["squash", "rebase"]},
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "heimgewebe/grabowski",
+            "ruleset_id": 18801517,
+        }
+        drifted_pull_request_rule = deepcopy(pull_request_rule)
+        drifted_pull_request_rule["parameters"] = {
+            "allowed_merge_methods": ["rebase"]
+        }
+
+        class DispatchRuleDriftGh(FakeGh):
+            def __init__(self) -> None:
+                super().__init__(
+                    active_rules=[strict_rule, pull_request_rule],
+                    view={
+                        "number": 96,
+                        "state": "OPEN",
+                        "baseRefName": "main",
+                        "baseRefOid": CAPTAIN_BASE_SHA,
+                        "headRefName": "feat/captain",
+                        "headRefOid": CAPTAIN_HEAD,
+                        "isDraft": False,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                    },
+                )
+                self.branch_rule_reads = 0
+
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if any("/rules/branches/" in item for item in argv):
+                    self.branch_rule_reads += 1
+                    if self.branch_rule_reads >= 6:
+                        self.active_rules = [
+                            strict_rule,
+                            drifted_pull_request_rule,
+                        ]
+                return super().__call__(repo, argv)
+
+        action = captain_action(
+            target={
+                "repo": "heimgewebe/grabowski",
+                "pr": 96,
+                "base": "main",
+                "merge_method": "squash",
+            }
+        )
+        parameters = authorized_captain_run_parameters(actions=[action])
+        gh = DispatchRuleDriftGh()
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertTrue(execution["merge_guard_cleanup_passed"])
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released",
+            execution["merge_lease_guard"]["status"],
+        )
+        self.assertIn(
+            "merge_guard_branch_merge_policy_drift",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_atomic_merge_guard_blocks_base_sha_drift_after_acquisition_and_releases(self) -> None:
         parameters = authorized_captain_run_parameters()
         good = {
