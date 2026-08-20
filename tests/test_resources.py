@@ -626,6 +626,91 @@ class ResourceTests(unittest.TestCase):
             )
         self.assertEqual(child, raised.exception.resource_key)
 
+    def test_work_lane_scopes_conflict_across_nested_repository_boundaries(self) -> None:
+        outer = self.root / "outer"
+        nested = outer / "nested"
+        parent = f"path:{nested}"
+        child = f"path:{nested / 'module.py'}"
+        outer_metadata = self.work_lane_metadata(
+            outer, target=self.root / "lane-outer", lane_id="1" * 32
+        )
+        nested_metadata = self.work_lane_metadata(
+            nested, target=self.root / "lane-nested", lane_id="2" * 32
+        )
+
+        resources.acquire_resources(
+            f"lane:{'1' * 32}",
+            [parent],
+            purpose="outer repository subtree",
+            ttl_seconds=60,
+            metadata=outer_metadata,
+        )
+
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{'2' * 32}",
+                [child],
+                purpose="nested repository child",
+                ttl_seconds=60,
+                metadata=nested_metadata,
+            )
+        self.assertEqual(parent, raised.exception.resource_key)
+
+    def test_work_lane_conflict_check_rejects_metadata_digest_drift(self) -> None:
+        repository = self.root / "repo"
+        parent = f"path:{repository / 'src'}"
+        child = f"path:{repository / 'src' / 'module.py'}"
+        lane_id = "3" * 32
+        metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-drift", lane_id=lane_id
+        )
+        resources.acquire_resources(
+            f"lane:{lane_id}",
+            [parent],
+            purpose="lane metadata drift fixture",
+            ttl_seconds=60,
+            metadata=metadata,
+        )
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET metadata_sha256=? WHERE resource_key=?",
+                ("0" * 64, parent),
+            )
+            connection.commit()
+
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                "owner-exact", [child], purpose="descendant", ttl_seconds=60
+            )
+        self.assertEqual(parent, raised.exception.resource_key)
+
+    def test_work_lane_conflict_check_rejects_malformed_metadata(self) -> None:
+        repository = self.root / "repo"
+        parent = f"path:{repository / 'src'}"
+        child = f"path:{repository / 'src' / 'module.py'}"
+        lane_id = "4" * 32
+        metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-invalid", lane_id=lane_id
+        )
+        resources.acquire_resources(
+            f"lane:{lane_id}",
+            [parent],
+            purpose="lane malformed metadata fixture",
+            ttl_seconds=60,
+            metadata=metadata,
+        )
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET metadata_json=? WHERE resource_key=?",
+                ("{", parent),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "resource lease metadata is invalid"):
+            resources.acquire_resources(
+                "owner-exact", [child], purpose="descendant", ttl_seconds=60
+            )
+
     def test_work_lane_scope_conflicts_with_exact_descendant_path(self) -> None:
         repository = self.root / "repo"
         parent = f"path:{repository / 'src'}"

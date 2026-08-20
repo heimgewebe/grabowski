@@ -1303,10 +1303,12 @@ def _check_work_lane_path_scope_conflicts(
     ).fetchall()
     for row in rows:
         existing_path = str(row["resource_key"]).removeprefix("path:")
-        try:
-            existing_metadata = _row_metadata(row)
-        except Exception:
-            existing_metadata = {}
+        existing_metadata = _row_metadata(row)
+        _, observed_metadata_sha256 = _metadata(existing_metadata)
+        if row["metadata_sha256"] != observed_metadata_sha256:
+            raise ResourceConflict(
+                row["resource_key"], row["owner_id"], row["expires_at_unix"]
+            )
         existing_scope = _work_lane_path_scope(
             [str(row["resource_key"])],
             existing_metadata,
@@ -1322,7 +1324,6 @@ def _check_work_lane_path_scope_conflicts(
                 )
             if (
                 existing_scope is not None
-                and existing_scope["repository"] == requested_scope["repository"]
                 and any(
                     _absolute_paths_overlap(requested_path, existing_path_scope)
                     for requested_path in requested_scope["paths"]
