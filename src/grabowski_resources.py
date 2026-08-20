@@ -5032,14 +5032,15 @@ def rebind_same_owner_resources(
         expected_owner_id=owner,
         resource_keys=keys,
     )
-    if any(item["metadata_sha256"] != metadata_sha256 for item in original):
-        raise RuntimeError("Journaled lease metadata does not match requested rebind")
     current_by_key = {item["resource_key"]: item for item in current}
+    original_by_key = {item["resource_key"]: item for item in original}
     now = _now()
     requested_expires = now + ttl
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            observed_rows: dict[str, sqlite3.Row] = {}
+            observed_metadata_by_key: dict[str, dict[str, Any]] = {}
             for key in keys:
                 row = connection.execute(
                     "SELECT * FROM leases WHERE resource_key=?", (key,)
@@ -5056,6 +5057,48 @@ def rebind_same_owner_resources(
                     raise RuntimeError(
                         f"Resource lease metadata integrity mismatch: {key}"
                     )
+                observed_rows[key] = row
+                observed_metadata_by_key[key] = observed_metadata
+
+            if any(
+                item["metadata_sha256"] != metadata_sha256 for item in original
+            ):
+                preserved_work_admission: Any = None
+                for key in keys:
+                    observed_metadata = observed_metadata_by_key[key]
+                    if (
+                        observed_rows[key]["metadata_sha256"]
+                        != original_by_key[key]["metadata_sha256"]
+                        or _lease_identity_metadata(
+                            observed_metadata, preserve_task_attempt=False
+                        )
+                        != _lease_identity_metadata(
+                            persisted_metadata, preserve_task_attempt=False
+                        )
+                        or "work_admission" not in observed_metadata
+                    ):
+                        raise RuntimeError(
+                            "Journaled lease metadata does not match requested rebind"
+                        )
+                    observed_work_admission = observed_metadata["work_admission"]
+                    if preserved_work_admission is None:
+                        preserved_work_admission = observed_work_admission
+                    elif observed_work_admission != preserved_work_admission:
+                        raise RuntimeError(
+                            "Journaled server work admission differs across requested leases"
+                        )
+                persisted_metadata = dict(persisted_metadata)
+                persisted_metadata["work_admission"] = preserved_work_admission
+                metadata_json, metadata_sha256 = _metadata(persisted_metadata)
+                if any(
+                    item["metadata_sha256"] != metadata_sha256 for item in original
+                ):
+                    raise RuntimeError(
+                        "Journaled lease metadata does not match requested rebind"
+                    )
+
+            for key in keys:
+                row = observed_rows[key]
                 lease_expires = max(int(row["expires_at_unix"]), requested_expires)
                 connection.execute(
                     """

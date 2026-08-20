@@ -2372,6 +2372,147 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(140, rebound["leases"][0]["acquired_at_unix"])
         self.assertEqual(330, rebound["leases"][0]["expires_at_unix"])
 
+    def test_same_owner_rebind_preserves_server_work_admission_after_expiry(self) -> None:
+        (self.root / ".git").mkdir()
+        key = f"repo:{self.root}"
+        scope = self.scope_manifest(
+            self.root, name="server-admission-rebind", path=self.root
+        )
+        metadata = {
+            "scope_manifest": scope,
+            "scope_manifest_complete": True,
+        }
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "blocker_codes": [],
+                "blockers": [],
+                "read_only": True,
+            }
+
+        with patch.object(resources, "_now", return_value=100):
+            original = resources.acquire_resources(
+                "owner-a",
+                [key],
+                purpose="stable server admission rebind",
+                ttl_seconds=30,
+                metadata=metadata,
+                admission_assessor=assessor,
+            )
+        with resources._database() as connection:
+            original_row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(original_row)
+        original_persisted_metadata = json.loads(original_row["metadata_json"])
+        self.assertIn("work_admission", original_persisted_metadata)
+
+        original_snapshot = resources._release_lease_snapshot(original["leases"][0])
+        with patch.object(resources, "_now", return_value=140):
+            rebound = resources.rebind_same_owner_resources(
+                "owner-a",
+                [key],
+                purpose="stable server admission rebind",
+                ttl_seconds=60,
+                metadata=metadata,
+                expected_current_leases=[original_snapshot],
+                expected_original_leases=[original_snapshot],
+            )
+
+        self.assertEqual(
+            original["leases"][0]["metadata_sha256"],
+            rebound["leases"][0]["metadata_sha256"],
+        )
+        with resources._database() as connection:
+            rebound_row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(rebound_row)
+        self.assertEqual(
+            original_persisted_metadata, json.loads(rebound_row["metadata_json"])
+        )
+
+    def test_same_owner_rebind_rejects_drifted_server_work_admission(self) -> None:
+        (self.root / ".git").mkdir()
+        key = f"repo:{self.root}"
+        scope = self.scope_manifest(
+            self.root, name="drifted-server-admission-rebind", path=self.root
+        )
+        metadata = {
+            "scope_manifest": scope,
+            "scope_manifest_complete": True,
+        }
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "blocker_codes": [],
+                "blockers": [],
+                "read_only": True,
+            }
+
+        with patch.object(resources, "_now", return_value=100):
+            original = resources.acquire_resources(
+                "owner-a",
+                [key],
+                purpose="stable drifted server admission rebind",
+                ttl_seconds=30,
+                metadata=metadata,
+                admission_assessor=assessor,
+            )
+        original_snapshot = resources._release_lease_snapshot(original["leases"][0])
+        with resources._database() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+            drifted_metadata = json.loads(row["metadata_json"])
+            drifted_metadata["work_admission"] = dict(
+                drifted_metadata["work_admission"]
+            )
+            drifted_metadata["work_admission"]["assessment_sha256"] = "b" * 64
+            metadata_json, metadata_sha256 = resources._metadata(drifted_metadata)
+            connection.execute(
+                "UPDATE leases SET metadata_json=?, metadata_sha256=? WHERE resource_key=?",
+                (metadata_json, metadata_sha256, key),
+            )
+            current_row = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(current_row)
+        current_snapshot = resources._release_lease_snapshot(current_row)
+
+        with patch.object(resources, "_now", return_value=140):
+            with self.assertRaisesRegex(
+                RuntimeError, "Journaled lease metadata does not match requested rebind"
+            ):
+                resources.rebind_same_owner_resources(
+                    "owner-a",
+                    [key],
+                    purpose="stable drifted server admission rebind",
+                    ttl_seconds=60,
+                    metadata=metadata,
+                    expected_current_leases=[current_snapshot],
+                    expected_original_leases=[original_snapshot],
+                )
+
+    def test_same_owner_rebind_rejects_public_work_admission_metadata(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not a public authority surface"):
+            resources.rebind_same_owner_resources(
+                "owner-a",
+                ["component:forbidden-rebind-work-admission"],
+                purpose="attempt caller admission evidence during rebind",
+                ttl_seconds=60,
+                metadata={"work_admission": {"decision": "allow"}},
+                expected_current_leases=[],
+                expected_original_leases=[],
+            )
+
     def test_task_reconciliation_preserves_live_generation_and_recreates_missing(self) -> None:
         task_id = "a" * 24
         owner = f"task:{task_id}"
