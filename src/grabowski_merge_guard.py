@@ -1446,6 +1446,8 @@ class CaptainMergeGuardRunner:
         self.dispatch_called = False
         self.repository_policy_args: list[str] | None = None
         self.repository_policy_snapshot: dict[str, bool] | None = None
+        self.branch_merge_policy_args: list[str] | None = None
+        self.branch_merge_policy_snapshot: list[dict[str, Any]] | None = None
         does_not_establish = [
             "merge_authority",
             "review_completeness",
@@ -1614,6 +1616,170 @@ class CaptainMergeGuardRunner:
         evidence["matched"] = not errors
         evidence["errors"] = list(errors)
         self.receipt["repository_policy_revalidation"] = evidence
+        return errors
+
+    def _explicit_merge_method_requested(self) -> bool:
+        target = self.action.get("target")
+        return isinstance(target, dict) and isinstance(target.get("merge_method"), str)
+
+    def _is_branch_merge_policy_query(self, args: list[str]) -> bool:
+        if not self._explicit_merge_method_requested():
+            return False
+        target = self.action["target"]
+        encoded_branch = quote(str(target.get("base", "")), safe="")
+        expected = [
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            "-f",
+            "per_page=100",
+            f"repos/{target.get('repo', '')}/rules/branches/{encoded_branch}",
+        ]
+        return args == expected
+
+    def _branch_merge_policy_snapshot_info(
+        self,
+        result: Any,
+        *,
+        command: list[str],
+    ) -> tuple[list[dict[str, Any]] | None, dict[str, Any], list[str]]:
+        info = _merge_guard_result_info(result)
+        evidence = {
+            "command": ["gh", *command],
+            "returncode": info["returncode"],
+            "stdout_sha256": hashlib.sha256(info["stdout"].encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
+        }
+        errors: list[str] = []
+        if info["returncode"] != 0:
+            errors.append("merge_guard_branch_merge_policy_query_failed")
+            return None, evidence, errors
+        try:
+            raw = json.loads(info["stdout"])
+        except json.JSONDecodeError:
+            errors.append("merge_guard_branch_merge_policy_invalid_json")
+            return None, evidence, errors
+        if not isinstance(raw, list):
+            errors.append("merge_guard_branch_merge_policy_invalid_shape")
+            return None, evidence, errors
+        if raw and all(isinstance(item, dict) for item in raw):
+            rules = list(raw)
+        elif all(isinstance(page, list) for page in raw):
+            rules = [item for page in raw for item in page]
+        else:
+            errors.append("merge_guard_branch_merge_policy_invalid_pages")
+            return None, evidence, errors
+        if len(rules) > 1000 or any(not isinstance(rule, dict) for rule in rules):
+            errors.append("merge_guard_branch_merge_policy_invalid_rules")
+            return None, evidence, errors
+
+        supported_methods = {"merge", "squash", "rebase"}
+        projected_rules: list[dict[str, Any]] = []
+        for rule in rules:
+            rule_type = rule.get("type")
+            if rule_type == "pull_request":
+                parameters = rule.get("parameters")
+                methods = (
+                    parameters.get("allowed_merge_methods")
+                    if isinstance(parameters, dict)
+                    else None
+                )
+                if (
+                    not isinstance(methods, list)
+                    or not methods
+                    or any(
+                        not isinstance(method, str)
+                        or method not in supported_methods
+                        for method in methods
+                    )
+                ):
+                    errors.append(
+                        "merge_guard_branch_merge_policy_allowed_methods_invalid"
+                    )
+                    return None, evidence, errors
+                projected_rules.append(
+                    {
+                        "type": "pull_request",
+                        "allowed_merge_methods": sorted(set(methods)),
+                    }
+                )
+            elif rule_type == "merge_queue":
+                parameters = rule.get("parameters")
+                merge_method = (
+                    parameters.get("merge_method")
+                    if isinstance(parameters, dict)
+                    else None
+                )
+                normalized_method = (
+                    merge_method.lower() if isinstance(merge_method, str) else None
+                )
+                if normalized_method not in supported_methods:
+                    errors.append(
+                        "merge_guard_branch_merge_policy_queue_method_invalid"
+                    )
+                    return None, evidence, errors
+                projected_rules.append(
+                    {
+                        "type": "merge_queue",
+                        "merge_method": normalized_method,
+                    }
+                )
+
+        snapshot = sorted(projected_rules, key=_canonical_json)
+        evidence["active_rule_count"] = len(rules)
+        evidence["merge_policy_rule_count"] = len(snapshot)
+        evidence["merge_policy_sha256"] = _sha256_json(snapshot)
+        return snapshot, evidence, errors
+
+    def _capture_branch_merge_policy_snapshot(
+        self,
+        args: list[str],
+        result: Any,
+    ) -> None:
+        snapshot, evidence, errors = self._branch_merge_policy_snapshot_info(
+            result, command=args
+        )
+        evidence["errors"] = list(errors)
+        self.receipt["branch_merge_policy_snapshot"] = evidence
+        self.branch_merge_policy_args = list(args)
+        self.branch_merge_policy_snapshot = snapshot
+
+    def _revalidate_branch_merge_policy(self) -> list[str]:
+        if not self._explicit_merge_method_requested():
+            return []
+        if (
+            self.branch_merge_policy_args is None
+            or self.branch_merge_policy_snapshot is None
+        ):
+            errors = ["merge_guard_branch_merge_policy_snapshot_missing"]
+            self.receipt["branch_merge_policy_revalidation"] = {"errors": errors}
+            return errors
+        try:
+            raw = self.github_runner(
+                self.repo_path, list(self.branch_merge_policy_args)
+            )
+        except Exception as exc:
+            errors = [
+                f"merge_guard_branch_merge_policy_revalidation_exception:{type(exc).__name__}"
+            ]
+            self.receipt["branch_merge_policy_revalidation"] = {
+                "command": ["gh", *self.branch_merge_policy_args],
+                "errors": errors,
+            }
+            return errors
+        snapshot, evidence, errors = self._branch_merge_policy_snapshot_info(
+            raw, command=self.branch_merge_policy_args
+        )
+        evidence["initial_rules_sha256"] = _sha256_json(
+            self.branch_merge_policy_snapshot
+        )
+        if not errors and snapshot != self.branch_merge_policy_snapshot:
+            errors.append("merge_guard_branch_merge_policy_drift")
+        evidence["matched"] = not errors
+        evidence["errors"] = list(errors)
+        self.receipt["branch_merge_policy_revalidation"] = evidence
         return errors
 
     def _codex_api_json(
@@ -2915,6 +3081,11 @@ class CaptainMergeGuardRunner:
             result = self.github_runner(repo_path, args)
             if self._is_repository_policy_query(args):
                 self._capture_repository_policy_snapshot(args, result)
+            elif (
+                self.branch_merge_policy_args is None
+                and self._is_branch_merge_policy_query(args)
+            ):
+                self._capture_branch_merge_policy_snapshot(args, result)
             return result
         if self.receipt["status"] != "not_reached":
             raise RuntimeError("merge lease guard permits exactly one merge dispatch")
@@ -3088,6 +3259,7 @@ class CaptainMergeGuardRunner:
             revalidation_errors = list(decision_reconciliation.get("errors", []))
             revalidation_errors.extend(self._revalidate_dispatch_bindings(bindings))
             revalidation_errors.extend(self._revalidate_repository_policy())
+            revalidation_errors.extend(self._revalidate_branch_merge_policy())
             if revalidation_errors:
                 self.receipt["status"] = "blocked_after_guard_revalidation"
                 self.receipt["contract_satisfied"] = False
