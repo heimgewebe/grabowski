@@ -1258,6 +1258,107 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         self.assertEqual(result["writer_route"], result["scoped_writer"]["route"])
 
+    def test_spark_catalog_route_is_lane_writer_not_contrast_alias(self) -> None:
+        validation = router._validate_catalog(self.catalog)
+        self.assertTrue(validation["valid"])
+        model = self.catalog["models"]["gpt-5.3-codex-spark"]
+        pool = self.catalog["quota_pools"]["openai-codex-spark"]
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-spark-low"
+        )
+        self.assertEqual("live-verified-via-codex-app-server", model["availability"])
+        self.assertEqual("codex_bengalfox", pool["provider_limit_id"])
+        self.assertEqual(0, pool["marginal_cost_usd"])
+        self.assertFalse(pool["payg_fallback_allowed"])
+        self.assertFalse(pool["automatic_overage"])
+        self.assertFalse(route.get("contrast_only", False))
+        self.assertEqual(["openai-codex-spark"], route["quota_pools"])
+        self.assertEqual(
+            ["mechanical", "triage", "docs", "tests"], route["task_classes"]
+        )
+
+    def test_separate_spark_quota_enables_low_risk_scoped_writer(self) -> None:
+        self.state["pools"]["openai-agentic"] = {
+            "status": "exhausted",
+            "remaining_ratio": 0.0,
+            "reset_at": (
+                datetime.now(timezone.utc) + timedelta(hours=6)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "verified_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self.state["pools"]["openai-codex-spark"] = {
+            "status": "available",
+            "remaining_ratio": 1.0,
+            "reset_at": (
+                datetime.now(timezone.utc) + timedelta(days=6)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "verified_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self._write_state()
+
+        result = self._route(
+            "docs",
+            changed_files=1,
+            duration_minutes=15,
+            novelty="low",
+            need_review=False,
+        )
+
+        self.assertEqual("scoped_writer", result["executor"])
+        self.assertEqual("codex-spark-low", result["writer_route"])
+        self.assertEqual("codex-spark-low", result["scoped_writer"]["route"])
+        self.assertTrue(
+            result["scoped_writer"]["execution_eligible_if_separately_authorized"]
+        )
+        self.assertNotIn(
+            "codex-spark-low",
+            " ".join(result["excluded"].get("scoped-writer:codex-spark-low", [])),
+        )
+
+    def test_unknown_spark_quota_remains_advisory_and_cannot_write(self) -> None:
+        self.state["pools"]["openai-agentic"] = {
+            "status": "exhausted",
+            "remaining_ratio": 0.0,
+            "reset_at": (
+                datetime.now(timezone.utc) + timedelta(hours=6)
+            ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "verified_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self.state["pools"]["openai-codex-spark"] = {
+            "status": "unknown",
+            "verified_at": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self._write_state()
+
+        result = self._route(
+            "docs",
+            changed_files=1,
+            duration_minutes=15,
+            novelty="low",
+            need_review=False,
+        )
+
+        self.assertEqual("controller", result["executor"])
+        self.assertIsNone(result["scoped_writer"])
+        self.assertEqual([], result["scoped_writer_fallbacks"])
+        self.assertIn("scoped-writer:codex-spark-low", result["excluded"])
+        self.assertIn(
+            "automatic scoped-writer execution is forbidden",
+            result["excluded"]["scoped-writer:codex-spark-low"][0],
+        )
+
     def test_controller_owned_work_has_no_scoped_writer(self) -> None:
         result = self._route("deployment")
         self.assertEqual(result["decision"], "controller")
