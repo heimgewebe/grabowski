@@ -5525,6 +5525,7 @@ CAPTAIN_DIFF = hashlib.sha256(CAPTAIN_DIFF_TEXT.encode("utf-8")).hexdigest()
 def captain_codex_request_material(
     *,
     head: str = CAPTAIN_HEAD,
+    base_sha: str = CAPTAIN_BASE_SHA,
     diff_sha256: str = CAPTAIN_DIFF,
     repo: str = "heimgewebe/grabowski",
     pr: int = 96,
@@ -5535,6 +5536,7 @@ def captain_codex_request_material(
         "repo": repo,
         "pr": pr,
         "head_sha": head,
+        "base_sha": base_sha,
         "diff_sha256": diff_sha256,
     }
     payload = {
@@ -5543,8 +5545,8 @@ def captain_codex_request_material(
     }
     body = (
         "@codex review\n\n"
-        "Please review the exact current pull-request head. Grabowski will accept only "
-        "a Codex result bound to the head and diff recorded below.\n\n"
+        "Please review the exact current pull-request base and head. Grabowski will accept only "
+        "a Codex result bound to the base, head and diff recorded below.\n\n"
         "<!-- grabowski-codex-review-request:v1\n"
         + json.dumps(
             payload,
@@ -5571,7 +5573,7 @@ def captain_codex_review_evidence(
     request_time = "2026-07-26T08:00:00Z"
     completion_time = "2026-07-26T08:01:00Z"
     request_payload, request_body = captain_codex_request_material(
-        head=head, diff_sha256=diff_sha256, repo=repo, pr=pr
+        head=head, base_sha=base_sha, diff_sha256=diff_sha256, repo=repo, pr=pr
     )
     review_body = "reviewed"
     current_threads = sorted(set(thread_ids or []))
@@ -5723,10 +5725,11 @@ def captain_codex_live_state(
     review_pages: list[list[dict[str, object]]] | None = None,
 ) -> dict[str, object]:
     head = str(view.get("headRefOid") or CAPTAIN_HEAD)
+    base_sha = str(view.get("baseRefOid") or CAPTAIN_BASE_SHA)
     pr = int(view.get("number") or 96)
     diff_sha256 = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
     _, request_body = captain_codex_request_material(
-        head=head, diff_sha256=diff_sha256, pr=pr
+        head=head, base_sha=base_sha, diff_sha256=diff_sha256, pr=pr
     )
     request_comment = {
         "id": 101,
@@ -5820,6 +5823,7 @@ def captain_review_finding_thread(
 def captain_codex_review_exception(
     *,
     head: str = CAPTAIN_HEAD,
+    base_sha: str = CAPTAIN_BASE_SHA,
     diff_sha256: str = CAPTAIN_DIFF,
     expires_delta: timedelta = timedelta(hours=1),
 ) -> dict[str, object]:
@@ -5832,6 +5836,7 @@ def captain_codex_review_exception(
         "repo": "heimgewebe/grabowski",
         "pr": 96,
         "head_sha": head,
+        "base_sha": base_sha,
         "diff_sha256": diff_sha256,
         "approved_by": "alex",
         "reason": "Codex unavailable during a bounded incident window",
@@ -6668,6 +6673,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(parameters)
 
         self.assertEqual("pass", self.gate(result, "codex-review-settled")["status"])
+
+    def test_codex_review_exception_for_other_base_sha_blocks(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("codex_review_evidence")
+        parameters["codex_review_exception"] = captain_codex_review_exception(
+            base_sha="a" * 40
+        )
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "codex-review-settled")["status"])
+        self.assertIn("base_sha does not match expected value", result["output"]["blocked_reasons"])
 
     def test_expired_codex_review_exception_blocks(self) -> None:
         parameters = captain_parameters()
@@ -8928,6 +8945,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "repo",
                 "pr",
                 "head_sha",
+                "base_sha",
                 "diff_sha256",
                 "generated_at",
                 "expires_at",
@@ -8945,6 +8963,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             },
         )
         self.assertIn("expected_head", codex_review_exception["binds"])
+        self.assertIn("expected_base_sha", codex_review_exception["binds"])
         self.assertIn("diff_sha256", codex_review_exception["binds"])
         self.assertEqual(
             codex_review_exception["alternative_group"],

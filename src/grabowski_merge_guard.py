@@ -2078,6 +2078,8 @@ class CaptainMergeGuardRunner:
                     errors.append("merge_guard_codex_exception_expired")
                 if exception.get("head_sha") != bindings.get("head_sha"):
                     errors.append("merge_guard_codex_exception_head_drift")
+                if exception.get("base_sha") != bindings.get("base_sha"):
+                    errors.append("merge_guard_codex_exception_base_drift")
                 if exception.get("diff_sha256") != bindings.get("diff_sha256"):
                     errors.append("merge_guard_codex_exception_diff_drift")
                 if str(exception.get("repo", "")).lower() != str(
