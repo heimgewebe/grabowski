@@ -39,6 +39,7 @@ def _self_review() -> dict:
         "repo": "heimgewebe/grabowski",
         "pr": 42,
         "head_sha": "a" * 40,
+        "base_sha": "f" * 40,
         "diff_sha256": "b" * 64,
         "diff_reviewed": True,
         "reviewed_files": ["tools/pr_review_gate.py"],

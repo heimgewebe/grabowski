@@ -12,8 +12,18 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from grabowski_pr_diff import (  # noqa: E402
+    canonicalize_github_pr_diff_identity,
+    github_pr_diff_identity_sha256,
+)
 
 try:
     from review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
@@ -397,8 +407,9 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     pr_diff_text: str | None = None
     pr_diff_error: str | None = None
     try:
-        pr_diff_bytes = _run_bytes(repo, ["gh", "pr", "diff", str(pr)])
-        pr_diff_sha256 = _sha256_bytes(pr_diff_bytes)
+        raw_pr_diff_bytes = _run_bytes(repo, ["gh", "pr", "diff", str(pr)])
+        pr_diff_bytes = canonicalize_github_pr_diff_identity(raw_pr_diff_bytes)
+        pr_diff_sha256 = github_pr_diff_identity_sha256(raw_pr_diff_bytes)
         try:
             pr_diff_text = pr_diff_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -2441,6 +2452,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
         raise GateInputError("cannot write external review packet without PR head SHA")
     output_dir = Path(os.path.abspath(output_dir))
 
+    pr_diff = canonicalize_github_pr_diff_identity(pr_diff)
     diff_sha256 = _sha256_bytes(pr_diff)
     diff_filename = f"pr-{pr_number}-{head[:12]}.diff"
     prompt_filename = f"pr-{pr_number}-{head[:12]}-external-review-prompt.md"
@@ -2528,6 +2540,9 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
     head = pr.get("headRefOid")
     if not isinstance(head, str) or not head:
         raise GateInputError("cannot write self-review template without PR head SHA")
+    base = pr.get("baseRefOid")
+    if not isinstance(base, str) or re.fullmatch(r"[0-9a-f]{40}", base) is None:
+        raise GateInputError("cannot write self-review template without PR base SHA")
     diff_sha256 = state.get("pr_diff_sha256")
     if not _valid_sha256(diff_sha256):
         pr_diff_error = state.get("pr_diff_error")
@@ -2546,6 +2561,7 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
         "repo": repo_name,
         "pr": pr_number,
         "head_sha": head,
+        "base_sha": base,
         "diff_sha256": _normalize_sha256(diff_sha256),
         "diff_reviewed": False,
         "reviewed_files": paths,
@@ -2576,6 +2592,7 @@ def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict
         "repo": repo_name,
         "pr": pr_number,
         "head_sha": head,
+        "base_sha": base,
         "diff_sha256": _normalize_sha256(diff_sha256),
         "required_review_focus": list(REQUIRED_SELF_REVIEW_FOCUS),
     }
@@ -3003,6 +3020,11 @@ def evaluate_review_gate(
             self_review_failures.append("PR headRefOid is missing")
         elif self_review.get("head_sha") != head_sha:
             self_review_failures.append("self-review head_sha mismatch")
+        base_sha = pr.get("baseRefOid")
+        if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+            self_review_failures.append("PR baseRefOid is missing or invalid")
+        elif self_review.get("base_sha") != base_sha:
+            self_review_failures.append("self-review base_sha mismatch")
         self_review_workflow_failures = _self_review_workflow_failures(pr, self_review, repo_name=repo_name)
         self_review_failures.extend(self_review_workflow_failures)
         if self_review.get("diff_reviewed") is not True:

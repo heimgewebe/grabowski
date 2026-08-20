@@ -302,6 +302,7 @@ class ReviewEvidenceCiRecursionTests(unittest.TestCase):
             "repo": "heimgewebe/grabowski",
             "pr": 42,
             "head_sha": "a" * 40,
+            "base_sha": "b" * 40,
             "reviewed_files": ["docs/note.md"],
             "review_focus": REVIEW_FOCUS,
             "diff_reviewed": True,

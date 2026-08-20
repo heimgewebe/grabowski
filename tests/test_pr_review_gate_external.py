@@ -85,6 +85,7 @@ def _self_review(
         "repo": repo,
         "pr": 7,
         "head_sha": HEAD,
+        "base_sha": BASE,
         "diff_sha256": DIFF_SHA,
         "diff_reviewed": True,
         "reviewed_files": [path],

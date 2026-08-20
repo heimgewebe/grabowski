@@ -332,6 +332,7 @@ jobs:
             "repo": "heimgewebe/schauwerk",
             "pr": 72,
             "head_sha": "a" * 40,
+            "base_sha": "b" * 40,
             "reviewed_files": ["docs/note.md"],
             "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
             "diff_reviewed": True,

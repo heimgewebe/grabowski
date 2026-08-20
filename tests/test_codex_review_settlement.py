@@ -64,10 +64,11 @@ def request_comment(
     created_at: str = REQUEST_TIME,
     updated_at: str | None = None,
     head: str = HEAD,
+    base: str = BASE,
     diff_sha256: str = DIFF,
 ) -> dict:
     payload = settlement._request_payload(
-        REPOSITORY, PR, head, diff_sha256
+        REPOSITORY, PR, head, base, diff_sha256
     )
     return {
         "databaseId": comment_id,
@@ -295,6 +296,18 @@ class CodexReviewSettlementTests(unittest.TestCase):
         )
         self.assertFalse(result["required"])
         self.assertEqual(result["status"], "pass")
+        self.assertFalse(result["settled"])
+
+    def test_base_update_invalidates_request_even_when_head_and_diff_match(self) -> None:
+        state = base_state()
+        state["baseRefOid"] = "d" * 40
+        state["comments"] = connection([request_comment(base=BASE)], hasPreviousPage=False)
+        state["reviews"] = connection([codex_review()], hasPreviousPage=False)
+
+        result = self.evaluate(state)
+
+        self.assertFalse(result["request_present"])
+        self.assertEqual("pending", result["status"])
         self.assertFalse(result["settled"])
 
     def test_current_head_review_after_bound_request_settles(self) -> None:

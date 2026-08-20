@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 import importlib.util
 from pathlib import Path
 import sys
@@ -49,7 +50,7 @@ def connection(nodes: list[dict], **page: bool) -> dict:
 
 
 def request_payloads() -> tuple[dict, dict, dict]:
-    payload = settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)
+    payload = settlement._request_payload(REPOSITORY, PR, HEAD, BASE, DIFF)
     body = settlement._request_body(payload)
     graph = {
         "databaseId": 101,
@@ -299,6 +300,35 @@ class CodexQuotaTerminalContractTests(unittest.TestCase):
             phase="test",
         )
         self.assertIn("merge_guard_codex_unavailable_comment_unbound", errors)
+
+    def test_merge_guard_rejects_exception_from_other_base(self) -> None:
+        evidence, live = valid_review_evidence_and_live()
+        runner = runner_for(evidence, live)
+        now = datetime.now(timezone.utc)
+        core = {
+            "schema_version": 1,
+            "kind": "grabowski_codex_review_exception",
+            "repo": REPOSITORY,
+            "pr": PR,
+            "head_sha": HEAD,
+            "base_sha": "d" * 40,
+            "diff_sha256": DIFF,
+            "generated_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(),
+            "approved_by": "alex",
+            "reason": "bounded test exception",
+        }
+        runner.parameters.pop("codex_review_evidence")
+        runner.parameters["codex_review_exception"] = {
+            **core,
+            "exception_sha256": grips.sha256_json(core),
+        }
+
+        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
+            runner, bindings(), phase="test"
+        )
+
+        self.assertIn("merge_guard_codex_exception_base_drift", errors)
 
     def test_merge_guard_rejects_non_boolean_explicit_requirement(self) -> None:
         evidence, live = valid_review_evidence_and_live()
