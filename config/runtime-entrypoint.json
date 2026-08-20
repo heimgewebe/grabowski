@@ -319,6 +319,10 @@
       "source": "src/grabowski_merge_guard.py"
     },
     {
+      "module": "grabowski_pr_diff",
+      "source": "src/grabowski_pr_diff.py"
+    },
+    {
       "module": "grabowski_decision_reviews",
       "source": "src/grabowski_decision_reviews.py"
     },
