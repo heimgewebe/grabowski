@@ -308,6 +308,26 @@
       },
       "quality_prior_class": "C"
     },
+    "gpt-5.3-codex-spark": {
+      "availability": "live-verified-via-codex-app-server",
+      "base_quality_rank": 64,
+      "evidence": "codex-app-server-model-list-and-separate-bengalfox-rate-limit-2026-08-19",
+      "family": "openai-gpt-5.3-codex",
+      "identity_kind": "model",
+      "name": "GPT-5.3 Codex Spark",
+      "provider_family": "openai",
+      "quality": {
+        "architecture": 4,
+        "autonomy": 6,
+        "coding": 7,
+        "context": 6,
+        "debugging": 5,
+        "reliability": 7,
+        "review": 5,
+        "speed": 10
+      },
+      "quality_prior_class": "C"
+    },
     "gpt-5.4-legacy": {
       "availability": "blocked-legacy",
       "evidence": "not-routable",
@@ -772,7 +792,8 @@
           "gemini-3.6-flash",
           "gpt-oss-120b",
           "claude-sonnet-4.6",
-          "claude-opus-4.6"
+          "claude-opus-4.6",
+          "gpt-5.3-codex-spark"
         ]
       },
       "S": {
@@ -1075,6 +1096,29 @@
       "plan": "ChatGPT Pro",
       "plan_evidence": "owner-asserted-2026-07-29; codex-login-status-chatgpt; gpt-5.6-sol-smoke-2026-07-29"
     },
+    "openai-codex-spark": {
+      "automatic_overage": false,
+      "cost_mode": "subscription_included",
+      "credits_allowed": false,
+      "excluded_cost_surfaces": [
+        "openai-api",
+        "purchased-codex-credits"
+      ],
+      "included_surfaces": [
+        "codex-cli"
+      ],
+      "marginal_cost_usd": 0,
+      "max_concurrency": 1,
+      "overage_action": "block_and_surface",
+      "payg_fallback_allowed": false,
+      "plan": "Codex subscription baseline (provider-attested)",
+      "plan_evidence": "codex-app-server planType=prolite; limitId=codex_bengalfox; credits=null; model-list visible 2026-08-19",
+      "provider_limit_id": "codex_bengalfox",
+      "provider_limit_name": "GPT-5.3-Codex-Spark",
+      "quota_mode": "codex-app-server-separate-limit",
+      "reserve_floor": 0.15,
+      "unknown_execution": "advisory-only"
+    },
     "openrouter-paid": {
       "blocked_reason": "Paid OpenRouter route forbidden.",
       "cost_mode": "metered-api",
@@ -1155,6 +1199,44 @@
         "triage"
       ],
       "tier": "critical"
+    },
+    {
+      "argv_prefix": [
+        "codex",
+        "--model",
+        "gpt-5.3-codex-spark",
+        "-c",
+        "model_reasoning_effort=\"low\""
+      ],
+      "base_quality_rank": 64,
+      "burn_weight": 0.35,
+      "delegation_overhead_minutes": 2,
+      "effort": "low",
+      "enabled": true,
+      "harness": "codex",
+      "harness_quality": 9,
+      "id": "codex-spark-low",
+      "independence_group": "openai-gpt-5.3-codex-spark",
+      "min_duration_minutes": 3,
+      "model": "gpt-5.3-codex-spark",
+      "priority": 109,
+      "quality_class": "C",
+      "quota_pools": [
+        "openai-codex-spark"
+      ],
+      "task_affinity": {
+        "docs": 14,
+        "mechanical": 18,
+        "tests": 12,
+        "triage": 16
+      },
+      "task_classes": [
+        "mechanical",
+        "triage",
+        "docs",
+        "tests"
+      ],
+      "tier": "fast"
     },
     {
       "argv_prefix": [

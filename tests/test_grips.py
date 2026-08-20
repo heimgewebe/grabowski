@@ -3792,6 +3792,41 @@ class GripFoundationTests(unittest.TestCase):
         }
         return {**body, "recommendation_sha256": grips.sha256_json(body)}
 
+    def test_agent_execution_spark_writer_command_is_exact_model_bound(self) -> None:
+        route = {
+            "route": "codex-spark-low",
+            "harness": "codex",
+            "argv_prefix": [
+                "codex",
+                "--model",
+                "gpt-5.3-codex-spark",
+                "-c",
+                'model_reasoning_effort="low"',
+            ],
+            "route_role": "scoped-writer",
+            "contrast_only": False,
+            "paid_only": False,
+        }
+        command = grips._agent_execution_route_command(
+            route,
+            prompt="Implement the bounded source request",
+            role="writer",
+        )
+        self.assertEqual(
+            [
+                "codex",
+                "--model",
+                "gpt-5.3-codex-spark",
+                "-c",
+                'model_reasoning_effort="low"',
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "Implement the bounded source request",
+            ],
+            command,
+        )
+
     def test_agent_execution_happy_path_source_mode_binds_route_plan_lane_workspace_without_lane_writer_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp).resolve()
