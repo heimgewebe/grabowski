@@ -1,5 +1,5 @@
 {
-  "catalog_version": "lane-scoped-writer-v6",
+  "catalog_version": "lane-scoped-writer-v7",
   "harnesses": {
     "antigravity": {
       "aliases": [
@@ -740,7 +740,7 @@
     "frontier_model_policy": {
       "benchmark_prior_not_local_truth": true,
       "escalation_route": "codex-sol-xhigh",
-      "opus_role": "Upper-frontier Anthropic reviewer through the Claude Pro baseline; review remains advisory unless separately delegated as a scoped writer lane.",
+      "opus_role": "Upper-frontier Anthropic reviewer plus escalation-only scoped writer for architecture, deep-debug, migration and difficult complex-patch work through the shared Claude Pro baseline; Sonnet remains the routine Claude writer, Codex Sol remains the canonical top escalation, and Opus writer results require independent review.",
       "principle": "The controller owns authoritative integration and closeout. Explicitly lane-bound scoped writers may implement and publish PRs; reviewer and observer results remain advisory.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
@@ -748,6 +748,7 @@
       ],
       "upper_review_or_contrast_routes": [
         "codex-sol-medium",
+        "claude-opus-5-writer-high",
         "claude-opus-5-high",
         "codex-terra-high",
         "claude-sonnet-5-high",
@@ -2468,6 +2469,53 @@
         "migration"
       ],
       "tier": "deep"
+    },
+    {
+      "argv_prefix": [
+        "claude",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "base_quality_rank": 92,
+      "burn_weight": 2.1,
+      "delegation_overhead_minutes": 6,
+      "effort": "high",
+      "enabled": true,
+      "escalation_only": true,
+      "harness": "claude",
+      "harness_quality": 9,
+      "id": "claude-opus-5-writer-high",
+      "independence_group": "anthropic-claude-pro",
+      "min_duration_minutes": 20,
+      "model": "claude-opus-5",
+      "priority": 109,
+      "quality_class": "A",
+      "quota_pools": [
+        "claude-pro"
+      ],
+      "risk_affinity": {
+        "high-risk": 8,
+        "prior-attempt-failed": 12,
+        "root-cause": 10,
+        "uncertainty-heavy": 12
+      },
+      "task_affinity": {
+        "architecture": 14,
+        "complex-patch": 12,
+        "deep-debug": 16,
+        "migration": 18
+      },
+      "task_classes": [
+        "architecture",
+        "complex-patch",
+        "deep-debug",
+        "migration"
+      ],
+      "tier": "critical"
     },
     {
       "argv_prefix": [

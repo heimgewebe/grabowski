@@ -124,6 +124,34 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
                 self.assertIn("independent-review", route["task_classes"])
                 self.assertIn("critical-review", route["task_classes"])
 
+    def test_opus_has_separate_escalation_writer_and_review_route(self) -> None:
+        writer = self.routes["claude-opus-5-writer-high"]
+        reviewer = self.routes["claude-opus-5-high"]
+        self.assertTrue(writer["enabled"])
+        self.assertTrue(writer["escalation_only"])
+        self.assertFalse(writer.get("review_only", False))
+        self.assertEqual(writer["quota_pools"], ["claude-pro"])
+        self.assertEqual(writer["independence_group"], reviewer["independence_group"])
+        self.assertEqual(
+            writer["task_classes"],
+            ["architecture", "complex-patch", "deep-debug", "migration"],
+        )
+        self.assertEqual(writer["argv_prefix"][-2:], ["--permission-mode", "acceptEdits"])
+        self.assertTrue(reviewer["review_only"])
+        self.assertEqual(reviewer["argv_prefix"][-2:], ["--permission-mode", "plan"])
+
+    def test_frontier_policy_keeps_codex_top_and_grok_independent_peer(self) -> None:
+        frontier = self.catalog["policy"]["frontier_model_policy"]
+        self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
+        self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
+        self.assertIn("claude-opus-5-writer-high", frontier["upper_review_or_contrast_routes"])
+        grok_writer = self.routes["grok-4.5-high"]
+        grok_reviewer = self.routes["grok-4.5-review-high"]
+        self.assertTrue(grok_writer["enabled"])
+        self.assertEqual(grok_writer["independence_group"], "xai-grok-4.5")
+        self.assertTrue(grok_reviewer["enabled"])
+        self.assertTrue(grok_reviewer["review_only"])
+
     def test_external_codex_routes_remain_contrast_only_except_attested_spark_writer(self) -> None:
         routes = [route for route in self.catalog["routes"] if route.get("harness") == "codex"]
         self.assertTrue(routes)
@@ -136,6 +164,18 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertTrue(all(route.get("contrast_only") is True for route in legacy_routes))
 
     def test_runtime_command_prefixes_do_not_duplicate_runner_owned_flags(self) -> None:
+        self.assertEqual(
+            self.routes["claude-opus-5-writer-high"]["argv_prefix"],
+            [
+                "claude",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "acceptEdits",
+            ],
+        )
         self.assertEqual(
             self.routes["claude-opus-5-high"]["argv_prefix"],
             [
