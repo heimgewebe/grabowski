@@ -197,15 +197,27 @@ def _authority_blocker(
     if source_kind not in AUTHORITY_BLOCKER_SOURCE_KINDS or source_id is None:
         return None
 
-    if source_kind == "automation":
+    if source_kind == "automation" and state == "binding_identity_drift":
+        blocker_code = "automation-terminal-or-identity-rebind-evidence-required"
+        authority = "immutable_automation_terminal_evidence"
+        permitted_repair_paths = [
+            "source_terminal_evidence",
+            "authorized_identity_rebind",
+        ]
+        safe_repair_condition = (
+            "Bind immutable terminal evidence to this exact automation source_id or "
+            "complete a separately authorized identity rebind with its own current "
+            "preconditions, then rerun reconciliation. Checkout absence, retention "
+            "expiry and lease absence are insufficient."
+        )
+    elif source_kind == "automation":
         blocker_code = "automation-terminal-evidence-contract-required"
         authority = "immutable_automation_terminal_evidence"
         permitted_repair_paths = ["source_terminal_evidence"]
         safe_repair_condition = (
             "Bind immutable terminal evidence to this exact automation source_id and "
-            "rerun reconciliation; resolve any remaining identity drift through a "
-            "separately authorized operation. Checkout absence, retention expiry and "
-            "lease absence are insufficient."
+            "rerun reconciliation. Checkout absence, retention expiry and lease "
+            "absence are insufficient."
         )
     elif state == "binding_identity_drift":
         blocker_code = "work-lane-terminal-or-identity-rebind-evidence-required"

@@ -135,6 +135,24 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertIn("Checkout absence", blocker["safe_repair_condition"])
         self.assertIn("checkout_absence_as_terminal_proof", blocker["does_not_establish"])
 
+    def test_automation_identity_drift_exposes_terminal_or_rebind_authority(self) -> None:
+        result = reconcile_binding(
+            binding(source={"kind": "automation", "id": "frontier-20260806"}),
+            worktree(branch="topic-v2"),
+            repository_observable=True,
+        )
+        self.assertEqual("binding_identity_drift", result["state"])
+        blocker = result["authority_blocker"]
+        self.assertEqual(
+            "automation-terminal-or-identity-rebind-evidence-required",
+            blocker["blocker_code"],
+        )
+        self.assertEqual(
+            ["source_terminal_evidence", "authorized_identity_rebind"],
+            blocker["permitted_repair_paths"],
+        )
+        self.assertIn("separately authorized identity rebind", blocker["safe_repair_condition"])
+
     def test_work_lane_identity_drift_exposes_terminal_or_rebind_authority(self) -> None:
         result = reconcile_binding(
             binding(source={"kind": "work_lane", "id": "a" * 32}),
