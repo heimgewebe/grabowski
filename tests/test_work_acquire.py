@@ -362,6 +362,36 @@ class WorkAcquireTests(unittest.TestCase):
             result["inputs"]["system_convergence_plan"]["plan_sha256"],
         )
 
+    def test_declared_write_path_uses_narrow_path_and_branch_leases(self) -> None:
+        seen: dict[str, object] = {}
+
+        def acquire(owner: str, keys: list[str], **kwargs: object) -> dict[str, object]:
+            seen["keys"] = list(keys)
+            return self.acquired(owner, keys)
+
+        params = self.parameters()
+        params["write_paths"] = ["src/app.py"]
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+        })
+
+        result = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+
+        self.assertEqual("ready", result["state"])
+        keys = seen["keys"]
+        self.assertIn(f"path:{self.repo / 'src' / 'app.py'}", keys)
+        self.assertIn(f"repo:{self.repo}:branch:feat/authority-p0", keys)
+        self.assertNotIn(f"repo:{self.repo}", keys)
+
     def test_verified_isolation_promotes_lane_decision(self) -> None:
         admission = self.isolation_admission()
         ensure = Mock(
