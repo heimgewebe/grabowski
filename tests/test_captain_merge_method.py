@@ -40,15 +40,22 @@ import grabowski_grips as grips  # noqa: E402
 
 
 class _RepoPolicyGh:
-    def __init__(self, settings: dict[str, bool]) -> None:
+    def __init__(
+        self,
+        settings: dict[str, bool],
+        branch_rules: list[dict[str, object]] | None = None,
+    ) -> None:
         self.settings = settings
+        self.branch_rules = list(branch_rules or [])
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, _repo: Path, argv: list[str]) -> dict[str, object]:
         self.calls.append(tuple(argv))
+        is_branch_rules = any("/rules/branches/" in argument for argument in argv)
+        payload: object = [self.branch_rules] if is_branch_rules else self.settings
         return {
             "returncode": 0,
-            "stdout": json.dumps(self.settings),
+            "stdout": json.dumps(payload),
             "stderr": "",
         }
 
@@ -73,6 +80,20 @@ def _settings(
     }
 
 
+def _pull_request_rule(*methods: str) -> dict[str, object]:
+    return {
+        "type": "pull_request",
+        "parameters": {"allowed_merge_methods": list(methods)},
+    }
+
+
+def _merge_queue_rule(method: str) -> dict[str, object]:
+    return {
+        "type": "merge_queue",
+        "parameters": {"merge_method": method},
+    }
+
+
 class CaptainMergeMethodTests(unittest.TestCase):
     def test_explicit_squash_overrides_repository_preference(self) -> None:
         policy, _query, errors = grips._captain_repository_merge_policy(
@@ -80,6 +101,7 @@ class CaptainMergeMethodTests(unittest.TestCase):
             _RepoPolicyGh(_settings()),
             repo_slug="heimgewebe/grabowski",
             requested_method="squash",
+            base_branch="main",
         )
 
         self.assertEqual(errors, [])
@@ -97,6 +119,7 @@ class CaptainMergeMethodTests(unittest.TestCase):
             _RepoPolicyGh(_settings(squash=False)),
             repo_slug="heimgewebe/grabowski",
             requested_method="squash",
+            base_branch="main",
         )
 
         self.assertIsNotNone(policy)
@@ -104,6 +127,68 @@ class CaptainMergeMethodTests(unittest.TestCase):
         self.assertEqual(policy["requested_method"], "squash")
         self.assertEqual(policy["selected_method"], "squash")
         self.assertEqual(errors, ["repository_merge_method_not_allowed:squash"])
+
+    def test_explicit_method_respects_branch_allowed_merge_methods(self) -> None:
+        policy, _query, errors = grips._captain_repository_merge_policy(
+            Path.cwd(),
+            _RepoPolicyGh(
+                _settings(),
+                branch_rules=[_pull_request_rule("squash", "rebase")],
+            ),
+            repo_slug="heimgewebe/grabowski",
+            requested_method="merge",
+            base_branch="main",
+        )
+
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertEqual(
+            policy["branch_merge_policy"]["pull_request_allowed_methods"],
+            ["squash", "rebase"],
+        )
+        self.assertEqual(errors, ["repository_branch_merge_method_not_allowed:merge"])
+
+    def test_explicit_method_rejects_mismatched_merge_queue_method(self) -> None:
+        policy, _query, errors = grips._captain_repository_merge_policy(
+            Path.cwd(),
+            _RepoPolicyGh(
+                _settings(),
+                branch_rules=[_merge_queue_rule("SQUASH")],
+            ),
+            repo_slug="heimgewebe/grabowski",
+            requested_method="rebase",
+            base_branch="main",
+        )
+
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertEqual(policy["branch_merge_policy"]["merge_queue_method"], "squash")
+        self.assertEqual(
+            errors,
+            ["repository_merge_queue_method_mismatch:rebase:squash"],
+        )
+
+    def test_explicit_method_accepts_matching_merge_queue_method(self) -> None:
+        policy, _query, errors = grips._captain_repository_merge_policy(
+            Path.cwd(),
+            _RepoPolicyGh(
+                _settings(),
+                branch_rules=[
+                    _pull_request_rule("squash", "rebase"),
+                    _merge_queue_rule("SQUASH"),
+                ],
+            ),
+            repo_slug="heimgewebe/grabowski",
+            requested_method="squash",
+            base_branch="main",
+        )
+
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertEqual(policy["selected_method"], "squash")
+        self.assertIs(policy["branch_merge_policy"]["merge_queue_present"], True)
+        self.assertEqual(policy["branch_merge_policy"]["merge_queue_method"], "squash")
 
     def test_pr_merge_target_rejects_noncanonical_or_unknown_method(self) -> None:
         for merge_method in ("SQUASH", "octopus", " squash"):
@@ -167,9 +252,17 @@ class CaptainMergeMethodTests(unittest.TestCase):
         }
         requested: dict[str, object] = {}
 
-        def policy(_repo_path, _github_runner, *, repo_slug, requested_method=None):
+        def policy(
+            _repo_path,
+            _github_runner,
+            *,
+            repo_slug,
+            requested_method=None,
+            base_branch=None,
+        ):
             requested["repo_slug"] = repo_slug
             requested["method"] = requested_method
+            requested["base_branch"] = base_branch
             return (
                 {
                     "settings": _settings(),
@@ -221,7 +314,11 @@ class CaptainMergeMethodTests(unittest.TestCase):
 
         self.assertEqual(
             requested,
-            {"repo_slug": "heimgewebe/grabowski", "method": "squash"},
+            {
+                "repo_slug": "heimgewebe/grabowski",
+                "method": "squash",
+                "base_branch": "main",
+            },
         )
         merge_call = next(call for call in gh.calls if call[:2] == ("pr", "merge"))
         self.assertIn("--squash", merge_call)
