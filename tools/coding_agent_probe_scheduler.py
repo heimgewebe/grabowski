@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import stat
 import subprocess
@@ -92,6 +93,12 @@ EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
 DEFAULT_CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 CODEX_QUOTA_POOL = "openai-agentic"
 CODEX_QUOTA_SOURCE = "codex-rollout-rate-limits-v1"
+CODEX_APP_SERVER_SOURCE = "codex-app-server-account-rate-limits-v1"
+CODEX_SPARK_MODEL = "gpt-5.3-codex-spark"
+CODEX_SPARK_QUOTA_POOL = "openai-codex-spark"
+CODEX_SPARK_LIMIT_ID = "codex_bengalfox"
+CODEX_SPARK_LIMIT_NAME = "GPT-5.3-Codex-Spark"
+CODEX_ALLOWED_PLAN_TYPES = frozenset({"prolite"})
 MAX_CODEX_DAY_DIRECTORIES = 4
 MAX_CODEX_DIRECTORY_ENTRIES = 512
 MAX_CODEX_ROLLOUT_FILES = 128
@@ -489,6 +496,147 @@ def collect_codex_quota_observation(
     return {**core, "observation_sha256": value_sha256(core)}
 
 
+
+def _unknown_codex_direct_observation(pool: str, reason: str) -> dict[str, Any]:
+    core = {
+        "schema_version": 1,
+        "pool": pool,
+        "source": CODEX_APP_SERVER_SOURCE,
+        "status": "unknown",
+        "reason": reason,
+        "observed_at": iso_now(),
+        "paid_fallback_authorized": False,
+        "model_invocations": 0,
+    }
+    return {**core, "observation_sha256": value_sha256(core)}
+
+
+def _provider_limit_observation(
+    *,
+    pool: str,
+    limit_id: str,
+    value: dict[str, Any],
+    observed_at: str,
+    expected_limit_name: str | None = None,
+) -> dict[str, Any]:
+    if value.get("limitId") != limit_id:
+        raise ProbeSchedulerError("Codex provider limit id mismatch")
+    if expected_limit_name is not None and value.get("limitName") != expected_limit_name:
+        raise ProbeSchedulerError("Codex provider limit name mismatch")
+    plan_type = value.get("planType")
+    if plan_type not in CODEX_ALLOWED_PLAN_TYPES:
+        raise ProbeSchedulerError("Codex provider plan type is not allowlisted")
+    primary = value.get("primary")
+    if not isinstance(primary, dict):
+        raise ProbeSchedulerError("Codex provider primary limit is missing")
+    used_percent = primary.get("usedPercent")
+    resets_at = primary.get("resetsAt")
+    window_minutes = primary.get("windowDurationMins")
+    if (
+        isinstance(used_percent, bool)
+        or not isinstance(used_percent, (int, float))
+        or not 0 <= float(used_percent) <= 100
+        or isinstance(resets_at, bool)
+        or not isinstance(resets_at, int)
+        or resets_at <= 0
+        or isinstance(window_minutes, bool)
+        or not isinstance(window_minutes, int)
+        or window_minutes <= 0
+    ):
+        raise ProbeSchedulerError("Codex provider limit window is invalid")
+    reached_type = value.get("rateLimitReachedType")
+    if reached_type is not None and not isinstance(reached_type, str):
+        raise ProbeSchedulerError("Codex provider reached type is invalid")
+    credits = value.get("credits")
+    if pool == CODEX_SPARK_QUOTA_POOL:
+        if credits is not None:
+            raise ProbeSchedulerError("Spark provider limit unexpectedly exposes credits")
+    elif isinstance(credits, dict):
+        if credits.get("hasCredits") is not False or credits.get("unlimited") is not False:
+            raise ProbeSchedulerError("Codex purchased-credit state is not eligible for automatic routing")
+    elif credits is not None:
+        raise ProbeSchedulerError("Codex provider credit state is invalid")
+    status = "exhausted" if float(used_percent) >= 100 or bool(reached_type) else "available"
+    remaining_ratio = max(0.0, 1.0 - float(used_percent) / 100.0)
+    reset_at = datetime.fromtimestamp(resets_at, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    core = {
+        "schema_version": 1,
+        "pool": pool,
+        "source": CODEX_APP_SERVER_SOURCE,
+        "status": status,
+        "remaining_ratio": remaining_ratio,
+        "used_percent": float(used_percent),
+        "reset_at": reset_at,
+        "observed_at": observed_at,
+        "window_minutes": window_minutes,
+        "plan_type": plan_type,
+        "provider_limit_id": limit_id,
+        "paid_fallback_authorized": False,
+        "model_invocations": 0,
+    }
+    return {**core, "observation_sha256": value_sha256(core)}
+
+
+def parse_codex_app_server_observations(
+    model_result: dict[str, Any],
+    rate_limit_result: dict[str, Any],
+    *,
+    observed_at: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    stamp = observed_at or iso_now()
+    models = model_result.get("data")
+    if not isinstance(models, list):
+        raise ProbeSchedulerError("Codex model list is invalid")
+    spark = [
+        item
+        for item in models
+        if isinstance(item, dict) and item.get("id") == CODEX_SPARK_MODEL
+    ]
+    spark_efforts = spark[0].get("supportedReasoningEfforts") if len(spark) == 1 else None
+    if (
+        len(spark) != 1
+        or spark[0].get("model") != CODEX_SPARK_MODEL
+        or spark[0].get("hidden") is not False
+        or spark[0].get("displayName") != CODEX_SPARK_LIMIT_NAME
+        or not isinstance(spark_efforts, list)
+        or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("reasoningEffort"), str)
+            for item in spark_efforts
+        )
+        or "low" not in {item["reasoningEffort"] for item in spark_efforts}
+    ):
+        raise ProbeSchedulerError("Spark model identity is not live-visible")
+    by_limit = rate_limit_result.get("rateLimitsByLimitId")
+    if not isinstance(by_limit, dict):
+        raise ProbeSchedulerError("Codex provider rate-limit map is invalid")
+    main_value = by_limit.get("codex")
+    spark_value = by_limit.get(CODEX_SPARK_LIMIT_ID)
+    if not isinstance(main_value, dict) or not isinstance(spark_value, dict):
+        raise ProbeSchedulerError("Codex provider required rate limits are missing")
+    reset_credits = rate_limit_result.get("rateLimitResetCredits")
+    if not isinstance(reset_credits, dict):
+        raise ProbeSchedulerError("Codex rate-limit reset-credit state is missing")
+    available_count = reset_credits.get("availableCount")
+    if isinstance(available_count, bool) or not isinstance(available_count, int) or available_count != 0:
+        raise ProbeSchedulerError("Codex rate-limit reset credits are not eligible for automatic routing")
+    main = _provider_limit_observation(
+        pool=CODEX_QUOTA_POOL,
+        limit_id="codex",
+        value=main_value,
+        observed_at=stamp,
+    )
+    spark_observation = _provider_limit_observation(
+        pool=CODEX_SPARK_QUOTA_POOL,
+        limit_id=CODEX_SPARK_LIMIT_ID,
+        value=spark_value,
+        observed_at=stamp,
+        expected_limit_name=CODEX_SPARK_LIMIT_NAME,
+    )
+    if main["plan_type"] != spark_observation["plan_type"]:
+        raise ProbeSchedulerError("Codex main and Spark plan types differ")
+    return {CODEX_QUOTA_POOL: main, CODEX_SPARK_QUOTA_POOL: spark_observation}
+
 def read_json(path: Path, *, required: bool = True) -> tuple[dict[str, Any], bytes]:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -839,6 +987,264 @@ def collect_bounded_process_output(
         selector.close()
 
 
+
+
+def _open_private_codex_metadata_source(
+    source: Path,
+    *,
+    label: str,
+    required: bool,
+) -> int | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        source_fd = os.open(source, flags)
+    except FileNotFoundError:
+        if required:
+            raise ProbeSchedulerError(f"{label} is missing")
+        return None
+    except OSError as exc:
+        raise ProbeSchedulerError(f"{label} cannot be opened safely") from exc
+    try:
+        opened = os.fstat(source_fd)
+        linked = source.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) & 0o077
+            or opened.st_size > MAX_ROUTER_BYTES
+        ):
+            raise ProbeSchedulerError(f"{label} is not a private owned regular file")
+        return source_fd
+    except BaseException:
+        os.close(source_fd)
+        raise
+
+
+@contextmanager
+def temporary_codex_metadata_home(
+    *,
+    state_directory: Path,
+    source_codex_home: Path,
+) -> Iterator[tuple[Path, tuple[int, ...]]]:
+    if not _owned_directory(state_directory, label="coding-agent state directory"):
+        raise ProbeSchedulerError("coding-agent state directory is missing")
+    try:
+        source_home_metadata = source_codex_home.lstat()
+    except FileNotFoundError as exc:
+        raise ProbeSchedulerError("Codex home is missing") from exc
+    if (
+        not stat.S_ISDIR(source_home_metadata.st_mode)
+        or stat.S_ISLNK(source_home_metadata.st_mode)
+        or source_home_metadata.st_uid != os.getuid()
+    ):
+        raise ProbeSchedulerError("Codex home is not an owned real directory")
+    descriptors: list[int] = []
+    temporary = Path(
+        tempfile.mkdtemp(prefix=".codex-metadata-", dir=state_directory)
+    )
+    try:
+        os.chmod(temporary, PRIVATE_DIRECTORY_MODE)
+        for name, required in (("auth.json", True), ("config.toml", False)):
+            descriptor = _open_private_codex_metadata_source(
+                source_codex_home / name,
+                label=f"Codex {name} metadata source",
+                required=required,
+            )
+            if descriptor is None:
+                continue
+            descriptors.append(descriptor)
+            target = f"/proc/self/fd/{descriptor}"
+            os.symlink(target, temporary / name)
+            linked = (temporary / name).lstat()
+            if not stat.S_ISLNK(linked.st_mode) or os.readlink(temporary / name) != target:
+                raise ProbeSchedulerError(f"Codex {name} metadata descriptor link is invalid")
+        yield temporary, tuple(descriptors)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+def _codex_app_server_read_response(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    buffer: bytearray,
+    *,
+    response_id: int,
+    deadline: float,
+    total_bytes: list[int],
+) -> dict[str, Any]:
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        events = selector.select(min(remaining, 0.2))
+        if not events:
+            if process.poll() is not None:
+                raise ProbeSchedulerError("Codex app-server exited before metadata response")
+            continue
+        for key, _mask in events:
+            chunk = os.read(key.fileobj.fileno(), IO_CHUNK_BYTES)
+            if not chunk:
+                if process.poll() is not None:
+                    raise ProbeSchedulerError("Codex app-server closed metadata stream")
+                continue
+            total_bytes[0] += len(chunk)
+            if total_bytes[0] > MAX_COMMAND_OUTPUT_BYTES:
+                raise ProbeSchedulerError("Codex app-server metadata exceeds byte limit")
+            buffer.extend(chunk)
+            while b"\n" in buffer:
+                line, _, rest = buffer.partition(b"\n")
+                buffer[:] = rest
+                if not line:
+                    continue
+                try:
+                    value = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ProbeSchedulerError("Codex app-server returned invalid JSON") from exc
+                if not isinstance(value, dict):
+                    raise ProbeSchedulerError("Codex app-server response is not an object")
+                if value.get("id") != response_id:
+                    continue
+                if value.get("error") is not None:
+                    raise ProbeSchedulerError("Codex app-server metadata request failed")
+                result = value.get("result")
+                if not isinstance(result, dict):
+                    raise ProbeSchedulerError("Codex app-server metadata result is invalid")
+                return result
+    raise ProbeSchedulerError("Codex app-server metadata request timed out")
+
+
+def collect_codex_app_server_observations(
+    codex_binary: Path,
+    *,
+    environment: dict[str, str],
+    timeout_seconds: int,
+    state_directory: Path,
+    source_codex_home: Path,
+) -> dict[str, dict[str, Any]]:
+    unknown = {
+        CODEX_QUOTA_POOL: _unknown_codex_direct_observation(
+            CODEX_QUOTA_POOL, "direct_provider_metadata_unavailable"
+        ),
+        CODEX_SPARK_QUOTA_POOL: _unknown_codex_direct_observation(
+            CODEX_SPARK_QUOTA_POOL, "direct_provider_metadata_unavailable"
+        ),
+    }
+    try:
+        path = codex_binary.resolve(strict=True)
+        metadata = path.stat()
+        if (
+            not path.is_absolute()
+            or not stat.S_ISREG(metadata.st_mode)
+            or not os.access(path, os.X_OK)
+            or metadata.st_uid != os.getuid()
+        ):
+            return unknown
+        codex_home_context = temporary_codex_metadata_home(
+            state_directory=state_directory,
+            source_codex_home=source_codex_home,
+        )
+        temporary_codex_home, codex_metadata_fds = codex_home_context.__enter__()
+        child_environment = dict(environment)
+        child_environment["CODEX_HOME"] = str(temporary_codex_home)
+        child_environment["CODEX_SQLITE_HOME"] = str(temporary_codex_home)
+        process = subprocess.Popen(
+            [str(path), "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=child_environment,
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=codex_metadata_fds,
+        )
+    except (OSError, RuntimeError, ProbeSchedulerError):
+        try:
+            codex_home_context.__exit__(None, None, None)
+        except (NameError, OSError):
+            pass
+        return unknown
+    assert process.stdin is not None and process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    buffer = bytearray()
+    total_bytes = [0]
+    deadline = time.monotonic() + timeout_seconds
+
+    def send(value: dict[str, Any]) -> None:
+        payload = canonical_bytes(value) + b"\n"
+        if len(payload) > 64 * 1024:
+            raise ProbeSchedulerError("Codex app-server request is too large")
+        process.stdin.write(payload)
+        process.stdin.flush()
+
+    try:
+        send(
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "grabowski-coding-agent-probe",
+                        "version": "1",
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            }
+        )
+        _codex_app_server_read_response(
+            process,
+            selector,
+            buffer,
+            response_id=1,
+            deadline=deadline,
+            total_bytes=total_bytes,
+        )
+        send({"method": "initialized"})
+        send(
+            {
+                "id": 2,
+                "method": "model/list",
+                "params": {"limit": 100, "cursor": None, "includeHidden": True},
+            }
+        )
+        model_result = _codex_app_server_read_response(
+            process,
+            selector,
+            buffer,
+            response_id=2,
+            deadline=deadline,
+            total_bytes=total_bytes,
+        )
+        send({"id": 3, "method": "account/rateLimits/read", "params": None})
+        rate_result = _codex_app_server_read_response(
+            process,
+            selector,
+            buffer,
+            response_id=3,
+            deadline=deadline,
+            total_bytes=total_bytes,
+        )
+        return parse_codex_app_server_observations(model_result, rate_result)
+    except (BrokenPipeError, OSError, ProbeSchedulerError):
+        return unknown
+    finally:
+        selector.close()
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        terminate_process_group(process)
+        process.stdout.close()
+        codex_home_context.__exit__(None, None, None)
+
 def run_json_command(
     argv: list[str],
     *,
@@ -1013,7 +1419,11 @@ def quota_update_plan(
     current_state: dict[str, Any],
     *,
     now: datetime | None = None,
+    force_unknown: bool = False,
 ) -> dict[str, Any] | None:
+    pool_id = observation.get("pool")
+    if pool_id not in {CODEX_QUOTA_POOL, CODEX_SPARK_QUOTA_POOL}:
+        raise ProbeSchedulerError("Codex quota observation pool is invalid")
     status = observation.get("status")
     if status in {"available", "exhausted"}:
         remaining = observation.get("remaining_ratio")
@@ -1026,12 +1436,13 @@ def quota_update_plan(
         ):
             raise ProbeSchedulerError("Codex quota observation is invalid")
         return {
+            "pool": pool_id,
             "reason": "fresh_provider_observation",
             "argv": [
                 router_invocation,
                 "set-quota",
                 "--pool",
-                CODEX_QUOTA_POOL,
+                pool_id,
                 "--status",
                 str(status),
                 "--remaining-ratio",
@@ -1044,18 +1455,39 @@ def quota_update_plan(
     if status != "unknown":
         return None
     pools = current_state.get("pools")
-    pool = pools.get(CODEX_QUOTA_POOL) if isinstance(pools, dict) else None
+    pool = pools.get(pool_id) if isinstance(pools, dict) else None
+    if force_unknown:
+        if isinstance(pool, dict) and (
+            pool.get("status") == "unknown"
+            and "remaining_ratio" not in pool
+            and "reset_at" not in pool
+        ):
+            return None
+        return {
+            "pool": pool_id,
+            "reason": "provider_metadata_unavailable_to_unknown",
+            "argv": [
+                router_invocation,
+                "set-quota",
+                "--pool",
+                pool_id,
+                "--status",
+                "unknown",
+                "--verified-now",
+            ],
+        }
     reset_at = parse_time(pool.get("reset_at")) if isinstance(pool, dict) else None
     boundary = (now or utc_now()).astimezone(timezone.utc)
     if reset_at is None or reset_at > boundary:
         return None
     return {
+        "pool": pool_id,
         "reason": "expired_reset_to_unknown",
         "argv": [
             router_invocation,
             "set-quota",
             "--pool",
-            CODEX_QUOTA_POOL,
+            pool_id,
             "--status",
             "unknown",
             "--verified-now",
@@ -1069,7 +1501,10 @@ def validate_state_after_quota_update(
     observation: dict[str, Any],
     result: dict[str, Any],
 ) -> None:
-    if result.get("updated") is not True or result.get("pool") != CODEX_QUOTA_POOL:
+    pool_id = observation.get("pool")
+    if pool_id not in {CODEX_QUOTA_POOL, CODEX_SPARK_QUOTA_POOL}:
+        raise ProbeSchedulerError("Codex quota observation pool is invalid")
+    if result.get("updated") is not True or result.get("pool") != pool_id:
         raise ProbeSchedulerError("router quota update result is invalid")
     pool_state = result.get("pool_state")
     if not isinstance(pool_state, dict):
@@ -1090,14 +1525,14 @@ def validate_state_after_quota_update(
         ):
             raise ProbeSchedulerError("router quota update does not match observation")
     elif any(field in pool_state for field in ("remaining_ratio", "reset_at")):
-        raise ProbeSchedulerError("expired quota reset retained stale quota fields")
+        raise ProbeSchedulerError("quota reset retained stale quota fields")
     for field in ("schema_version", "catalog_sha256", "catalog", "routes", "history"):
         if after.get(field) != before.get(field):
             raise ProbeSchedulerError(f"quota update changed router {field}")
     expected_pools = json.loads(json.dumps(before.get("pools", {}), sort_keys=True))
     if not isinstance(expected_pools, dict):
         raise ProbeSchedulerError("router pool state before quota update is invalid")
-    expected_pools[CODEX_QUOTA_POOL] = pool_state
+    expected_pools[pool_id] = pool_state
     if after.get("pools") != expected_pools:
         raise ProbeSchedulerError("quota update changed unrelated pool state")
 
@@ -1160,6 +1595,44 @@ def main(argv: list[str] | None = None) -> int:
             router_invocation, router_sha256, router_descriptor = router
             before, before_bytes = read_json(arguments.state, required=False)
             environment = sanitized_environment()
+            before_probe = before
+            before_probe_bytes = before_bytes
+            spark_preclear: dict[str, Any] | None = None
+            existing_pools = before.get("pools")
+            existing_spark = (
+                existing_pools.get(CODEX_SPARK_QUOTA_POOL)
+                if isinstance(existing_pools, dict)
+                else None
+            )
+            if isinstance(existing_spark, dict) and (
+                existing_spark.get("status") != "unknown"
+                or "remaining_ratio" in existing_spark
+                or "reset_at" in existing_spark
+            ):
+                preclear_observation = _unknown_codex_direct_observation(
+                    CODEX_SPARK_QUOTA_POOL, "provider_metadata_refresh_started"
+                )
+                preclear_plan = quota_update_plan(
+                    router_invocation,
+                    preclear_observation,
+                    before,
+                    force_unknown=True,
+                )
+                if preclear_plan is not None:
+                    preclear_result = run_json_command(
+                        preclear_plan["argv"],
+                        environment=environment,
+                        timeout_seconds=arguments.timeout_seconds,
+                        pass_fds=(router_descriptor,),
+                    )
+                    before_probe, before_probe_bytes = read_json(arguments.state)
+                    validate_state_after_quota_update(
+                        before, before_probe, preclear_observation, preclear_result
+                    )
+                    spark_preclear = {
+                        "reason": "provider_metadata_refresh_started_to_unknown",
+                        "result": preclear_result,
+                    }
             probe = run_json_command(
                 [router_invocation, "probe"],
                 environment=environment,
@@ -1168,27 +1641,88 @@ def main(argv: list[str] | None = None) -> int:
             )
             validate_probe(probe)
             after_probe, after_probe_bytes = read_json(arguments.state)
-            validate_state_after_probe(before, after_probe, probe)
-            quota_observation = collect_codex_quota_observation(
+            validate_state_after_probe(before_probe, after_probe, probe)
+            rollout_observation = collect_codex_quota_observation(
                 arguments.codex_sessions_root
             )
-            quota_plan = quota_update_plan(
-                router_invocation, quota_observation, after_probe
+            codex_provider = probe.get("providers", {}).get("codex", {})
+            codex_harness = probe.get("harnesses", {}).get("codex", {})
+            configured_codex_models = codex_provider.get("models", [])
+            spark_configured = (
+                isinstance(configured_codex_models, list)
+                and CODEX_SPARK_MODEL in configured_codex_models
             )
-            quota_result: dict[str, Any] | None = None
-            if quota_plan is not None:
+            direct_observations: dict[str, dict[str, Any]] = {}
+            if spark_configured:
+                codex_binary = codex_harness.get("binary")
+                if isinstance(codex_binary, str) and codex_binary:
+                    direct_observations = collect_codex_app_server_observations(
+                        Path(codex_binary),
+                        environment=environment,
+                        timeout_seconds=min(arguments.timeout_seconds, 30),
+                        state_directory=arguments.state.parent,
+                        source_codex_home=Path.home() / ".codex",
+                    )
+                else:
+                    direct_observations = {
+                        CODEX_QUOTA_POOL: _unknown_codex_direct_observation(
+                            CODEX_QUOTA_POOL, "codex_binary_unavailable"
+                        ),
+                        CODEX_SPARK_QUOTA_POOL: _unknown_codex_direct_observation(
+                            CODEX_SPARK_QUOTA_POOL, "codex_binary_unavailable"
+                        ),
+                    }
+            direct_main = direct_observations.get(CODEX_QUOTA_POOL, {})
+            quota_observation = (
+                direct_main
+                if direct_main.get("status") in {"available", "exhausted"}
+                else rollout_observation
+            )
+            quota_observations: dict[str, dict[str, Any]] = {
+                CODEX_QUOTA_POOL: quota_observation
+            }
+            if spark_configured:
+                spark_observation = direct_observations.get(
+                    CODEX_SPARK_QUOTA_POOL,
+                    _unknown_codex_direct_observation(
+                        CODEX_SPARK_QUOTA_POOL, "direct_provider_metadata_unavailable"
+                    ),
+                )
+                quota_observations[CODEX_SPARK_QUOTA_POOL] = spark_observation
+
+            after = after_probe
+            after_bytes = after_probe_bytes
+            quota_updates: dict[str, dict[str, Any]] = {}
+            for pool_id in (CODEX_QUOTA_POOL, CODEX_SPARK_QUOTA_POOL):
+                observation = quota_observations.get(pool_id)
+                if observation is None:
+                    continue
+                quota_plan = quota_update_plan(
+                    router_invocation,
+                    observation,
+                    after,
+                    force_unknown=(
+                        pool_id == CODEX_SPARK_QUOTA_POOL and spark_configured
+                    ),
+                )
+                if quota_plan is None:
+                    continue
                 quota_result = run_json_command(
                     quota_plan["argv"],
                     environment=environment,
                     timeout_seconds=arguments.timeout_seconds,
                     pass_fds=(router_descriptor,),
                 )
-                after, after_bytes = read_json(arguments.state)
+                next_state, next_bytes = read_json(arguments.state)
                 validate_state_after_quota_update(
-                    after_probe, after, quota_observation, quota_result
+                    after, next_state, observation, quota_result
                 )
-            else:
-                after, after_bytes = after_probe, after_probe_bytes
+                quota_updates[pool_id] = {
+                    "reason": quota_plan["reason"],
+                    "result": quota_result,
+                }
+                after, after_bytes = next_state, next_bytes
+
             status_value = run_json_command(
                 [router_invocation, "status"],
                 environment=environment,
@@ -1196,9 +1730,10 @@ def main(argv: list[str] | None = None) -> int:
                 pass_fds=(router_descriptor,),
             )
             validate_status(status_value)
-            if quota_result is not None:
-                effective_pool = status_value.get("pools", {}).get(CODEX_QUOTA_POOL)
-                expected_status = quota_observation.get("status")
+            for pool_id, update in quota_updates.items():
+                observation = quota_observations[pool_id]
+                effective_pool = status_value.get("pools", {}).get(pool_id)
+                expected_status = observation.get("status")
                 if expected_status not in {"available", "exhausted"}:
                     expected_status = "unknown"
                 if (
@@ -1210,9 +1745,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 if expected_status in {"available", "exhausted"} and (
                     effective_pool.get("remaining_ratio")
-                    != quota_observation["remaining_ratio"]
-                    or effective_pool.get("reset_at")
-                    != quota_observation["reset_at"]
+                    != observation["remaining_ratio"]
+                    or effective_pool.get("reset_at") != observation["reset_at"]
                 ):
                     raise ProbeSchedulerError(
                         "router status does not confirm the Codex quota update"
@@ -1221,8 +1755,9 @@ def main(argv: list[str] | None = None) -> int:
                     field in effective_pool for field in ("remaining_ratio", "reset_at")
                 ):
                     raise ProbeSchedulerError(
-                        "router status retained expired Codex quota fields"
+                        "router status retained stale Codex quota fields"
                     )
+            main_update = quota_updates.get(CODEX_QUOTA_POOL)
             receipt = {
                 "schema_version": 1,
                 "kind": "coding-agent-probe-scheduler-receipt",
@@ -1233,13 +1768,25 @@ def main(argv: list[str] | None = None) -> int:
                 "router_sha256_pin": str(arguments.router_sha256_file),
                 "state": str(arguments.state),
                 "state_sha256_before": bytes_sha256(before_bytes),
+                "state_sha256_after_preclear": bytes_sha256(before_probe_bytes),
                 "state_sha256_after_probe": bytes_sha256(after_probe_bytes),
                 "state_sha256_after": bytes_sha256(after_bytes),
                 "history_sha256": value_sha256(after.get("history", {})),
                 "quota_observation": quota_observation,
-                "quota_state_updated": quota_result is not None,
+                "quota_state_updated": main_update is not None,
                 "quota_update_reason": (
-                    quota_plan["reason"] if quota_plan is not None else None
+                    main_update["reason"] if main_update is not None else None
+                ),
+                "quota_observations": quota_observations,
+                "quota_updates": {
+                    pool_id: {"reason": update["reason"]}
+                    for pool_id, update in quota_updates.items()
+                },
+                "spark_configured": spark_configured,
+                "spark_preclear": (
+                    {"reason": spark_preclear["reason"]}
+                    if spark_preclear is not None
+                    else None
                 ),
                 "catalog_probe_sha256": probe["catalog_probe_sha256"],
                 "observed_at": probe["observed_at"],

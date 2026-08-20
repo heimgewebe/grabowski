@@ -108,7 +108,12 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
         sleep.assert_called_once_with(0.02)
 
     def write_router(
-        self, *, mutate_history: bool = False, tamper_digest: bool = False
+        self,
+        *,
+        mutate_history: bool = False,
+        tamper_digest: bool = False,
+        spark_configured: bool = False,
+        fail_probe: bool = False,
     ) -> None:
         program = f"""\
 #!/usr/bin/env python3
@@ -122,12 +127,14 @@ import sys
 
 state_path = Path({str(self.state)!r})
 if sys.argv[1] == "probe":
+    if {fail_probe!r}:
+        raise SystemExit(9)
     state = json.loads(state_path.read_text())
     body = {{
         "schema_version": 2,
         "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "harnesses": {{}},
-        "providers": {{"codex": {{"available": True}}}},
+        "harnesses": {{"codex": {{"available": True, "binary": "/fake/codex"}}}} if {spark_configured!r} else {{}},
+        "providers": {{"codex": {{"available": True, "models": {["gpt-5.3-codex-spark"] if spark_configured else []!r}}}}},
         "verified_quota_pools": [],
         "api_key_environment_scrubbed": {list(TEST_SCRUBBED_ENV)!r},
         "model_invocations": 0,
@@ -424,6 +431,274 @@ else:
         )
         self.assertEqual("unknown", observation["status"])
         self.assertEqual("no_fresh_provider_quota_receipt", observation["reason"])
+
+    @staticmethod
+    def direct_codex_results(
+        *, spark_used_percent: float = 0.0, spark_credits: object = None
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        reset_main = 1787197929
+        reset_spark = 1787774582
+        model_result = {
+            "data": [
+                {
+                    "id": SCHEDULER.CODEX_SPARK_MODEL,
+                    "model": SCHEDULER.CODEX_SPARK_MODEL,
+                    "displayName": SCHEDULER.CODEX_SPARK_LIMIT_NAME,
+                    "hidden": False,
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "low", "description": "Fast"},
+                        {"reasoningEffort": "medium", "description": "Balanced"},
+                        {"reasoningEffort": "high", "description": "Deep"},
+                        {"reasoningEffort": "xhigh", "description": "Extra deep"},
+                    ],
+                }
+            ]
+        }
+        rate_result = {
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "limitName": None,
+                    "planType": "prolite",
+                    "primary": {
+                        "usedPercent": 100.0,
+                        "resetsAt": reset_main,
+                        "windowDurationMins": 300,
+                    },
+                    "secondary": None,
+                    "credits": {"hasCredits": False, "unlimited": False},
+                    "rateLimitReachedType": "rate_limit_reached",
+                },
+                SCHEDULER.CODEX_SPARK_LIMIT_ID: {
+                    "limitId": SCHEDULER.CODEX_SPARK_LIMIT_ID,
+                    "limitName": SCHEDULER.CODEX_SPARK_LIMIT_NAME,
+                    "planType": "prolite",
+                    "primary": {
+                        "usedPercent": spark_used_percent,
+                        "resetsAt": reset_spark,
+                        "windowDurationMins": 10080,
+                    },
+                    "secondary": None,
+                    "credits": spark_credits,
+                    "rateLimitReachedType": None,
+                },
+            },
+            "rateLimitResetCredits": {"availableCount": 0},
+        }
+        return model_result, rate_result
+
+    def test_codex_app_server_parser_binds_separate_spark_pool(self) -> None:
+        model_result, rate_result = self.direct_codex_results()
+        observations = SCHEDULER.parse_codex_app_server_observations(
+            model_result,
+            rate_result,
+            observed_at="2026-08-19T20:04:35Z",
+        )
+        main = observations[SCHEDULER.CODEX_QUOTA_POOL]
+        spark = observations[SCHEDULER.CODEX_SPARK_QUOTA_POOL]
+        self.assertEqual("exhausted", main["status"])
+        self.assertEqual(0.0, main["remaining_ratio"])
+        self.assertEqual("available", spark["status"])
+        self.assertEqual(1.0, spark["remaining_ratio"])
+        self.assertEqual("prolite", spark["plan_type"])
+        self.assertEqual(SCHEDULER.CODEX_SPARK_LIMIT_ID, spark["provider_limit_id"])
+        self.assertFalse(spark["paid_fallback_authorized"])
+        self.assertEqual(0, spark["model_invocations"])
+
+    def test_codex_app_server_collector_uses_metadata_only_stdio_protocol(self) -> None:
+        model_result, rate_result = self.direct_codex_results()
+        fake_codex = self.root / "codex-app-server-fake"
+        source_codex_home = self.root / "codex-home"
+        source_codex_home.mkdir(mode=0o700)
+        (source_codex_home / "auth.json").write_text("{}", encoding="utf-8")
+        (source_codex_home / "config.toml").write_text("model = \"test\"\n", encoding="utf-8")
+        os.chmod(source_codex_home / "auth.json", 0o600)
+        os.chmod(source_codex_home / "config.toml", 0o600)
+        program = f"""\
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+MODEL = {model_result!r}
+RATE = {rate_result!r}
+home = Path(os.environ["CODEX_HOME"])
+assert os.environ["CODEX_SQLITE_HOME"] == str(home)
+assert home.is_dir()
+assert (home / "auth.json").is_symlink()
+assert (home / "config.toml").is_symlink()
+assert (home / "auth.json").read_text() == "{{}}"
+assert "model" in (home / "config.toml").read_text()
+assert os.readlink(home / "auth.json").startswith("/proc/self/fd/")
+assert os.readlink(home / "config.toml").startswith("/proc/self/fd/")
+(home / "state_5.sqlite").write_text("temporary-state")
+for line in sys.stdin:
+    value = json.loads(line)
+    method = value.get("method")
+    if method == "initialized":
+        continue
+    response_id = value.get("id")
+    if method == "initialize":
+        result = {{}}
+    elif method == "model/list":
+        result = MODEL
+    elif method == "account/rateLimits/read":
+        result = RATE
+    else:
+        print(json.dumps({{"id": response_id, "error": {{"message": "unexpected"}}}}), flush=True)
+        continue
+    print(json.dumps({{"id": response_id, "result": result}}), flush=True)
+"""
+        fake_codex.write_text(textwrap.dedent(program), encoding="utf-8")
+        os.chmod(fake_codex, 0o700)
+
+        observations = SCHEDULER.collect_codex_app_server_observations(
+            fake_codex,
+            environment=SCHEDULER.sanitized_environment(),
+            timeout_seconds=3,
+            state_directory=self.root,
+            source_codex_home=source_codex_home,
+        )
+
+        self.assertEqual("exhausted", observations[SCHEDULER.CODEX_QUOTA_POOL]["status"])
+        self.assertEqual(
+            "available", observations[SCHEDULER.CODEX_SPARK_QUOTA_POOL]["status"]
+        )
+        self.assertEqual(
+            0, observations[SCHEDULER.CODEX_SPARK_QUOTA_POOL]["model_invocations"]
+        )
+        self.assertFalse(
+            observations[SCHEDULER.CODEX_SPARK_QUOTA_POOL]["paid_fallback_authorized"]
+        )
+        self.assertEqual(
+            [],
+            [item.name for item in self.root.iterdir() if item.name.startswith(".codex-metadata-")],
+        )
+
+    def test_codex_app_server_parser_rejects_nonbaseline_spark_evidence(self) -> None:
+        cases = []
+        model_result, rate_result = self.direct_codex_results()
+        hidden_model = json.loads(json.dumps(model_result))
+        hidden_model["data"][0]["hidden"] = True
+        cases.append((hidden_model, rate_result))
+        model_result, rate_result = self.direct_codex_results(spark_credits={})
+        cases.append((model_result, rate_result))
+        model_result, rate_result = self.direct_codex_results()
+        mismatched_plan = json.loads(json.dumps(rate_result))
+        mismatched_plan["rateLimitsByLimitId"][SCHEDULER.CODEX_SPARK_LIMIT_ID][
+            "planType"
+        ] = "enterprise"
+        cases.append((model_result, mismatched_plan))
+        model_result, rate_result = self.direct_codex_results()
+        reset_credits = json.loads(json.dumps(rate_result))
+        reset_credits["rateLimitResetCredits"]["availableCount"] = 1
+        cases.append((model_result, reset_credits))
+        for candidate_model, candidate_rate in cases:
+            with self.subTest(candidate_rate=candidate_rate):
+                with self.assertRaises(SCHEDULER.ProbeSchedulerError):
+                    SCHEDULER.parse_codex_app_server_observations(
+                        candidate_model, candidate_rate
+                    )
+
+    def test_scheduler_updates_main_and_spark_from_direct_provider_metadata(self) -> None:
+        self.write_router(spark_configured=True)
+        model_result, rate_result = self.direct_codex_results()
+        direct = SCHEDULER.parse_codex_app_server_observations(
+            model_result,
+            rate_result,
+            observed_at="2026-08-19T20:04:35Z",
+        )
+        with mock.patch.object(
+            SCHEDULER,
+            "collect_codex_app_server_observations",
+            return_value=direct,
+        ):
+            result = SCHEDULER.main(self.arguments())
+        self.assertEqual(0, result)
+        after = json.loads(self.state.read_text(encoding="utf-8"))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual("exhausted", after["pools"][SCHEDULER.CODEX_QUOTA_POOL]["status"])
+        spark = after["pools"][SCHEDULER.CODEX_SPARK_QUOTA_POOL]
+        self.assertEqual("available", spark["status"])
+        self.assertEqual(1.0, spark["remaining_ratio"])
+        self.assertEqual(
+            "fresh_provider_observation",
+            receipt["quota_updates"][SCHEDULER.CODEX_SPARK_QUOTA_POOL]["reason"],
+        )
+        self.assertTrue(receipt["spark_configured"])
+        self.assertEqual(0, receipt["model_invocations"])
+        self.assertEqual(0, receipt["paid_api_requests_authorized"])
+
+    def test_scheduler_clears_stale_spark_when_direct_metadata_is_unavailable(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.initial["pools"][SCHEDULER.CODEX_SPARK_QUOTA_POOL] = {
+            "status": "available",
+            "remaining_ratio": 0.8,
+            "reset_at": (now + timedelta(days=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "verified_at": (now - timedelta(minutes=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self.state.write_text(json.dumps(self.initial), encoding="utf-8")
+        self.write_router(spark_configured=True)
+        direct = {
+            SCHEDULER.CODEX_QUOTA_POOL: SCHEDULER._unknown_codex_direct_observation(
+                SCHEDULER.CODEX_QUOTA_POOL, "test-unavailable"
+            ),
+            SCHEDULER.CODEX_SPARK_QUOTA_POOL: SCHEDULER._unknown_codex_direct_observation(
+                SCHEDULER.CODEX_SPARK_QUOTA_POOL, "test-unavailable"
+            ),
+        }
+        with mock.patch.object(
+            SCHEDULER,
+            "collect_codex_app_server_observations",
+            return_value=direct,
+        ):
+            result = SCHEDULER.main(self.arguments())
+        self.assertEqual(0, result)
+        after = json.loads(self.state.read_text(encoding="utf-8"))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        spark = after["pools"][SCHEDULER.CODEX_SPARK_QUOTA_POOL]
+        self.assertEqual("unknown", spark["status"])
+        self.assertNotIn("remaining_ratio", spark)
+        self.assertNotIn("reset_at", spark)
+        self.assertEqual({}, receipt["quota_updates"])
+        self.assertEqual(
+            "provider_metadata_refresh_started_to_unknown",
+            receipt["spark_preclear"]["reason"],
+        )
+
+    def test_scheduler_preclears_spark_before_later_probe_failure(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.initial["pools"][SCHEDULER.CODEX_SPARK_QUOTA_POOL] = {
+            "status": "available",
+            "remaining_ratio": 0.9,
+            "reset_at": (now + timedelta(days=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "verified_at": (now - timedelta(minutes=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self.state.write_text(json.dumps(self.initial), encoding="utf-8")
+        self.write_router(spark_configured=True, fail_probe=True)
+        result = SCHEDULER.main(self.arguments())
+        self.assertEqual(1, result)
+        after = json.loads(self.state.read_text(encoding="utf-8"))
+        spark = after["pools"][SCHEDULER.CODEX_SPARK_QUOTA_POOL]
+        self.assertEqual("unknown", spark["status"])
+        self.assertNotIn("remaining_ratio", spark)
+        self.assertNotIn("reset_at", spark)
+        failure = json.loads(self.failure.read_text(encoding="utf-8"))
+        self.assertEqual("failed", failure["status"])
+        self.assertEqual(0, failure["model_invocations"])
+        self.assertEqual(0, failure["paid_api_requests_authorized"])
 
     def test_scheduler_applies_exact_codex_quota_without_paid_fallback(self) -> None:
         now = datetime.now(timezone.utc)
