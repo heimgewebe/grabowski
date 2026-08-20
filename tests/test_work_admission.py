@@ -1546,6 +1546,130 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertEqual(result["decision"], "blocked")
         self.assertIn("reconciliation-unobservable", result["blocker_codes"])
 
+    def test_snapshot_bound_reconciliation_pagination_is_consumed_completely(
+        self,
+    ) -> None:
+        snapshot_sha256 = "b" * 64
+        first_rows = [
+            {"checkout_key": f"{index:064x}", "blocking": False}
+            for index in range(admission.MAX_RECONCILIATIONS)
+        ]
+        final_row = {
+            "checkout_key": f"{admission.MAX_RECONCILIATIONS:064x}",
+            "blocking": False,
+        }
+        pages = {
+            None: {
+                "count": len(first_rows),
+                "total_count": len(first_rows) + 1,
+                "bindings": first_rows,
+                "attention": [],
+                "pagination": {
+                    "limit": admission.MAX_RECONCILIATIONS,
+                    "offset": 0,
+                    "next_cursor": "cursor-100",
+                    "has_more": True,
+                    "snapshot_bound": True,
+                },
+                "snapshot_sha256": snapshot_sha256,
+                "source_snapshot": {"repository_errors": []},
+            },
+            "cursor-100": {
+                "count": 1,
+                "total_count": len(first_rows) + 1,
+                "bindings": [final_row],
+                "attention": [],
+                "pagination": {
+                    "limit": admission.MAX_RECONCILIATIONS,
+                    "offset": len(first_rows),
+                    "next_cursor": None,
+                    "has_more": False,
+                    "snapshot_bound": True,
+                },
+                "snapshot_sha256": snapshot_sha256,
+                "source_snapshot": {"repository_errors": []},
+            },
+        }
+        requested: list[str | None] = []
+
+        def load_page(cursor: str | None) -> dict[str, object]:
+            requested.append(cursor)
+            return pages[cursor]
+
+        result = admission._consume_reconciliation_pages(load_page)
+
+        self.assertEqual(requested, [None, "cursor-100"])
+        self.assertEqual(result["count"], admission.MAX_RECONCILIATIONS + 1)
+        self.assertEqual(
+            len(result["bindings"]),
+            admission.MAX_RECONCILIATIONS + 1,
+        )
+        self.assertFalse(result["pagination"]["has_more"])
+        self.assertTrue(result["pagination"]["complete"])
+        self.assertEqual(result["pagination"]["pages_consumed"], 2)
+        self.assertEqual(result["snapshot_sha256"], snapshot_sha256)
+
+    def test_paginated_reconciliation_snapshot_drift_fails_closed(self) -> None:
+        pages = {
+            None: {
+                "count": 1,
+                "total_count": 2,
+                "bindings": [{"checkout_key": "a", "blocking": False}],
+                "attention": [],
+                "pagination": {
+                    "limit": admission.MAX_RECONCILIATIONS,
+                    "offset": 0,
+                    "next_cursor": "next",
+                    "has_more": True,
+                    "snapshot_bound": True,
+                },
+                "snapshot_sha256": "a" * 64,
+                "source_snapshot": {"repository_errors": []},
+            },
+            "next": {
+                "count": 1,
+                "total_count": 2,
+                "bindings": [{"checkout_key": "b", "blocking": False}],
+                "attention": [],
+                "pagination": {
+                    "limit": admission.MAX_RECONCILIATIONS,
+                    "offset": 1,
+                    "next_cursor": None,
+                    "has_more": False,
+                    "snapshot_bound": True,
+                },
+                "snapshot_sha256": "b" * 64,
+                "source_snapshot": {"repository_errors": []},
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+            admission._consume_reconciliation_pages(lambda cursor: pages[cursor])
+
+    def test_complete_reconciliation_above_page_size_remains_assessable(
+        self,
+    ) -> None:
+        bindings = [
+            {"checkout_key": f"{index:064x}", "blocking": False}
+            for index in range(admission.MAX_RECONCILIATIONS + 1)
+        ]
+        result = self._assess(
+            [self._main()],
+            reconciliation={
+                "count": len(bindings),
+                "total_count": len(bindings),
+                "bindings": bindings,
+                "pagination": {"has_more": False},
+                "source_snapshot": {"repository_errors": []},
+                "snapshot_sha256": "b" * 64,
+            },
+        )
+
+        self.assertNotIn(
+            "bounded-reconciliation-exceeded",
+            result["blocker_codes"],
+        )
+
 
     def _reposkop_result(self, repository: str, purpose: str) -> dict[str, object]:
         return {
