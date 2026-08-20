@@ -15,6 +15,8 @@ import grabowski_nonconflict as nonconflict
 SCHEMA_VERSION = 1
 MAX_WORKTREES = 256
 MAX_RECONCILIATIONS = 100
+MAX_RECONCILIATION_PAGES = 32
+MAX_COMPLETE_RECONCILIATIONS = MAX_RECONCILIATIONS * MAX_RECONCILIATION_PAGES
 GIT_IDENTITY_TIMEOUT_SECONDS = 5
 INVENTORY_COMPLETENESS_KEYS = frozenset(
     {
@@ -238,6 +240,138 @@ def _default_inventory(repo: str) -> dict[str, Any]:
     )
 
 
+def _consume_reconciliation_pages(
+    load_page: Callable[[str | None], dict[str, Any]],
+) -> dict[str, Any]:
+    bindings: list[Any] = []
+    attention: list[Any] = []
+    expected_snapshot_sha256: str | None = None
+    expected_total_count: int | None = None
+    first_page: dict[str, Any] | None = None
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+
+    for page_index in range(MAX_RECONCILIATION_PAGES):
+        page = load_page(cursor)
+        if not isinstance(page, dict):
+            raise RuntimeError("binding reconciliation page is unavailable")
+        if first_page is None:
+            first_page = page
+
+        snapshot_sha256 = page.get("snapshot_sha256")
+        if not _is_sha256(snapshot_sha256):
+            raise RuntimeError("binding reconciliation snapshot identity is invalid")
+        if expected_snapshot_sha256 is None:
+            expected_snapshot_sha256 = snapshot_sha256
+        elif snapshot_sha256 != expected_snapshot_sha256:
+            raise RuntimeError("binding reconciliation snapshot changed during pagination")
+
+        pagination = page.get("pagination")
+        page_bindings = page.get("bindings")
+        if (
+            not isinstance(pagination, dict)
+            or pagination.get("snapshot_bound") is not True
+        ):
+            raise RuntimeError(
+                "binding reconciliation pagination is not snapshot-bound"
+            )
+        if not isinstance(page_bindings, list):
+            raise RuntimeError("binding reconciliation page rows are unavailable")
+
+        count = page.get("count")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count != len(page_bindings)
+        ):
+            raise RuntimeError("binding reconciliation page count is inconsistent")
+        total_count = page.get("total_count")
+        if (
+            isinstance(total_count, bool)
+            or not isinstance(total_count, int)
+            or total_count < 0
+            or total_count > MAX_COMPLETE_RECONCILIATIONS
+        ):
+            raise RuntimeError(
+                "binding reconciliation exceeds bounded total capacity"
+            )
+        if expected_total_count is None:
+            expected_total_count = total_count
+        elif total_count != expected_total_count:
+            raise RuntimeError(
+                "binding reconciliation total changed during pagination"
+            )
+
+        offset = pagination.get("offset")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset != len(bindings)
+        ):
+            raise RuntimeError(
+                "binding reconciliation pagination is non-contiguous"
+            )
+        if len(bindings) + len(page_bindings) > MAX_COMPLETE_RECONCILIATIONS:
+            raise RuntimeError(
+                "binding reconciliation exceeds bounded total capacity"
+            )
+        bindings.extend(page_bindings)
+
+        page_attention = page.get("attention")
+        if isinstance(page_attention, list):
+            attention.extend(page_attention)
+
+        has_more = pagination.get("has_more")
+        next_cursor = pagination.get("next_cursor")
+        if not isinstance(has_more, bool):
+            raise RuntimeError(
+                "binding reconciliation pagination state is invalid"
+            )
+        if has_more:
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in seen_cursors
+            ):
+                raise RuntimeError(
+                    "binding reconciliation continuation cursor is invalid"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+            continue
+
+        if next_cursor is not None:
+            raise RuntimeError(
+                "completed binding reconciliation exposes a continuation cursor"
+            )
+        if len(bindings) != expected_total_count:
+            raise RuntimeError(
+                "binding reconciliation completed with missing rows"
+            )
+
+        assert first_page is not None
+        return {
+            **first_page,
+            "count": len(bindings),
+            "bindings": bindings,
+            "attention": attention,
+            "pagination": {
+                "limit": MAX_RECONCILIATIONS,
+                "offset": 0,
+                "next_cursor": None,
+                "has_more": False,
+                "snapshot_bound": True,
+                "pages_consumed": page_index + 1,
+                "complete": True,
+            },
+            "snapshot_sha256": expected_snapshot_sha256,
+        }
+
+    raise RuntimeError(
+        "binding reconciliation exceeded bounded page capacity"
+    )
+
+
 def _default_reconciliation(repo: str) -> dict[str, Any]:
     import grabowski_checkout_binding_reconciler
     import grabowski_checkouts
@@ -250,15 +384,30 @@ def _default_reconciliation(repo: str) -> dict[str, Any]:
         }
         return {
             **material,
+            "count": 0,
+            "total_count": 0,
             "snapshot_sha256": _digest(material),
-            "pagination": {"has_more": False},
+            "pagination": {
+                "limit": MAX_RECONCILIATIONS,
+                "offset": 0,
+                "next_cursor": None,
+                "has_more": False,
+                "snapshot_bound": True,
+                "pages_consumed": 0,
+                "complete": True,
+            },
             "source_snapshot": {"repository_errors": []},
         }
-    return grabowski_checkout_binding_reconciler.reconcile_checkout_bindings(
-        db_path=grabowski_checkouts.CHECKOUT_DB,
-        repository_filters=[repo],
-        limit=MAX_RECONCILIATIONS,
-    )
+
+    def load_page(cursor: str | None) -> dict[str, Any]:
+        return grabowski_checkout_binding_reconciler.reconcile_checkout_bindings(
+            db_path=grabowski_checkouts.CHECKOUT_DB,
+            repository_filters=[repo],
+            limit=MAX_RECONCILIATIONS,
+            cursor=cursor,
+        )
+
+    return _consume_reconciliation_pages(load_page)
 
 
 
@@ -1122,14 +1271,17 @@ def assess_repository_admission(
             {"code": "reconciliation-unobservable", "detail": "binding reconciliation is unavailable"}
         )
         bindings = []
-    elif len(bindings) > MAX_RECONCILIATIONS:
+    elif len(bindings) > MAX_COMPLETE_RECONCILIATIONS:
         blockers.append(
             {
                 "code": "bounded-reconciliation-exceeded",
-                "detail": f"binding reconciliation exceeds {MAX_RECONCILIATIONS}",
+                "detail": (
+                    "binding reconciliation exceeds bounded complete capacity "
+                    f"{MAX_COMPLETE_RECONCILIATIONS}"
+                ),
             }
         )
-        bindings = bindings[:MAX_RECONCILIATIONS]
+        bindings = bindings[:MAX_COMPLETE_RECONCILIATIONS]
 
     pagination = reconciliation.get("pagination") if isinstance(reconciliation, dict) else None
     source_snapshot = reconciliation.get("source_snapshot") if isinstance(reconciliation, dict) else None
