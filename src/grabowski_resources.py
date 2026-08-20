@@ -1231,6 +1231,119 @@ def _blocking_repository_rows(
     return matches
 
 
+def _work_lane_path_scope(
+    keys: list[str], metadata: dict[str, Any], *, owner_id: str
+) -> dict[str, Any] | None:
+    """Return the bounded subtree write scope of one Work Lane lease group."""
+    lane_id = metadata.get("lane_id")
+    if (
+        metadata.get("schema_version") != 1
+        or metadata.get("kind") != "grabowski.work_lane"
+        or not isinstance(lane_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None
+        or owner_id != f"lane:{lane_id}"
+    ):
+        return None
+    repository_value = metadata.get("repo")
+    target_value = metadata.get("target_path")
+    if not isinstance(repository_value, str) or not isinstance(target_value, str):
+        return None
+    repository_path = Path(repository_value).expanduser()
+    target_path = Path(target_value).expanduser()
+    if not repository_path.is_absolute() or not target_path.is_absolute():
+        return None
+    repository = os.path.normpath(str(repository_path))
+    paths: list[str] = []
+    for key in keys:
+        if not key.startswith("path:"):
+            continue
+        path = key.removeprefix("path:")
+        try:
+            if os.path.commonpath([path, repository]) != repository:
+                continue
+        except ValueError:
+            continue
+        paths.append(path)
+    return {"repository": repository, "paths": sorted(set(paths))}
+
+
+def _path_scope_contains(scope_path: str, path: str) -> bool:
+    try:
+        return os.path.commonpath([scope_path, path]) == scope_path
+    except ValueError:
+        return False
+
+
+def _check_work_lane_path_scope_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    keys: list[str],
+    owner: str,
+    metadata: dict[str, Any],
+    now: int,
+) -> None:
+    """Protect Work Lane directory scopes without redefining exact path leases.
+
+    ``path:`` remains an exact resource identity for legacy and lifecycle users.
+    Work Lane write paths are different: the sandbox permits a declared directory
+    and therefore everything below it to be written.  The server-generated lane
+    metadata lets us apply subtree overlap only to lane paths inside the canonical
+    repository; the usual sibling target-worktree path therefore stays exact.
+    """
+    requested_exact_paths = [
+        key.removeprefix("path:") for key in keys if key.startswith("path:")
+    ]
+    if not requested_exact_paths:
+        return
+    requested_scope = _work_lane_path_scope(keys, metadata, owner_id=owner)
+    rows = connection.execute(
+        "SELECT * FROM leases WHERE resource_key>=? AND resource_key<? "
+        "AND owner_id<>? AND expires_at_unix>? ORDER BY resource_key",
+        ("path:", "path;", owner, now),
+    ).fetchall()
+    for row in rows:
+        existing_path = str(row["resource_key"]).removeprefix("path:")
+        try:
+            existing_metadata = _row_metadata(row)
+        except Exception:
+            existing_metadata = {}
+        existing_scope = _work_lane_path_scope(
+            [str(row["resource_key"])],
+            existing_metadata,
+            owner_id=str(row["owner_id"]),
+        )
+        if requested_scope is not None and requested_scope["paths"]:
+            if any(
+                _path_scope_contains(scope_path, existing_path)
+                for scope_path in requested_scope["paths"]
+            ):
+                raise ResourceConflict(
+                    row["resource_key"], row["owner_id"], row["expires_at_unix"]
+                )
+            if (
+                existing_scope is not None
+                and existing_scope["repository"] == requested_scope["repository"]
+                and any(
+                    _absolute_paths_overlap(requested_path, existing_path_scope)
+                    for requested_path in requested_scope["paths"]
+                    for existing_path_scope in existing_scope["paths"]
+                )
+            ):
+                raise ResourceConflict(
+                    row["resource_key"], row["owner_id"], row["expires_at_unix"]
+                )
+            continue
+
+        if existing_scope is not None and existing_scope["paths"] and any(
+            _path_scope_contains(existing_path_scope, requested_path)
+            for existing_path_scope in existing_scope["paths"]
+            for requested_path in requested_exact_paths
+        ):
+            raise ResourceConflict(
+                row["resource_key"], row["owner_id"], row["expires_at_unix"]
+            )
+
+
 def _check_repository_semantic_conflicts(
     connection: sqlite3.Connection,
     *,
@@ -4825,6 +4938,13 @@ def acquire_resources(
                 owner=owner,
                 now=now,
                 bureau_contract=bureau_contract,
+            )
+            _check_work_lane_path_scope_conflicts(
+                connection,
+                keys=keys,
+                owner=owner,
+                metadata=sanitized_metadata,
+                now=now,
             )
             existing: dict[str, sqlite3.Row] = {}
             for key in keys:
