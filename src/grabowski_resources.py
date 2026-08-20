@@ -5731,8 +5731,16 @@ def grabowski_resource_acquire(
     Emergency-recovery mode is derived only from a validated Bureau recovery
     contract; caller-supplied lease-mode metadata is not an authority surface.
     Self-scoped branch and operation keys are authoritative and reject scope
-    manifests.
+    manifests. Work Lane identity metadata is server-owned and can only be
+    created through the Work Lane acquisition path.
     """
+    if (
+        isinstance(metadata, dict)
+        and metadata.get("kind") == "grabowski.work_lane"
+    ):
+        raise ValueError(
+            "metadata.kind grabowski.work_lane is a server-owned authority surface"
+        )
     normalized_resource_keys = _public_repository_scope_keys(resource_keys, metadata)
     operator._require_operator_mutation("resource_lease")
     result = acquire_resources(

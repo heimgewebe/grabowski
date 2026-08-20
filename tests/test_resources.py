@@ -552,6 +552,23 @@ class ResourceTests(unittest.TestCase):
 
         self.assertEqual(child, result["leases"][0]["resource_key"])
 
+    def test_public_resource_acquire_rejects_spoofed_work_lane_metadata(self) -> None:
+        repository = self.root / "repo"
+        lane_id = "f" * 32
+        metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-spoof", lane_id=lane_id
+        )
+
+        with self.assertRaisesRegex(ValueError, "server-owned authority surface"):
+            resources.grabowski_resource_acquire(
+                f"lane:{lane_id}",
+                [f"path:{repository / 'src'}"],
+                "spoofed lane scope",
+                60,
+                metadata,
+            )
+        self.assertEqual(0, resources.count_resources())
+
     def test_work_lane_write_scopes_conflict_on_parent_child_overlap(self) -> None:
         repository = self.root / "repo"
         parent = f"path:{repository / 'src'}"
