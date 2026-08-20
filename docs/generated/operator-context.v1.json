@@ -3171,6 +3171,10 @@
         "source": "src/grabowski_merge_guard.py"
       },
       {
+        "module": "grabowski_pr_diff",
+        "source": "src/grabowski_pr_diff.py"
+      },
+      {
         "module": "grabowski_decision_reviews",
         "source": "src/grabowski_decision_reviews.py"
       },
@@ -3520,7 +3524,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "417d8989983fcf2ef95ddaa2f39ee655049dbfb746e9d456f712afbe0efab494"
+      "sha256": "44c126891b6814c80019b27c120a8fc60b83a3b76fc98a91bcc2879ecdd14eb1"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3604,6 +3608,7 @@
       "src/grabowski_operator_optimization.py": "6e21534f87f9646f957c40c7607554b7f54b165b47516170f09fdc9314cd1dbf",
       "src/grabowski_operator_relay.py": "24a9187ef0f7f858a21eb9a7a0bb808b01b8b66b2943be8f9ce2845940916ca5",
       "src/grabowski_operator_routing_shadow_capture.py": "127306dc8dce2a9abf62b128a03a5e7936d1ad7e0838793549e3142d4d9b4f43",
+      "src/grabowski_pr_diff.py": "cf6194a892b34f8f20ddafd3b293a76db57d73dbe6ec6e5324d2fdd39ce7f242",
       "src/grabowski_private_io.py": "6250c583bdc1614a6265123604161d3668587191b94932faf2912b03140e3d6f",
       "src/grabowski_privileged.py": "70b7c434b60f3dc7a5f08f650f21db9f598a0b2fa9747d7679f396b00a47a7eb",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
