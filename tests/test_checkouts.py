@@ -2143,7 +2143,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
     def test_binding_identity_rebind_preview_and_apply_converges_branch_rename(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()
         preview = checkouts.grabowski_checkout_binding_terminal_preview(
-            binding["checkout_key"], operation="identity_rebind"
+            binding["checkout_key"]
         )
         self.assertEqual(
             [
@@ -2170,7 +2170,6 @@ class CheckoutLifecycleTests(unittest.TestCase):
             preview["snapshot_sha256"],
             preview["observed_at_unix"],
             preview["confirmation"],
-            operation="identity_rebind",
         )
         self.assertEqual("applied", applied["status"])
         for row in (applied["after"]["lifecycle"], applied["after"]["retention"]):
@@ -2212,7 +2211,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         (self.checkout / "dirty.txt").write_text("dirty\n", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "must be clean"):
             checkouts.grabowski_checkout_binding_terminal_preview(
-                binding["checkout_key"], operation="identity_rebind"
+                binding["checkout_key"]
             )
 
     def test_binding_identity_rebind_rejects_foreign_owner_or_other_drift(self) -> None:
@@ -2225,7 +2224,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             connection.commit()
         with self.assertRaisesRegex(PermissionError, "one unchanged owner"):
             checkouts.grabowski_checkout_binding_terminal_preview(
-                binding["checkout_key"], operation="identity_rebind"
+                binding["checkout_key"]
             )
 
     def test_binding_identity_rebind_rejects_unrelated_remote_secured_head(self) -> None:
@@ -2249,7 +2248,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "descend from recorded head"):
             checkouts.grabowski_checkout_binding_terminal_preview(
-                binding["checkout_key"], operation="identity_rebind"
+                binding["checkout_key"]
             )
 
     def test_binding_identity_rebind_requires_remote_secured_head(self) -> None:
@@ -2258,13 +2257,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self._git("branch", "-m", new_branch, cwd=self.checkout)
         with self.assertRaisesRegex(RuntimeError, "remote-secured"):
             checkouts.grabowski_checkout_binding_terminal_preview(
-                binding["checkout_key"], operation="identity_rebind"
+                binding["checkout_key"]
             )
 
     def test_binding_identity_rebind_rejects_snapshot_toctou(self) -> None:
         binding, _, _ = self._renamed_managed_checkout()
         preview = checkouts.grabowski_checkout_binding_terminal_preview(
-            binding["checkout_key"], operation="identity_rebind"
+            binding["checkout_key"]
         )
         with checkouts._database() as connection:
             connection.execute(
@@ -2279,13 +2278,12 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 preview["snapshot_sha256"],
                 preview["observed_at_unix"],
                 preview["confirmation"],
-                operation="identity_rebind",
-            )
+                )
 
     def test_binding_identity_rebind_audit_failure_requires_readback(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()
         preview = checkouts.grabowski_checkout_binding_terminal_preview(
-            binding["checkout_key"], operation="identity_rebind"
+            binding["checkout_key"]
         )
         with patch.object(checkouts.base, "_append_audit", side_effect=OSError("audit down")):
             with self.assertRaisesRegex(RuntimeError, "readback required"):
@@ -2295,8 +2293,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
                     preview["snapshot_sha256"],
                     preview["observed_at_unix"],
                     preview["confirmation"],
-                    operation="identity_rebind",
-                )
+                        )
         checkout_key = preview["checkout"]["checkout_key"]
         lifecycle = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
         retention = checkouts._retention_records([checkout_key])[checkout_key]

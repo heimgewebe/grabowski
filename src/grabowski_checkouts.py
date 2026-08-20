@@ -2689,22 +2689,19 @@ def _verify_recovery_refs(repo: Path, recovery_refs: list[dict[str, str]]) -> li
 
 
 @mcp.tool(name="grabowski_checkout_binding_terminal_preview", annotations=READ_ONLY)
-def grabowski_checkout_binding_terminal_preview(
-    checkout_key: str,
-    operation: str = "terminal_missing",
-) -> dict[str, Any]:
-    """Preview one source-bound checkout-binding reconciliation."""
+def grabowski_checkout_binding_terminal_preview(checkout_key: str) -> dict[str, Any]:
+    """Preview an evidence-only terminal transition for one missing managed checkout."""
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
-    if operation == "identity_rebind":
+    key = _validate_sha256(checkout_key, "checkout_key")
+    lifecycle = _lifecycle_bindings([key]).get(key)
+    if lifecycle is not None and Path(lifecycle["checkout_path"]).exists():
         return _binding_identity_rebind_state_for_key(
-            checkout_key, observed_at_unix=_now()
+            key, observed_at_unix=_now()
         )
-    if operation != "terminal_missing":
-        raise ValueError("operation must be terminal_missing or identity_rebind")
     from grabowski_checkout_terminal_reconciliation import preview
 
-    return preview(checkout_key)
+    return preview(key)
 
 
 @mcp.tool(name="grabowski_checkout_binding_terminal_apply", annotations=MUTATING)
@@ -2714,26 +2711,25 @@ def grabowski_checkout_binding_terminal_apply(
     expected_preview_sha256: str,
     preview_created_at_unix: int,
     confirmation: str,
-    operation: str = "terminal_missing",
 ) -> dict[str, Any]:
-    """CAS-apply one source-bound checkout-binding reconciliation."""
+    """CAS-apply one source-bound terminal state without archive or cleanup effects."""
     operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
-    if operation == "identity_rebind":
+    key = _validate_sha256(checkout_key, "checkout_key")
+    rebind_prefix = f"{BINDING_IDENTITY_REBIND_CONFIRMATION}:{key}:"
+    if isinstance(confirmation, str) and confirmation.startswith(rebind_prefix):
         return _binding_identity_rebind_apply(
-            checkout_key=checkout_key,
+            checkout_key=key,
             owner_id=owner_id,
             expected_snapshot_sha256=expected_preview_sha256,
             preview_created_at_unix=preview_created_at_unix,
             confirmation=confirmation,
         )
-    if operation != "terminal_missing":
-        raise ValueError("operation must be terminal_missing or identity_rebind")
     from grabowski_checkout_terminal_reconciliation import apply
 
     return apply(
-        checkout_key,
+        key,
         owner_id,
         expected_preview_sha256,
         preview_created_at_unix,
