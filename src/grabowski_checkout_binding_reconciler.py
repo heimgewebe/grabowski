@@ -42,6 +42,7 @@ MAX_PAGE_LIMIT = 100
 MAX_BINDINGS = 10_000
 MAX_REPOSITORY_ERRORS = 100
 LIFECYCLE_PHASES = checkouts.LIFECYCLE_PHASES
+AUTHORITY_BLOCKER_SOURCE_KINDS = frozenset({"automation", "work_lane"})
 REQUIRED_BINDING_FIELDS = (
     "checkout_key",
     "repo_common_dir",
@@ -179,6 +180,76 @@ def _evidence(binding: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _authority_blocker(
+    binding: Mapping[str, Any],
+    *,
+    state: str,
+    blocking: bool,
+) -> dict[str, Any] | None:
+    """Describe the authority required before one blocked source may converge."""
+    if not blocking:
+        return None
+    source = binding.get("source")
+    if not isinstance(source, Mapping):
+        return None
+    source_kind = _text(source.get("kind"))
+    source_id = _text(source.get("id"))
+    if source_kind not in AUTHORITY_BLOCKER_SOURCE_KINDS or source_id is None:
+        return None
+
+    if source_kind == "automation":
+        blocker_code = "automation-terminal-evidence-contract-required"
+        authority = "immutable_automation_terminal_evidence"
+        permitted_repair_paths = ["source_terminal_evidence"]
+        safe_repair_condition = (
+            "Bind immutable terminal evidence to this exact automation source_id and "
+            "rerun reconciliation; resolve any remaining identity drift through a "
+            "separately authorized operation. Checkout absence, retention expiry and "
+            "lease absence are insufficient."
+        )
+    elif state == "binding_identity_drift":
+        blocker_code = "work-lane-terminal-or-identity-rebind-evidence-required"
+        authority = "work_lane_lifecycle"
+        permitted_repair_paths = [
+            "source_terminal_closeout",
+            "authorized_identity_rebind",
+        ]
+        safe_repair_condition = (
+            "Provide explicit terminal closeout evidence for this exact work_lane "
+            "source_id or complete a separately authorized identity rebind with its "
+            "own current preconditions, then rerun reconciliation. Checkout absence, "
+            "retention expiry and lease absence are insufficient."
+        )
+    else:
+        blocker_code = "work-lane-terminal-evidence-required"
+        authority = "work_lane_lifecycle"
+        permitted_repair_paths = ["source_terminal_closeout"]
+        safe_repair_condition = (
+            "Provide explicit terminal closeout evidence for this exact work_lane "
+            "source_id, then rerun reconciliation. Checkout absence, retention expiry "
+            "and lease absence are insufficient."
+        )
+
+    return {
+        "schema_version": RECONCILER_SCHEMA_VERSION,
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "state": state,
+        "blocker_code": blocker_code,
+        "authority": authority,
+        "permitted_repair_paths": permitted_repair_paths,
+        "safe_repair_condition": safe_repair_condition,
+        "does_not_establish": [
+            "source_terminality",
+            "permission_to_repair",
+            "permission_to_terminalize",
+            "checkout_absence_as_terminal_proof",
+            "retention_expiry_as_terminal_proof",
+            "lease_absence_as_terminal_proof",
+        ],
+    }
+
+
 def _durable_evidence_drift_reasons(
     binding: Mapping[str, Any],
     phase: str | None,
@@ -306,7 +377,8 @@ def reconcile_binding(
         state = "binding_identity_drift" if reasons else "bound_present"
 
     blocking = state not in {"bound_present", "archived_cleaned", "externally_terminal_missing"}
-    return {
+    authority_blocker = _authority_blocker(binding, state=state, blocking=blocking)
+    result = {
         "schema_version": RECONCILER_SCHEMA_VERSION,
         "checkout_key": binding_identity["checkout_key"],
         "state": state,
@@ -332,6 +404,9 @@ def reconcile_binding(
             "checkout_absence_as_cleanup_proof",
         ],
     }
+    if authority_blocker is not None:
+        result["authority_blocker"] = authority_blocker
+    return result
 
 
 def reconcile_bindings(
@@ -755,6 +830,7 @@ def reconcile_checkout_bindings(
             "state": row["state"],
             "classification": "actionable",
             "reasons": row["reasons"],
+            **({"authority_blocker": row["authority_blocker"]} if "authority_blocker" in row else {}),
             "recommended_next_step": row["recommended_next_step"],
             "authority": "read_only_projection",
         }
