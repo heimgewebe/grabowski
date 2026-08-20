@@ -81,6 +81,17 @@ class ResourceTests(unittest.TestCase):
             "shared_gates": [],
         }
 
+    def work_lane_metadata(
+        self, repository: Path, *, target: Path, lane_id: str
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane",
+            "lane_id": lane_id,
+            "repo": str(repository),
+            "target_path": str(target),
+        }
+
     def operation_scope(
         self,
         repository: Path,
@@ -527,6 +538,231 @@ class ResourceTests(unittest.TestCase):
             resources.acquire_resources(
                 "owner-b", [key], purpose="conflicting host work", ttl_seconds=60
             )
+
+    def test_exact_path_resource_leases_remain_exact_identities(self) -> None:
+        parent = f"path:{self.root / 'repo' / 'src'}"
+        child = f"path:{self.root / 'repo' / 'src' / 'module.py'}"
+
+        resources.acquire_resources(
+            "owner-parent", [parent], purpose="exact parent", ttl_seconds=60
+        )
+        result = resources.acquire_resources(
+            "owner-child", [child], purpose="exact child", ttl_seconds=60
+        )
+
+        self.assertEqual(child, result["leases"][0]["resource_key"])
+
+    def test_public_resource_acquire_rejects_spoofed_work_lane_metadata(self) -> None:
+        repository = self.root / "repo"
+        lane_id = "f" * 32
+        metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-spoof", lane_id=lane_id
+        )
+
+        with self.assertRaisesRegex(ValueError, "server-owned authority surface"):
+            resources.grabowski_resource_acquire(
+                f"lane:{lane_id}",
+                [f"path:{repository / 'src'}"],
+                "spoofed lane scope",
+                60,
+                metadata,
+            )
+        self.assertEqual(0, resources.count_resources())
+
+    def test_work_lane_write_scopes_conflict_on_parent_child_overlap(self) -> None:
+        repository = self.root / "repo"
+        parent = f"path:{repository / 'src'}"
+        child = f"path:{repository / 'src' / 'module.py'}"
+        sibling = f"path:{repository / 'tests' / 'test_module.py'}"
+        parent_metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-parent", lane_id="a" * 32
+        )
+        child_metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-child", lane_id="b" * 32
+        )
+        sibling_metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-sibling", lane_id="c" * 32
+        )
+
+        resources.acquire_resources(
+            f"lane:{'a' * 32}",
+            [parent],
+            purpose="lane parent scope",
+            ttl_seconds=60,
+            metadata=parent_metadata,
+        )
+        resources.acquire_resources(
+            f"lane:{'c' * 32}",
+            [sibling],
+            purpose="disjoint lane scope",
+            ttl_seconds=60,
+            metadata=sibling_metadata,
+        )
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{'b' * 32}",
+                [child],
+                purpose="nested lane scope",
+                ttl_seconds=60,
+                metadata=child_metadata,
+            )
+        self.assertEqual(parent, raised.exception.resource_key)
+
+        resources.release_resources(f"lane:{'a' * 32}", [parent])
+        resources.acquire_resources(
+            f"lane:{'b' * 32}",
+            [child],
+            purpose="lane child scope",
+            ttl_seconds=60,
+            metadata=child_metadata,
+        )
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{'a' * 32}",
+                [parent],
+                purpose="lane parent scope",
+                ttl_seconds=60,
+                metadata=parent_metadata,
+            )
+        self.assertEqual(child, raised.exception.resource_key)
+
+    def test_work_lane_scopes_conflict_across_nested_repository_boundaries(self) -> None:
+        outer = self.root / "outer"
+        nested = outer / "nested"
+        parent = f"path:{nested}"
+        child = f"path:{nested / 'module.py'}"
+        outer_metadata = self.work_lane_metadata(
+            outer, target=self.root / "lane-outer", lane_id="1" * 32
+        )
+        nested_metadata = self.work_lane_metadata(
+            nested, target=self.root / "lane-nested", lane_id="2" * 32
+        )
+
+        resources.acquire_resources(
+            f"lane:{'1' * 32}",
+            [parent],
+            purpose="outer repository subtree",
+            ttl_seconds=60,
+            metadata=outer_metadata,
+        )
+
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{'2' * 32}",
+                [child],
+                purpose="nested repository child",
+                ttl_seconds=60,
+                metadata=nested_metadata,
+            )
+        self.assertEqual(parent, raised.exception.resource_key)
+
+    def test_work_lane_conflict_check_rejects_metadata_digest_drift(self) -> None:
+        repository = self.root / "repo"
+        parent = f"path:{repository / 'src'}"
+        child = f"path:{repository / 'src' / 'module.py'}"
+        lane_id = "3" * 32
+        metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-drift", lane_id=lane_id
+        )
+        resources.acquire_resources(
+            f"lane:{lane_id}",
+            [parent],
+            purpose="lane metadata drift fixture",
+            ttl_seconds=60,
+            metadata=metadata,
+        )
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET metadata_sha256=? WHERE resource_key=?",
+                ("0" * 64, parent),
+            )
+            connection.commit()
+
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                "owner-exact", [child], purpose="descendant", ttl_seconds=60
+            )
+        self.assertEqual(parent, raised.exception.resource_key)
+
+    def test_work_lane_conflict_check_rejects_malformed_metadata(self) -> None:
+        repository = self.root / "repo"
+        parent = f"path:{repository / 'src'}"
+        child = f"path:{repository / 'src' / 'module.py'}"
+        lane_id = "4" * 32
+        metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-invalid", lane_id=lane_id
+        )
+        resources.acquire_resources(
+            f"lane:{lane_id}",
+            [parent],
+            purpose="lane malformed metadata fixture",
+            ttl_seconds=60,
+            metadata=metadata,
+        )
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET metadata_json=? WHERE resource_key=?",
+                ("{", parent),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "resource lease metadata is invalid"):
+            resources.acquire_resources(
+                "owner-exact", [child], purpose="descendant", ttl_seconds=60
+            )
+
+    def test_work_lane_scope_conflicts_with_exact_descendant_path(self) -> None:
+        repository = self.root / "repo"
+        parent = f"path:{repository / 'src'}"
+        child = f"path:{repository / 'src' / 'module.py'}"
+        lane_metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane", lane_id="d" * 32
+        )
+
+        resources.acquire_resources(
+            f"lane:{'d' * 32}",
+            [parent],
+            purpose="lane subtree",
+            ttl_seconds=60,
+            metadata=lane_metadata,
+        )
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "owner-exact", [child], purpose="exact child", ttl_seconds=60
+            )
+
+        resources.release_resources(f"lane:{'d' * 32}", [parent])
+        resources.acquire_resources(
+            "owner-exact", [child], purpose="exact child", ttl_seconds=60
+        )
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                f"lane:{'d' * 32}",
+                [parent],
+                purpose="lane subtree",
+                ttl_seconds=60,
+                metadata=lane_metadata,
+            )
+
+    def test_same_owner_may_hold_nested_work_lane_paths(self) -> None:
+        repository = self.root / "repo"
+        parent = f"path:{repository / 'src'}"
+        child = f"path:{repository / 'src' / 'module.py'}"
+        lane_metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane", lane_id="e" * 32
+        )
+
+        result = resources.acquire_resources(
+            f"lane:{'e' * 32}",
+            [parent, child],
+            purpose="one lane owner",
+            ttl_seconds=60,
+            metadata=lane_metadata,
+        )
+
+        self.assertEqual(
+            [parent, child], [item["resource_key"] for item in result["leases"]]
+        )
 
     def test_normalizes_top_level_operation_resource_keys(self) -> None:
         key = (
