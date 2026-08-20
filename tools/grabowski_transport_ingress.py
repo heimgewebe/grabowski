@@ -267,9 +267,49 @@ def read_routing_selector(path: Path = DEFAULT_SELECTOR_FILE) -> dict[str, Any]:
     return _validate_routing_selector(value)
 
 
+def _routing_selector_fingerprint(path: Path) -> tuple[int, int, int, int, int]:
+    try:
+        linked = path.lstat()
+    except OSError as exc:
+        raise IngressConfigurationError("routing selector is unavailable") from exc
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.getuid()
+        or stat.S_IMODE(linked.st_mode) != 0o600
+        or linked.st_nlink != 1
+        or linked.st_size > MAX_SELECTOR_BYTES
+    ):
+        raise IngressConfigurationError(
+            "routing selector must be one private owner-controlled regular file"
+        )
+    return (
+        linked.st_dev,
+        linked.st_ino,
+        linked.st_size,
+        linked.st_mtime_ns,
+        linked.st_ctime_ns,
+    )
+
+
+def _read_routing_selector_snapshot(
+    path: Path,
+) -> tuple[dict[str, Any], tuple[int, int, int, int, int]]:
+    before = _routing_selector_fingerprint(path)
+    route = read_routing_selector(path)
+    after = _routing_selector_fingerprint(path)
+    if before != after:
+        raise IngressConfigurationError(
+            "routing selector changed while loading cached snapshot"
+        )
+    return route, after
+
+
 @contextmanager
-def _selector_lock(path: Path):
-    _validate_private_parent(path, create=True)
+def _selector_lock(
+    path: Path, *, exclusive: bool = True, create_parent: bool = True
+):
+    _validate_private_parent(path, create=create_parent)
     lock_path = path.parent / f".{path.name}.lock"
     flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(lock_path, flags, 0o600)
@@ -282,7 +322,9 @@ def _selector_lock(path: Path):
             or metadata.st_nlink != 1
         ):
             raise IngressConfigurationError("routing selector lock is unsafe")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(
+            descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        )
         yield
     finally:
         try:
@@ -665,13 +707,20 @@ class TransportIngress:
     ) -> None:
         self._token = token
         self._selector_file = selector_file
+        self._selector_route: dict[str, Any] | None = None
+        self._selector_fingerprint: tuple[int, int, int, int, int] | None = None
         self._static_route: dict[str, Any] | None = None
         if selector_file is not None:
             if upstream is not None or runtime_binding_sha256 is not None:
                 raise IngressConfigurationError(
                     "selector routing cannot be combined with a static upstream"
                 )
-            read_routing_selector(selector_file)
+            with _selector_lock(
+                selector_file, exclusive=False, create_parent=False
+            ):
+                route, fingerprint = _read_routing_selector_snapshot(selector_file)
+            self._selector_route = route
+            self._selector_fingerprint = fingerprint
         else:
             if upstream is None or runtime_binding_sha256 is None:
                 raise IngressConfigurationError(
@@ -692,7 +741,20 @@ class TransportIngress:
 
     def _route(self) -> dict[str, Any]:
         if self._selector_file is not None:
-            return read_routing_selector(self._selector_file)
+            with _selector_lock(
+                self._selector_file, exclusive=False, create_parent=False
+            ):
+                fingerprint = _routing_selector_fingerprint(self._selector_file)
+                if (
+                    self._selector_route is None
+                    or fingerprint != self._selector_fingerprint
+                ):
+                    route, fingerprint = _read_routing_selector_snapshot(
+                        self._selector_file
+                    )
+                    self._selector_route = route
+                    self._selector_fingerprint = fingerprint
+                return dict(self._selector_route)
         assert self._static_route is not None
         return dict(self._static_route)
 

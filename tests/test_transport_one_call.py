@@ -393,6 +393,87 @@ class TransportIngressTests(unittest.TestCase):
                     with self.assertRaises(ingress.IngressConfigurationError):
                         ingress._read_private_token(path)
 
+    def test_selector_route_avoids_full_reads_until_generation_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            selector_path = Path(directory) / "routing.json"
+            canonical = ingress.publish_routing_selector(
+                path=selector_path,
+                expected_selector_sha256=None,
+                selected_slot="canonical",
+                runtime_binding=BINDING,
+                cutover_id="t167-bootstrap",
+                now_unix=100,
+            )
+            original_reader = ingress._read_private_selector_bytes
+            with mock.patch.object(
+                ingress,
+                "_read_private_selector_bytes",
+                wraps=original_reader,
+            ) as full_reader:
+                proxy = ingress.TransportIngress(
+                    token=SECRET, selector_file=selector_path
+                )
+                self.assertEqual(full_reader.call_count, 1)
+                for _ in range(1000):
+                    route = proxy._route()
+                    self.assertEqual(route["selector_sha256"], canonical["selector_sha256"])
+                self.assertEqual(full_reader.call_count, 1)
+
+                green = ingress.publish_routing_selector(
+                    path=selector_path,
+                    expected_selector_sha256=canonical["selector_sha256"],
+                    selected_slot="green",
+                    runtime_binding={**BINDING, "release_id": "release-green"},
+                    cutover_id="t167-cutover",
+                    now_unix=101,
+                )
+                reads_after_publish = full_reader.call_count
+                route = proxy._route()
+                self.assertEqual(route["selector_sha256"], green["selector_sha256"])
+                self.assertEqual(route["generation"], 2)
+                self.assertEqual(route["selected_slot"], "green")
+                self.assertEqual(full_reader.call_count, reads_after_publish + 1)
+                for _ in range(25):
+                    self.assertEqual(proxy._route()["generation"], 2)
+                self.assertEqual(full_reader.call_count, reads_after_publish + 1)
+
+    def test_changed_invalid_selector_never_falls_back_to_cached_route(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            selector_path = Path(directory) / "routing.json"
+            canonical = ingress.publish_routing_selector(
+                path=selector_path,
+                expected_selector_sha256=None,
+                selected_slot="canonical",
+                runtime_binding=BINDING,
+                cutover_id="t167-bootstrap-invalid",
+                now_unix=100,
+            )
+            proxy = ingress.TransportIngress(token=SECRET, selector_file=selector_path)
+            self.assertEqual(
+                proxy._route()["selector_sha256"], canonical["selector_sha256"]
+            )
+
+            selector_path.write_text("{", encoding="utf-8")
+            selector_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                ingress.IngressConfigurationError, "invalid JSON"
+            ):
+                proxy._route()
+            self.assertEqual(
+                proxy._selector_route["selector_sha256"],
+                canonical["selector_sha256"],
+            )
+
+            selector_path.unlink()
+            with self.assertRaisesRegex(
+                ingress.IngressConfigurationError, "unavailable"
+            ):
+                proxy._route()
+            self.assertEqual(
+                proxy._selector_route["selector_sha256"],
+                canonical["selector_sha256"],
+            )
+
     def test_chunked_request_body_is_bounded_while_streaming(self) -> None:
         proxy = ingress.TransportIngress(
             token=SECRET,
