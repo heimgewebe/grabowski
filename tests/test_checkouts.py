@@ -2140,6 +2140,22 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self._git("update-ref", f"refs/remotes/origin/{new_branch}", new_head)
         return binding, new_head, new_branch
 
+    def test_binding_preview_preserves_terminal_path_without_branch_rename(self) -> None:
+        binding = self._managed_binding(owner="owner-a")
+        sentinel = {"kind": "checkout_terminal_reconciliation_preview", "status": "blocked"}
+        with patch(
+            "grabowski_checkout_terminal_reconciliation.preview",
+            return_value=sentinel,
+        ) as terminal_preview, patch.object(
+            checkouts, "_binding_identity_rebind_state_for_key"
+        ) as rebind_preview:
+            result = checkouts.grabowski_checkout_binding_terminal_preview(
+                binding["checkout_key"]
+            )
+        self.assertEqual(sentinel, result)
+        terminal_preview.assert_called_once_with(binding["checkout_key"])
+        rebind_preview.assert_not_called()
+
     def test_binding_identity_rebind_preview_and_apply_converges_branch_rename(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()
         preview = checkouts.grabowski_checkout_binding_terminal_preview(

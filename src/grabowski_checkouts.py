@@ -2696,9 +2696,13 @@ def grabowski_checkout_binding_terminal_preview(checkout_key: str) -> dict[str, 
     key = _validate_sha256(checkout_key, "checkout_key")
     lifecycle = _lifecycle_bindings([key]).get(key)
     if lifecycle is not None and Path(lifecycle["checkout_path"]).exists():
-        return _binding_identity_rebind_state_for_key(
-            key, observed_at_unix=_now()
-        )
+        repo_path = _resolve_repo(lifecycle["repo_path"])
+        checkout = _safe_path(lifecycle["checkout_path"], must_exist=True)
+        _, _, record = _worktree_for_path(repo_path, checkout)
+        if record.get("branch") != lifecycle["expected_branch"]:
+            return _binding_identity_rebind_state_for_key(
+                key, observed_at_unix=_now()
+            )
     from grabowski_checkout_terminal_reconciliation import preview
 
     return preview(key)
