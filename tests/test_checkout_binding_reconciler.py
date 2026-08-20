@@ -469,9 +469,21 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertEqual(result["state"], "bound_present")
 
     def test_unobservable_repository_precedes_absence_classification(self) -> None:
-        result = reconcile_binding(binding(), None, repository_observable=False)
+        result = reconcile_binding(
+            binding(source={"kind": "automation", "id": "frontier-20260806"}),
+            None,
+            repository_observable=False,
+        )
         self.assertEqual(result["state"], "repository_unobservable")
         self.assertIn("repository-state-unobservable", result["reasons"])
+        blocker = result["authority_blocker"]
+        self.assertEqual("repository-observability-required", blocker["blocker_code"])
+        self.assertEqual("git_repository_observation", blocker["authority"])
+        self.assertEqual(
+            ["restore_repository_observability"],
+            blocker["permitted_repair_paths"],
+        )
+        self.assertIn("No source terminal evidence is required", blocker["safe_repair_condition"])
 
     def test_identity_drift_is_explicit(self) -> None:
         result = reconcile_binding(
@@ -814,7 +826,13 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"
             create_checkout_db(path)
-            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            insert_binding(
+                path,
+                checkout_key="key-a",
+                checkout_path=CHECKOUT,
+                source_kind="automation",
+                source_id="frontier-20260806",
+            )
             before = path.read_bytes()
             result = collect_lifecycle_bindings_from_db(path)
             after = path.read_bytes()
@@ -986,7 +1004,13 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"
             create_checkout_db(path)
-            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            insert_binding(
+                path,
+                checkout_key="key-a",
+                checkout_path=CHECKOUT,
+                source_kind="automation",
+                source_id="frontier-20260806",
+            )
             with mock.patch(
                 "grabowski_checkout_binding_reconciler.checkouts.observe_worktree_records",
                 side_effect=RuntimeError("offline"),
@@ -994,6 +1018,18 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 result = reconcile_checkout_bindings(db_path=path)
             row = result["bindings"][0]
             self.assertEqual(row["state"], "repository_unobservable")
+            self.assertEqual(
+                "repository-observability-required",
+                row["authority_blocker"]["blocker_code"],
+            )
+            self.assertEqual(
+                ["restore_repository_observability"],
+                row["authority_blocker"]["permitted_repair_paths"],
+            )
+            self.assertEqual(
+                row["authority_blocker"],
+                result["attention"][0]["authority_blocker"],
+            )
             self.assertEqual(result["attention"][0]["checkout_key"], "key-a")
             self.assertEqual(
                 result["source_snapshot"]["repository_errors"][0]["error"],

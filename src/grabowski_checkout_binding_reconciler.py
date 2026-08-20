@@ -197,7 +197,16 @@ def _authority_blocker(
     if source_kind not in AUTHORITY_BLOCKER_SOURCE_KINDS or source_id is None:
         return None
 
-    if source_kind == "automation" and state == "binding_identity_drift":
+    if state == "repository_unobservable":
+        blocker_code = "repository-observability-required"
+        authority = "git_repository_observation"
+        permitted_repair_paths = ["restore_repository_observability"]
+        safe_repair_condition = (
+            "Restore bounded canonical Git repository observation and rerun "
+            "reconciliation. No source terminal evidence is required merely because "
+            "repository observation failed."
+        )
+    elif source_kind == "automation" and state == "binding_identity_drift":
         blocker_code = "automation-terminal-or-identity-rebind-evidence-required"
         authority = "immutable_automation_terminal_evidence"
         permitted_repair_paths = [
