@@ -504,10 +504,13 @@ def _validate_browser_operator_default(value: Any) -> None:
             label=f"{semantic_label}.supported_intents",
             maximum=8,
         )
-        if supported_intents != ["read_state", "navigate", "scroll_into_view"]:
+        current_supported_intents = ["read_state", "navigate", "scroll_into_view"]
+        staged_supported_intents = [*current_supported_intents, "activate"]
+        if supported_intents not in (current_supported_intents, staged_supported_intents):
             _fail(
-                f"{semantic_label}.supported_intents must be "
-                "['read_state', 'navigate', 'scroll_into_view']"
+                f"{semantic_label}.supported_intents must be either "
+                "['read_state', 'navigate', 'scroll_into_view'] or "
+                "['read_state', 'navigate', 'scroll_into_view', 'activate']"
             )
         uncovered_intents = _require_mapping(
             semantic["uncovered_intents"],

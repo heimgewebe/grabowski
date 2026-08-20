@@ -277,6 +277,25 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
         self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
 
+    def test_validator_accepts_staged_activate_contract_for_two_phase_rollout(self) -> None:
+        manifest = self.staged.manifest()
+        semantic = manifest["entrypoint_contract"]["browser_operator_default"][
+            "semantic_gateway"
+        ]
+        self.assertEqual(
+            semantic["supported_intents"],
+            ["read_state", "navigate", "scroll_into_view"],
+        )
+        semantic["supported_intents"] = [
+            "read_state",
+            "navigate",
+            "scroll_into_view",
+            "activate",
+        ]
+
+        self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
+        self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
+
     def test_deployed_release_ships_the_canonical_validator(self) -> None:
         """The runtime cannot validate itself unless the schema travels with it."""
         contract = self.staged.manifest()["entrypoint_contract"]

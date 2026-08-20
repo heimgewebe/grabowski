@@ -2307,6 +2307,12 @@ BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
         "requires_navigation_target": True,
     },
     "scroll_into_view": {"effect_class": "local_ui", "requires_element": True},
+    "activate": {
+        "effect_class": "network_navigation",
+        "requires_element": True,
+        "required_element_role": "link",
+        "requires_bound_navigation_target": True,
+    },
 }
 BROWSER_SEMANTIC_GATEWAY_OPERATIONS = ("observe", "act")
 BROWSER_SEMANTIC_EFFECT_STATES = {
@@ -2355,6 +2361,7 @@ _BROWSER_NODE_RESULT_TO_OUTCOME = {
 }
 BROWSER_SEMANTIC_NODE_SOURCE = r"""
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 
 const request = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 let ws = null;
@@ -2430,10 +2437,75 @@ function boundedText(value, limit) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function sha256Text(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function canonicalLinkNavigationTarget(rawHref, baseUrl) {
+  if (typeof rawHref !== 'string' || !rawHref || rawHref !== rawHref.trim() ||
+      rawHref.includes(String.fromCharCode(92)) || Buffer.byteLength(rawHref, 'utf8') > 4096) {
+    return null;
+  }
+  for (const character of rawHref) {
+    const code = character.codePointAt(0);
+    if (code <= 0x20 || code === 0x7f) return null;
+  }
+  let target;
+  try {
+    target = new URL(rawHref, baseUrl);
+  } catch {
+    return null;
+  }
+  if (!['http:', 'https:'].includes(target.protocol) || !target.hostname ||
+      target.username || target.password || target.port === '0') {
+    return null;
+  }
+  const value = target.href;
+  return Buffer.byteLength(value, 'utf8') <= 4096 ? value : null;
+}
+
+async function readDocumentBaseUrl() {
+  const document = await call('DOM.getDocument', {depth: 0, pierce: false});
+  const root = document && document.root ? document.root : null;
+  const value = root && typeof root.baseURL === 'string' && root.baseURL
+    ? root.baseURL
+    : (root && typeof root.documentURL === 'string' ? root.documentURL : '');
+  if (!value) throw new Error('protocol');
+  return value;
+}
+
+async function readLinkNavigationBinding(backendNodeId, baseUrl) {
+  let described;
+  try {
+    described = await call('DOM.describeNode', {
+      backendNodeId, depth: 0, pierce: false,
+    });
+  } catch {
+    return null;
+  }
+  const node = described && described.node ? described.node : null;
+  const localName = node && typeof node.localName === 'string'
+    ? node.localName.toLowerCase() : '';
+  const nodeName = node && typeof node.nodeName === 'string'
+    ? node.nodeName.toLowerCase() : '';
+  if (!node || (localName !== 'a' && nodeName !== 'a')) return null;
+  const attributes = Array.isArray(node.attributes) ? node.attributes : [];
+  let rawHref = null;
+  for (let index = 0; index + 1 < attributes.length; index += 2) {
+    if (attributes[index] === 'href') {
+      rawHref = attributes[index + 1];
+      break;
+    }
+  }
+  const target = canonicalLinkNavigationTarget(rawHref, baseUrl);
+  return target ? {target, sha256: sha256Text(target)} : null;
+}
+
 async function readElements() {
   const tree = await call('Accessibility.getFullAXTree');
   const elements = [];
   const seen = new Set();
+  let baseUrl = null;
   for (const node of Array.isArray(tree.nodes) ? tree.nodes : []) {
     if (elements.length >= 80) break;
     if (!node || node.ignored === true || !Number.isInteger(node.backendDOMNodeId)) continue;
@@ -2441,10 +2513,17 @@ async function readElements() {
     const role = boundedText(node.role && node.role.value, 64);
     if (!semanticRoles.has(role)) continue;
     seen.add(node.backendDOMNodeId);
+    let navigationTargetSha256 = null;
+    if (role === 'link') {
+      if (baseUrl === null) baseUrl = await readDocumentBaseUrl();
+      const binding = await readLinkNavigationBinding(node.backendDOMNodeId, baseUrl);
+      navigationTargetSha256 = binding ? binding.sha256 : null;
+    }
     elements.push({
       backend_node_id: String(node.backendDOMNodeId),
       role,
       name: boundedText(node.name && node.name.value, 160),
+      navigation_target_sha256: navigationTargetSha256,
     });
   }
   return elements;
@@ -2506,7 +2585,8 @@ function sameElements(left, right) {
     return expected &&
       element.backend_node_id === expected.backend_node_id &&
       element.role === expected.role &&
-      element.name === expected.name;
+      element.name === expected.name &&
+      element.navigation_target_sha256 === expected.navigation_target_sha256;
   });
 }
 
@@ -2552,6 +2632,77 @@ async function verifyElementImmediately(expected) {
   return objectId;
 }
 
+
+async function readLinkNavigationTarget(expected) {
+  if (!expected || expected.role !== 'link' ||
+      typeof expected.navigation_target_sha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(expected.navigation_target_sha256)) {
+    throw new Error('element-contract');
+  }
+  const objectId = await verifyElementImmediately(expected);
+  try {
+    const baseUrl = await readDocumentBaseUrl();
+    const binding = await readLinkNavigationBinding(
+      Number(expected.backend_node_id), baseUrl
+    );
+    if (!binding || binding.sha256 !== expected.navigation_target_sha256) {
+      throw new Error('stale-snapshot');
+    }
+    return binding.target;
+  } finally {
+    try {
+      await call('Runtime.releaseObject', {objectId});
+    } catch {}
+  }
+}
+
+async function performCorrelatedNavigation(before, navigationTarget) {
+  sameDocumentNavigations.length = 0;
+  const navigation = await call('Page.navigate', {url: navigationTarget});
+  if (typeof navigation.errorText === 'string' && navigation.errorText.trim()) {
+    throw new Error('navigation-error');
+  }
+  const acknowledgedFrameId = typeof navigation.frameId === 'string'
+    ? navigation.frameId : null;
+  const acknowledgedLoaderId = typeof navigation.loaderId === 'string'
+    ? navigation.loaderId : null;
+  if (!acknowledgedFrameId) throw new Error('navigation-uncorrelated');
+  const deadline = Date.now() + request.timeout_ms;
+  let correlation = null;
+  let correlatedState = null;
+  while (Date.now() <= deadline) {
+    const identity = await readNavigationIdentity();
+    const identityCorrelated = identity.main_frame_id === acknowledgedFrameId && (
+      acknowledgedLoaderId
+        ? identity.loader_id === acknowledgedLoaderId
+        : identity.navigation_entry_id !== before.navigation_entry_id
+    );
+    if (identityCorrelated) {
+      const state = await readState();
+      const changed = !sameState(before, state);
+      const newDocument = Boolean(
+        acknowledgedLoaderId && changed &&
+        state.main_frame_id === acknowledgedFrameId &&
+        state.loader_id === acknowledgedLoaderId
+      );
+      const sameDocument = Boolean(
+        !acknowledgedLoaderId && changed &&
+        state.main_frame_id === acknowledgedFrameId &&
+        state.navigation_entry_id !== before.navigation_entry_id &&
+        sameDocumentNavigations.some((entry) => entry.frame_id === acknowledgedFrameId)
+      );
+      if (newDocument || sameDocument) {
+        correlation = newDocument ? 'new-document' : 'same-document';
+        correlatedState = state;
+        break;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (!correlation) throw new Error('navigation-uncorrelated');
+  return {state: correlatedState, correlation};
+}
+
 try {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), request.timeout_ms);
@@ -2582,59 +2733,31 @@ try {
   } else if (request.op === 'navigate') {
     const before = await readState();
     if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
-    sameDocumentNavigations.length = 0;
-    const navigation = await call('Page.navigate', {url: request.navigation_target});
-    if (typeof navigation.errorText === 'string' && navigation.errorText.trim()) {
-      throw new Error('navigation-error');
-    }
-    const acknowledgedFrameId = typeof navigation.frameId === 'string'
-      ? navigation.frameId : null;
-    const acknowledgedLoaderId = typeof navigation.loaderId === 'string'
-      ? navigation.loaderId : null;
-    if (!acknowledgedFrameId) throw new Error('navigation-uncorrelated');
-    const deadline = Date.now() + request.timeout_ms;
-    let correlation = null;
-    let correlatedState = null;
-    while (Date.now() <= deadline) {
-      // Gate the expensive full observation on the cheap navigation identity;
-      // the authoritative predicate below still runs against a fresh readState.
-      const identity = await readNavigationIdentity();
-      const identityCorrelated = identity.main_frame_id === acknowledgedFrameId && (
-        acknowledgedLoaderId
-          ? identity.loader_id === acknowledgedLoaderId
-          : identity.navigation_entry_id !== before.navigation_entry_id
-      );
-      if (identityCorrelated) {
-        const state = await readState();
-        const changed = !sameState(before, state);
-        const newDocument = Boolean(
-          acknowledgedLoaderId && changed &&
-          state.main_frame_id === acknowledgedFrameId &&
-          state.loader_id === acknowledgedLoaderId
-        );
-        const sameDocument = Boolean(
-          !acknowledgedLoaderId && changed &&
-          state.main_frame_id === acknowledgedFrameId &&
-          state.navigation_entry_id !== before.navigation_entry_id &&
-          sameDocumentNavigations.some((entry) =>
-            entry.frame_id === acknowledgedFrameId
-          )
-        );
-        if (newDocument || sameDocument) {
-          correlation = newDocument ? 'new-document' : 'same-document';
-          correlatedState = state;
-          break;
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    if (!correlation) throw new Error('navigation-uncorrelated');
+    const navigation = await performCorrelatedNavigation(before, request.navigation_target);
     emit({
       schema_version: 1,
       ok: true,
       result_code: 'ok',
-      state: correlatedState,
-      navigation_correlation: correlation,
+      state: navigation.state,
+      navigation_correlation: navigation.correlation,
+    }, 0);
+  } else if (request.op === 'activate') {
+    const before = await readState();
+    if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
+    const expectedElement = request.expected_element;
+    const selected = before.elements.find((element) =>
+      expectedElement && element.backend_node_id === expectedElement.backend_node_id &&
+      element.role === expectedElement.role && element.name === expectedElement.name
+    );
+    if (!selected || expectedElement.role !== 'link') throw new Error('element-contract');
+    const navigationTarget = await readLinkNavigationTarget(expectedElement);
+    const navigation = await performCorrelatedNavigation(before, navigationTarget);
+    emit({
+      schema_version: 1,
+      ok: true,
+      result_code: 'ok',
+      state: navigation.state,
+      navigation_correlation: navigation.correlation,
     }, 0);
   } else if (request.op === 'scroll_into_view') {
     const before = await readState();
@@ -2831,7 +2954,7 @@ def _run_node_browser_semantic(
     navigation_correlation = payload.get("navigation_correlation")
     if navigation_correlation not in {None, "new-document", "same-document"}:
         raise RuntimeError("browser semantic navigation correlation is invalid")
-    if request.get("op") == "navigate":
+    if request.get("op") in {"navigate", "activate"}:
         if payload["ok"] is True and (
             not isinstance(state, dict) or navigation_correlation is None
         ):
@@ -2859,10 +2982,10 @@ def _bounded_semantic_text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
-def _bounded_browser_elements(raw: Any) -> list[dict[str, str]]:
+def _bounded_browser_elements(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
-    bounded: list[dict[str, str]] = []
+    bounded: list[dict[str, Any]] = []
     seen_backend_ids: set[str] = set()
     for entry in raw:
         if len(bounded) >= BROWSER_MAX_ELEMENTS:
@@ -2877,6 +3000,11 @@ def _bounded_browser_elements(raw: Any) -> list[dict[str, str]]:
         role = _bounded_semantic_text(entry.get("role"), BROWSER_ELEMENT_ROLE_MAX)
         if not role:
             continue
+        navigation_target_sha256 = entry.get("navigation_target_sha256")
+        if not isinstance(navigation_target_sha256, str) or re.fullmatch(
+            r"[0-9a-f]{64}", navigation_target_sha256
+        ) is None:
+            navigation_target_sha256 = None
         seen_backend_ids.add(backend_node_id)
         bounded.append(
             {
@@ -2885,6 +3013,7 @@ def _bounded_browser_elements(raw: Any) -> list[dict[str, str]]:
                 "name": _bounded_semantic_text(
                     entry.get("name"), BROWSER_ELEMENT_NAME_MAX
                 ),
+                "navigation_target_sha256": navigation_target_sha256,
             }
         )
     return bounded
@@ -2914,7 +3043,7 @@ class CDPAdapter:
         intent: dict[str, Any],
         *,
         expected_state: dict[str, Any],
-        expected_element: dict[str, str],
+        expected_element: dict[str, Any],
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -2923,6 +3052,14 @@ class CDPAdapter:
         navigation_target: str,
         *,
         expected_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def activate_link(
+        self,
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, Any],
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -2957,7 +3094,7 @@ class ChromeCDPAdapter(CDPAdapter):
         intent: dict[str, Any],
         *,
         expected_state: dict[str, Any],
-        expected_element: dict[str, str],
+        expected_element: dict[str, Any],
     ) -> dict[str, Any]:
         payload = self._run(
             {
@@ -2981,6 +3118,31 @@ class ChromeCDPAdapter(CDPAdapter):
                 "op": "navigate",
                 "navigation_target": navigation_target,
                 "expected_state": expected_state,
+            }
+        )
+        if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
+            raise _BrowserSemanticError(payload.get("result_code") or "protocol")
+        if payload.get("navigation_correlation") not in {
+            "new-document",
+            "same-document",
+        }:
+            raise _BrowserSemanticError("navigation-uncorrelated")
+        state = _bounded_browser_state(payload["state"])
+        if state == expected_state:
+            raise _BrowserSemanticError("navigation-uncorrelated")
+        return state
+
+    def activate_link(
+        self,
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = self._run(
+            {
+                "op": "activate",
+                "expected_state": expected_state,
+                "expected_element": expected_element,
             }
         )
         if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
@@ -3092,7 +3254,7 @@ def _is_browser_snapshot_id(value: Any) -> bool:
 def _browser_element_id(
     worker_id: str,
     snapshot_id: str,
-    element: dict[str, str],
+    element: dict[str, Any],
     handle_key: bytes,
 ) -> str:
     payload = {
@@ -3101,6 +3263,7 @@ def _browser_element_id(
         "backend_node_id": element["backend_node_id"],
         "role": element["role"],
         "name": element["name"],
+        "navigation_target_sha256": element.get("navigation_target_sha256"),
     }
     return _browser_mac(BROWSER_ELEMENT_ID_PREFIX, handle_key, payload)
 
@@ -3136,7 +3299,7 @@ def _browser_element_for_id(
     state: dict[str, Any],
     element_id: str,
     handle_key: bytes,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     for element in state["elements"]:
         candidate = _browser_element_id(
             worker_id, snapshot_id, element, handle_key
@@ -3385,7 +3548,7 @@ def browser_semantic_act(
             post_observation=None,
         )
 
-    expected_element: dict[str, str] | None = None
+    expected_element: dict[str, Any] | None = None
     if intent["element_id"] is not None:
         expected_element = _browser_element_for_id(
             identifier, snapshot_id, fresh_state, intent["element_id"], handle_key
@@ -3399,6 +3562,35 @@ def browser_semantic_act(
                 pre_observation=pre_observation,
                 post_observation=None,
             )
+        required_role = BROWSER_ACTION_CATALOG[intent["action_kind"]].get(
+            "required_element_role"
+        )
+        if required_role is not None and expected_element["role"] != required_role:
+            return _browser_outcome(
+                action,
+                ok=False,
+                result_code="element_contract",
+                effect_state="not_started",
+                pre_observation=pre_observation,
+                post_observation=None,
+            )
+        if BROWSER_ACTION_CATALOG[intent["action_kind"]].get(
+            "requires_bound_navigation_target"
+        ) is True:
+            navigation_target_sha256 = expected_element.get(
+                "navigation_target_sha256"
+            )
+            if not isinstance(navigation_target_sha256, str) or re.fullmatch(
+                r"[0-9a-f]{64}", navigation_target_sha256
+            ) is None:
+                return _browser_outcome(
+                    action,
+                    ok=False,
+                    result_code="element_contract",
+                    effect_state="not_started",
+                    pre_observation=pre_observation,
+                    post_observation=None,
+                )
 
     if intent["effect_class"] not in BROWSER_EFFECT_CLASSES_IMPLEMENTED:
         return _browser_outcome(
@@ -3412,17 +3604,27 @@ def browser_semantic_act(
     if intent["action_kind"] == "read_state":
         post_state = fresh_state
         effect_state = "not_applicable"
-    elif intent["action_kind"] == "navigate":
+    elif intent["action_kind"] in {"navigate", "activate"}:
         try:
-            post_state = adapter.navigate(
-                intent["navigation_target"], expected_state=fresh_state
-            )
+            if intent["action_kind"] == "navigate":
+                post_state = adapter.navigate(
+                    intent["navigation_target"], expected_state=fresh_state
+                )
+            else:
+                if expected_element is None:
+                    raise RuntimeError(
+                        "link activation lost its snapshot-bound element binding"
+                    )
+                post_state = adapter.activate_link(
+                    expected_state=fresh_state,
+                    expected_element=expected_element,
+                )
         except _BrowserSemanticError as exc:
-            if exc.result_code == "stale-snapshot":
+            if exc.result_code in {"stale-snapshot", "element-contract"}:
                 return _browser_outcome(
                     action,
                     ok=False,
-                    result_code="stale_snapshot",
+                    result_code=_browser_outcome_code_from_node(exc.result_code),
                     effect_state="not_started",
                     pre_observation=pre_observation,
                     post_observation=None,
@@ -3512,6 +3714,9 @@ def _browser_semantic_catalog() -> dict[str, Any]:
                 "requires_element": spec["requires_element"],
                 "requires_navigation_target": spec.get(
                     "requires_navigation_target", False
+                ),
+                "requires_bound_navigation_target": spec.get(
+                    "requires_bound_navigation_target", False
                 ),
                 "admission": BROWSER_EFFECT_CONTRACTS[spec["effect_class"]][
                     "admission"
