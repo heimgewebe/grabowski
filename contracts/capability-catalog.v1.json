@@ -1926,7 +1926,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests. Work Lane identity metadata is server-owned and can only be\ncreated through the Work Lane acquisition path.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"

@@ -1986,7 +1986,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests. Work Lane identity metadata is server-owned and can only be\ncreated through the Work Lane acquisition path.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"
@@ -3622,7 +3622,7 @@
       "src/grabowski_reposkop_context.py": "c27482b00c4085c03eb3c417ea1dc3df514b3c375ec37d27ca77dbb4e4835f21",
       "src/grabowski_reposkop_effectiveness.py": "4c24196d75374ca0a979d3138086da0b885f5525960ba4a32b401db514662331",
       "src/grabowski_reposkop_shadow.py": "8d21fdff7cbb524b72ca8d078a3a318cd0db60cc103518eeff02ad25fb89912e",
-      "src/grabowski_resources.py": "9aefeaf7be494a55229f4301af89596b3a76a29b59dc70cf84e63c79d892c69d",
+      "src/grabowski_resources.py": "fe8214836862669f37cb52d4f4b7ae8494862c7b4dcb4d64bbd93ab84804002d",
       "src/grabowski_runtime.py": "7447c4224d82c110b66f0481e7ee6c61260dc3649db8c28d192fedf0e2834e2a",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
