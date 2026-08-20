@@ -526,24 +526,51 @@ def _provider_limit_observation(
     plan_type = value.get("planType")
     if plan_type not in CODEX_ALLOWED_PLAN_TYPES:
         raise ProbeSchedulerError("Codex provider plan type is not allowlisted")
-    primary = value.get("primary")
-    if not isinstance(primary, dict):
-        raise ProbeSchedulerError("Codex provider primary limit is missing")
-    used_percent = primary.get("usedPercent")
-    resets_at = primary.get("resetsAt")
-    window_minutes = primary.get("windowDurationMins")
-    if (
-        isinstance(used_percent, bool)
-        or not isinstance(used_percent, (int, float))
-        or not 0 <= float(used_percent) <= 100
-        or isinstance(resets_at, bool)
-        or not isinstance(resets_at, int)
-        or resets_at <= 0
-        or isinstance(window_minutes, bool)
-        or not isinstance(window_minutes, int)
-        or window_minutes <= 0
-    ):
-        raise ProbeSchedulerError("Codex provider limit window is invalid")
+    windows: list[dict[str, Any]] = []
+    for label in ("primary", "secondary"):
+        raw_window = value.get(label)
+        if raw_window is None:
+            if label == "primary":
+                raise ProbeSchedulerError("Codex provider primary limit is missing")
+            continue
+        if not isinstance(raw_window, dict):
+            raise ProbeSchedulerError("Codex provider limit window is invalid")
+        used_percent = raw_window.get("usedPercent")
+        resets_at = raw_window.get("resetsAt")
+        window_minutes = raw_window.get("windowDurationMins")
+        if (
+            isinstance(used_percent, bool)
+            or not isinstance(used_percent, (int, float))
+            or not 0 <= float(used_percent) <= 100
+            or isinstance(resets_at, bool)
+            or not isinstance(resets_at, int)
+            or resets_at <= 0
+            or isinstance(window_minutes, bool)
+            or not isinstance(window_minutes, int)
+            or window_minutes <= 0
+        ):
+            raise ProbeSchedulerError("Codex provider limit window is invalid")
+        remaining_ratio = max(0.0, 1.0 - float(used_percent) / 100.0)
+        windows.append(
+            {
+                "label": label,
+                "remaining_ratio": remaining_ratio,
+                "used_percent": float(used_percent),
+                "reset_at": datetime.fromtimestamp(resets_at, timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "reset_at_unix": resets_at,
+                "window_minutes": window_minutes,
+            }
+        )
+    limiting_window = min(
+        windows,
+        key=lambda item: (
+            float(item["remaining_ratio"]),
+            -int(item["reset_at_unix"]),
+        ),
+    )
     reached_type = value.get("rateLimitReachedType")
     if reached_type is not None and not isinstance(reached_type, str):
         raise ProbeSchedulerError("Codex provider reached type is invalid")
@@ -556,19 +583,27 @@ def _provider_limit_observation(
             raise ProbeSchedulerError("Codex purchased-credit state is not eligible for automatic routing")
     elif credits is not None:
         raise ProbeSchedulerError("Codex provider credit state is invalid")
-    status = "exhausted" if float(used_percent) >= 100 or bool(reached_type) else "available"
-    remaining_ratio = max(0.0, 1.0 - float(used_percent) / 100.0)
-    reset_at = datetime.fromtimestamp(resets_at, timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    status = (
+        "exhausted"
+        if any(float(item["used_percent"]) >= 100 for item in windows)
+        or bool(reached_type)
+        else "available"
+    )
     core = {
         "schema_version": 1,
         "pool": pool,
         "source": CODEX_APP_SERVER_SOURCE,
         "status": status,
-        "remaining_ratio": remaining_ratio,
-        "used_percent": float(used_percent),
-        "reset_at": reset_at,
+        "remaining_ratio": limiting_window["remaining_ratio"],
+        "used_percent": limiting_window["used_percent"],
+        "reset_at": limiting_window["reset_at"],
         "observed_at": observed_at,
-        "window_minutes": window_minutes,
+        "window_minutes": limiting_window["window_minutes"],
+        "limiting_window": limiting_window["label"],
+        "limits": [
+            {key: item[key] for key in ("label", "remaining_ratio", "used_percent", "reset_at", "window_minutes")}
+            for item in windows
+        ],
         "plan_type": plan_type,
         "provider_limit_id": limit_id,
         "paid_fallback_authorized": False,
@@ -1144,7 +1179,6 @@ def collect_codex_app_server_observations(
             not path.is_absolute()
             or not stat.S_ISREG(metadata.st_mode)
             or not os.access(path, os.X_OK)
-            or metadata.st_uid != os.getuid()
         ):
             return unknown
         codex_home_context = temporary_codex_metadata_home(

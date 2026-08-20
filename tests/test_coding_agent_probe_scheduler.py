@@ -505,6 +505,29 @@ else:
         self.assertFalse(spark["paid_fallback_authorized"])
         self.assertEqual(0, spark["model_invocations"])
 
+    def test_codex_app_server_parser_uses_most_restrictive_provider_window(self) -> None:
+        model_result, rate_result = self.direct_codex_results()
+        main = rate_result["rateLimitsByLimitId"]["codex"]
+        main["primary"] = {
+            "usedPercent": 20.0,
+            "resetsAt": 1787197929,
+            "windowDurationMins": 300,
+        }
+        main["secondary"] = {
+            "usedPercent": 100.0,
+            "resetsAt": 1787774582,
+            "windowDurationMins": 10080,
+        }
+
+        observations = SCHEDULER.parse_codex_app_server_observations(
+            model_result, rate_result, observed_at="2026-08-20T04:10:00Z"
+        )
+        direct_main = observations[SCHEDULER.CODEX_QUOTA_POOL]
+        self.assertEqual("exhausted", direct_main["status"])
+        self.assertEqual(0.0, direct_main["remaining_ratio"])
+        self.assertEqual("secondary", direct_main["limiting_window"])
+        self.assertEqual(2, len(direct_main["limits"]))
+
     def test_codex_app_server_collector_uses_metadata_only_stdio_protocol(self) -> None:
         model_result, rate_result = self.direct_codex_results()
         fake_codex = self.root / "codex-app-server-fake"
@@ -552,13 +575,23 @@ for line in sys.stdin:
         fake_codex.write_text(textwrap.dedent(program), encoding="utf-8")
         os.chmod(fake_codex, 0o700)
 
-        observations = SCHEDULER.collect_codex_app_server_observations(
-            fake_codex,
-            environment=SCHEDULER.sanitized_environment(),
-            timeout_seconds=3,
-            state_directory=self.root,
-            source_codex_home=source_codex_home,
-        )
+        fake_codex_resolved = fake_codex.resolve()
+        original_stat = Path.stat
+
+        def stat_with_system_owner(path: Path, *args: object, **kwargs: object) -> object:
+            metadata = original_stat(path, *args, **kwargs)
+            if str(path) == str(fake_codex_resolved):
+                return mock.Mock(st_mode=metadata.st_mode, st_uid=0)
+            return metadata
+
+        with mock.patch.object(Path, "stat", stat_with_system_owner):
+            observations = SCHEDULER.collect_codex_app_server_observations(
+                fake_codex,
+                environment=SCHEDULER.sanitized_environment(),
+                timeout_seconds=3,
+                state_directory=self.root,
+                source_codex_home=source_codex_home,
+            )
 
         self.assertEqual("exhausted", observations[SCHEDULER.CODEX_QUOTA_POOL]["status"])
         self.assertEqual(
