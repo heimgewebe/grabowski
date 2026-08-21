@@ -2710,12 +2710,20 @@ def _current_registry_revision_proof(
                 "observed_plan_sha256": plan_sha256,
             },
         )
+    task_state = task.get("state")
+    if not isinstance(task_state, str) or not task_state:
+        raise BureauPickupError("orphan-recovery-task-state-invalid")
+    if task_state in TERMINAL_BUREAU_TASK_STATES:
+        raise BureauPickupError(
+            "orphan-recovery-task-terminal",
+            details={"task_id": task_id, "task_state": task_state},
+        )
     return {
         "task_id": task_id,
         "initiative_id": initiative_id,
         "task_sha256": task_sha256,
         "plan_sha256": plan_sha256,
-        "task_state": task.get("state"),
+        "task_state": task_state,
         "task_authority": task_authority,
     }
 
@@ -3236,7 +3244,6 @@ def _reacquire_orphaned_assignment_leases(
                 )
         live: list[dict[str, Any]] = []
         expired: list[dict[str, Any]] = []
-        absent: list[str] = []
         for key in keys:
             observed = resources.inspect_resource(key)
             if observed is not None:
@@ -3258,8 +3265,10 @@ def _reacquire_orphaned_assignment_leases(
                 continue
             persisted = _persisted_resource_lease(key)
             if persisted is None:
-                absent.append(key)
-                continue
+                raise BureauPickupError(
+                    "orphan-recovery-expired-lease-history-missing",
+                    details={"resource_key": key},
+                )
             if persisted.get("owner_id") != intent["lease_owner_id"]:
                 raise BureauPickupError(
                     "orphan-recovery-lease-foreign-owner",
@@ -3293,22 +3302,6 @@ def _reacquire_orphaned_assignment_leases(
             )
             actions.append(
                 {"group": group["name"], "method": "same-owner-rebind", "resource_keys": expired_keys}
-            )
-        if absent:
-            subgroup = {**group, "resource_keys": absent}
-            result = resources.acquire_resources(
-                intent["lease_owner_id"],
-                absent,
-                purpose=purpose,
-                ttl_seconds=group["ttl_seconds"],
-                metadata=group["metadata"],
-                nonconflict_proof=group["nonconflict_proof"],
-            )
-            _validate_acquired_group(intent["lease_owner_id"], subgroup, result)
-            for key in absent:
-                _current_lease_metadata_identity(key, group["metadata"])
-            actions.append(
-                {"group": group["name"], "method": "acquire", "resource_keys": absent}
             )
         if live:
             short = [

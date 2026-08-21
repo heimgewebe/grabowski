@@ -1324,6 +1324,54 @@ class BureauPickupTests(unittest.TestCase):
             )
         self.assertEqual("orphan-recovery-task-drift", raised.exception.code)
 
+    def test_orphan_recovery_rejects_terminal_task_before_lease_effect(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        state_root = Path(fixture["current_request"]["coordination_root"])
+        terminal = dict(fixture["task"])
+        terminal["state"] = "cancelled"
+        spec_sha256 = pickup._sha256(terminal)
+        database = state_root / "bureau.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "INSERT INTO task_spec_revisions VALUES(?,?,?,?,?,?,?)",
+                (
+                    "TEST-T001",
+                    2,
+                    1,
+                    spec_sha256,
+                    json.dumps(terminal, sort_keys=True, separators=(",", ":")),
+                    "test-terminal",
+                    "2026-08-21T00:01:00Z",
+                ),
+            )
+            connection.execute(
+                "UPDATE task_specs SET current_revision=?,spec_sha256=?,updated_at=? "
+                "WHERE task_id=?",
+                (2, spec_sha256, "2026-08-21T00:01:00Z", "TEST-T001"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup, "_coordination_status", return_value=fixture["orphaned"]
+            ),
+            mock.patch.object(
+                pickup, "_reacquire_orphaned_assignment_leases"
+            ) as reacquire,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("orphan-recovery-task-terminal", raised.exception.code)
+        self.assertEqual("cancelled", raised.exception.details["task_state"])
+        reacquire.assert_not_called()
+
     def test_orphan_recovery_uses_state_store_task_spec_authority(self) -> None:
         fixture = self.orphan_recovery_fixture()
         state_root = Path(fixture["current_request"]["coordination_root"])
@@ -1580,6 +1628,29 @@ class BureauPickupTests(unittest.TestCase):
                 fixture["acquisition"],
                 fixture["run_dir"],
             )
+        rebind.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_orphan_recovery_rejects_missing_lease_history_before_acquire(self) -> None:
+        repository = self.root / "repository-missing-history"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        with (
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
+            mock.patch.object(pickup, "_persisted_resource_lease", return_value=None),
+            mock.patch.object(pickup.resources, "rebind_same_owner_resources") as rebind,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual(
+            "orphan-recovery-expired-lease-history-missing", raised.exception.code
+        )
         rebind.assert_not_called()
         acquire.assert_not_called()
 
