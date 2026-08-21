@@ -116,6 +116,73 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertTrue(result["blocking"])
         self.assertIn("checkout_absence_as_cleanup_proof", result["does_not_establish"])
 
+    def test_orphaned_automation_exposes_machine_readable_authority_blocker(self) -> None:
+        result = reconcile_binding(
+            binding(source={"kind": "automation", "id": "frontier-20260806"}),
+            None,
+            repository_observable=True,
+        )
+        self.assertEqual("orphaned_binding", result["state"])
+        self.assertTrue(result["blocking"])
+        blocker = result["authority_blocker"]
+        self.assertEqual("automation", blocker["source_kind"])
+        self.assertEqual("frontier-20260806", blocker["source_id"])
+        self.assertEqual(
+            "automation-terminal-evidence-contract-required",
+            blocker["blocker_code"],
+        )
+        self.assertEqual(["source_terminal_evidence"], blocker["permitted_repair_paths"])
+        self.assertIn("Checkout absence", blocker["safe_repair_condition"])
+        self.assertIn("checkout_absence_as_terminal_proof", blocker["does_not_establish"])
+
+    def test_automation_identity_drift_exposes_terminal_or_rebind_authority(self) -> None:
+        result = reconcile_binding(
+            binding(source={"kind": "automation", "id": "frontier-20260806"}),
+            worktree(branch="topic-v2"),
+            repository_observable=True,
+        )
+        self.assertEqual("binding_identity_drift", result["state"])
+        blocker = result["authority_blocker"]
+        self.assertEqual(
+            "automation-terminal-or-identity-rebind-evidence-required",
+            blocker["blocker_code"],
+        )
+        self.assertEqual(
+            ["source_terminal_evidence", "authorized_identity_rebind"],
+            blocker["permitted_repair_paths"],
+        )
+        self.assertIn("separately authorized identity rebind", blocker["safe_repair_condition"])
+
+    def test_work_lane_identity_drift_exposes_terminal_or_rebind_authority(self) -> None:
+        result = reconcile_binding(
+            binding(source={"kind": "work_lane", "id": "a" * 32}),
+            worktree(branch="topic-v2"),
+            repository_observable=True,
+        )
+        self.assertEqual("binding_identity_drift", result["state"])
+        self.assertTrue(result["blocking"])
+        blocker = result["authority_blocker"]
+        self.assertEqual("work_lane", blocker["source_kind"])
+        self.assertEqual("a" * 32, blocker["source_id"])
+        self.assertEqual(
+            "work-lane-terminal-or-identity-rebind-evidence-required",
+            blocker["blocker_code"],
+        )
+        self.assertEqual(
+            ["source_terminal_closeout", "authorized_identity_rebind"],
+            blocker["permitted_repair_paths"],
+        )
+        self.assertIn("separately authorized identity rebind", blocker["safe_repair_condition"])
+
+    def test_nonblocking_work_lane_has_no_authority_blocker(self) -> None:
+        result = reconcile_binding(
+            binding(source={"kind": "work_lane", "id": "b" * 32}),
+            worktree(),
+            repository_observable=True,
+        )
+        self.assertEqual("bound_present", result["state"])
+        self.assertNotIn("authority_blocker", result)
+
     def test_external_terminal_missing_is_terminal_nonblocking(self) -> None:
         result = reconcile_binding(
             binding(phase="externally_terminal_missing"),
@@ -402,9 +469,21 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertEqual(result["state"], "bound_present")
 
     def test_unobservable_repository_precedes_absence_classification(self) -> None:
-        result = reconcile_binding(binding(), None, repository_observable=False)
+        result = reconcile_binding(
+            binding(source={"kind": "automation", "id": "frontier-20260806"}),
+            None,
+            repository_observable=False,
+        )
         self.assertEqual(result["state"], "repository_unobservable")
         self.assertIn("repository-state-unobservable", result["reasons"])
+        blocker = result["authority_blocker"]
+        self.assertEqual("repository-observability-required", blocker["blocker_code"])
+        self.assertEqual("git_repository_observation", blocker["authority"])
+        self.assertEqual(
+            ["restore_repository_observability"],
+            blocker["permitted_repair_paths"],
+        )
+        self.assertIn("No source terminal evidence is required", blocker["safe_repair_condition"])
 
     def test_identity_drift_is_explicit(self) -> None:
         result = reconcile_binding(
@@ -597,6 +676,8 @@ def insert_binding(
     checkout_path: str,
     phase: str = "active",
     expected_head: str = HEAD,
+    source_kind: str = "bureau-task",
+    source_id: str = "T096",
 ) -> None:
     connection = sqlite3.connect(path)
     connection.execute(
@@ -615,8 +696,8 @@ def insert_binding(
             checkout_path,
             "operator:test",
             "test",
-            "bureau-task",
-            "T096",
+            source_kind,
+            source_id,
             "operator-worktree",
             phase,
             9999999999,
@@ -745,7 +826,13 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"
             create_checkout_db(path)
-            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            insert_binding(
+                path,
+                checkout_key="key-a",
+                checkout_path=CHECKOUT,
+                source_kind="automation",
+                source_id="frontier-20260806",
+            )
             before = path.read_bytes()
             result = collect_lifecycle_bindings_from_db(path)
             after = path.read_bytes()
@@ -888,11 +975,42 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
             self.assertEqual(result["attention"], [])
             self.assertEqual(result["summary"]["archived_cleaned"], 1)
 
+    def test_attention_propagates_automation_authority_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            insert_binding(
+                path,
+                checkout_key="key-a",
+                checkout_path=CHECKOUT,
+                source_kind="automation",
+                source_id="frontier-20260806",
+            )
+            with mock.patch(
+                "grabowski_checkout_binding_reconciler.checkouts.observe_worktree_records",
+                return_value=observed_repo(),
+            ):
+                result = reconcile_checkout_bindings(db_path=path)
+            row = result["bindings"][0]
+            attention = result["attention"][0]
+            self.assertEqual("orphaned_binding", row["state"])
+            self.assertEqual(row["authority_blocker"], attention["authority_blocker"])
+            self.assertEqual(
+                "automation-terminal-evidence-contract-required",
+                attention["authority_blocker"]["blocker_code"],
+            )
+
     def test_repository_observation_failure_is_blocking_not_orphaned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"
             create_checkout_db(path)
-            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            insert_binding(
+                path,
+                checkout_key="key-a",
+                checkout_path=CHECKOUT,
+                source_kind="automation",
+                source_id="frontier-20260806",
+            )
             with mock.patch(
                 "grabowski_checkout_binding_reconciler.checkouts.observe_worktree_records",
                 side_effect=RuntimeError("offline"),
@@ -900,6 +1018,18 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 result = reconcile_checkout_bindings(db_path=path)
             row = result["bindings"][0]
             self.assertEqual(row["state"], "repository_unobservable")
+            self.assertEqual(
+                "repository-observability-required",
+                row["authority_blocker"]["blocker_code"],
+            )
+            self.assertEqual(
+                ["restore_repository_observability"],
+                row["authority_blocker"]["permitted_repair_paths"],
+            )
+            self.assertEqual(
+                row["authority_blocker"],
+                result["attention"][0]["authority_blocker"],
+            )
             self.assertEqual(result["attention"][0]["checkout_key"], "key-a")
             self.assertEqual(
                 result["source_snapshot"]["repository_errors"][0]["error"],

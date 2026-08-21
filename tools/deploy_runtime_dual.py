@@ -5801,10 +5801,26 @@ class ProductionBlueGreenRuntime:
                 "Blue complete schema identity is unavailable for platform publication recovery",
                 phase="platform-publication-preflight",
             )
+        blue_entrypoint = self.blue_manifest.get("entrypoint_contract")
+        blue_tools = (
+            blue_entrypoint.get("expected_tools")
+            if isinstance(blue_entrypoint, dict)
+            else None
+        )
+        if (
+            not isinstance(blue_tools, list)
+            or not blue_tools
+            or any(not isinstance(name, str) or not name for name in blue_tools)
+        ):
+            core.fail(
+                "Authentic blue tool-count evidence is unavailable for platform publication recovery",
+                phase="platform-publication-preflight",
+            )
+        source_tool_count = len(blue_tools)
         return client_snapshot._platform_publication_contract(
-            registered_tool_count=len(self.snapshot.contract.expected_tools),
+            registered_tool_count=source_tool_count,
             registered_names_sha256=self.blue_binding["registered_names_sha256"],
-            complete_schema_count=len(self.snapshot.contract.expected_tools),
+            complete_schema_count=source_tool_count,
             complete_schema_sha256=self.source_complete_schema_sha256,
         )
 
@@ -5814,12 +5830,24 @@ class ProductionBlueGreenRuntime:
                 "Green readiness is unavailable for platform publication preparation",
                 phase="platform-publication-preflight",
             )
+        blue_contract = self._blue_platform_publication_contract()
+        target_tool_count = len(self.snapshot.contract.expected_tools)
+        surface_changed = (
+            blue_contract["tool_count"] != target_tool_count
+            or blue_contract["tool_names_sha256"]
+            != self.green_binding["registered_names_sha256"]
+            or blue_contract["tool_schemas_count"]
+            != self.green_readiness["complete_schema_count"]
+            or blue_contract["tool_schemas_sha256"]
+            != self.green_readiness["complete_schema_sha256"]
+        )
         result = client_snapshot.prepare_platform_publication_for_runtime(
-            registered_tool_count=len(self.snapshot.contract.expected_tools),
+            registered_tool_count=target_tool_count,
             registered_names_sha256=self.green_binding["registered_names_sha256"],
             complete_schema_count=self.green_readiness["complete_schema_count"],
             complete_schema_sha256=self.green_readiness["complete_schema_sha256"],
             cutover_id=self.cutover_id,
+            require_current_cutover_binding=surface_changed,
         )
         self.platform_publication = result
         return result
@@ -6139,14 +6167,16 @@ def prepare_production_blue_green_runtime(
     green_binding, _ = transport_ingress._read_runtime_binding(
         build.release_path / core.MANIFEST_NAME
     )
+    # Tool count/name/schema changes are authorized later by the existing
+    # Publication-v2 request after Green is independently verified.  Agent
+    # instructions are not part of that contract and therefore remain strict
+    # continuity here.
     if (
-        blue_binding["registered_names_sha256"]
-        != green_binding["registered_names_sha256"]
-        or blue_binding["agent_instructions_sha256"]
+        blue_binding["agent_instructions_sha256"]
         != green_binding["agent_instructions_sha256"]
     ):
         core.fail(
-            "No authentic prior connector declaration covers the changed green surface",
+            "No authentic prior connector declaration covers changed green agent instructions",
             phase="snapshot-authenticity-preflight",
         )
     blue_entrypoint = blue_manifest.get("entrypoint_contract")
@@ -6155,14 +6185,12 @@ def prepare_production_blue_green_runtime(
         if isinstance(blue_entrypoint, dict)
         else None
     )
-    green_tools = list(snapshot.contract.expected_tools)
     if (
         not isinstance(blue_tools, list)
         or any(not isinstance(name, str) for name in blue_tools)
-        or sorted(blue_tools) != sorted(green_tools)
     ):
         core.fail(
-            "Blue and green tool-name continuity is unavailable",
+            "Authentic blue tool-name evidence is unavailable",
             phase="snapshot-authenticity-preflight",
         )
     snapshot_status = client_snapshot.snapshot_status(
