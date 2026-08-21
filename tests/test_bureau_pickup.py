@@ -2152,6 +2152,68 @@ class BureauPickupTests(unittest.TestCase):
             (fixture["run_dir"] / "orphan-lease-recovery-compensation.json").is_file()
         )
 
+    def test_orphan_recovery_compensates_rebind_when_final_readback_fails(self) -> None:
+        repository = self.root / "repository-readback"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        rebound = {
+            **original,
+            "updated_at_unix": int(time.time()),
+            "expires_at_unix": int(time.time()) + 300,
+        }
+        with (
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[None, None]
+            ),
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "rebind_same_owner_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "resource_keys": [key],
+                    "metadata_sha256": original["metadata_sha256"],
+                    "leases": [rebound],
+                },
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "released": [rebound],
+                    "snapshot_guarded": True,
+                    "force": False,
+                },
+            ) as release,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual("orphan-recovery-lease-effect-failed", raised.exception.code)
+        self.assertEqual(
+            "orphan-recovery-lease-readback-missing",
+            raised.exception.details["cause_code"],
+        )
+        self.assertEqual("released", raised.exception.details["compensation"]["status"])
+        release.assert_called_once_with(
+            fixture["intent"]["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(rebound)],
+        )
+
     def test_orphan_recovery_active_run_is_refreshed_after_lease_recovery(self) -> None:
         repository = self.root / "repository"
         key = f"repo:{repository}"

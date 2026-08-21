@@ -3329,6 +3329,45 @@ def _reacquire_orphaned_assignment_leases(
 
     actions: list[dict[str, Any]] = []
     rebound_after_snapshots: list[dict[str, Any]] = []
+
+    def _raise_compensated_lease_effect_failure(exc: Exception) -> None:
+        compensation: dict[str, Any] = {
+            "required": True,
+            "status": "pending",
+            "resource_keys": [
+                item["resource_key"] for item in rebound_after_snapshots
+            ],
+            "cause_code": getattr(exc, "code", None),
+            "error_type": type(exc).__name__,
+        }
+        try:
+            released = resources.release_resources(
+                intent["lease_owner_id"],
+                [item["resource_key"] for item in rebound_after_snapshots],
+                expected_leases=rebound_after_snapshots,
+            )
+            compensation.update({"status": "released", "result": released})
+        except Exception as release_exc:
+            compensation.update(
+                {
+                    "status": "release-failed",
+                    "release_error_type": type(release_exc).__name__,
+                }
+            )
+        compensation["receipt_sha256"] = _sha256(compensation)
+        _write_bound_json(
+            run_dir / "orphan-lease-recovery-compensation.json", compensation
+        )
+        raise BureauPickupError(
+            "orphan-recovery-lease-effect-failed",
+            details={
+                "cause_code": getattr(exc, "code", None),
+                "error_type": type(exc).__name__,
+                "effect_count": len(actions),
+                "compensation": compensation,
+            },
+        ) from exc
+
     try:
         for index, plan in enumerate(plans, start=1):
             group = plan["group"]
@@ -3404,65 +3443,37 @@ def _reacquire_orphaned_assignment_leases(
     except Exception as exc:
         if not rebound_after_snapshots:
             raise
-        compensation: dict[str, Any] = {
-            "required": True,
-            "status": "pending",
-            "resource_keys": [
-                item["resource_key"] for item in rebound_after_snapshots
-            ],
-            "cause_code": getattr(exc, "code", None),
-            "error_type": type(exc).__name__,
-        }
-        if rebound_after_snapshots:
-            try:
-                released = resources.release_resources(
-                    intent["lease_owner_id"],
-                    [item["resource_key"] for item in rebound_after_snapshots],
-                    expected_leases=rebound_after_snapshots,
-                )
-                compensation.update(
-                    {"status": "released", "result": released}
-                )
-            except Exception as release_exc:
-                compensation.update(
-                    {
-                        "status": "release-failed",
-                        "release_error_type": type(release_exc).__name__,
-                    }
-                )
-        compensation["receipt_sha256"] = _sha256(compensation)
-        _write_bound_json(
-            run_dir / "orphan-lease-recovery-compensation.json", compensation
-        )
-        raise BureauPickupError(
-            "orphan-recovery-lease-effect-failed",
-            details={
-                "cause_code": getattr(exc, "code", None),
-                "error_type": type(exc).__name__,
-                "effect_count": len(actions),
-                "compensation": compensation,
-            },
-        ) from exc
+        _raise_compensated_lease_effect_failure(exc)
+
     current_leases: list[dict[str, Any]] = []
-    for key in intent["required_resource_keys"]:
-        observed = resources.inspect_resource(key)
-        original = original_by_key[key]
-        if observed is None:
-            raise BureauPickupError(
-                "orphan-recovery-lease-readback-missing", details={"resource_key": key}
-            )
-        if observed.get("owner_id") != intent["lease_owner_id"]:
-            raise BureauPickupError(
-                "orphan-recovery-lease-foreign-owner",
-                details={"resource_key": key, "owner_id": observed.get("owner_id")},
-            )
-        if observed.get("metadata_sha256") != original.get("metadata_sha256"):
-            _current_lease_metadata_identity(key, expected_metadata_by_key[key])
-        if observed.get("expires_at_unix", 0) < resources._now() + 60:
-            raise BureauPickupError(
-                "orphan-recovery-lease-too-short", details={"resource_key": key}
-            )
-        current_leases.append(_lease_snapshot(observed))
+    try:
+        for key in intent["required_resource_keys"]:
+            observed = resources.inspect_resource(key)
+            original = original_by_key[key]
+            if observed is None:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-readback-missing",
+                    details={"resource_key": key},
+                )
+            if observed.get("owner_id") != intent["lease_owner_id"]:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-foreign-owner",
+                    details={
+                        "resource_key": key,
+                        "owner_id": observed.get("owner_id"),
+                    },
+                )
+            if observed.get("metadata_sha256") != original.get("metadata_sha256"):
+                _current_lease_metadata_identity(key, expected_metadata_by_key[key])
+            if observed.get("expires_at_unix", 0) < resources._now() + 60:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-too-short", details={"resource_key": key}
+                )
+            current_leases.append(_lease_snapshot(observed))
+    except Exception as exc:
+        if not rebound_after_snapshots:
+            raise
+        _raise_compensated_lease_effect_failure(exc)
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup_orphan_lease_recovery",
