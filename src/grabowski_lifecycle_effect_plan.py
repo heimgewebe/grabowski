@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-import grabowski_lifecycle_archive as lifecycle
 import grabowski_lifecycle_evidence as lifecycle_evidence
 
 
@@ -200,7 +199,7 @@ def sha256_json(value: Any) -> str:
 
 
 def _validate_sha256(value: Any, *, label: str) -> str:
-    if not isinstance(value, str) or lifecycle.SHA256.fullmatch(value) is None:
+    if not isinstance(value, str) or lifecycle_evidence.SHA256.fullmatch(value) is None:
         raise ValueError(f"{label} must be a lowercase SHA-256 digest")
     return value
 
@@ -1540,11 +1539,11 @@ def verify_effect_execution_receipt(
     revalidation: Mapping[str, Any],
 ) -> dict[str, Any]:
     try:
-        payload = lifecycle._read_regular_bytes(
+        payload = lifecycle_evidence.read_regular_bytes(
             receipt_path,
             max_bytes=MAX_EFFECT_RECEIPT_BYTES,
         )
-    except lifecycle.LifecycleArchiveIntegrityError as exc:
+    except lifecycle_evidence.LifecycleEvidenceIntegrityError as exc:
         raise LifecycleEffectPlanIntegrityError(str(exc)) from exc
     try:
         value = json.loads(payload.decode("utf-8"))
