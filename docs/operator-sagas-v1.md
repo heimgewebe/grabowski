@@ -34,6 +34,8 @@ The saga is deliberately **not** a cross-system transaction. A successful Prepar
 
 Receipt hashes are recomputed before trust. An embedded grip result whose receipt digest, output digest, top-level digest or status disagrees is rejected.
 
+The runtime implementation lives in the already deployed `grabowski_grip_orchestration` source set. `grabowski_sagas.py` is a source/test compatibility re-export only; `grabowski_grips` does not import it at runtime. This avoids creating a new deployment-source dependency and keeps concurrent runtime-entrypoint work isolated.
+
 A self-consistent caller-supplied Captain JSON object is **not** sufficient settlement evidence. `saga-settle` requires the exact `captain-run-audit-intent` and `captain-run-audit-completion` records that the server emitted for the real Captain call. It reads both records from one verified immutable audit snapshot, checks their hash-chain identities, actor/context/request continuity and exact action/target/head/base/receipt/output/status bindings, then derives `VerifiedCaptainAuditBinding.v1`. A missing or mismatching audit record fails closed.
 
 The audit lookup is intentionally bounded to the newest 100,000 verified records. If a Captain result is so old that its records are outside that window, the saga does not infer authenticity and does not gain retry authority; the caller must obtain fresh authoritative evidence or use the normal recovery path.

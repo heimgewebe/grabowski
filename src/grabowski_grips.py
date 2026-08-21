@@ -16,7 +16,6 @@ from urllib.parse import quote, urlsplit
 
 import grabowski_repobrief
 import grabowski_grip_orchestration
-import grabowski_sagas
 import grabowski_convergence
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
@@ -9090,12 +9089,12 @@ def _saga_allowed_parameters(parameters: dict[str, Any], allowed: set[str]) -> N
 
 def _saga_plan_from_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     try:
-        return grabowski_sagas.build_plan(
+        return grabowski_grip_orchestration.build_plan(
             parameters.get("saga_kind"),
             parameters.get("target"),
             parameters.get("idempotency_key"),
         )
-    except grabowski_sagas.SagaError as exc:
+    except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
 
 
@@ -9121,7 +9120,7 @@ def _run_saga_plan(
     _check(
         receipt,
         "five-phase-contract",
-        "pass" if phase_names == list(grabowski_sagas.PHASES) else "fail",
+        "pass" if phase_names == list(grabowski_grip_orchestration.PHASES) else "fail",
         ",".join(str(item) for item in phase_names),
     )
     _check(receipt, "identity-bound", "pass", str(plan["plan_sha256"]))
@@ -9161,8 +9160,8 @@ def _run_saga_run(
         github_runner=github_runner,
     )
     try:
-        run_receipt = grabowski_sagas.build_run_receipt(plan, mechanic)
-    except grabowski_sagas.SagaError as exc:
+        run_receipt = grabowski_grip_orchestration.build_run_receipt(plan, mechanic)
+    except grabowski_grip_orchestration.SagaError as exc:
         raise GripActionError(str(exc)) from exc
     child_hashes = run_receipt.get("child_receipt_sha256s")
     receipt_bound = isinstance(child_hashes, list) and all(_is_sha256_hex(item) for item in child_hashes)
@@ -9271,10 +9270,10 @@ def _saga_captain_audit_binding(
         raise GripPreflightError("captain_result must be an object")
     captain_result = dict(captain_result_value)
     try:
-        receipt, _output = grabowski_sagas._validate_grip_result(
+        receipt, _output = grabowski_grip_orchestration._validate_grip_result(
             captain_result, expected_grip="captain-run", field="captain_result"
         )
-    except grabowski_sagas.SagaError as exc:
+    except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
     audit = captain_result.get("captain_audit")
     if not isinstance(audit, dict) or audit.get("status") != "complete":
@@ -9300,7 +9299,7 @@ def _saga_captain_audit_binding(
     expected_common = {
         "kind": "grabowski_captain_run_audit",
         "action": plan["captain_handoff"]["action"],
-        "target_sha256": grabowski_sagas.sha256_json(plan["captain_handoff"]["target"]),
+        "target_sha256": grabowski_grip_orchestration.sha256_json(plan["captain_handoff"]["target"]),
         "expected_head": expected_identity["expected_head"],
         "expected_base": expected_base,
         "expected_base_sha": expected_base_sha,
@@ -9332,7 +9331,7 @@ def _saga_captain_audit_binding(
         raise GripPreflightError("Captain audit execution result digest mismatch")
     body = {
         "schema_version": 1,
-        "kind": grabowski_sagas.CAPTAIN_AUDIT_BINDING_KIND,
+        "kind": grabowski_grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
         "authority": "verified_grabowski_audit_chain",
         "intent_record_sha256": intent_sha,
         "completion_record_sha256": completion_sha,
@@ -9373,14 +9372,14 @@ def _run_saga_settle(
         plan, parameters.get("captain_result")
     )
     try:
-        settlement = grabowski_sagas.settle(
+        settlement = grabowski_grip_orchestration.settle(
             plan_value=plan,
             run_receipt_value=parameters.get("run_receipt"),
             captain_result_value=parameters.get("captain_result"),
             captain_audit_binding_value=captain_audit_binding,
             readback_value=parameters.get("readback"),
         )
-    except grabowski_sagas.SagaError as exc:
+    except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
     _check(receipt, "plan-run-captain-bound", "pass", str(settlement["settlement_sha256"]))
     _check(
