@@ -27,7 +27,7 @@ def _load_gate():
 pr_review_gate = _load_gate()
 
 
-def _self_review() -> dict:
+def _self_review(*, reviewed_files: list[str] | None = None) -> dict:
     return {
         "schema_version": 1,
         "kind": "grabowski_self_review",
@@ -37,12 +37,15 @@ def _self_review() -> dict:
         "pr": 58,
         "head_sha": HEAD,
         "base_sha": BASE,
-        "reviewed_files": ["docs/low_risk_note.md"],
+        "reviewed_files": reviewed_files or ["docs/low_risk_note.md"],
         "review_focus": ["correctness", "regression_risk", "tests", "security", "integration"],
         "diff_sha256": DIFF_SHA,
         "diff_reviewed": True,
         "all_findings_triaged": True,
-        "review_iterations": [{"n": 1, "summary": "reviewed", "material_findings": 0}],
+        "review_iterations": [
+            {"n": 1, "summary": "reviewed correctness", "material_findings": 0},
+            {"n": 2, "summary": "reviewed integration", "material_findings": 0},
+        ],
         "stop_reason": "clean_pass",
         "findings": [],
         "material_findings_remaining": 0,
@@ -75,6 +78,16 @@ def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN"
         "reviewComments": [],
         "pr_diff_sha256": DIFF_SHA,
     }
+
+
+def _registry_state(*, include_non_registry: bool = False) -> tuple[dict, list[str]]:
+    state = _state()
+    paths = ["registry/tasks/TEST-BASE-BOUND.json"]
+    if include_non_registry:
+        paths.insert(0, "docs/low_risk_note.md")
+    state["pr"]["files"] = [{"path": path} for path in paths]
+    state["pr"]["changedFiles"] = len(paths)
+    return state, paths
 
 
 class PrReviewGateTrustedActorsTests(unittest.TestCase):
@@ -154,13 +167,13 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
             result["failures"],
         )
 
-    def test_base_bound_expected_check_accepts_exact_current_base_link(self) -> None:
+    def test_non_registry_freshness_check_does_not_require_base_sha_link(self) -> None:
         state = _state()
         state["checks"].append(
             {
                 "bucket": "pass",
                 "name": FRESHNESS,
-                "link": f"https://github.com/heimgewebe/bureau/actions/runs/1?base_sha={BASE}",
+                "link": "https://github.com/heimgewebe/bureau/actions/runs/1",
             }
         )
 
@@ -171,10 +184,29 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         )
 
         self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [])
+
+    def test_registry_freshness_check_accepts_exact_current_base_link(self) -> None:
+        state, paths = _registry_state()
+        state["checks"].append(
+            {
+                "bucket": "pass",
+                "name": FRESHNESS,
+                "link": f"https://github.com/heimgewebe/bureau/actions/runs/1?base_sha={BASE}",
+            }
+        )
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=paths),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
 
-    def test_base_bound_expected_check_blocks_stale_base_link(self) -> None:
-        state = _state()
+    def test_any_registry_task_path_keeps_freshness_base_binding_strict(self) -> None:
+        state, paths = _registry_state(include_non_registry=True)
         state["checks"].append(
             {
                 "bucket": "pass",
@@ -185,7 +217,24 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
 
         result = pr_review_gate.evaluate_review_gate(
             state,
-            self_review=_self_review(),
+            self_review=_self_review(reviewed_files=paths),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+            result["failures"],
+        )
+
+    def test_registry_freshness_check_blocks_missing_link(self) -> None:
+        state, paths = _registry_state()
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=paths),
             expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
         )
 
@@ -195,8 +244,9 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
             result["failures"],
         )
 
-    def test_base_bound_expected_check_blocks_missing_link(self) -> None:
+    def test_missing_changed_files_count_cannot_relax_base_binding(self) -> None:
         state = _state()
+        state["pr"].pop("changedFiles")
         state["checks"].append({"bucket": "pass", "name": FRESHNESS})
 
         result = pr_review_gate.evaluate_review_gate(
@@ -206,6 +256,40 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         )
 
         self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+            result["failures"],
+        )
+
+    def test_exact_registry_tasks_path_keeps_base_binding_strict(self) -> None:
+        state = _state()
+        paths = ["registry/tasks"]
+        state["pr"]["files"] = [{"path": paths[0]}]
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=paths),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+
+    def test_missing_changed_file_evidence_cannot_relax_base_binding(self) -> None:
+        state = _state()
+        state["pr"]["files"] = []
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
         self.assertIn(
             f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
             result["failures"],

@@ -101,6 +101,7 @@ DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate (attested)",
 }
 BASE_BOUND_REQUIRED_CHECK_NAMES = {"registry-registration-preflight/freshness"}
+REGISTRY_TASK_PATH_PREFIX = "registry/tasks/"
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude", "claude[bot]", "claude-code", "claude-code[bot]", "anthropic", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -2943,6 +2944,31 @@ def _check_link_matches_base_sha(check: dict[str, Any], base_sha: object) -> boo
     return values == [base_sha]
 
 
+def _effective_base_bound_check_names(
+    pr: dict[str, Any], expected_check_names: tuple[str, ...]
+) -> set[str]:
+    required = set(expected_check_names) & BASE_BOUND_REQUIRED_CHECK_NAMES
+    freshness = "registry-registration-preflight/freshness"
+    if freshness not in required:
+        return required
+
+    paths, path_failures = _current_pr_paths_failures(pr)
+    if pr.get("changedFiles") is None or path_failures:
+        return required
+    if any(
+        path == REGISTRY_TASK_PATH_PREFIX.rstrip("/")
+        or path.startswith(REGISTRY_TASK_PATH_PREFIX)
+        for path in paths
+    ):
+        return required
+
+    # The custom ?base_sha= CheckRun exists only for Registry-task candidates.
+    # Non-Registry PRs still run the native pull_request_target freshness job
+    # against the current base, but GitHub owns that job's details URL.
+    required.remove(freshness)
+    return required
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
@@ -3138,6 +3164,9 @@ def evaluate_review_gate(
     expected_check_buckets_by_name: dict[str, list[str | None]] = {
         name: [] for name in expected_check_names
     }
+    base_bound_check_names = _effective_base_bound_check_names(
+        pr, expected_check_names
+    )
     stale_or_unbound_base_checks: set[str] = set()
     current_base_sha = pr.get("baseRefOid")
     blocking_checks = []
@@ -3152,7 +3181,7 @@ def evaluate_review_gate(
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:
                 blocking_checks.append(check)
-            elif name in BASE_BOUND_REQUIRED_CHECK_NAMES and not _check_link_matches_base_sha(
+            elif name in base_bound_check_names and not _check_link_matches_base_sha(
                 check, current_base_sha
             ):
                 stale_or_unbound_base_checks.add(name)
@@ -3243,9 +3272,7 @@ def evaluate_review_gate(
         },
         "check_policy": {
             "expected_check_names": list(expected_check_names),
-            "base_bound_check_names": sorted(
-                set(expected_check_names) & BASE_BOUND_REQUIRED_CHECK_NAMES
-            ),
+            "base_bound_check_names": sorted(base_bound_check_names),
         },
     }
 
