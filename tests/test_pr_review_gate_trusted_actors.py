@@ -69,7 +69,8 @@ def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN"
             "changedFiles": 1,
             "additions": 1,
             "deletions": 0,
-            "files": [{"path": "docs/low_risk_note.md"}],
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "docs/low_risk_note.md", "status": "modified"}],
             "reviews": [{"author": {"login": actor}, "commit_id": HEAD}],
             "latestReviews": [],
             "comments": [],
@@ -85,7 +86,7 @@ def _registry_state(*, include_non_registry: bool = False) -> tuple[dict, list[s
     paths = ["registry/tasks/TEST-BASE-BOUND.json"]
     if include_non_registry:
         paths.insert(0, "docs/low_risk_note.md")
-    state["pr"]["files"] = [{"path": path} for path in paths]
+    state["pr"]["files"] = [{"path": path, "status": "modified"} for path in paths]
     state["pr"]["changedFiles"] = len(paths)
     return state, paths
 
@@ -309,6 +310,96 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
                     f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
                     result["failures"],
                 )
+
+    def test_registry_task_rename_out_keeps_base_binding_strict(self) -> None:
+        state = _state()
+        state["pr"]["files"] = [
+            {
+                "path": "docs/TEST-BASE-BOUND.json",
+                "status": "renamed",
+                "previousPath": "registry/tasks/TEST-BASE-BOUND.json",
+            }
+        ]
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=["docs/TEST-BASE-BOUND.json"]),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+            result["failures"],
+        )
+
+    def test_non_registry_rename_can_relax_base_binding(self) -> None:
+        state = _state()
+        state["pr"]["files"] = [
+            {
+                "path": "docs/new-name.md",
+                "status": "renamed",
+                "previousPath": "docs/old-name.md",
+            }
+        ]
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=["docs/new-name.md"]),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [])
+
+    def test_rename_without_previous_path_cannot_relax_base_binding(self) -> None:
+        state = _state()
+        state["pr"]["files"] = [{"path": "docs/new-name.md", "status": "renamed"}]
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=["docs/new-name.md"]),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+            result["failures"],
+        )
+
+    def test_pull_file_evidence_preserves_rename_preimage_and_rejects_missing_one(self) -> None:
+        payload = [
+            [
+                {
+                    "filename": "docs/new-name.md",
+                    "status": "renamed",
+                    "previous_filename": "registry/tasks/old-name.json",
+                },
+                {"filename": "docs/other.md", "status": "modified"},
+            ]
+        ]
+        self.assertEqual(
+            pr_review_gate._pull_file_evidence(payload),
+            [
+                {
+                    "path": "docs/new-name.md",
+                    "status": "renamed",
+                    "previousPath": "registry/tasks/old-name.json",
+                },
+                {"path": "docs/other.md", "status": "modified"},
+            ],
+        )
+        self.assertIsNone(
+            pr_review_gate._pull_file_evidence(
+                [[{"filename": "docs/new-name.md", "status": "renamed"}]]
+            )
+        )
 
     def test_missing_changed_files_count_cannot_relax_base_binding(self) -> None:
         state = _state()
