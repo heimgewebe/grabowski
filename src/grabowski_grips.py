@@ -221,6 +221,44 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="worktree_admin",
         operation_class="worktree-admin",
     ),
+    "checkout-binding-identity-rebind-preview": GripSpec(
+        name="checkout-binding-identity-rebind-preview",
+        version="1.0",
+        summary="Preview one clean remote-secured managed checkout branch-rename identity rebind.",
+        effect=READ_ONLY,
+        required_parameters=("checkout_key",),
+        acceptance_ids=(
+            "checkout-key-bound",
+            "branch-rename-only",
+            "clean-uncoordinated",
+            "remote-and-lineage-proven",
+            "snapshot-bound",
+        ),
+        runner="checkout_binding_identity_rebind_preview",
+    ),
+    "checkout-binding-identity-rebind-apply": GripSpec(
+        name="checkout-binding-identity-rebind-apply",
+        version="1.0",
+        summary="CAS-apply one preview-bound lifecycle identity rebind without Git, owner, archive or cleanup effects.",
+        effect=MUTATING,
+        required_parameters=(
+            "checkout_key",
+            "owner_id",
+            "expected_snapshot_sha256",
+            "preview_created_at_unix",
+            "confirmation",
+        ),
+        acceptance_ids=(
+            "checkout-key-bound",
+            "snapshot-cas-bound",
+            "retention-live-revalidated",
+            "identity-only-effect",
+            "target-identity-converged",
+        ),
+        runner="checkout_binding_identity_rebind_apply",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
+    ),
     "checkout-owner-handoff-preview": GripSpec(
         name="checkout-owner-handoff-preview",
         version="1.0",
@@ -830,6 +868,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "worktree-hygiene-reconcile",
         "checkout-binding-terminal-preview",
         "checkout-binding-terminal-apply",
+        "checkout-binding-identity-rebind-preview",
+        "checkout-binding-identity-rebind-apply",
         "checkout-owner-handoff-preview",
         "checkout-owner-handoff-apply",
         "situation",
@@ -880,6 +920,8 @@ GRIP_SURFACE_TARGETS = {
     "worktree-hygiene-reconcile": "terminal repository worktree lifecycle",
     "checkout-binding-terminal-preview": "one missing managed checkout lifecycle binding",
     "checkout-binding-terminal-apply": "one preview-bound missing checkout lifecycle transition",
+    "checkout-binding-identity-rebind-preview": "one existing managed checkout with proven branch-name identity drift",
+    "checkout-binding-identity-rebind-apply": "one snapshot-bound lifecycle and retention expected-identity update",
     "checkout-owner-handoff-preview": "one clean managed checkout with lifecycle/retention owner drift",
     "checkout-owner-handoff-apply": "one snapshot-bound managed checkout owner alignment",
     "situation": "repository and PR situation snapshot",
@@ -936,6 +978,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "rerun checkout-binding-terminal-preview for the exact checkout key and apply only "
         "a fresh matching digest; never force-release leases, delete refs, or infer terminality "
         "from checkout absence"
+    ),
+    "checkout-binding-identity-rebind-apply": (
+        "rerun checkout-binding-identity-rebind-preview only while branch-name drift still exists; "
+        "after outcome_unknown inspect lifecycle and retention identity before any retry; never rewrite "
+        "Git history, change owner, archive or cleanup as recovery"
     ),
     "checkout-owner-handoff-apply": (
         "rerun checkout-owner-handoff-preview against the exact clean checkout and existing "
@@ -1003,6 +1050,10 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "checkout-binding-terminal-apply": (
         "requires the exact preview SHA-256, preview creation time and terminal-reconciliation confirmation; "
         "the existing reconciliation implementation revalidates terminal source evidence, coordination and CAS state",
+    ),
+    "checkout-binding-identity-rebind-apply": (
+        "requires the exact dedicated rebind snapshot, preview time and confirmation; apply revalidates clean checkout, "
+        "same owner, branch-only drift, head ancestry, remote security, coordination, live retention and both SQLite CAS preimages",
     ),
     "worktree-ensure": (
         "the leases for path:<target_path> and repo:<repo>:branch:<branch> must already be live "
@@ -5177,6 +5228,192 @@ def _run_checkout_binding_terminal_apply(
         },
         "receipt_status": "passed",
     }
+
+
+def _run_checkout_binding_identity_rebind_preview(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    checkout_key = _string_parameter(parameters, "checkout_key")
+    try:
+        output = grabowski_checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            checkout_key
+        )
+    except (ValueError, PermissionError, RuntimeError, OSError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    checkout = output.get("checkout")
+    coordination = output.get("coordination")
+    remote = output.get("remote")
+    lineage = output.get("head_lineage")
+    target = output.get("target_identity")
+    snapshot = output.get("snapshot_sha256")
+    observed = output.get("observed_at_unix")
+    confirmation = output.get("confirmation")
+    if (
+        output.get("kind") != "checkout_binding_identity_rebind_preview"
+        or not isinstance(checkout, dict)
+        or checkout.get("checkout_key") != checkout_key
+    ):
+        raise GripActionError("checkout identity rebind preview identity mismatch")
+    if output.get("allowed_drift_reasons") != [
+        "binding-expected-branch-mismatch",
+        "retention-expected-branch-mismatch",
+    ]:
+        raise GripActionError("checkout identity rebind preview exceeded branch-only drift")
+    if (
+        checkout.get("dirty") is not False
+        or not isinstance(coordination, dict)
+        or coordination.get("blocking") is not False
+    ):
+        raise GripActionError("checkout identity rebind preview is not clean and uncoordinated")
+    if (
+        not isinstance(remote, dict)
+        or remote.get("remote_secured") is not True
+        or not isinstance(lineage, dict)
+        or lineage.get("recorded_head_is_ancestor") is not True
+    ):
+        raise GripActionError("checkout identity rebind preview lacks remote and lineage proof")
+    if (
+        not isinstance(target, dict)
+        or target.get("expected_head") != checkout.get("head")
+        or target.get("expected_branch") != checkout.get("branch")
+        or not _is_sha256_hex(snapshot)
+        or type(observed) is not int
+        or not isinstance(confirmation, str)
+        or not confirmation.endswith(str(snapshot))
+    ):
+        raise GripActionError("checkout identity rebind preview lacks exact snapshot binding")
+    _check(receipt, "checkout-key-bound", "pass", checkout_key)
+    _check(receipt, "branch-rename-only", "pass", ",".join(output["allowed_drift_reasons"]))
+    _check(receipt, "clean-uncoordinated", "pass", "clean=true blocking=false")
+    _check(receipt, "remote-and-lineage-proven", "pass", str(lineage["recorded_head"]))
+    _check(receipt, "snapshot-bound", "pass", f"{snapshot}@{observed}")
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_checkout_binding_identity_rebind_apply(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    checkout_key = _string_parameter(parameters, "checkout_key")
+    owner_id = _string_parameter(parameters, "owner_id")
+    expected_snapshot = _string_parameter(parameters, "expected_snapshot_sha256")
+    confirmation = _string_parameter(parameters, "confirmation")
+    observed = parameters.get("preview_created_at_unix")
+    if not _is_sha256_hex(expected_snapshot):
+        raise GripPreflightError("expected_snapshot_sha256 must be a SHA-256 digest")
+    if type(observed) is not int or observed < 0:
+        raise GripPreflightError("preview_created_at_unix must be a non-negative integer")
+    try:
+        output = grabowski_checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            checkout_key, owner_id, expected_snapshot, observed, confirmation
+        )
+    except (ValueError, PermissionError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except RuntimeError as exc:
+        lifecycle = grabowski_checkouts._lifecycle_bindings([checkout_key]).get(checkout_key)
+        retention = grabowski_checkouts._retention_records([checkout_key]).get(checkout_key)
+        identity_rows_agree = (
+            isinstance(lifecycle, dict)
+            and isinstance(retention, dict)
+            and lifecycle.get("owner_id") == owner_id
+            and retention.get("owner_id") == owner_id
+            and lifecycle.get("expected_head") == retention.get("expected_head")
+            and lifecycle.get("expected_branch") == retention.get("expected_branch")
+        )
+        _check(receipt, "checkout-key-bound", "pass", checkout_key)
+        _check(receipt, "snapshot-cas-bound", "pass", expected_snapshot)
+        _check(receipt, "retention-live-revalidated", "skip", "apply outcome requires authoritative readback")
+        _check(receipt, "identity-only-effect", "skip", "apply outcome requires authoritative readback")
+        _check(
+            receipt,
+            "target-identity-converged",
+            "skip",
+            f"identity_rows_agree={str(identity_rows_agree).lower()}",
+        )
+        return {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_grip_outcome",
+            "status": "outcome_unknown",
+            "checkout_key": checkout_key,
+            "effect_started": True,
+            "readback_required": True,
+            "identity_rows_agree": identity_rows_agree,
+            "apply_error_type": type(exc).__name__,
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["checkout_binding_identity_rebind_readback_required"],
+            "does_not_establish": [
+                "target identity",
+                "audit completion",
+                "retry authority",
+                "archive or cleanup authority",
+            ],
+        }
+    before = output.get("before")
+    after = output.get("after")
+    audit = output.get("audit")
+    if (
+        output.get("kind") != "checkout_binding_identity_rebind_result"
+        or output.get("status") != "applied"
+        or output.get("snapshot_sha256") != expected_snapshot
+    ):
+        raise GripActionError("checkout identity rebind apply returned an invalid result")
+    if not isinstance(before, dict) or not isinstance(after, dict) or not isinstance(audit, dict):
+        raise GripActionError("checkout identity rebind apply lacks before/after/audit evidence")
+    before_lifecycle = before.get("lifecycle")
+    before_retention = before.get("retention")
+    after_lifecycle = after.get("lifecycle")
+    after_retention = after.get("retention")
+    if (
+        not isinstance(before_lifecycle, dict)
+        or not isinstance(before_retention, dict)
+        or not isinstance(after_lifecycle, dict)
+        or not isinstance(after_retention, dict)
+        or before_lifecycle.get("owner_id") != owner_id
+        or before_retention.get("owner_id") != owner_id
+        or before_lifecycle.get("expected_head") != before_retention.get("expected_head")
+        or before_lifecycle.get("expected_branch") != before_retention.get("expected_branch")
+        or after_lifecycle.get("owner_id") != owner_id
+        or after_retention.get("owner_id") != owner_id
+        or after_lifecycle.get("expected_head") != after_retention.get("expected_head")
+        or after_lifecycle.get("expected_branch") != after_retention.get("expected_branch")
+        or after_lifecycle.get("expected_head") == before_lifecycle.get("expected_head")
+        or after_lifecycle.get("expected_branch") == before_lifecycle.get("expected_branch")
+        or after_lifecycle.get("phase") != before_lifecycle.get("phase")
+    ):
+        raise GripActionError("checkout identity rebind apply did not converge one bounded identity update")
+    if audit.get("effects") != [
+        "lifecycle_expected_identity_update",
+        "retention_expected_identity_update",
+    ]:
+        raise GripActionError("checkout identity rebind apply exceeded identity-only effects")
+    _check(receipt, "checkout-key-bound", "pass", checkout_key)
+    _check(receipt, "snapshot-cas-bound", "pass", expected_snapshot)
+    _check(
+        receipt,
+        "retention-live-revalidated",
+        "pass",
+        str(after_retention.get("retention_until_unix")),
+    )
+    _check(receipt, "identity-only-effect", "pass", ",".join(audit["effects"]))
+    _check(
+        receipt,
+        "target-identity-converged",
+        "pass",
+        f"{after_lifecycle.get('expected_branch')}@{after_lifecycle.get('expected_head')}",
+    )
+    return {**output, "receipt_status": "passed"}
 
 
 def _owner_handoff_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
@@ -12678,6 +12915,8 @@ _RUNNERS = {
     "worktree_hygiene_reconcile": _run_worktree_hygiene_reconcile,
     "checkout_binding_terminal_preview": _run_checkout_binding_terminal_preview,
     "checkout_binding_terminal_apply": _run_checkout_binding_terminal_apply,
+    "checkout_binding_identity_rebind_preview": _run_checkout_binding_identity_rebind_preview,
+    "checkout_binding_identity_rebind_apply": _run_checkout_binding_identity_rebind_apply,
     "checkout_owner_handoff_preview": _run_checkout_owner_handoff_preview,
     "checkout_owner_handoff_apply": _run_checkout_owner_handoff_apply,
     "post_merge_sync": _run_post_merge_sync,

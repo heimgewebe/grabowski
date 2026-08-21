@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "9a921131b5cdfbb34003ec05a212c3b8cfe93c6bebc7d58aea858a23b6b749f3"
+    "sha256": "1999a55d4302823421a6b673de37270040056e97e5a8e7b9651752f516e032cb"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "cc174c47ffd17256c29e1758b13e4ff57e1c9d36282f97d25b8d5099b7b8fee4"
+    "sha256": "8db4ac968d59d42cb9636cdf8e2cd79316171aad7b939e0a3209801442c354d1"
   },
   "counts": {
     "core": 22,
-    "full": 196,
-    "operator": 181
+    "full": 198,
+    "operator": 183
   },
   "profiles": {
     "core": [
@@ -106,6 +106,8 @@
       "grabowski_checkout_binding_reconciliation",
       "grabowski_checkout_binding_terminal_preview",
       "grabowski_checkout_binding_terminal_apply",
+      "grabowski_checkout_binding_identity_rebind_preview",
+      "grabowski_checkout_binding_identity_rebind_apply",
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
@@ -293,6 +295,8 @@
       "grabowski_checkout_binding_reconciliation",
       "grabowski_checkout_binding_terminal_preview",
       "grabowski_checkout_binding_terminal_apply",
+      "grabowski_checkout_binding_identity_rebind_preview",
+      "grabowski_checkout_binding_identity_rebind_apply",
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
