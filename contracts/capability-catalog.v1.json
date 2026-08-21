@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "9de19f91440066d577a1836eeeb79c4d7a452502979b6346e4281917c6b953f0",
+  "capability_source_sha256": "2ae85246fc566463d3cd9af1659ebec1471e85b69d2a162d58dac7c2d95862fa",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "9a921131b5cdfbb34003ec05a212c3b8cfe93c6bebc7d58aea858a23b6b749f3",
+  "contract_sha256": "1999a55d4302823421a6b673de37270040056e97e5a8e7b9651752f516e032cb",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -837,6 +837,32 @@
       "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
       "risk_class": "medium",
       "tool": "grabowski_checkout_binding_terminal_apply"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "Preview one safe lifecycle identity rebind for an existing renamed checkout.",
+      "effects": [],
+      "id": "grabowski_checkout_binding_identity_rebind_preview",
+      "purpose": "Preview one clean, coordination-free and remote-secured existing checkout whose current branch name differs from its active lifecycle binding.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_binding_identity_rebind_preview"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "CAS-rebind lifecycle and retention identity after an exact safe preview.",
+      "effects": [
+        "audit-append",
+        "resource-lease",
+        "state-change"
+      ],
+      "id": "grabowski_checkout_binding_identity_rebind_apply",
+      "purpose": "CAS-update only lifecycle and retention expected head/branch after exact branch-rename preview and current retention revalidation.",
+      "read_only": false,
+      "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
+      "risk_class": "medium",
+      "tool": "grabowski_checkout_binding_identity_rebind_apply"
     },
     {
       "category": "checkout-lifecycle",
@@ -1926,7 +1952,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests. Work Lane identity metadata is server-owned and can only be\ncreated through the Work Lane acquisition path.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"
