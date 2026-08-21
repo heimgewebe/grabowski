@@ -141,11 +141,19 @@ def route_binding_from_decision(value: Any) -> dict[str, Any]:
     )
     if effect_profile not in EFFECT_PROFILES:
         raise ExecutionPlanError("route effect profile is unsupported")
+    if effect_profile == "delivery" and executor != "scoped_writer":
+        raise ExecutionPlanError(
+            "delivery effect profile requires a scoped_writer route"
+        )
     verification_policy = _required_text(
         route.get("verification_policy"), "route.verification_policy", maximum=32
     )
     if verification_policy not in VERIFICATION_POLICIES:
         raise ExecutionPlanError("route verification policy is unsupported")
+    if effect_profile == "delivery" and verification_policy != "independent_review":
+        raise ExecutionPlanError(
+            "delivery effect profile requires verification_policy=independent_review"
+        )
     return {
         "routing_contract_version": ROUTING_CONTRACT_VERSION,
         "recommendation_sha256": recommendation,

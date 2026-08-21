@@ -19,13 +19,18 @@ SHA_B = "b" * 64
 SHA_C = "c" * 64
 
 
-def route_decision(*, verification_policy: str = "independent_review") -> dict:
+def route_decision(
+    *,
+    verification_policy: str = "independent_review",
+    effect_profile: str = "candidate",
+    executor: str = "scoped_writer",
+) -> dict:
     body = {
         "schema_version": 2,
         "routing_contract_version": execution_plan.ROUTING_CONTRACT_VERSION,
-        "executor": "scoped_writer",
+        "executor": executor,
         "writer_route": "codex-sol-high",
-        "effect_profile": "candidate",
+        "effect_profile": effect_profile,
         "verification_policy": verification_policy,
         "task_class": "complex-patch",
         "risk": {"flags": [], "novelty": "medium", "critical_task_class": False},
@@ -126,6 +131,34 @@ class ExecutionPlanTests(unittest.TestCase):
         route["writer_route"] = "different-route"
         with self.assertRaisesRegex(execution_plan.ExecutionPlanError, "digest mismatch"):
             writer_verify_plan(route_decision=route)
+
+    def test_delivery_profile_is_immutably_bound_through_execution_plan(self) -> None:
+        plan = writer_verify_plan(
+            route_decision=route_decision(
+                effect_profile="delivery", verification_policy="independent_review"
+            )
+        )
+        self.assertEqual("delivery", plan["route_binding"]["effect_profile"])
+        self.assertEqual(plan, execution_plan.validate_execution_plan(plan))
+
+    def test_delivery_profile_rejects_deterministic_verification(self) -> None:
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError,
+            "requires verification_policy=independent_review",
+        ):
+            execution_plan.route_binding_from_decision(
+                route_decision(
+                    effect_profile="delivery", verification_policy="deterministic"
+                )
+            )
+
+    def test_delivery_profile_rejects_controller_route(self) -> None:
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError, "requires a scoped_writer"
+        ):
+            execution_plan.route_binding_from_decision(
+                route_decision(effect_profile="delivery", executor="controller")
+            )
 
     def test_route_and_revision_payloads_are_bounded(self) -> None:
         route = route_decision()

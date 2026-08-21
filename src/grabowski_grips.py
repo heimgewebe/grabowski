@@ -221,6 +221,44 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="worktree_admin",
         operation_class="worktree-admin",
     ),
+    "checkout-binding-identity-rebind-preview": GripSpec(
+        name="checkout-binding-identity-rebind-preview",
+        version="1.0",
+        summary="Preview one clean remote-secured managed checkout branch-rename identity rebind.",
+        effect=READ_ONLY,
+        required_parameters=("checkout_key",),
+        acceptance_ids=(
+            "checkout-key-bound",
+            "branch-rename-only",
+            "clean-uncoordinated",
+            "remote-and-lineage-proven",
+            "snapshot-bound",
+        ),
+        runner="checkout_binding_identity_rebind_preview",
+    ),
+    "checkout-binding-identity-rebind-apply": GripSpec(
+        name="checkout-binding-identity-rebind-apply",
+        version="1.0",
+        summary="CAS-apply one preview-bound lifecycle identity rebind without Git, owner, archive or cleanup effects.",
+        effect=MUTATING,
+        required_parameters=(
+            "checkout_key",
+            "owner_id",
+            "expected_snapshot_sha256",
+            "preview_created_at_unix",
+            "confirmation",
+        ),
+        acceptance_ids=(
+            "checkout-key-bound",
+            "snapshot-cas-bound",
+            "retention-live-revalidated",
+            "identity-only-effect",
+            "target-identity-converged",
+        ),
+        runner="checkout_binding_identity_rebind_apply",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
+    ),
     "checkout-owner-handoff-preview": GripSpec(
         name="checkout-owner-handoff-preview",
         version="1.0",
@@ -742,10 +780,10 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "agent-execution-happy-path": GripSpec(
         name="agent-execution-happy-path",
-        version="1.1",
+        version="1.2",
         summary=(
             "Bind one bounded Source request to Route/ExecutionPlan/Work Lane/Agent Workspace, "
-            "or resume an existing lane-backed Workspace, and advance it autonomously to integration_ready."
+            "or resume an existing lane-backed Workspace, and advance its bound Candidate or Delivery profile to integration_ready."
         ),
         effect=MUTATING,
         required_parameters=("base", "title"),
@@ -830,6 +868,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "worktree-hygiene-reconcile",
         "checkout-binding-terminal-preview",
         "checkout-binding-terminal-apply",
+        "checkout-binding-identity-rebind-preview",
+        "checkout-binding-identity-rebind-apply",
         "checkout-owner-handoff-preview",
         "checkout-owner-handoff-apply",
         "situation",
@@ -880,6 +920,8 @@ GRIP_SURFACE_TARGETS = {
     "worktree-hygiene-reconcile": "terminal repository worktree lifecycle",
     "checkout-binding-terminal-preview": "one missing managed checkout lifecycle binding",
     "checkout-binding-terminal-apply": "one preview-bound missing checkout lifecycle transition",
+    "checkout-binding-identity-rebind-preview": "one existing managed checkout with proven branch-name identity drift",
+    "checkout-binding-identity-rebind-apply": "one snapshot-bound lifecycle and retention expected-identity update",
     "checkout-owner-handoff-preview": "one clean managed checkout with lifecycle/retention owner drift",
     "checkout-owner-handoff-apply": "one snapshot-bound managed checkout owner alignment",
     "situation": "repository and PR situation snapshot",
@@ -916,7 +958,7 @@ GRIP_SURFACE_TARGETS = {
     "branch-publish": "git branch publication",
     "pr-create-or-update": "GitHub pull request metadata",
     "candidate-integration-ready": "one closed verified Agent Workspace through controller custody to an exact ready PR",
-    "agent-execution-happy-path": "one bounded Source request or lane-backed Agent Workspace through autonomous coordination to integration_ready",
+    "agent-execution-happy-path": "one bounded Source request or lane-backed Agent Workspace through profile-bound autonomous coordination to integration_ready",
 }
 GRIP_SURFACE_RECOVERY_PATHS = {
     READ_ONLY: "rerun the grip with the same inputs; no local recovery should be required",
@@ -925,7 +967,7 @@ GRIP_SURFACE_RECOVERY_PATHS = {
 GRIP_RECOVERY_PATHS_BY_NAME = {
     "agent-execution-happy-path": (
         "read back the exact Source-derived Work Lane, Workspace coordinator status, continuation job and any nested "
-        "candidate-integration-ready receipt; never replay an unknown lane/workspace/collect/revision/close/adoption/push/PR "
+        "candidate-integration-ready receipt or immutable CandidateDeliveryManifest.v1; never replay an unknown lane/workspace/collect/revision/close/commit/adoption/push/PR "
         "effect without its named authoritative readback"
     ),
     "candidate-integration-ready": (
@@ -936,6 +978,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "rerun checkout-binding-terminal-preview for the exact checkout key and apply only "
         "a fresh matching digest; never force-release leases, delete refs, or infer terminality "
         "from checkout absence"
+    ),
+    "checkout-binding-identity-rebind-apply": (
+        "rerun checkout-binding-identity-rebind-preview only while branch-name drift still exists; "
+        "after outcome_unknown inspect lifecycle and retention identity before any retry; never rewrite "
+        "Git history, change owner, archive or cleanup as recovery"
     ),
     "checkout-owner-handoff-apply": (
         "rerun checkout-owner-handoff-preview against the exact clean checkout and existing "
@@ -986,11 +1033,13 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 GRIP_CONDITIONAL_PRECONDITIONS = {
     "agent-execution-happy-path": (
         "exactly one mode is required: workspace_id resumes one lane-backed Agent Workspace; otherwise source_kind, source_id, repo, source_revision, write_paths, objective, test_argv and retention_until_unix form one bounded Source request",
-        "Source mode derives branch, target checkout, idempotency identity, canonical route, ExecutionPlan.v1 and route-bound writer/reviewer commands server-side; callers cannot select branch, target, Candidate or revision identities",
+        "Source mode derives branch, target checkout, idempotency identity, canonical route, ExecutionPlan.v1 and route-bound writer/reviewer commands server-side; effect_profile defaults to candidate and delivery is an explicit scoped-writer-only opt-in; resume derives the profile from the lane plan",
+        "callers cannot select branch, target, Candidate, delivery action or revision identities",
         "Work Lane binds scoped-writer authority but receives no scoped_writer_argv, so Agent Workspace is the only writer-start owner",
         "the internal execution coordinator owns no state store and may only collect, consume the one bounded candidate revision, or close through existing workspace seams",
         "ordinary pending async progress is handed to one deterministic existing Grabowski job; a continuation runner never creates another continuation job",
-        "candidate-integration-ready is invoked only after exact closed PASS Candidate bindings are revalidated from coordinator status",
+        "candidate-integration-ready remains the candidate-default P1-P5 path; delivery commit/push/PR runs internally only after exact closed PASS Candidate bindings and candidate/commit tree equality are revalidated",
+        "writer delivery never terminalizes, releases, merges or deploys; the outer controller alone may terminalize pr_opened/pr_updated and snapshot-release exact lane leases",
     ),
     "candidate-integration-ready": (
         "workspace_id must name a closed lane-backed Agent Workspace whose current Candidate is fully PASS-verified; "
@@ -1001,6 +1050,10 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "checkout-binding-terminal-apply": (
         "requires the exact preview SHA-256, preview creation time and terminal-reconciliation confirmation; "
         "the existing reconciliation implementation revalidates terminal source evidence, coordination and CAS state",
+    ),
+    "checkout-binding-identity-rebind-apply": (
+        "requires the exact dedicated rebind snapshot, preview time and confirmation; apply revalidates clean checkout, "
+        "same owner, branch-only drift, head ancestry, remote security, coordination, live retention and both SQLite CAS preimages",
     ),
     "worktree-ensure": (
         "the leases for path:<target_path> and repo:<repo>:branch:<branch> must already be live "
@@ -5177,6 +5230,192 @@ def _run_checkout_binding_terminal_apply(
     }
 
 
+def _run_checkout_binding_identity_rebind_preview(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    checkout_key = _string_parameter(parameters, "checkout_key")
+    try:
+        output = grabowski_checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            checkout_key
+        )
+    except (ValueError, PermissionError, RuntimeError, OSError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    checkout = output.get("checkout")
+    coordination = output.get("coordination")
+    remote = output.get("remote")
+    lineage = output.get("head_lineage")
+    target = output.get("target_identity")
+    snapshot = output.get("snapshot_sha256")
+    observed = output.get("observed_at_unix")
+    confirmation = output.get("confirmation")
+    if (
+        output.get("kind") != "checkout_binding_identity_rebind_preview"
+        or not isinstance(checkout, dict)
+        or checkout.get("checkout_key") != checkout_key
+    ):
+        raise GripActionError("checkout identity rebind preview identity mismatch")
+    if output.get("allowed_drift_reasons") != [
+        "binding-expected-branch-mismatch",
+        "retention-expected-branch-mismatch",
+    ]:
+        raise GripActionError("checkout identity rebind preview exceeded branch-only drift")
+    if (
+        checkout.get("dirty") is not False
+        or not isinstance(coordination, dict)
+        or coordination.get("blocking") is not False
+    ):
+        raise GripActionError("checkout identity rebind preview is not clean and uncoordinated")
+    if (
+        not isinstance(remote, dict)
+        or remote.get("remote_secured") is not True
+        or not isinstance(lineage, dict)
+        or lineage.get("recorded_head_is_ancestor") is not True
+    ):
+        raise GripActionError("checkout identity rebind preview lacks remote and lineage proof")
+    if (
+        not isinstance(target, dict)
+        or target.get("expected_head") != checkout.get("head")
+        or target.get("expected_branch") != checkout.get("branch")
+        or not _is_sha256_hex(snapshot)
+        or type(observed) is not int
+        or not isinstance(confirmation, str)
+        or not confirmation.endswith(str(snapshot))
+    ):
+        raise GripActionError("checkout identity rebind preview lacks exact snapshot binding")
+    _check(receipt, "checkout-key-bound", "pass", checkout_key)
+    _check(receipt, "branch-rename-only", "pass", ",".join(output["allowed_drift_reasons"]))
+    _check(receipt, "clean-uncoordinated", "pass", "clean=true blocking=false")
+    _check(receipt, "remote-and-lineage-proven", "pass", str(lineage["recorded_head"]))
+    _check(receipt, "snapshot-bound", "pass", f"{snapshot}@{observed}")
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_checkout_binding_identity_rebind_apply(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    checkout_key = _string_parameter(parameters, "checkout_key")
+    owner_id = _string_parameter(parameters, "owner_id")
+    expected_snapshot = _string_parameter(parameters, "expected_snapshot_sha256")
+    confirmation = _string_parameter(parameters, "confirmation")
+    observed = parameters.get("preview_created_at_unix")
+    if not _is_sha256_hex(expected_snapshot):
+        raise GripPreflightError("expected_snapshot_sha256 must be a SHA-256 digest")
+    if type(observed) is not int or observed < 0:
+        raise GripPreflightError("preview_created_at_unix must be a non-negative integer")
+    try:
+        output = grabowski_checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            checkout_key, owner_id, expected_snapshot, observed, confirmation
+        )
+    except (ValueError, PermissionError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except RuntimeError as exc:
+        lifecycle = grabowski_checkouts._lifecycle_bindings([checkout_key]).get(checkout_key)
+        retention = grabowski_checkouts._retention_records([checkout_key]).get(checkout_key)
+        identity_rows_agree = (
+            isinstance(lifecycle, dict)
+            and isinstance(retention, dict)
+            and lifecycle.get("owner_id") == owner_id
+            and retention.get("owner_id") == owner_id
+            and lifecycle.get("expected_head") == retention.get("expected_head")
+            and lifecycle.get("expected_branch") == retention.get("expected_branch")
+        )
+        _check(receipt, "checkout-key-bound", "pass", checkout_key)
+        _check(receipt, "snapshot-cas-bound", "pass", expected_snapshot)
+        _check(receipt, "retention-live-revalidated", "skip", "apply outcome requires authoritative readback")
+        _check(receipt, "identity-only-effect", "skip", "apply outcome requires authoritative readback")
+        _check(
+            receipt,
+            "target-identity-converged",
+            "skip",
+            f"identity_rows_agree={str(identity_rows_agree).lower()}",
+        )
+        return {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_grip_outcome",
+            "status": "outcome_unknown",
+            "checkout_key": checkout_key,
+            "effect_started": True,
+            "readback_required": True,
+            "identity_rows_agree": identity_rows_agree,
+            "apply_error_type": type(exc).__name__,
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["checkout_binding_identity_rebind_readback_required"],
+            "does_not_establish": [
+                "target identity",
+                "audit completion",
+                "retry authority",
+                "archive or cleanup authority",
+            ],
+        }
+    before = output.get("before")
+    after = output.get("after")
+    audit = output.get("audit")
+    if (
+        output.get("kind") != "checkout_binding_identity_rebind_result"
+        or output.get("status") != "applied"
+        or output.get("snapshot_sha256") != expected_snapshot
+    ):
+        raise GripActionError("checkout identity rebind apply returned an invalid result")
+    if not isinstance(before, dict) or not isinstance(after, dict) or not isinstance(audit, dict):
+        raise GripActionError("checkout identity rebind apply lacks before/after/audit evidence")
+    before_lifecycle = before.get("lifecycle")
+    before_retention = before.get("retention")
+    after_lifecycle = after.get("lifecycle")
+    after_retention = after.get("retention")
+    if (
+        not isinstance(before_lifecycle, dict)
+        or not isinstance(before_retention, dict)
+        or not isinstance(after_lifecycle, dict)
+        or not isinstance(after_retention, dict)
+        or before_lifecycle.get("owner_id") != owner_id
+        or before_retention.get("owner_id") != owner_id
+        or before_lifecycle.get("expected_head") != before_retention.get("expected_head")
+        or before_lifecycle.get("expected_branch") != before_retention.get("expected_branch")
+        or after_lifecycle.get("owner_id") != owner_id
+        or after_retention.get("owner_id") != owner_id
+        or after_lifecycle.get("expected_head") != after_retention.get("expected_head")
+        or after_lifecycle.get("expected_branch") != after_retention.get("expected_branch")
+        or after_lifecycle.get("expected_head") == before_lifecycle.get("expected_head")
+        or after_lifecycle.get("expected_branch") == before_lifecycle.get("expected_branch")
+        or after_lifecycle.get("phase") != before_lifecycle.get("phase")
+    ):
+        raise GripActionError("checkout identity rebind apply did not converge one bounded identity update")
+    if audit.get("effects") != [
+        "lifecycle_expected_identity_update",
+        "retention_expected_identity_update",
+    ]:
+        raise GripActionError("checkout identity rebind apply exceeded identity-only effects")
+    _check(receipt, "checkout-key-bound", "pass", checkout_key)
+    _check(receipt, "snapshot-cas-bound", "pass", expected_snapshot)
+    _check(
+        receipt,
+        "retention-live-revalidated",
+        "pass",
+        str(after_retention.get("retention_until_unix")),
+    )
+    _check(receipt, "identity-only-effect", "pass", ",".join(audit["effects"]))
+    _check(
+        receipt,
+        "target-identity-converged",
+        "pass",
+        f"{after_lifecycle.get('expected_branch')}@{after_lifecycle.get('expected_head')}",
+    )
+    return {**output, "receipt_status": "passed"}
+
+
 def _owner_handoff_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
     expected_head = _sha_parameter(parameters, "expected_head").lower()
     if len(expected_head) != 40:
@@ -5667,9 +5906,15 @@ def _run_pr_create_or_update(
         _check(receipt, "existing_pr_draft_state", "pass", f"draft={existing_draft}")
         draft = existing_draft if requested_draft is None else requested_draft
         _check(receipt, "existing_pr", "pass", str(existing.get("number")))
-        edit_args = ["pr", "edit", str(existing["number"]), "--title", title]
-        if body:
-            edit_args.extend(["--body", body])
+        edit_args = [
+            "pr",
+            "edit",
+            str(existing["number"]),
+            "--title",
+            title,
+            "--body",
+            body,
+        ]
         _github(repo, github_runner, edit_args)
         if requested_draft is None:
             _check(receipt, "pr_draft_transition", "skip", f"request omitted; preserved draft={draft}")
@@ -5758,6 +6003,7 @@ _AGENT_EXECUTION_SOURCE_FIELDS = frozenset(
         "novelty",
         "risk_flags",
         "verification_policy",
+        "effect_profile",
         "review_objective",
         "runtime_seconds",
     }
@@ -6005,6 +6251,11 @@ def _agent_execution_source_request(
         raise GripPreflightError(
             "P5 one-shot verification_policy must be deterministic or independent_review"
         )
+    effect_profile = parameters.get("effect_profile", "candidate")
+    if effect_profile not in {"candidate", "delivery"}:
+        raise GripPreflightError(
+            "effect_profile must be candidate or delivery"
+        )
 
     try:
         route = router.canonical_execution_route(
@@ -6016,11 +6267,12 @@ def _agent_execution_source_request(
             latency_priority=False,
             need_review=verification_policy == "independent_review",
             verification_policy=verification_policy,
+            effect_profile=effect_profile,
         )
     except Exception as exc:
         raise GripPreflightError("canonical execution routing failed") from exc
-    if not isinstance(route, dict) or route.get("effect_profile") != "candidate":
-        raise GripPreflightError("canonical route is not a P5 candidate execution route")
+    if not isinstance(route, dict) or route.get("effect_profile") != effect_profile:
+        raise GripPreflightError("canonical route effect profile differs from the request")
     try:
         execution_plan.route_binding_from_decision(route)
         plan = _agent_execution_build_plan(
@@ -6056,6 +6308,8 @@ def _agent_execution_source_request(
         "runtime_seconds": runtime_seconds,
         "retention_until_unix": retention_until_unix,
     }
+    if effect_profile == "delivery":
+        request_material["effect_profile"] = "delivery"
     request_sha256 = sha256_json(request_material)
     branch = f"feat/aef-{_agent_execution_slug(source_id)}-{source_identity_sha256[:10]}"
     target = repo.parent / f".grabowski-aef-{_agent_execution_slug(repo.name, maximum=16)}-{source_identity_sha256[:12]}"
@@ -6077,6 +6331,7 @@ def _agent_execution_source_request(
         "lane_id": None,
         "lane_receipt_sha256": None,
         "reconcile_required": False,
+        **({"effect_profile": "delivery"} if effect_profile == "delivery" else {}),
     }
     if route.get("executor") == "controller":
         _check(
@@ -6136,7 +6391,11 @@ def _agent_execution_source_request(
         "base_head": source_revision,
         "branch": branch,
         "target_path": str(target),
-        "purpose": f"AEF P5 one-shot {source_kind}:{source_id} {request_sha256[:12]}",
+        "purpose": (
+            f"AEF P6 delivery {source_kind}:{source_id} {request_sha256[:12]}"
+            if effect_profile == "delivery"
+            else f"AEF P5 one-shot {source_kind}:{source_id} {request_sha256[:12]}"
+        ),
         "retention_until_unix": retention_until_unix,
         "artifact_class": "implementation-worktree",
         "idempotency_key": f"aef-{source_identity_sha256[:20]}-{request_sha256[:20]}",
@@ -6542,6 +6801,62 @@ def _agent_execution_bound_writer_command(workspace: Any, workspace_id: str) -> 
     return list(command)
 
 
+def _agent_execution_bound_effect_profile(
+    workspace: Any,
+    workspace_id: str,
+    *,
+    frontdoor: dict[str, Any] | None,
+) -> str:
+    if isinstance(frontdoor, dict):
+        plan = frontdoor.get("execution_plan")
+        route_binding = plan.get("route_binding") if isinstance(plan, dict) else None
+        profile = (
+            route_binding.get("effect_profile")
+            if isinstance(route_binding, dict)
+            else None
+        )
+        if profile in {"candidate", "delivery"}:
+            return str(profile)
+        raise GripPreflightError("Source-mode ExecutionPlan effect profile is invalid")
+    try:
+        manifest = workspace._manifest(workspace_id)
+    except Exception as exc:
+        raise GripPreflightError("workspace manifest is not safely readable") from exc
+    if not isinstance(manifest, dict) or not workspace._lane_backed(manifest):
+        raise GripPreflightError("effect profile requires a lane-backed Agent Workspace")
+    resources_value = manifest.get("resources")
+    lane_binding = (
+        resources_value.get("lane_binding")
+        if isinstance(resources_value, dict)
+        else None
+    )
+    # P1-P5 lane workspaces without a bound P6 profile remain Candidate-mode.
+    if not isinstance(lane_binding, dict) or not hasattr(workspace, "_lane_receipt"):
+        return "candidate"
+    lane_id = lane_binding.get("lane_id")
+    lane_receipt_sha256 = lane_binding.get("receipt_sha256")
+    if not isinstance(lane_id, str) or not isinstance(lane_receipt_sha256, str):
+        return "candidate"
+    try:
+        lane = workspace._lane_receipt(lane_id, lane_receipt_sha256)
+    except Exception as exc:
+        raise GripPreflightError("bound Work Lane is not safely readable") from exc
+    inputs = lane.get("inputs") if isinstance(lane, dict) else None
+    plan = inputs.get("execution_plan") if isinstance(inputs, dict) else None
+    if plan is None:
+        return "candidate"
+    try:
+        import grabowski_execution_plan as execution_plan
+
+        validated = execution_plan.validate_execution_plan(plan)
+    except Exception as exc:
+        raise GripPreflightError("bound ExecutionPlan.v1 is invalid") from exc
+    profile = validated["route_binding"]["effect_profile"]
+    if profile == "delivery" and validated["route_binding"]["executor"] != "scoped_writer":
+        raise GripPreflightError("delivery profile drifted from scoped_writer authority")
+    return str(profile)
+
+
 def _agent_execution_closed_candidate(status: Any) -> dict[str, Any] | None:
     if not isinstance(status, dict):
         return None
@@ -6687,6 +7002,11 @@ def _run_agent_execution_happy_path(
 
     coordinator, workspace = _agent_execution_happy_path_modules()
     revision_argv = _agent_execution_bound_writer_command(workspace, workspace_id)
+    effect_profile = _agent_execution_bound_effect_profile(
+        workspace,
+        workspace_id,
+        frontdoor=frontdoor,
+    )
     _check(receipt, "revision-command-server-bound", "pass", "workspace manifest writer command")
 
     def with_frontdoor(value: dict[str, Any]) -> dict[str, Any]:
@@ -6834,6 +7154,106 @@ def _run_agent_execution_happy_path(
             }
         )
     _check(receipt, "closed-candidate-exact", "pass", candidate["candidate_id"])
+    if effect_profile == "delivery":
+        delivery = _run_candidate_delivery_profile(
+            workspace_id=workspace_id,
+            expected_candidate_id=candidate["candidate_id"],
+            expected_result_sha256=candidate["result_sha256"],
+            base=base,
+            title=title,
+            body=body,
+            runner=runner,
+            github_runner=github_runner,
+        )
+        if delivery.get("delivery_ready") is not True:
+            _check(
+                receipt,
+                "candidate-integration-composed",
+                "fail",
+                str(delivery.get("state")),
+            )
+            _check(
+                receipt,
+                "unknown-effect-no-retry",
+                "pass",
+                str(delivery.get("next_action")),
+            )
+            return with_frontdoor(
+                {
+                    **delivery,
+                    "workspace_id": workspace_id,
+                    "candidate": candidate,
+                    "coordinator": coordinated,
+                    "integration_ready": False,
+                    "receipt_status": "blocked",
+                }
+            )
+        terminalization = _controller_terminalize_delivered_source(
+            delivery=delivery,
+            runner=runner,
+            github_runner=github_runner,
+        )
+        if terminalization.get("terminalized") is not True:
+            _check(
+                receipt,
+                "candidate-integration-composed",
+                "fail",
+                str(terminalization.get("state")),
+            )
+            _check(
+                receipt,
+                "unknown-effect-no-retry",
+                "pass",
+                str(terminalization.get("next_action")),
+            )
+            return with_frontdoor(
+                {
+                    **delivery,
+                    "state": str(terminalization.get("state")),
+                    "workspace_id": workspace_id,
+                    "candidate": candidate,
+                    "coordinator": coordinated,
+                    "terminalization": terminalization,
+                    "integration_ready": True,
+                    "cleanup_complete": False,
+                    "reconcile_required": True,
+                    "next_action": terminalization.get("next_action"),
+                    "receipt_status": "blocked",
+                }
+            )
+        _check(
+            receipt,
+            "candidate-integration-composed",
+            "pass",
+            str(delivery.get("state")),
+        )
+        _check(
+            receipt,
+            "unknown-effect-no-retry",
+            "pass",
+            "delivery publication has exact remote and PR readback",
+        )
+        return with_frontdoor(
+            {
+                **delivery,
+                "state": "integration_ready",
+                "workspace_id": workspace_id,
+                "candidate": candidate,
+                "coordinator": coordinated,
+                "terminalization": terminalization,
+                "integration_ready": True,
+                "cleanup_complete": True,
+                "reconcile_required": False,
+                "next_action": "observe_ci_and_review_then_merge_under_controller_authority",
+                "later_correction": "open_a_new_lane; never revive_this_terminalized_source_lane",
+                "nonclaims": [
+                    "merge remains controller-only",
+                    "deployment remains controller-only",
+                    "delivery does not authorize source-lane revival",
+                ],
+                "receipt_status": "passed",
+            }
+        )
     integration = run_grip(
         "candidate-integration-ready",
         {
@@ -7005,6 +7425,952 @@ def _candidate_open_pr_readback(
     ):
         return dict(item)
     return None
+
+
+def _candidate_delivery_modules() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+    workspace, work_acquire, lane_closeout, resource_store, checkouts = (
+        _candidate_integration_modules()
+    )
+    import grabowski_candidate_adoption as delivery_profile
+    import grabowski_execution_plan as execution_plan
+
+    return (
+        workspace,
+        work_acquire,
+        lane_closeout,
+        resource_store,
+        checkouts,
+        delivery_profile,
+        execution_plan,
+    )
+
+
+def _delivery_remote_readback(
+    repo: Path,
+    runner: CommandRunner,
+    *,
+    branch: str,
+    expected_head: str,
+) -> dict[str, Any]:
+    result = _git_optional(repo, runner, ["ls-remote", "origin", f"refs/heads/{branch}"])
+    if int(result.get("returncode", 1)) != 0:
+        return {"state": "unavailable", "head": None}
+    lines = [line.split() for line in str(result.get("stdout", "")).splitlines() if line.strip()]
+    if not lines:
+        return {"state": "absent", "head": None}
+    if len(lines) != 1 or len(lines[0]) < 2 or re.fullmatch(r"[0-9a-f]{40}", lines[0][0]) is None:
+        return {"state": "unavailable", "head": None}
+    head = lines[0][0]
+    return {"state": "exact" if head == expected_head else "drifted", "head": head}
+
+
+def _delivery_pr_readback(
+    repo: Path,
+    github_runner: GithubRunner,
+    *,
+    branch: str,
+    base: str,
+    expected_head: str,
+    title: str,
+    body: str,
+    draft: bool,
+) -> dict[str, Any]:
+    try:
+        value = _json_stdout(
+            _github(
+                repo,
+                github_runner,
+                [
+                    "pr",
+                    "list",
+                    "--head",
+                    branch,
+                    "--state",
+                    "open",
+                    "--json",
+                    "number,url,state,baseRefName,headRefName,headRefOid,isDraft,title,body",
+                ],
+            )
+        )
+    except Exception as exc:
+        return {"state": "unavailable", "pr": None, "error": type(exc).__name__}
+    if not isinstance(value, list):
+        return {"state": "unavailable", "pr": None, "error": "invalid_shape"}
+    if len(value) > 1:
+        return {"state": "duplicate", "pr": None, "count": len(value)}
+    if not value:
+        return {"state": "absent", "pr": None}
+    item = value[0]
+    if not isinstance(item, dict):
+        return {"state": "unavailable", "pr": None, "error": "invalid_item"}
+    structural_exact = bool(
+        item.get("baseRefName") == base
+        and item.get("headRefName") == branch
+        and item.get("headRefOid") == expected_head
+        and isinstance(item.get("number"), int)
+    )
+    if not structural_exact:
+        return {"state": "drifted", "pr": dict(item)}
+    metadata_exact = bool(
+        item.get("isDraft") is draft
+        and item.get("title") == title
+        and item.get("body") == body
+    )
+    return {
+        "state": "exact" if metadata_exact else "update_required",
+        "pr": dict(item),
+    }
+
+
+def _delivery_local_commit_readback(
+    worktree: Path,
+    runner: CommandRunner,
+    *,
+    branch: str,
+    base_commit: str,
+    head_commit: str,
+    expected_tree: str,
+    expected_message: str,
+) -> dict[str, Any] | None:
+    try:
+        observed_branch = str(
+            _git(worktree, runner, ["branch", "--show-current"]).get("stdout", "")
+        ).strip()
+        observed_head = str(_git(worktree, runner, ["rev-parse", "HEAD"]).get("stdout", "")).strip().lower()
+        parents = str(
+            _git(worktree, runner, ["rev-list", "--parents", "-n", "1", observed_head]).get(
+                "stdout", ""
+            )
+        ).strip().split()
+        tree = str(
+            _git(worktree, runner, ["rev-parse", f"{observed_head}^{{tree}}"]).get(
+                "stdout", ""
+            )
+        ).strip().lower()
+        message = str(
+            _git(worktree, runner, ["show", "-s", "--format=%s", observed_head]).get(
+                "stdout", ""
+            )
+        ).rstrip("\n")
+        status = str(
+            _git(worktree, runner, ["status", "--porcelain=v1", "--untracked-files=all"]).get(
+                "stdout", ""
+            )
+        )
+    except Exception:
+        return None
+    if not (
+        observed_branch == branch
+        and observed_head == head_commit
+        and parents == [head_commit, base_commit]
+        and tree == expected_tree
+        and message == expected_message
+        and status == ""
+    ):
+        return None
+    return {
+        "branch": observed_branch,
+        "head_sha": observed_head,
+        "parent_sha": base_commit,
+        "git_tree_sha": tree,
+        "clean": True,
+    }
+
+
+def _delivery_identity_context(
+    *,
+    workspace: Any,
+    work_acquire: Any,
+    execution_plan: Any,
+    workspace_id: str,
+    expected_candidate_id: str,
+    expected_result_sha256: str,
+) -> dict[str, Any]:
+    manifest = workspace._manifest(workspace_id)
+    if not isinstance(manifest, dict) or not workspace._lane_backed(manifest):
+        raise GripPreflightError("delivery requires a lane-backed Agent Workspace")
+    resources_value = manifest.get("resources")
+    lane_binding = resources_value.get("lane_binding") if isinstance(resources_value, dict) else None
+    if not isinstance(lane_binding, dict):
+        raise GripPreflightError("delivery Work Lane binding is missing")
+    lane_id = lane_binding.get("lane_id")
+    lane_receipt_sha256 = lane_binding.get("receipt_sha256")
+    if (
+        not isinstance(lane_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", lane_id) is None
+        or not isinstance(lane_receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", lane_receipt_sha256) is None
+    ):
+        raise GripPreflightError("delivery Work Lane identity is invalid")
+    record = _candidate_lane_record(work_acquire, lane_id)
+    terminal_closeout = record.get("terminal_closeout")
+    if terminal_closeout is not None and (
+        not isinstance(terminal_closeout, dict)
+        or terminal_closeout.get("closeout_state") not in {"pr_opened", "pr_updated"}
+    ):
+        raise GripPreflightError("terminalized source lane cannot be revived for delivery")
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict):
+        raise GripPreflightError("delivery Work Lane inputs are missing")
+    plan_value = inputs.get("execution_plan")
+    try:
+        plan = execution_plan.validate_execution_plan(plan_value)
+    except Exception as exc:
+        raise GripPreflightError("delivery ExecutionPlan.v1 is invalid") from exc
+    route = plan["route_binding"]
+    scoped_writer = inputs.get("scoped_writer")
+    scope = manifest.get("scope")
+    allowed_paths = scope.get("allowed_paths") if isinstance(scope, dict) else None
+    if (
+        route.get("effect_profile") != "delivery"
+        or route.get("executor") != "scoped_writer"
+        or not isinstance(scoped_writer, dict)
+        or scoped_writer.get("role") != "scoped_writer"
+        or scoped_writer.get("actor") != f"scoped-writer:{route.get('writer_route')}"
+        or inputs.get("source") != plan.get("source_binding")
+        or inputs.get("repo") != manifest.get("repository")
+        or inputs.get("target_path") != manifest.get("writer_worktree")
+        or inputs.get("branch") != manifest.get("writer_branch")
+        or inputs.get("base_head") != manifest.get("expected_base_head")
+        or (
+            terminal_closeout is None
+            and record.get("receipt_sha256") != lane_receipt_sha256
+        )
+        or (
+            isinstance(terminal_closeout, dict)
+            and terminal_closeout.get("expected_receipt_sha256")
+            != lane_receipt_sha256
+        )
+        or not isinstance(allowed_paths, list)
+        or sorted(allowed_paths) != plan.get("write_scope")
+        or sorted(inputs.get("write_paths", [])) != plan.get("write_scope")
+    ):
+        raise GripPreflightError("delivery lane, route, plan, branch or scope identity drifted")
+    collection, candidate, receipts, summary = workspace._adoption_collection_evidence(
+        manifest,
+        expected_candidate_id=expected_candidate_id,
+        expected_result_sha256=expected_result_sha256,
+    )
+    workspace._require_closed_lane_workspace_for_adoption(manifest, collection)
+    if terminal_closeout is None:
+        workspace._require_adoption_lane_authority(manifest)
+    if (
+        candidate.get("workspace_id") != workspace_id
+        or candidate.get("lane_id") != lane_id
+        or candidate.get("base_head") != manifest.get("expected_base_head")
+    ):
+        raise GripPreflightError("delivery Candidate identity drifted from lane authority")
+    owner_id = inputs.get("lease_owner_id")
+    resource_keys = inputs.get("resource_keys")
+    if not isinstance(owner_id, str) or not isinstance(resource_keys, list) or not resource_keys:
+        raise GripPreflightError("delivery lane lease scope is invalid")
+    return {
+        "manifest": manifest,
+        "record": record,
+        "inputs": inputs,
+        "plan": plan,
+        "collection": collection,
+        "candidate": candidate,
+        "receipts": receipts,
+        "summary": summary,
+        "lane_id": lane_id,
+        "lane_receipt_sha256": lane_receipt_sha256,
+        "owner_id": owner_id,
+        "resource_keys": list(resource_keys),
+        "worktree": Path(str(manifest["writer_worktree"])),
+        "branch": str(manifest["writer_branch"]),
+        "base_commit": str(manifest["expected_base_head"]),
+        "terminal_closeout": terminal_closeout,
+    }
+
+
+def _run_candidate_delivery_profile(
+    *,
+    workspace_id: str,
+    expected_candidate_id: str,
+    expected_result_sha256: str,
+    base: str,
+    title: str,
+    body: str,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    (
+        workspace,
+        work_acquire,
+        _lane_closeout,
+        resource_store,
+        _checkouts,
+        delivery_profile,
+        execution_plan,
+    ) = _candidate_delivery_modules()
+    try:
+        context = _delivery_identity_context(
+            workspace=workspace,
+            work_acquire=work_acquire,
+            execution_plan=execution_plan,
+            workspace_id=workspace_id,
+            expected_candidate_id=expected_candidate_id,
+            expected_result_sha256=expected_result_sha256,
+        )
+        if context["terminal_closeout"] is None:
+            _candidate_lane_lease_snapshots(
+                resource_store,
+                owner_id=context["owner_id"],
+                resource_keys=context["resource_keys"],
+            )
+        candidate_tree = workspace._candidate_patch_tree_sha(
+            context["manifest"], context["collection"], context["candidate"]
+        )
+    except Exception as exc:
+        return {
+            "state": "delivery_identity_drift",
+            "delivery_ready": False,
+            "reconcile_required": True,
+            "leases_preserved": True,
+            "next_action": "read_back_closed_candidate_lane_route_plan_branch_and_scope",
+            "error": type(exc).__name__,
+        }
+    worktree = context["worktree"]
+    branch = context["branch"]
+    base_commit = context["base_commit"]
+    round_number = int(context["candidate"]["round"])
+    manifest_path = (
+        workspace._workspace_dir(workspace_id)
+        / f"delivery-manifest-round-{round_number:04d}.json"
+    )
+    delivery_manifest: dict[str, Any] | None = None
+    terminal_replay = context["terminal_closeout"] is not None
+    if terminal_replay and not manifest_path.exists():
+        return {
+            "state": "terminal_delivery_replay_requires_new_lane",
+            "delivery_ready": False,
+            "reconcile_required": True,
+            "leases_preserved": True,
+            "later_correction": "new_lane_required",
+            "next_action": "open_new_lane; do_not_republish_terminal_source_lane",
+        }
+    if manifest_path.exists():
+        try:
+            delivery_manifest = delivery_profile.read_candidate_delivery_manifest(
+                manifest_path,
+                candidate_manifest=context["candidate"],
+                verification_receipts=context["receipts"],
+                verification_summary=context["summary"],
+                collection_result=context["collection"],
+                execution_plan_value=context["plan"],
+            )
+        except Exception as exc:
+            return {
+                "state": "delivery_identity_conflict",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "next_action": "inspect_immutable_delivery_manifest_before_retry",
+                "error": type(exc).__name__,
+            }
+        expected_pr = delivery_manifest["actions"]["pr"]
+        if (
+            delivery_manifest["branch"]["writer_branch"] != branch
+            or delivery_manifest["branch"]["base_branch"] != base
+            or expected_pr.get("title") != title
+            or expected_pr.get("body") != body
+            or expected_pr.get("draft") is not False
+        ):
+            return {
+                "state": "delivery_action_identity_stale",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "next_action": "use_the_exact_manifest_bound_delivery_action",
+            }
+        head_commit = str(delivery_manifest["commit_range"]["head_commit"])
+    else:
+        try:
+            current_head = str(
+                _git(worktree, runner, ["rev-parse", "HEAD"]).get("stdout", "")
+            ).strip().lower()
+        except Exception as exc:
+            return {
+                "state": "delivery_commit_outcome_unknown",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "next_action": "read_back_local_writer_branch_before_retry",
+                "error": type(exc).__name__,
+            }
+        if current_head == base_commit:
+            try:
+                workspace._adoption_candidate_snapshot(
+                    context["manifest"], context["collection"], context["candidate"]
+                )
+                staged_tree = workspace._stage_candidate_for_adoption(
+                    context["manifest"], context["collection"], context["candidate"]
+                )
+                if staged_tree != candidate_tree:
+                    raise GripActionError("staged Candidate tree identity changed")
+                commit = _git(
+                    worktree,
+                    runner,
+                    [
+                        "-c",
+                        "user.name=Grabowski Scoped Writer",
+                        "-c",
+                        "user.email=grabowski-writer@localhost",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit-tree",
+                        candidate_tree,
+                        "-p",
+                        base_commit,
+                        "-m",
+                        f"Deliver candidate {expected_candidate_id[:12]}",
+                    ],
+                )
+                head_commit = str(commit.get("stdout", "")).strip().lower()
+                if re.fullmatch(r"[0-9a-f]{40}", head_commit) is None:
+                    raise GripActionError("writer delivery commit identity is invalid")
+                update = _git_optional(
+                    worktree,
+                    runner,
+                    ["update-ref", f"refs/heads/{branch}", head_commit, base_commit],
+                )
+                observed_head = str(
+                    _git(worktree, runner, ["rev-parse", "HEAD"]).get("stdout", "")
+                ).strip().lower()
+                if observed_head != head_commit:
+                    return {
+                        "state": "delivery_commit_outcome_unknown",
+                        "delivery_ready": False,
+                        "reconcile_required": True,
+                        "leases_preserved": True,
+                        "next_action": "read_back_local_writer_branch_before_retry",
+                        "update_returncode": update.get("returncode"),
+                    }
+            except Exception as exc:
+                return {
+                    "state": "delivery_commit_outcome_unknown",
+                    "delivery_ready": False,
+                    "reconcile_required": True,
+                    "leases_preserved": True,
+                    "next_action": "read_back_local_writer_branch_and_candidate_tree_before_retry",
+                    "error": type(exc).__name__,
+                }
+        else:
+            head_commit = current_head
+        local = _delivery_local_commit_readback(
+            worktree,
+            runner,
+            branch=branch,
+            base_commit=base_commit,
+            head_commit=head_commit,
+            expected_tree=candidate_tree,
+            expected_message=f"Deliver candidate {expected_candidate_id[:12]}",
+        )
+        if local is None:
+            return {
+                "state": "delivery_commit_identity_drift",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "next_action": "read_back_exact_single_parent_writer_commit_and_tree",
+            }
+        try:
+            delivery_manifest = delivery_profile.build_candidate_delivery_manifest(
+                candidate_manifest=context["candidate"],
+                verification_receipts=context["receipts"],
+                verification_summary=context["summary"],
+                collection_result=context["collection"],
+                execution_plan_value=context["plan"],
+                lane_receipt_sha256=context["lane_receipt_sha256"],
+                base_commit=base_commit,
+                head_commit=head_commit,
+                candidate_git_tree_sha=candidate_tree,
+                commit_git_tree_sha=local["git_tree_sha"],
+                writer_branch=branch,
+                base_branch=base,
+                title=title,
+                body=body,
+                draft=False,
+            )
+            delivery_profile.persist_candidate_delivery_manifest(
+                manifest_path,
+                delivery_manifest,
+                candidate_manifest=context["candidate"],
+                verification_receipts=context["receipts"],
+                verification_summary=context["summary"],
+                collection_result=context["collection"],
+                execution_plan_value=context["plan"],
+            )
+            observed_manifest = delivery_profile.read_candidate_delivery_manifest(
+                manifest_path,
+                candidate_manifest=context["candidate"],
+                verification_receipts=context["receipts"],
+                verification_summary=context["summary"],
+                collection_result=context["collection"],
+                execution_plan_value=context["plan"],
+            )
+            if observed_manifest != delivery_manifest:
+                raise GripActionError("immutable delivery manifest readback drifted")
+        except Exception as exc:
+            return {
+                "state": "delivery_manifest_reconcile_required",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "next_action": "read_back_immutable_delivery_manifest_before_any_publication",
+                "error": type(exc).__name__,
+            }
+    assert delivery_manifest is not None
+    local = _delivery_local_commit_readback(
+        worktree,
+        runner,
+        branch=branch,
+        base_commit=base_commit,
+        head_commit=head_commit,
+        expected_tree=candidate_tree,
+        expected_message=f"Deliver candidate {expected_candidate_id[:12]}",
+    )
+    if (
+        local is None
+        or delivery_manifest["commit_range"]["candidate_git_tree_sha"] != candidate_tree
+        or delivery_manifest["commit_range"]["commit_git_tree_sha"] != candidate_tree
+    ):
+        if terminal_replay:
+            return {
+                "state": "terminal_delivery_replay_requires_new_lane",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "delivery_manifest": delivery_manifest,
+                "later_correction": "new_lane_required",
+                "next_action": "open_new_lane; do_not_republish_terminal_source_lane",
+            }
+        return {
+            "state": "delivery_tree_mismatch",
+            "delivery_ready": False,
+            "reconcile_required": True,
+            "leases_preserved": True,
+            "next_action": "prove_commit_tree_equals_verified_candidate_tree",
+        }
+
+    remote = _delivery_remote_readback(
+        worktree, runner, branch=branch, expected_head=head_commit
+    )
+    if terminal_replay and remote["state"] != "exact":
+        return {
+            "state": "terminal_delivery_replay_requires_new_lane",
+            "delivery_ready": False,
+            "reconcile_required": True,
+            "leases_preserved": True,
+            "delivery_manifest": delivery_manifest,
+            "remote_readback": remote,
+            "later_correction": "new_lane_required",
+            "next_action": "open_new_lane; do_not_republish_terminal_source_lane",
+        }
+    if remote["state"] in {"unavailable", "drifted"}:
+        return {
+            "state": "outcome_unknown" if remote["state"] == "unavailable" else "delivery_branch_drift",
+            "delivery_ready": False,
+            "reconcile_required": True,
+            "leases_preserved": True,
+            "delivery_manifest": delivery_manifest,
+            "remote_readback": remote,
+            "next_action": "authoritative_remote_branch_readback_before_retry",
+        }
+    branch_publication: dict[str, Any]
+    if remote["state"] == "absent":
+        branch_publication = run_grip(
+            "branch-publish",
+            {"repo": str(worktree), "branch": branch, "expected_head": head_commit},
+            allow_mutation=True,
+            command_runner=runner,
+            github_runner=github_runner,
+        )
+        remote = _delivery_remote_readback(
+            worktree, runner, branch=branch, expected_head=head_commit
+        )
+        if remote["state"] != "exact":
+            return {
+                "state": "outcome_unknown",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "delivery_manifest": delivery_manifest,
+                "branch_publication": branch_publication,
+                "remote_readback": remote,
+                "next_action": "authoritative_remote_branch_readback_before_retry",
+            }
+    else:
+        branch_publication = {"replayed": True, "remote_head": head_commit}
+
+    pr_readback = _delivery_pr_readback(
+        worktree,
+        github_runner,
+        branch=branch,
+        base=base,
+        expected_head=head_commit,
+        title=title,
+        body=body,
+        draft=False,
+    )
+    if terminal_replay:
+        if pr_readback["state"] != "exact":
+            return {
+                "state": "terminal_delivery_replay_requires_new_lane",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "delivery_manifest": delivery_manifest,
+                "branch_publication": branch_publication,
+                "pr_readback": pr_readback,
+                "later_correction": "new_lane_required",
+                "next_action": "open_new_lane; do_not_republish_terminal_source_lane",
+            }
+        terminal_assessment = context["terminal_closeout"].get("assessment")
+        terminal_pr_number = (
+            terminal_assessment.get("pr_number")
+            if isinstance(terminal_assessment, dict)
+            else None
+        )
+        observed_pr = pr_readback.get("pr")
+        if (
+            isinstance(terminal_pr_number, bool)
+            or not isinstance(terminal_pr_number, int)
+            or terminal_pr_number < 1
+            or not isinstance(observed_pr, dict)
+            or observed_pr.get("number") != terminal_pr_number
+        ):
+            return {
+                "state": "terminal_delivery_replay_requires_new_lane",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "delivery_manifest": delivery_manifest,
+                "branch_publication": branch_publication,
+                "pr_readback": pr_readback,
+                "terminal_pr_number": terminal_pr_number,
+                "later_correction": "new_lane_required",
+                "next_action": "open_new_lane; do_not_rebind_terminal_source_lane_to_another_pr",
+            }
+    if pr_readback["state"] in {"unavailable", "duplicate", "drifted"}:
+        return {
+            "state": "outcome_unknown" if pr_readback["state"] == "unavailable" else "delivery_pr_identity_drift",
+            "delivery_ready": False,
+            "reconcile_required": True,
+            "leases_preserved": True,
+            "delivery_manifest": delivery_manifest,
+            "branch_publication": branch_publication,
+            "pr_readback": pr_readback,
+            "next_action": "authoritative_open_pr_readback_before_retry",
+        }
+    if pr_readback["state"] == "exact":
+        pr_publication = {"replayed": True, "pr": pr_readback["pr"]}
+        pr_action = "reused"
+    else:
+        pr_publication = run_grip(
+            "pr-create-or-update",
+            {
+                "repo": str(worktree),
+                "branch": branch,
+                "base": base,
+                "expected_head": head_commit,
+                "title": title,
+                "body": body,
+                "draft": False,
+            },
+            allow_mutation=True,
+            command_runner=runner,
+            github_runner=github_runner,
+        )
+        pr_readback = _delivery_pr_readback(
+            worktree,
+            github_runner,
+            branch=branch,
+            base=base,
+            expected_head=head_commit,
+            title=title,
+            body=body,
+            draft=False,
+        )
+        if pr_readback["state"] != "exact":
+            return {
+                "state": "outcome_unknown",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "delivery_manifest": delivery_manifest,
+                "branch_publication": branch_publication,
+                "pr_publication": pr_publication,
+                "pr_readback": pr_readback,
+                "next_action": "authoritative_open_pr_readback_before_retry",
+            }
+        action_output = pr_publication.get("output") if isinstance(pr_publication, dict) else None
+        action_value = action_output.get("action") if isinstance(action_output, dict) else None
+        pr_action = str(action_value) if action_value in {"created", "updated"} else "updated"
+    return {
+        "state": "delivery_pr_ready",
+        "delivery_ready": True,
+        "integration_ready": False,
+        "workspace_id": workspace_id,
+        "candidate_id": expected_candidate_id,
+        "resulting_commit_sha": head_commit,
+        "candidate_git_tree_sha": candidate_tree,
+        "delivery_manifest": delivery_manifest,
+        "delivery_manifest_path": str(manifest_path),
+        "branch": branch,
+        "base": base,
+        "pr": pr_readback["pr"],
+        "pr_action": pr_action,
+        "branch_publication": branch_publication,
+        "pr_publication": pr_publication,
+        "leases_preserved": True,
+        "reconcile_required": False,
+        "next_action": "controller_terminalize_source_lane_from_exact_pr_readback",
+        "nonclaims": [
+            "writer delivery does not merge",
+            "writer delivery does not deploy",
+            "writer delivery does not terminalize or release the source lane",
+        ],
+    }
+
+
+def _controller_terminalize_delivered_source(
+    *,
+    delivery: dict[str, Any],
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    """Controller-only source closeout after exact delivery publication readback."""
+    (
+        workspace,
+        work_acquire,
+        lane_closeout,
+        resource_store,
+        checkouts,
+        _delivery_profile,
+        _execution_plan,
+    ) = _candidate_delivery_modules()
+    workspace_id = delivery.get("workspace_id")
+    manifest_value = delivery.get("delivery_manifest")
+    pr_expected = delivery.get("pr")
+    if (
+        delivery.get("delivery_ready") is not True
+        or not isinstance(workspace_id, str)
+        or not isinstance(manifest_value, dict)
+        or not isinstance(pr_expected, dict)
+    ):
+        return {
+            "state": "controller_terminalization_precondition_failed",
+            "terminalized": False,
+            "reconcile_required": True,
+            "next_action": "revalidate_exact_delivery_manifest_remote_branch_and_pr",
+        }
+    try:
+        manifest = workspace._manifest(workspace_id)
+        resources_value = manifest.get("resources") if isinstance(manifest, dict) else None
+        lane_binding = resources_value.get("lane_binding") if isinstance(resources_value, dict) else None
+        if not isinstance(lane_binding, dict):
+            raise GripActionError("source Work Lane binding is missing")
+        lane_id = str(lane_binding["lane_id"])
+        record = _candidate_lane_record(work_acquire, lane_id)
+        inputs = record.get("inputs")
+        if not isinstance(inputs, dict):
+            raise GripActionError("source Work Lane inputs are missing")
+        owner_id = str(inputs["lease_owner_id"])
+        resource_keys = list(inputs["resource_keys"])
+        worktree = Path(str(manifest["writer_worktree"]))
+        branch = str(manifest["writer_branch"])
+        base_commit = str(manifest["expected_base_head"])
+        head_commit = str(delivery["resulting_commit_sha"])
+        candidate_tree = str(delivery["candidate_git_tree_sha"])
+        action_pr = manifest_value["actions"]["pr"]
+        if (
+            manifest_value["identity"]["workspace_id"] != workspace_id
+            or manifest_value["identity"]["lane_id"] != lane_id
+            or manifest_value["identity"]["lane_receipt_sha256"]
+            != lane_binding.get("receipt_sha256")
+            or manifest_value["commit_range"]["head_commit"] != head_commit
+            or manifest_value["commit_range"]["candidate_git_tree_sha"] != candidate_tree
+            or manifest_value["commit_range"]["commit_git_tree_sha"] != candidate_tree
+            or manifest_value["branch"]["writer_branch"] != branch
+        ):
+            raise GripActionError("delivery manifest drifted before controller closeout")
+    except Exception as exc:
+        return {
+            "state": "controller_terminalization_identity_drift",
+            "terminalized": False,
+            "reconcile_required": True,
+            "next_action": "read_back_lane_delivery_manifest_and_local_commit",
+            "error": type(exc).__name__,
+        }
+
+    terminal_wrapper = record.get("terminal_closeout")
+    if terminal_wrapper is None:
+        try:
+            snapshots = _candidate_lane_lease_snapshots(
+                resource_store, owner_id=owner_id, resource_keys=resource_keys
+            )
+            status = workspace.grabowski_agent_workspace_status(workspace_id)
+            tasks = status.get("tasks") if isinstance(status, dict) else None
+            if not isinstance(tasks, dict) or "writer" not in tasks:
+                raise GripActionError("workspace task readback is incomplete")
+            task_records = [item for item in tasks.values() if isinstance(item, dict)]
+            if len(task_records) != len(tasks) or any(
+                not isinstance(item.get("terminal"), bool) for item in task_records
+            ):
+                raise GripActionError("workspace task liveness is ambiguous")
+            task_active = any(item["terminal"] is False for item in task_records)
+            writer_state = tasks["writer"].get("state")
+            if not isinstance(writer_state, str):
+                raise GripActionError("workspace writer state is unavailable")
+            process_active = bool(_candidate_process_readback(checkouts, worktree))
+            local = _delivery_local_commit_readback(
+                worktree,
+                runner,
+                branch=branch,
+                base_commit=base_commit,
+                head_commit=head_commit,
+                expected_tree=candidate_tree,
+                expected_message=str(manifest_value["actions"]["commit"]["message"]),
+            )
+            remote = _delivery_remote_readback(
+                worktree, runner, branch=branch, expected_head=head_commit
+            )
+            pr_readback = _delivery_pr_readback(
+                worktree,
+                github_runner,
+                branch=branch,
+                base=str(action_pr["base"]),
+                expected_head=head_commit,
+                title=str(action_pr["title"]),
+                body=str(action_pr["body"]),
+                draft=False,
+            )
+            if (
+                task_active
+                or process_active
+                or local is None
+                or remote.get("state") != "exact"
+                or pr_readback.get("state") != "exact"
+            ):
+                raise GripActionError(
+                    "controller closeout readback is not exact and inactive"
+                )
+            pr = pr_readback["pr"]
+            pr_origin = "opened" if delivery.get("pr_action") == "created" else "updated"
+            observation = lane_closeout.LaneCloseoutObservation(
+                lane_id=lane_id,
+                repository=str(manifest["repository"]),
+                workspace=str(worktree),
+                branch=branch,
+                base_revision=base_commit,
+                writer_state=writer_state,
+                task_active=False,
+                process_active=False,
+                lease_active=True,
+                git_dirty=False,
+                head_sha=head_commit,
+                remote_head_sha=head_commit,
+                ahead_commits=0,
+                behind_commits=0,
+                pr_number=int(pr["number"]),
+                pr_state="open",
+                pr_head_sha=head_commit,
+                pr_origin=pr_origin,
+            )
+            assessment = lane_closeout.assess(observation)
+            if (
+                assessment.get("phase") != "terminal"
+                or assessment.get("closeout_state") not in {"pr_opened", "pr_updated"}
+                or assessment.get("lease_release_ready") is not True
+            ):
+                raise GripActionError("controller closeout assessment is not terminal")
+            terminal_lane = work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(record["receipt_sha256"]),
+                audit_fn=work_acquire.operator.base._append_audit_with_digest,
+                audit_lookup_fn=work_acquire._find_terminal_closeout_audit,
+            )
+        except Exception as exc:
+            return {
+                "state": "controller_terminalization_reconcile_required",
+                "terminalized": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "next_action": "refresh_exact_task_process_lease_git_remote_and_pr_readback",
+                "error": type(exc).__name__,
+            }
+    else:
+        if (
+            not isinstance(terminal_wrapper, dict)
+            or terminal_wrapper.get("closeout_state") not in {"pr_opened", "pr_updated"}
+        ):
+            return {
+                "state": "controller_terminalization_conflict",
+                "terminalized": False,
+                "reconcile_required": True,
+                "next_action": "inspect_existing_source_lane_terminal_state",
+            }
+        terminal_lane = record
+        try:
+            snapshots = _candidate_lane_lease_snapshots(
+                resource_store,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                allow_all_absent=True,
+            )
+        except GripActionError as exc:
+            return {
+                "state": "controller_release_reconcile_required",
+                "terminalized": False,
+                "reconcile_required": True,
+                "next_action": "read_back_exact_source_lane_lease_set_before_release",
+                "error": str(exc),
+            }
+
+    lease_release: dict[str, Any] | None = None
+    if snapshots:
+        try:
+            lease_release = resource_store.grabowski_resource_release(
+                owner_id,
+                resource_keys,
+                force=False,
+                expected_leases=snapshots,
+            )
+        except Exception as exc:
+            return {
+                "state": "controller_release_reconcile_required",
+                "terminalized": False,
+                "reconcile_required": True,
+                "next_action": "read_back_exact_source_lane_lease_set_before_release",
+                "error": type(exc).__name__,
+            }
+        released = lease_release.get("released") if isinstance(lease_release, dict) else None
+        if not isinstance(released, list) or {
+            item.get("resource_key") for item in released if isinstance(item, dict)
+        } != set(resource_keys):
+            return {
+                "state": "controller_release_reconcile_required",
+                "terminalized": False,
+                "reconcile_required": True,
+                "next_action": "read_back_exact_source_lane_lease_set_after_release",
+            }
+    return {
+        "state": "source_lane_terminalized",
+        "terminalized": True,
+        "controller_only": True,
+        "source_lane": terminal_lane,
+        "lease_release": lease_release,
+        "reconcile_required": False,
+        "later_correction": "new_lane_required",
+        "nonclaims": [
+            "source terminalization does not merge",
+            "source terminalization does not deploy",
+            "a later CI correction may not revive this source lane",
+        ],
+    }
 
 
 def _run_candidate_integration_ready(
@@ -11576,6 +12942,8 @@ _RUNNERS = {
     "worktree_hygiene_reconcile": _run_worktree_hygiene_reconcile,
     "checkout_binding_terminal_preview": _run_checkout_binding_terminal_preview,
     "checkout_binding_terminal_apply": _run_checkout_binding_terminal_apply,
+    "checkout_binding_identity_rebind_preview": _run_checkout_binding_identity_rebind_preview,
+    "checkout_binding_identity_rebind_apply": _run_checkout_binding_identity_rebind_apply,
     "checkout_owner_handoff_preview": _run_checkout_owner_handoff_preview,
     "checkout_owner_handoff_apply": _run_checkout_owner_handoff_apply,
     "post_merge_sync": _run_post_merge_sync,
