@@ -900,6 +900,32 @@
     },
     {
       "category": "checkout-lifecycle",
+      "description": "Preview one safe lifecycle identity rebind for an existing renamed checkout.",
+      "effects": [],
+      "id": "grabowski_checkout_binding_identity_rebind_preview",
+      "purpose": "Preview one clean, coordination-free and remote-secured existing checkout whose current branch name differs from its active lifecycle binding.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_checkout_binding_identity_rebind_preview"
+    },
+    {
+      "category": "checkout-lifecycle",
+      "description": "CAS-rebind lifecycle and retention identity after an exact safe preview.",
+      "effects": [
+        "audit-append",
+        "resource-lease",
+        "state-change"
+      ],
+      "id": "grabowski_checkout_binding_identity_rebind_apply",
+      "purpose": "CAS-update only lifecycle and retention expected head/branch after exact branch-rename preview and current retention revalidation.",
+      "read_only": false,
+      "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
+      "risk_class": "medium",
+      "tool": "grabowski_checkout_binding_identity_rebind_apply"
+    },
+    {
+      "category": "checkout-lifecycle",
       "description": "Assign explicit retention ownership to one temporary linked Git checkout.",
       "effects": [
         "state-create",
@@ -2881,6 +2907,8 @@
       "grabowski_checkout_binding_reconciliation",
       "grabowski_checkout_binding_terminal_preview",
       "grabowski_checkout_binding_terminal_apply",
+      "grabowski_checkout_binding_identity_rebind_preview",
+      "grabowski_checkout_binding_identity_rebind_apply",
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
@@ -3517,7 +3545,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "9de19f91440066d577a1836eeeb79c4d7a452502979b6346e4281917c6b953f0"
+      "sha256": "2ae85246fc566463d3cd9af1659ebec1471e85b69d2a162d58dac7c2d95862fa"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3525,7 +3553,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "9a921131b5cdfbb34003ec05a212c3b8cfe93c6bebc7d58aea858a23b6b749f3"
+      "sha256": "1999a55d4302823421a6b673de37270040056e97e5a8e7b9651752f516e032cb"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3555,11 +3583,11 @@
       "src/grabowski_checkout_identity.py": "377ca0a5396df74023cff263a7ae16da94d1c31a887772c3abb877961f4e5fd5",
       "src/grabowski_checkout_terminal_reconciliation.py": "fbe3f0a0778c006a76ab5d44734c6d06988fd0a0cda2e931b39a5e0a0f4a41b2",
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
-      "src/grabowski_checkouts.py": "6159fd198fbe7ddb461c1057a9cf0f10b4473fc49d15cc5c793aa9bd5f35718d",
+      "src/grabowski_checkouts.py": "8268fdc3105200c20db2ef0f564b396241e5b3c78ec8284c3c847edfe73c34b6",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
-      "src/grabowski_coding_agent_router.py": "870243d88d18fcc7cea344e7bdb02dae9e110276fd47b8d7389910b57c1c824c",
+      "src/grabowski_coding_agent_router.py": "a845c30a5d639531a502e719d9d934675750f413aef6d768a76de7fdb9eb159b",
       "src/grabowski_coding_agent_router_cli.py": "583e4d7e0213245b423d7255fca88834db2de678ea1ae86ed2e515946b9afb14",
       "src/grabowski_command_identity.py": "582b209fa1b1e4cb5faef74fa56214f79aabf6ad1e47ec0425a5962d74209138",
       "src/grabowski_connector_contract.py": "7d8b9011c737b4785595c68aeb97652641c5c2be00f6dfc4d5f1c7be38895c57",
