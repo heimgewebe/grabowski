@@ -1361,6 +1361,8 @@ class SelfDeployToolTests(unittest.TestCase):
                 "runtime_asset_identity_valid": True,
                 "release_python_identity_valid": True,
                 "environment_compatibility_valid": True,
+                "runtime_binding_valid": True,
+                "provenance_valid": True,
             }
             with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
                 SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
@@ -1414,6 +1416,8 @@ class SelfDeployToolTests(unittest.TestCase):
                 "runtime_asset_identity_valid": True,
                 "release_python_identity_valid": True,
                 "environment_compatibility_valid": True,
+                "runtime_binding_valid": True,
+                "provenance_valid": True,
             }
             with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
                 SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
@@ -1452,6 +1456,8 @@ class SelfDeployToolTests(unittest.TestCase):
             "runtime_asset_identity_valid": True,
             "release_python_identity_valid": True,
             "environment_compatibility_valid": True,
+            "runtime_binding_valid": True,
+            "provenance_valid": True,
         }
         command_fields = {
             "source_kind": "canonical-main",
@@ -1468,6 +1474,55 @@ class SelfDeployToolTests(unittest.TestCase):
                     status, command_fields
                 )
             )
+
+    def test_missing_finalization_requires_full_runtime_provenance(self) -> None:
+        status = {
+            "final_status": "missing_finalization_evidence",
+            "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        }
+        deployment = {
+            "completion_status": "complete",
+            "repo_head": "a" * 40,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "release_path_valid": True,
+            "release_id_valid": True,
+            "repo_head_valid": True,
+            "stable_runtime_manifest_valid": True,
+            "runtime_pointer_valid": True,
+            "artifact_integrity_valid": True,
+            "runtime_asset_identity_valid": True,
+            "release_python_identity_valid": True,
+            "runtime_binding_valid": True,
+            "environment_compatibility_valid": True,
+            "provenance_valid": True,
+        }
+        command_fields = {
+            "source_kind": "canonical-main",
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "expected_head": "a" * 40,
+        }
+        for invalid_field in ("runtime_binding_valid", "provenance_valid"):
+            with self.subTest(invalid_field=invalid_field), patch.object(
+                SELF_DEPLOY.base,
+                "_deployment_metadata",
+                return_value={**deployment, invalid_field: False},
+                create=True,
+            ), patch.object(
+                SELF_DEPLOY, "_sidecars_match_deploy_head", return_value=True
+            ) as sidecar_readback:
+                self.assertFalse(
+                    SELF_DEPLOY._missing_finalization_deploy_is_runtime_proven(
+                        status, command_fields
+                    )
+                )
+                sidecar_readback.assert_not_called()
 
     def test_sidecar_readback_allows_detached_worktree_source_kind(self) -> None:
         repo = ROOT
@@ -1570,6 +1625,8 @@ class SelfDeployToolTests(unittest.TestCase):
             "runtime_asset_identity_valid": True,
             "release_python_identity_valid": True,
             "environment_compatibility_valid": True,
+            "runtime_binding_valid": True,
+            "provenance_valid": True,
         }
         for finalization_state in ("invalid_contract", "invalid_receipt"):
             with self.subTest(finalization_state=finalization_state), tempfile.TemporaryDirectory() as temporary:
@@ -1640,6 +1697,8 @@ class SelfDeployToolTests(unittest.TestCase):
                 "runtime_asset_identity_valid": True,
                 "release_python_identity_valid": True,
                 "environment_compatibility_valid": True,
+                "runtime_binding_valid": True,
+                "provenance_valid": True,
             }
             with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
                 SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}

@@ -1776,11 +1776,10 @@ def _missing_finalization_deploy_is_runtime_proven(
     """Treat an exited deploy as terminal only when its active release proves the head.
 
     The reconciliation must stay valid when canonical source has already advanced
-    beyond the deployed release.  Therefore it deliberately ignores live source
-    identity and entrypoint-origin checks, which are expected to drift in that
-    state, and instead requires the immutable release manifest, active runtime
-    pointer, release artifacts and environment to validate independently.  No
-    missing job receipt is synthesized or rewritten.
+    beyond the deployed release.  Deployment metadata validates the active immutable
+    release independently of the canonical checkout, so require its complete runtime
+    binding and provenance in addition to the exact release head and sidecar readback.
+    No missing job receipt is synthesized or rewritten.
     """
     if status.get("final_status") in TERMINAL_JOB_STATUSES | REUSABLE_JOB_STATUSES:
         return False
@@ -1813,7 +1812,9 @@ def _missing_finalization_deploy_is_runtime_proven(
         "artifact_integrity_valid",
         "runtime_asset_identity_valid",
         "release_python_identity_valid",
+        "runtime_binding_valid",
         "environment_compatibility_valid",
+        "provenance_valid",
     )
     return bool(
         isinstance(deployment, dict)
