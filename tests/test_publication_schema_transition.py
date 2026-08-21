@@ -359,15 +359,26 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         client_snapshot.activate_platform_publication_request(
             request_id=prior["request_id"], now_unix=self.now_unix + 1
         )
-        original_write = client_snapshot._write_private_json
+        original_open = client_snapshot.os.open
+        directory_open_attempts = 0
 
-        def write_then_fail(path: Path, payload: dict[str, object]) -> None:
-            original_write(path, payload)
-            if path == client_snapshot.PLATFORM_PUBLICATION_CURRENT_PATH:
-                raise OSError("simulated post-replace current write failure")
+        def fail_first_current_directory_open(
+            path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> int:
+            nonlocal directory_open_attempts
+            if (
+                Path(path) == client_snapshot.PLATFORM_PUBLICATION_CURRENT_PATH.parent
+                and flags & client_snapshot.os.O_DIRECTORY
+            ):
+                directory_open_attempts += 1
+                if directory_open_attempts == 1:
+                    raise OSError("simulated post-replace directory open failure")
+            if dir_fd is None:
+                return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
 
         with mock.patch.object(
-            client_snapshot, "_write_private_json", side_effect=write_then_fail
+            client_snapshot.os, "open", side_effect=fail_first_current_directory_open
         ):
             prepared = client_snapshot.prepare_platform_publication_for_runtime(
                 registered_tool_count=TOOL_COUNT,
@@ -380,6 +391,7 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             )
 
         self.assertFalse(prepared["reused"])
+        self.assertGreaterEqual(directory_open_attempts, 2)
         current = client_snapshot._read_publication_current()
         self.assertEqual(current["request_id"], prepared["request_id"])
         self.assertEqual(current["state"], "pending_activation")
@@ -400,6 +412,47 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         restored = client_snapshot._read_publication_current()
         self.assertEqual(restored["request_id"], prior["request_id"])
         self.assertEqual(restored["state"], "publication_pending")
+
+    def test_changed_surface_preserves_write_error_when_recovery_directory_fsync_fails(self) -> None:
+        prior = self._prepare_publication(cutover_id="foreign-durability-unknown")
+        client_snapshot.activate_platform_publication_request(
+            request_id=prior["request_id"], now_unix=self.now_unix + 1
+        )
+        original_open = client_snapshot.os.open
+        directory_open_attempts = 0
+
+        def fail_current_directory_open(
+            path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+        ) -> int:
+            nonlocal directory_open_attempts
+            if (
+                Path(path) == client_snapshot.PLATFORM_PUBLICATION_CURRENT_PATH.parent
+                and flags & client_snapshot.os.O_DIRECTORY
+            ):
+                directory_open_attempts += 1
+                raise OSError("simulated persistent directory open failure")
+            if dir_fd is None:
+                return original_open(path, flags, mode)
+            return original_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(
+            client_snapshot.os, "open", side_effect=fail_current_directory_open
+        ):
+            with self.assertRaisesRegex(OSError, "persistent directory open"):
+                client_snapshot.prepare_platform_publication_for_runtime(
+                    registered_tool_count=TOOL_COUNT,
+                    registered_names_sha256=NAMES_SHA256,
+                    complete_schema_count=TOOL_COUNT,
+                    complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+                    cutover_id=CUTOVER_ID,
+                    require_current_cutover_binding=True,
+                    now_unix=self.now_unix + 2,
+                )
+
+        self.assertGreaterEqual(directory_open_attempts, 2)
+        visible_current = client_snapshot._read_publication_current()
+        self.assertEqual(visible_current["state"], "pending_activation")
+        self.assertNotEqual(visible_current["request_id"], prior["request_id"])
 
     def test_changed_surface_preserves_write_error_when_current_readback_differs(self) -> None:
         prior = self._prepare_publication(cutover_id="foreign-no-effect")
