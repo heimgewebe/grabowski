@@ -1698,10 +1698,16 @@ class BureauPickupTests(unittest.TestCase):
         rebind.assert_not_called()
         renew.assert_not_called()
 
-    def test_orphan_recovery_rechecks_run_before_lease_recovery(self) -> None:
+    def test_orphan_recovery_rechecks_run_after_lease_preflight_before_effect(self) -> None:
         repository = self.root / "repository-run-guard"
         key = f"repo:{repository}"
         fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
         terminal = self.orphan_recovery_coordination(
             fixture["intent"],
             fixture["journal_identity"],
@@ -1715,7 +1721,12 @@ class BureauPickupTests(unittest.TestCase):
                 "_coordination_status",
                 side_effect=[fixture["orphaned"], terminal],
             ) as status,
-            mock.patch.object(pickup.resources, "inspect_resource") as inspect_resource,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=None
+            ) as inspect_resource,
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ) as persisted,
             mock.patch.object(
                 pickup.resources, "rebind_same_owner_resources"
             ) as rebind,
@@ -1730,7 +1741,8 @@ class BureauPickupTests(unittest.TestCase):
             )
         self.assertEqual("orphan-recovery-run-not-eligible", raised.exception.code)
         self.assertEqual(2, status.call_count)
-        inspect_resource.assert_not_called()
+        inspect_resource.assert_called_once_with(key)
+        persisted.assert_called_once_with(key)
         rebind.assert_not_called()
         renew.assert_not_called()
         resume.assert_not_called()

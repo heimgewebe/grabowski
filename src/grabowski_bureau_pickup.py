@@ -3301,8 +3301,15 @@ def _reacquire_orphaned_assignment_leases(
         )
 
     # Do not mutate an early group until every group has passed lineage and
-    # ownership validation. Each effect remains CAS-bound to the preflight
-    # snapshots below.
+    # ownership validation. Recovery may install an internal, non-serializable
+    # run-state guard here; normalized external requests cannot supply one.
+    pre_effect_guard = request.get("_orphan_recovery_pre_effect_guard")
+    if pre_effect_guard is not None:
+        if not callable(pre_effect_guard):
+            raise BureauPickupError("orphan-recovery-run-guard-invalid")
+        pre_effect_guard()
+
+    # Each effect remains CAS-bound to the read-only preflight snapshots.
     actions: list[dict[str, Any]] = []
     for plan in plans:
         group = plan["group"]
@@ -3513,28 +3520,35 @@ def _recover_orphaned_journal_before_claim(
     )
     _assert_registry_binding(current_binding)
     already_resumed = candidate.get("already_resumed") is True
-    pre_resume = _bound_bureau_call(
-        current_binding,
-        lambda: _coordination_status(
-            intent["run_id"],
-            registry_root=request["registry_root"],
-            coordination_root=request["coordination_root"],
-        ),
-    )
-    if already_resumed:
-        run = _validate_resumed_run(
-            pre_resume, intent, acquisition, journal_identity
+    pre_resume: dict[str, Any] | None = None
+    run: dict[str, Any] | None = None
+
+    def _guard_run_before_lease_effect() -> None:
+        nonlocal pre_resume, run
+        pre_resume = _bound_bureau_call(
+            current_binding,
+            lambda: _coordination_status(
+                intent["run_id"],
+                registry_root=request["registry_root"],
+                coordination_root=request["coordination_root"],
+            ),
         )
-    else:
-        run = _validate_recoverable_orphan(
-            pre_resume, intent, acquisition, journal_identity
-        )
-    # The authoritative run-state read above is deliberately the last Bureau
-    # observation before lease recovery. A terminal transition therefore
-    # fails closed before any rebind or renewal effect.
+        if already_resumed:
+            run = _validate_resumed_run(
+                pre_resume, intent, acquisition, journal_identity
+            )
+        else:
+            run = _validate_recoverable_orphan(
+                pre_resume, intent, acquisition, journal_identity
+            )
+
+    lease_request = dict(candidate["stored_request"])
+    lease_request["_orphan_recovery_pre_effect_guard"] = _guard_run_before_lease_effect
     lease_receipt = _reacquire_orphaned_assignment_leases(
-        intent, candidate["stored_request"], acquisition, candidate["run_dir"]
+        intent, lease_request, acquisition, candidate["run_dir"]
     )
+    if pre_resume is None or run is None:
+        raise BureauPickupError("orphan-recovery-run-guard-missing")
     resume_result: dict[str, Any] | None = None
     resume_error: Exception | None = None
     if already_resumed:
