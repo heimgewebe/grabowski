@@ -2431,7 +2431,10 @@ def activate_platform_publication_request(
         if current["state"] != "pending_activation":
             raise ClientSnapshotError("publication request is not awaiting activation")
         previous = request.get("previous_current")
-        if previous is not None and previous["contract_sha256"] != current["contract_sha256"]:
+        if previous is not None and (
+            previous["contract_sha256"] != current["contract_sha256"]
+            or previous["state"] != "platform_converged"
+        ):
             _persist_publication_resolution(
                 request_id=previous["request_id"],
                 outcome="superseded",
