@@ -14,7 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -4328,6 +4328,364 @@ globalThis.fetch = async () => ({
                 view="history",
                 cursor="browser:history:1:" + "0" * 20,
             )
+
+    def test_bidi_record_adapter_projects_qualified_fallback(self) -> None:
+        record = {
+            "executable": str(self.binary),
+            "port": 9555,
+            "argv_json": json.dumps([
+                str(self.root / "chromedriver"),
+                "--port=9555",
+                "--allowed-ips=127.0.0.1",
+                "--verbose",
+            ]),
+        }
+        adapter = workers._browser_record_adapter(record)
+        self.assertEqual(adapter["adapter_id"], workers.BROWSER_BIDI_ADAPTER_ID)
+        self.assertEqual(adapter["protocol"], "webdriver-bidi")
+        self.assertEqual(adapter["selection_role"], "qualified-pre-effect-fallback")
+
+    def test_bidi_fallback_requires_ephemeral_profile_and_effect_free_start_args(self) -> None:
+        driver = self.root / "chromedriver"
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()):
+            with self.assertRaisesRegex(ValueError, "ephemeral primary and standby"):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9556,
+                    persistent_profile=str(self.root / "profile"),
+                    chromedriver_executable=str(driver),
+                    runtime_seconds=60,
+                )
+            with self.assertRaisesRegex(PermissionError, "effect-free Chrome startup"):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9556,
+                    args=["https://example.com"],
+                    chromedriver_executable=str(driver),
+                    runtime_seconds=60,
+                )
+
+    def test_bidi_fallback_returns_cdp_when_primary_is_ready(self) -> None:
+        primary = {"worker": {"worker_id": "a" * 20, "state": "running"}}
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers, "_chromedriver_executable", return_value=self.root / "chromedriver"
+        ), patch.object(workers, "_browser_start_cdp_worker", return_value=primary) as start_cdp, patch.object(
+            workers.browser_bidi, "cdp_endpoint_ready", return_value=True
+        ), patch.object(workers, "_browser_start_bidi_worker") as start_bidi:
+            result_value = workers.browser_start(
+                str(self.binary),
+                port=9557,
+                args=["--headless=new"],
+                chromedriver_executable=str(self.root / "chromedriver"),
+                runtime_seconds=60,
+            )
+        start_cdp.assert_called_once()
+        start_bidi.assert_not_called()
+        self.assertIs(result_value, primary)
+        self.assertFalse(result_value["fallback"]["selected"])
+        self.assertEqual(result_value["fallback"]["selected_adapter"], "chrome-cdp")
+
+    def test_bidi_fallback_selects_bidi_only_after_private_primary_terminalization(self) -> None:
+        primary = {"worker": {"worker_id": "b" * 20, "state": "running"}}
+        fallback = {"worker": {"worker_id": "c" * 20}}
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers, "_chromedriver_executable", return_value=self.root / "chromedriver"
+        ), patch.object(workers, "_browser_start_cdp_worker", return_value=primary), patch.object(
+            workers.browser_bidi, "cdp_endpoint_ready", side_effect=[False, False]
+        ), patch.object(
+            workers, "worker_stop", return_value={"worker": {"state": "stopped"}}
+        ) as stop_primary, patch.object(
+            workers.resources, "inspect_resource", return_value=None
+        ), patch.object(
+            workers, "_browser_start_bidi_worker", return_value=fallback
+        ) as start_bidi:
+            result_value = workers.browser_start(
+                str(self.binary),
+                port=9558,
+                args=["--headless=new"],
+                chromedriver_executable=str(self.root / "chromedriver"),
+                runtime_seconds=60,
+            )
+        self.assertIs(result_value, fallback)
+        stop_primary.assert_called_once_with("b" * 20, expected_kind="browser")
+        kwargs = start_bidi.call_args.kwargs
+        self.assertEqual(kwargs["port"], 9558)
+        evidence = kwargs["fallback_evidence"]
+        self.assertTrue(evidence["selected"])
+        self.assertFalse(evidence["effect_started"])
+        self.assertEqual(evidence["effect_state"], "not_started")
+        self.assertEqual(evidence["primary_worker_id"], "b" * 20)
+
+    def test_bidi_fallback_blocks_when_private_primary_cannot_terminalize(self) -> None:
+        primary = {"worker": {"worker_id": "d" * 20, "state": "running"}}
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers, "_chromedriver_executable", return_value=self.root / "chromedriver"
+        ), patch.object(workers, "_browser_start_cdp_worker", return_value=primary), patch.object(
+            workers.browser_bidi, "cdp_endpoint_ready", return_value=False
+        ), patch.object(
+            workers, "worker_stop", return_value={"worker": {"state": "running"}}
+        ), patch.object(workers, "_browser_start_bidi_worker") as start_bidi:
+            with self.assertRaisesRegex(RuntimeError, "could not be terminalized"):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9559,
+                    args=["--headless=new"],
+                    chromedriver_executable=str(self.root / "chromedriver"),
+                    runtime_seconds=60,
+                )
+        start_bidi.assert_not_called()
+
+    def test_bidi_fallback_blocks_when_primary_port_lease_remains(self) -> None:
+        primary = {"worker": {"worker_id": "e" * 20, "state": "running"}}
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers, "_chromedriver_executable", return_value=self.root / "chromedriver"
+        ), patch.object(workers, "_browser_start_cdp_worker", return_value=primary), patch.object(
+            workers.browser_bidi, "cdp_endpoint_ready", return_value=False
+        ), patch.object(
+            workers, "worker_stop", return_value={"worker": {"state": "stopped"}}
+        ), patch.object(
+            workers.resources, "inspect_resource", return_value={"owner_id": "worker:other"}
+        ), patch.object(workers, "_browser_start_bidi_worker") as start_bidi:
+            with self.assertRaisesRegex(RuntimeError, "port lease remains active"):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9560,
+                    args=["--headless=new"],
+                    chromedriver_executable=str(self.root / "chromedriver"),
+                    runtime_seconds=60,
+                )
+        start_bidi.assert_not_called()
+
+    def test_bidi_record_adapter_rejects_noncanonical_driver_argv(self) -> None:
+        record = {
+            "executable": str(self.binary),
+            "port": 9567,
+            "argv_json": json.dumps([
+                str(self.root / "chromedriver"),
+                "--port=9999",
+                "--allowed-ips=127.0.0.1",
+                "--verbose",
+            ]),
+        }
+        adapter = workers._browser_record_adapter(record)
+        self.assertEqual(adapter["adapter_id"], "chrome-cdp")
+        self.assertEqual(adapter["protocol"], "cdp")
+
+    def test_bidi_session_setup_failure_requires_verified_compensation(self) -> None:
+        driver = self.root / "chromedriver"
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        evidence = {
+            "schema_version": 1,
+            "armed": True,
+            "selected": True,
+            "primary_worker_id": "9" * 20,
+            "effect_started": False,
+            "effect_state": "not_started",
+        }
+        with patch.object(workers.operator, "_run", return_value=result()), patch.object(
+            workers.browser_bidi, "driver_ready"
+        ), patch.object(
+            workers.browser_bidi, "create_chrome_session", side_effect=RuntimeError("session failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "session failed"):
+                workers._browser_start_bidi_worker(
+                    binary=self.binary.resolve(),
+                    driver=driver.resolve(),
+                    port=9568,
+                    extra=["--headless=new"],
+                    runtime=60,
+                    fallback_evidence=evidence,
+                )
+        self.assertIsNone(workers.resources.inspect_resource("port:9568"))
+        self.assertFalse(any((workers.WORKER_STATE / "profiles").glob("*")))
+
+    def test_bidi_session_setup_failure_surfaces_incomplete_compensation(self) -> None:
+        driver = self.root / "chromedriver"
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        evidence = {"schema_version": 1, "armed": True, "selected": True}
+        with patch.object(workers.operator, "_run", return_value=result()), patch.object(
+            workers.browser_bidi, "driver_ready"
+        ), patch.object(
+            workers.browser_bidi, "create_chrome_session", side_effect=RuntimeError("session failed")
+        ), patch.object(
+            workers, "worker_stop", side_effect=RuntimeError("stop failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "compensation could not be verified"):
+                workers._browser_start_bidi_worker(
+                    binary=self.binary.resolve(),
+                    driver=driver.resolve(),
+                    port=9569,
+                    extra=["--headless=new"],
+                    runtime=60,
+                    fallback_evidence=evidence,
+                )
+
+    def test_bidi_fallback_start_binds_private_session_and_control_plane(self) -> None:
+        driver = self.root / "chromedriver"
+        driver.write_text("#!/bin/sh\nexit 0\n")
+        driver.chmod(0o755)
+        evidence = {
+            "schema_version": 1,
+            "armed": True,
+            "selected": True,
+            "primary_worker_id": "f" * 20,
+            "primary_adapter": "chrome-cdp",
+            "primary_state": "stopped",
+            "effect_started": False,
+            "effect_state": "not_started",
+            "fallback_authorized": True,
+        }
+        session = {
+            "session_id": "session-1",
+            "websocket_url": "ws://127.0.0.1:9561/session/session-1",
+            "browser_version": "151.0",
+            "driver_version": "150.0",
+        }
+        with patch.object(workers.operator, "_run", return_value=result()), patch.object(
+            workers.browser_bidi, "driver_ready"
+        ), patch.object(
+            workers.browser_bidi, "create_chrome_session", return_value=session
+        ):
+            started = workers._browser_start_bidi_worker(
+                binary=self.binary.resolve(),
+                driver=driver.resolve(),
+                port=9561,
+                extra=["--headless=new"],
+                runtime=60,
+                fallback_evidence=evidence,
+            )
+        worker = started["worker"]
+        self.assertEqual(worker["control_plane"]["adapter"]["id"], workers.BROWSER_BIDI_ADAPTER_ID)
+        self.assertEqual(worker["control_plane"]["adapter"]["protocol"], "webdriver-bidi")
+        self.assertEqual(worker["control_plane"]["browser"]["selection_role"], "qualified-pre-effect-fallback")
+        self.assertIn("Firefox availability", worker["control_plane"]["does_not_establish"])
+        self.assertNotIn("Firefox or WebDriver BiDi availability", worker["control_plane"]["does_not_establish"])
+        self.assertTrue(started["fallback"]["session_ready"])
+        record = workers._row(worker["worker_id"])
+        private = Path(record["config_path"]).parent / workers.BROWSER_BIDI_SESSION_NAME
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+        self.assertNotIn(session["session_id"], json.dumps(worker))
+        self.assertNotIn(session["websocket_url"], json.dumps(worker))
+
+    def test_semantic_adapter_selects_chrome_webdriver_bidi_record(self) -> None:
+        worker_id = "e" * 20
+        directory = workers.WORKER_STATE / "instances" / worker_id
+        directory.mkdir(parents=True, mode=0o700)
+        config = directory / "worker.json"
+        config.write_text("{}")
+        driver = self.root / "chromedriver"
+        record = {
+            "worker_id": worker_id,
+            "kind": "browser",
+            "executable": str(self.binary.resolve()),
+            "argv_json": json.dumps([
+                str(driver),
+                "--port=9560",
+                "--allowed-ips=127.0.0.1",
+                "--verbose",
+            ]),
+            "config_path": str(config),
+            "port": 9560,
+        }
+        workers._write_private_worker_json(
+            directory,
+            workers.BROWSER_BIDI_SESSION_NAME,
+            {
+                "schema_version": 1,
+                "session_id": "session-2",
+                "websocket_url": "ws://127.0.0.1:9560/session/session-2",
+                "browser_version": "151.0",
+                "driver_version": "150.0",
+            },
+        )
+        adapter = workers._browser_semantic_adapter(record, timeout_seconds=10)
+        self.assertIsInstance(adapter, workers.ChromeWebDriverBidiAdapter)
+
+    def test_bidi_activation_target_drift_fails_before_navigation(self) -> None:
+        expected = {
+            "origin": "https://example.com",
+            "ready_state": "complete",
+            "title": "Example",
+            "main_frame_id": "ctx",
+            "loader_id": "loader",
+            "navigation_entry_id": "entry",
+            "elements": [],
+        }
+        original = "https://example.com/issues"
+        element = {
+            "backend_node_id": "1",
+            "role": "link",
+            "name": "Issues",
+            "navigation_target_sha256": hashlib.sha256(original.encode()).hexdigest(),
+        }
+        connection = Mock()
+        connection.__enter__ = Mock(return_value=connection)
+        connection.__exit__ = Mock(return_value=None)
+        with patch.object(
+            workers, "_read_browser_bidi_session", return_value={"websocket_url": "ws://127.0.0.1:9561/session/x"}
+        ), patch.object(workers.browser_bidi, "BidiJsonConnection", return_value=connection), patch.object(
+            workers, "_browser_bidi_context", return_value="ctx"
+        ), patch.object(workers, "_browser_bidi_decode_state", return_value=expected), patch.object(
+            workers, "_browser_bidi_evaluate", return_value=json.dumps("https://example.com/changed")
+        ):
+            adapter = workers.ChromeWebDriverBidiAdapter({}, timeout_seconds=10)
+            with self.assertRaisesRegex(RuntimeError, "stale-snapshot"):
+                adapter.activate_link(expected_state=expected, expected_element=element)
+        self.assertFalse(
+            any(call.args and call.args[0] == "browsingContext.navigate" for call in connection.call.call_args_list)
+        )
+
+
+    def test_bidi_session_rejects_websocket_port_drift(self) -> None:
+        from grabowski_browser_bidi import BrowserBidiError, _validate_chrome_ws
+        with patch("grabowski_browser_bidi.socket.getaddrinfo", return_value=[
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9563))
+        ]):
+            with self.assertRaisesRegex(BrowserBidiError, "identity mismatch"):
+                _validate_chrome_ws(
+                    "ws://127.0.0.1:9563/session/session-3",
+                    expected_session_id="session-3",
+                    expected_port=9562,
+                )
+
+    def test_bidi_scroll_element_drift_fails_closed(self) -> None:
+        expected = {
+            "origin": "https://example.com",
+            "ready_state": "complete",
+            "title": "Example",
+            "main_frame_id": "ctx",
+            "loader_id": "loader",
+            "navigation_entry_id": "entry",
+            "elements": [],
+        }
+        element = {
+            "backend_node_id": "7",
+            "role": "heading",
+            "name": "Expected heading",
+            "navigation_target_sha256": None,
+        }
+        connection = Mock()
+        connection.__enter__ = Mock(return_value=connection)
+        connection.__exit__ = Mock(return_value=None)
+        with patch.object(
+            workers, "_read_browser_bidi_session", return_value={"websocket_url": "ws://127.0.0.1:9565/session/x"}
+        ), patch.object(workers.browser_bidi, "BidiJsonConnection", return_value=connection), patch.object(
+            workers, "_browser_bidi_context", return_value="ctx"
+        ), patch.object(workers, "_browser_bidi_decode_state", return_value=expected), patch.object(
+            workers, "_browser_bidi_evaluate", return_value=json.dumps({"role": "heading", "name": "Changed heading"})
+        ):
+            adapter = workers.ChromeWebDriverBidiAdapter({}, timeout_seconds=10)
+            with self.assertRaisesRegex(RuntimeError, "stale-snapshot"):
+                adapter.perform_local_ui_effect(
+                    {"action_kind": "scroll_into_view"},
+                    expected_state=expected,
+                    expected_element=element,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
