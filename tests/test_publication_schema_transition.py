@@ -31,6 +31,7 @@ for module_root in (SRC, TOOLS):
 import grabowski_client_snapshot as client_snapshot
 import grabowski_connector_contract as connector_contract
 import grabowski_midcutover_resume as midcutover
+import grabowski_system_map as system_map
 
 
 HEAD_BLUE = "a" * 40
@@ -467,6 +468,32 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         self.assertFalse(status["external_client_snapshot_observable"])
         self.assertTrue(status["historical_schema_evidence_only"])
         self.assertFalse(status["external_client_schema_observable"])
+
+        component_map = system_map.build_component_map(
+            runtime_healthy=True,
+            client_snapshot=status,
+            coding_agent_catalog={},
+            tasks={},
+            leases={},
+            obligations={},
+            source_registry={
+                component_id: {"authority": "test"}
+                for component_id in (
+                    "bureau",
+                    "repobrief",
+                    "chronik",
+                    "systemkatalog",
+                    "github_ci",
+                )
+            },
+        )
+        connector = next(
+            component
+            for component in component_map["components"]
+            if component["id"] == "connector"
+        )
+        self.assertFalse(connector["observed"])
+        self.assertEqual(connector["signal"], "unknown")
 
         inspected = client_snapshot.inspect_cutover_snapshot_binding(
             **self._inspection_parameters(
