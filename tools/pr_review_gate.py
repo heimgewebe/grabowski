@@ -100,7 +100,9 @@ DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate (advisory)",
     "Review evidence gate (attested)",
 }
-BASE_BOUND_REQUIRED_CHECK_NAMES = {"registry-registration-preflight/freshness"}
+REGISTRY_FRESHNESS_CHECK_NAME = "registry-registration-preflight/freshness"
+BASE_BOUND_REQUIRED_CHECK_NAMES = {REGISTRY_FRESHNESS_CHECK_NAME}
+REGISTRY_TASK_PATH_PREFIX = "registry/tasks/"
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude", "claude[bot]", "claude-code", "claude-code[bot]", "anthropic", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -395,12 +397,77 @@ def _target_repo_from_pr_url(value: Any, *, expected_pr: int) -> str | None:
     return _canonical_repo_slug(f"{match.group('owner')}/{match.group('repo')}")
 
 
+def _pull_file_evidence(payload: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(payload, list):
+        return None
+    records: list[dict[str, Any]] = []
+    for page in payload:
+        if not isinstance(page, list):
+            return None
+        for item in page:
+            if not isinstance(item, dict):
+                return None
+            filename = item.get("filename")
+            status = item.get("status")
+            if not isinstance(filename, str) or not filename.strip():
+                return None
+            if not isinstance(status, str) or not status.strip():
+                return None
+            record: dict[str, Any] = {"path": filename, "status": status.strip().lower()}
+            previous = item.get("previous_filename")
+            if record["status"] == "renamed":
+                if not isinstance(previous, str) or not previous.strip():
+                    return None
+                record["previousPath"] = previous
+            elif previous is not None:
+                if not isinstance(previous, str) or not previous.strip():
+                    return None
+                record["previousPath"] = previous
+            records.append(record)
+    return records
+
+
+def _load_pull_file_evidence(repo: Path, *, repo_slug: str, pr: int) -> list[dict[str, Any]] | None:
+    payload = _run_json(
+        repo,
+        [
+            "gh",
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            "-f",
+            "per_page=100",
+            f"repos/{repo_slug}/pulls/{pr}/files",
+        ],
+    )
+    return _pull_file_evidence(payload)
+
+
 def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     view = _run_json(repo, ["gh", "pr", "view", str(pr), "--json", ",".join(PR_FIELDS)])
     checks = _run_json(repo, ["gh", "pr", "checks", str(pr), "--json", ",".join(CHECK_FIELDS)], allow_nonzero=True)
     repo_info = _run_json(repo, ["gh", "repo", "view", "--json", "nameWithOwner"])
     checkout_name = repo_info.get("nameWithOwner") if isinstance(repo_info, dict) else None
     target_name = _target_repo_from_pr_url(view.get("url"), expected_pr=pr) if isinstance(view, dict) else None
+    pull_files_complete = False
+    if isinstance(view, dict):
+        changed_files = view.get("changedFiles")
+        changed_files_valid = (
+            isinstance(changed_files, int)
+            and not isinstance(changed_files, bool)
+            and changed_files >= 0
+        )
+        if isinstance(target_name, str) and changed_files_valid:
+            try:
+                pull_files = _load_pull_file_evidence(repo, repo_slug=target_name, pr=pr)
+            except RuntimeError:
+                pull_files = None
+            if pull_files is not None and changed_files == len(pull_files):
+                view["files"] = pull_files
+                pull_files_complete = True
+        view["pullFilesEvidenceComplete"] = pull_files_complete
     # Self-review evidence is local and diff-bound. PR comments, approvals and
     # review bodies are deliberately absent from the live query and gate state.
     pr_diff_sha256: str | None = None
@@ -2943,6 +3010,61 @@ def _check_link_matches_base_sha(check: dict[str, Any], base_sha: object) -> boo
     return values == [base_sha]
 
 
+def _effective_base_bound_check_names(
+    pr: dict[str, Any], expected_check_names: tuple[str, ...]
+) -> set[str]:
+    required = set(expected_check_names) & BASE_BOUND_REQUIRED_CHECK_NAMES
+    if REGISTRY_FRESHNESS_CHECK_NAME not in required:
+        return required
+
+    paths, path_failures = _current_pr_paths_failures(pr)
+    if (
+        pr.get("pullFilesEvidenceComplete") is not True
+        or pr.get("changedFiles") is None
+        or path_failures
+    ):
+        return required
+    raw_files = pr.get("files")
+    if not isinstance(raw_files, list):
+        return required
+    touched_paths: list[str] = []
+    for item in raw_files:
+        if not isinstance(item, dict):
+            return required
+        path = item.get("path") or item.get("filename")
+        status = item.get("status")
+        if not isinstance(path, str) or not isinstance(status, str) or not status.strip():
+            return required
+        normalized = _normalized_review_path(path)
+        if normalized is None:
+            return required
+        touched_paths.append(normalized)
+        previous = item.get("previousPath")
+        if previous is None:
+            previous = item.get("previous_filename")
+        if status.strip().lower() == "renamed" and previous is None:
+            return required
+        if previous is not None:
+            if not isinstance(previous, str):
+                return required
+            normalized_previous = _normalized_review_path(previous)
+            if normalized_previous is None:
+                return required
+            touched_paths.append(normalized_previous)
+    registry_root = REGISTRY_TASK_PATH_PREFIX.rstrip("/")
+    if any(
+        path == registry_root or path.startswith(REGISTRY_TASK_PATH_PREFIX)
+        for path in touched_paths
+    ):
+        return required
+
+    # The custom ?base_sha= CheckRun exists only for Registry-task candidates.
+    # Non-Registry PRs still run the native pull_request_target freshness job
+    # against the current base, but GitHub owns that job's details URL.
+    required.remove(REGISTRY_FRESHNESS_CHECK_NAME)
+    return required
+
+
 def evaluate_review_gate(
     state: dict[str, Any],
     *,
@@ -3138,6 +3260,9 @@ def evaluate_review_gate(
     expected_check_buckets_by_name: dict[str, list[str | None]] = {
         name: [] for name in expected_check_names
     }
+    base_bound_check_names = _effective_base_bound_check_names(
+        pr, expected_check_names
+    )
     stale_or_unbound_base_checks: set[str] = set()
     current_base_sha = pr.get("baseRefOid")
     blocking_checks = []
@@ -3152,7 +3277,7 @@ def evaluate_review_gate(
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:
                 blocking_checks.append(check)
-            elif name in BASE_BOUND_REQUIRED_CHECK_NAMES and not _check_link_matches_base_sha(
+            elif name in base_bound_check_names and not _check_link_matches_base_sha(
                 check, current_base_sha
             ):
                 stale_or_unbound_base_checks.add(name)
@@ -3243,9 +3368,7 @@ def evaluate_review_gate(
         },
         "check_policy": {
             "expected_check_names": list(expected_check_names),
-            "base_bound_check_names": sorted(
-                set(expected_check_names) & BASE_BOUND_REQUIRED_CHECK_NAMES
-            ),
+            "base_bound_check_names": sorted(base_bound_check_names),
         },
     }
 
