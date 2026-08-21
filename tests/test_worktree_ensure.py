@@ -321,10 +321,73 @@ class WorktreeEnsureTests(unittest.TestCase):
 
         self.assertEqual(created["result_state"], "CREATED")
         self.assertEqual(blocked["result_state"], "NOT_ACCEPTED")
-        self.assertEqual(blocked["error_class"], "CHECKOUT_LIFECYCLE_REJECTED")
+        self.assertEqual(blocked["error_class"], "CHECKOUT_CAPACITY_SATURATED")
         self.assertIn("active checkout limit", blocked["error"])
+        self.assertEqual(
+            blocked["checkout_capacity"],
+            {
+                "schema_version": 1,
+                "available": True,
+                "configured_limit": 1,
+                "used": 1,
+                "free": 0,
+                "saturated": True,
+                "capacity_semantics": "unexpired_active_retention",
+                "does_not_establish": [
+                    "checkout_terminality",
+                    "checkout_cleanup_eligibility",
+                    "execution_resource_pressure",
+                ],
+            },
+        )
         self.assertTrue(Path(str(first["target_path"])).is_dir())
         self.assertFalse(Path(str(second["target_path"])).exists())
+
+    def test_capacity_error_without_projection_proof_keeps_generic_rejection(self) -> None:
+        parameters = self._parameters(
+            key="limit-unproved",
+            branch="feat/limit-unproved",
+            target=self.worktree_root / "limit-unproved",
+        )
+        lifecycle_error = RuntimeError(
+            "Per-repository active checkout limit reached: active=8 limit=8"
+        )
+        with (
+            patch.object(
+                worktree_ensure,
+                "_reserve_input_lifecycle",
+                side_effect=lifecycle_error,
+            ),
+            patch.object(
+                checkouts,
+                "active_capacity_projection",
+                side_effect=RuntimeError("projection unavailable"),
+            ),
+        ):
+            blocked = self._ensure(parameters)
+
+        self.assertEqual(blocked["result_state"], "NOT_ACCEPTED")
+        self.assertEqual(blocked["error_class"], "CHECKOUT_LIFECYCLE_REJECTED")
+        self.assertNotIn("checkout_capacity", blocked)
+        self.assertFalse(Path(str(parameters["target_path"])).exists())
+
+    def test_unrelated_lifecycle_rejection_is_not_capacity_saturation(self) -> None:
+        parameters = self._parameters(
+            key="limit-unrelated",
+            branch="feat/limit-unrelated",
+            target=self.worktree_root / "limit-unrelated",
+        )
+        with patch.object(
+            worktree_ensure,
+            "_reserve_input_lifecycle",
+            side_effect=RuntimeError("checkout lifecycle binding drift"),
+        ):
+            blocked = self._ensure(parameters)
+
+        self.assertEqual(blocked["result_state"], "NOT_ACCEPTED")
+        self.assertEqual(blocked["error_class"], "CHECKOUT_LIFECYCLE_REJECTED")
+        self.assertNotIn("checkout_capacity", blocked)
+        self.assertFalse(Path(str(parameters["target_path"])).exists())
 
     def test_expired_missing_active_binding_does_not_consume_creation_capacity(self) -> None:
         missing = self.worktree_root / "expired-missing"
