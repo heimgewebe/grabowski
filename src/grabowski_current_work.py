@@ -1074,9 +1074,6 @@ def _add_checkouts(
             for reason in item["binding_drift_reasons"]:
                 if reason not in group["action_reasons"]:
                     group["action_reasons"].append(reason)
-        if item["lifecycle_state"] == "managed_active_attention":
-            _blocking(group, "managed-active-lifecycle-attention")
-
         if item["dirty"]:
             identifying_live_lease = any(
                 _resource_identifies_checkout(lease["resource_key"], item)
@@ -1128,10 +1125,15 @@ def _add_checkouts(
                 if "closed-not-cleaned" not in group["action_reasons"]:
                     group["action_reasons"].append("closed-not-cleaned")
         elif item["binding_phase"] == "active" and item["binding_consistent"]:
-            if item["retention_active"] or item["coordination_blocking"]:
+            if (
+                item["retention_active"]
+                or item["coordination_blocking"]
+                or item["resource_leases"]
+                or item["processes"]
+            ):
                 _set_projection_state(group, "active")
             else:
-                _blocking(group, "managed-active-lifecycle-attention")
+                _hygiene(group, "managed-active-lifecycle-attention")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:
