@@ -42,6 +42,7 @@ LEASE_BLOCKING_STATUSES = (
 )
 LEASE_REMEDIATION_MAX_KEYS = 16
 LEASE_ACQUIRING_GRIP = "work-acquire"
+CHECKOUT_CAPACITY_LIMIT_ERROR_PREFIX = "Per-repository active checkout limit reached:"
 
 
 class WorktreeEnsurePreflight(ValueError):
@@ -749,6 +750,11 @@ def _public_output(
         "lifecycle": lifecycle,
         "lifecycle_reservation": record.get("lifecycle_reservation"),
         "work_admission": record.get("work_admission"),
+        **(
+            {"checkout_capacity": record["checkout_capacity"]}
+            if isinstance(record.get("checkout_capacity"), dict)
+            else {}
+        ),
         "lifecycle_integrity": {
             "sha256": _sha256_json(lifecycle) if isinstance(lifecycle, dict) else None,
             "source": (
@@ -770,6 +776,56 @@ def _public_output(
             "does not clean up conflicting worktrees or branches",
             "does not prove connector delivery of the response",
             "a legacy lifecycle projection is not bound by the original receipt hash",
+        ],
+    }
+
+
+def _checkout_capacity_saturation_evidence(
+    repo: str | Path, exc: BaseException
+) -> dict[str, Any] | None:
+    if not str(exc).startswith(CHECKOUT_CAPACITY_LIMIT_ERROR_PREFIX):
+        return None
+
+    import grabowski_checkouts as checkouts
+
+    try:
+        projection = checkouts.active_capacity_projection(Path(repo))
+        if not isinstance(projection, dict):
+            return None
+        configured_limit = projection.get("configured_limit")
+        used = projection.get("used")
+        free = projection.get("free")
+        semantics = projection.get("capacity_semantics")
+    except Exception:
+        return None
+    if (
+        projection.get("available") is not True
+        or projection.get("saturated") is not True
+        or not isinstance(configured_limit, int)
+        or isinstance(configured_limit, bool)
+        or configured_limit < 1
+        or not isinstance(used, int)
+        or isinstance(used, bool)
+        or used < configured_limit
+        or not isinstance(free, int)
+        or isinstance(free, bool)
+        or free != 0
+        or not isinstance(semantics, str)
+        or not semantics
+    ):
+        return None
+    return {
+        "schema_version": 1,
+        "available": True,
+        "configured_limit": configured_limit,
+        "used": used,
+        "free": 0,
+        "saturated": True,
+        "capacity_semantics": semantics,
+        "does_not_establish": [
+            "checkout_terminality",
+            "checkout_cleanup_eligibility",
+            "execution_resource_pressure",
         ],
     }
 
@@ -1214,17 +1270,26 @@ def ensure_worktree(
         try:
             lifecycle_reservation = _reserve_input_lifecycle(inputs)
         except (PermissionError, RuntimeError, ValueError) as exc:
+            checkout_capacity = _checkout_capacity_saturation_evidence(
+                inputs["repo"], exc
+            )
             record = _durable_record(
                 inputs=inputs,
                 parameters_sha256=parameters_sha256,
                 state="complete",
                 result_state="NOT_ACCEPTED",
                 post_state=observation,
-                error_class="CHECKOUT_LIFECYCLE_REJECTED",
+                error_class=(
+                    "CHECKOUT_CAPACITY_SATURATED"
+                    if checkout_capacity is not None
+                    else "CHECKOUT_LIFECYCLE_REJECTED"
+                ),
                 error=str(exc),
                 friction=recovery_friction,
                 created_at_unix=existing.get("created_at_unix") if existing else None,
             )
+            if checkout_capacity is not None:
+                record["checkout_capacity"] = checkout_capacity
             record["lease"] = lease
             written = _write_receipt(receipt_path, record)
             return _public_output(
