@@ -45,6 +45,7 @@ if "mcp" not in sys.modules:
 
 import grabowski_grips as grips
 import grabowski_grip_orchestration as grip_orchestration
+import grabowski_sagas as sagas
 import grabowski_merge_guard as merge_guard
 import grabowski_resources as resources
 import grabowski_task_attention as task_attention
@@ -927,6 +928,9 @@ class GripFoundationTests(unittest.TestCase):
                 "convergence-state-classify",
                 "gate-evidence-preflight",
                 "mechanic-loop",
+                "saga-plan",
+                "saga-run",
+                "saga-settle",
                 "operator-obligation-close",
                 "operator-obligation-list",
                 "operator-obligation-open",
@@ -1864,6 +1868,9 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(
             by_name["bureau-pickup-orphan-reconcile"]["availability"]["available"]
         )
+        self.assertTrue(by_name["saga-plan"]["availability"]["available"])
+        self.assertFalse(by_name["saga-run"]["availability"]["available"])
+        self.assertTrue(by_name["saga-settle"]["availability"]["available"])
         self.assertFalse(by_name["captain-preflight"]["availability"]["available"])
         self.assertFalse(by_name["captain-run"]["availability"]["available"])
         self.assertTrue(by_name["repo-orient"]["availability"]["available"])
@@ -1873,6 +1880,313 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(by_name["operator-obligation-close"]["availability"]["available"])
         self.assertFalse(by_name["operator-obligation-resolve"]["availability"]["available"])
         self.assertIn("does not expose generic shell execution", surface["non_claims"])
+
+    def test_saga_grips_compose_mechanic_without_executing_captain(self) -> None:
+        repo = str(Path(__file__).resolve().parents[1])
+        target = {
+            "repository_path": repo,
+            "repository": "heimgewebe/grabowski",
+            "adapter": "grabowski-self",
+            "runtime_target": "heim-pc",
+            "expected_head": "a" * 40,
+        }
+        plan_result = grips.grip_run(
+            "saga-plan",
+            {
+                "saga_kind": "runtime-deployment",
+                "target": target,
+                "idempotency_key": "t121-grip-runtime-pilot",
+            },
+            profile="observer",
+        )
+        self.assertEqual("passed", plan_result["status"])
+        plan = plan_result["output"]
+        self.assertEqual(
+            ["prepare", "plan", "apply", "readback", "settle"],
+            [phase["name"] for phase in plan["phases"]],
+        )
+
+        with patch.object(
+            grips,
+            "_runtime_deploy_self_preflight",
+            return_value={
+                "adapter": "grabowski-self",
+                "expected_head": "a" * 40,
+                "ready": True,
+            },
+        ), patch.object(grips, "_run_captain_runtime_deploy") as captain_executor:
+            run_result = grips.grip_run(
+                "saga-run",
+                {
+                    "saga_kind": "runtime-deployment",
+                    "target": target,
+                    "idempotency_key": "t121-grip-runtime-pilot",
+                    "expected_plan_sha256": plan["plan_sha256"],
+                },
+                profile="operator",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", run_result["status"])
+        self.assertEqual("captain_required", run_result["output"]["state"])
+        self.assertEqual("captain-run", run_result["output"]["captain_handoff"]["grip"])
+        self.assertEqual("runtime-deploy", run_result["output"]["captain_handoff"]["action"])
+        captain_executor.assert_not_called()
+        self.assertEqual(
+            ["runtime-deploy-check"],
+            [
+                action["action"]
+                for action in run_result["output"]["mechanic"]["output"]["actions"]
+            ],
+        )
+
+    def test_saga_settle_grip_binds_captain_receipt_and_runtime_readback(self) -> None:
+        repo = str(Path(__file__).resolve().parents[1])
+        target = {
+            "repository_path": repo,
+            "repository": "heimgewebe/grabowski",
+            "adapter": "grabowski-self",
+            "runtime_target": "heim-pc",
+            "expected_head": "a" * 40,
+        }
+        plan = sagas.build_plan(
+            "runtime-deployment", target, "t121-grip-runtime-settle"
+        )
+
+        child_output = {"ready": True}
+        child_receipt = {
+            "kind": "grabowski.operator_grip_receipt",
+            "schema_version": 1,
+            "grip": {"name": "runtime-deploy-check"},
+            "status": "passed",
+            "output_sha256": sagas.sha256_json(child_output),
+        }
+        child_receipt["receipt_sha256"] = sagas.sha256_json(child_receipt)
+        mechanic_output = {
+            "requested_action_count": 1,
+            "executed_action_count": 1,
+            "complete": True,
+            "actions": [
+                {
+                    "index": 0,
+                    "action": "runtime-deploy-check",
+                    "grip": "runtime-deploy-check",
+                    "target": deepcopy(plan["mechanic_actions"][0]["target"]),
+                    "scope": deepcopy(plan["mechanic_actions"][0]["scope"]),
+                    "receipt_path": plan["mechanic_actions"][0]["receipt_path"],
+                    "allow_mutation": False,
+                    "child_receipt_sha256": child_receipt["receipt_sha256"],
+                    "receipt_status": "passed",
+                    "receipt": child_receipt,
+                    "output": child_output,
+                }
+            ],
+        }
+        mechanic_receipt = {
+            "kind": "grabowski.operator_grip_receipt",
+            "schema_version": 1,
+            "grip": {"name": "mechanic-loop"},
+            "status": "passed",
+            "output_sha256": sagas.sha256_json(mechanic_output),
+        }
+        mechanic_receipt["receipt_sha256"] = sagas.sha256_json(mechanic_receipt)
+        run = sagas.build_run_receipt(
+            plan,
+            {
+                "status": "passed",
+                "receipt_sha256": mechanic_receipt["receipt_sha256"],
+                "receipt": mechanic_receipt,
+                "output": mechanic_output,
+            },
+        )
+
+        captain_output = {
+            "decision": "scheduled",
+            "actions": [
+                {
+                    "action": "runtime-deploy",
+                    "target": deepcopy(plan["captain_handoff"]["target"]),
+                }
+            ],
+            "executions": [
+                {
+                    "execution_invoked": True,
+                    "execution_attempted": True,
+                    "verification_passed": True,
+                    "deployment_scheduled": True,
+                    "deployment_completion_verified": False,
+                }
+            ],
+        }
+        captain_receipt = {
+            "kind": "grabowski.operator_grip_receipt",
+            "schema_version": 1,
+            "grip": {"name": "captain-run"},
+            "status": "passed",
+            "output_sha256": sagas.sha256_json(captain_output),
+        }
+        captain_receipt["receipt_sha256"] = sagas.sha256_json(captain_receipt)
+        captain = {
+            "status": "passed",
+            "receipt_sha256": captain_receipt["receipt_sha256"],
+            "receipt": captain_receipt,
+            "output": captain_output,
+        }
+        readback = {
+            "identity": {"repo_head": "a" * 40, "completion_status": "complete"},
+            "integrity": {"manifest_schema_valid": True, "artifact_integrity_valid": True},
+            "serving_process": {
+                "matches_deployed_manifest": True,
+                "serves_deployed_release": True,
+            },
+        }
+        binding_body = {
+            "schema_version": 1,
+            "kind": sagas.CAPTAIN_AUDIT_BINDING_KIND,
+            "authority": "verified_grabowski_audit_chain",
+            "intent_record_sha256": "c" * 64,
+            "completion_record_sha256": "d" * 64,
+            "action": "runtime-deploy",
+            "target_sha256": sagas.sha256_json(plan["captain_handoff"]["target"]),
+            "expected_head": "a" * 40,
+            "expected_base": None,
+            "expected_base_sha": None,
+            "receipt_sha256": captain_receipt["receipt_sha256"],
+            "output_sha256": captain_receipt["output_sha256"],
+            "status": "passed",
+        }
+        audit_binding = {
+            **binding_body,
+            "binding_sha256": sagas.sha256_json(binding_body),
+        }
+        with patch.object(
+            grips, "_saga_captain_audit_binding", return_value=audit_binding
+        ):
+            settled = grips.grip_run(
+                "saga-settle",
+                {
+                    "saga_kind": "runtime-deployment",
+                    "target": target,
+                    "idempotency_key": "t121-grip-runtime-settle",
+                    "expected_plan_sha256": plan["plan_sha256"],
+                    "run_receipt": run,
+                    "captain_result": captain,
+                    "readback": readback,
+                },
+                profile="observer",
+            )
+        self.assertEqual("passed", settled["status"])
+        self.assertEqual("settled", settled["output"]["state"])
+        self.assertEqual(
+            captain_receipt["receipt_sha256"],
+            settled["output"]["captain_receipt_sha256"],
+        )
+
+    def test_saga_captain_audit_binding_requires_verified_server_records(self) -> None:
+        target = {
+            "repository_path": str(Path(__file__).resolve().parents[1]),
+            "repository": "heimgewebe/grabowski",
+            "adapter": "grabowski-self",
+            "runtime_target": "heim-pc",
+            "expected_head": "a" * 40,
+        }
+        plan = sagas.build_plan(
+            "runtime-deployment", target, "t121-audit-binding-pilot"
+        )
+        output = {
+            "decision": "scheduled",
+            "actions": [
+                {
+                    "action": "runtime-deploy",
+                    "target": deepcopy(plan["captain_handoff"]["target"]),
+                }
+            ],
+            "executions": [
+                {
+                    "execution_invoked": True,
+                    "execution_attempted": True,
+                    "verification_passed": True,
+                    "deployment_scheduled": True,
+                    "deployment_completion_verified": False,
+                }
+            ],
+        }
+        receipt = {
+            "kind": "grabowski.operator_grip_receipt",
+            "schema_version": 1,
+            "grip": {"name": "captain-run"},
+            "status": "passed",
+            "output_sha256": sagas.sha256_json(output),
+        }
+        receipt["receipt_sha256"] = sagas.sha256_json(receipt)
+        captain = {
+            "status": "passed",
+            "receipt_sha256": receipt["receipt_sha256"],
+            "receipt": receipt,
+            "output": output,
+        }
+        with self.assertRaisesRegex(
+            grips.GripPreflightError, "complete server Captain audit"
+        ):
+            grips._saga_captain_audit_binding(plan, captain)
+
+        intent_sha = "c" * 64
+        completion_sha = "d" * 64
+        target_sha = sagas.sha256_json(plan["captain_handoff"]["target"])
+        common = {
+            "kind": "grabowski_captain_run_audit",
+            "actor_id": "operator:test",
+            "action": "runtime-deploy",
+            "target_sha256": target_sha,
+            "expected_head": "a" * 40,
+            "expected_base": None,
+            "expected_base_sha": None,
+            "context_sha256": "1" * 64,
+            "request_sha256": "2" * 64,
+        }
+        intent = {
+            **common,
+            "operation": "captain-run-audit-intent",
+            "phase": "intent",
+            "record_sha256": intent_sha,
+        }
+        execution_result = {
+            "status": "passed",
+            "receipt_sha256": receipt["receipt_sha256"],
+            "output_sha256": receipt["output_sha256"],
+        }
+        completion = {
+            **common,
+            "operation": "captain-run-audit-completion",
+            "phase": "completion",
+            "record_sha256": completion_sha,
+            "intent_audit_sha256": intent_sha,
+            "execution_result": execution_result,
+            "execution_result_sha256": sagas.sha256_json(execution_result),
+        }
+        captain["captain_audit"] = {
+            "status": "complete",
+            "intent": {
+                "audit_chain_valid": True,
+                "audit_record_sha256": intent_sha,
+            },
+            "completion": {
+                "audit_chain_valid": True,
+                "audit_record_sha256": completion_sha,
+            },
+        }
+        with patch.object(
+            grips,
+            "_saga_verified_audit_records",
+            return_value={intent_sha: intent, completion_sha: completion},
+        ):
+            binding = grips._saga_captain_audit_binding(plan, captain)
+        self.assertEqual("verified_grabowski_audit_chain", binding["authority"])
+        self.assertEqual(intent_sha, binding["intent_record_sha256"])
+        self.assertEqual(completion_sha, binding["completion_record_sha256"])
+        self.assertEqual(receipt["receipt_sha256"], binding["receipt_sha256"])
 
     def test_operator_obligation_grips_enforce_response_end_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
