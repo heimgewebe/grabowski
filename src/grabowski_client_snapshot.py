@@ -1595,7 +1595,21 @@ def _write_publication_current(
     }
     document = {**material, "current_sha256": _sha256_json(material)}
     _ensure_private_directory(PLATFORM_PUBLICATION_ROOT)
-    _write_private_json(PLATFORM_PUBLICATION_CURRENT_PATH, document)
+    try:
+        _write_private_json(PLATFORM_PUBLICATION_CURRENT_PATH, document)
+    except (OSError, ClientSnapshotError) as write_exc:
+        # os.replace() precedes the directory fsync and final validation in the
+        # atomic writer.  A raised exception can therefore mean either no effect
+        # or an already-published exact Current projection.  Read back once and
+        # accept only the complete hash-validated intended document; otherwise
+        # preserve the original write failure and let the caller fail closed.
+        try:
+            observed = _read_publication_current()
+        except (OSError, ClientSnapshotError):
+            raise write_exc
+        if observed != document:
+            raise write_exc
+        return observed
     return document
 
 
