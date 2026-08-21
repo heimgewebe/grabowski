@@ -354,6 +354,39 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         self.assertEqual(current["request_id"], prepared["request_id"])
         self.assertEqual(current["state"], "pending_activation")
 
+    def test_changed_surface_activation_supersedes_foreign_same_contract_inflight_request(self) -> None:
+        prior = self._prepare_publication(cutover_id="foreign-inflight")
+        attempted = client_snapshot.record_platform_publication_attempt(
+            request_id=prior["request_id"],
+            attempt_id="foreign-submitted",
+            outcome="submitted",
+            reference="connector-settings-refresh",
+            now_unix=self.now_unix + 1,
+        )
+        self.assertEqual(attempted["state"], "awaiting_platform_observation")
+
+        prepared = client_snapshot.prepare_platform_publication_for_runtime(
+            registered_tool_count=TOOL_COUNT,
+            registered_names_sha256=NAMES_SHA256,
+            complete_schema_count=TOOL_COUNT,
+            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+            cutover_id=CUTOVER_ID,
+            require_current_cutover_binding=True,
+            now_unix=self.now_unix + 2,
+        )
+        self.assertFalse(prepared["reused"])
+        self.assertNotEqual(prepared["request_id"], prior["request_id"])
+
+        activated = client_snapshot.activate_platform_publication_request(
+            request_id=prepared["request_id"], now_unix=self.now_unix + 3
+        )
+        self.assertEqual(activated["state"], "publication_pending")
+        resolution = client_snapshot._read_publication_resolution(prior["request_id"])
+        self.assertEqual(resolution["outcome"], "superseded")
+        self.assertEqual(
+            resolution["successor_request_id"], prepared["request_id"]
+        )
+
     def test_changed_surface_recovers_exact_current_after_post_replace_write_error(self) -> None:
         prior = self._prepare_publication(cutover_id="foreign-ambiguous-write")
         client_snapshot.activate_platform_publication_request(
