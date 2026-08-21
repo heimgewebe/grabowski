@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
 import time
 from typing import Any, Literal
@@ -80,6 +81,8 @@ EXECUTION_HEARTBEAT_MAX_AGE_SECONDS = 900
 EXTERNAL_BINDING_FIELDS = ("external_system", "external_id", "external_state")
 ACTIVE_EXTERNAL_STATES = frozenset({"queued", "running", "succeeded"})
 ORPHAN_RECONCILE_ERROR = "orphan-reconcile:stale-or-unbound-execution"
+ORPHAN_RESUME_ERROR = "stale worker without external executor"
+REGISTRY_BINDING_RECOVERY_KIND = "grabowski_bureau_pickup_registry_binding_recovery"
 LEASE_IDENTITY_FIELDS = (
     "resource_key",
     "owner_id",
@@ -2491,6 +2494,1330 @@ def _journaled_existing_assignment_after_claim_rejection(
     return synthetic, stored_binding, stored_request, coordination
 
 
+
+def _request_without_registry_root(request: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(request)
+    payload.pop("registry_root", None)
+    return payload
+
+
+def _registry_json(path: Path, *, label: str) -> dict[str, Any]:
+    try:
+        snapshot = bureau._read_regular_file_snapshot(
+            path, label=label, max_bytes=MAX_REQUEST_BYTES
+        )
+    except (OSError, RuntimeError) as exc:
+        raise BureauPickupError(
+            f"{label}-read-failed", details=_runtime_error_details(exc, path=str(path))
+        ) from None
+    try:
+        value = json.loads(snapshot.raw)
+    except json.JSONDecodeError:
+        raise BureauPickupError(f"{label}-invalid") from None
+    if not isinstance(value, dict):
+        raise BureauPickupError(f"{label}-invalid")
+    return value
+
+
+def _registry_successor_proof(
+    stored_binding: RegistryBinding, current_binding: RegistryBinding
+) -> dict[str, Any]:
+    stored = _validate_registry_binding_identity(stored_binding["identity"])
+    current = _validate_registry_binding_identity(current_binding["identity"])
+    if (
+        stored.get("kind") != "canonical-registry-binding"
+        or current.get("kind") != "canonical-registry-binding"
+    ):
+        raise BureauPickupError("orphan-recovery-requires-canonical-registry")
+    before = stored["source_commit"]
+    after = current["source_commit"]
+    if before != after:
+        lines = bureau._git_identity_lines(
+            bureau_leases.BUREAU_REPOSITORY_ROOT,
+            "merge-base",
+            "--is-ancestor",
+            before,
+            after,
+        )
+        if lines is None:
+            raise BureauPickupError(
+                "orphan-recovery-registry-source-not-ancestor",
+                details={"stored_source_commit": before, "current_source_commit": after},
+            )
+    return {
+        "repository": str(bureau_leases.BUREAU_REPOSITORY_ROOT),
+        "stored_source_commit": before,
+        "current_source_commit": after,
+        "stored_registry_binding_sha256": stored["binding_sha256"],
+        "current_registry_binding_sha256": current["binding_sha256"],
+        "ancestor_proven": True,
+    }
+
+
+def _authoritative_task_spec_for_recovery(
+    registry_task: dict[str, Any],
+    *,
+    task_id: str,
+    coordination_root: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if coordination_root is None:
+        return registry_task, {"kind": "legacy-git-bootstrap", "revision": None}
+    state_root = Path(coordination_root)
+    state_db = state_root / "bureau.sqlite3"
+    try:
+        metadata = os.lstat(state_db)
+    except FileNotFoundError:
+        raise BureauPickupError(
+            "orphan-recovery-state-db-missing", details={"path": str(state_db)}
+        ) from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise BureauPickupError(
+            "orphan-recovery-state-db-unsafe", details={"path": str(state_db)}
+        )
+    try:
+        connection = sqlite3.connect(
+            f"file:{state_db}?mode=ro", uri=True, timeout=5
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name IN ('task_specs','task_spec_revisions')"
+                )
+            }
+            if tables != {"task_specs", "task_spec_revisions"}:
+                raise BureauPickupError("orphan-recovery-task-spec-schema-drift")
+            count = int(connection.execute("SELECT COUNT(*) FROM task_specs").fetchone()[0])
+            if count == 0:
+                return registry_task, {
+                    "kind": "legacy-git-bootstrap",
+                    "revision": None,
+                }
+            row = connection.execute(
+                "SELECT p.current_revision AS current_revision, "
+                "p.spec_sha256 AS pointer_sha256, "
+                "r.revision AS revision, r.parent_revision AS parent_revision, "
+                "r.spec_sha256 AS revision_sha256, r.spec_json AS spec_json "
+                "FROM task_specs p JOIN task_spec_revisions r "
+                "ON r.task_id=p.task_id AND r.revision=p.current_revision "
+                "WHERE p.task_id=?",
+                (task_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except BureauPickupError:
+        raise
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        raise BureauPickupError(
+            "orphan-recovery-task-spec-read-failed",
+            details={"path": str(state_db), "error_type": type(exc).__name__},
+        ) from exc
+    if row is None:
+        raise BureauPickupError(
+            "orphan-recovery-authoritative-task-missing",
+            details={"task_id": task_id},
+        )
+    revision = int(row["revision"])
+    current_revision = int(row["current_revision"])
+    parent = row["parent_revision"]
+    parent_revision = None if parent is None else int(parent)
+    pointer_sha256 = row["pointer_sha256"]
+    revision_sha256 = row["revision_sha256"]
+    if (
+        revision < 1
+        or current_revision != revision
+        or parent_revision != (None if revision == 1 else revision - 1)
+        or not isinstance(pointer_sha256, str)
+        or SHA256_RE.fullmatch(pointer_sha256) is None
+        or pointer_sha256 != revision_sha256
+    ):
+        raise BureauPickupError("orphan-recovery-task-spec-pointer-drift")
+    try:
+        spec = json.loads(str(row["spec_json"]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise BureauPickupError("orphan-recovery-task-spec-json-invalid") from exc
+    if not isinstance(spec, dict) or spec.get("id") != task_id:
+        raise BureauPickupError("orphan-recovery-task-spec-id-drift")
+    if _sha256(spec) != revision_sha256:
+        raise BureauPickupError("orphan-recovery-task-spec-digest-drift")
+    return spec, {
+        "kind": "bureau-state-store-task-specs",
+        "revision": revision,
+        "spec_sha256": revision_sha256,
+        "state_db": str(state_db),
+    }
+
+
+def _current_registry_revision_proof(
+    current_binding: RegistryBinding,
+    intent: dict[str, Any],
+    *,
+    coordination_root: str | None = None,
+) -> dict[str, Any]:
+    identity = _validate_registry_binding_identity(current_binding["identity"])
+    if identity.get("kind") != "canonical-registry-binding":
+        raise BureauPickupError("orphan-recovery-requires-canonical-registry")
+    task_id = intent["task_id"]
+    root = Path(identity["registry_root"])
+    task = _registry_json(
+        root / "registry" / "tasks" / f"{task_id}.json",
+        label="orphan-recovery-task",
+    )
+    if task.get("id") != task_id:
+        raise BureauPickupError("orphan-recovery-task-id-drift")
+    task, task_authority = _authoritative_task_spec_for_recovery(
+        task, task_id=task_id, coordination_root=coordination_root
+    )
+    revision = json.loads(json.dumps(task))
+    revision.pop("state", None)
+    metadata = revision.get("metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("verification", None)
+        if not metadata:
+            revision.pop("metadata", None)
+    task_sha256 = _sha256(revision)
+    initiative_id = task.get("initiative")
+    if (
+        not isinstance(initiative_id, str)
+        or TASK_ID_RE.fullmatch(initiative_id) is None
+    ):
+        raise BureauPickupError("orphan-recovery-initiative-invalid")
+    initiative = _registry_json(
+        root / "registry" / "initiatives" / f"{initiative_id}.json",
+        label="orphan-recovery-initiative",
+    )
+    if initiative.get("id") != initiative_id:
+        raise BureauPickupError("orphan-recovery-initiative-id-drift")
+    plan = initiative.get("current_plan") or {}
+    if not isinstance(plan, dict):
+        raise BureauPickupError("orphan-recovery-plan-invalid")
+    plan_sha256 = _sha256(plan)
+    if task_sha256 != intent.get("task_sha256"):
+        raise BureauPickupError(
+            "orphan-recovery-task-drift",
+            details={
+                "expected_task_sha256": intent.get("task_sha256"),
+                "observed_task_sha256": task_sha256,
+            },
+        )
+    if plan_sha256 != intent.get("plan_sha256"):
+        raise BureauPickupError(
+            "orphan-recovery-plan-drift",
+            details={
+                "expected_plan_sha256": intent.get("plan_sha256"),
+                "observed_plan_sha256": plan_sha256,
+            },
+        )
+    task_state = task.get("state")
+    if not isinstance(task_state, str) or not task_state:
+        raise BureauPickupError("orphan-recovery-task-state-invalid")
+    if task_state in TERMINAL_BUREAU_TASK_STATES:
+        raise BureauPickupError(
+            "orphan-recovery-task-terminal",
+            details={"task_id": task_id, "task_state": task_state},
+        )
+    return {
+        "task_id": task_id,
+        "initiative_id": initiative_id,
+        "task_sha256": task_sha256,
+        "plan_sha256": plan_sha256,
+        "task_state": task_state,
+        "task_authority": task_authority,
+    }
+
+
+def _journal_run_identity(run_dir: Path, intent: dict[str, Any]) -> dict[str, Any]:
+    committed = _read_bound_json(run_dir / "commit-result.json", label="commit-result")
+    envelope = committed.get("envelope")
+    run = committed.get("run")
+    if not isinstance(envelope, dict) or not isinstance(run, dict):
+        raise BureauPickupError("orphan-recovery-journal-commit-invalid")
+    envelope_sha256 = _sha256(envelope)
+    workspace = intent.get("workspace")
+    expected = {
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "task_sha256": intent["task_sha256"],
+        "plan_sha256": intent["plan_sha256"],
+        "workspace_path": workspace.get("workspace_path") if isinstance(workspace, dict) else None,
+        "workspace_branch": workspace.get("workspace_branch") if isinstance(workspace, dict) else None,
+    }
+    mismatches = {
+        key: {"expected": value, "observed": run.get(key)}
+        for key, value in expected.items()
+        if run.get(key) != value
+    }
+    if mismatches:
+        raise BureauPickupError(
+            "orphan-recovery-journal-run-drift", details={"mismatches": mismatches}
+        )
+    attempt = run.get("attempt")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise BureauPickupError("orphan-recovery-journal-attempt-invalid")
+    return {
+        **expected,
+        "attempt": attempt,
+        "envelope_sha256": envelope_sha256,
+    }
+
+
+def _validate_recoverable_orphan(
+    coordination: dict[str, Any],
+    intent: dict[str, Any],
+    acquisition: dict[str, Any],
+    journal_identity: dict[str, Any],
+) -> dict[str, Any]:
+    if coordination.get("status") != "coordinated":
+        raise BureauPickupError(
+            "orphan-recovery-coordination-unavailable",
+            details={"status": coordination.get("status"), "code": coordination.get("code")},
+        )
+    run = coordination.get("run")
+    if not isinstance(run, dict):
+        raise BureauPickupError("orphan-recovery-run-missing")
+    expected = {
+        key: journal_identity[key]
+        for key in (
+            "run_id",
+            "task_id",
+            "worker_id",
+            "task_sha256",
+            "plan_sha256",
+            "envelope_sha256",
+            "attempt",
+            "workspace_path",
+            "workspace_branch",
+        )
+    }
+    mismatches = {
+        key: {"expected": value, "observed": run.get(key)}
+        for key, value in expected.items()
+        if run.get(key) != value
+    }
+    if mismatches:
+        raise BureauPickupError(
+            "orphan-recovery-run-identity-drift", details={"mismatches": mismatches}
+        )
+    if run.get("state") != "orphaned" or run.get("error") != ORPHAN_RESUME_ERROR:
+        raise BureauPickupError(
+            "orphan-recovery-run-not-eligible",
+            details={"state": run.get("state"), "error": run.get("error")},
+        )
+    if any(
+        run.get(field) is not None
+        for field in (
+            "external_system",
+            "external_id",
+            "external_state",
+            "external_observed_at",
+        )
+    ):
+        raise BureauPickupError("orphan-recovery-external-binding-present")
+    reservations = run.get("reservations")
+    if reservations not in (None, []):
+        raise BureauPickupError("orphan-recovery-reservations-present")
+    if coordination.get("claim_intent_sha256") != intent["intent_sha256"]:
+        raise BureauPickupError("orphan-recovery-intent-drift")
+    release = coordination.get("release")
+    if not isinstance(release, dict):
+        raise BureauPickupError("orphan-recovery-release-binding-missing")
+    expected_release = {
+        "owner_id": intent["lease_owner_id"],
+        "resource_keys": intent["required_resource_keys"],
+        "claim_intent_sha256": intent["intent_sha256"],
+    }
+    if any(release.get(key) != value for key, value in expected_release.items()):
+        raise BureauPickupError("orphan-recovery-release-binding-drift")
+    if acquisition.get("run_id") != intent["run_id"] or acquisition.get(
+        "task_id"
+    ) != intent["task_id"]:
+        raise BureauPickupError("orphan-recovery-acquisition-run-drift")
+    if acquisition.get("owner_id") != intent["lease_owner_id"] or acquisition.get(
+        "claim_intent_sha256"
+    ) != intent["intent_sha256"]:
+        raise BureauPickupError("orphan-recovery-acquisition-owner-drift")
+    return run
+
+
+def _journaled_orphan_recovery_candidate(
+    request: dict[str, Any], current_binding: RegistryBinding
+) -> dict[str, Any] | None:
+    if current_binding["explicit"]:
+        return None
+    candidates: list[dict[str, Any]] = []
+    requested_identity = _request_without_registry_root(request)
+    for run_id in _journal_run_ids():
+        run_dir = _absolute_path(STATE_ROOT) / "runs" / run_id
+        try:
+            stored_payload = _read_bound_json(run_dir / "request.json", label="request")
+        except BureauPickupError as exc:
+            if exc.code.startswith("request-"):
+                continue
+            raise
+        stored_payload = dict(stored_payload)
+        marker = _normalize_registry_binding_marker(
+            stored_payload.pop("registry_binding_sha256", None)
+        )
+        if "coordination_root" not in stored_payload:
+            if Path(request["coordination_root"]) != _legacy_coordination_root():
+                continue
+            stored_payload["coordination_root"] = request["coordination_root"]
+        try:
+            stored_request = _normalize_request(
+                stored_payload, allow_internal_bindings=True
+            )
+        except ValueError:
+            continue
+        if _request_without_registry_root(stored_request) != requested_identity:
+            continue
+        intent = _read_bound_json(run_dir / "intent.json", label="intent")
+        synthetic = {
+            "status": "existing-assignment",
+            "run": {"run_id": run_id, "state": "orphaned"},
+            "envelope": {"claim_intent": intent},
+        }
+        validated_intent, _ = _validate_intent_result(synthetic, stored_request)
+        if validated_intent["run_id"] != run_id:
+            raise BureauPickupError("orphan-recovery-journal-run-mismatch")
+        try:
+            acquisition = _read_bound_json(
+                run_dir / "acquisition.json", label="acquisition"
+            )
+            journal_identity = _journal_run_identity(run_dir, validated_intent)
+        except BureauPickupError as exc:
+            if exc.code in {
+                "acquisition-missing",
+                "commit-result-missing",
+            }:
+                continue
+            raise
+        _validate_acquisition(acquisition)
+        coordination = _bound_bureau_call(
+            current_binding,
+            lambda: _coordination_status(
+                run_id,
+                registry_root=request["registry_root"],
+                coordination_root=request["coordination_root"],
+            ),
+        )
+        run = coordination.get("run") if isinstance(coordination, dict) else None
+        state = run.get("state") if isinstance(run, dict) else None
+        already_resumed = state in ACTIVE_EXECUTION_STATES
+        if not already_resumed and state != "orphaned":
+            continue
+        stored_binding = _read_journal_registry_binding(
+            run_dir,
+            stored_request["registry_root"],
+            expected_sha256=marker,
+        )
+        if stored_binding["identity"].get("kind") != "canonical-registry-binding":
+            raise BureauPickupError(
+                "orphan-recovery-requires-canonical-registry",
+                details={"run_id": run_id},
+            )
+        if already_resumed:
+            _validate_resumed_run(
+                coordination, validated_intent, acquisition, journal_identity
+            )
+        elif state == "orphaned":
+            _validate_recoverable_orphan(
+                coordination, validated_intent, acquisition, journal_identity
+            )
+        else:
+            continue
+        candidates.append(
+            {
+                "run_dir": run_dir,
+                "stored_request": stored_request,
+                "stored_binding": stored_binding,
+                "intent": validated_intent,
+                "acquisition": acquisition,
+                "journal_identity": journal_identity,
+                "coordination": coordination,
+                "already_resumed": already_resumed,
+            }
+        )
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise BureauPickupError(
+            "orphan-recovery-journal-ambiguous",
+            details={
+                "task_id": request["task_id"],
+                "worker_id": request["worker_id"],
+                "candidate_run_ids": [item["intent"]["run_id"] for item in candidates],
+            },
+        )
+    return candidates[0]
+
+
+def _validated_registry_recovery_receipt(
+    value: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    digest = value.get("receipt_sha256")
+    payload = dict(value)
+    payload.pop("receipt_sha256", None)
+    if (
+        not isinstance(digest, str)
+        or SHA256_RE.fullmatch(digest) is None
+        or _sha256(payload) != digest
+    ):
+        raise BureauPickupError("orphan-recovery-registry-receipt-digest-drift")
+    intent = candidate["intent"]
+    journal_identity = candidate["journal_identity"]
+    expected = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": REGISTRY_BINDING_RECOVERY_KIND,
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "task_sha256": intent["task_sha256"],
+        "plan_sha256": intent["plan_sha256"],
+        "envelope_sha256": journal_identity["envelope_sha256"],
+        "stored_registry_binding_sha256": candidate["stored_binding"]["identity"][
+            "binding_sha256"
+        ],
+    }
+    drift = {
+        field: {"expected": expected_value, "observed": value.get(field)}
+        for field, expected_value in expected.items()
+        if value.get(field) != expected_value
+    }
+    if drift:
+        raise BureauPickupError(
+            "orphan-recovery-registry-receipt-identity-drift",
+            details={"drift": drift},
+        )
+    ancestry = value.get("ancestry")
+    current_binding_sha256 = value.get("current_registry_binding_sha256")
+    current_source_commit = (
+        ancestry.get("current_source_commit") if isinstance(ancestry, dict) else None
+    )
+    if (
+        not isinstance(current_binding_sha256, str)
+        or SHA256_RE.fullmatch(current_binding_sha256) is None
+        or not isinstance(current_source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", current_source_commit) is None
+    ):
+        raise BureauPickupError("orphan-recovery-registry-receipt-lineage-invalid")
+    predecessor = value.get("predecessor_receipt_sha256")
+    if predecessor is not None and (
+        not isinstance(predecessor, str) or SHA256_RE.fullmatch(predecessor) is None
+    ):
+        raise BureauPickupError("orphan-recovery-registry-receipt-lineage-invalid")
+    return value
+
+
+def _registry_recovery_receipt_chain(
+    candidate: dict[str, Any],
+) -> list[dict[str, Any]]:
+    run_dir = candidate["run_dir"]
+    try:
+        names = sorted(os.listdir(run_dir))
+    except OSError as exc:
+        raise BureauPickupError(
+            "orphan-recovery-registry-receipt-read-failed",
+            details=_runtime_error_details(exc),
+        ) from exc
+    matching = [
+        name
+        for name in names
+        if name == "registry-binding-recovery.json"
+        or re.fullmatch(r"registry-binding-recovery-[0-9a-f]{16}\.json", name)
+    ]
+    if not matching:
+        return []
+    if len(matching) > 64:
+        raise BureauPickupError(
+            "orphan-recovery-registry-receipt-chain-too-large",
+            details={"count": len(matching), "limit": 64},
+        )
+    by_digest: dict[str, dict[str, Any]] = {}
+    for name in matching:
+        receipt = _validated_registry_recovery_receipt(
+            _read_bound_json(run_dir / name, label="registry-binding-recovery"),
+            candidate=candidate,
+        )
+        digest = receipt["receipt_sha256"]
+        if digest in by_digest and by_digest[digest] != receipt:
+            raise BureauPickupError("orphan-recovery-registry-receipt-digest-collision")
+        by_digest[digest] = receipt
+    roots = [
+        receipt
+        for receipt in by_digest.values()
+        if receipt.get("predecessor_receipt_sha256") is None
+    ]
+    if len(roots) != 1:
+        raise BureauPickupError(
+            "orphan-recovery-registry-receipt-lineage-drift",
+            details={"root_count": len(roots)},
+        )
+    ordered = [roots[0]]
+    seen = {roots[0]["receipt_sha256"]}
+    while len(seen) < len(by_digest):
+        children = [
+            receipt
+            for receipt in by_digest.values()
+            if receipt.get("predecessor_receipt_sha256") == ordered[-1]["receipt_sha256"]
+            and receipt["receipt_sha256"] not in seen
+        ]
+        if len(children) != 1:
+            raise BureauPickupError(
+                "orphan-recovery-registry-receipt-lineage-drift",
+                details={"child_count": len(children)},
+            )
+        ordered.append(children[0])
+        seen.add(children[0]["receipt_sha256"])
+    return ordered
+
+
+def _ensure_registry_binding_recovery_receipt(
+    candidate: dict[str, Any],
+    current_binding: RegistryBinding,
+    ancestry: dict[str, Any],
+    revision: dict[str, Any],
+) -> dict[str, Any]:
+    intent = candidate["intent"]
+    journal_identity = candidate["journal_identity"]
+    chain = _registry_recovery_receipt_chain(candidate)
+    current_binding_sha256 = current_binding["identity"]["binding_sha256"]
+    if chain and chain[-1].get("current_registry_binding_sha256") == current_binding_sha256:
+        return chain[-1]
+    if any(
+        existing.get("current_registry_binding_sha256") == current_binding_sha256
+        for existing in chain[:-1]
+    ):
+        raise BureauPickupError(
+            "orphan-recovery-registry-receipt-lineage-drift",
+            details={"reason": "registry-binding-rollback"},
+        )
+
+    predecessor = chain[-1] if chain else None
+    if predecessor is not None:
+        prior_source = predecessor["ancestry"]["current_source_commit"]
+        current_source = ancestry["current_source_commit"]
+        if prior_source != current_source:
+            lines = bureau._git_identity_lines(
+                bureau_leases.BUREAU_REPOSITORY_ROOT,
+                "merge-base",
+                "--is-ancestor",
+                prior_source,
+                current_source,
+            )
+            if lines is None:
+                raise BureauPickupError(
+                    "orphan-recovery-registry-receipt-lineage-drift",
+                    details={
+                        "prior_source_commit": prior_source,
+                        "current_source_commit": current_source,
+                    },
+                )
+
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": REGISTRY_BINDING_RECOVERY_KIND,
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "task_sha256": intent["task_sha256"],
+        "plan_sha256": intent["plan_sha256"],
+        "envelope_sha256": journal_identity["envelope_sha256"],
+        "stored_registry_binding_sha256": candidate["stored_binding"]["identity"][
+            "binding_sha256"
+        ],
+        "current_registry_binding_sha256": current_binding_sha256,
+        "predecessor_receipt_sha256": (
+            predecessor["receipt_sha256"] if predecessor is not None else None
+        ),
+        "ancestry": ancestry,
+        "current_revision": revision,
+        "history_preserved": [
+            "registry-binding.json",
+            "request.json",
+            "intent.json",
+            "acquisition.json",
+        ],
+    }
+    receipt["receipt_sha256"] = _sha256(receipt)
+    path = (
+        candidate["run_dir"] / "registry-binding-recovery.json"
+        if predecessor is None
+        else candidate["run_dir"]
+        / f"registry-binding-recovery-{current_binding_sha256[:16]}.json"
+    )
+    if os.path.lexists(path):
+        existing = _validated_registry_recovery_receipt(
+            _read_bound_json(path, label="registry-binding-recovery"),
+            candidate=candidate,
+        )
+        if existing != receipt:
+            raise BureauPickupError("orphan-recovery-registry-receipt-drift")
+        return existing
+    _write_bound_json(path, receipt)
+    return receipt
+
+
+def _current_lease_metadata_identity(
+    resource_key: str, expected_metadata: dict[str, Any]
+) -> dict[str, Any]:
+    key = resources.normalize_resource_key(resource_key)
+    try:
+        with resources._resource_readonly_sqlite(resources.RESOURCE_DB) as connection:
+            resources._validate_resource_schema_current(connection)
+            row = connection.execute(
+                "SELECT metadata_sha256, metadata_json FROM leases WHERE resource_key=?",
+                (key,),
+            ).fetchone()
+    except Exception as exc:
+        raise BureauPickupError(
+            "orphan-recovery-lease-metadata-read-failed",
+            details={"resource_key": key, "error_type": type(exc).__name__},
+        ) from exc
+    if row is None:
+        raise BureauPickupError(
+            "orphan-recovery-lease-readback-missing", details={"resource_key": key}
+        )
+    try:
+        observed = json.loads(row["metadata_json"])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise BureauPickupError(
+            "orphan-recovery-lease-metadata-invalid", details={"resource_key": key}
+        ) from exc
+    if not isinstance(observed, dict):
+        raise BureauPickupError(
+            "orphan-recovery-lease-metadata-invalid", details={"resource_key": key}
+        )
+    _, observed_sha256 = resources._metadata(observed)
+    if observed_sha256 != row["metadata_sha256"]:
+        raise BureauPickupError(
+            "orphan-recovery-lease-metadata-integrity-drift",
+            details={"resource_key": key},
+        )
+    sanitized = bureau_leases.sanitize_bureau_metadata([key], dict(expected_metadata))
+    expected = {} if sanitized is None else sanitized
+    observed_identity = resources._lease_identity_metadata(
+        observed, preserve_task_attempt=False
+    )
+    expected_identity = resources._lease_identity_metadata(
+        expected, preserve_task_attempt=False
+    )
+    if observed_identity != expected_identity:
+        raise BureauPickupError(
+            "orphan-recovery-lease-metadata-identity-drift",
+            details={"resource_key": key},
+        )
+    return observed_identity
+
+
+def _orphan_recovery_original_leases(
+    intent: dict[str, Any], acquisition: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    by_key = {
+        item["resource_key"]: item
+        for item in acquisition.get("leases", [])
+        if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
+    }
+    if sorted(by_key) != intent["required_resource_keys"]:
+        raise BureauPickupError("orphan-recovery-lease-journal-incomplete")
+    return by_key
+
+
+def _reacquire_orphaned_assignment_leases(
+    intent: dict[str, Any],
+    request: dict[str, Any],
+    acquisition: dict[str, Any],
+    run_dir: Path,
+) -> dict[str, Any]:
+    original_by_key = _orphan_recovery_original_leases(intent, acquisition)
+    groups = _acquisition_groups(intent, request)
+    expected_metadata_by_key = {
+        key: group["metadata"]
+        for group in groups
+        for key in group["resource_keys"]
+    }
+    now = resources._now()
+    plans: list[dict[str, Any]] = []
+    for group in groups:
+        keys = list(group["resource_keys"])
+        purpose = f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+        for key in keys:
+            original = original_by_key[key]
+            if original.get("purpose") != purpose:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-purpose-drift",
+                    details={"resource_key": key, "group": group["name"]},
+                )
+        live: list[dict[str, Any]] = []
+        expired: list[dict[str, Any]] = []
+        for key in keys:
+            observed = resources.inspect_resource(key)
+            if observed is not None:
+                if observed.get("owner_id") != intent["lease_owner_id"]:
+                    raise BureauPickupError(
+                        "orphan-recovery-lease-foreign-owner",
+                        details={"resource_key": key, "owner_id": observed.get("owner_id")},
+                    )
+                if observed.get("purpose") != purpose:
+                    raise BureauPickupError(
+                        "orphan-recovery-live-lease-binding-drift",
+                        details={"resource_key": key},
+                    )
+                if observed.get("metadata_sha256") != original_by_key[key].get(
+                    "metadata_sha256"
+                ):
+                    _current_lease_metadata_identity(key, group["metadata"])
+                live.append(observed)
+                continue
+            persisted = _persisted_resource_lease(key)
+            if persisted is None:
+                raise BureauPickupError(
+                    "orphan-recovery-expired-lease-history-missing",
+                    details={"resource_key": key},
+                )
+            if persisted.get("owner_id") != intent["lease_owner_id"]:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-foreign-owner",
+                    details={"resource_key": key, "owner_id": persisted.get("owner_id")},
+                )
+            if persisted.get("purpose") != purpose or persisted.get(
+                "metadata_sha256"
+            ) != original_by_key[key].get("metadata_sha256"):
+                raise BureauPickupError(
+                    "orphan-recovery-lease-history-drift",
+                    details={"resource_key": key},
+                )
+            if persisted["expires_at_unix"] > now:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-readback-drift",
+                    details={"resource_key": key},
+                )
+            expired.append(persisted)
+        short = [
+            item for item in live if item.get("expires_at_unix", 0) < now + 60
+        ]
+        if short:
+            raise BureauPickupError(
+                "orphan-recovery-live-lease-too-short",
+                details={
+                    "group": group["name"],
+                    "resource_keys": [item["resource_key"] for item in short],
+                },
+            )
+        plans.append(
+            {
+                "group": group,
+                "purpose": purpose,
+                "expired": expired,
+            }
+        )
+
+    # Do not mutate an early group until every group has passed lineage and
+    # ownership validation. Recovery installs internal guards here; normalized
+    # external requests cannot supply these callable values.
+    pre_effect_guard = request.get("_orphan_recovery_pre_effect_guard")
+    if pre_effect_guard is not None:
+        if not callable(pre_effect_guard):
+            raise BureauPickupError("orphan-recovery-run-guard-invalid")
+        pre_effect_guard()
+
+    actions: list[dict[str, Any]] = []
+    rebound_after_snapshots: list[dict[str, Any]] = []
+
+    def _raise_compensated_lease_effect_failure(exc: Exception) -> None:
+        compensation: dict[str, Any] = {
+            "required": True,
+            "status": "pending",
+            "resource_keys": [
+                item["resource_key"] for item in rebound_after_snapshots
+            ],
+            "cause_code": getattr(exc, "code", None),
+            "error_type": type(exc).__name__,
+        }
+        try:
+            released = resources.release_resources(
+                intent["lease_owner_id"],
+                [item["resource_key"] for item in rebound_after_snapshots],
+                expected_leases=rebound_after_snapshots,
+            )
+            compensation.update({"status": "released", "result": released})
+        except Exception as release_exc:
+            compensation.update(
+                {
+                    "status": "release-failed",
+                    "release_error_type": type(release_exc).__name__,
+                }
+            )
+        compensation["receipt_sha256"] = _sha256(compensation)
+        _write_bound_json(
+            run_dir / "orphan-lease-recovery-compensation.json", compensation
+        )
+        raise BureauPickupError(
+            "orphan-recovery-lease-effect-failed",
+            details={
+                "cause_code": getattr(exc, "code", None),
+                "error_type": type(exc).__name__,
+                "effect_count": len(actions),
+                "compensation": compensation,
+            },
+        ) from exc
+
+    try:
+        for index, plan in enumerate(plans, start=1):
+            group = plan["group"]
+            purpose = plan["purpose"]
+            expired = plan["expired"]
+            if not expired:
+                continue
+            expired_keys = [item["resource_key"] for item in expired]
+            result = resources.rebind_same_owner_resources(
+                intent["lease_owner_id"],
+                expired_keys,
+                purpose=purpose,
+                ttl_seconds=group["ttl_seconds"],
+                metadata=group["metadata"],
+                expected_current_leases=[_lease_snapshot(item) for item in expired],
+                expected_original_leases=[
+                    _lease_snapshot(original_by_key[key]) for key in expired_keys
+                ],
+            )
+            result_leases = result.get("leases")
+            if not isinstance(result_leases, list):
+                raise BureauPickupError(
+                    "orphan-recovery-lease-rebind-result-invalid",
+                    details={"group": group["name"]},
+                )
+            after = [
+                _lease_snapshot(item)
+                for item in result_leases
+                if isinstance(item, dict)
+                and item.get("resource_key") in expired_keys
+            ]
+            if sorted(item["resource_key"] for item in after) != sorted(expired_keys):
+                raise BureauPickupError(
+                    "orphan-recovery-lease-rebind-result-invalid",
+                    details={"group": group["name"]},
+                )
+            rebound_after_snapshots.extend(after)
+            rebound_group = {**group, "resource_keys": expired_keys}
+            _validate_acquired_group(
+                intent["lease_owner_id"], rebound_group, result
+            )
+            effect = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_lease_effect",
+                "run_id": intent["run_id"],
+                "task_id": intent["task_id"],
+                "owner_id": intent["lease_owner_id"],
+                "claim_intent_sha256": intent["intent_sha256"],
+                "group": group["name"],
+                "method": "same-owner-rebind",
+                "resource_keys": expired_keys,
+                "before": [_lease_snapshot(item) for item in expired],
+                "after": after,
+            }
+            effect["receipt_sha256"] = _sha256(effect)
+            _write_bound_json(
+                run_dir / f"orphan-lease-effect-{index:02d}.json", effect
+            )
+            actions.append(
+                {
+                    "group": group["name"],
+                    "method": "same-owner-rebind",
+                    "resource_keys": expired_keys,
+                    "effect_receipt_sha256": effect["receipt_sha256"],
+                }
+            )
+
+        post_effect_guard = request.get("_orphan_recovery_post_effect_guard")
+        if post_effect_guard is not None:
+            if not callable(post_effect_guard):
+                raise BureauPickupError("orphan-recovery-post-effect-guard-invalid")
+            post_effect_guard()
+    except Exception as exc:
+        if not rebound_after_snapshots:
+            raise
+        _raise_compensated_lease_effect_failure(exc)
+
+    current_leases: list[dict[str, Any]] = []
+    try:
+        for key in intent["required_resource_keys"]:
+            observed = resources.inspect_resource(key)
+            original = original_by_key[key]
+            if observed is None:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-readback-missing",
+                    details={"resource_key": key},
+                )
+            if observed.get("owner_id") != intent["lease_owner_id"]:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-foreign-owner",
+                    details={
+                        "resource_key": key,
+                        "owner_id": observed.get("owner_id"),
+                    },
+                )
+            if observed.get("metadata_sha256") != original.get("metadata_sha256"):
+                _current_lease_metadata_identity(key, expected_metadata_by_key[key])
+            if observed.get("expires_at_unix", 0) < resources._now() + 60:
+                raise BureauPickupError(
+                    "orphan-recovery-lease-too-short", details={"resource_key": key}
+                )
+            current_leases.append(_lease_snapshot(observed))
+    except Exception as exc:
+        if not rebound_after_snapshots:
+            raise
+        _raise_compensated_lease_effect_failure(exc)
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_orphan_lease_recovery",
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "owner_id": intent["lease_owner_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "resource_keys": intent["required_resource_keys"],
+        "actions": actions,
+        "lease_identities": [
+            {
+                "resource_key": item["resource_key"],
+                "owner_id": item["owner_id"],
+                "metadata_sha256": item["metadata_sha256"],
+            }
+            for item in current_leases
+        ],
+    }
+    receipt["receipt_sha256"] = _sha256(receipt)
+    path = run_dir / "orphan-lease-recovery.json"
+    if os.path.lexists(path):
+        existing = _read_bound_json(path, label="orphan-lease-recovery")
+        existing_digest = existing.get("receipt_sha256")
+        existing_payload = dict(existing)
+        existing_payload.pop("receipt_sha256", None)
+        if (
+            not isinstance(existing_digest, str)
+            or SHA256_RE.fullmatch(existing_digest) is None
+            or _sha256(existing_payload) != existing_digest
+        ):
+            raise BureauPickupError("orphan-recovery-lease-receipt-digest-drift")
+        stable_fields = (
+            "schema_version",
+            "kind",
+            "run_id",
+            "task_id",
+            "owner_id",
+            "claim_intent_sha256",
+            "resource_keys",
+        )
+        if any(existing.get(field) != receipt.get(field) for field in stable_fields):
+            raise BureauPickupError("orphan-recovery-lease-receipt-drift")
+        return existing
+    _write_bound_json(path, receipt)
+    return receipt
+
+
+def _resume_orphaned_run(
+    request: dict[str, Any],
+    intent: dict[str, Any],
+    run: dict[str, Any],
+    envelope_sha256: str,
+    *,
+    revision_proof: dict[str, Any],
+) -> dict[str, Any]:
+    arguments = _bureau_arguments(
+        "orphan-resume",
+        registry_root=request["registry_root"],
+        coordination_root=request["coordination_root"],
+    )
+    arguments.extend(
+        [
+            intent["run_id"],
+            "--worker",
+            intent["worker_id"],
+            "--expected-updated-at",
+            str(run["updated_at"]),
+            "--expected-task-sha256",
+            revision_proof["task_sha256"],
+            "--expected-plan-sha256",
+            revision_proof["plan_sha256"],
+            "--expected-envelope-sha256",
+            envelope_sha256,
+        ]
+    )
+    return bureau._invoke_bureau(
+        arguments,
+        mutation=True,
+        required_readback=[
+            f"bureau_run:{intent['run_id']}",
+            f"grabowski_leases:{intent['lease_owner_id']}",
+        ],
+    )
+
+
+def _validate_resumed_run(
+    coordination: dict[str, Any],
+    intent: dict[str, Any],
+    acquisition: dict[str, Any],
+    journal_identity: dict[str, Any],
+) -> dict[str, Any]:
+    run = _validate_claim_readback(coordination, intent, acquisition)
+    expected = {
+        key: journal_identity[key]
+        for key in (
+            "run_id",
+            "task_id",
+            "worker_id",
+            "task_sha256",
+            "plan_sha256",
+            "envelope_sha256",
+            "attempt",
+            "workspace_path",
+            "workspace_branch",
+        )
+    }
+    mismatches = {
+        key: {"expected": value, "observed": run.get(key)}
+        for key, value in expected.items()
+        if run.get(key) != value
+    }
+    if mismatches:
+        raise BureauPickupError(
+            "orphan-recovery-resumed-run-drift", details={"mismatches": mismatches}
+        )
+    if run.get("state") not in ACTIVE_EXECUTION_STATES or run.get("error") is not None:
+        raise BureauPickupError(
+            "orphan-recovery-resume-readback-not-active",
+            details={"state": run.get("state"), "error": run.get("error")},
+        )
+    _require_active_execution_binding(
+        coordination, action="orphan-recovery-resume-readback"
+    )
+    return run
+
+
+def _recover_orphaned_journal_before_claim(
+    request: dict[str, Any],
+    current_binding: RegistryBinding,
+    request_sha256: str,
+) -> dict[str, Any] | None:
+    candidate = _journaled_orphan_recovery_candidate(request, current_binding)
+    if candidate is None:
+        return None
+    closeout_latch = _bound_bureau_call(
+        current_binding, lambda: _machine_completion_closeout_latch(request)
+    )
+    if closeout_latch is not None:
+        return _closeout_latched_response(
+            request, current_binding, request_sha256, closeout_latch
+        )
+    intent = candidate["intent"]
+    acquisition = candidate["acquisition"]
+    journal_identity = candidate["journal_identity"]
+    ancestry = _registry_successor_proof(candidate["stored_binding"], current_binding)
+    revision = _current_registry_revision_proof(
+        current_binding,
+        intent,
+        coordination_root=request["coordination_root"],
+    )
+    binding_receipt = _ensure_registry_binding_recovery_receipt(
+        candidate, current_binding, ancestry, revision
+    )
+    _assert_registry_binding(current_binding)
+    already_resumed = candidate.get("already_resumed") is True
+    pre_resume: dict[str, Any] | None = None
+    run: dict[str, Any] | None = None
+
+    post_lease_readback: dict[str, Any] | None = None
+    post_lease_run: dict[str, Any] | None = None
+    post_lease_revision: dict[str, Any] | None = None
+
+    def _guard_recovery_authority(*, post_effect: bool) -> None:
+        nonlocal pre_resume, run, post_lease_readback
+        nonlocal post_lease_run, post_lease_revision
+        _assert_registry_binding(current_binding)
+        current_revision = _current_registry_revision_proof(
+            current_binding,
+            intent,
+            coordination_root=request["coordination_root"],
+        )
+        observed = _bound_bureau_call(
+            current_binding,
+            lambda: _coordination_status(
+                intent["run_id"],
+                registry_root=request["registry_root"],
+                coordination_root=request["coordination_root"],
+            ),
+        )
+        if already_resumed:
+            validated = _validate_resumed_run(
+                observed, intent, acquisition, journal_identity
+            )
+        else:
+            validated = _validate_recoverable_orphan(
+                observed, intent, acquisition, journal_identity
+            )
+        if post_effect:
+            post_lease_readback = observed
+            post_lease_run = validated
+            post_lease_revision = current_revision
+        else:
+            pre_resume = observed
+            run = validated
+
+    lease_request = dict(candidate["stored_request"])
+    lease_request["_orphan_recovery_pre_effect_guard"] = (
+        lambda: _guard_recovery_authority(post_effect=False)
+    )
+    lease_request["_orphan_recovery_post_effect_guard"] = (
+        lambda: _guard_recovery_authority(post_effect=True)
+    )
+    lease_receipt = _reacquire_orphaned_assignment_leases(
+        intent, lease_request, acquisition, candidate["run_dir"]
+    )
+    if (
+        pre_resume is None
+        or run is None
+        or post_lease_readback is None
+        or post_lease_run is None
+        or post_lease_revision is None
+    ):
+        raise BureauPickupError("orphan-recovery-run-guard-missing")
+    resume_result: dict[str, Any] | None = None
+    resume_error: Exception | None = None
+    if already_resumed:
+        readback = post_lease_readback
+        _validate_resumed_run(readback, intent, acquisition, journal_identity)
+        resume_result = {"status": "already-active", "run": readback.get("run")}
+    else:
+        try:
+            resume_result = _bound_bureau_call(
+                current_binding,
+                lambda: _resume_orphaned_run(
+                    request,
+                    intent,
+                    post_lease_run,
+                    journal_identity["envelope_sha256"],
+                    revision_proof=post_lease_revision,
+                ),
+            )
+        except Exception as exc:
+            resume_error = exc
+        try:
+            readback = _bound_bureau_call(
+                current_binding,
+                lambda: _coordination_status(
+                    intent["run_id"],
+                    registry_root=request["registry_root"],
+                    coordination_root=request["coordination_root"],
+                ),
+            )
+        except Exception as exc:
+            raise BureauPickupError(
+                "orphan-recovery-resume-outcome-unknown",
+                details={
+                    "resume_error_type": type(resume_error).__name__ if resume_error else None,
+                    "readback_error_type": type(exc).__name__,
+                    "lease_retained": bool(intent["required_resource_keys"]),
+                },
+            ) from exc
+    observed_run = readback.get("run") if isinstance(readback, dict) else None
+    if isinstance(observed_run, dict) and observed_run.get("state") in ACTIVE_EXECUTION_STATES:
+        _validate_resumed_run(readback, intent, acquisition, journal_identity)
+    else:
+        raise BureauPickupError(
+            "orphan-recovery-resume-failed",
+            details={
+                "resume_error_type": type(resume_error).__name__ if resume_error else None,
+                "resume_status": resume_result.get("status") if isinstance(resume_result, dict) else None,
+                "readback_sha256": _sha256(readback),
+                "observed_state": observed_run.get("state") if isinstance(observed_run, dict) else None,
+                "lease_retained": bool(intent["required_resource_keys"]),
+                "duplicate_run_created": False,
+            },
+        )
+    success = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_orphan_recovery",
+        "status": "resumed-existing-assignment",
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "registry_binding_recovery_receipt_sha256": binding_receipt["receipt_sha256"],
+        "lease_recovery_receipt_sha256": lease_receipt["receipt_sha256"],
+        "run_readback_sha256": _sha256(readback),
+        "response_loss_recovered": resume_error is not None,
+        "resume_effect_skipped_already_active": already_resumed,
+    }
+    success["receipt_sha256"] = _sha256(success)
+    success_path = candidate["run_dir"] / "orphan-recovery.json"
+    if os.path.lexists(success_path):
+        persisted_success = _read_bound_json(
+            success_path, label="orphan-recovery"
+        )
+        persisted_digest = persisted_success.get("receipt_sha256")
+        persisted_payload = dict(persisted_success)
+        persisted_payload.pop("receipt_sha256", None)
+        stable_success = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_bureau_pickup_orphan_recovery",
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+        }
+        if (
+            not isinstance(persisted_digest, str)
+            or SHA256_RE.fullmatch(persisted_digest) is None
+            or _sha256(persisted_payload) != persisted_digest
+            or any(
+                persisted_success.get(field) != value
+                for field, value in stable_success.items()
+            )
+        ):
+            raise BureauPickupError("orphan-recovery-receipt-drift")
+        success = persisted_success
+    else:
+        _write_bound_json(success_path, success)
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup",
+        "status": "resumed-existing-assignment",
+        "request_sha256": request_sha256,
+        "registry_binding_sha256": current_binding["identity"]["binding_sha256"],
+        "registry_binding_kind": current_binding["identity"]["kind"],
+        "registry_binding_source": "journal-successor-recovery",
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "lease_owner_id": intent["lease_owner_id"],
+        "resource_keys": intent["required_resource_keys"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "acquisition_sha256": acquisition["acquisition_sha256"],
+        "commit": resume_result,
+        "recovery": readback,
+        "run_readback_sha256": _sha256(readback),
+        "orphan_recovery_receipt_sha256": success["receipt_sha256"],
+        "journal": str(candidate["run_dir"]),
+        "does_not_establish": [
+            "task completion",
+            "automatic lease release",
+            "ownership of an unjournaled assignment",
+        ],
+    }
+    bureau._audit(
+        "bureau-pickup-orphan-resume",
+        result,
+        run_id=intent["run_id"],
+        task_id=intent["task_id"],
+    )
+    return result
+
+
 def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -3201,6 +4528,11 @@ def grabowski_bureau_pickup_execute(
     )
     operator._require_operator_mutation("resource_lease")
     request_sha256 = _sha256(normalized)
+    orphan_recovery = _recover_orphaned_journal_before_claim(
+        normalized, registry_binding, request_sha256
+    )
+    if orphan_recovery is not None:
+        return orphan_recovery
     intent_payload, closeout_latch = _bound_bureau_call(
         registry_binding,
         lambda: _claim_intent_or_closeout(normalized),
