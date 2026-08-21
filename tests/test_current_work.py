@@ -1475,6 +1475,17 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
 
     def test_orphaned_binding_projects_one_hygiene_current_work_group(self) -> None:
+        authority_blocker = {
+            "schema_version": 1,
+            "source_kind": "automation",
+            "source_id": "frontier-20260806",
+            "state": "orphaned_binding",
+            "blocker_code": "automation-terminal-evidence-contract-required",
+            "authority": "immutable_automation_terminal_evidence",
+            "permitted_repair_paths": ["source_terminal_evidence"],
+            "safe_repair_condition": "Bind immutable terminal evidence and rerun reconciliation.",
+            "does_not_establish": ["source_terminality", "permission_to_repair"],
+        }
         result = project(
             reconciliation_payload={
                 "bindings": [
@@ -1485,7 +1496,14 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                         "reasons": ["binding-has-no-current-git-worktree-record"],
                         "binding_identity": {"checkout_key": "key-orphan"},
                         "worktree_identity": None,
-                        "evidence": {"owner_id": "operator:test"},
+                        "evidence": {
+                            "owner_id": "operator:test",
+                            "source": {
+                                "kind": "automation",
+                                "id": "frontier-20260806",
+                            },
+                        },
+                        "authority_blocker": authority_blocker,
                         "recommended_next_step": "inspect_git_and_binding_history_without_mutation",
                     }
                 ],
@@ -1503,6 +1521,43 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "checkout_binding_reconciliation",
             row["observation"]["relevant_sources"],
         )
+        reconciliation_ref = next(
+            ref
+            for ref in row["heuristic_refs"]
+            if ref["source"] == "checkout-binding-reconciliation"
+        )
+        self.assertEqual(
+            reconciliation_ref["authority_blocker"],
+            authority_blocker,
+        )
+
+    def test_automation_reconciliation_requires_valid_authority_blocker(self) -> None:
+        with self.assertRaises(
+            current_work.CurrentWorkProjectionError,
+            msg="automation reconciliation must not silently lose authority requirements",
+        ):
+            project(
+                reconciliation_payload={
+                    "bindings": [
+                        {
+                            "checkout_key": "key-automation",
+                            "state": "orphaned_binding",
+                            "blocking": True,
+                            "reasons": ["binding-has-no-current-git-worktree-record"],
+                            "binding_identity": {"checkout_key": "key-automation"},
+                            "worktree_identity": None,
+                            "evidence": {
+                                "source": {
+                                    "kind": "automation",
+                                    "id": "frontier-20260806",
+                                }
+                            },
+                            "recommended_next_step": "inspect_git_and_binding_history_without_mutation",
+                        }
+                    ],
+                    "pagination": {"has_more": False},
+                },
+            )
 
     def test_binding_drift_attaches_to_existing_checkout_without_duplicate(self) -> None:
         existing = checkout("key-a", "/tmp/work", dirty=False, lifecycle_state="active")

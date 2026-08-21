@@ -107,6 +107,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_checkout_binding_reconciliation` | checkout-lifecycle | yes | low | Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority. |
 | `grabowski_checkout_binding_terminal_preview` | checkout-lifecycle | yes | low | Preview one exact source- and identity-bound external terminal transition for an already missing managed checkout. |
 | `grabowski_checkout_binding_terminal_apply` | checkout-lifecycle | no | medium | Apply one fresh compare-and-swap transition to externally_terminal_missing while preserving retention, branch, refs, archive state and filesystem contents. |
+| `grabowski_checkout_binding_identity_rebind_preview` | checkout-lifecycle | yes | low | Preview one clean, coordination-free and remote-secured existing checkout whose current branch name differs from its active lifecycle binding. |
+| `grabowski_checkout_binding_identity_rebind_apply` | checkout-lifecycle | no | medium | CAS-update only lifecycle and retention expected head/branch after exact branch-rename preview and current retention revalidation. |
 | `grabowski_checkout_retain` | checkout-lifecycle | no | medium | Assign explicit retention ownership to one temporary linked Git checkout. |
 | `grabowski_checkout_archive` | checkout-lifecycle | no | medium | Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches. |
 | `grabowski_checkout_cleanup` | checkout-lifecycle | no | high | Plan or apply cleanup for an archived linked checkout; apply requires a persisted dry run. |

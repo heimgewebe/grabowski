@@ -1,28 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
 import time
 from typing import Any, Iterable, Mapping, Sequence
 
+import grabowski_lifecycle_evidence as lifecycle_evidence
+
 
 SCHEMA_VERSION = 1
-SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-TERMINAL_TASK_STATES = frozenset({"completed", "failed", "cancelled", "timed_out", "signalled"})
-ATTENTION_GATED_TASK_STATES = frozenset({"failed", "timed_out", "signalled"})
-RECOVERY_TASK_STATES = frozenset({"interrupted", "outcome_unknown"})
-ACTIVE_TASK_STATES = frozenset({"launching", "running"})
-CURRENT_CLASSIFICATIONS = frozenset(
-    {"active", "blocking", "recovery_required", "ambiguous", "untouchable"}
-)
-LIFECYCLE_CLASSIFICATIONS = frozenset(
-    {*CURRENT_CLASSIFICATIONS, "terminal_archivable", "archived"}
-)
+SHA256 = lifecycle_evidence.SHA256
+TERMINAL_TASK_STATES = lifecycle_evidence.TERMINAL_TASK_STATES
+ATTENTION_GATED_TASK_STATES = lifecycle_evidence.ATTENTION_GATED_TASK_STATES
+RECOVERY_TASK_STATES = lifecycle_evidence.RECOVERY_TASK_STATES
+ACTIVE_TASK_STATES = lifecycle_evidence.ACTIVE_TASK_STATES
+CURRENT_CLASSIFICATIONS = lifecycle_evidence.CURRENT_CLASSIFICATIONS
+LIFECYCLE_CLASSIFICATIONS = lifecycle_evidence.LIFECYCLE_CLASSIFICATIONS
 
 
 class LifecycleArchiveError(RuntimeError):
@@ -33,152 +29,19 @@ class LifecycleArchiveIntegrityError(LifecycleArchiveError):
     pass
 
 
-@dataclass(frozen=True)
-class LifecycleEvidence:
-    identity: str
-    kind: str
-    state: str | None = None
-    closed: bool | None = None
-    archived: bool = False
-    dirty: bool | None = False
-    active_task: bool | None = False
-    active_process: bool | None = False
-    active_lease: bool | None = False
-    foreign_retention: bool | None = False
-    shared_reference: bool | None = False
-    open_task_role: bool | None = False
-    retention_recovery_required: bool | None = False
-    tmux_session_only: bool | None = False
-    receipt_integrity_valid: bool | None = True
-    observation_errors: tuple[str, ...] = ()
+LifecycleEvidence = lifecycle_evidence.LifecycleEvidence
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    return lifecycle_evidence.canonical_json_bytes(value)
 
 
 def sha256_json(value: Any) -> str:
-    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
-
-
-def _unknown_boolean_fields(evidence: LifecycleEvidence) -> list[str]:
-    fields = (
-        "dirty",
-        "active_task",
-        "active_process",
-        "active_lease",
-        "foreign_retention",
-        "shared_reference",
-        "open_task_role",
-        "retention_recovery_required",
-        "tmux_session_only",
-        "receipt_integrity_valid",
-    )
-    return [name for name in fields if getattr(evidence, name) is None]
+    return lifecycle_evidence.sha256_json(value)
 
 
 def classify_lifecycle(evidence: LifecycleEvidence) -> dict[str, Any]:
-    """Classify one live-observed lifecycle object without creating cleanup authority."""
-    if not evidence.identity:
-        raise ValueError("identity must not be empty")
-    if not evidence.kind:
-        raise ValueError("kind must not be empty")
-
-    reasons: list[str] = []
-    unknown_fields = _unknown_boolean_fields(evidence)
-    if evidence.observation_errors:
-        reasons.extend(f"observation_error:{value}" for value in evidence.observation_errors)
-    if unknown_fields:
-        reasons.extend(f"observation_unknown:{value}" for value in unknown_fields)
-    if reasons:
-        classification = "ambiguous"
-    elif evidence.archived:
-        if evidence.receipt_integrity_valid is not True:
-            classification = "recovery_required"
-            reasons.append("archive_receipt_integrity_missing_or_invalid")
-        elif evidence.retention_recovery_required:
-            classification = "recovery_required"
-            reasons.append("retention_recovery_archive_required")
-        elif evidence.tmux_session_only:
-            classification = "ambiguous"
-            reasons.append("tmux_session_without_live_role_or_process")
-        else:
-            contradictory = any(
-                (
-                    evidence.active_task,
-                    evidence.active_process,
-                    evidence.active_lease,
-                    evidence.dirty,
-                    evidence.foreign_retention,
-                    evidence.shared_reference,
-                    evidence.open_task_role,
-                )
-            )
-            if contradictory or evidence.state in ACTIVE_TASK_STATES | RECOVERY_TASK_STATES:
-                classification = "ambiguous"
-                reasons.append("archived_state_conflicts_with_live_evidence")
-            else:
-                classification = "archived"
-                reasons.append("archive_receipt_present")
-    elif evidence.foreign_retention:
-        classification = "untouchable"
-        reasons.append("foreign_retention")
-    elif evidence.dirty:
-        classification = "untouchable"
-        reasons.append("dirty_checkout")
-    elif evidence.shared_reference:
-        classification = "untouchable"
-        reasons.append("shared_reference")
-    elif evidence.open_task_role:
-        classification = "active"
-        reasons.append("open_task_role")
-    elif evidence.active_task or evidence.state in ACTIVE_TASK_STATES:
-        classification = "active"
-        reasons.append("active_task")
-    elif evidence.active_process:
-        classification = "active"
-        reasons.append("active_process")
-    elif evidence.active_lease:
-        classification = "blocking"
-        reasons.append("active_lease")
-    elif evidence.retention_recovery_required:
-        classification = "recovery_required"
-        reasons.append("retention_recovery_archive_required")
-    elif evidence.tmux_session_only:
-        classification = "ambiguous"
-        reasons.append("tmux_session_without_live_role_or_process")
-    elif evidence.state in RECOVERY_TASK_STATES:
-        classification = "recovery_required"
-        reasons.append(f"task_state:{evidence.state}")
-    elif evidence.state in TERMINAL_TASK_STATES or evidence.closed is True:
-        if evidence.receipt_integrity_valid is not True:
-            classification = "recovery_required"
-            reasons.append("terminal_receipt_integrity_missing_or_invalid")
-        else:
-            classification = "terminal_archivable"
-            reasons.append("terminal_and_unblocked")
-    else:
-        classification = "blocking"
-        reasons.append("not_terminal")
-
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "identity": evidence.identity,
-        "kind": evidence.kind,
-        "classification": classification,
-        "reason_codes": reasons,
-        "safe_to_archive": classification == "terminal_archivable",
-        "does_not_establish": [
-            "deletion_authority",
-            "absence_of_future_activity",
-            "permission_to_override_foreign_ownership",
-        ],
-    }
+    return lifecycle_evidence.classify_lifecycle(evidence)
 
 
 def bounded_current_projection(
@@ -852,38 +715,10 @@ def _read_regular_bytes(
     *,
     max_bytes: int | None = None,
 ) -> bytes:
-    if max_bytes is not None and (
-        isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0
-    ):
-        raise ValueError("max_bytes must be a non-negative integer or None")
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise LifecycleArchiveIntegrityError(
-            f"archive file is missing or unsafe: {path.name}"
-        ) from exc
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise LifecycleArchiveIntegrityError(
-                f"archive file is missing or unsafe: {path.name}"
-            )
-        if max_bytes is not None and metadata.st_size > max_bytes:
-            raise LifecycleArchiveIntegrityError(
-                f"archive file exceeds server-owned read bound: {path.name}"
-            )
-        with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            payload = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
-        if max_bytes is not None and len(payload) > max_bytes:
-            raise LifecycleArchiveIntegrityError(
-                f"archive file exceeds server-owned read bound: {path.name}"
-            )
-        return payload
-    finally:
-        os.close(descriptor)
+        return lifecycle_evidence.read_regular_bytes(path, max_bytes=max_bytes)
+    except lifecycle_evidence.LifecycleEvidenceIntegrityError as exc:
+        raise LifecycleArchiveIntegrityError(str(exc)) from exc
 
 
 def _validate_task_archive_manifest(

@@ -1258,6 +1258,48 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         self.assertEqual(result["writer_route"], result["scoped_writer"]["route"])
 
+    def test_candidate_effect_profile_remains_the_byte_compatible_default(self) -> None:
+        implicit = self._route("bounded-patch")
+        explicit = self._route("bounded-patch", effect_profile="candidate")
+        self.assertEqual(implicit, explicit)
+        self.assertEqual("candidate", implicit["effect_profile"])
+
+    def test_delivery_effect_profile_requires_and_binds_scoped_writer(self) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness == "claude"
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
+
+        result = self._route(
+            "bounded-patch",
+            changed_files=2,
+            duration_minutes=30,
+            novelty="medium",
+            verification_policy="independent_review",
+            effect_profile="delivery",
+        )
+
+        self.assertEqual("scoped_writer", result["executor"])
+        self.assertEqual("delivery", result["effect_profile"])
+        self.assertEqual(result["writer_route"], result["scoped_writer"]["route"])
+
+    def test_delivery_effect_profile_rejects_deterministic_verification(self) -> None:
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError,
+            "requires verification_policy=independent_review",
+        ):
+            self._route(
+                "bounded-patch",
+                verification_policy="deterministic",
+                effect_profile="delivery",
+            )
+
+    def test_delivery_effect_profile_fails_closed_on_controller_route(self) -> None:
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "requires an eligible scoped_writer"
+        ):
+            self._route("security-review", effect_profile="delivery")
+
     def test_spark_catalog_route_is_lane_writer_not_contrast_alias(self) -> None:
         validation = router._validate_catalog(self.catalog)
         self.assertTrue(validation["valid"])

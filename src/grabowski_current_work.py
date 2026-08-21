@@ -1155,6 +1155,108 @@ def _add_checkouts(
             _set_projection_state(group, "terminal_archived")
 
 
+def _validated_authority_blocker(
+    raw: dict[str, Any],
+    *,
+    state: str,
+) -> dict[str, Any] | None:
+    blocker = raw.get("authority_blocker")
+    evidence = raw.get("evidence")
+    source = evidence.get("source") if isinstance(evidence, dict) else None
+    source_kind = source.get("kind") if isinstance(source, dict) else None
+    evidence_source_id = source.get("id") if isinstance(source, dict) else None
+    blocker_required = source_kind in {"automation", "work_lane"}
+    if blocker is None:
+        if blocker_required:
+            raise CurrentWorkProjectionError(
+                "blocking automation/work_lane reconciliation is missing authority_blocker"
+            )
+        return None
+    if not isinstance(blocker, dict):
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker must be an object"
+        )
+    schema_version = _integer(
+        blocker.get("schema_version"),
+        "checkout_binding_reconciliation.authority_blocker.schema_version",
+    )
+    if schema_version != 1:
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker schema_version is unsupported"
+        )
+    blocker_source_kind = _text(
+        blocker.get("source_kind"),
+        "checkout_binding_reconciliation.authority_blocker.source_kind",
+    )
+    if blocker_source_kind not in {"automation", "work_lane"}:
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker source_kind is unsupported"
+        )
+    if source_kind is not None and blocker_source_kind != source_kind:
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker source_kind does not match evidence"
+        )
+    source_id = _text(
+        blocker.get("source_id"),
+        "checkout_binding_reconciliation.authority_blocker.source_id",
+    )
+    if evidence_source_id is not None and source_id != evidence_source_id:
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker source_id does not match evidence"
+        )
+    blocker_state = _text(
+        blocker.get("state"),
+        "checkout_binding_reconciliation.authority_blocker.state",
+    )
+    if blocker_state != state:
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker state does not match reconciliation"
+        )
+    blocker_code = _text(
+        blocker.get("blocker_code"),
+        "checkout_binding_reconciliation.authority_blocker.blocker_code",
+    )
+    authority = _text(
+        blocker.get("authority"),
+        "checkout_binding_reconciliation.authority_blocker.authority",
+    )
+    permitted = blocker.get("permitted_repair_paths")
+    if (
+        not isinstance(permitted, list)
+        or not permitted
+        or len(permitted) > MAX_EVIDENCE
+        or not all(isinstance(item, str) and item.strip() for item in permitted)
+    ):
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker permitted_repair_paths are invalid"
+        )
+    safe_repair_condition = _text(
+        blocker.get("safe_repair_condition"),
+        "checkout_binding_reconciliation.authority_blocker.safe_repair_condition",
+    )
+    does_not_establish = blocker.get("does_not_establish")
+    if (
+        not isinstance(does_not_establish, list)
+        or not does_not_establish
+        or len(does_not_establish) > MAX_EVIDENCE
+        or not all(isinstance(item, str) and item.strip() for item in does_not_establish)
+    ):
+        raise CurrentWorkProjectionError(
+            "checkout binding reconciliation authority_blocker does_not_establish is invalid"
+        )
+    return {
+        "schema_version": schema_version,
+        "source_kind": blocker_source_kind,
+        "source_id": source_id,
+        "state": blocker_state,
+        "blocker_code": blocker_code,
+        "authority": authority,
+        "permitted_repair_paths": [item.strip() for item in permitted],
+        "safe_repair_condition": safe_repair_condition,
+        "does_not_establish": [item.strip() for item in does_not_establish],
+    }
+
+
 def _add_binding_reconciliation(
     groups: dict[str, dict[str, Any]],
     rows: list[dict[str, Any]],
@@ -1204,6 +1306,7 @@ def _add_binding_reconciliation(
             raise CurrentWorkProjectionError(
                 "non-present reconciliation states must be blocking"
             )
+        authority_blocker = _validated_authority_blocker(raw, state=state)
         work_id = f"checkout:{checkout_key}"
         group = groups.get(work_id)
         historical_only = group is None and raw.get("worktree_identity") is None
@@ -1224,6 +1327,11 @@ def _add_binding_reconciliation(
                 "binding_identity": raw.get("binding_identity"),
                 "worktree_identity": raw.get("worktree_identity"),
                 "evidence": raw.get("evidence"),
+                **(
+                    {"authority_blocker": authority_blocker}
+                    if authority_blocker is not None
+                    else {}
+                ),
                 "recommended_next_step": raw.get("recommended_next_step"),
                 "authority": False,
             },
