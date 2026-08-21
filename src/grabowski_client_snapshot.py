@@ -1595,7 +1595,30 @@ def _write_publication_current(
     }
     document = {**material, "current_sha256": _sha256_json(material)}
     _ensure_private_directory(PLATFORM_PUBLICATION_ROOT)
-    _write_private_json(PLATFORM_PUBLICATION_CURRENT_PATH, document)
+    try:
+        _write_private_json(PLATFORM_PUBLICATION_CURRENT_PATH, document)
+    except (OSError, ClientSnapshotError) as write_exc:
+        # os.replace() precedes the directory fsync and final validation in the
+        # atomic writer.  A raised exception can therefore mean either no effect
+        # or an already-published Current pathname that is not crash-durable yet.
+        # Re-establish parent-directory durability first, then accept only the
+        # complete hash-validated intended document.  Any fsync/readback mismatch
+        # preserves the original write failure and keeps the outcome fail-closed.
+        try:
+            directory_fd = os.open(
+                PLATFORM_PUBLICATION_CURRENT_PATH.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            observed = _read_publication_current()
+        except (OSError, ClientSnapshotError):
+            raise write_exc
+        if observed != document:
+            raise write_exc
+        return observed
     return document
 
 
