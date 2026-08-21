@@ -1695,7 +1695,7 @@ def _sidecar_controller_contract_valid(value: dict[str, Any]) -> bool:
 
 def _sidecars_match_deploy_head(command_fields: dict[str, Any]) -> bool:
     try:
-        if command_fields.get("source_kind") != "canonical-main":
+        if command_fields.get("source_kind") not in SOURCE_KINDS:
             return False
         repository = Path(str(command_fields.get("canonical_repository"))).resolve(strict=True)
         if repository != CANONICAL_REPOSITORY.resolve(strict=True):

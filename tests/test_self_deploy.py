@@ -1469,6 +1469,26 @@ class SelfDeployToolTests(unittest.TestCase):
                 )
             )
 
+    def test_sidecar_readback_allows_detached_worktree_source_kind(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        fields = {
+            "source_kind": "detached-worktree",
+            "canonical_repository": str(repo),
+            "expected_head": "a" * 40,
+        }
+        with patch.object(
+            SELF_DEPLOY, "_sidecar_git_blob", return_value=b"invalid-router"
+        ) as git_blob:
+            self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
+        git_blob.assert_called_once_with(
+            repo, "a" * 40, SELF_DEPLOY.SIDECAR_ROUTER_SOURCE_RELATIVE
+        )
+
+        fields["source_kind"] = "unsupported"
+        with patch.object(SELF_DEPLOY, "_sidecar_git_blob") as unsupported_blob:
+            self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
+        unsupported_blob.assert_not_called()
+
     def test_sidecar_readback_is_exact_head_and_runtime_catalog_bound(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         marker = 'runtime_python="$HOME/.local/share/grabowski-mcp/.venv/bin/python"'
