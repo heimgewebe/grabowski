@@ -1097,6 +1097,61 @@ class CodingAgentRouterTests(unittest.TestCase):
             self.assertTrue(review["reviewers"][0]["review_capable"])
             self.assertNotEqual(review["reviewers"][0]["provider_family"], "openai")
 
+    def test_external_reviewers_are_bound_to_selected_scoped_writer(self) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness in {"claude", "antigravity"}
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
+
+        result = self._route(
+            "architecture",
+            changed_files=24,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["high-risk"],
+            need_review=True,
+            verification_policy="independent_review",
+        )
+
+        self.assertEqual("claude-opus-5-writer-high", result["writer_route"])
+        writer = result["scoped_writer"]
+        self.assertIsNotNone(writer)
+        reviewer = result["reviewers"][0]
+        self.assertEqual("antigravity-gemini-pro-review-high", reviewer["route"])
+        self.assertNotEqual(writer["independence_group"], reviewer["independence_group"])
+        self.assertNotEqual(writer["provider_family"], reviewer["provider_family"])
+        self.assertIn("reviewer:claude-opus-5-high", result["excluded"])
+        self.assertIn(
+            "reviewer shares the primary model lineage",
+            result["excluded"]["reviewer:claude-opus-5-high"],
+        )
+
+    def test_selected_scoped_writer_fails_closed_without_independent_review_route(
+        self,
+    ) -> None:
+        for harness, state in self.state["catalog"]["harnesses"].items():
+            state["available"] = harness == "claude"
+        self.state["pools"]["claude-pro"] = {"remaining_ratio": 0.9}
+        self._write_state()
+
+        result = self._route(
+            "architecture",
+            changed_files=24,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["high-risk"],
+            need_review=True,
+            verification_policy="independent_review",
+        )
+
+        self.assertEqual("claude-opus-5-writer-high", result["writer_route"])
+        self.assertEqual([], result["reviewers"])
+        self.assertEqual("no-independent-review-route", result["review_status"])
+        self.assertIn(
+            "reviewer shares the primary model lineage",
+            result["excluded"]["reviewer:claude-opus-5-high"],
+        )
+
     def test_fable_contrast_and_review_routes_never_become_primary_writer(self) -> None:
         coding = self._route("complex-patch", need_review=True)
         self.assertEqual(coding["decision"], "controller")
