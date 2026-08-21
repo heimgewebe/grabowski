@@ -4055,6 +4055,30 @@ class GripFoundationTests(unittest.TestCase):
             self.assertEqual("new_lane_required", result["later_correction"])
             nested.assert_not_called()
 
+    def test_terminal_delivery_replay_rejects_replacement_pr_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case, _ = self._delivery_publication_case(Path(tmp))
+            case["context"]["terminal_closeout"] = {
+                "closeout_state": "pr_opened",
+                "assessment": {"pr_number": 76},
+            }
+            result, nested = self._run_delivery_publication_case(
+                case,
+                remote_readbacks=[{"state": "exact", "head": case["head"]}],
+                pr_readbacks=[{"state": "exact", "pr": case["pr"]}],
+            )
+        self.assertEqual(
+            "terminal_delivery_replay_requires_new_lane", result["state"]
+        )
+        self.assertTrue(result["reconcile_required"])
+        self.assertEqual(76, result["terminal_pr_number"])
+        self.assertEqual("new_lane_required", result["later_correction"])
+        self.assertEqual(
+            "open_new_lane; do_not_rebind_terminal_source_lane_to_another_pr",
+            result["next_action"],
+        )
+        nested.assert_not_called()
+
     def test_delivery_commit_cas_is_reused_only_after_exact_local_readback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

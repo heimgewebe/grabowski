@@ -8014,18 +8014,45 @@ def _run_candidate_delivery_profile(
         body=body,
         draft=False,
     )
-    if terminal_replay and pr_readback["state"] != "exact":
-        return {
-            "state": "terminal_delivery_replay_requires_new_lane",
-            "delivery_ready": False,
-            "reconcile_required": True,
-            "leases_preserved": True,
-            "delivery_manifest": delivery_manifest,
-            "branch_publication": branch_publication,
-            "pr_readback": pr_readback,
-            "later_correction": "new_lane_required",
-            "next_action": "open_new_lane; do_not_republish_terminal_source_lane",
-        }
+    if terminal_replay:
+        if pr_readback["state"] != "exact":
+            return {
+                "state": "terminal_delivery_replay_requires_new_lane",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "delivery_manifest": delivery_manifest,
+                "branch_publication": branch_publication,
+                "pr_readback": pr_readback,
+                "later_correction": "new_lane_required",
+                "next_action": "open_new_lane; do_not_republish_terminal_source_lane",
+            }
+        terminal_assessment = context["terminal_closeout"].get("assessment")
+        terminal_pr_number = (
+            terminal_assessment.get("pr_number")
+            if isinstance(terminal_assessment, dict)
+            else None
+        )
+        observed_pr = pr_readback.get("pr")
+        if (
+            isinstance(terminal_pr_number, bool)
+            or not isinstance(terminal_pr_number, int)
+            or terminal_pr_number < 1
+            or not isinstance(observed_pr, dict)
+            or observed_pr.get("number") != terminal_pr_number
+        ):
+            return {
+                "state": "terminal_delivery_replay_requires_new_lane",
+                "delivery_ready": False,
+                "reconcile_required": True,
+                "leases_preserved": True,
+                "delivery_manifest": delivery_manifest,
+                "branch_publication": branch_publication,
+                "pr_readback": pr_readback,
+                "terminal_pr_number": terminal_pr_number,
+                "later_correction": "new_lane_required",
+                "next_action": "open_new_lane; do_not_rebind_terminal_source_lane_to_another_pr",
+            }
     if pr_readback["state"] in {"unavailable", "duplicate", "drifted"}:
         return {
             "state": "outcome_unknown" if pr_readback["state"] == "unavailable" else "delivery_pr_identity_drift",
