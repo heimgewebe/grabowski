@@ -1517,6 +1517,10 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         and finalization.get("final_status") == "outcome_unknown"
         and finalization.get("blind_retry_allowed") is False
     )
+    runtime_proven_terminal = bool(
+        deploy_fields is not None
+        and _missing_finalization_deploy_is_runtime_proven(status, deploy_fields)
+    )
     return {
         "unit": entry.name,
         "kind": "deploy" if deploy_fields is not None else "midcutover_resume",
@@ -1527,9 +1531,61 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         "final_status": final_status,
         "fields": command_fields,
         "readback_required": readback_required,
-        "terminal": final_status in TERMINAL_JOB_STATUSES and not readback_required,
+        "runtime_proven_terminal": runtime_proven_terminal,
+        "terminal": (
+            final_status in TERMINAL_JOB_STATUSES and not readback_required
+        ) or runtime_proven_terminal,
         "reusable": final_status in REUSABLE_JOB_STATUSES and not readback_required,
     }
+
+
+def _missing_finalization_deploy_is_runtime_proven(
+    status: dict[str, Any], command_fields: dict[str, Any]
+) -> bool:
+    """Treat an exited deploy as terminal only when its active release proves the head.
+
+    The reconciliation must stay valid when canonical source has already advanced
+    beyond the deployed release.  Therefore it deliberately ignores live source
+    identity and entrypoint-origin checks, which are expected to drift in that
+    state, and instead requires the immutable release manifest, active runtime
+    pointer, release artifacts and environment to validate independently.  No
+    missing job receipt is synthesized or rewritten.
+    """
+    if status.get("final_status") in TERMINAL_JOB_STATUSES | REUSABLE_JOB_STATUSES:
+        return False
+    finalization = status.get("finalization_receipt")
+    if isinstance(finalization, dict) and finalization.get("valid") is True:
+        return False
+    properties = status.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    if (
+        properties.get("ActiveState") != "inactive"
+        or properties.get("SubState") != "dead"
+        or properties.get("Result") != "success"
+        or str(properties.get("ExecMainStatus")) != "0"
+    ):
+        return False
+    deployment = base._deployment_metadata()
+    required_release_integrity = (
+        "manifest_parse_valid",
+        "manifest_schema_valid",
+        "release_path_valid",
+        "release_id_valid",
+        "repo_head_valid",
+        "stable_runtime_manifest_valid",
+        "runtime_pointer_valid",
+        "artifact_integrity_valid",
+        "runtime_asset_identity_valid",
+        "release_python_identity_valid",
+        "environment_compatibility_valid",
+    )
+    return bool(
+        isinstance(deployment, dict)
+        and deployment.get("completion_status") == "complete"
+        and deployment.get("repo_head") == command_fields.get("expected_head")
+        and all(deployment.get(key) is True for key in required_release_integrity)
+    )
 
 
 def inflight_runtime_job_evidence(
@@ -1712,6 +1768,8 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
                 f"self deploy job requires authoritative runtime readback before retry: {entry.name} (outcome_unknown)"
             )
         if final_status in TERMINAL_JOB_STATUSES:
+            continue
+        if _missing_finalization_deploy_is_runtime_proven(status, candidate_fields):
             continue
         retained_units.append(entry.name)
         if final_status not in REUSABLE_JOB_STATUSES:

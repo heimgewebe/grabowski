@@ -1323,6 +1323,160 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
                     SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
 
+    def test_missing_finalization_success_is_pruned_when_runtime_proves_exact_head(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": previous,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                "cwd": str(repo),
+            }
+            status = {
+                "final_status": "missing_finalization_evidence",
+                "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+                "properties": {
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                },
+            }
+            deployment = {
+                "completion_status": "complete",
+                "repo_head": "a" * 40,
+                "manifest_parse_valid": True,
+                "manifest_schema_valid": True,
+                "release_path_valid": True,
+                "release_id_valid": True,
+                "repo_head_valid": True,
+                "stable_runtime_manifest_valid": True,
+                "runtime_pointer_valid": True,
+                "artifact_integrity_valid": True,
+                "runtime_asset_identity_valid": True,
+                "release_python_identity_valid": True,
+                "environment_compatibility_valid": True,
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ), patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index:
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+        write_index.assert_called_once_with(root, units=[], pending_unit=None)
+
+    def test_missing_finalization_success_blocks_when_runtime_head_mismatches(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": previous,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                "cwd": str(repo),
+            }
+            status = {
+                "final_status": "missing_finalization_evidence",
+                "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+                "properties": {
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                },
+            }
+            deployment = {
+                "completion_status": "complete",
+                "repo_head": "c" * 40,
+                "manifest_parse_valid": True,
+                "manifest_schema_valid": True,
+                "release_path_valid": True,
+                "release_id_valid": True,
+                "repo_head_valid": True,
+                "stable_runtime_manifest_valid": True,
+                "runtime_pointer_valid": True,
+                "artifact_integrity_valid": True,
+                "runtime_asset_identity_valid": True,
+                "release_python_identity_valid": True,
+                "environment_compatibility_valid": True,
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ), patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_inflight_evidence_prunes_runtime_proven_missing_finalization(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": previous,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                "cwd": str(repo),
+            }
+            status = {
+                "final_status": "missing_finalization_evidence",
+                "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+                "properties": {
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                },
+            }
+            deployment = {
+                "completion_status": "complete",
+                "repo_head": "a" * 40,
+                "manifest_parse_valid": True,
+                "manifest_schema_valid": True,
+                "release_path_valid": True,
+                "release_id_valid": True,
+                "repo_head_valid": True,
+                "stable_runtime_manifest_valid": True,
+                "runtime_pointer_valid": True,
+                "artifact_integrity_valid": True,
+                "runtime_asset_identity_valid": True,
+                "release_python_identity_valid": True,
+                "environment_compatibility_valid": True,
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ), patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index:
+                evidence = SELF_DEPLOY.inflight_runtime_job_evidence(prune=True)
+        self.assertEqual([job_dir.name], evidence["pruned_units"])
+        self.assertEqual([], evidence["blocking_units"])
+        write_index.assert_called_once_with(root, units=[], pending_unit=None)
+
     def test_matching_deploy_blocks_durable_outcome_unknown_before_retry(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
