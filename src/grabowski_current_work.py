@@ -1598,6 +1598,31 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
             "priority": 1,
         }
 
+    # Expired managed-active bindings remain actionable lifecycle attention even
+    # when they no longer establish coordination blocking. Preserve that signal
+    # in convergence guidance for both standalone hygiene and mixed live groups.
+    if "managed-active-lifecycle-attention" in action_reasons:
+        if projection_state == "hygiene":
+            return {
+                "convergence_stage": "hygiene",
+                "next_convergence_action": (
+                    "reconcile managed active lifecycle attention without "
+                    "treating it as coordination blocking"
+                ),
+                "finishable_chain": False,
+                "priority": 5,
+            }
+        if projection_state == "active":
+            return {
+                "convergence_stage": "active",
+                "next_convergence_action": (
+                    "monitor active work execution and reconcile managed active "
+                    "lifecycle attention"
+                ),
+                "finishable_chain": False,
+                "priority": 4,
+            }
+
     # Historical reconciliation without a current authority or physical surface is
     # hygiene.  It remains visible but must not displace operative work.
     if projection_state == "hygiene":

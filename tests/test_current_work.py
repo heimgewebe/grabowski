@@ -688,6 +688,10 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertIn(
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
+        self.assertEqual(
+            group["next_convergence_action"],
+            "reconcile managed active lifecycle attention without treating it as coordination blocking",
+        )
 
     def test_managed_active_checkout_with_process_remains_active(self) -> None:
         owner = "operator:managed-live"
@@ -746,6 +750,10 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 self.assertTrue(group["action_required"])
                 self.assertIn(
                     "managed-active-lifecycle-attention", group["action_reasons"]
+                )
+                self.assertEqual(
+                    group["next_convergence_action"],
+                    "monitor active work execution and reconcile managed active lifecycle attention",
                 )
 
     def test_terminal_managed_lifecycle_drift_is_hygiene_and_explained(self) -> None:
