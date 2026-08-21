@@ -100,7 +100,8 @@ DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate (advisory)",
     "Review evidence gate (attested)",
 }
-BASE_BOUND_REQUIRED_CHECK_NAMES = {"registry-registration-preflight/freshness"}
+REGISTRY_FRESHNESS_CHECK_NAME = "registry-registration-preflight/freshness"
+BASE_BOUND_REQUIRED_CHECK_NAMES = {REGISTRY_FRESHNESS_CHECK_NAME}
 REGISTRY_TASK_PATH_PREFIX = "registry/tasks/"
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude", "claude[bot]", "claude-code", "claude-code[bot]", "anthropic", "anthropic[bot]"}
@@ -2948,24 +2949,29 @@ def _effective_base_bound_check_names(
     pr: dict[str, Any], expected_check_names: tuple[str, ...]
 ) -> set[str]:
     required = set(expected_check_names) & BASE_BOUND_REQUIRED_CHECK_NAMES
-    freshness = "registry-registration-preflight/freshness"
-    if freshness not in required:
+    if REGISTRY_FRESHNESS_CHECK_NAME not in required:
         return required
 
     paths, path_failures = _current_pr_paths_failures(pr)
     if pr.get("changedFiles") is None or path_failures:
         return required
+    normalized_paths: list[str] = []
+    for path in paths:
+        normalized = _normalized_review_path(path)
+        if normalized is None:
+            return required
+        normalized_paths.append(normalized)
+    registry_root = REGISTRY_TASK_PATH_PREFIX.rstrip("/")
     if any(
-        path == REGISTRY_TASK_PATH_PREFIX.rstrip("/")
-        or path.startswith(REGISTRY_TASK_PATH_PREFIX)
-        for path in paths
+        path == registry_root or path.startswith(REGISTRY_TASK_PATH_PREFIX)
+        for path in normalized_paths
     ):
         return required
 
     # The custom ?base_sha= CheckRun exists only for Registry-task candidates.
     # Non-Registry PRs still run the native pull_request_target freshness job
     # against the current base, but GitHub owns that job's details URL.
-    required.remove(freshness)
+    required.remove(REGISTRY_FRESHNESS_CHECK_NAME)
     return required
 
 

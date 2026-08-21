@@ -244,6 +244,72 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
             result["failures"],
         )
 
+    def test_normalized_registry_task_paths_keep_base_binding_strict(self) -> None:
+        for raw_path in (
+            "./registry/tasks/X.json",
+            " registry/tasks/X.json ",
+            "./registry/tasks",
+        ):
+            with self.subTest(raw_path=raw_path):
+                state = _state()
+                state["pr"]["files"] = [{"path": raw_path}]
+                state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+                result = pr_review_gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(reviewed_files=[raw_path]),
+                    expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+                )
+
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertEqual(
+                    result["check_policy"]["base_bound_check_names"], [FRESHNESS]
+                )
+                self.assertIn(
+                    f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+                    result["failures"],
+                )
+
+    def test_malformed_individual_path_cannot_relax_base_binding(self) -> None:
+        state = _state()
+        state["pr"]["files"] = [{"path": "docs/../x.md"}]
+        state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=["docs/../x.md"]),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+            result["failures"],
+        )
+
+    def test_invalid_or_mismatched_changed_files_count_cannot_relax_binding(self) -> None:
+        for changed_files in (True, "1", 2):
+            with self.subTest(changed_files=changed_files):
+                state = _state()
+                state["pr"]["changedFiles"] = changed_files
+                state["checks"].append({"bucket": "pass", "name": FRESHNESS})
+
+                result = pr_review_gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(),
+                    expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+                )
+
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertEqual(
+                    result["check_policy"]["base_bound_check_names"], [FRESHNESS]
+                )
+                self.assertIn(
+                    f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+                    result["failures"],
+                )
+
     def test_missing_changed_files_count_cannot_relax_base_binding(self) -> None:
         state = _state()
         state["pr"].pop("changedFiles")
@@ -276,6 +342,10 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
 
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+        self.assertIn(
+            f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+            result["failures"],
+        )
 
     def test_missing_changed_file_evidence_cannot_relax_base_binding(self) -> None:
         state = _state()
