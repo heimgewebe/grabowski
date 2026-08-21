@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -980,6 +981,1410 @@ class BureauPickupTests(unittest.TestCase):
         ):
             binding = REAL_CANONICAL_REGISTRY_BINDING()
         return binding, managed, tracked
+
+    def orphan_recovery_binding(self, root, source_commit, task, initiative):
+        root.mkdir(parents=True, exist_ok=True)
+        documents = {
+            f"registry/tasks/{task['id']}.json": task,
+            f"registry/initiatives/{initiative['id']}.json": initiative,
+        }
+        paths = sorted(documents)
+        for relative, value in documents.items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(value), encoding="utf-8")
+        tree_sha256 = pickup._observed_registry_tree_sha256(root, paths)
+        inventory_path = root / ".bureau-runtime-snapshot.json"
+        inventory_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "bureau_registry_snapshot",
+                    "source_commit": source_commit,
+                    "tree_sha256": tree_sha256,
+                    "paths": paths,
+                }
+            ),
+            encoding="utf-8",
+        )
+        inventory = pickup.bureau._read_regular_file_snapshot(
+            inventory_path, label="test-orphan-recovery-inventory"
+        )
+        identity = {
+            "schema_version": 1,
+            "kind": "canonical-registry-binding",
+            "registry_root": str(root),
+            "source_commit": source_commit,
+            "registry_tree_sha256": tree_sha256,
+            "launcher_sha256": "c" * 64,
+            "manifest_sha256": "d" * 64,
+            "inventory_path": str(inventory_path),
+            "inventory_sha256": inventory.sha256,
+        }
+        identity["binding_sha256"] = pickup._sha256(identity)
+        return pickup._registry_binding_from_identity(identity)
+
+    def orphan_recovery_documents(self, *, keys=None, repository=None):
+        task = {
+            "schema_version": 1,
+            "id": "TEST-T001",
+            "initiative": "TEST-I001",
+            "state": "ready",
+            "goal": "recover the same run",
+        }
+        initiative = {
+            "schema_version": 1,
+            "id": "TEST-I001",
+            "state": "active",
+            "current_plan": {"repository": "test", "path": "plan.md"},
+        }
+        revision = json.loads(json.dumps(task))
+        revision.pop("state", None)
+        intent = self.intent(keys or ["path:/tmp/orphan-recovery-placeholder"])
+        intent["required_resource_keys"] = sorted(keys or [])
+        intent["task_sha256"] = pickup._sha256(revision)
+        intent["plan_sha256"] = pickup._sha256(initiative["current_plan"])
+        repo = repository or str(self.root / "repository")
+        workspace = self.root / "workspace"
+        workspace.mkdir(exist_ok=True)
+        intent["workspace"] = {
+            "repository": repo,
+            "source_head_at_intent": "a" * 40,
+            "baseline_commit": "b" * 40,
+            "workspace_branch": "bureau/test-t001/0123456789",
+            "workspace_path": str(workspace),
+        }
+        return task, initiative, intent
+
+    def write_orphan_recovery_journal(
+        self, stored_binding, intent, stored_request, *, lease_metadata="a" * 64
+    ):
+        run_dir = pickup._run_directory(intent["run_id"])
+        pickup._write_bound_json(
+            run_dir / "registry-binding.json", stored_binding["identity"]
+        )
+        pickup._write_bound_json(
+            run_dir / "request.json",
+            {
+                **stored_request,
+                "registry_binding_sha256": stored_binding["identity"][
+                    "binding_sha256"
+                ],
+            },
+        )
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        leases = []
+        groups = []
+        for group in pickup._acquisition_groups(intent, stored_request):
+            purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+            )
+            group_leases = [
+                {
+                    **self.lease(key, intent["lease_owner_id"], lease_metadata),
+                    "purpose": purpose,
+                }
+                for key in group["resource_keys"]
+            ]
+            leases.extend(group_leases)
+            groups.append(
+                {
+                    "group": group["name"],
+                    "resource_keys": list(group["resource_keys"]),
+                    "result": {
+                        "owner_id": intent["lease_owner_id"],
+                        "leases": group_leases,
+                    },
+                }
+            )
+        acquisition = {
+            "schema_version": pickup.SCHEMA_VERSION,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": intent["required_resource_keys"],
+            "resource_lease_contract_version": (
+                pickup.resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+            ),
+            "leases": leases,
+            "groups": groups,
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        pickup._write_bound_json(run_dir / "acquisition.json", acquisition)
+        envelope = {
+            "schema_version": 1,
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+            "task_sha256": intent["task_sha256"],
+            "plan_sha256": intent["plan_sha256"],
+            "claim_intent": intent,
+        }
+        run = {
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+            "attempt": 3,
+            "task_sha256": intent["task_sha256"],
+            "plan_sha256": intent["plan_sha256"],
+            "workspace_path": intent["workspace"]["workspace_path"],
+            "workspace_branch": intent["workspace"]["workspace_branch"],
+        }
+        pickup._write_bound_json(
+            run_dir / "commit-result.json",
+            {"status": "claimed", "run": run, "envelope": envelope},
+        )
+        return run_dir, acquisition, pickup._journal_run_identity(run_dir, intent)
+
+    def orphan_recovery_coordination(
+        self,
+        intent,
+        journal_identity,
+        *,
+        state="orphaned",
+        error=pickup.ORPHAN_RESUME_ERROR,
+        external=None,
+    ):
+        run = {
+            **journal_identity,
+            "state": state,
+            "error": error,
+            "updated_at": "2026-08-20T07:29:34.789607Z",
+            "reservations": [],
+            "heartbeat_at": self.utc_heartbeat(age_seconds=0),
+            "external_system": None,
+            "external_id": None,
+            "external_state": None,
+            "external_observed_at": None,
+        }
+        if external:
+            run.update(external)
+        keys = intent["required_resource_keys"]
+        return {
+            "status": "coordinated",
+            "run": run,
+            "claim_intent_sha256": intent["intent_sha256"],
+            "release": {
+                "required": bool(keys),
+                "owner_id": intent["lease_owner_id"],
+                "resource_keys": keys,
+                "claim_intent_sha256": intent["intent_sha256"],
+            },
+            "blocking": False,
+        }
+
+    def orphan_recovery_fixture(self, *, keys=None, request_task_id="TEST-T001"):
+        keys = keys or []
+        repository = (
+            keys[0].removeprefix("repo:")
+            if len(keys) == 1 and keys[0].startswith("repo:")
+            else None
+        )
+        task, initiative, intent = self.orphan_recovery_documents(
+            keys=keys, repository=repository
+        )
+        old_root = self.root / "old-registry"
+        current_root = self.root / "current-registry"
+        stored_binding = self.orphan_recovery_binding(
+            old_root, "1" * 40, task, initiative
+        )
+        current_binding = self.orphan_recovery_binding(
+            current_root, "2" * 40, task, initiative
+        )
+        self.coordination_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.coordination_root.chmod(0o700)
+        database = self.coordination_root / "bureau.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE task_spec_revisions(
+                    task_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    parent_revision INTEGER,
+                    spec_sha256 TEXT NOT NULL,
+                    spec_json TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, revision)
+                );
+                CREATE TABLE task_specs(
+                    task_id TEXT PRIMARY KEY,
+                    current_revision INTEGER NOT NULL,
+                    spec_sha256 TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+            spec_sha256 = pickup._sha256(task)
+            connection.execute(
+                "INSERT INTO task_spec_revisions VALUES(?,?,?,?,?,?,?)",
+                (
+                    task["id"],
+                    1,
+                    None,
+                    spec_sha256,
+                    json.dumps(task, sort_keys=True, separators=(",", ":")),
+                    "test",
+                    "2026-08-21T00:00:00Z",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_specs VALUES(?,?,?,?)",
+                (task["id"], 1, spec_sha256, "2026-08-21T00:00:00Z"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        stored_request = pickup._normalize_request(
+            {
+                **self.request(task_id=request_task_id),
+                "registry_root": str(old_root),
+            },
+            allow_internal_bindings=True,
+        )
+        current_request = {**stored_request, "registry_root": str(current_root)}
+        run_dir, acquisition, journal_identity = self.write_orphan_recovery_journal(
+            stored_binding, intent, stored_request
+        )
+        orphaned = self.orphan_recovery_coordination(
+            intent, journal_identity, state="orphaned"
+        )
+        resumed = self.orphan_recovery_coordination(
+            intent, journal_identity, state="assigned", error=None
+        )
+        return {
+            "task": task,
+            "initiative": initiative,
+            "intent": intent,
+            "stored_binding": stored_binding,
+            "current_binding": current_binding,
+            "stored_request": stored_request,
+            "current_request": current_request,
+            "run_dir": run_dir,
+            "acquisition": acquisition,
+            "journal_identity": journal_identity,
+            "orphaned": orphaned,
+            "resumed": resumed,
+        }
+
+    def test_orphan_recovery_resumes_same_run_before_new_claim(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        registry_before = (fixture["run_dir"] / "registry-binding.json").read_bytes()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["resumed"],
+                ],
+            ) as status,
+            mock.patch.object(
+                pickup,
+                "_resume_orphaned_run",
+                return_value={
+                    "status": "resumed",
+                    "run": fixture["resumed"]["run"],
+                },
+            ) as resume,
+        ):
+            result = pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("resumed-existing-assignment", result["status"])
+        self.assertEqual(fixture["intent"]["run_id"], result["run_id"])
+        self.assertEqual(4, status.call_count)
+        resume.assert_called_once()
+        self.assertEqual(
+            registry_before,
+            (fixture["run_dir"] / "registry-binding.json").read_bytes(),
+        )
+        self.assertTrue((fixture["run_dir"] / "registry-binding-recovery.json").is_file())
+        self.assertTrue((fixture["run_dir"] / "orphan-recovery.json").is_file())
+
+    def test_orphan_recovery_rejects_current_task_drift_before_lease_effect(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        changed = dict(fixture["task"])
+        changed["goal"] = "changed task"
+        drift_binding = self.orphan_recovery_binding(
+            self.root / "drift-registry",
+            "3" * 40,
+            changed,
+            fixture["initiative"],
+        )
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            pickup._current_registry_revision_proof(
+                drift_binding, fixture["intent"]
+            )
+        self.assertEqual("orphan-recovery-task-drift", raised.exception.code)
+
+    def test_orphan_recovery_rejects_terminal_task_before_lease_effect(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        state_root = Path(fixture["current_request"]["coordination_root"])
+        terminal = dict(fixture["task"])
+        terminal["state"] = "cancelled"
+        spec_sha256 = pickup._sha256(terminal)
+        database = state_root / "bureau.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "INSERT INTO task_spec_revisions VALUES(?,?,?,?,?,?,?)",
+                (
+                    "TEST-T001",
+                    2,
+                    1,
+                    spec_sha256,
+                    json.dumps(terminal, sort_keys=True, separators=(",", ":")),
+                    "test-terminal",
+                    "2026-08-21T00:01:00Z",
+                ),
+            )
+            connection.execute(
+                "UPDATE task_specs SET current_revision=?,spec_sha256=?,updated_at=? "
+                "WHERE task_id=?",
+                (2, spec_sha256, "2026-08-21T00:01:00Z", "TEST-T001"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup, "_coordination_status", return_value=fixture["orphaned"]
+            ),
+            mock.patch.object(
+                pickup, "_reacquire_orphaned_assignment_leases"
+            ) as reacquire,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("orphan-recovery-task-terminal", raised.exception.code)
+        self.assertEqual("cancelled", raised.exception.details["task_state"])
+        reacquire.assert_not_called()
+
+    def test_orphan_recovery_uses_state_store_task_spec_authority(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        state_root = Path(fixture["current_request"]["coordination_root"])
+        changed = dict(fixture["task"])
+        changed["goal"] = "state store changed task"
+        spec_sha256 = pickup._sha256(changed)
+        database = state_root / "bureau.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "INSERT INTO task_spec_revisions VALUES(?,?,?,?,?,?,?)",
+                (
+                    "TEST-T001",
+                    2,
+                    1,
+                    spec_sha256,
+                    json.dumps(changed, sort_keys=True, separators=(",", ":")),
+                    "test-update",
+                    "2026-08-21T00:01:00Z",
+                ),
+            )
+            connection.execute(
+                "UPDATE task_specs SET current_revision=?,spec_sha256=?,updated_at=? "
+                "WHERE task_id=?",
+                (2, spec_sha256, "2026-08-21T00:01:00Z", "TEST-T001"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            pickup._current_registry_revision_proof(
+                fixture["current_binding"],
+                fixture["intent"],
+                coordination_root=str(state_root),
+            )
+        self.assertEqual("orphan-recovery-task-drift", raised.exception.code)
+
+    def test_orphan_recovery_registry_receipts_chain_across_descendant_deploys(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        candidate = {
+            "run_dir": fixture["run_dir"],
+            "stored_binding": fixture["stored_binding"],
+            "intent": fixture["intent"],
+            "journal_identity": fixture["journal_identity"],
+        }
+        ancestry_one = {
+            "repository": str(pickup.bureau_leases.BUREAU_REPOSITORY_ROOT),
+            "stored_source_commit": "1" * 40,
+            "current_source_commit": "2" * 40,
+            "stored_registry_binding_sha256": fixture["stored_binding"]["identity"][
+                "binding_sha256"
+            ],
+            "current_registry_binding_sha256": fixture["current_binding"]["identity"][
+                "binding_sha256"
+            ],
+            "ancestor_proven": True,
+        }
+        revision_one = pickup._current_registry_revision_proof(
+            fixture["current_binding"],
+            fixture["intent"],
+            coordination_root=fixture["current_request"]["coordination_root"],
+        )
+        first = pickup._ensure_registry_binding_recovery_receipt(
+            candidate, fixture["current_binding"], ancestry_one, revision_one
+        )
+        first_path = fixture["run_dir"] / "registry-binding-recovery.json"
+        first_bytes = first_path.read_bytes()
+
+        next_binding = self.orphan_recovery_binding(
+            self.root / "next-registry",
+            "3" * 40,
+            fixture["task"],
+            fixture["initiative"],
+        )
+        ancestry_two = {
+            **ancestry_one,
+            "current_source_commit": "3" * 40,
+            "current_registry_binding_sha256": next_binding["identity"][
+                "binding_sha256"
+            ],
+        }
+        revision_two = pickup._current_registry_revision_proof(
+            next_binding,
+            fixture["intent"],
+            coordination_root=fixture["current_request"]["coordination_root"],
+        )
+        with mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]):
+            second = pickup._ensure_registry_binding_recovery_receipt(
+                candidate, next_binding, ancestry_two, revision_two
+            )
+
+        self.assertEqual(first_bytes, first_path.read_bytes())
+        self.assertEqual(first["receipt_sha256"], second["predecessor_receipt_sha256"])
+        successor = fixture["run_dir"] / (
+            "registry-binding-recovery-"
+            f"{next_binding['identity']['binding_sha256'][:16]}.json"
+        )
+        self.assertTrue(successor.is_file())
+        self.assertNotEqual(first["receipt_sha256"], second["receipt_sha256"])
+        chain = pickup._registry_recovery_receipt_chain(candidate)
+        self.assertEqual(
+            [first["receipt_sha256"], second["receipt_sha256"]],
+            [item["receipt_sha256"] for item in chain],
+        )
+
+    def test_orphan_recovery_registry_receipt_chain_rejects_rollback(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        candidate = {
+            "run_dir": fixture["run_dir"],
+            "stored_binding": fixture["stored_binding"],
+            "intent": fixture["intent"],
+            "journal_identity": fixture["journal_identity"],
+        }
+        ancestry_one = {
+            "repository": str(pickup.bureau_leases.BUREAU_REPOSITORY_ROOT),
+            "stored_source_commit": "1" * 40,
+            "current_source_commit": "2" * 40,
+            "stored_registry_binding_sha256": fixture["stored_binding"]["identity"][
+                "binding_sha256"
+            ],
+            "current_registry_binding_sha256": fixture["current_binding"]["identity"][
+                "binding_sha256"
+            ],
+            "ancestor_proven": True,
+        }
+        revision_one = pickup._current_registry_revision_proof(
+            fixture["current_binding"],
+            fixture["intent"],
+            coordination_root=fixture["current_request"]["coordination_root"],
+        )
+        pickup._ensure_registry_binding_recovery_receipt(
+            candidate, fixture["current_binding"], ancestry_one, revision_one
+        )
+        next_binding = self.orphan_recovery_binding(
+            self.root / "rollback-next-registry",
+            "3" * 40,
+            fixture["task"],
+            fixture["initiative"],
+        )
+        ancestry_two = {
+            **ancestry_one,
+            "current_source_commit": "3" * 40,
+            "current_registry_binding_sha256": next_binding["identity"][
+                "binding_sha256"
+            ],
+        }
+        revision_two = pickup._current_registry_revision_proof(
+            next_binding,
+            fixture["intent"],
+            coordination_root=fixture["current_request"]["coordination_root"],
+        )
+        with mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]):
+            pickup._ensure_registry_binding_recovery_receipt(
+                candidate, next_binding, ancestry_two, revision_two
+            )
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            pickup._ensure_registry_binding_recovery_receipt(
+                candidate, fixture["current_binding"], ancestry_one, revision_one
+            )
+        self.assertEqual(
+            "orphan-recovery-registry-receipt-lineage-drift", raised.exception.code
+        )
+        self.assertEqual("registry-binding-rollback", raised.exception.details["reason"])
+
+    def test_orphan_recovery_registry_receipt_chain_rejects_fork(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        candidate = {
+            "run_dir": fixture["run_dir"],
+            "stored_binding": fixture["stored_binding"],
+            "intent": fixture["intent"],
+            "journal_identity": fixture["journal_identity"],
+        }
+        ancestry_one = {
+            "repository": str(pickup.bureau_leases.BUREAU_REPOSITORY_ROOT),
+            "stored_source_commit": "1" * 40,
+            "current_source_commit": "2" * 40,
+            "stored_registry_binding_sha256": fixture["stored_binding"]["identity"][
+                "binding_sha256"
+            ],
+            "current_registry_binding_sha256": fixture["current_binding"]["identity"][
+                "binding_sha256"
+            ],
+            "ancestor_proven": True,
+        }
+        revision_one = pickup._current_registry_revision_proof(
+            fixture["current_binding"],
+            fixture["intent"],
+            coordination_root=fixture["current_request"]["coordination_root"],
+        )
+        pickup._ensure_registry_binding_recovery_receipt(
+            candidate, fixture["current_binding"], ancestry_one, revision_one
+        )
+        fork_binding = self.orphan_recovery_binding(
+            self.root / "fork-registry",
+            "4" * 40,
+            fixture["task"],
+            fixture["initiative"],
+        )
+        fork_ancestry = {
+            **ancestry_one,
+            "current_source_commit": "4" * 40,
+            "current_registry_binding_sha256": fork_binding["identity"][
+                "binding_sha256"
+            ],
+        }
+        fork_revision = pickup._current_registry_revision_proof(
+            fork_binding,
+            fixture["intent"],
+            coordination_root=fixture["current_request"]["coordination_root"],
+        )
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=None),
+            self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "orphan-recovery-registry-receipt-lineage-drift",
+            ),
+        ):
+            pickup._ensure_registry_binding_recovery_receipt(
+                candidate, fork_binding, fork_ancestry, fork_revision
+            )
+
+    def test_orphan_recovery_rejects_nonancestor_registry(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=None),
+            self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "orphan-recovery-registry-source-not-ancestor",
+            ),
+        ):
+            pickup._registry_successor_proof(
+                fixture["stored_binding"], fixture["current_binding"]
+            )
+
+    def test_orphan_recovery_rejects_foreign_live_lease(self) -> None:
+        repository = self.root / "repository"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        foreign = {
+            **self.lease(key, "foreign-owner"),
+            "purpose": "foreign work",
+        }
+        with (
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=foreign),
+            mock.patch.object(pickup.resources, "rebind_same_owner_resources") as rebind,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            self.assertRaisesRegex(
+                pickup.BureauPickupError, "orphan-recovery-lease-foreign-owner"
+            ),
+        ):
+            pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        rebind.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_orphan_recovery_rejects_missing_lease_history_before_acquire(self) -> None:
+        repository = self.root / "repository-missing-history"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        with (
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
+            mock.patch.object(pickup, "_persisted_resource_lease", return_value=None),
+            mock.patch.object(pickup.resources, "rebind_same_owner_resources") as rebind,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual(
+            "orphan-recovery-expired-lease-history-missing", raised.exception.code
+        )
+        rebind.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_orphan_recovery_preflights_all_groups_before_any_rebind(self) -> None:
+        repository = self.root / "repository"
+        repo_key = f"repo:{repository}"
+        bureau_key = pickup.bureau_leases.BUREAU_MERGE_GATE_KEY
+        fixture = self.orphan_recovery_fixture(keys=[bureau_key, repo_key])
+        originals = {
+            item["resource_key"]: item for item in fixture["acquisition"]["leases"]
+        }
+        expired_bureau = {
+            **pickup._lease_snapshot(originals[bureau_key]),
+            "purpose": originals[bureau_key]["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        foreign_repo = {
+            **pickup._lease_snapshot(originals[repo_key]),
+            "owner_id": "foreign-owner",
+            "purpose": originals[repo_key]["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        with (
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[None, None]
+            ),
+            mock.patch.object(
+                pickup,
+                "_persisted_resource_lease",
+                side_effect=[expired_bureau, foreign_repo],
+            ),
+            mock.patch.object(
+                pickup.resources, "rebind_same_owner_resources"
+            ) as rebind,
+            mock.patch.object(pickup.resources, "renew_resources") as renew,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual("orphan-recovery-lease-foreign-owner", raised.exception.code)
+        rebind.assert_not_called()
+        renew.assert_not_called()
+
+    def test_orphan_recovery_rechecks_run_after_lease_preflight_before_effect(self) -> None:
+        repository = self.root / "repository-run-guard"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        terminal = self.orphan_recovery_coordination(
+            fixture["intent"],
+            fixture["journal_identity"],
+            state="cancelled",
+            error=None,
+        )
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[fixture["orphaned"], terminal],
+            ) as status,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=None
+            ) as inspect_resource,
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ) as persisted,
+            mock.patch.object(
+                pickup.resources, "rebind_same_owner_resources"
+            ) as rebind,
+            mock.patch.object(pickup.resources, "renew_resources") as renew,
+            mock.patch.object(pickup, "_resume_orphaned_run") as resume,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("orphan-recovery-run-not-eligible", raised.exception.code)
+        self.assertEqual(2, status.call_count)
+        inspect_resource.assert_called_once_with(key)
+        persisted.assert_called_once_with(key)
+        rebind.assert_not_called()
+        renew.assert_not_called()
+        resume.assert_not_called()
+
+    def test_orphan_recovery_rechecks_task_after_lease_preflight_before_effect(self) -> None:
+        repository = self.root / "repository-task-guard"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        database = Path(fixture["current_request"]["coordination_root"]) / "bureau.sqlite3"
+
+        def terminalize_during_preflight(_key):
+            terminal = dict(fixture["task"])
+            terminal["state"] = "cancelled"
+            spec_sha256 = pickup._sha256(terminal)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "INSERT INTO task_spec_revisions VALUES(?,?,?,?,?,?,?)",
+                    (
+                        terminal["id"],
+                        2,
+                        1,
+                        spec_sha256,
+                        json.dumps(terminal, sort_keys=True, separators=(",", ":")),
+                        "test-pre-effect-terminal",
+                        "2026-08-21T00:02:00Z",
+                    ),
+                )
+                connection.execute(
+                    "UPDATE task_specs SET current_revision=?,spec_sha256=?,updated_at=? "
+                    "WHERE task_id=?",
+                    (2, spec_sha256, "2026-08-21T00:02:00Z", terminal["id"]),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            return None
+
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup, "_coordination_status", return_value=fixture["orphaned"]
+            ) as status,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=terminalize_during_preflight
+            ) as inspect_resource,
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ) as persisted,
+            mock.patch.object(
+                pickup.resources, "rebind_same_owner_resources"
+            ) as rebind,
+            mock.patch.object(pickup.resources, "renew_resources") as renew,
+            mock.patch.object(pickup, "_resume_orphaned_run") as resume,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("orphan-recovery-task-terminal", raised.exception.code)
+        self.assertEqual("cancelled", raised.exception.details["task_state"])
+        status.assert_called_once()
+        inspect_resource.assert_called_once_with(key)
+        persisted.assert_called_once_with(key)
+        rebind.assert_not_called()
+        renew.assert_not_called()
+        resume.assert_not_called()
+
+    def test_orphan_recovery_rejects_wrong_reason_or_external_binding(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        cases = [
+            (
+                self.orphan_recovery_coordination(
+                    fixture["intent"],
+                    fixture["journal_identity"],
+                    error="manual orphan",
+                ),
+                "orphan-recovery-run-not-eligible",
+            ),
+            (
+                self.orphan_recovery_coordination(
+                    fixture["intent"],
+                    fixture["journal_identity"],
+                    external={
+                        "external_system": "agent",
+                        "external_id": "ext-1",
+                        "external_state": "running",
+                        "external_observed_at": "2026-08-20T07:00:00Z",
+                    },
+                ),
+                "orphan-recovery-external-binding-present",
+            ),
+        ]
+        for coordination, code in cases:
+            with self.subTest(code=code):
+                with self.assertRaises(pickup.BureauPickupError) as raised:
+                    pickup._validate_recoverable_orphan(
+                        coordination,
+                        fixture["intent"],
+                        fixture["acquisition"],
+                        fixture["journal_identity"],
+                    )
+                self.assertEqual(code, raised.exception.code)
+
+    def test_orphan_recovery_resume_failure_reads_back_without_duplicate(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                ],
+            ) as status,
+            mock.patch.object(
+                pickup,
+                "_resume_orphaned_run",
+                side_effect=RuntimeError("response lost or resume failed"),
+            ) as resume,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("orphan-recovery-resume-failed", raised.exception.code)
+        self.assertFalse(raised.exception.details["duplicate_run_created"])
+        self.assertEqual(4, status.call_count)
+        resume.assert_called_once()
+
+    def test_orphan_recovery_expired_lease_uses_same_owner_rebind(self) -> None:
+        repository = self.root / "repository"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        rebound = {
+            **original,
+            "updated_at_unix": int(time.time()),
+            "expires_at_unix": int(time.time()) + 300,
+        }
+        with (
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[None, rebound],
+            ),
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "rebind_same_owner_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "resource_keys": [key],
+                    "metadata_sha256": original["metadata_sha256"],
+                    "leases": [rebound],
+                },
+            ) as rebind,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            receipt = pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual("same-owner-rebind", receipt["actions"][0]["method"])
+        rebind.assert_called_once()
+        acquire.assert_not_called()
+
+    def test_orphan_recovery_lease_receipt_is_stable_across_retry(self) -> None:
+        repository = self.root / "repository"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        rebound = {
+            **original,
+            "updated_at_unix": int(time.time()),
+            "expires_at_unix": int(time.time()) + 300,
+        }
+        with (
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[None, rebound, rebound, rebound],
+            ),
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "rebind_same_owner_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "resource_keys": [key],
+                    "metadata_sha256": original["metadata_sha256"],
+                    "leases": [rebound],
+                },
+            ) as rebind,
+        ):
+            first = pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+            second = pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual(first["receipt_sha256"], second["receipt_sha256"])
+        self.assertEqual("same-owner-rebind", second["actions"][0]["method"])
+        rebind.assert_called_once()
+
+    def test_orphan_recovery_retry_after_prior_resume_skips_second_effect(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[
+                    fixture["resumed"],
+                    fixture["resumed"],
+                    fixture["resumed"],
+                ],
+            ) as status,
+            mock.patch.object(pickup, "_resume_orphaned_run") as resume,
+        ):
+            result = pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("resumed-existing-assignment", result["status"])
+        self.assertEqual(fixture["intent"]["run_id"], result["run_id"])
+        self.assertEqual("already-active", result["commit"]["status"])
+        self.assertTrue(result["orphan_recovery_receipt_sha256"])
+        self.assertEqual(3, status.call_count)
+        resume.assert_not_called()
+
+    def test_orphan_recovery_skips_incomplete_pre_acquisition_journal(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        (fixture["run_dir"] / "acquisition.json").unlink()
+        with mock.patch.object(pickup, "_coordination_status") as status:
+            candidate = pickup._journaled_orphan_recovery_candidate(
+                fixture["current_request"], fixture["current_binding"]
+            )
+        self.assertIsNone(candidate)
+        status.assert_not_called()
+
+    def test_orphan_recovery_queue_selected_request_uses_journal_intent_task(self) -> None:
+        fixture = self.orphan_recovery_fixture(request_task_id=None)
+        with mock.patch.object(
+            pickup, "_coordination_status", return_value=fixture["orphaned"]
+        ):
+            candidate = pickup._journaled_orphan_recovery_candidate(
+                fixture["current_request"], fixture["current_binding"]
+            )
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertIsNone(candidate["stored_request"]["task_id"])
+        self.assertEqual(
+            fixture["intent"]["task_id"], candidate["intent"]["task_id"]
+        )
+        self.assertEqual(
+            fixture["intent"]["run_id"], candidate["intent"]["run_id"]
+        )
+
+    def test_orphan_recovery_skips_terminal_legacy_binding_before_binding_rejection(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        terminal = self.orphan_recovery_coordination(
+            fixture["intent"], fixture["journal_identity"], state="cancelled", error=None
+        )
+        with (
+            mock.patch.object(pickup, "_coordination_status", return_value=terminal),
+            mock.patch.object(pickup, "_read_journal_registry_binding") as binding,
+        ):
+            candidate = pickup._journaled_orphan_recovery_candidate(
+                fixture["current_request"], fixture["current_binding"]
+            )
+        self.assertIsNone(candidate)
+        binding.assert_not_called()
+
+    def test_orphan_recovery_rejects_recoverable_legacy_binding(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        with (
+            mock.patch.object(
+                pickup, "_coordination_status", return_value=fixture["orphaned"]
+            ),
+            mock.patch.object(
+                pickup,
+                "_read_journal_registry_binding",
+                return_value={
+                    "identity": {"kind": "explicit-registry-binding"},
+                    "explicit": True,
+                },
+            ),
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._journaled_orphan_recovery_candidate(
+                fixture["current_request"], fixture["current_binding"]
+            )
+        self.assertEqual(
+            "orphan-recovery-requires-canonical-registry", raised.exception.code
+        )
+
+    def test_orphan_recovery_compensates_prior_rebind_when_later_group_fails(self) -> None:
+        repository = self.root / "repository"
+        repo_key = f"repo:{repository}"
+        bureau_key = pickup.bureau_leases.BUREAU_MERGE_GATE_KEY
+        fixture = self.orphan_recovery_fixture(keys=[bureau_key, repo_key])
+        originals = {
+            item["resource_key"]: item for item in fixture["acquisition"]["leases"]
+        }
+        expired_bureau = {
+            **pickup._lease_snapshot(originals[bureau_key]),
+            "purpose": originals[bureau_key]["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        expired_repo = {
+            **pickup._lease_snapshot(originals[repo_key]),
+            "purpose": originals[repo_key]["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        rebound_bureau = {
+            **originals[bureau_key],
+            "updated_at_unix": int(time.time()),
+            "expires_at_unix": int(time.time()) + 300,
+        }
+        release_result = {
+            "owner_id": fixture["intent"]["lease_owner_id"],
+            "released": [rebound_bureau],
+            "snapshot_guarded": True,
+            "force": False,
+        }
+        with (
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[None, None]
+            ),
+            mock.patch.object(
+                pickup,
+                "_persisted_resource_lease",
+                side_effect=[expired_bureau, expired_repo],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "rebind_same_owner_resources",
+                side_effect=[
+                    {
+                        "owner_id": fixture["intent"]["lease_owner_id"],
+                        "resource_keys": [bureau_key],
+                        "metadata_sha256": originals[bureau_key]["metadata_sha256"],
+                        "leases": [rebound_bureau],
+                    },
+                    RuntimeError("second group CAS failed"),
+                ],
+            ) as rebind,
+            mock.patch.object(
+                pickup.resources, "release_resources", return_value=release_result
+            ) as release,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual("orphan-recovery-lease-effect-failed", raised.exception.code)
+        self.assertEqual("released", raised.exception.details["compensation"]["status"])
+        self.assertEqual(2, rebind.call_count)
+        release.assert_called_once_with(
+            fixture["intent"]["lease_owner_id"],
+            [bureau_key],
+            expected_leases=[pickup._lease_snapshot(rebound_bureau)],
+        )
+        self.assertTrue((fixture["run_dir"] / "orphan-lease-effect-01.json").is_file())
+        self.assertTrue(
+            (fixture["run_dir"] / "orphan-lease-recovery-compensation.json").is_file()
+        )
+
+    def test_orphan_recovery_compensates_rebind_when_final_readback_fails(self) -> None:
+        repository = self.root / "repository-readback"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        rebound = {
+            **original,
+            "updated_at_unix": int(time.time()),
+            "expires_at_unix": int(time.time()) + 300,
+        }
+        with (
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[None, None]
+            ),
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "rebind_same_owner_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "resource_keys": [key],
+                    "metadata_sha256": original["metadata_sha256"],
+                    "leases": [rebound],
+                },
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "released": [rebound],
+                    "snapshot_guarded": True,
+                    "force": False,
+                },
+            ) as release,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._reacquire_orphaned_assignment_leases(
+                fixture["intent"],
+                fixture["stored_request"],
+                fixture["acquisition"],
+                fixture["run_dir"],
+            )
+        self.assertEqual("orphan-recovery-lease-effect-failed", raised.exception.code)
+        self.assertEqual(
+            "orphan-recovery-lease-readback-missing",
+            raised.exception.details["cause_code"],
+        )
+        self.assertEqual("released", raised.exception.details["compensation"]["status"])
+        release.assert_called_once_with(
+            fixture["intent"]["lease_owner_id"],
+            [key],
+            expected_leases=[pickup._lease_snapshot(rebound)],
+        )
+
+    def test_orphan_recovery_active_run_is_refreshed_after_lease_recovery(self) -> None:
+        repository = self.root / "repository"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        rebound = {
+            **original,
+            "updated_at_unix": int(time.time()),
+            "expires_at_unix": int(time.time()) + 300,
+        }
+        terminal = self.orphan_recovery_coordination(
+            fixture["intent"], fixture["journal_identity"], state="cancelled", error=None
+        )
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[fixture["resumed"], fixture["resumed"], terminal],
+            ) as status,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[None]
+            ),
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "rebind_same_owner_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "resource_keys": [key],
+                    "metadata_sha256": original["metadata_sha256"],
+                    "leases": [rebound],
+                },
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={
+                    "owner_id": fixture["intent"]["lease_owner_id"],
+                    "released": [rebound],
+                    "snapshot_guarded": True,
+                    "force": False,
+                },
+            ) as release,
+            mock.patch.object(pickup, "_resume_orphaned_run") as resume,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("orphan-recovery-lease-effect-failed", raised.exception.code)
+        self.assertEqual(3, status.call_count)
+        release.assert_called_once()
+        resume.assert_not_called()
+
+    def test_orphan_recovery_retry_reuses_persisted_success_receipt(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["resumed"],
+                    fixture["resumed"],
+                    fixture["resumed"],
+                    fixture["resumed"],
+                ],
+            ),
+            mock.patch.object(
+                pickup,
+                "_resume_orphaned_run",
+                return_value={"status": "resumed", "run": fixture["resumed"]["run"]},
+            ) as resume,
+        ):
+            first = pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+            receipt_bytes = (fixture["run_dir"] / "orphan-recovery.json").read_bytes()
+            second = pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual(
+            first["orphan_recovery_receipt_sha256"],
+            second["orphan_recovery_receipt_sha256"],
+        )
+        self.assertEqual(
+            receipt_bytes, (fixture["run_dir"] / "orphan-recovery.json").read_bytes()
+        )
+        resume.assert_called_once()
+
+    def test_orphan_recovery_binds_post_lease_task_revision_into_resume(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        revision = pickup._current_registry_revision_proof(
+            fixture["current_binding"],
+            fixture["intent"],
+            coordination_root=fixture["current_request"]["coordination_root"],
+        )
+        post_revision = {**revision, "test_marker": "post-lease"}
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_current_registry_revision_proof",
+                side_effect=[revision, revision, post_revision],
+            ) as revision_proof,
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["orphaned"],
+                    fixture["resumed"],
+                ],
+            ),
+            mock.patch.object(
+                pickup,
+                "_resume_orphaned_run",
+                return_value={
+                    "status": "resumed",
+                    "run": fixture["resumed"]["run"],
+                },
+            ) as resume,
+        ):
+            result = pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("resumed-existing-assignment", result["status"])
+        self.assertEqual(3, revision_proof.call_count)
+        self.assertEqual(post_revision, resume.call_args.kwargs["revision_proof"])
+        self.assertEqual(
+            fixture["orphaned"]["run"]["updated_at"], resume.call_args.args[2]["updated_at"]
+        )
+
+    def test_execute_orphan_recovery_precedes_claim_intent(self) -> None:
+        recovered = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup",
+            "status": "resumed-existing-assignment",
+            "run_id": self.intent()["run_id"],
+        }
+        with (
+            mock.patch.object(pickup, "_machine_completion_closeout_latch", return_value=None),
+            mock.patch.object(
+                pickup, "_recover_orphaned_journal_before_claim", return_value=recovered
+            ) as recovery,
+            mock.patch.object(pickup, "_claim_intent_or_closeout") as claim,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(recovered, result)
+        recovery.assert_called_once()
+        claim.assert_not_called()
 
     def test_canonical_binding_uses_managed_manifest_identity(self) -> None:
         managed, _tracked = self.managed_registry_fixture()
