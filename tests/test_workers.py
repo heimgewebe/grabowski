@@ -4458,6 +4458,21 @@ globalThis.fetch = async () => ({
                 )
         start_bidi.assert_not_called()
 
+    def test_bidi_record_adapter_accepts_configured_driver_name(self) -> None:
+        record = {
+            "executable": str(self.binary),
+            "port": 9566,
+            "argv_json": json.dumps([
+                str(self.root / "chromedriver-150-custom"),
+                "--port=9566",
+                "--allowed-ips=127.0.0.1",
+                "--verbose",
+            ]),
+        }
+        adapter = workers._browser_record_adapter(record)
+        self.assertEqual(adapter["adapter_id"], workers.BROWSER_BIDI_ADAPTER_ID)
+        self.assertEqual(adapter["protocol"], "webdriver-bidi")
+
     def test_bidi_record_adapter_rejects_noncanonical_driver_argv(self) -> None:
         record = {
             "executable": str(self.binary),

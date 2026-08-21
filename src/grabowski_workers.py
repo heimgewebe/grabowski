@@ -326,7 +326,7 @@ def _browser_record_adapter(record: dict[str, Any]) -> dict[str, Any]:
         isinstance(argv, list)
         and len(argv) == 4
         and isinstance(argv[0], str)
-        and Path(argv[0]).name == "chromedriver"
+        and Path(argv[0]).is_absolute()
         and isinstance(expected_port, int)
         and not isinstance(expected_port, bool)
         and argv[1:] == [
