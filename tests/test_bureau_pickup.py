@@ -1746,6 +1746,29 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual("same-owner-rebind", second["actions"][0]["method"])
         rebind.assert_called_once()
 
+    def test_orphan_recovery_retry_after_prior_resume_skips_second_effect(self) -> None:
+        fixture = self.orphan_recovery_fixture()
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup,
+                "_coordination_status",
+                side_effect=[fixture["resumed"], fixture["resumed"]],
+            ) as status,
+            mock.patch.object(pickup, "_resume_orphaned_run") as resume,
+        ):
+            result = pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("resumed-existing-assignment", result["status"])
+        self.assertEqual(fixture["intent"]["run_id"], result["run_id"])
+        self.assertEqual("already-active", result["commit"]["status"])
+        self.assertTrue(result["orphan_recovery_receipt_sha256"])
+        self.assertEqual(2, status.call_count)
+        resume.assert_not_called()
+
     def test_execute_orphan_recovery_precedes_claim_intent(self) -> None:
         recovered = {
             "schema_version": 1,

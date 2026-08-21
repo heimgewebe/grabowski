@@ -2896,11 +2896,18 @@ def _journaled_orphan_recovery_candidate(
             ),
         )
         run = coordination.get("run") if isinstance(coordination, dict) else None
-        if isinstance(run, dict) and run.get("state") != "orphaned":
+        state = run.get("state") if isinstance(run, dict) else None
+        already_resumed = state in ACTIVE_EXECUTION_STATES
+        if already_resumed:
+            _validate_resumed_run(
+                coordination, validated_intent, acquisition, journal_identity
+            )
+        elif state == "orphaned":
+            _validate_recoverable_orphan(
+                coordination, validated_intent, acquisition, journal_identity
+            )
+        else:
             continue
-        _validate_recoverable_orphan(
-            coordination, validated_intent, acquisition, journal_identity
-        )
         candidates.append(
             {
                 "run_dir": run_dir,
@@ -2910,6 +2917,7 @@ def _journaled_orphan_recovery_candidate(
                 "acquisition": acquisition,
                 "journal_identity": journal_identity,
                 "coordination": coordination,
+                "already_resumed": already_resumed,
             }
         )
     if not candidates:
@@ -3496,38 +3504,44 @@ def _recover_orphaned_journal_before_claim(
             coordination_root=request["coordination_root"],
         ),
     )
-    run = _validate_recoverable_orphan(
-        pre_resume, intent, acquisition, journal_identity
-    )
+    already_resumed = candidate.get("already_resumed") is True
     resume_result: dict[str, Any] | None = None
     resume_error: Exception | None = None
-    try:
-        resume_result = _bound_bureau_call(
-            current_binding,
-            lambda: _resume_orphaned_run(
-                request, intent, run, journal_identity["envelope_sha256"]
-            ),
+    if already_resumed:
+        _validate_resumed_run(pre_resume, intent, acquisition, journal_identity)
+        readback = pre_resume
+        resume_result = {"status": "already-active", "run": pre_resume.get("run")}
+    else:
+        run = _validate_recoverable_orphan(
+            pre_resume, intent, acquisition, journal_identity
         )
-    except Exception as exc:
-        resume_error = exc
-    try:
-        readback = _bound_bureau_call(
-            current_binding,
-            lambda: _coordination_status(
-                intent["run_id"],
-                registry_root=request["registry_root"],
-                coordination_root=request["coordination_root"],
-            ),
-        )
-    except Exception as exc:
-        raise BureauPickupError(
-            "orphan-recovery-resume-outcome-unknown",
-            details={
-                "resume_error_type": type(resume_error).__name__ if resume_error else None,
-                "readback_error_type": type(exc).__name__,
-                "lease_retained": bool(intent["required_resource_keys"]),
-            },
-        ) from exc
+        try:
+            resume_result = _bound_bureau_call(
+                current_binding,
+                lambda: _resume_orphaned_run(
+                    request, intent, run, journal_identity["envelope_sha256"]
+                ),
+            )
+        except Exception as exc:
+            resume_error = exc
+        try:
+            readback = _bound_bureau_call(
+                current_binding,
+                lambda: _coordination_status(
+                    intent["run_id"],
+                    registry_root=request["registry_root"],
+                    coordination_root=request["coordination_root"],
+                ),
+            )
+        except Exception as exc:
+            raise BureauPickupError(
+                "orphan-recovery-resume-outcome-unknown",
+                details={
+                    "resume_error_type": type(resume_error).__name__ if resume_error else None,
+                    "readback_error_type": type(exc).__name__,
+                    "lease_retained": bool(intent["required_resource_keys"]),
+                },
+            ) from exc
     observed_run = readback.get("run") if isinstance(readback, dict) else None
     if isinstance(observed_run, dict) and observed_run.get("state") in ACTIVE_EXECUTION_STATES:
         _validate_resumed_run(readback, intent, acquisition, journal_identity)
@@ -3555,6 +3569,7 @@ def _recover_orphaned_journal_before_claim(
         "lease_recovery_receipt_sha256": lease_receipt["receipt_sha256"],
         "run_readback_sha256": _sha256(readback),
         "response_loss_recovered": resume_error is not None,
+        "resume_effect_skipped_already_active": already_resumed,
     }
     success["receipt_sha256"] = _sha256(success)
     success_path = candidate["run_dir"] / "orphan-recovery.json"
