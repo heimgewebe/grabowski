@@ -2158,7 +2158,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
     def test_binding_identity_rebind_preview_and_apply_converges_branch_rename(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()
-        preview = checkouts.grabowski_checkout_binding_terminal_preview(
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
             binding["checkout_key"]
         )
         self.assertEqual(
@@ -2180,7 +2180,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual("topic", preview["lifecycle"]["expected_branch"])
         self.assertEqual(self.head, preview["lifecycle"]["expected_head"])
 
-        applied = checkouts.grabowski_checkout_binding_terminal_apply(
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
             binding["checkout_key"],
             "owner-a",
             preview["snapshot_sha256"],
@@ -2226,7 +2226,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         binding, _, _ = self._renamed_managed_checkout()
         (self.checkout / "dirty.txt").write_text("dirty\n", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "must be clean"):
-            checkouts.grabowski_checkout_binding_terminal_preview(
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
                 binding["checkout_key"]
             )
 
@@ -2239,7 +2239,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             )
             connection.commit()
         with self.assertRaisesRegex(PermissionError, "one unchanged owner"):
-            checkouts.grabowski_checkout_binding_terminal_preview(
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
                 binding["checkout_key"]
             )
 
@@ -2263,7 +2263,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             cwd=self.checkout,
         )
         with self.assertRaisesRegex(RuntimeError, "descend from recorded head"):
-            checkouts.grabowski_checkout_binding_terminal_preview(
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
                 binding["checkout_key"]
             )
 
@@ -2272,13 +2272,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
         new_branch = "topic-v2"
         self._git("branch", "-m", new_branch, cwd=self.checkout)
         with self.assertRaisesRegex(RuntimeError, "remote-secured"):
-            checkouts.grabowski_checkout_binding_terminal_preview(
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
                 binding["checkout_key"]
             )
 
     def test_binding_identity_rebind_rejects_snapshot_toctou(self) -> None:
         binding, _, _ = self._renamed_managed_checkout()
-        preview = checkouts.grabowski_checkout_binding_terminal_preview(
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
             binding["checkout_key"]
         )
         with checkouts._database() as connection:
@@ -2288,7 +2288,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             )
             connection.commit()
         with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
-            checkouts.grabowski_checkout_binding_terminal_apply(
+            checkouts.grabowski_checkout_binding_identity_rebind_apply(
                 binding["checkout_key"],
                 "owner-a",
                 preview["snapshot_sha256"],
@@ -2298,12 +2298,12 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
     def test_binding_identity_rebind_audit_failure_requires_readback(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()
-        preview = checkouts.grabowski_checkout_binding_terminal_preview(
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
             binding["checkout_key"]
         )
         with patch.object(checkouts.base, "_append_audit", side_effect=OSError("audit down")):
             with self.assertRaisesRegex(RuntimeError, "readback required"):
-                checkouts.grabowski_checkout_binding_terminal_apply(
+                checkouts.grabowski_checkout_binding_identity_rebind_apply(
                     binding["checkout_key"],
                     "owner-a",
                     preview["snapshot_sha256"],
@@ -2317,6 +2317,31 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(new_head, lifecycle["expected_head"])
         self.assertEqual(new_branch, retention["expected_branch"])
         self.assertEqual(new_head, retention["expected_head"])
+
+    def test_binding_identity_rebind_rechecks_retention_expiry_at_apply_time(self) -> None:
+        binding, _, _ = self._renamed_managed_checkout()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET retention_until_unix=? WHERE checkout_key=?",
+                (preview["observed_at_unix"], binding["checkout_key"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "retention expired"):
+            checkouts.grabowski_checkout_binding_identity_rebind_apply(
+                binding["checkout_key"],
+                "owner-a",
+                preview["snapshot_sha256"],
+                preview["observed_at_unix"],
+                preview["confirmation"],
+            )
+        lifecycle = checkouts._lifecycle_bindings([binding["checkout_key"]])[
+            binding["checkout_key"]
+        ]
+        self.assertEqual("topic", lifecycle["expected_branch"])
+        self.assertEqual(self.head, lifecycle["expected_head"])
 
     def test_lifecycle_source_has_no_forced_filesystem_deletion(self) -> None:
         source = (SRC / "grabowski_checkouts.py").read_text(encoding="utf-8")

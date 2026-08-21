@@ -2693,19 +2693,9 @@ def grabowski_checkout_binding_terminal_preview(checkout_key: str) -> dict[str, 
     """Preview an evidence-only terminal transition for one missing managed checkout."""
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
-    key = _validate_sha256(checkout_key, "checkout_key")
-    lifecycle = _lifecycle_bindings([key]).get(key)
-    if lifecycle is not None and Path(lifecycle["checkout_path"]).exists():
-        repo_path = _resolve_repo(lifecycle["repo_path"])
-        checkout = _safe_path(lifecycle["checkout_path"], must_exist=True)
-        _, _, record = _worktree_for_path(repo_path, checkout)
-        if record.get("branch") != lifecycle["expected_branch"]:
-            return _binding_identity_rebind_state_for_key(
-                key, observed_at_unix=_now()
-            )
     from grabowski_checkout_terminal_reconciliation import preview
 
-    return preview(key)
+    return preview(checkout_key)
 
 
 @mcp.tool(name="grabowski_checkout_binding_terminal_apply", annotations=MUTATING)
@@ -2720,20 +2710,10 @@ def grabowski_checkout_binding_terminal_apply(
     operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
-    key = _validate_sha256(checkout_key, "checkout_key")
-    rebind_prefix = f"{BINDING_IDENTITY_REBIND_CONFIRMATION}:{key}:"
-    if isinstance(confirmation, str) and confirmation.startswith(rebind_prefix):
-        return _binding_identity_rebind_apply(
-            checkout_key=key,
-            owner_id=owner_id,
-            expected_snapshot_sha256=expected_preview_sha256,
-            preview_created_at_unix=preview_created_at_unix,
-            confirmation=confirmation,
-        )
     from grabowski_checkout_terminal_reconciliation import apply
 
     return apply(
-        key,
+        checkout_key,
         owner_id,
         expected_preview_sha256,
         preview_created_at_unix,
@@ -2924,6 +2904,18 @@ def _binding_identity_rebind_state_for_key(
     )
 
 
+@mcp.tool(name="grabowski_checkout_binding_identity_rebind_preview", annotations=READ_ONLY)
+def grabowski_checkout_binding_identity_rebind_preview(
+    checkout_key: str,
+) -> dict[str, Any]:
+    """Preview one safe lifecycle identity rebind for an existing renamed checkout."""
+    operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("github_cli")
+    return _binding_identity_rebind_state_for_key(
+        checkout_key, observed_at_unix=_now()
+    )
+
+
 def _binding_identity_rebind_apply(
     checkout_key: str,
     owner_id: str,
@@ -2958,6 +2950,8 @@ def _binding_identity_rebind_apply(
         raise RuntimeError("Checkout identity rebind snapshot changed")
     if confirmation != planned["confirmation"]:
         raise PermissionError("Checkout identity rebind confirmation mismatch")
+    if int(planned["retention"]["retention_until_unix"]) <= _now():
+        raise RuntimeError("Checkout retention expired before identity rebind apply")
 
     checkout = Path(planned["checkout"]["checkout_path"])
     top_level = Path(planned["checkout"]["repo_path"])
@@ -2986,6 +2980,10 @@ def _binding_identity_rebind_apply(
             raise RuntimeError(
                 "Checkout identity rebind snapshot changed after lease acquisition"
             )
+        if int(current["retention"]["retention_until_unix"]) <= _now():
+            raise RuntimeError(
+                "Checkout retention expired after identity rebind lease acquisition"
+            )
 
         applied_at = _now()
         checkout_key = planned["checkout"]["checkout_key"]
@@ -3003,6 +3001,10 @@ def _binding_identity_rebind_apply(
                 raise RuntimeError("Checkout identity rebind database state disappeared")
             lifecycle_before = _lifecycle_public(lifecycle_row)
             retention_before = _retention_public(retention_row)
+            if int(retention_before["retention_until_unix"]) <= applied_at:
+                raise RuntimeError(
+                    "Checkout retention expired before identity rebind commit"
+                )
             if (
                 _sha256_json(lifecycle_before) != planned["lifecycle_sha256"]
                 or _sha256_json(retention_before) != planned["retention_sha256"]
@@ -3121,6 +3123,28 @@ def _binding_identity_rebind_apply(
         raise RuntimeError("Checkout identity rebind produced no result")
     result["lease_release"] = lease_release
     return result
+
+
+@mcp.tool(name="grabowski_checkout_binding_identity_rebind_apply", annotations=MUTATING)
+def grabowski_checkout_binding_identity_rebind_apply(
+    checkout_key: str,
+    owner_id: str,
+    expected_snapshot_sha256: str,
+    preview_created_at_unix: int,
+    confirmation: str,
+) -> dict[str, Any]:
+    """CAS-rebind lifecycle and retention identity after an exact safe preview."""
+    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("github_cli")
+    return _binding_identity_rebind_apply(
+        checkout_key=checkout_key,
+        owner_id=owner_id,
+        expected_snapshot_sha256=expected_snapshot_sha256,
+        preview_created_at_unix=preview_created_at_unix,
+        confirmation=confirmation,
+    )
+
 
 def _owner_handoff_state(
     *,
