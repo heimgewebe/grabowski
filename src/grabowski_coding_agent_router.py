@@ -1868,6 +1868,7 @@ def canonical_execution_route(
     latency_priority: bool = False,
     need_review: bool = False,
     verification_policy: str | None = None,
+    effect_profile: str = "candidate",
 ) -> dict[str, Any]:
     """Return the single canonical execution-routing decision."""
     catalog, validation = _load_catalog()
@@ -1902,6 +1903,10 @@ def canonical_execution_route(
         raise CodingAgentRouterError(
             "verification_policy must be deterministic, independent_review or competition"
         )
+    if effect_profile not in {"candidate", "delivery"}:
+        raise CodingAgentRouterError(
+            "effect_profile must be candidate or delivery"
+        )
     if direct_review_task:
         if verification_policy not in (None, "independent_review"):
             raise CodingAgentRouterError(
@@ -1916,6 +1921,10 @@ def canonical_execution_route(
         verification_policy_value = "independent_review"
     else:
         verification_policy_value = verification_policy or "deterministic"
+    if effect_profile == "delivery" and verification_policy_value != "independent_review":
+        raise CodingAgentRouterError(
+            "effect_profile=delivery requires verification_policy=independent_review"
+        )
     external_review_requested = verification_policy_value == "independent_review"
     review_task_class = task_value if direct_review_task else "independent-review"
     common = {
@@ -2059,6 +2068,10 @@ def canonical_execution_route(
         executor_reason = "task class is controller-owned"
     else:
         executor_reason = f"no eligible scoped writer selected ({scoped_writer_status}); controller fallback"
+    if effect_profile == "delivery" and executor != "scoped_writer":
+        raise CodingAgentRouterError(
+            "effect_profile=delivery requires an eligible scoped_writer route"
+        )
     risk = {
         "flags": flags,
         "novelty": novelty_value,
@@ -2072,7 +2085,7 @@ def canonical_execution_route(
         "integration_owner": "controller",
         "executor": executor,
         "writer_route": writer_route,
-        "effect_profile": "candidate",
+        "effect_profile": effect_profile,
         "verification_policy": verification_policy_value,
         "risk": risk,
         "executor_reason": executor_reason,
@@ -2151,6 +2164,7 @@ def grabowski_coding_agent_route(
     latency_priority: bool = False,
     need_review: bool = False,
     verification_policy: str | None = None,
+    effect_profile: str = "candidate",
 ) -> dict[str, Any]:
     """Route execution canonically as controller or lane-scoped writer plus verification policy."""
     return canonical_execution_route(
@@ -2162,4 +2176,5 @@ def grabowski_coding_agent_route(
         latency_priority=latency_priority,
         need_review=need_review,
         verification_policy=verification_policy,
+        effect_profile=effect_profile,
     )

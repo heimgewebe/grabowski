@@ -3821,6 +3821,389 @@ class GripFoundationTests(unittest.TestCase):
         self.assertTrue(call.kwargs["allow_mutation"])
         self.assertEqual("1" * 64, result["output"]["candidate"]["candidate_id"])
 
+    def _delivery_publication_case(self, root: Path) -> tuple[dict[str, object], object]:
+        workspace_id = "gaw-p6-publication"
+        branch = "feat/p6-publication"
+        head = "a" * 40
+        tree = "b" * 40
+        manifest = {
+            "branch": {"writer_branch": branch, "base_branch": "main"},
+            "commit_range": {
+                "head_commit": head,
+                "candidate_git_tree_sha": tree,
+                "commit_git_tree_sha": tree,
+            },
+            "actions": {
+                "pr": {
+                    "base": "main",
+                    "head": branch,
+                    "head_sha": head,
+                    "title": "P6 delivery",
+                    "body": "exact body",
+                    "draft": False,
+                }
+            },
+        }
+        path = root / "delivery-manifest-round-0001.json"
+        path.write_text("{}", encoding="utf-8")
+        delivery_profile = types.SimpleNamespace(
+            read_candidate_delivery_manifest=Mock(return_value=manifest)
+        )
+        workspace = types.SimpleNamespace(
+            _workspace_dir=Mock(return_value=root),
+            _candidate_patch_tree_sha=Mock(return_value=tree),
+        )
+        modules = (
+            workspace,
+            object(),
+            object(),
+            object(),
+            object(),
+            delivery_profile,
+            object(),
+        )
+        context = {
+            "manifest": {},
+            "record": {},
+            "inputs": {},
+            "plan": {},
+            "collection": {},
+            "candidate": {"candidate_id": "1" * 64, "round": 1},
+            "receipts": [],
+            "summary": {},
+            "lane_id": "2" * 32,
+            "lane_receipt_sha256": "3" * 64,
+            "owner_id": "lane:owner",
+            "resource_keys": ["path:/work"],
+            "worktree": root,
+            "branch": branch,
+            "base_commit": "c" * 40,
+            "terminal_closeout": None,
+        }
+        local = {
+            "branch": branch,
+            "head_sha": head,
+            "parent_sha": "c" * 40,
+            "git_tree_sha": tree,
+            "clean": True,
+        }
+        pr = {
+            "number": 77,
+            "url": "https://example.invalid/77",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": branch,
+            "headRefOid": head,
+            "isDraft": False,
+            "title": "P6 delivery",
+            "body": "exact body",
+        }
+        return {
+            "workspace_id": workspace_id,
+            "branch": branch,
+            "head": head,
+            "tree": tree,
+            "manifest": manifest,
+            "modules": modules,
+            "context": context,
+            "local": local,
+            "pr": pr,
+        }, delivery_profile
+
+    def _run_delivery_publication_case(
+        self,
+        case: dict[str, object],
+        *,
+        remote_readbacks: list[dict[str, object]],
+        pr_readbacks: list[dict[str, object]],
+        nested: Mock | None = None,
+    ) -> tuple[dict[str, object], Mock]:
+        nested_runner = nested or Mock()
+        with (
+            patch.object(grips, "_candidate_delivery_modules", return_value=case["modules"]),
+            patch.object(grips, "_delivery_identity_context", return_value=case["context"]),
+            patch.object(grips, "_candidate_lane_lease_snapshots", return_value=[]),
+            patch.object(grips, "_delivery_local_commit_readback", return_value=case["local"]),
+            patch.object(grips, "_delivery_remote_readback", side_effect=remote_readbacks),
+            patch.object(grips, "_delivery_pr_readback", side_effect=pr_readbacks),
+            patch.object(grips, "run_grip", side_effect=nested_runner),
+        ):
+            result = grips._run_candidate_delivery_profile(
+                workspace_id=str(case["workspace_id"]),
+                expected_candidate_id="1" * 64,
+                expected_result_sha256="4" * 64,
+                base="main",
+                title="P6 delivery",
+                body="exact body",
+                runner=FakeGit(branch=str(case["branch"]), head=str(case["head"])),
+                github_runner=FakeGh(),
+            )
+        return result, nested_runner
+
+    def test_delivery_ambiguous_push_requires_authoritative_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case, _ = self._delivery_publication_case(Path(tmp))
+            nested = Mock(return_value={"receipt": {"status": "failed"}})
+            result, nested = self._run_delivery_publication_case(
+                case,
+                remote_readbacks=[
+                    {"state": "absent", "head": None},
+                    {"state": "unavailable", "head": None},
+                ],
+                pr_readbacks=[],
+                nested=nested,
+            )
+        self.assertEqual("outcome_unknown", result["state"])
+        self.assertTrue(result["reconcile_required"])
+        self.assertEqual("authoritative_remote_branch_readback_before_retry", result["next_action"])
+        self.assertEqual("branch-publish", nested.call_args.args[0])
+
+    def test_delivery_exact_push_and_pr_readback_are_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case, _ = self._delivery_publication_case(Path(tmp))
+            result, nested = self._run_delivery_publication_case(
+                case,
+                remote_readbacks=[{"state": "exact", "head": case["head"]}],
+                pr_readbacks=[{"state": "exact", "pr": case["pr"]}],
+            )
+        self.assertEqual("delivery_pr_ready", result["state"])
+        self.assertTrue(result["delivery_ready"])
+        self.assertEqual("reused", result["pr_action"])
+        nested.assert_not_called()
+
+    def test_delivery_ambiguous_pr_requires_exact_metadata_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case, _ = self._delivery_publication_case(Path(tmp))
+            nested = Mock(return_value={"receipt": {"status": "failed"}})
+            result, nested = self._run_delivery_publication_case(
+                case,
+                remote_readbacks=[{"state": "exact", "head": case["head"]}],
+                pr_readbacks=[
+                    {"state": "absent", "pr": None},
+                    {"state": "unavailable", "pr": None},
+                ],
+                nested=nested,
+            )
+        self.assertEqual("outcome_unknown", result["state"])
+        self.assertTrue(result["reconcile_required"])
+        self.assertEqual("authoritative_open_pr_readback_before_retry", result["next_action"])
+        self.assertEqual("pr-create-or-update", nested.call_args.args[0])
+
+    def test_delivery_duplicate_pr_readback_fails_closed_without_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case, _ = self._delivery_publication_case(Path(tmp))
+            result, nested = self._run_delivery_publication_case(
+                case,
+                remote_readbacks=[{"state": "exact", "head": case["head"]}],
+                pr_readbacks=[{"state": "duplicate", "pr": None, "count": 2}],
+            )
+        self.assertEqual("delivery_pr_identity_drift", result["state"])
+        self.assertTrue(result["reconcile_required"])
+        nested.assert_not_called()
+
+    def test_delivery_pr_metadata_update_is_reused_after_exact_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case, _ = self._delivery_publication_case(Path(tmp))
+            nested = Mock(
+                return_value={
+                    "receipt": {"status": "passed"},
+                    "output": {"action": "updated", "pr": case["pr"]},
+                }
+            )
+            result, nested = self._run_delivery_publication_case(
+                case,
+                remote_readbacks=[{"state": "exact", "head": case["head"]}],
+                pr_readbacks=[
+                    {"state": "update_required", "pr": case["pr"]},
+                    {"state": "exact", "pr": case["pr"]},
+                ],
+                nested=nested,
+            )
+        self.assertEqual("delivery_pr_ready", result["state"])
+        self.assertEqual("updated", result["pr_action"])
+        self.assertEqual("pr-create-or-update", nested.call_args.args[0])
+        self.assertEqual("exact body", nested.call_args.args[1]["body"])
+
+    def test_terminal_delivery_replay_never_republishes_missing_branch_or_pr(self) -> None:
+        scenarios = (
+            (
+                "missing_branch",
+                [{"state": "absent", "head": None}],
+                [],
+            ),
+            (
+                "missing_pr",
+                [{"state": "exact", "head": "a" * 40}],
+                [{"state": "absent", "pr": None}],
+            ),
+        )
+        for name, remote_readbacks, pr_readbacks in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                case, _ = self._delivery_publication_case(Path(tmp))
+                case["context"]["terminal_closeout"] = {
+                    "closeout_state": "pr_opened"
+                }
+                result, nested = self._run_delivery_publication_case(
+                    case,
+                    remote_readbacks=remote_readbacks,
+                    pr_readbacks=pr_readbacks,
+                )
+            self.assertEqual(
+                "terminal_delivery_replay_requires_new_lane", result["state"]
+            )
+            self.assertTrue(result["reconcile_required"])
+            self.assertEqual("new_lane_required", result["later_correction"])
+            nested.assert_not_called()
+
+    def test_terminal_delivery_replay_rejects_replacement_pr_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            case, _ = self._delivery_publication_case(Path(tmp))
+            case["context"]["terminal_closeout"] = {
+                "closeout_state": "pr_opened",
+                "assessment": {"pr_number": 76},
+            }
+            result, nested = self._run_delivery_publication_case(
+                case,
+                remote_readbacks=[{"state": "exact", "head": case["head"]}],
+                pr_readbacks=[{"state": "exact", "pr": case["pr"]}],
+            )
+        self.assertEqual(
+            "terminal_delivery_replay_requires_new_lane", result["state"]
+        )
+        self.assertTrue(result["reconcile_required"])
+        self.assertEqual(76, result["terminal_pr_number"])
+        self.assertEqual("new_lane_required", result["later_correction"])
+        self.assertEqual(
+            "open_new_lane; do_not_rebind_terminal_source_lane_to_another_pr",
+            result["next_action"],
+        )
+        nested.assert_not_called()
+
+    def test_delivery_commit_cas_is_reused_only_after_exact_local_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            case, delivery_profile = self._delivery_publication_case(root)
+            (root / "delivery-manifest-round-0001.json").unlink()
+            case["modules"][0]._adoption_candidate_snapshot = Mock()
+            case["modules"][0]._stage_candidate_for_adoption = Mock(
+                return_value=case["tree"]
+            )
+            delivery_profile.build_candidate_delivery_manifest = Mock(
+                return_value=case["manifest"]
+            )
+            delivery_profile.persist_candidate_delivery_manifest = Mock(return_value=True)
+            git_calls: list[list[str]] = []
+
+            def git_readback(_repo: Path, _runner: object, args: list[str]) -> dict[str, object]:
+                git_calls.append(list(args))
+                if args == ["rev-parse", "HEAD"]:
+                    observed = case["context"]["base_commit"] if len(git_calls) == 1 else case["head"]
+                    return {"returncode": 0, "stdout": f"{observed}\n", "stderr": ""}
+                if "commit-tree" in args:
+                    return {"returncode": 0, "stdout": f"{case['head']}\n", "stderr": ""}
+                raise AssertionError(f"unexpected git read: {args}")
+
+            update_ref = Mock(return_value={"returncode": 0, "stdout": "", "stderr": ""})
+            nested = Mock()
+            with (
+                patch.object(grips, "_candidate_delivery_modules", return_value=case["modules"]),
+                patch.object(grips, "_delivery_identity_context", return_value=case["context"]),
+                patch.object(grips, "_candidate_lane_lease_snapshots", return_value=[]),
+                patch.object(grips, "_git", side_effect=git_readback),
+                patch.object(grips, "_git_optional", update_ref),
+                patch.object(grips, "_delivery_local_commit_readback", return_value=case["local"]),
+                patch.object(
+                    grips,
+                    "_delivery_remote_readback",
+                    return_value={"state": "exact", "head": case["head"]},
+                ),
+                patch.object(
+                    grips,
+                    "_delivery_pr_readback",
+                    return_value={"state": "exact", "pr": case["pr"]},
+                ),
+                patch.object(grips, "run_grip", side_effect=nested),
+            ):
+                result = grips._run_candidate_delivery_profile(
+                    workspace_id=str(case["workspace_id"]),
+                    expected_candidate_id="1" * 64,
+                    expected_result_sha256="4" * 64,
+                    base="main",
+                    title="P6 delivery",
+                    body="exact body",
+                    runner=FakeGit(branch=str(case["branch"]), head=str(case["head"])),
+                    github_runner=FakeGh(),
+                )
+
+        self.assertEqual("delivery_pr_ready", result["state"])
+        update_ref.assert_called_once_with(
+            root,
+            unittest.mock.ANY,
+            [
+                "update-ref",
+                f"refs/heads/{case['branch']}",
+                case["head"],
+                case["context"]["base_commit"],
+            ],
+        )
+        self.assertEqual(2, sum(args == ["rev-parse", "HEAD"] for args in git_calls))
+        nested.assert_not_called()
+
+    def test_delivery_happy_path_keeps_terminalization_controller_only(self) -> None:
+        case = self._happy_path_case()
+        delivery_output = {
+            "state": "delivery_pr_ready",
+            "delivery_ready": True,
+            "workspace_id": case["workspace_id"],
+            "resulting_commit_sha": "a" * 40,
+            "candidate_git_tree_sha": "b" * 40,
+            "delivery_manifest": {"manifest_id": "c" * 64},
+            "pr": {"number": 77},
+            "reconcile_required": False,
+        }
+        deliver = Mock(return_value=delivery_output)
+        terminalize = Mock(
+            return_value={
+                "state": "source_lane_terminalized",
+                "terminalized": True,
+                "controller_only": True,
+                "later_correction": "new_lane_required",
+            }
+        )
+        original_run_grip = grips.run_grip
+        with (
+            patch.object(
+                grips,
+                "_agent_execution_happy_path_modules",
+                return_value=(case["coordinator"], case["workspace"]),
+            ),
+            patch.object(grips, "_agent_execution_bound_effect_profile", return_value="delivery"),
+            patch.object(grips, "_run_candidate_delivery_profile", deliver),
+            patch.object(grips, "_controller_terminalize_delivered_source", terminalize),
+            patch.object(grips, "run_grip", side_effect=case["nested"]),
+        ):
+            result = original_run_grip(
+                "agent-execution-happy-path",
+                dict(case["params"]),
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        self.assertEqual("integration_ready", result["output"]["state"])
+        self.assertEqual(
+            "open_a_new_lane; never revive_this_terminalized_source_lane",
+            result["output"]["later_correction"],
+        )
+        self.assertIn("merge remains controller-only", result["output"]["nonclaims"])
+        self.assertIn("deployment remains controller-only", result["output"]["nonclaims"])
+        deliver.assert_called_once()
+        terminalize.assert_called_once_with(
+            delivery=delivery_output,
+            runner=unittest.mock.ANY,
+            github_runner=unittest.mock.ANY,
+        )
+        case["nested"].assert_not_called()
+
     def test_agent_execution_happy_path_pending_never_runs_candidate_integration(self) -> None:
         case = self._happy_path_case(coordinator_state="pending")
         result = self._run_happy_path_case(case)
@@ -5143,7 +5526,10 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("updated", result["output"]["action"])
-        self.assertIn(("pr", "edit", "77", "--title", "Updated"), fake_gh.calls)
+        self.assertIn(
+            ("pr", "edit", "77", "--title", "Updated", "--body", ""),
+            fake_gh.calls,
+        )
         self.assertIsNone(result["output"]["draft_requested"])
         self.assertFalse(any(call[:2] == ("pr", "ready") for call in fake_gh.calls))
 
