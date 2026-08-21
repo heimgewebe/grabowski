@@ -748,7 +748,6 @@
       ],
       "upper_review_or_contrast_routes": [
         "codex-sol-medium",
-        "claude-opus-5-writer-high",
         "claude-opus-5-high",
         "codex-terra-high",
         "claude-sonnet-5-high",

@@ -144,7 +144,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         frontier = self.catalog["policy"]["frontier_model_policy"]
         self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
         self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
-        self.assertIn("claude-opus-5-writer-high", frontier["upper_review_or_contrast_routes"])
+        self.assertNotIn("claude-opus-5-writer-high", frontier["upper_review_or_contrast_routes"])
         grok_writer = self.routes["grok-4.5-high"]
         grok_reviewer = self.routes["grok-4.5-review-high"]
         self.assertTrue(grok_writer["enabled"])
