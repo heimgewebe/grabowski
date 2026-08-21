@@ -1554,7 +1554,11 @@ def _missing_finalization_deploy_is_runtime_proven(
     if status.get("final_status") in TERMINAL_JOB_STATUSES | REUSABLE_JOB_STATUSES:
         return False
     finalization = status.get("finalization_receipt")
-    if isinstance(finalization, dict) and finalization.get("valid") is True:
+    if not isinstance(finalization, dict):
+        return False
+    if finalization.get("state") not in {"missing_receipt", "not_configured"}:
+        return False
+    if finalization.get("valid") is True:
         return False
     properties = status.get("properties")
     if not isinstance(properties, dict):

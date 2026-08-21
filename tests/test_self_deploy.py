@@ -1425,6 +1425,58 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
                     SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
 
+    def test_invalid_finalization_evidence_blocks_even_when_runtime_head_matches(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        deployment = {
+            "completion_status": "complete",
+            "repo_head": "a" * 40,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "release_path_valid": True,
+            "release_id_valid": True,
+            "repo_head_valid": True,
+            "stable_runtime_manifest_valid": True,
+            "runtime_pointer_valid": True,
+            "artifact_integrity_valid": True,
+            "runtime_asset_identity_valid": True,
+            "release_python_identity_valid": True,
+            "environment_compatibility_valid": True,
+        }
+        for finalization_state in ("invalid_contract", "invalid_receipt"):
+            with self.subTest(finalization_state=finalization_state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                job_dir = root / "grabowski-job-abcdef012345"
+                job_dir.mkdir()
+                metadata = {
+                    "argv": previous,
+                    "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                    "cwd": str(repo),
+                }
+                status = {
+                    "final_status": "missing_finalization_evidence",
+                    "finalization_receipt": {"valid": False, "state": finalization_state},
+                    "properties": {
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainStatus": "0",
+                    },
+                }
+                with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                    SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+                ), patch.object(
+                    SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+                ), patch.object(
+                    SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+                ), patch.object(
+                    SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                        SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
     def test_inflight_evidence_prunes_runtime_proven_missing_finalization(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
