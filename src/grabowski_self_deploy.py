@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import stat
 import subprocess
 import time
@@ -78,6 +79,18 @@ BLUE_GREEN_RECEIPT_ROOT = (
     Path.home() / ".local/state/grabowski/blue-green-deployment-receipts"
 )
 MAX_BLUE_GREEN_RECEIPT_BYTES = 256 * 1024
+SIDECAR_ROUTER_SOURCE_RELATIVE = Path("tools/agent-route")
+SIDECAR_SCHEDULER_SOURCE_RELATIVE = Path("tools/coding_agent_probe_scheduler.py")
+SIDECAR_ROUTER_TARGET = Path.home() / "bin/agent-route"
+SIDECAR_SCHEDULER_TARGET = (
+    Path.home() / ".local/libexec/grabowski/coding_agent_probe_scheduler.py"
+)
+SIDECAR_ROUTER_PIN = (
+    Path.home() / ".config/grabowski/coding-agent-probe-scheduler-router.sha256"
+)
+SIDECAR_RUNTIME_PYTHON = Path.home() / ".local/share/grabowski-mcp/.venv/bin/python"
+MAX_SIDECAR_SOURCE_BYTES = 1024 * 1024
+MAX_SIDECAR_READBACK_BYTES = 256 * 1024
 
 
 class BlueGreenCutoverError(RuntimeError):
@@ -1539,6 +1552,224 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
     }
 
 
+def _sidecar_git_blob(repository: Path, expected_head: str, relative: Path) -> bytes:
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+        or relative not in {SIDECAR_ROUTER_SOURCE_RELATIVE, SIDECAR_SCHEDULER_SOURCE_RELATIVE}
+    ):
+        raise RuntimeError("sidecar source binding is invalid")
+    completed = subprocess.run(
+        [
+            "/usr/bin/git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.file.allow=never",
+            "-C",
+            str(repository),
+            "show",
+            f"{expected_head}:{relative.as_posix()}",
+        ],
+        cwd="/",
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "/bin/false",
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("sidecar source blob is unavailable")
+    if (
+        len(completed.stdout) > MAX_SIDECAR_SOURCE_BYTES
+        or len(completed.stderr) > MAX_SIDECAR_READBACK_BYTES
+    ):
+        raise RuntimeError("sidecar source blob exceeds bounded output")
+    return completed.stdout
+
+
+def _sidecar_file_bytes(path: Path, *, mode: int) -> bytes:
+    parent = path.parent
+    parent_metadata = parent.lstat()
+    if (
+        parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+        or parent.resolve(strict=True) != Path(os.path.abspath(parent))
+    ):
+        raise RuntimeError("installed sidecar parent directory is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != mode
+            or before.st_size > MAX_SIDECAR_SOURCE_BYTES
+        ):
+            raise RuntimeError("installed sidecar file is unsafe")
+        data = bytearray()
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise RuntimeError("installed sidecar file ended early")
+            data.extend(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("installed sidecar file grew while reading")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
+        ) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise RuntimeError("installed sidecar file changed while reading")
+        return bytes(data)
+    finally:
+        os.close(descriptor)
+
+
+def _sidecar_json_readback(argv: list[str]) -> dict[str, Any]:
+    completed = subprocess.run(
+        argv,
+        cwd="/",
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        env={
+            "HOME": str(Path.home()),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONNOUSERSITE": "1",
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("sidecar readback command failed")
+    if (
+        len(completed.stdout) > MAX_SIDECAR_READBACK_BYTES
+        or len(completed.stderr) > MAX_SIDECAR_READBACK_BYTES
+    ):
+        raise RuntimeError("sidecar readback exceeds bounded output")
+    try:
+        value = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("sidecar readback is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("sidecar readback root is not an object")
+    return value
+
+
+def _sidecar_controller_contract_valid(value: dict[str, Any]) -> bool:
+    expected = {
+        "decision": "controller",
+        "controller": "grabowski-primary",
+        "primary_role": "controller-integrator",
+        "delegated_scoped_writers_allowed": True,
+        "controller_integration_required": True,
+        "single_mutating_writer": True,
+        "single_mutating_writer_scope": "overlapping-resource-lane",
+        "external_primary_writer_forbidden": False,
+        "automatic_execution_authorized": True,
+    }
+    return all(value.get(key) == expected_value for key, expected_value in expected.items())
+
+
+def _sidecars_match_deploy_head(command_fields: dict[str, Any]) -> bool:
+    try:
+        if command_fields.get("source_kind") != "canonical-main":
+            return False
+        repository = Path(str(command_fields.get("canonical_repository"))).resolve(strict=True)
+        if repository != CANONICAL_REPOSITORY.resolve(strict=True):
+            return False
+        expected_head = str(command_fields.get("expected_head"))
+        router_template_bytes = _sidecar_git_blob(
+            repository, expected_head, SIDECAR_ROUTER_SOURCE_RELATIVE
+        )
+        try:
+            router_template = router_template_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        marker = 'runtime_python="$HOME/.local/share/grabowski-mcp/.venv/bin/python"'
+        if router_template.count(marker) != 1:
+            return False
+        expected_router = router_template.replace(
+            marker, f"runtime_python={shlex.quote(str(SIDECAR_RUNTIME_PYTHON))}", 1
+        ).encode("utf-8")
+        expected_scheduler = _sidecar_git_blob(
+            repository, expected_head, SIDECAR_SCHEDULER_SOURCE_RELATIVE
+        )
+        if not expected_scheduler.startswith(b"#!/usr/bin/env python3\n"):
+            return False
+        installed_router = _sidecar_file_bytes(SIDECAR_ROUTER_TARGET, mode=0o755)
+        installed_scheduler = _sidecar_file_bytes(SIDECAR_SCHEDULER_TARGET, mode=0o755)
+        installed_pin = _sidecar_file_bytes(SIDECAR_ROUTER_PIN, mode=0o600)
+        router_sha256 = hashlib.sha256(expected_router).hexdigest()
+        if (
+            installed_router != expected_router
+            or installed_scheduler != expected_scheduler
+            or installed_pin != f"{router_sha256}\n".encode("ascii")
+        ):
+            return False
+        runtime = _sidecar_json_readback(
+            [
+                str(SIDECAR_RUNTIME_PYTHON),
+                "-m",
+                "grabowski_coding_agent_router_cli",
+                "validate",
+            ]
+        )
+        catalog_sha256 = runtime.get("catalog_sha256")
+        if (
+            runtime.get("valid") is not True
+            or runtime.get("catalog_source") != "deployment_catalog"
+            or not isinstance(catalog_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", catalog_sha256) is None
+        ):
+            return False
+        recommendation = _sidecar_json_readback(
+            [
+                str(SIDECAR_RUNTIME_PYTHON),
+                "-m",
+                "grabowski_coding_agent_router_cli",
+                "recommend",
+                "--task-class",
+                "complex-patch",
+                "--changed-files",
+                "50",
+                "--duration-minutes",
+                "600",
+                "--novelty",
+                "high",
+                "--need-review",
+            ]
+        )
+        return bool(
+            recommendation.get("catalog_sha256") == catalog_sha256
+            and _sidecar_controller_contract_valid(recommendation)
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
+        return False
+
+
 def _missing_finalization_deploy_is_runtime_proven(
     status: dict[str, Any], command_fields: dict[str, Any]
 ) -> bool:
@@ -1589,6 +1820,7 @@ def _missing_finalization_deploy_is_runtime_proven(
         and deployment.get("completion_status") == "complete"
         and deployment.get("repo_head") == command_fields.get("expected_head")
         and all(deployment.get(key) is True for key in required_release_integrity)
+        and _sidecars_match_deploy_head(command_fields)
     )
 
 
