@@ -1470,13 +1470,13 @@ class SelfDeployToolTests(unittest.TestCase):
             )
 
     def test_sidecar_readback_allows_detached_worktree_source_kind(self) -> None:
-        repo = Path("/home/alex/repos/grabowski")
+        repo = ROOT
         fields = {
             "source_kind": "detached-worktree",
             "canonical_repository": str(repo),
             "expected_head": "a" * 40,
         }
-        with patch.object(
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
             SELF_DEPLOY, "_sidecar_git_blob", return_value=b"invalid-router"
         ) as git_blob:
             self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
@@ -1485,12 +1485,14 @@ class SelfDeployToolTests(unittest.TestCase):
         )
 
         fields["source_kind"] = "unsupported"
-        with patch.object(SELF_DEPLOY, "_sidecar_git_blob") as unsupported_blob:
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+            SELF_DEPLOY, "_sidecar_git_blob"
+        ) as unsupported_blob:
             self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
         unsupported_blob.assert_not_called()
 
     def test_sidecar_readback_is_exact_head_and_runtime_catalog_bound(self) -> None:
-        repo = Path("/home/alex/repos/grabowski")
+        repo = ROOT
         marker = 'runtime_python="$HOME/.local/share/grabowski-mcp/.venv/bin/python"'
         router_template = f"#!/bin/sh\n{marker}\n".encode("utf-8")
         expected_router = (
@@ -1520,7 +1522,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "canonical_repository": str(repo),
             "expected_head": "a" * 40,
         }
-        with patch.object(
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
             SELF_DEPLOY, "_sidecar_git_blob", side_effect=[router_template, scheduler]
         ), patch.object(
             SELF_DEPLOY,
@@ -1535,7 +1537,7 @@ class SelfDeployToolTests(unittest.TestCase):
         ):
             self.assertTrue(SELF_DEPLOY._sidecars_match_deploy_head(fields))
 
-        with patch.object(
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
             SELF_DEPLOY, "_sidecar_git_blob", side_effect=[router_template, scheduler]
         ), patch.object(
             SELF_DEPLOY,
