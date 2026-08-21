@@ -1747,6 +1747,78 @@ class BureauPickupTests(unittest.TestCase):
         renew.assert_not_called()
         resume.assert_not_called()
 
+    def test_orphan_recovery_rechecks_task_after_lease_preflight_before_effect(self) -> None:
+        repository = self.root / "repository-task-guard"
+        key = f"repo:{repository}"
+        fixture = self.orphan_recovery_fixture(keys=[key])
+        original = fixture["acquisition"]["leases"][0]
+        expired = {
+            **pickup._lease_snapshot(original),
+            "purpose": original["purpose"],
+            "expires_at_unix": int(time.time()) - 1,
+        }
+        database = Path(fixture["current_request"]["coordination_root"]) / "bureau.sqlite3"
+
+        def terminalize_during_preflight(_key):
+            terminal = dict(fixture["task"])
+            terminal["state"] = "cancelled"
+            spec_sha256 = pickup._sha256(terminal)
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "INSERT INTO task_spec_revisions VALUES(?,?,?,?,?,?,?)",
+                    (
+                        terminal["id"],
+                        2,
+                        1,
+                        spec_sha256,
+                        json.dumps(terminal, sort_keys=True, separators=(",", ":")),
+                        "test-pre-effect-terminal",
+                        "2026-08-21T00:02:00Z",
+                    ),
+                )
+                connection.execute(
+                    "UPDATE task_specs SET current_revision=?,spec_sha256=?,updated_at=? "
+                    "WHERE task_id=?",
+                    (2, spec_sha256, "2026-08-21T00:02:00Z", terminal["id"]),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            return None
+
+        with (
+            mock.patch.object(pickup.bureau, "_git_identity_lines", return_value=[]),
+            mock.patch.object(
+                pickup, "_coordination_status", return_value=fixture["orphaned"]
+            ) as status,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=terminalize_during_preflight
+            ) as inspect_resource,
+            mock.patch.object(
+                pickup, "_persisted_resource_lease", return_value=expired
+            ) as persisted,
+            mock.patch.object(
+                pickup.resources, "rebind_same_owner_resources"
+            ) as rebind,
+            mock.patch.object(pickup.resources, "renew_resources") as renew,
+            mock.patch.object(pickup, "_resume_orphaned_run") as resume,
+            self.assertRaises(pickup.BureauPickupError) as raised,
+        ):
+            pickup._recover_orphaned_journal_before_claim(
+                fixture["current_request"],
+                fixture["current_binding"],
+                pickup._sha256(fixture["current_request"]),
+            )
+        self.assertEqual("orphan-recovery-task-terminal", raised.exception.code)
+        self.assertEqual("cancelled", raised.exception.details["task_state"])
+        status.assert_called_once()
+        inspect_resource.assert_called_once_with(key)
+        persisted.assert_called_once_with(key)
+        rebind.assert_not_called()
+        renew.assert_not_called()
+        resume.assert_not_called()
+
     def test_orphan_recovery_rejects_wrong_reason_or_external_binding(self) -> None:
         fixture = self.orphan_recovery_fixture()
         cases = [

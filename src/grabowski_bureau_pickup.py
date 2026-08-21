@@ -3525,6 +3525,12 @@ def _recover_orphaned_journal_before_claim(
 
     def _guard_run_before_lease_effect() -> None:
         nonlocal pre_resume, run
+        _assert_registry_binding(current_binding)
+        _current_registry_revision_proof(
+            current_binding,
+            intent,
+            coordination_root=request["coordination_root"],
+        )
         pre_resume = _bound_bureau_call(
             current_binding,
             lambda: _coordination_status(
