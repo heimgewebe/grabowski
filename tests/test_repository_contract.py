@@ -182,7 +182,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 196)
+        self.assertEqual(len(tools), 198)
         self.assertNotIn("grabowski_agent_workspace_adopt", tools)
         self.assertIn("grabowski_browser_worker_semantic", tools)
         self.assertTrue(

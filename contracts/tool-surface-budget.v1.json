@@ -528,6 +528,56 @@
         "authority_class": "read"
       }
     },
+    "grabowski_checkout_binding_identity_rebind_preview": {
+      "evidence_refs": [
+        "github:heimgewebe/grabowski#852",
+        "tests:tests/test_checkouts.py",
+        "tests:tests/test_grips.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only read-only proof for one existing active managed checkout whose current named branch differs from the stored lifecycle identity.",
+        "evidence": "The checkout key resolves the target server-side; clean state, unchanged owner, branch-only drift, recorded-head ancestry, exact remote security, live retention and zero coordination blockers are snapshot-bound before any mutation authority exists."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Reusing missing-checkout terminal preview was rejected because terminal reconciliation proves absence and source terminality, while identity rebind proves a live existing checkout and a branch-name identity correction.",
+      "rationale": "Branch identity reconciliation has different evidence, postconditions and mutation authority from checkout terminalization, so it requires an independently inspectable preview surface.",
+      "tool_contract": {
+        "tool": "grabowski_checkout_binding_identity_rebind_preview",
+        "category": "checkout-lifecycle",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "authority_class": "read"
+      }
+    },
+    "grabowski_checkout_binding_identity_rebind_apply": {
+      "evidence_refs": [
+        "github:heimgewebe/grabowski#852",
+        "tests:tests/test_checkouts.py",
+        "tests:tests/test_grips.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the CAS update of expected_head and expected_branch in matching active lifecycle and retention rows for one preview-proven existing checkout.",
+        "evidence": "Exact preview digest and confirmation, unchanged owner, clean checkout, branch-only drift, ancestry and remote proof, zero coordination blockers, current retention checks before lease/after lease/before commit, SQLite preimage CAS, bounded audit and post-readback prevent broader authority."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Reusing terminal apply was rejected because terminal apply changes lifecycle phase for an absent checkout and explicitly preserves branch identity; archive, cleanup and generic state mutation were rejected as broader or differently scoped authority.",
+      "rationale": "Correcting stored identity for a still-existing checkout is a separate mutation class. It changes no Git ref, checkout branch, owner, archive, filesystem content or lifecycle phase and must not inherit terminalization authority implicitly.",
+      "tool_contract": {
+        "tool": "grabowski_checkout_binding_identity_rebind_apply",
+        "category": "checkout-lifecycle",
+        "effects": [
+          "audit-append",
+          "resource-lease",
+          "state-change"
+        ],
+        "read_only": false,
+        "reversibility": "compare-and-swap-state-transition-with-retained-audit-evidence",
+        "risk_class": "medium",
+        "authority_class": "mutation"
+      }
+    },
     "grabowski_chronik_history": {
       "evidence_refs": [
         "bureau:CCM-V1-T002",

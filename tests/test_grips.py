@@ -918,6 +918,8 @@ class GripFoundationTests(unittest.TestCase):
                 "n8n-workflow-edge-verify",
                 "checkout-binding-terminal-apply",
                 "checkout-binding-terminal-preview",
+                "checkout-binding-identity-rebind-apply",
+                "checkout-binding-identity-rebind-preview",
                 "checkout-owner-handoff-apply",
                 "checkout-owner-handoff-preview",
                 "transport-roundtrip",
@@ -979,6 +981,7 @@ class GripFoundationTests(unittest.TestCase):
             "worktree-ensure",
             "worktree-hygiene-reconcile",
             "checkout-binding-terminal-apply",
+            "checkout-binding-identity-rebind-apply",
             "checkout-owner-handoff-apply",
         ):
             self.assertEqual("worktree_admin", specs[name]["operation_effect_class"])
@@ -1425,6 +1428,155 @@ class GripFoundationTests(unittest.TestCase):
         check = next(item for item in result["receipt"]["checks"] if item["id"] == "lifecycle-only-effect")
         self.assertEqual("pass", check["status"])
         self.assertIn("terminal_head_rebind", check["detail"])
+
+    def test_checkout_binding_identity_rebind_preview_grip_validates_dedicated_schema(self) -> None:
+        checkout_key = "a" * 64
+        snapshot = "b" * 64
+        preview = {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_preview",
+            "observed_at_unix": 100,
+            "checkout": {
+                "checkout_key": checkout_key,
+                "head": "1" * 40,
+                "branch": "topic-v2",
+                "dirty": False,
+            },
+            "owner_id": "owner-a",
+            "allowed_drift_reasons": [
+                "binding-expected-branch-mismatch",
+                "retention-expected-branch-mismatch",
+            ],
+            "head_lineage": {
+                "recorded_head": "0" * 40,
+                "current_head": "1" * 40,
+                "recorded_head_is_ancestor": True,
+            },
+            "remote": {"remote_secured": True},
+            "coordination": {"blocking": False},
+            "target_identity": {
+                "expected_head": "1" * 40,
+                "expected_branch": "topic-v2",
+            },
+            "snapshot_sha256": snapshot,
+            "confirmation": f"rebind-checkout-identity:{checkout_key}:{snapshot}",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_identity_rebind_preview",
+            return_value=preview,
+        ) as rebind_preview, patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_preview"
+        ) as terminal_preview:
+            result = grips.grip_run(
+                "checkout-binding-identity-rebind-preview",
+                {"checkout_key": checkout_key},
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("passed", result["output"]["receipt_status"])
+        rebind_preview.assert_called_once_with(checkout_key)
+        terminal_preview.assert_not_called()
+        checks = {item["id"]: item for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["branch-rename-only"]["status"])
+        self.assertEqual("pass", checks["remote-and-lineage-proven"]["status"])
+
+    def test_checkout_binding_identity_rebind_apply_grip_uses_dedicated_authority(self) -> None:
+        checkout_key = "a" * 64
+        snapshot = "b" * 64
+        target = {"expected_head": "1" * 40, "expected_branch": "topic-v2"}
+        preview = {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_preview",
+            "observed_at_unix": 100,
+            "checkout": {
+                "checkout_key": checkout_key,
+                "head": target["expected_head"],
+                "branch": target["expected_branch"],
+                "dirty": False,
+            },
+            "owner_id": "owner-a",
+            "allowed_drift_reasons": [
+                "binding-expected-branch-mismatch",
+                "retention-expected-branch-mismatch",
+            ],
+            "head_lineage": {
+                "recorded_head": "0" * 40,
+                "current_head": target["expected_head"],
+                "recorded_head_is_ancestor": True,
+            },
+            "remote": {"remote_secured": True},
+            "coordination": {"blocking": False},
+            "target_identity": target,
+            "snapshot_sha256": snapshot,
+            "confirmation": f"rebind-checkout-identity:{checkout_key}:{snapshot}",
+        }
+        output = {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_result",
+            "status": "applied",
+            "snapshot_sha256": snapshot,
+            "before": {
+                "lifecycle": {
+                    "owner_id": "owner-a",
+                    "phase": "active",
+                    "expected_head": "0" * 40,
+                    "expected_branch": "topic",
+                },
+                "retention": {
+                    "owner_id": "owner-a",
+                    "expected_head": "0" * 40,
+                    "expected_branch": "topic",
+                },
+            },
+            "after": {
+                "lifecycle": {"owner_id": "owner-a", "phase": "active", **target},
+                "retention": {
+                    "owner_id": "owner-a",
+                    "retention_until_unix": 1000,
+                    **target,
+                },
+            },
+            "audit": {
+                "effects": [
+                    "lifecycle_expected_identity_update",
+                    "retention_expected_identity_update",
+                ]
+            },
+        }
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_snapshot_sha256": snapshot,
+            "preview_created_at_unix": 100,
+            "confirmation": preview["confirmation"],
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_identity_rebind_preview"
+        ) as rebind_preview, patch(
+            "grabowski_checkouts.grabowski_checkout_binding_identity_rebind_apply",
+            return_value=output,
+        ) as rebind_apply, patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply"
+        ) as terminal_apply:
+            blocked = grips.grip_run(
+                "checkout-binding-identity-rebind-apply", parameters
+            )
+            self.assertEqual("blocked", blocked["status"])
+            rebind_apply.assert_not_called()
+            result = grips.grip_run(
+                "checkout-binding-identity-rebind-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        rebind_preview.assert_not_called()
+        rebind_apply.assert_called_once_with(
+            checkout_key, "owner-a", snapshot, 100, preview["confirmation"]
+        )
+        terminal_apply.assert_not_called()
+        checks = {item["id"]: item for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["retention-live-revalidated"]["status"])
+        self.assertEqual("pass", checks["identity-only-effect"]["status"])
+        self.assertEqual("pass", checks["target-identity-converged"]["status"])
 
     def test_checkout_owner_handoff_preview_grip_delegates_without_new_mcp_surface(self) -> None:
         snapshot = "d" * 64
@@ -4190,7 +4342,7 @@ class GripFoundationTests(unittest.TestCase):
         contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
         contract = json.loads(contract_path.read_text())
         self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
-        self.assertEqual(196, len(contract["expected_tools"]))
+        self.assertEqual(198, len(contract["expected_tools"]))
         supporting = {
             (item["module"], item["source"])
             for item in contract["supporting_sources"]
