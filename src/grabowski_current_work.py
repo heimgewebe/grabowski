@@ -209,6 +209,10 @@ def _set_projection_state(group: dict[str, Any], state: str) -> None:
     }
     if priority[state] >= priority[group["projection_state"]]:
         group["projection_state"] = state
+        if state == "hygiene":
+            group["work_class"] = "hygiene"
+        elif state in {"resumable", "active", "blocking"}:
+            group["work_class"] = "operational"
 
 
 def _blocking(group: dict[str, Any], reason: str) -> None:
@@ -219,10 +223,8 @@ def _blocking(group: dict[str, Any], reason: str) -> None:
 
 
 def _hygiene(group: dict[str, Any], reason: str) -> None:
-    group["work_class"] = "hygiene"
     group["action_required"] = True
-    if group["projection_state"] not in {"active", "blocking", "resumable"}:
-        group["projection_state"] = "hygiene"
+    _set_projection_state(group, "hygiene")
     if reason and reason not in group["action_reasons"]:
         group["action_reasons"].append(reason)
 
@@ -1074,6 +1076,15 @@ def _add_checkouts(
             for reason in item["binding_drift_reasons"]:
                 if reason not in group["action_reasons"]:
                     group["action_reasons"].append(reason)
+        if (
+            item["lifecycle_state"] == "managed_active_attention"
+            and item["binding_phase"] == "active"
+            and item["binding_consistent"]
+        ):
+            group["action_required"] = True
+            if "managed-active-lifecycle-attention" not in group["action_reasons"]:
+                group["action_reasons"].append("managed-active-lifecycle-attention")
+
         if item["dirty"]:
             identifying_live_lease = any(
                 _resource_identifies_checkout(lease["resource_key"], item)
@@ -1131,21 +1142,9 @@ def _add_checkouts(
                 or item["resource_leases"]
                 or item["processes"]
             ):
-                group["work_class"] = "operational"
                 _set_projection_state(group, "active")
             else:
-                group["action_required"] = True
-                if "managed-active-lifecycle-attention" not in group["action_reasons"]:
-                    group["action_reasons"].append(
-                        "managed-active-lifecycle-attention"
-                    )
-                if group["projection_state"] not in {
-                    "active",
-                    "blocking",
-                    "resumable",
-                }:
-                    group["work_class"] = "hygiene"
-                    _set_projection_state(group, "hygiene")
+                _set_projection_state(group, "hygiene")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:

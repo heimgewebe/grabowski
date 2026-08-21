@@ -715,8 +715,14 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["projection_state"], "active")
-        self.assertNotIn(
+        self.assertEqual(group["work_class"], "operational")
+        self.assertTrue(group["action_required"])
+        self.assertIn(
             "managed-active-lifecycle-attention", group["action_reasons"]
+        )
+        self.assertEqual(
+            group["next_convergence_action"],
+            "monitor active work execution and reconcile managed active lifecycle attention",
         )
 
     def test_managed_active_mixed_stale_and_live_checkout_remains_operational(self) -> None:
@@ -754,6 +760,41 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 self.assertEqual(
                     group["next_convergence_action"],
                     "monitor active work execution and reconcile managed active lifecycle attention",
+                )
+
+    def test_dirty_and_retained_active_group_work_class_is_order_independent(self) -> None:
+        owner = "operator:managed-dirty-mixed"
+        dirty = checkout(
+            "managed-dirty",
+            "/home/alex/repos/.worktrees/managed-dirty",
+            dirty=True,
+            lifecycle_state="managed_active_attention",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=False,
+        )
+        live = checkout(
+            "managed-retained",
+            "/home/alex/repos/.worktrees/managed-retained",
+            lifecycle_state="retained",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=True,
+        )
+        for worktrees in ([dirty, live], [live, dirty]):
+            with self.subTest(order=[item["checkout_key"] for item in worktrees]):
+                result = project(
+                    checkout_payloads=[
+                        {"repository": REPOSITORY, "worktrees": worktrees}
+                    ]
+                )
+                group = result["work"][0]
+                self.assertEqual(group["projection_state"], "active")
+                self.assertEqual(group["work_class"], "operational")
+                self.assertTrue(group["action_required"])
+                self.assertIn("dirty-checkout-visible", group["action_reasons"])
+                self.assertIn(
+                    "managed-active-lifecycle-attention", group["action_reasons"]
                 )
 
     def test_terminal_managed_lifecycle_drift_is_hygiene_and_explained(self) -> None:
