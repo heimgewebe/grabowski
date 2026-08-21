@@ -715,6 +715,39 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
 
+    def test_managed_active_mixed_stale_and_live_checkout_remains_operational(self) -> None:
+        owner = "operator:managed-mixed"
+        stale = checkout(
+            "managed-stale",
+            "/home/alex/repos/.worktrees/managed-stale",
+            lifecycle_state="managed_active_attention",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=False,
+        )
+        live = checkout(
+            "managed-live",
+            "/home/alex/repos/.worktrees/managed-live",
+            lifecycle_state="retained",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=True,
+        )
+        for worktrees in ([stale, live], [live, stale]):
+            with self.subTest(order=[item["checkout_key"] for item in worktrees]):
+                result = project(
+                    checkout_payloads=[
+                        {"repository": REPOSITORY, "worktrees": worktrees}
+                    ]
+                )
+                group = result["work"][0]
+                self.assertEqual(group["projection_state"], "active")
+                self.assertEqual(group["work_class"], "operational")
+                self.assertTrue(group["action_required"])
+                self.assertIn(
+                    "managed-active-lifecycle-attention", group["action_reasons"]
+                )
+
     def test_terminal_managed_lifecycle_drift_is_hygiene_and_explained(self) -> None:
         owner = "operator:managed-drift"
         result = project(

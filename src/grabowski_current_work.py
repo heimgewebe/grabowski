@@ -1131,9 +1131,21 @@ def _add_checkouts(
                 or item["resource_leases"]
                 or item["processes"]
             ):
+                group["work_class"] = "operational"
                 _set_projection_state(group, "active")
             else:
-                _hygiene(group, "managed-active-lifecycle-attention")
+                group["action_required"] = True
+                if "managed-active-lifecycle-attention" not in group["action_reasons"]:
+                    group["action_reasons"].append(
+                        "managed-active-lifecycle-attention"
+                    )
+                if group["projection_state"] not in {
+                    "active",
+                    "blocking",
+                    "resumable",
+                }:
+                    group["work_class"] = "hygiene"
+                    _set_projection_state(group, "hygiene")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:
