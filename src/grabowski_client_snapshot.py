@@ -824,6 +824,8 @@ def _historical_snapshot_freshness(
 def _authorized_publication_schema_transition(
     *,
     cutover_id: str,
+    source_tool_count: int,
+    source_names_sha256: str,
     registered_tool_count: int,
     registered_names_sha256: str,
     green_complete_schema_count: Any,
@@ -832,10 +834,11 @@ def _authorized_publication_schema_transition(
     source_complete_schema_sha256: str,
     target_schema_identity_sha256: str,
     green_readiness: dict[str, Any],
+    schema_changed: bool,
     now_unix: int,
     expected_publication_request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Authorise a *changed* green tool schema against durable Publication-v2.
+    """Authorise a *changed* green tool surface against durable Publication-v2.
 
     Continuity of the connector surface is the ordinary case, and for it no
     authorisation is required at all.  A schema change is different: the client
@@ -850,6 +853,17 @@ def _authorized_publication_schema_transition(
     the caller: every value is recomputed and compared against the durable
     request, the durable current projection and the lifecycle projection.
     """
+    if (
+        isinstance(source_tool_count, bool)
+        or not isinstance(source_tool_count, int)
+        or source_tool_count < 1
+    ):
+        raise ClientSnapshotError("source publication tool count is invalid")
+    source_names_sha256 = _require_authentic_digest(
+        source_names_sha256, label="source publication names hash"
+    )
+    if type(schema_changed) is not bool:
+        raise ClientSnapshotError("schema_changed must be a boolean")
     target_contract = _platform_publication_contract(
         registered_tool_count=registered_tool_count,
         registered_names_sha256=registered_names_sha256,
@@ -938,8 +952,13 @@ def _authorized_publication_schema_transition(
     material = {
         "schema_version": 1,
         "kind": "grabowski_connector_schema_transition",
-        "schema_changed": True,
+        "schema_changed": schema_changed,
+        "surface_changed": True,
         "cutover_id": cutover_id,
+        "source_tool_count": source_tool_count,
+        "source_names_sha256": source_names_sha256,
+        "target_tool_count": registered_tool_count,
+        "target_names_sha256": registered_names_sha256,
         "source_schema_identity_sha256": source_schema_identity_sha256,
         "source_complete_schema_sha256": source_complete_schema_sha256,
         "target_schema_identity_sha256": target_schema_identity_sha256,
@@ -952,7 +971,7 @@ def _authorized_publication_schema_transition(
         "publication_current_state": durable_state,
         "authorized_at_unix": now_unix,
         "does_not_establish": [
-            "that any client has observed the changed green schema",
+            "that any client has observed the changed green surface",
             "platform connector catalog publication",
         ],
     }
@@ -1109,22 +1128,39 @@ def _rebind_snapshot_for_cutover(
             or schema_evidence["probe"].get("schema_contract_matches") is not True
         ):
             raise ClientSnapshotError(scope_error)
+        source_tool_count = declaration.get("observed_tool_count")
+        if (
+            isinstance(source_tool_count, bool)
+            or not isinstance(source_tool_count, int)
+            or not 1 <= source_tool_count <= 1_000
+        ):
+            raise ClientSnapshotError("source connector tool count is invalid")
+        source_names_sha256 = _require_authentic_digest(
+            declaration.get("observed_names_sha256"),
+            label="source observed names hash",
+        )
+        source_instructions_sha256 = _require_authentic_digest(
+            declaration.get("observed_agent_instructions_sha256"),
+            label="source observed instructions hash",
+        )
         if (
             source_binding.get("release_id") != current_release
             or source_binding.get("repo_head") != current_repo_head
             or declaration.get("observed_release_id") != current_release
-            or declaration.get("observed_tool_count") != registered_tool_count
-            or declaration.get("observed_names_sha256") != names_sha256
-            or declaration.get("observed_agent_instructions_sha256")
-            != instructions_sha256
-            or source_binding.get("registered_tool_count")
-            != registered_tool_count
-            or source_binding.get("registered_names_sha256") != names_sha256
+            or source_binding.get("registered_tool_count") != source_tool_count
+            or source_binding.get("registered_names_sha256") != source_names_sha256
             or source_binding.get("agent_instructions_sha256")
-            != instructions_sha256
+            != source_instructions_sha256
         ):
             raise ClientSnapshotError(
-                "authentic connector snapshot does not match blue or green surface continuity"
+                "authentic connector snapshot source binding is internally inconsistent"
+            )
+        # Publication-v2 binds the target tool contract (count, names and schemas),
+        # but it does not bind agent instructions.  Keep that dimension on strict
+        # historical continuity instead of silently widening publication authority.
+        if source_instructions_sha256 != instructions_sha256:
+            raise ClientSnapshotError(
+                "green agent instructions differ from the authentic blue declaration"
             )
         for label, value in (
             ("observed names hash", declaration.get("observed_names_sha256")),
@@ -1161,7 +1197,7 @@ def _rebind_snapshot_for_cutover(
         if (
             observed_artifact.get("complete_schema_observable") is not True
             or isinstance(source_complete_schema_count, bool)
-            or source_complete_schema_count != registered_tool_count
+            or source_complete_schema_count != source_tool_count
             or green_complete_schema_count != registered_tool_count
         ):
             raise ClientSnapshotError(
@@ -1189,10 +1225,17 @@ def _rebind_snapshot_for_cutover(
             or source_schema_identity_sha256 != green_schema_identity_sha256
             or source_complete_schema_sha256 != green_complete_schema_sha256
         )
+        surface_changed = (
+            schema_changed
+            or source_tool_count != registered_tool_count
+            or source_names_sha256 != names_sha256
+        )
         schema_transition: dict[str, Any] | None = None
-        if schema_changed:
+        if surface_changed:
             schema_transition = _authorized_publication_schema_transition(
                 cutover_id=cutover_binding["cutover_id"],
+                source_tool_count=source_tool_count,
+                source_names_sha256=source_names_sha256,
                 registered_tool_count=registered_tool_count,
                 registered_names_sha256=names_sha256,
                 green_complete_schema_count=green_complete_schema_count,
@@ -1201,6 +1244,7 @@ def _rebind_snapshot_for_cutover(
                 source_complete_schema_sha256=source_complete_schema_sha256,
                 target_schema_identity_sha256=green_schema_identity_sha256,
                 green_readiness=green_readiness,
+                schema_changed=schema_changed,
                 now_unix=timestamp,
                 expected_publication_request_id=publication_request_id,
             )
@@ -1229,11 +1273,12 @@ def _rebind_snapshot_for_cutover(
             "target_schema_identity_sha256": green_schema_identity_sha256,
             "target_complete_schema_sha256": green_complete_schema_sha256,
             "schema_changed": schema_changed,
+            "surface_changed": surface_changed,
             "surface_continuity_sha256": _sha256_json(
                 {
-                    "registered_tool_count": registered_tool_count,
-                    "registered_names_sha256": names_sha256,
-                    "agent_instructions_sha256": instructions_sha256,
+                    "registered_tool_count": source_tool_count,
+                    "registered_names_sha256": source_names_sha256,
+                    "agent_instructions_sha256": source_instructions_sha256,
                     "schema_identity_sha256": source_schema_identity_sha256,
                     "complete_schema_sha256": source_complete_schema_sha256,
                 }
@@ -1242,10 +1287,10 @@ def _rebind_snapshot_for_cutover(
             "publication_schema_transition": schema_transition,
         }
         nonclaims = list(additional_nonclaims)
-        if schema_changed:
+        if surface_changed:
             model = f"{verification_model}+publication-v2-schema-transition-v1"
             for limitation in (
-                "that any client has observed the changed green tool schema",
+                "that any client has observed the changed green tool surface",
                 "current green schema observability from the preserved historical evidence",
             ):
                 if limitation not in nonclaims:
@@ -1296,12 +1341,13 @@ def _rebind_snapshot_for_cutover(
         # A changed schema means the preserved observation describes the
         # predecessor surface. Reporting a contract match here would be the
         # false claim this transition exists to avoid.
-        "schema_contract_matches": not schema_changed,
+        "schema_contract_matches": not surface_changed,
         "schema_changed": schema_changed,
+        "surface_changed": surface_changed,
         "publication_schema_transition": schema_transition,
         "recommended_next_action": (
-            "capture a fresh client observation of the changed green schema"
-            if schema_changed
+            "capture a fresh client observation of the changed green surface"
+            if surface_changed
             else recommended_next_action
         ),
         "does_not_establish": list(receipt["does_not_establish"]),
@@ -3072,18 +3118,55 @@ def inspect_cutover_snapshot_binding(
             ("observed artifact hash", declaration.get("observed_tools_artifact_sha256")),
         ):
             _require_authentic_digest(value, label=label)
+        source_tool_count = declaration.get("observed_tool_count")
         if (
-            declaration.get("observed_release_id") != source_release
-            or declaration.get("observed_tool_count") != registered_tool_count
-            or declaration.get("observed_names_sha256") != names_sha256
-            or declaration.get("observed_agent_instructions_sha256")
-            != instructions_sha256
-            or binding.get("registered_tool_count") != registered_tool_count
-            or binding.get("registered_names_sha256") != names_sha256
-            or binding.get("agent_instructions_sha256") != instructions_sha256
+            isinstance(source_tool_count, bool)
+            or not isinstance(source_tool_count, int)
+            or not 1 <= source_tool_count <= 1_000
         ):
+            raise ClientSnapshotError("source connector tool count is invalid")
+        source_names_sha256 = _require_authentic_digest(
+            declaration.get("observed_names_sha256"),
+            label="source observed names hash",
+        )
+        source_instructions_sha256 = _require_authentic_digest(
+            declaration.get("observed_agent_instructions_sha256"),
+            label="source observed instructions hash",
+        )
+        if declaration.get("observed_release_id") != source_release:
             observation["state"] = SNAPSHOT_BINDING_FOREIGN
-            observation["error"] = "client snapshot surface names another lineage"
+            observation["error"] = "client snapshot source declaration names another release"
+            return observation
+        source_binding_selected = (
+            binding.get("release_id") == source_release
+            and binding.get("repo_head") == source_repo_head
+        )
+        target_binding_selected = (
+            binding.get("release_id") == target_release
+            and binding.get("repo_head") == target_repo_head
+        )
+        if source_binding_selected:
+            binding_surface_matches = (
+                binding.get("registered_tool_count") == source_tool_count
+                and binding.get("registered_names_sha256") == source_names_sha256
+                and binding.get("agent_instructions_sha256")
+                == source_instructions_sha256
+            )
+        elif target_binding_selected:
+            binding_surface_matches = (
+                binding.get("registered_tool_count") == registered_tool_count
+                and binding.get("registered_names_sha256") == names_sha256
+                and binding.get("agent_instructions_sha256") == instructions_sha256
+            )
+        else:
+            binding_surface_matches = False
+        if not binding_surface_matches:
+            observation["state"] = SNAPSHOT_BINDING_FOREIGN
+            observation["error"] = "client snapshot server binding names another surface"
+            return observation
+        if source_instructions_sha256 != instructions_sha256:
+            observation["state"] = SNAPSHOT_BINDING_FOREIGN
+            observation["error"] = "green agent instructions differ from the blue declaration"
             return observation
 
         observed_artifact = schema_evidence.get("observed_artifact")
@@ -3107,7 +3190,7 @@ def inspect_cutover_snapshot_binding(
         )
         if (
             observed_artifact.get("complete_schema_observable") is not True
-            or observed_artifact.get("complete_schema_count") != registered_tool_count
+            or observed_artifact.get("complete_schema_count") != source_tool_count
             or green_readiness.get("complete_schema_count") != registered_tool_count
             or green_readiness.get("schema_identity_sha256") != target_identity
         ):
@@ -3117,10 +3200,17 @@ def inspect_cutover_snapshot_binding(
             or source_identity != target_identity
             or source_complete != target_complete
         )
+        surface_changed = (
+            schema_changed
+            or source_tool_count != registered_tool_count
+            or source_names_sha256 != names_sha256
+        )
         current_authorization = None
-        if schema_changed:
+        if surface_changed:
             current_authorization = _authorized_publication_schema_transition(
                 cutover_id=cutover_id,
+                source_tool_count=source_tool_count,
+                source_names_sha256=source_names_sha256,
                 registered_tool_count=registered_tool_count,
                 registered_names_sha256=names_sha256,
                 green_complete_schema_count=registered_tool_count,
@@ -3129,6 +3219,7 @@ def inspect_cutover_snapshot_binding(
                 source_complete_schema_sha256=source_complete,
                 target_schema_identity_sha256=target_identity,
                 green_readiness=green_readiness,
+                schema_changed=schema_changed,
                 now_unix=int(time.time()) if now_unix is None else now_unix,
                 expected_publication_request_id=publication_request_id,
             )
@@ -3143,8 +3234,9 @@ def inspect_cutover_snapshot_binding(
                     "receipt_sha256"
                 ),
                 "schema_changed": schema_changed,
+                "surface_changed": surface_changed,
                 "current_publication_authorized": current_authorization is not None
-                if schema_changed
+                if surface_changed
                 else True,
             }
         )
@@ -3196,13 +3288,17 @@ def inspect_cutover_snapshot_binding(
             or transition.get("target_schema_identity_sha256") != target_identity
             or transition.get("target_complete_schema_sha256") != target_complete
             or transition.get("schema_changed") is not schema_changed
+            or (
+                transition.get("surface_changed", transition.get("schema_changed"))
+                is not surface_changed
+            )
             or transition.get("green_readiness_sha256") != _sha256_json(green_readiness)
             or transition.get("surface_continuity_sha256")
             != _sha256_json(
                 {
-                    "registered_tool_count": registered_tool_count,
-                    "registered_names_sha256": names_sha256,
-                    "agent_instructions_sha256": instructions_sha256,
+                    "registered_tool_count": source_tool_count,
+                    "registered_names_sha256": source_names_sha256,
+                    "agent_instructions_sha256": source_instructions_sha256,
                     "schema_identity_sha256": source_identity,
                     "complete_schema_sha256": source_complete,
                 }
@@ -3257,7 +3353,7 @@ def inspect_cutover_snapshot_binding(
             observation["error"] = "snapshot rebind recovery-time contract is invalid"
             return observation
         persisted_publication = transition.get("publication_schema_transition")
-        if schema_changed:
+        if surface_changed:
             stable_fields = (
                 "cutover_id",
                 "source_schema_identity_sha256",
@@ -3269,6 +3365,15 @@ def inspect_cutover_snapshot_binding(
                 "publication_request_sha256",
                 "publication_contract_sha256",
             )
+            if isinstance(persisted_publication, dict) and "surface_changed" in persisted_publication:
+                stable_fields += (
+                    "source_tool_count",
+                    "source_names_sha256",
+                    "target_tool_count",
+                    "target_names_sha256",
+                    "surface_changed",
+                    "schema_changed",
+                )
             if not isinstance(persisted_publication, dict) or any(
                 persisted_publication.get(key) != current_authorization.get(key)
                 for key in stable_fields
@@ -3276,11 +3381,25 @@ def inspect_cutover_snapshot_binding(
                 observation["state"] = SNAPSHOT_BINDING_FOREIGN
                 observation["error"] = "snapshot publication transition is not currently authorized"
                 return observation
+            expected_transition_nonclaims = [
+                (
+                    "that any client has observed the changed green surface"
+                    if "surface_changed" in persisted_publication
+                    else "that any client has observed the changed green schema"
+                ),
+                "platform connector catalog publication",
+            ]
             if (
                 persisted_publication.get("schema_version") != 1
                 or persisted_publication.get("kind")
                 != "grabowski_connector_schema_transition"
-                or persisted_publication.get("schema_changed") is not True
+                or (
+                    persisted_publication.get(
+                        "surface_changed", persisted_publication.get("schema_changed")
+                    )
+                    is not True
+                )
+                or persisted_publication.get("schema_changed") is not schema_changed
                 or persisted_publication.get("publication_state")
                 not in PUBLICATION_REBIND_AUTHORIZED_STATES
                 or persisted_publication.get("publication_current_state")
@@ -3292,10 +3411,7 @@ def inspect_cutover_snapshot_binding(
                 or persisted_publication.get("authorized_at_unix")
                 != rebound_created
                 or persisted_publication.get("does_not_establish")
-                != [
-                    "that any client has observed the changed green schema",
-                    "platform connector catalog publication",
-                ]
+                != expected_transition_nonclaims
             ):
                 observation["state"] = SNAPSHOT_BINDING_FOREIGN
                 observation["error"] = (
@@ -3945,15 +4061,47 @@ def snapshot_status(
         and _SHA256_RE.fullmatch(transition["source_receipt_sha256"]) is not None
         and len(set(transition["source_receipt_sha256"])) > 1
     )
-    declaration_matches = (
-        declaration.get("observed_tool_count") == expected_tool_count
-        and declaration.get("observed_names_sha256") == expected_names_sha256
-        and (
-            declaration.get("observed_release_id") == expected_release_id
-            or transition_matches
+    publication_transition = (
+        transition.get("publication_schema_transition")
+        if isinstance(transition, dict)
+        and isinstance(transition.get("publication_schema_transition"), dict)
+        else None
+    )
+    publication_transition_hash_valid = False
+    if isinstance(publication_transition, dict):
+        declared_transition_sha256 = publication_transition.get("transition_sha256")
+        unsigned_transition = dict(publication_transition)
+        unsigned_transition.pop("transition_sha256", None)
+        publication_transition_hash_valid = (
+            isinstance(declared_transition_sha256, str)
+            and _SHA256_RE.fullmatch(declared_transition_sha256) is not None
+            and _sha256_json(unsigned_transition) == declared_transition_sha256
         )
-        and declaration.get("observed_agent_instructions_sha256")
+    historical_surface_matches = (
+        transition_matches
+        and publication_transition_hash_valid
+        and publication_transition.get("surface_changed") is True
+        and publication_transition.get("source_tool_count")
+        == declaration.get("observed_tool_count")
+        and publication_transition.get("source_names_sha256")
+        == declaration.get("observed_names_sha256")
+        and publication_transition.get("target_tool_count") == expected_tool_count
+        and publication_transition.get("target_names_sha256") == expected_names_sha256
+    )
+    declaration_matches = (
+        declaration.get("observed_agent_instructions_sha256")
         == expected_agent_instructions_sha256
+        and (
+            (
+                declaration.get("observed_tool_count") == expected_tool_count
+                and declaration.get("observed_names_sha256") == expected_names_sha256
+                and (
+                    declaration.get("observed_release_id") == expected_release_id
+                    or transition_matches
+                )
+            )
+            or historical_surface_matches
+        )
     )
     observation_scope = declaration.get("observation_scope")
     if observation_scope not in {
@@ -3992,7 +4140,8 @@ def snapshot_status(
     # be reported as an observation of what is running now: no client has seen
     # the changed schema until one actually looks.
     historical_schema_evidence_only = bool(
-        isinstance(transition, dict) and transition.get("schema_changed") is True
+        isinstance(transition, dict)
+        and transition.get("surface_changed", transition.get("schema_changed")) is True
     )
     complete_schema_observable = (
         not historical_schema_evidence_only

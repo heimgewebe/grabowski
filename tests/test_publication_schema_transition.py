@@ -36,6 +36,7 @@ import grabowski_midcutover_resume as midcutover
 HEAD_BLUE = "a" * 40
 HEAD_GREEN = "b" * 40
 NAMES_SHA256 = "12" * 32
+GREEN_NAMES_SHA256 = "13" * 32
 INSTRUCTIONS_SHA256 = "34" * 32
 ARTIFACT_SHA256 = "56" * 32
 BLUE_SCHEMA_BY_TOOL = {
@@ -111,16 +112,18 @@ def _green_readiness(
     *,
     schema_by_tool: dict[str, str],
     complete_schema_sha256: str,
+    tool_count: int = TOOL_COUNT,
+    names_sha256: str = NAMES_SHA256,
 ) -> dict[str, object]:
     return {
         "ready": True,
         "release_id": "green",
         "repo_head": HEAD_GREEN,
-        "names_sha256": NAMES_SHA256,
+        "names_sha256": names_sha256,
         "agent_instructions_sha256": INSTRUCTIONS_SHA256,
         "schema_sha256_by_tool": dict(schema_by_tool),
         "schema_identity_sha256": client_snapshot._sha256_json(schema_by_tool),
-        "complete_schema_count": TOOL_COUNT,
+        "complete_schema_count": tool_count,
         "complete_schema_sha256": complete_schema_sha256,
     }
 
@@ -164,13 +167,14 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         *,
         complete_schema_sha256: str = GREEN_COMPLETE_SCHEMA,
         cutover_id: str = CUTOVER_ID,
+        tool_count: int = TOOL_COUNT,
         names_sha256: str = NAMES_SHA256,
         activate: bool = True,
     ) -> dict[str, object]:
         prepared = client_snapshot.prepare_platform_publication_for_runtime(
-            registered_tool_count=TOOL_COUNT,
+            registered_tool_count=tool_count,
             registered_names_sha256=names_sha256,
-            complete_schema_count=TOOL_COUNT,
+            complete_schema_count=tool_count,
             complete_schema_sha256=complete_schema_sha256,
             cutover_id=cutover_id,
             now_unix=self.now_unix,
@@ -186,6 +190,8 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         *,
         schema_by_tool: dict[str, str] = GREEN_SCHEMA_BY_TOOL,
         complete_schema_sha256: str = GREEN_COMPLETE_SCHEMA,
+        tool_count: int = TOOL_COUNT,
+        names_sha256: str = NAMES_SHA256,
         cutover_id: str = CUTOVER_ID,
         source_evidence_time: int | None = None,
         publication_request_id: str | None = None,
@@ -194,6 +200,8 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         readiness = _green_readiness(
             schema_by_tool=schema_by_tool,
             complete_schema_sha256=complete_schema_sha256,
+            tool_count=tool_count,
+            names_sha256=names_sha256,
         )
         parameters = {
             "cutover_id": cutover_id,
@@ -202,8 +210,8 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             "current_repo_head": HEAD_BLUE,
             "green_release_id": "green",
             "green_repo_head": HEAD_GREEN,
-            "registered_tool_count": TOOL_COUNT,
-            "registered_names_sha256": NAMES_SHA256,
+            "registered_tool_count": tool_count,
+            "registered_names_sha256": names_sha256,
             "agent_instructions_sha256": INSTRUCTIONS_SHA256,
             "green_readiness": readiness,
         }
@@ -235,7 +243,7 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             "blue_release_id": "blue",
             "green_release_id": "green",
             "expected_head": HEAD_GREEN,
-            "names_sha256": NAMES_SHA256,
+            "names_sha256": names_sha256,
             "agent_instructions_sha256": INSTRUCTIONS_SHA256,
             "green_readiness": readiness,
             "observations": [activation],
@@ -266,7 +274,14 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         )
 
     def _inspection_parameters(
-        self, request_id: str, *, now_unix: int = 5_000
+        self,
+        request_id: str,
+        *,
+        tool_count: int = TOOL_COUNT,
+        names_sha256: str = NAMES_SHA256,
+        schema_by_tool: dict[str, str] = GREEN_SCHEMA_BY_TOOL,
+        complete_schema_sha256: str = GREEN_COMPLETE_SCHEMA,
+        now_unix: int = 5_000,
     ) -> dict[str, object]:
         return {
             "cutover_id": CUTOVER_ID,
@@ -277,12 +292,14 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             "target_repo_head": HEAD_GREEN,
             "source_evidence_time": self.now_unix,
             "publication_request_id": request_id,
-            "registered_tool_count": TOOL_COUNT,
-            "registered_names_sha256": NAMES_SHA256,
+            "registered_tool_count": tool_count,
+            "registered_names_sha256": names_sha256,
             "agent_instructions_sha256": INSTRUCTIONS_SHA256,
             "green_readiness": _green_readiness(
-                schema_by_tool=GREEN_SCHEMA_BY_TOOL,
-                complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+                schema_by_tool=schema_by_tool,
+                complete_schema_sha256=complete_schema_sha256,
+                tool_count=tool_count,
+                names_sha256=names_sha256,
             ),
             "path": self.snapshot_path,
             "now_unix": now_unix,
@@ -398,6 +415,71 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             rebound["cutover_transition"]["publication_schema_transition"],
             transition,
         )
+
+    def test_authorized_toolset_change_preserves_blue_history_and_binds_green_target(self) -> None:
+        target_count = TOOL_COUNT + 2
+        prepared = self._prepare_publication(
+            tool_count=target_count,
+            names_sha256=GREEN_NAMES_SHA256,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+        )
+        result = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            tool_count=target_count,
+            names_sha256=GREEN_NAMES_SHA256,
+        )
+        self.assertFalse(result["schema_changed"])
+        self.assertTrue(result["surface_changed"])
+        transition = result["publication_schema_transition"]
+        self.assertEqual(transition["publication_request_id"], prepared["request_id"])
+        self.assertEqual(transition["source_tool_count"], TOOL_COUNT)
+        self.assertEqual(transition["source_names_sha256"], NAMES_SHA256)
+        self.assertEqual(transition["target_tool_count"], target_count)
+        self.assertEqual(transition["target_names_sha256"], GREEN_NAMES_SHA256)
+        self.assertFalse(transition["schema_changed"])
+        self.assertTrue(transition["surface_changed"])
+
+        rebound = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            rebound["client_declaration"]["observed_tool_count"], TOOL_COUNT
+        )
+        self.assertEqual(
+            rebound["client_declaration"]["observed_names_sha256"], NAMES_SHA256
+        )
+        self.assertEqual(
+            rebound["server_binding"]["registered_tool_count"], target_count
+        )
+        self.assertEqual(
+            rebound["server_binding"]["registered_names_sha256"], GREEN_NAMES_SHA256
+        )
+
+        status = client_snapshot.snapshot_status(
+            expected_tool_count=target_count,
+            expected_names_sha256=GREEN_NAMES_SHA256,
+            expected_release_id="green",
+            expected_repo_head=HEAD_GREEN,
+            expected_agent_instructions_sha256=INSTRUCTIONS_SHA256,
+            now_unix=self.now_unix,
+        )
+        self.assertEqual(status["state"], "matched")
+        self.assertTrue(status["external_client_snapshot_observable"])
+        self.assertTrue(status["historical_schema_evidence_only"])
+        self.assertFalse(status["external_client_schema_observable"])
+
+        inspected = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(
+                prepared["request_id"],
+                tool_count=target_count,
+                names_sha256=GREEN_NAMES_SHA256,
+                schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                now_unix=self.now_unix,
+            )
+        )
+        self.assertEqual(inspected["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND)
+        self.assertTrue(inspected["surface_changed"])
+        self.assertFalse(inspected["schema_changed"])
 
     # ---- 9: the preserved evidence is not a green observation ------------
 
@@ -594,6 +676,40 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             ):
                 effect_reached = True
         self.assertFalse(effect_reached)
+
+    def test_cold_inspection_accepts_legacy_schema_transition_receipt_shape(self) -> None:
+        prepared = self._prepare_publication()
+        self._rebind()
+        receipt = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        transition = receipt["cutover_transition"]
+        publication = transition["publication_schema_transition"]
+        transition.pop("surface_changed", None)
+        for key in (
+            "surface_changed",
+            "source_tool_count",
+            "source_names_sha256",
+            "target_tool_count",
+            "target_names_sha256",
+        ):
+            publication.pop(key, None)
+        publication["does_not_establish"] = [
+            "that any client has observed the changed green schema",
+            "platform connector catalog publication",
+        ]
+        publication.pop("transition_sha256", None)
+        publication["transition_sha256"] = client_snapshot._sha256_json(publication)
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = client_snapshot._sha256_json(receipt)
+        client_snapshot._write_private_json(self.snapshot_path, receipt)
+
+        observed = client_snapshot.inspect_cutover_snapshot_binding(
+            **self._inspection_parameters(prepared["request_id"], now_unix=self.now_unix)
+        )
+        self.assertEqual(
+            observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND
+        )
+        self.assertTrue(observed["schema_changed"])
+        self.assertTrue(observed["surface_changed"])
 
     def test_cold_rebound_inspection_refuses_revoked_current_authorization(self) -> None:
         prepared = self._prepare_publication()
