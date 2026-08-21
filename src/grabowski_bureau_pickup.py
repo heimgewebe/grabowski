@@ -3225,13 +3225,13 @@ def _reacquire_orphaned_assignment_leases(
 ) -> dict[str, Any]:
     original_by_key = _orphan_recovery_original_leases(intent, acquisition)
     groups = _acquisition_groups(intent, request)
-    actions: list[dict[str, Any]] = []
     expected_metadata_by_key = {
         key: group["metadata"]
         for group in groups
         for key in group["resource_keys"]
     }
     now = resources._now()
+    plans: list[dict[str, Any]] = []
     for group in groups:
         keys = list(group["resource_keys"])
         purpose = f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
@@ -3287,9 +3287,31 @@ def _reacquire_orphaned_assignment_leases(
                     details={"resource_key": key},
                 )
             expired.append(persisted)
+        plans.append(
+            {
+                "group": group,
+                "purpose": purpose,
+                "expired": expired,
+                "short": [
+                    item
+                    for item in live
+                    if item.get("expires_at_unix", 0) < now + 120
+                ],
+            }
+        )
+
+    # Do not mutate an early group until every group has passed lineage and
+    # ownership validation. Each effect remains CAS-bound to the preflight
+    # snapshots below.
+    actions: list[dict[str, Any]] = []
+    for plan in plans:
+        group = plan["group"]
+        purpose = plan["purpose"]
+        expired = plan["expired"]
+        short = plan["short"]
         if expired:
             expired_keys = [item["resource_key"] for item in expired]
-            result = resources.rebind_same_owner_resources(
+            resources.rebind_same_owner_resources(
                 intent["lease_owner_id"],
                 expired_keys,
                 purpose=purpose,
@@ -3301,22 +3323,26 @@ def _reacquire_orphaned_assignment_leases(
                 ],
             )
             actions.append(
-                {"group": group["name"], "method": "same-owner-rebind", "resource_keys": expired_keys}
+                {
+                    "group": group["name"],
+                    "method": "same-owner-rebind",
+                    "resource_keys": expired_keys,
+                }
             )
-        if live:
-            short = [
-                item for item in live if item.get("expires_at_unix", 0) < now + 120
-            ]
-            if short:
-                resources.renew_resources(
-                    intent["lease_owner_id"],
-                    [item["resource_key"] for item in short],
-                    ttl_seconds=group["ttl_seconds"],
-                    expected_leases=[_lease_snapshot(item) for item in short],
-                )
-                actions.append(
-                    {"group": group["name"], "method": "renew", "resource_keys": [item["resource_key"] for item in short]}
-                )
+        if short:
+            resources.renew_resources(
+                intent["lease_owner_id"],
+                [item["resource_key"] for item in short],
+                ttl_seconds=group["ttl_seconds"],
+                expected_leases=[_lease_snapshot(item) for item in short],
+            )
+            actions.append(
+                {
+                    "group": group["name"],
+                    "method": "renew",
+                    "resource_keys": [item["resource_key"] for item in short],
+                }
+            )
     current_leases: list[dict[str, Any]] = []
     for key in intent["required_resource_keys"]:
         observed = resources.inspect_resource(key)
@@ -3486,9 +3512,7 @@ def _recover_orphaned_journal_before_claim(
         candidate, current_binding, ancestry, revision
     )
     _assert_registry_binding(current_binding)
-    lease_receipt = _reacquire_orphaned_assignment_leases(
-        intent, candidate["stored_request"], acquisition, candidate["run_dir"]
-    )
+    already_resumed = candidate.get("already_resumed") is True
     pre_resume = _bound_bureau_call(
         current_binding,
         lambda: _coordination_status(
@@ -3497,17 +3521,26 @@ def _recover_orphaned_journal_before_claim(
             coordination_root=request["coordination_root"],
         ),
     )
-    already_resumed = candidate.get("already_resumed") is True
-    resume_result: dict[str, Any] | None = None
-    resume_error: Exception | None = None
     if already_resumed:
-        _validate_resumed_run(pre_resume, intent, acquisition, journal_identity)
-        readback = pre_resume
-        resume_result = {"status": "already-active", "run": pre_resume.get("run")}
+        run = _validate_resumed_run(
+            pre_resume, intent, acquisition, journal_identity
+        )
     else:
         run = _validate_recoverable_orphan(
             pre_resume, intent, acquisition, journal_identity
         )
+    # The authoritative run-state read above is deliberately the last Bureau
+    # observation before lease recovery. A terminal transition therefore
+    # fails closed before any rebind or renewal effect.
+    lease_receipt = _reacquire_orphaned_assignment_leases(
+        intent, candidate["stored_request"], acquisition, candidate["run_dir"]
+    )
+    resume_result: dict[str, Any] | None = None
+    resume_error: Exception | None = None
+    if already_resumed:
+        readback = pre_resume
+        resume_result = {"status": "already-active", "run": pre_resume.get("run")}
+    else:
         try:
             resume_result = _bound_bureau_call(
                 current_binding,
