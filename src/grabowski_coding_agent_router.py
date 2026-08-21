@@ -2011,6 +2011,11 @@ def canonical_execution_route(
     if external_review_requested:
         review_status = state_status
         review_state_error_type = state_error_type
+        review_primary_group = controller_route["independence_group"]
+        review_primary_provider = controller_model["provider_family"]
+        if scoped_writer is not None:
+            review_primary_group = scoped_writer["independence_group"]
+            review_primary_provider = scoped_writer["provider_family"]
         if state is not None and route_derivations is not None:
             try:
                 ranked, review_excluded = _rank_routes(
@@ -2018,8 +2023,8 @@ def canonical_execution_route(
                     catalog,
                     state,
                     reviewer=True,
-                    previous_group=controller_route["independence_group"],
-                    previous_provider=controller_model["provider_family"],
+                    previous_group=review_primary_group,
+                    previous_provider=review_primary_provider,
                     route_derivations=route_derivations,
                     **common,
                 )
