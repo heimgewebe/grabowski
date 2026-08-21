@@ -2845,7 +2845,7 @@ def _validate_recoverable_orphan(
 def _journaled_orphan_recovery_candidate(
     request: dict[str, Any], current_binding: RegistryBinding
 ) -> dict[str, Any] | None:
-    if current_binding["explicit"] or request.get("task_id") is None:
+    if current_binding["explicit"]:
         return None
     candidates: list[dict[str, Any]] = []
     requested_identity = _request_without_registry_root(request)
@@ -2873,16 +2873,6 @@ def _journaled_orphan_recovery_candidate(
             continue
         if _request_without_registry_root(stored_request) != requested_identity:
             continue
-        stored_binding = _read_journal_registry_binding(
-            run_dir,
-            stored_request["registry_root"],
-            expected_sha256=marker,
-        )
-        if stored_binding["identity"].get("kind") != "canonical-registry-binding":
-            raise BureauPickupError(
-                "orphan-recovery-requires-canonical-registry",
-                details={"run_id": run_id},
-            )
         intent = _read_bound_json(run_dir / "intent.json", label="intent")
         synthetic = {
             "status": "existing-assignment",
@@ -2892,9 +2882,19 @@ def _journaled_orphan_recovery_candidate(
         validated_intent, _ = _validate_intent_result(synthetic, stored_request)
         if validated_intent["run_id"] != run_id:
             raise BureauPickupError("orphan-recovery-journal-run-mismatch")
-        acquisition = _read_bound_json(run_dir / "acquisition.json", label="acquisition")
+        try:
+            acquisition = _read_bound_json(
+                run_dir / "acquisition.json", label="acquisition"
+            )
+            journal_identity = _journal_run_identity(run_dir, validated_intent)
+        except BureauPickupError as exc:
+            if exc.code in {
+                "acquisition-missing",
+                "commit-result-missing",
+            }:
+                continue
+            raise
         _validate_acquisition(acquisition)
-        journal_identity = _journal_run_identity(run_dir, validated_intent)
         coordination = _bound_bureau_call(
             current_binding,
             lambda: _coordination_status(
@@ -2906,6 +2906,18 @@ def _journaled_orphan_recovery_candidate(
         run = coordination.get("run") if isinstance(coordination, dict) else None
         state = run.get("state") if isinstance(run, dict) else None
         already_resumed = state in ACTIVE_EXECUTION_STATES
+        if not already_resumed and state != "orphaned":
+            continue
+        stored_binding = _read_journal_registry_binding(
+            run_dir,
+            stored_request["registry_root"],
+            expected_sha256=marker,
+        )
+        if stored_binding["identity"].get("kind") != "canonical-registry-binding":
+            raise BureauPickupError(
+                "orphan-recovery-requires-canonical-registry",
+                details={"run_id": run_id},
+            )
         if already_resumed:
             _validate_resumed_run(
                 coordination, validated_intent, acquisition, journal_identity
@@ -3287,38 +3299,45 @@ def _reacquire_orphaned_assignment_leases(
                     details={"resource_key": key},
                 )
             expired.append(persisted)
+        short = [
+            item for item in live if item.get("expires_at_unix", 0) < now + 60
+        ]
+        if short:
+            raise BureauPickupError(
+                "orphan-recovery-live-lease-too-short",
+                details={
+                    "group": group["name"],
+                    "resource_keys": [item["resource_key"] for item in short],
+                },
+            )
         plans.append(
             {
                 "group": group,
                 "purpose": purpose,
                 "expired": expired,
-                "short": [
-                    item
-                    for item in live
-                    if item.get("expires_at_unix", 0) < now + 120
-                ],
             }
         )
 
     # Do not mutate an early group until every group has passed lineage and
-    # ownership validation. Recovery may install an internal, non-serializable
-    # run-state guard here; normalized external requests cannot supply one.
+    # ownership validation. Recovery installs internal guards here; normalized
+    # external requests cannot supply these callable values.
     pre_effect_guard = request.get("_orphan_recovery_pre_effect_guard")
     if pre_effect_guard is not None:
         if not callable(pre_effect_guard):
             raise BureauPickupError("orphan-recovery-run-guard-invalid")
         pre_effect_guard()
 
-    # Each effect remains CAS-bound to the read-only preflight snapshots.
     actions: list[dict[str, Any]] = []
-    for plan in plans:
-        group = plan["group"]
-        purpose = plan["purpose"]
-        expired = plan["expired"]
-        short = plan["short"]
-        if expired:
+    rebound_after_snapshots: list[dict[str, Any]] = []
+    try:
+        for index, plan in enumerate(plans, start=1):
+            group = plan["group"]
+            purpose = plan["purpose"]
+            expired = plan["expired"]
+            if not expired:
+                continue
             expired_keys = [item["resource_key"] for item in expired]
-            resources.rebind_same_owner_resources(
+            result = resources.rebind_same_owner_resources(
                 intent["lease_owner_id"],
                 expired_keys,
                 purpose=purpose,
@@ -3329,27 +3348,101 @@ def _reacquire_orphaned_assignment_leases(
                     _lease_snapshot(original_by_key[key]) for key in expired_keys
                 ],
             )
+            result_leases = result.get("leases")
+            if not isinstance(result_leases, list):
+                raise BureauPickupError(
+                    "orphan-recovery-lease-rebind-result-invalid",
+                    details={"group": group["name"]},
+                )
+            after = [
+                _lease_snapshot(item)
+                for item in result_leases
+                if isinstance(item, dict)
+                and item.get("resource_key") in expired_keys
+            ]
+            if sorted(item["resource_key"] for item in after) != sorted(expired_keys):
+                raise BureauPickupError(
+                    "orphan-recovery-lease-rebind-result-invalid",
+                    details={"group": group["name"]},
+                )
+            rebound_after_snapshots.extend(after)
+            rebound_group = {**group, "resource_keys": expired_keys}
+            _validate_acquired_group(
+                intent["lease_owner_id"], rebound_group, result
+            )
+            effect = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_lease_effect",
+                "run_id": intent["run_id"],
+                "task_id": intent["task_id"],
+                "owner_id": intent["lease_owner_id"],
+                "claim_intent_sha256": intent["intent_sha256"],
+                "group": group["name"],
+                "method": "same-owner-rebind",
+                "resource_keys": expired_keys,
+                "before": [_lease_snapshot(item) for item in expired],
+                "after": after,
+            }
+            effect["receipt_sha256"] = _sha256(effect)
+            _write_bound_json(
+                run_dir / f"orphan-lease-effect-{index:02d}.json", effect
+            )
             actions.append(
                 {
                     "group": group["name"],
                     "method": "same-owner-rebind",
                     "resource_keys": expired_keys,
+                    "effect_receipt_sha256": effect["receipt_sha256"],
                 }
             )
-        if short:
-            resources.renew_resources(
-                intent["lease_owner_id"],
-                [item["resource_key"] for item in short],
-                ttl_seconds=group["ttl_seconds"],
-                expected_leases=[_lease_snapshot(item) for item in short],
-            )
-            actions.append(
-                {
-                    "group": group["name"],
-                    "method": "renew",
-                    "resource_keys": [item["resource_key"] for item in short],
-                }
-            )
+
+        post_effect_guard = request.get("_orphan_recovery_post_effect_guard")
+        if post_effect_guard is not None:
+            if not callable(post_effect_guard):
+                raise BureauPickupError("orphan-recovery-post-effect-guard-invalid")
+            post_effect_guard()
+    except Exception as exc:
+        if not rebound_after_snapshots:
+            raise
+        compensation: dict[str, Any] = {
+            "required": True,
+            "status": "pending",
+            "resource_keys": [
+                item["resource_key"] for item in rebound_after_snapshots
+            ],
+            "cause_code": getattr(exc, "code", None),
+            "error_type": type(exc).__name__,
+        }
+        if rebound_after_snapshots:
+            try:
+                released = resources.release_resources(
+                    intent["lease_owner_id"],
+                    [item["resource_key"] for item in rebound_after_snapshots],
+                    expected_leases=rebound_after_snapshots,
+                )
+                compensation.update(
+                    {"status": "released", "result": released}
+                )
+            except Exception as release_exc:
+                compensation.update(
+                    {
+                        "status": "release-failed",
+                        "release_error_type": type(release_exc).__name__,
+                    }
+                )
+        compensation["receipt_sha256"] = _sha256(compensation)
+        _write_bound_json(
+            run_dir / "orphan-lease-recovery-compensation.json", compensation
+        )
+        raise BureauPickupError(
+            "orphan-recovery-lease-effect-failed",
+            details={
+                "cause_code": getattr(exc, "code", None),
+                "error_type": type(exc).__name__,
+                "effect_count": len(actions),
+                "compensation": compensation,
+            },
+        ) from exc
     current_leases: list[dict[str, Any]] = []
     for key in intent["required_resource_keys"]:
         observed = resources.inspect_resource(key)
@@ -3418,7 +3511,12 @@ def _reacquire_orphaned_assignment_leases(
 
 
 def _resume_orphaned_run(
-    request: dict[str, Any], intent: dict[str, Any], run: dict[str, Any], envelope_sha256: str
+    request: dict[str, Any],
+    intent: dict[str, Any],
+    run: dict[str, Any],
+    envelope_sha256: str,
+    *,
+    revision_proof: dict[str, Any],
 ) -> dict[str, Any]:
     arguments = _bureau_arguments(
         "orphan-resume",
@@ -3433,9 +3531,9 @@ def _resume_orphaned_run(
             "--expected-updated-at",
             str(run["updated_at"]),
             "--expected-task-sha256",
-            intent["task_sha256"],
+            revision_proof["task_sha256"],
             "--expected-plan-sha256",
-            intent["plan_sha256"],
+            revision_proof["plan_sha256"],
             "--expected-envelope-sha256",
             envelope_sha256,
         ]
@@ -3523,15 +3621,20 @@ def _recover_orphaned_journal_before_claim(
     pre_resume: dict[str, Any] | None = None
     run: dict[str, Any] | None = None
 
-    def _guard_run_before_lease_effect() -> None:
-        nonlocal pre_resume, run
+    post_lease_readback: dict[str, Any] | None = None
+    post_lease_run: dict[str, Any] | None = None
+    post_lease_revision: dict[str, Any] | None = None
+
+    def _guard_recovery_authority(*, post_effect: bool) -> None:
+        nonlocal pre_resume, run, post_lease_readback
+        nonlocal post_lease_run, post_lease_revision
         _assert_registry_binding(current_binding)
-        _current_registry_revision_proof(
+        current_revision = _current_registry_revision_proof(
             current_binding,
             intent,
             coordination_root=request["coordination_root"],
         )
-        pre_resume = _bound_bureau_call(
+        observed = _bound_bureau_call(
             current_binding,
             lambda: _coordination_status(
                 intent["run_id"],
@@ -3540,32 +3643,55 @@ def _recover_orphaned_journal_before_claim(
             ),
         )
         if already_resumed:
-            run = _validate_resumed_run(
-                pre_resume, intent, acquisition, journal_identity
+            validated = _validate_resumed_run(
+                observed, intent, acquisition, journal_identity
             )
         else:
-            run = _validate_recoverable_orphan(
-                pre_resume, intent, acquisition, journal_identity
+            validated = _validate_recoverable_orphan(
+                observed, intent, acquisition, journal_identity
             )
+        if post_effect:
+            post_lease_readback = observed
+            post_lease_run = validated
+            post_lease_revision = current_revision
+        else:
+            pre_resume = observed
+            run = validated
 
     lease_request = dict(candidate["stored_request"])
-    lease_request["_orphan_recovery_pre_effect_guard"] = _guard_run_before_lease_effect
+    lease_request["_orphan_recovery_pre_effect_guard"] = (
+        lambda: _guard_recovery_authority(post_effect=False)
+    )
+    lease_request["_orphan_recovery_post_effect_guard"] = (
+        lambda: _guard_recovery_authority(post_effect=True)
+    )
     lease_receipt = _reacquire_orphaned_assignment_leases(
         intent, lease_request, acquisition, candidate["run_dir"]
     )
-    if pre_resume is None or run is None:
+    if (
+        pre_resume is None
+        or run is None
+        or post_lease_readback is None
+        or post_lease_run is None
+        or post_lease_revision is None
+    ):
         raise BureauPickupError("orphan-recovery-run-guard-missing")
     resume_result: dict[str, Any] | None = None
     resume_error: Exception | None = None
     if already_resumed:
-        readback = pre_resume
-        resume_result = {"status": "already-active", "run": pre_resume.get("run")}
+        readback = post_lease_readback
+        _validate_resumed_run(readback, intent, acquisition, journal_identity)
+        resume_result = {"status": "already-active", "run": readback.get("run")}
     else:
         try:
             resume_result = _bound_bureau_call(
                 current_binding,
                 lambda: _resume_orphaned_run(
-                    request, intent, run, journal_identity["envelope_sha256"]
+                    request,
+                    intent,
+                    post_lease_run,
+                    journal_identity["envelope_sha256"],
+                    revision_proof=post_lease_revision,
                 ),
             )
         except Exception as exc:
@@ -3619,7 +3745,33 @@ def _recover_orphaned_journal_before_claim(
     }
     success["receipt_sha256"] = _sha256(success)
     success_path = candidate["run_dir"] / "orphan-recovery.json"
-    if not os.path.lexists(success_path):
+    if os.path.lexists(success_path):
+        persisted_success = _read_bound_json(
+            success_path, label="orphan-recovery"
+        )
+        persisted_digest = persisted_success.get("receipt_sha256")
+        persisted_payload = dict(persisted_success)
+        persisted_payload.pop("receipt_sha256", None)
+        stable_success = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_bureau_pickup_orphan_recovery",
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+        }
+        if (
+            not isinstance(persisted_digest, str)
+            or SHA256_RE.fullmatch(persisted_digest) is None
+            or _sha256(persisted_payload) != persisted_digest
+            or any(
+                persisted_success.get(field) != value
+                for field, value in stable_success.items()
+            )
+        ):
+            raise BureauPickupError("orphan-recovery-receipt-drift")
+        success = persisted_success
+    else:
         _write_bound_json(success_path, success)
     result = {
         "schema_version": SCHEMA_VERSION,
