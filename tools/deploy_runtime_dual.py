@@ -5830,12 +5830,24 @@ class ProductionBlueGreenRuntime:
                 "Green readiness is unavailable for platform publication preparation",
                 phase="platform-publication-preflight",
             )
+        blue_contract = self._blue_platform_publication_contract()
+        target_tool_count = len(self.snapshot.contract.expected_tools)
+        surface_changed = (
+            blue_contract["tool_count"] != target_tool_count
+            or blue_contract["tool_names_sha256"]
+            != self.green_binding["registered_names_sha256"]
+            or blue_contract["tool_schemas_count"]
+            != self.green_readiness["complete_schema_count"]
+            or blue_contract["tool_schemas_sha256"]
+            != self.green_readiness["complete_schema_sha256"]
+        )
         result = client_snapshot.prepare_platform_publication_for_runtime(
-            registered_tool_count=len(self.snapshot.contract.expected_tools),
+            registered_tool_count=target_tool_count,
             registered_names_sha256=self.green_binding["registered_names_sha256"],
             complete_schema_count=self.green_readiness["complete_schema_count"],
             complete_schema_sha256=self.green_readiness["complete_schema_sha256"],
             cutover_id=self.cutover_id,
+            require_current_cutover_binding=surface_changed,
         )
         self.platform_publication = result
         return result

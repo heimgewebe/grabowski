@@ -1100,6 +1100,97 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             active_contract["tool_schemas_sha256"], COMPLETE_SCHEMA_SHA256
         )
 
+    def test_platform_publication_preflight_requires_current_cutover_for_changed_surface(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock(expected_tools=["grabowski_status", "grabowski_context"])
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=mock.Mock(
+                release_path=Path("/release/green"),
+                release_id="green",
+                agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+            ),
+            activation=mock.Mock(steps=[]),
+            blue_manifest={
+                "entrypoint_contract": {"expected_tools": ["grabowski_status"]}
+            },
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding={
+                **runtime_binding("green", HEAD_GREEN),
+                "registered_names_sha256": "7b" * 32,
+            },
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-surface-change",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            source_complete_schema_sha256=COMPLETE_SCHEMA_SHA256,
+            green_readiness={
+                "complete_schema_count": 2,
+                "complete_schema_sha256": "92" * 32,
+            },
+        )
+        with mock.patch.object(
+            dual.client_snapshot,
+            "prepare_platform_publication_for_runtime",
+            return_value={"state": "pending_activation", "request_id": "gpp-current"},
+        ) as prepare:
+            result = runtime.prepare_platform_publication()
+        self.assertEqual(result["request_id"], "gpp-current")
+        prepare.assert_called_once_with(
+            registered_tool_count=2,
+            registered_names_sha256="7b" * 32,
+            complete_schema_count=2,
+            complete_schema_sha256="92" * 32,
+            cutover_id="cutover-surface-change",
+            require_current_cutover_binding=True,
+        )
+
+    def test_platform_publication_preflight_keeps_code_only_reuse_cutover_agnostic(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=mock.Mock(
+                release_path=Path("/release/green"),
+                release_id="green",
+                agent_instructions={"sha256": INSTRUCTIONS_SHA256},
+            ),
+            activation=mock.Mock(steps=[]),
+            blue_manifest={
+                "entrypoint_contract": {"expected_tools": ["grabowski_status"]}
+            },
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-code-only",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            source_complete_schema_sha256=COMPLETE_SCHEMA_SHA256,
+            green_readiness={
+                "complete_schema_count": 1,
+                "complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+            },
+        )
+        with mock.patch.object(
+            dual.client_snapshot,
+            "prepare_platform_publication_for_runtime",
+            return_value={"state": "platform_converged", "request_id": "gpp-prior"},
+        ) as prepare:
+            result = runtime.prepare_platform_publication()
+        self.assertEqual(result["request_id"], "gpp-prior")
+        prepare.assert_called_once_with(
+            registered_tool_count=1,
+            registered_names_sha256=NAMES_SHA256,
+            complete_schema_count=1,
+            complete_schema_sha256=COMPLETE_SCHEMA_SHA256,
+            cutover_id="cutover-code-only",
+            require_current_cutover_binding=False,
+        )
+
     def _schema_verification_runtime(self, blue_schema_sha256: str):
         snapshot = mock.Mock()
         snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])

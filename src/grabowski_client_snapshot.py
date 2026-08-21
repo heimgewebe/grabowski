@@ -2241,6 +2241,7 @@ def prepare_platform_publication_for_runtime(
     complete_schema_count: int,
     complete_schema_sha256: str,
     cutover_id: str,
+    require_current_cutover_binding: bool = False,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     timestamp = int(time.time()) if now_unix is None else now_unix
@@ -2251,6 +2252,8 @@ def prepare_platform_publication_for_runtime(
         complete_schema_sha256=complete_schema_sha256,
     )
     cutover_id = _validate_identifier(cutover_id, label="publication cutover id")
+    if type(require_current_cutover_binding) is not bool:
+        raise ClientSnapshotError("require_current_cutover_binding must be a boolean")
     with _state_lock():
         _ensure_private_directory(PLATFORM_PUBLICATION_ROOT)
         current = _read_publication_current()
@@ -2291,14 +2294,23 @@ def prepare_platform_publication_for_runtime(
                     raise ClientSnapshotError(
                         "existing platform convergence receipt does not bind the current request contract"
                     )
-            return {
-                "state": current["state"],
-                "request_id": current["request_id"],
-                "request_sha256": request["request_sha256"],
-                "contract": contract,
-                "reused": True,
-                "recommended_next_action": "continue the existing semantic publication lifecycle",
-            }
+            if not (
+                require_current_cutover_binding
+                and request["cutover_id"] != cutover_id
+            ):
+                return {
+                    "state": current["state"],
+                    "request_id": current["request_id"],
+                    "request_sha256": request["request_sha256"],
+                    "contract": contract,
+                    "reused": True,
+                    "recommended_next_action": "continue the existing semantic publication lifecycle",
+                }
+            # A changed Blue->Green surface needs an authorization request bound
+            # to this exact cutover.  Preserve the semantically identical prior
+            # request as previous_current, then fall through to create a new
+            # request for the current cutover instead of discovering the foreign
+            # binding only after the connector switch.
         request_id = _request_id_for_contract(
             cutover_id=cutover_id,
             contract_sha256=contract["tool_contract_sha256"],

@@ -327,6 +327,56 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             self._rebind()
         self._assert_snapshot_untouched()
 
+    def test_changed_surface_requires_same_contract_request_bound_to_current_cutover(self) -> None:
+        prior = self._prepare_publication(cutover_id="foreign-cutover")
+        client_snapshot.activate_platform_publication_request(
+            request_id=prior["request_id"], now_unix=self.now_unix + 1
+        )
+
+        prepared = client_snapshot.prepare_platform_publication_for_runtime(
+            registered_tool_count=TOOL_COUNT,
+            registered_names_sha256=NAMES_SHA256,
+            complete_schema_count=TOOL_COUNT,
+            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+            cutover_id=CUTOVER_ID,
+            require_current_cutover_binding=True,
+            now_unix=self.now_unix + 2,
+        )
+
+        self.assertFalse(prepared["reused"])
+        self.assertNotEqual(prepared["request_id"], prior["request_id"])
+        request = client_snapshot._read_publication_request(prepared["request_id"])
+        self.assertEqual(request["cutover_id"], CUTOVER_ID)
+        self.assertEqual(
+            request["previous_current"]["request_id"], prior["request_id"]
+        )
+        current = client_snapshot._read_publication_current()
+        self.assertEqual(current["request_id"], prepared["request_id"])
+        self.assertEqual(current["state"], "pending_activation")
+
+    def test_unchanged_surface_may_reuse_same_contract_from_foreign_cutover(self) -> None:
+        prior = self._prepare_publication(cutover_id="foreign-code-only")
+        client_snapshot.activate_platform_publication_request(
+            request_id=prior["request_id"], now_unix=self.now_unix + 1
+        )
+
+        replay = client_snapshot.prepare_platform_publication_for_runtime(
+            registered_tool_count=TOOL_COUNT,
+            registered_names_sha256=NAMES_SHA256,
+            complete_schema_count=TOOL_COUNT,
+            complete_schema_sha256=GREEN_COMPLETE_SCHEMA,
+            cutover_id=CUTOVER_ID,
+            require_current_cutover_binding=False,
+            now_unix=self.now_unix + 2,
+        )
+
+        self.assertTrue(replay["reused"])
+        self.assertEqual(replay["request_id"], prior["request_id"])
+        self.assertEqual(
+            client_snapshot._read_publication_current()["request_id"],
+            prior["request_id"],
+        )
+
     def test_schema_change_with_pending_activation_fails(self) -> None:
         self._prepare_publication(activate=False)
         with self.assertRaisesRegex(
