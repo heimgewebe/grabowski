@@ -1275,12 +1275,24 @@ class CodingAgentRouterTests(unittest.TestCase):
             changed_files=2,
             duration_minutes=30,
             novelty="medium",
+            verification_policy="independent_review",
             effect_profile="delivery",
         )
 
         self.assertEqual("scoped_writer", result["executor"])
         self.assertEqual("delivery", result["effect_profile"])
         self.assertEqual(result["writer_route"], result["scoped_writer"]["route"])
+
+    def test_delivery_effect_profile_rejects_deterministic_verification(self) -> None:
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError,
+            "requires verification_policy=independent_review",
+        ):
+            self._route(
+                "bounded-patch",
+                verification_policy="deterministic",
+                effect_profile="delivery",
+            )
 
     def test_delivery_effect_profile_fails_closed_on_controller_route(self) -> None:
         with self.assertRaisesRegex(

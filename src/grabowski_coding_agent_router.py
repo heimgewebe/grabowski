@@ -1921,6 +1921,10 @@ def canonical_execution_route(
         verification_policy_value = "independent_review"
     else:
         verification_policy_value = verification_policy or "deterministic"
+    if effect_profile == "delivery" and verification_policy_value != "independent_review":
+        raise CodingAgentRouterError(
+            "effect_profile=delivery requires verification_policy=independent_review"
+        )
     external_review_requested = verification_policy_value == "independent_review"
     review_task_class = task_value if direct_review_task else "independent-review"
     common = {

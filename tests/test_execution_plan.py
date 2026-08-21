@@ -134,10 +134,23 @@ class ExecutionPlanTests(unittest.TestCase):
 
     def test_delivery_profile_is_immutably_bound_through_execution_plan(self) -> None:
         plan = writer_verify_plan(
-            route_decision=route_decision(effect_profile="delivery")
+            route_decision=route_decision(
+                effect_profile="delivery", verification_policy="independent_review"
+            )
         )
         self.assertEqual("delivery", plan["route_binding"]["effect_profile"])
         self.assertEqual(plan, execution_plan.validate_execution_plan(plan))
+
+    def test_delivery_profile_rejects_deterministic_verification(self) -> None:
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError,
+            "requires verification_policy=independent_review",
+        ):
+            execution_plan.route_binding_from_decision(
+                route_decision(
+                    effect_profile="delivery", verification_policy="deterministic"
+                )
+            )
 
     def test_delivery_profile_rejects_controller_route(self) -> None:
         with self.assertRaisesRegex(

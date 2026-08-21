@@ -150,6 +150,10 @@ def route_binding_from_decision(value: Any) -> dict[str, Any]:
     )
     if verification_policy not in VERIFICATION_POLICIES:
         raise ExecutionPlanError("route verification policy is unsupported")
+    if effect_profile == "delivery" and verification_policy != "independent_review":
+        raise ExecutionPlanError(
+            "delivery effect profile requires verification_policy=independent_review"
+        )
     return {
         "routing_contract_version": ROUTING_CONTRACT_VERSION,
         "recommendation_sha256": recommendation,
