@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -13,7 +14,7 @@ import grabowski_operator_obligation as operator_obligation
 
 
 SCHEMA_VERSION = checkouts.TERMINAL_RECONCILIATION_SCHEMA_VERSION
-TERMINAL_TASK_STATES = frozenset({"verified", "cancelled", "obsolete", "rejected"})
+TERMINAL_TASK_STATES = frozenset({"verified", "cancelled", "superseded"})
 GITHUB_ISSUE_SOURCE_RE = re.compile(
     r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*):(?P<suffix>[^\x00]+)\Z"
 )
@@ -42,6 +43,84 @@ def _github_json(arguments: list[str], *, timeout_seconds: int = 30) -> Any:
         raise RuntimeError("GitHub observation returned invalid JSON") from exc
 
 
+def _bureau_json(
+    arguments: list[str],
+    *,
+    control_root: Path,
+    timeout_seconds: int = 30,
+) -> dict[str, Any]:
+    legacy_root = Path(
+        os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
+    ).expanduser()
+    state_root = Path(
+        os.environ.get("GRABOWSKI_BUREAU_COORDINATION_ROOT", str(legacy_root))
+    ).expanduser()
+    completed = subprocess.run(
+        [
+            str(bureau_leases.BUREAU_CONTRACT_EXECUTABLE),
+            "--state-root",
+            str(state_root),
+            "--json",
+            *arguments,
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_seconds,
+        cwd=str(control_root),
+        env=checkouts.operator._safe_environment(),
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(detail or "Bureau status projection failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Bureau status projection returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Bureau status projection returned an invalid payload")
+    return payload
+
+
+def _bureau_task_projection(
+    source_id: str, *, control_root: Path
+) -> dict[str, Any]:
+    payload = _bureau_json(
+        ["status-projection", "--skip-github"],
+        control_root=control_root,
+    )
+    result = payload.get("result")
+    tasks = result.get("tasks") if isinstance(result, dict) else None
+    if not isinstance(tasks, list):
+        raise RuntimeError("Bureau status projection has no authoritative task list")
+    matches = [
+        item
+        for item in tasks
+        if isinstance(item, dict) and item.get("task_id") == source_id
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Bureau status projection task identity is ambiguous or missing: {source_id}"
+        )
+    task = matches[0]
+    state = task.get("effective_state")
+    if state not in TERMINAL_TASK_STATES:
+        raise RuntimeError(f"Bureau task source is not terminal: {state}")
+    registry_state = task.get("registry_state")
+    task_spec_state = task.get("task_spec_state")
+    if registry_state is not None and not isinstance(registry_state, str):
+        raise RuntimeError("Bureau status projection registry state is invalid")
+    if task_spec_state is not None and not isinstance(task_spec_state, str):
+        raise RuntimeError("Bureau status projection TaskSpec state is invalid")
+    return {
+        "task_id": source_id,
+        "effective_state": state,
+        "registry_state": registry_state,
+        "task_spec_state": task_spec_state,
+    }
+
+
 def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
     if not isinstance(source_id, str) or not source_id.strip():
         raise ValueError("bureau task source id is invalid")
@@ -61,9 +140,7 @@ def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
         raise RuntimeError("Bureau task source is invalid JSON") from exc
     if not isinstance(task, dict) or task.get("id") != source_id:
         raise RuntimeError("Bureau task source identity differs")
-    state = task.get("state")
-    if state not in TERMINAL_TASK_STATES:
-        raise RuntimeError(f"Bureau task source is not terminal: {state}")
+    projection = _bureau_task_projection(source_id, control_root=control_root)
     registry_tree = checkouts._git_read(
         control_root,
         ["rev-parse", f"{control['head']}:registry"],
@@ -73,7 +150,11 @@ def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
             "schema_version": SCHEMA_VERSION,
             "kind": "bureau_task",
             "source_id": source_id,
-            "terminal_state": state,
+            "terminal_state": projection["effective_state"],
+            "git_registry_state": task.get("state"),
+            "projected_registry_state": projection["registry_state"],
+            "task_spec_state": projection["task_spec_state"],
+            "task_projection_sha256": checkouts._sha256_json(projection),
             "registry_commit": control["head"],
             "registry_tree": registry_tree,
             "task_json_sha256": checkouts._sha256_json(task),

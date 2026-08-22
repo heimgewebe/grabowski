@@ -605,11 +605,35 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual("completed_without_current_obligation", evidence["terminal_state"])
         self.assertEqual("goo-complete", evidence["obligations"][0]["obligation_id"])
 
-    def test_bureau_task_binds_current_registry_head(self) -> None:
-        task = {"id": "TASK-T001", "state": "verified"}
+    def test_bureau_json_runs_from_control_root(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["bureau"], 0, stdout=json.dumps({"result": {"tasks": []}}), stderr=""
+        )
+        with patch.object(sources.subprocess, "run", return_value=completed) as run:
+            payload = sources._bureau_json(
+                ["status-projection", "--skip-github"],
+                control_root=self.repo,
+            )
+        self.assertEqual({"result": {"tasks": []}}, payload)
+        self.assertEqual(str(self.repo), run.call_args.kwargs["cwd"])
+
+    def test_bureau_task_binds_current_registry_head_and_effective_state(self) -> None:
+        task = {"id": "TASK-T001", "state": "planned"}
         raw = json.dumps(task)
         completed = subprocess.CompletedProcess(["git"], 0, stdout=raw, stderr="")
         tree = subprocess.CompletedProcess(["git"], 0, stdout="d" * 40 + "\n", stderr="")
+        projection = {
+            "result": {
+                "tasks": [
+                    {
+                        "task_id": "TASK-T001",
+                        "effective_state": "verified",
+                        "registry_state": "planned",
+                        "task_spec_state": "ready",
+                    }
+                ]
+            }
+        }
         with (
             patch.object(
                 sources.bureau_leases,
@@ -617,11 +641,83 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
                 return_value={"head": "e" * 40, "control_root": str(self.repo)},
             ),
             patch.object(sources, "_github_json", return_value={"sha": "e" * 40}),
+            patch.object(sources, "_bureau_json", return_value=projection),
             patch.object(checkouts, "_git_read", side_effect=[completed, tree]),
         ):
             evidence = sources.bureau_task_terminal_evidence("TASK-T001")
         self.assertEqual("verified", evidence["terminal_state"])
+        self.assertEqual("planned", evidence["git_registry_state"])
+        self.assertEqual("planned", evidence["projected_registry_state"])
+        self.assertEqual("ready", evidence["task_spec_state"])
         self.assertEqual("e" * 40, evidence["registry_commit"])
+
+    def test_bureau_task_does_not_fallback_to_terminal_git_state(self) -> None:
+        task = {"id": "TASK-T001", "state": "verified"}
+        raw = json.dumps(task)
+        completed = subprocess.CompletedProcess(["git"], 0, stdout=raw, stderr="")
+        projection = {
+            "result": {
+                "tasks": [
+                    {
+                        "task_id": "TASK-T001",
+                        "effective_state": "planned",
+                        "registry_state": "verified",
+                        "task_spec_state": "ready",
+                    }
+                ]
+            }
+        }
+        with (
+            patch.object(
+                sources.bureau_leases,
+                "inspect_bureau_control_checkout",
+                return_value={"head": "e" * 40, "control_root": str(self.repo)},
+            ),
+            patch.object(sources, "_github_json", return_value={"sha": "e" * 40}),
+            patch.object(sources, "_bureau_json", return_value=projection),
+            patch.object(checkouts, "_git_read", return_value=completed),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not terminal: planned"):
+                sources.bureau_task_terminal_evidence("TASK-T001")
+
+    def test_bureau_task_projection_allows_missing_task_spec_state(self) -> None:
+        projection = {
+            "result": {
+                "tasks": [
+                    {
+                        "task_id": "TASK-T001",
+                        "effective_state": "verified",
+                        "registry_state": "verified",
+                        "task_spec_state": None,
+                    }
+                ]
+            }
+        }
+        with patch.object(sources, "_bureau_json", return_value=projection):
+            observed = sources._bureau_task_projection(
+                "TASK-T001", control_root=self.repo
+            )
+        self.assertEqual("verified", observed["effective_state"])
+        self.assertIsNone(observed["task_spec_state"])
+
+    def test_bureau_task_accepts_superseded_effective_state(self) -> None:
+        projection = {
+            "result": {
+                "tasks": [
+                    {
+                        "task_id": "TASK-T001",
+                        "effective_state": "superseded",
+                        "registry_state": "ready",
+                        "task_spec_state": "superseded",
+                    }
+                ]
+            }
+        }
+        with patch.object(sources, "_bureau_json", return_value=projection):
+            observed = sources._bureau_task_projection(
+                "TASK-T001", control_root=self.repo
+            )
+        self.assertEqual("superseded", observed["effective_state"])
 
     def test_github_issue_requires_closed_state(self) -> None:
         with patch.object(
