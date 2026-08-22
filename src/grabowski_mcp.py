@@ -9309,7 +9309,7 @@ def repoground_query(
         or availability.get("status") == "available"
     )
     strategy = str(retrieval.get("strategy") or "none")
-    return {
+    result = {
         "kind": "grabowski.repoground_query",
         "schema_version": 2,
         "repo": repo,
@@ -9359,6 +9359,9 @@ def repoground_query(
             "runtime_correctness",
         ],
     }
+    if "structured_evidence" in repoground_result:
+        result["structured_evidence"] = repoground_result["structured_evidence"]
+    return result
 
 
 @mcp.tool(name="repoground_query_existing_index", annotations=READ_ANNOTATIONS)

@@ -1993,6 +1993,43 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["ranges"][1]["file_path"], "src/second.py")
         self.assertIsNone(result["snippets"][0]["text_excerpt"])
 
+    def test_agent_query_preserves_optional_structured_evidence(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        structured_evidence = {
+            "language_structure": {
+                "evidence": {
+                    "records": [
+                        {"language": "rust", "symbol": "helper"},
+                    ]
+                },
+                "budget": {"used_bytes": 512, "hard_limit_bytes": 4096},
+            }
+        }
+        payload = {
+            "status": "available",
+            "route": "structure_only",
+            "retrieval": {"strategy": "structure_only", "match_count": 0},
+            "resolved_ranges": [],
+            "structured_evidence": structured_evidence,
+        }
+
+        with patch.object(mcp, "_repoground_agent_query", return_value=payload):
+            result = mcp.repoground_query("demo-repo", "rust helper")
+
+        self.assertIs(result["structured_evidence"], structured_evidence)
+
+        payload_without_structure = dict(payload)
+        payload_without_structure.pop("structured_evidence")
+        with patch.object(
+            mcp, "_repoground_agent_query", return_value=payload_without_structure
+        ):
+            result_without_structure = mcp.repoground_query(
+                "demo-repo", "rust helper"
+            )
+
+        self.assertNotIn("structured_evidence", result_without_structure)
+
     def test_agent_query_preserves_or_fallback_and_drops_empty_ranges(self) -> None:
         _repo, head = self._git_repo("demo-repo")
         self._write_bundle("demo-repo-max-260701-1200", commit=head)
