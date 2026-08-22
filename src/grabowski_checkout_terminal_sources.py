@@ -55,22 +55,71 @@ def _bureau_json(
     state_root = Path(
         os.environ.get("GRABOWSKI_BUREAU_COORDINATION_ROOT", str(legacy_root))
     ).expanduser()
-    completed = subprocess.run(
-        [
-            str(bureau_leases.BUREAU_CONTRACT_EXECUTABLE),
-            "--state-root",
-            str(state_root),
-            "--json",
-            *arguments,
-        ],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout_seconds,
-        cwd=str(control_root),
-        env=checkouts.operator._safe_environment(),
-    )
+    state_root = Path(os.path.abspath(os.fspath(state_root)))
+
+    runtime = bureau_leases._contract_runtime()
+    bureau_leases._assert_contract_runtime_unchanged(runtime)
+    contract_arguments = [
+        "--state-root",
+        str(state_root),
+        "--json",
+        *arguments,
+    ]
+    descriptor = -1
+    try:
+        if runtime["runtime_kind"] == "legacy-venv":
+            wrapper_binding = json.dumps(
+                {
+                    "module_paths": {
+                        name: str(path)
+                        for name, path in runtime["module_paths"].items()
+                    },
+                    "package_files": {
+                        relative: {
+                            "path": str(runtime["package_paths"][relative]),
+                            "sha256": identity["sha256"],
+                        }
+                        for relative, identity in runtime[
+                            "package_identities"
+                        ].items()
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            argv = [
+                str(runtime["python_launcher"]),
+                "-I",
+                "-c",
+                bureau_leases._CONTRACT_WRAPPER,
+                wrapper_binding,
+                *contract_arguments,
+            ]
+            pass_fds: tuple[int, ...] = ()
+        else:
+            descriptor = bureau_leases._open_bound_launcher(runtime)
+            argv = [
+                str(runtime["python_launcher"]),
+                "-I",
+                f"/proc/self/fd/{descriptor}",
+                *contract_arguments,
+            ]
+            pass_fds = (descriptor,)
+        completed = subprocess.run(
+            argv,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            cwd=str(control_root),
+            env=bureau_leases._safe_environment(),
+            pass_fds=pass_fds,
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    bureau_leases._assert_contract_runtime_unchanged(runtime)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()
         raise RuntimeError(detail or "Bureau status projection failed")

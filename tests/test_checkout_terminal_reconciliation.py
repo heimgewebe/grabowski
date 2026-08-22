@@ -605,16 +605,95 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual("completed_without_current_obligation", evidence["terminal_state"])
         self.assertEqual("goo-complete", evidence["obligations"][0]["obligation_id"])
 
-    def test_bureau_json_runs_from_control_root(self) -> None:
+    def test_bureau_json_runs_bound_runtime_from_control_root(self) -> None:
         completed = subprocess.CompletedProcess(
             ["bureau"], 0, stdout=json.dumps({"result": {"tasks": []}}), stderr=""
         )
-        with patch.object(sources.subprocess, "run", return_value=completed) as run:
+        runtime = {
+            "runtime_kind": "managed-manifest",
+            "python_launcher": Path("/runtime/python"),
+        }
+        state_root = self.repo / "coordination"
+        with (
+            patch.dict(
+                sources.os.environ,
+                {"GRABOWSKI_BUREAU_COORDINATION_ROOT": str(state_root)},
+                clear=False,
+            ),
+            patch.object(
+                sources.bureau_leases, "_contract_runtime", return_value=runtime
+            ),
+            patch.object(
+                sources.bureau_leases, "_assert_contract_runtime_unchanged"
+            ) as assert_runtime,
+            patch.object(
+                sources.bureau_leases, "_open_bound_launcher", return_value=17
+            ),
+            patch.object(
+                sources.bureau_leases, "_safe_environment", return_value={"PATH": "/runtime"}
+            ),
+            patch.object(sources.os, "close") as close,
+            patch.object(sources.subprocess, "run", return_value=completed) as run,
+        ):
             payload = sources._bureau_json(
                 ["status-projection", "--skip-github"],
                 control_root=self.repo,
             )
         self.assertEqual({"result": {"tasks": []}}, payload)
+        self.assertEqual(2, assert_runtime.call_count)
+        self.assertEqual(
+            [
+                "/runtime/python",
+                "-I",
+                "/proc/self/fd/17",
+                "--state-root",
+                str(state_root),
+                "--json",
+                "status-projection",
+                "--skip-github",
+            ],
+            run.call_args.args[0],
+        )
+        self.assertEqual(str(self.repo), run.call_args.kwargs["cwd"])
+        self.assertEqual((17,), run.call_args.kwargs["pass_fds"])
+        close.assert_called_once_with(17)
+
+    def test_bureau_json_resolves_relative_coordination_root_before_chdir(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["bureau"], 0, stdout=json.dumps({"result": {"tasks": []}}), stderr=""
+        )
+        runtime = {
+            "runtime_kind": "managed-manifest",
+            "python_launcher": Path("/runtime/python"),
+        }
+        expected_state_root = Path(os.path.abspath("relative-state-root"))
+        with (
+            patch.dict(
+                sources.os.environ,
+                {"GRABOWSKI_BUREAU_COORDINATION_ROOT": "relative-state-root"},
+                clear=False,
+            ),
+            patch.object(
+                sources.bureau_leases, "_contract_runtime", return_value=runtime
+            ),
+            patch.object(
+                sources.bureau_leases, "_assert_contract_runtime_unchanged"
+            ),
+            patch.object(
+                sources.bureau_leases, "_open_bound_launcher", return_value=18
+            ),
+            patch.object(sources.bureau_leases, "_safe_environment", return_value={}),
+            patch.object(sources.os, "close"),
+            patch.object(sources.subprocess, "run", return_value=completed) as run,
+        ):
+            sources._bureau_json(
+                ["status-projection", "--skip-github"],
+                control_root=self.repo,
+            )
+        argv = run.call_args.args[0]
+        self.assertEqual(
+            str(expected_state_root), argv[argv.index("--state-root") + 1]
+        )
         self.assertEqual(str(self.repo), run.call_args.kwargs["cwd"])
 
     def test_bureau_task_binds_current_registry_head_and_effective_state(self) -> None:
