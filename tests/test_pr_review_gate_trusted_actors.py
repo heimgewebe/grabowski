@@ -206,6 +206,86 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
 
+    def test_registry_freshness_accepts_exact_external_id_when_github_strips_query(self) -> None:
+        state, paths = _registry_state()
+        state["checks"].append(
+            {
+                "bucket": "pass",
+                "name": FRESHNESS,
+                "link": "https://github.com/heimgewebe/bureau/runs/123",
+                "baseBindingEvidence": {
+                    "name": FRESHNESS,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_sha": HEAD,
+                    "external_id": f"registry-freshness:58:{HEAD}:{BASE}",
+                    "app_slug": "github-actions",
+                },
+            }
+        )
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=paths),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+
+    def test_registry_freshness_external_id_fails_closed_on_wrong_identity_or_app(self) -> None:
+        cases = (
+            (f"registry-freshness:59:{HEAD}:{BASE}", HEAD, "github-actions"),
+            (f"registry-freshness:58:{HEAD}:{BASE}", "d" * 40, "github-actions"),
+            (f"registry-freshness:58:{HEAD}:{'e' * 40}", HEAD, "github-actions"),
+            (f"registry-freshness:58:{HEAD}:{BASE}", HEAD, "other-app"),
+        )
+        for external_id, observed_head, app_slug in cases:
+            with self.subTest(external_id=external_id, observed_head=observed_head, app_slug=app_slug):
+                state, paths = _registry_state()
+                state["checks"].append(
+                    {
+                        "bucket": "pass",
+                        "name": FRESHNESS,
+                        "link": "https://github.com/heimgewebe/bureau/runs/123",
+                        "baseBindingEvidence": {
+                            "name": FRESHNESS,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "head_sha": observed_head,
+                            "external_id": external_id,
+                            "app_slug": app_slug,
+                        },
+                    }
+                )
+                result = pr_review_gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(reviewed_files=paths),
+                    expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+                )
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertIn(
+                    f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+                    result["failures"],
+                )
+
+    def test_github_check_run_id_is_repo_bound(self) -> None:
+        self.assertEqual(
+            pr_review_gate._github_check_run_id(
+                "https://github.com/heimgewebe/bureau/runs/97025223152",
+                repo_slug="heimgewebe/bureau",
+            ),
+            97025223152,
+        )
+        for link in (
+            "https://github.com/other/bureau/runs/97025223152",
+            "https://example.com/heimgewebe/bureau/runs/97025223152",
+            "https://github.com/heimgewebe/bureau/actions/runs/97025223152",
+        ):
+            self.assertIsNone(
+                pr_review_gate._github_check_run_id(link, repo_slug="heimgewebe/bureau")
+            )
+
     def test_any_registry_task_path_keeps_freshness_base_binding_strict(self) -> None:
         state, paths = _registry_state(include_non_registry=True)
         state["checks"].append(
