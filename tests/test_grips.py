@@ -1955,15 +1955,15 @@ class GripFoundationTests(unittest.TestCase):
             "runtime-deployment", target, "t121-grip-runtime-settle"
         )
 
-        child_output = {"ready": True}
+        child_output = {"ready": True, "message": "bereit – grün"}
         child_receipt = {
             "kind": "grabowski.operator_grip_receipt",
             "schema_version": 1,
             "grip": {"name": "runtime-deploy-check"},
             "status": "passed",
-            "output_sha256": sagas.sha256_json(child_output),
+            "output_sha256": grips.sha256_json(child_output),
         }
-        child_receipt["receipt_sha256"] = sagas.sha256_json(child_receipt)
+        child_receipt["receipt_sha256"] = grips.sha256_json(child_receipt)
         mechanic_output = {
             "requested_action_count": 1,
             "executed_action_count": 1,
@@ -1989,9 +1989,9 @@ class GripFoundationTests(unittest.TestCase):
             "schema_version": 1,
             "grip": {"name": "mechanic-loop"},
             "status": "passed",
-            "output_sha256": sagas.sha256_json(mechanic_output),
+            "output_sha256": grips.sha256_json(mechanic_output),
         }
-        mechanic_receipt["receipt_sha256"] = sagas.sha256_json(mechanic_receipt)
+        mechanic_receipt["receipt_sha256"] = grips.sha256_json(mechanic_receipt)
         run = sagas.build_run_receipt(
             plan,
             {
@@ -2000,6 +2000,7 @@ class GripFoundationTests(unittest.TestCase):
                 "receipt": mechanic_receipt,
                 "output": mechanic_output,
             },
+            receipt_sha256_json=grips.sha256_json,
         )
 
         captain_output = {
@@ -2025,9 +2026,9 @@ class GripFoundationTests(unittest.TestCase):
             "schema_version": 1,
             "grip": {"name": "captain-run"},
             "status": "passed",
-            "output_sha256": sagas.sha256_json(captain_output),
+            "output_sha256": grips.sha256_json(captain_output),
         }
-        captain_receipt["receipt_sha256"] = sagas.sha256_json(captain_receipt)
+        captain_receipt["receipt_sha256"] = grips.sha256_json(captain_receipt)
         captain = {
             "status": "passed",
             "receipt_sha256": captain_receipt["receipt_sha256"],
@@ -2049,7 +2050,7 @@ class GripFoundationTests(unittest.TestCase):
             "intent_record_sha256": "c" * 64,
             "completion_record_sha256": "d" * 64,
             "action": "runtime-deploy",
-            "target_sha256": sagas.sha256_json(plan["captain_handoff"]["target"]),
+            "target_sha256": grips.sha256_json(plan["captain_handoff"]["target"]),
             "expected_head": "a" * 40,
             "expected_base": None,
             "expected_base_sha": None,
@@ -2059,10 +2060,16 @@ class GripFoundationTests(unittest.TestCase):
         }
         audit_binding = {
             **binding_body,
-            "binding_sha256": sagas.sha256_json(binding_body),
+            "binding_sha256": grips.sha256_json(binding_body),
         }
-        with patch.object(
-            grips, "_saga_captain_audit_binding", return_value=audit_binding
+        with (
+            patch.object(
+                grips, "_saga_captain_audit_binding", return_value=audit_binding
+            ),
+            patch(
+                "grabowski_read_surface.grabowski_deployment_identity",
+                return_value=readback,
+            ) as deployment_identity,
         ):
             settled = grips.grip_run(
                 "saga-settle",
@@ -2073,15 +2080,85 @@ class GripFoundationTests(unittest.TestCase):
                     "expected_plan_sha256": plan["plan_sha256"],
                     "run_receipt": run,
                     "captain_result": captain,
-                    "readback": readback,
                 },
                 profile="observer",
+                github_runner=FakeGh(),
             )
         self.assertEqual("passed", settled["status"])
         self.assertEqual("settled", settled["output"]["state"])
         self.assertEqual(
+            "grabowski-deployment-identity",
+            settled["output"]["live_readback_source"],
+        )
+        deployment_identity.assert_called_once_with()
+        self.assertEqual(
             captain_receipt["receipt_sha256"],
             settled["output"]["captain_receipt_sha256"],
+        )
+
+    def test_saga_settle_rejects_caller_supplied_readback(self) -> None:
+        target = {
+            "repository_path": str(Path(__file__).resolve().parents[1]),
+            "repository": "heimgewebe/grabowski",
+            "adapter": "grabowski-self",
+            "runtime_target": "heim-pc",
+            "expected_head": "a" * 40,
+        }
+        plan = sagas.build_plan(
+            "runtime-deployment", target, "t121-grip-runtime-settle-untrusted"
+        )
+        result = grips.grip_run(
+            "saga-settle",
+            {
+                "saga_kind": "runtime-deployment",
+                "target": target,
+                "idempotency_key": "t121-grip-runtime-settle-untrusted",
+                "expected_plan_sha256": plan["plan_sha256"],
+                "run_receipt": {},
+                "captain_result": {},
+                "readback": {"identity": {"repo_head": "a" * 40}},
+            },
+            profile="observer",
+            github_runner=FakeGh(),
+        )
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("unknown parameter(s): readback", result["output"]["error"])
+
+    def test_saga_pr_live_readback_uses_exact_planned_pr_identity(self) -> None:
+        target = {
+            "repository_path": str(Path(__file__).resolve().parents[1]),
+            "repository": "heimgewebe/grabowski",
+            "pr": 876,
+            "base": "main",
+            "expected_head": "a" * 40,
+            "expected_base_sha": "b" * 40,
+            "bureau_run_id": "BUR-RUN-20260821T130302Z-9eb40cfeb0",
+            "merge_method": "squash",
+        }
+        plan = sagas.build_plan("pr-settlement", target, "t121-pr-live-readback")
+        view = {
+            "number": 876,
+            "state": "MERGED",
+            "baseRefName": "main",
+            "headRefOid": "a" * 40,
+            "mergeCommit": {"oid": "d" * 40},
+        }
+        github = FakeGh(view=view)
+        readback, source = grips._saga_live_readback(plan, github)
+        self.assertEqual("github-pr-view", source)
+        self.assertEqual(view["number"], readback["number"])
+        self.assertEqual(view["headRefOid"], readback["headRefOid"])
+        self.assertIn(
+            (
+                "pr",
+                "view",
+                "876",
+                "--repo",
+                "heimgewebe/grabowski",
+                "--json",
+                "number,state,baseRefName,headRefOid,mergeCommit",
+            ),
+            github.calls,
         )
 
     def test_saga_captain_audit_binding_requires_verified_server_records(self) -> None:

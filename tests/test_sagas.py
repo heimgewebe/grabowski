@@ -192,6 +192,9 @@ class SagaContractTests(unittest.TestCase):
         self.assertEqual("captain-run", plan["captain_handoff"]["grip"])
         self.assertEqual("pr-merge", plan["captain_handoff"]["action"])
         self.assertEqual(HEAD, plan["expected_identity"]["expected_head"])
+        readiness = plan["mechanic_actions"][1]
+        self.assertEqual("pr-check-readiness", readiness["action"])
+        self.assertEqual(HEAD, readiness["parameters"]["expected_head"])
         self.assertEqual(plan, sagas.validate_plan(plan))
         self.assertIn("cross-system-atomicity", plan["does_not_establish"])
 

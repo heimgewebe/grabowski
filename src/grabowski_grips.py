@@ -724,10 +724,10 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "expected_plan_sha256",
             "run_receipt",
             "captain_result",
-            "readback",
         ),
         acceptance_ids=("plan-run-captain-bound", "captain-audit-bound", "live-readback-bound", "partial-failure-explicit", "authority-preserved"),
         runner="saga_settle",
+        uses_github=True,
     ),
     "captain-preflight": GripSpec(
         name="captain-preflight",
@@ -9160,7 +9160,11 @@ def _run_saga_run(
         github_runner=github_runner,
     )
     try:
-        run_receipt = grabowski_grip_orchestration.build_run_receipt(plan, mechanic)
+        run_receipt = grabowski_grip_orchestration.build_run_receipt(
+            plan,
+            mechanic,
+            receipt_sha256_json=sha256_json,
+        )
     except grabowski_grip_orchestration.SagaError as exc:
         raise GripActionError(str(exc)) from exc
     child_hashes = run_receipt.get("child_receipt_sha256s")
@@ -9271,7 +9275,10 @@ def _saga_captain_audit_binding(
     captain_result = dict(captain_result_value)
     try:
         receipt, _output = grabowski_grip_orchestration._validate_grip_result(
-            captain_result, expected_grip="captain-run", field="captain_result"
+            captain_result,
+            expected_grip="captain-run",
+            field="captain_result",
+            receipt_sha256_json=sha256_json,
         )
     except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
@@ -9299,7 +9306,7 @@ def _saga_captain_audit_binding(
     expected_common = {
         "kind": "grabowski_captain_run_audit",
         "action": plan["captain_handoff"]["action"],
-        "target_sha256": grabowski_grip_orchestration.sha256_json(plan["captain_handoff"]["target"]),
+        "target_sha256": sha256_json(plan["captain_handoff"]["target"]),
         "expected_head": expected_identity["expected_head"],
         "expected_base": expected_base,
         "expected_base_sha": expected_base_sha,
@@ -9347,11 +9354,49 @@ def _saga_captain_audit_binding(
     return {**body, "binding_sha256": sha256_json(body)}
 
 
+def _saga_live_readback(
+    plan: dict[str, Any], github_runner: GithubRunner
+) -> tuple[dict[str, Any], str]:
+    target = plan["target"]
+    expected = plan["expected_identity"]
+    if plan["saga_kind"] == "pr-settlement":
+        result = _github(
+            Path(str(target["repository_path"])),
+            github_runner,
+            [
+                "pr",
+                "view",
+                str(expected["pr"]),
+                "--repo",
+                str(expected["repository"]),
+                "--json",
+                "number,state,baseRefName,headRefOid,mergeCommit",
+            ],
+        )
+        readback = _json_stdout(result)
+        if not isinstance(readback, dict):
+            raise GripActionError("typed PR readback must be a JSON object")
+        return dict(readback), "github-pr-view"
+
+    try:
+        import grabowski_read_surface
+
+        readback = grabowski_read_surface.grabowski_deployment_identity()
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise GripActionError(
+            f"typed deployment identity readback failed: {type(exc).__name__}"
+        ) from exc
+    if not isinstance(readback, dict):
+        raise GripActionError("typed deployment identity readback must be an object")
+    return dict(readback), "grabowski-deployment-identity"
+
+
 def _run_saga_settle(
     spec: GripSpec,
     parameters: dict[str, Any],
     receipt: Receipt,
     runner: CommandRunner,
+    github_runner: GithubRunner,
 ) -> dict[str, Any]:
     del spec, runner
     _saga_allowed_parameters(
@@ -9363,7 +9408,6 @@ def _run_saga_settle(
             "expected_plan_sha256",
             "run_receipt",
             "captain_result",
-            "readback",
         },
     )
     plan = _saga_plan_from_parameters(parameters)
@@ -9371,13 +9415,15 @@ def _run_saga_settle(
     captain_audit_binding = _saga_captain_audit_binding(
         plan, parameters.get("captain_result")
     )
+    readback, readback_source = _saga_live_readback(plan, github_runner)
     try:
         settlement = grabowski_grip_orchestration.settle(
             plan_value=plan,
             run_receipt_value=parameters.get("run_receipt"),
             captain_result_value=parameters.get("captain_result"),
             captain_audit_binding_value=captain_audit_binding,
-            readback_value=parameters.get("readback"),
+            readback_value=readback,
+            receipt_sha256_json=sha256_json,
         )
     except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
@@ -9392,7 +9438,7 @@ def _run_saga_settle(
         receipt,
         "live-readback-bound",
         "pass" if _is_sha256_hex(settlement.get("readback_sha256")) else "fail",
-        str(settlement.get("state")),
+        readback_source,
     )
     explicit = settlement.get("state") in {
         "settled",
@@ -9407,7 +9453,7 @@ def _run_saga_settle(
         "pass",
         "settlement is read-only; Captain remains the sole high-impact apply authority",
     )
-    return settlement
+    return {**settlement, "live_readback_source": readback_source}
 
 
 def _captain_wildcardish(value: Any) -> bool:

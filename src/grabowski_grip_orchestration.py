@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import hashlib
 import json
@@ -10,6 +10,7 @@ import re
 import grabowski_merge_guard
 
 CoreModule = Any
+ReceiptHasher = Callable[[Any], str]
 
 CAPTAIN_GATE_DETAIL_MAX_ITEMS = 32
 CAPTAIN_GATE_DETAIL_PREVIEW_LIMIT = 256
@@ -788,7 +789,10 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
         mechanic_actions.append(
             _mechanic_action(
                 "pr-check-readiness",
-                parameters={"repo": normalized["repository_path"]},
+                parameters={
+                    "repo": normalized["repository_path"],
+                    "expected_head": normalized["expected_head"],
+                },
                 target={
                     "repository": normalized["repository"],
                     "pr": normalized["pr"],
@@ -986,6 +990,7 @@ def _validate_grip_result(
     *,
     expected_grip: str,
     field: str,
+    receipt_sha256_json: ReceiptHasher | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     result = _bounded_mapping(value, field)
     receipt = _bounded_mapping(result.get("receipt"), f"{field}.receipt")
@@ -998,15 +1003,16 @@ def _validate_grip_result(
         or grip.get("name") != expected_grip
     ):
         raise SagaError(f"{field} lacks a canonical {expected_grip} receipt")
+    receipt_hasher = receipt_sha256_json or sha256_json
     receipt_sha = _sha256(receipt.get("receipt_sha256"), f"{field}.receipt.receipt_sha256")
-    expected_receipt_sha = sha256_json(
+    expected_receipt_sha = receipt_hasher(
         {key: item for key, item in receipt.items() if key != "receipt_sha256"}
     )
     if receipt_sha != expected_receipt_sha:
         raise SagaError(f"{field} receipt digest mismatch")
     if result.get("receipt_sha256") != receipt_sha:
         raise SagaError(f"{field} top-level receipt digest mismatch")
-    if receipt.get("output_sha256") != sha256_json(output):
+    if receipt.get("output_sha256") != receipt_hasher(output):
         raise SagaError(f"{field} output digest mismatch")
     if result.get("status") != receipt.get("status"):
         raise SagaError(f"{field} status differs from its receipt")
@@ -1014,12 +1020,17 @@ def _validate_grip_result(
 
 
 def _validate_mechanic_result(
-    plan: dict[str, Any], mechanic_result: Any
+    plan: dict[str, Any],
+    mechanic_result: Any,
+    *,
+    receipt_sha256_json: ReceiptHasher | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    receipt_hasher = receipt_sha256_json or sha256_json
     receipt, output = _validate_grip_result(
         mechanic_result,
         expected_grip="mechanic-loop",
         field="mechanic_result",
+        receipt_sha256_json=receipt_hasher,
     )
     planned_actions = plan["mechanic_actions"]
     child_actions = output.get("actions")
@@ -1074,13 +1085,13 @@ def _validate_mechanic_result(
             child_receipt.get("receipt_sha256"),
             f"mechanic_result.actions[{index}].receipt.receipt_sha256",
         )
-        if child_sha != sha256_json(
+        if child_sha != receipt_hasher(
             {key: item for key, item in child_receipt.items() if key != "receipt_sha256"}
         ):
             raise SagaError(f"mechanic_result.actions[{index}] child receipt digest mismatch")
         if record.get("child_receipt_sha256") != child_sha:
             raise SagaError(f"mechanic_result.actions[{index}] child receipt binding mismatch")
-        if child_receipt.get("output_sha256") != sha256_json(child_output):
+        if child_receipt.get("output_sha256") != receipt_hasher(child_output):
             raise SagaError(f"mechanic_result.actions[{index}] child output digest mismatch")
         if record.get("receipt_status") != child_receipt.get("status"):
             raise SagaError(f"mechanic_result.actions[{index}] child status mismatch")
@@ -1101,9 +1112,18 @@ def _validate_mechanic_result(
     return receipt, output, child_receipts
 
 
-def build_run_receipt(plan_value: Any, mechanic_result: Any) -> dict[str, Any]:
+def build_run_receipt(
+    plan_value: Any,
+    mechanic_result: Any,
+    *,
+    receipt_sha256_json: ReceiptHasher | None = None,
+) -> dict[str, Any]:
     plan = validate_plan(plan_value)
-    receipt, output, child_receipts = _validate_mechanic_result(plan, mechanic_result)
+    receipt, output, child_receipts = _validate_mechanic_result(
+        plan,
+        mechanic_result,
+        receipt_sha256_json=receipt_sha256_json,
+    )
     prepare_passed = receipt.get("status") == "passed" and output.get("complete") is True
     state = "captain_required" if prepare_passed else "prepare_blocked"
     body = {
@@ -1187,11 +1207,13 @@ def _captain_outcome(
     captain_result: dict[str, Any],
     *,
     plan: dict[str, Any],
+    receipt_sha256_json: ReceiptHasher | None = None,
 ) -> tuple[str, dict[str, Any] | None, str | None, str]:
     receipt, output = _validate_grip_result(
         captain_result,
         expected_grip="captain-run",
         field="captain_result",
+        receipt_sha256_json=receipt_sha256_json,
     )
     actions = output.get("actions")
     executions = output.get("executions")
@@ -1234,11 +1256,16 @@ def validate_captain_audit_binding(
     *,
     plan_value: Any,
     captain_result_value: Any,
+    receipt_sha256_json: ReceiptHasher | None = None,
 ) -> dict[str, Any]:
     plan = validate_plan(plan_value)
     captain = _bounded_mapping(captain_result_value, "captain_result")
+    receipt_hasher = receipt_sha256_json or sha256_json
     receipt, _output = _validate_grip_result(
-        captain, expected_grip="captain-run", field="captain_result"
+        captain,
+        expected_grip="captain-run",
+        field="captain_result",
+        receipt_sha256_json=receipt_hasher,
     )
     binding = _bounded_mapping(value, "captain_audit_binding")
     required = {
@@ -1258,7 +1285,7 @@ def validate_captain_audit_binding(
     binding_sha = _sha256(
         binding.get("binding_sha256"), "captain_audit_binding.binding_sha256"
     )
-    if binding_sha != sha256_json(
+    if binding_sha != receipt_hasher(
         {key: item for key, item in binding.items() if key != "binding_sha256"}
     ):
         raise SagaError("captain_audit_binding digest mismatch")
@@ -1269,7 +1296,7 @@ def validate_captain_audit_binding(
     expected_base_sha = expected_identity.get("expected_base_sha") if plan["saga_kind"] == "pr-settlement" else None
     expected_values = {
         "action": plan["captain_handoff"]["action"],
-        "target_sha256": sha256_json(plan["captain_handoff"]["target"]),
+        "target_sha256": receipt_hasher(plan["captain_handoff"]["target"]),
         "expected_head": expected_identity["expected_head"],
         "expected_base": expected_base,
         "expected_base_sha": expected_base_sha,
@@ -1332,6 +1359,7 @@ def settle(
     captain_result_value: Any,
     captain_audit_binding_value: Any,
     readback_value: Any,
+    receipt_sha256_json: ReceiptHasher | None = None,
 ) -> dict[str, Any]:
     plan = validate_plan(plan_value)
     run = validate_run_receipt(run_receipt_value, plan_value=plan)
@@ -1340,12 +1368,15 @@ def settle(
         captain_audit_binding_value,
         plan_value=plan,
         captain_result_value=captain,
+        receipt_sha256_json=receipt_sha256_json,
     )
     readback = _bounded_mapping(readback_value, "readback")
     if run.get("captain_ready") is not True or run.get("state") != "captain_required":
         raise SagaError("blocked saga run cannot be settled as an applied saga")
     captain_state, execution, captain_reason, captain_receipt_sha256 = _captain_outcome(
-        captain, plan=plan
+        captain,
+        plan=plan,
+        receipt_sha256_json=receipt_sha256_json,
     )
     if captain_state == "blocked":
         state = "apply_blocked"
