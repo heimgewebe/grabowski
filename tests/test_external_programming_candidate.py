@@ -75,7 +75,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "claude"
                 else "antigravity-gemini-flash-medium"
                 if provider == "antigravity"
-                else "grok-4.5-review-high"
+                else "grok-4.6-review-high"
                 if provider == "grok"
                 else "codex-sol-high"
             )
@@ -84,7 +84,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "claude"
                 else "gemini-3.5-flash"
                 if provider == "antigravity"
-                else "grok-4.5"
+                else "grok-4.6"
                 if provider == "grok"
                 else "gpt-5.6-sol"
             )
@@ -102,7 +102,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "claude"
                 else ["agy", "--model", "gemini-3.5-flash-medium"]
                 if provider == "antigravity"
-                else ["grok", "--model", "grok-4.5"]
+                else ["grok", "--model", "grok-4.6"]
                 if provider == "grok"
                 else ["codexr", "architecture"]
             )
@@ -264,7 +264,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             wrapper.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
             wrapper.chmod(0o755)
             executable = candidate_tool.resolve_provider_executable(
-                ["grok", "--model", "grok-4.5"],
+                ["grok", "--model", "grok-4.6"],
                 packet={"schema_version": 3, "provider": "grok"},
                 environment={"HOME": str(home), "PATH": str(wrapper_directory)},
             )
@@ -318,7 +318,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 max_budget_usd=0,
                 prompt_path=prompt,
             )
-        self.assertEqual(command[:3], ["grok", "--model", "grok-4.5"])
+        self.assertEqual(command[:3], ["grok", "--model", "grok-4.6"])
         self.assertNotIn("--single", command)
         self.assertEqual(command[command.index("--prompt-file") + 1], str(prompt))
         self.assertEqual(command[command.index("--max-turns") + 1], "1")
