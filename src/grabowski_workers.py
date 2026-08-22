@@ -4864,6 +4864,24 @@ def _prior_observation_summary(record: dict[str, Any]) -> dict[str, Any] | None:
     return summary or None
 
 
+def _browser_private_cleanup_pending(record: dict[str, Any]) -> bool:
+    if record.get("kind") != "browser":
+        return False
+    target = (
+        WORKER_STATE
+        / "instances"
+        / str(record["worker_id"])
+        / BROWSER_BIDI_SESSION_NAME
+    )
+    try:
+        os.lstat(target)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _reconcile_stopped_record(
     record: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -4876,7 +4894,19 @@ def _reconcile_stopped_record(
     if isinstance(terminalization, dict):
         unit_reset = terminalization.get("unit_reset")
         if isinstance(unit_reset, dict) and _terminalization_settled(observation):
-            return record, observation
+            if not _browser_private_cleanup_pending(record):
+                return record, observation
+            terminalization = dict(terminalization)
+            terminalization["cleanup"] = _cleanup(record)
+            observation = {
+                **observation,
+                "observed_at_unix": _now(),
+                "terminalization": terminalization,
+            }
+            stored = _update(
+                record["worker_id"], "stopped", observation=observation
+            )
+            return stored, observation
         if _terminalization_core_complete(terminalization):
             terminalization = dict(terminalization)
             observation = {**observation, "terminalization": terminalization}

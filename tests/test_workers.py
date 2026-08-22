@@ -2345,6 +2345,31 @@ globalThis.fetch = async () => ({
         self.assertEqual(terminalization["cleanup"]["status"], "completed")
         self.assertIn(str(session_path), terminalization["cleanup"]["removed"])
 
+    def test_stopped_status_reconciles_legacy_bidi_session_file(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9384, runtime_seconds=60)
+        worker = started["worker"]
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(stopped["worker"]["state"], "stopped")
+        record = workers._row(worker["worker_id"])
+        session_path = workers._write_private_worker_json(
+            Path(record["config_path"]).parent,
+            workers.BROWSER_BIDI_SESSION_NAME,
+            {"schema_version": 1, "session_id": "legacy-dead-session"},
+        )
+        self.assertTrue(session_path.is_file())
+
+        reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
+
+        self.assertEqual(reconciled["state"], "stopped")
+        self.assertFalse(session_path.exists())
+        cleanup = reconciled["last_observation"]["terminalization"]["cleanup"]
+        self.assertEqual(cleanup["status"], "completed")
+        self.assertIn(str(session_path), cleanup["removed"])
+
     def test_stop_unlinks_bidi_session_symlink_without_following_target(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()
