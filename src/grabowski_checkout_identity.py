@@ -802,6 +802,7 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
 
         evidence = _load_evidence(connection, checkout_key, now)
         current = _current_generation(connection, checkout_key)
+        supersession_binding_generation = current
         if current is not None and current["state"] in {"reserved", "blocking"}:
             raise CheckoutIdentityConflict(
                 "checkout path has an unfinished identity transition that requires reconciliation"
@@ -866,7 +867,9 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
                     supersession,
                     inputs=prepared_inputs,
                     evidence=evidence,
-                    prior_generation=prior_generation,
+                    prior_generation=(
+                        supersession_binding_generation or prior_generation
+                    ),
                 )
             _active_slot_available(
                 connection,

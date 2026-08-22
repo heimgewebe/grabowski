@@ -470,7 +470,11 @@ class CheckoutIdentityTests(unittest.TestCase):
             branch="replacement-topic",
             idempotency_key="handoff-after-archive-evolution",
         )
-        inputs["identity_supersession"] = self._supersession(archived, inputs)
+        inputs["identity_supersession"] = self._supersession(
+            archived,
+            inputs,
+            expected_generation_id=old_generation_id,
+        )
         reservation = identity.prepare(inputs)
         self.assertEqual("supersession", reservation["action"])
         self.assertEqual("reserved", reservation["state"])
