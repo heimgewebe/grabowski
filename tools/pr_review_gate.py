@@ -3386,6 +3386,20 @@ def resolve_inside_repo(repo: Path, raw: str | None, *, label: str = "self-revie
     return resolved
 
 
+def _sanitize_for_log(value: Any) -> str:
+    text = str(value)
+    patterns = [
+        r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization)\s*[:=]\s*([^\s,;]+)",
+        r"(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+\b",
+        r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b",
+        r"\b[A-Za-z0-9+/]{32,}={0,2}\b",
+        r"\b[0-9a-fA-F]{32,}\b",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "[REDACTED]", text)
+    return text
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -3463,9 +3477,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(result["verdict"])
         for item in result.get("failures", []):
-            print(f"BLOCK: {item}")
+            print(f"BLOCK: {_sanitize_for_log(item)}")
         for item in result.get("warnings", []):
-            print(f"WARN: {item}")
+            print(f"WARN: {_sanitize_for_log(item)}")
     return 0 if result.get("verdict") == "PASS" else 2
 
 
