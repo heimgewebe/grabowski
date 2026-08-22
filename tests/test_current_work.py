@@ -662,7 +662,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(binding_ref["phase"], "active")
         self.assertTrue(binding_ref["consistent"])
 
-    def test_managed_active_checkout_without_retention_is_blocking(self) -> None:
+    def test_managed_active_checkout_without_retention_is_hygiene(self) -> None:
         owner = "operator:managed-expired"
         result = project(
             checkout_payloads=[
@@ -682,10 +682,120 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             ]
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "blocking")
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
+        self.assertTrue(group["action_required"])
         self.assertIn(
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
+        self.assertEqual(
+            group["next_convergence_action"],
+            "reconcile managed active lifecycle attention without treating it as coordination blocking",
+        )
+
+    def test_managed_active_checkout_with_process_remains_active(self) -> None:
+        owner = "operator:managed-live"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-live",
+                            "/home/alex/repos/.worktrees/managed-live",
+                            processes=[{"pid": 42, "command": "python"}],
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "active")
+        self.assertEqual(group["work_class"], "operational")
+        self.assertTrue(group["action_required"])
+        self.assertIn(
+            "managed-active-lifecycle-attention", group["action_reasons"]
+        )
+        self.assertEqual(
+            group["next_convergence_action"],
+            "monitor active work execution and reconcile managed active lifecycle attention",
+        )
+
+    def test_managed_active_mixed_stale_and_live_checkout_remains_operational(self) -> None:
+        owner = "operator:managed-mixed"
+        stale = checkout(
+            "managed-stale",
+            "/home/alex/repos/.worktrees/managed-stale",
+            lifecycle_state="managed_active_attention",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=False,
+        )
+        live = checkout(
+            "managed-live",
+            "/home/alex/repos/.worktrees/managed-live",
+            lifecycle_state="retained",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=True,
+        )
+        for worktrees in ([stale, live], [live, stale]):
+            with self.subTest(order=[item["checkout_key"] for item in worktrees]):
+                result = project(
+                    checkout_payloads=[
+                        {"repository": REPOSITORY, "worktrees": worktrees}
+                    ]
+                )
+                group = result["work"][0]
+                self.assertEqual(group["projection_state"], "active")
+                self.assertEqual(group["work_class"], "operational")
+                self.assertTrue(group["action_required"])
+                self.assertIn(
+                    "managed-active-lifecycle-attention", group["action_reasons"]
+                )
+                self.assertEqual(
+                    group["next_convergence_action"],
+                    "monitor active work execution and reconcile managed active lifecycle attention",
+                )
+
+    def test_dirty_and_retained_active_group_work_class_is_order_independent(self) -> None:
+        owner = "operator:managed-dirty-mixed"
+        dirty = checkout(
+            "managed-dirty",
+            "/home/alex/repos/.worktrees/managed-dirty",
+            dirty=True,
+            lifecycle_state="managed_active_attention",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=False,
+        )
+        live = checkout(
+            "managed-retained",
+            "/home/alex/repos/.worktrees/managed-retained",
+            lifecycle_state="retained",
+            binding_owner=owner,
+            binding_phase="active",
+            retention_active=True,
+        )
+        for worktrees in ([dirty, live], [live, dirty]):
+            with self.subTest(order=[item["checkout_key"] for item in worktrees]):
+                result = project(
+                    checkout_payloads=[
+                        {"repository": REPOSITORY, "worktrees": worktrees}
+                    ]
+                )
+                group = result["work"][0]
+                self.assertEqual(group["projection_state"], "active")
+                self.assertEqual(group["work_class"], "operational")
+                self.assertTrue(group["action_required"])
+                self.assertIn("dirty-checkout-visible", group["action_reasons"])
+                self.assertIn(
+                    "managed-active-lifecycle-attention", group["action_reasons"]
+                )
 
     def test_terminal_managed_lifecycle_drift_is_hygiene_and_explained(self) -> None:
         owner = "operator:managed-drift"
