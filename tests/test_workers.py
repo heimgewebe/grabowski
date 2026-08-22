@@ -365,6 +365,8 @@ const readTransformZeroFallbackScenario = scenario === 'read-transform-zero-fall
 const readTransformZeroDescendantFallbackScenario = scenario === 'read-transform-zero-descendant-fallback';
 const readClipPathFallbackScenario = scenario === 'read-clip-path-fallback';
 const readEmbeddingOpacityFallbackScenario = scenario === 'read-embedding-opacity-fallback';
+const readOverflowClippedFallbackScenario = scenario === 'read-overflow-clipped-fallback';
+const readOverflowContainedFallbackScenario = scenario === 'read-overflow-contained-fallback';
 const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
 const scrollFallbackRevalidationFailureScenario = scenario === 'scroll-fallback-revalidation-failure';
 const activateTarget = 'https://private.invalid/issues';
@@ -402,6 +404,8 @@ function makeSemanticSnapshot(spec, child = null) {
         stringIndex(node.filter || 'none'),
         stringIndex(node.clipPath || 'none'),
         stringIndex(node.clip || 'auto'),
+        stringIndex(node.overflowX || 'visible'),
+        stringIndex(node.overflowY || 'visible'),
       ]);
       layout.bounds.push(node.bounds || [10 + nodeIndex, 10 + nodeIndex, 100, 20]);
       layout.text.push(stringIndex(node.layoutText || ''));
@@ -578,6 +582,16 @@ function fallbackSnapshot() {
     {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
     {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'embedded-' + marker},
   ]});
+  if (readOverflowClippedFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 100, nodeName: 'DIV', overflowX: 'hidden', overflowY: 'hidden', bounds: [10, 10, 0, 0]},
+    {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' '], bounds: [10, 10, 80, 30]},
+    {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'overflow-' + marker, bounds: [18, 13, 60, 20]},
+  ]);
+  if (readOverflowContainedFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 100, nodeName: 'DIV', overflowX: 'hidden', overflowY: 'hidden', bounds: [10, 10, 120, 50]},
+    {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' '], bounds: [20, 15, 80, 30]},
+    {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'Continue', bounds: [28, 18, 55, 20]},
+  ]);
   if (readDesignModeFallbackScenario) return makeSemanticSnapshot([
     {parent: -1, backendNodeId: 100, nodeName: 'HTML'},
     {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
@@ -675,7 +689,7 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
-          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
+          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readOverflowClippedFallbackScenario || readOverflowContainedFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -690,7 +704,7 @@ class FakeWebSocket {
         reply({object: {objectId: 'link-object'}});
         return;
       case 'Runtime.callFunctionOn':
-        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
+        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readOverflowClippedFallbackScenario || readOverflowContainedFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
           fail();
           return;
         }
@@ -706,7 +720,7 @@ class FakeWebSocket {
         }});
         return;
       case 'DOMSnapshot.captureSnapshot': {
-        const expectedStyles = ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip'];
+        const expectedStyles = ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y'];
         if (JSON.stringify(request.params && request.params.computedStyles) !== JSON.stringify(expectedStyles) ||
             request.params.includePaintOrder !== false || request.params.includeDOMRects !== false) {
           fail();
@@ -897,7 +911,7 @@ class FakeWebSocket {
           }});
           return;
         }
-        if (readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readMeterRoleFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario) {
+        if (readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readMeterRoleFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readOverflowClippedFallbackScenario || readOverflowContainedFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario) {
           reply({node: {
             backendNodeId: 101,
             nodeType: 1,
@@ -3992,6 +4006,9 @@ globalThis.fetch = async () => ({
         self.assertIn("function semanticLayoutVisibility", source)
         self.assertIn("normalizedClipPath", source)
         self.assertIn("normalizedClip", source)
+        self.assertIn("function semanticOverflowClipping", source)
+        self.assertIn("function semanticLayoutBoundsWithinClipping", source)
+        self.assertIn("function semanticSnapshotBoundsWithinClippingAncestors", source)
         self.assertIn("function semanticSnapshotContentDocumentOwners", source)
         self.assertIn("function semanticSnapshotEmbeddingChainVisible", source)
         self.assertIn("contentDocumentIndex", source)
@@ -4007,7 +4024,7 @@ globalThis.fetch = async () => ({
         self.assertIn("function semanticDesignModesAllOff", source)
         self.assertIn("async function captureSemanticVisibleSnapshot", source)
         self.assertIn("DOMSnapshot.captureSnapshot", source)
-        self.assertIn("computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip']", source)
+        self.assertIn("computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y']", source)
         self.assertIn("includePaintOrder: false", source)
         self.assertIn("includeDOMRects: false", source)
         self.assertIn("function semanticVisibleTextFromSnapshot", source)
@@ -4017,7 +4034,7 @@ globalThis.fetch = async () => ({
         self.assertIn("layout.bounds", source)
         self.assertIn("layout.text", source)
         self.assertIn("function semanticLayoutBoundsVisibility", source)
-        self.assertIn("width >= 0.5 && height >= 0.5", source)
+        self.assertIn("parsed.box.width >= 0.5 && parsed.box.height >= 0.5", source)
         self.assertNotIn("function boundedSemanticDomText", source)
         self.assertIn("'input', 'textarea', 'select', 'option', 'optgroup', 'output', 'meter', 'progress'", source)
         self.assertIn("'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'slider', 'spinbutton'", source)
@@ -4600,6 +4617,18 @@ globalThis.fetch = async () => ({
         self.assertEqual(execution.returncode, 0, execution.stderr)
         self.assertTrue(receipt["ok"])
         self.assertEqual(receipt["state"]["elements"][0]["name"], "")
+
+    def test_browser_semantic_node_excludes_overflow_clipped_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node("read-overflow-clipped-fallback")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "")
+
+    def test_browser_semantic_node_preserves_fully_contained_overflow_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node("read-overflow-contained-fallback")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "Continue")
 
     def test_browser_semantic_node_excludes_design_mode_editable_text(self) -> None:
         execution, receipt = self._run_browser_semantic_node("read-design-mode-fallback")

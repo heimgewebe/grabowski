@@ -2818,41 +2818,72 @@ function semanticFilterOpacityVisibility(filterText) {
   return {ok: true, visible: true};
 }
 
-function semanticLayoutBoundsVisibility(bounds) {
-  if (!Array.isArray(bounds) || bounds.length !== 4) return {ok: false, visible: false};
+function semanticLayoutBoundsBox(bounds) {
+  if (!Array.isArray(bounds) || bounds.length !== 4) return {ok: false, box: null};
   const values = bounds.map((value) => Number(value));
   if (values.some((value) => !Number.isFinite(value) || Math.abs(value) > 1000000000)) {
-    return {ok: false, visible: false};
+    return {ok: false, box: null};
   }
-  const width = values[2];
-  const height = values[3];
-  if (width < 0 || height < 0) return {ok: false, visible: false};
+  const [left, top, width, height] = values;
+  if (width < 0 || height < 0) return {ok: false, box: null};
+  const right = left + width;
+  const bottom = top + height;
+  if (![right, bottom].every((value) => Number.isFinite(value) && Math.abs(value) <= 1000000000)) {
+    return {ok: false, box: null};
+  }
+  return {ok: true, box: {left, top, right, bottom, width, height}};
+}
+
+function semanticLayoutBoundsVisibility(bounds) {
+  const parsed = semanticLayoutBoundsBox(bounds);
+  if (!parsed.ok) return {ok: false, visible: false};
   // DOMSnapshot bounds already include transforms.  Reject collapsed or
   // sub-pixel-degenerate rendered text instead of treating it as a visible label.
-  return {ok: true, visible: width >= 0.5 && height >= 0.5};
+  return {ok: true, visible: parsed.box.width >= 0.5 && parsed.box.height >= 0.5};
+}
+
+function semanticOverflowClipping(overflowText) {
+  const normalized = overflowText.trim().toLowerCase();
+  if (normalized === 'visible') return {ok: true, clips: false};
+  if (['hidden', 'clip', 'scroll', 'auto'].includes(normalized)) {
+    return {ok: true, clips: true};
+  }
+  return {ok: false, clips: true};
 }
 
 function semanticLayoutVisibility(strings, styleIndexes) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 6) return {ok: false, visible: false};
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 8) {
+    return {ok: false, visible: false, clipsX: true, clipsY: true};
+  }
   const visibility = semanticSnapshotString(strings, styleIndexes[0], 64);
   const opacityText = semanticSnapshotString(strings, styleIndexes[1], 64);
   const contentVisibility = semanticSnapshotString(strings, styleIndexes[2], 64);
   const filterText = semanticSnapshotString(strings, styleIndexes[3], 512);
   const clipPathText = semanticSnapshotString(strings, styleIndexes[4], 512);
   const clipText = semanticSnapshotString(strings, styleIndexes[5], 512);
+  const overflowXText = semanticSnapshotString(strings, styleIndexes[6], 64);
+  const overflowYText = semanticSnapshotString(strings, styleIndexes[7], 64);
   if (visibility === null || opacityText === null || contentVisibility === null ||
-      filterText === null || clipPathText === null || clipText === null) {
-    return {ok: false, visible: false};
+      filterText === null || clipPathText === null || clipText === null ||
+      overflowXText === null || overflowYText === null) {
+    return {ok: false, visible: false, clipsX: true, clipsY: true};
+  }
+  const overflowX = semanticOverflowClipping(overflowXText);
+  const overflowY = semanticOverflowClipping(overflowYText);
+  if (!overflowX.ok || !overflowY.ok) {
+    return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
   const normalizedVisibility = visibility.trim().toLowerCase();
   const normalizedContentVisibility = contentVisibility.trim().toLowerCase();
   const normalizedClipPath = clipPathText.trim().toLowerCase();
   const normalizedClip = clipText.trim().toLowerCase();
   const opacity = Number(opacityText.trim());
-  if (!Number.isFinite(opacity)) return {ok: false, visible: false};
+  if (!Number.isFinite(opacity)) {
+    return {ok: false, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
+  }
   if (['hidden', 'collapse'].includes(normalizedVisibility) ||
       normalizedContentVisibility === 'hidden' || opacity <= 0) {
-    return {ok: true, visible: false};
+    return {ok: true, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
   }
   // A non-default clipping primitive can remove all rendered pixels while
   // retaining normal layout bounds.  The semantic fallback cannot safely
@@ -2860,9 +2891,82 @@ function semanticLayoutVisibility(strings, styleIndexes) {
   // any explicit clip-path / legacy clip rather than publishing hidden text.
   if ((normalizedClipPath && normalizedClipPath !== 'none') ||
       (normalizedClip && normalizedClip !== 'auto')) {
+    return {ok: true, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
+  }
+  const filterVisibility = semanticFilterOpacityVisibility(filterText);
+  if (!filterVisibility.ok) {
+    return {ok: false, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
+  }
+  return {
+    ok: true, visible: filterVisibility.visible,
+    clipsX: overflowX.clips, clipsY: overflowY.clips,
+  };
+}
+
+function semanticLayoutBoundsWithinClipping(candidateBounds, clippingBounds, clipsX, clipsY) {
+  if (typeof clipsX !== 'boolean' || typeof clipsY !== 'boolean') {
+    return {ok: false, visible: false};
+  }
+  if (!clipsX && !clipsY) return {ok: true, visible: true};
+  const candidate = semanticLayoutBoundsBox(candidateBounds);
+  const clipping = semanticLayoutBoundsBox(clippingBounds);
+  if (!candidate.ok || !clipping.ok) return {ok: false, visible: false};
+  // Exact paint clipping can use the padding/scrollport box, which DOMSnapshot
+  // does not expose in the bounded no-DOMRects contract.  Require full
+  // containment in the rendered ancestor bounds on each clipping axis rather
+  // than guessing partial visibility.  This is intentionally fail-closed.
+  if (clipsX && (candidate.box.left < clipping.box.left ||
+      candidate.box.right > clipping.box.right)) {
     return {ok: true, visible: false};
   }
-  return semanticFilterOpacityVisibility(filterText);
+  if (clipsY && (candidate.box.top < clipping.box.top ||
+      candidate.box.bottom > clipping.box.bottom)) {
+    return {ok: true, visible: false};
+  }
+  return {ok: true, visible: true};
+}
+
+function semanticSnapshotBoundsWithinClippingAncestors(
+  document, strings, nodeIndex, layoutByNode, candidateBounds
+) {
+  const nodes = document && document.nodes ? document.nodes : null;
+  const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+  const parentIndex = nodes && Array.isArray(nodes.parentIndex) ? nodes.parentIndex : null;
+  const layout = document && document.layout ? document.layout : null;
+  const layoutStyles = layout && Array.isArray(layout.styles) ? layout.styles : null;
+  const layoutBounds = layout && Array.isArray(layout.bounds) ? layout.bounds : null;
+  if (!backendNodeIds || !parentIndex || !layoutStyles || !layoutBounds ||
+      !(layoutByNode instanceof Map) || parentIndex.length !== backendNodeIds.length ||
+      layoutStyles.length !== layoutBounds.length || !Number.isInteger(nodeIndex) ||
+      nodeIndex < 0 || nodeIndex >= backendNodeIds.length) {
+    return {ok: false, visible: false};
+  }
+  let current = nodeIndex;
+  for (let depth = 0; depth < 256; depth += 1) {
+    const layoutIndex = layoutByNode.get(current);
+    if (layoutIndex !== undefined) {
+      if (!Number.isInteger(layoutIndex) || layoutIndex < 0 ||
+          layoutIndex >= layoutStyles.length) {
+        return {ok: false, visible: false};
+      }
+      const visibility = semanticLayoutVisibility(strings, layoutStyles[layoutIndex]);
+      if (!visibility.ok) return {ok: false, visible: false};
+      if (!visibility.visible) return {ok: true, visible: false};
+      const clipping = semanticLayoutBoundsWithinClipping(
+        candidateBounds, layoutBounds[layoutIndex], visibility.clipsX, visibility.clipsY
+      );
+      if (!clipping.ok) return {ok: false, visible: false};
+      if (!clipping.visible) return {ok: true, visible: false};
+    }
+    const parent = parentIndex[current];
+    if (!Number.isInteger(parent) || parent < -1 || parent >= backendNodeIds.length ||
+        parent === current) {
+      return {ok: false, visible: false};
+    }
+    if (parent === -1) return {ok: true, visible: true};
+    current = parent;
+  }
+  return {ok: false, visible: false};
 }
 
 function semanticSnapshotTargetAncestorsLayoutVisible(
@@ -3025,6 +3129,12 @@ function semanticSnapshotEmbeddingChainVisible(documents, strings, targetDocumen
     const geometry = semanticLayoutBoundsVisibility(layoutInfo.layoutBounds[ownerLayoutIndex]);
     if (!geometry.ok) return {ok: false, visible: false};
     if (!geometry.visible) return {ok: true, visible: false};
+    const clipping = semanticSnapshotBoundsWithinClippingAncestors(
+      parentDocument, strings, owner.nodeIndex, layoutInfo.layoutByNode,
+      layoutInfo.layoutBounds[ownerLayoutIndex]
+    );
+    if (!clipping.ok) return {ok: false, visible: false};
+    if (!clipping.visible) return {ok: true, visible: false};
     const visibility = semanticSnapshotTargetAncestorsLayoutVisible(
       parentDocument, strings, owner.nodeIndex, layoutInfo.layoutByNode
     );
@@ -3115,7 +3225,7 @@ async function captureSemanticVisibleSnapshot() {
       return {ok: false, snapshot: null};
     }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
-      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip'],
+      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
@@ -3215,6 +3325,11 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
     const renderedGeometry = semanticLayoutBoundsVisibility(layoutBounds[layoutIndex]);
     if (!renderedGeometry.ok) return {ok: false, name: ''};
     if (!renderedGeometry.visible) continue;
+    const clipping = semanticSnapshotBoundsWithinClippingAncestors(
+      document, strings, nodeIndex, layoutByNode, layoutBounds[layoutIndex]
+    );
+    if (!clipping.ok) return {ok: false, name: ''};
+    if (!clipping.visible) continue;
     visitedTextLayouts += 1;
     if (visitedTextLayouts > 512) return {ok: false, name: ''};
     let allowed = true;
