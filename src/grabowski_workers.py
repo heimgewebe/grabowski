@@ -4949,7 +4949,19 @@ def worker_status(worker_id: str, *, expected_kind: str | None = None) -> dict[s
         observation = json.loads(record["last_observation_json"])
         terminalization = observation.get("terminalization")
         if _terminalization_settled(observation):
-            stored = record
+            if _browser_private_cleanup_pending(record):
+                terminalization = dict(terminalization)
+                terminalization["cleanup"] = _cleanup(record)
+                observation = {
+                    **observation,
+                    "observed_at_unix": _now(),
+                    "terminalization": terminalization,
+                }
+                stored = _update(
+                    worker_id, record["state"], observation=observation
+                )
+            else:
+                stored = record
         elif isinstance(terminalization, dict) and _terminalization_core_complete(
             terminalization
         ):
