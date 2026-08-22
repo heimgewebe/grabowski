@@ -445,6 +445,73 @@ def _load_pull_file_evidence(repo: Path, *, repo_slug: str, pr: int) -> list[dic
     return _pull_file_evidence(payload)
 
 
+def _github_check_run_id(link: Any, *, repo_slug: str) -> int | None:
+    if not isinstance(link, str) or not link:
+        return None
+    try:
+        parsed = urlparse(link)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        return None
+    match = re.fullmatch(
+        rf"/{re.escape(repo_slug)}/runs/(?P<run_id>[1-9][0-9]*)", parsed.path, re.IGNORECASE
+    )
+    return int(match.group("run_id")) if match is not None else None
+
+
+def _load_check_run_binding_evidence(
+    repo: Path, *, repo_slug: str, run_id: int
+) -> dict[str, Any] | None:
+    payload = _run_json(repo, ["gh", "api", f"repos/{repo_slug}/check-runs/{run_id}"])
+    if not isinstance(payload, dict):
+        return None
+    app = payload.get("app")
+    app_slug = app.get("slug") if isinstance(app, dict) else None
+    fields = {
+        "name": payload.get("name"),
+        "status": payload.get("status"),
+        "conclusion": payload.get("conclusion"),
+        "head_sha": payload.get("head_sha"),
+        "external_id": payload.get("external_id"),
+        "app_slug": app_slug,
+    }
+    if not all(isinstance(fields[key], str) and fields[key] for key in ("name", "status", "head_sha")):
+        return None
+    if fields["conclusion"] is not None and not isinstance(fields["conclusion"], str):
+        return None
+    if fields["external_id"] is not None and not isinstance(fields["external_id"], str):
+        return None
+    if fields["app_slug"] is not None and not isinstance(fields["app_slug"], str):
+        return None
+    return fields
+
+
+def _attach_registry_freshness_binding_evidence(
+    repo: Path, *, repo_slug: str, checks: Any
+) -> Any:
+    if not isinstance(checks, list):
+        return checks
+    enriched: list[Any] = []
+    for check in checks:
+        if not isinstance(check, dict) or check.get("name") != REGISTRY_FRESHNESS_CHECK_NAME:
+            enriched.append(check)
+            continue
+        copy = dict(check)
+        run_id = _github_check_run_id(check.get("link"), repo_slug=repo_slug)
+        if run_id is not None:
+            try:
+                evidence = _load_check_run_binding_evidence(
+                    repo, repo_slug=repo_slug, run_id=run_id
+                )
+            except RuntimeError:
+                evidence = None
+            if evidence is not None:
+                copy["baseBindingEvidence"] = evidence
+        enriched.append(copy)
+    return enriched
+
+
 def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     view = _run_json(repo, ["gh", "pr", "view", str(pr), "--json", ",".join(PR_FIELDS)])
     checks = _run_json(repo, ["gh", "pr", "checks", str(pr), "--json", ",".join(CHECK_FIELDS)], allow_nonzero=True)
@@ -468,6 +535,14 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
                 view["files"] = pull_files
                 pull_files_complete = True
         view["pullFilesEvidenceComplete"] = pull_files_complete
+        if pull_files_complete and isinstance(target_name, str):
+            base_bound_names = _effective_base_bound_check_names(
+                view, (REGISTRY_FRESHNESS_CHECK_NAME,)
+            )
+            if REGISTRY_FRESHNESS_CHECK_NAME in base_bound_names:
+                checks = _attach_registry_freshness_binding_evidence(
+                    repo, repo_slug=target_name, checks=checks
+                )
     # Self-review evidence is local and diff-bound. PR comments, approvals and
     # review bodies are deliberately absent from the live query and gate state.
     pr_diff_sha256: str | None = None
@@ -3031,6 +3106,35 @@ def _check_link_matches_base_sha(check: dict[str, Any], base_sha: object) -> boo
     return values == [base_sha]
 
 
+def _check_has_exact_registry_freshness_binding(
+    check: dict[str, Any], *, pr_number: object, head_sha: object, base_sha: object
+) -> bool:
+    if _check_link_matches_base_sha(check, base_sha):
+        return True
+    evidence = check.get("baseBindingEvidence")
+    if not isinstance(evidence, dict):
+        return False
+    if (
+        isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or pr_number <= 0
+        or not isinstance(head_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or not isinstance(base_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
+    ):
+        return False
+    return (
+        evidence.get("name") == REGISTRY_FRESHNESS_CHECK_NAME
+        and evidence.get("status") == "completed"
+        and evidence.get("conclusion") == "success"
+        and evidence.get("head_sha") == head_sha
+        and evidence.get("app_slug") == "github-actions"
+        and evidence.get("external_id")
+        == f"registry-freshness:{pr_number}:{head_sha}:{base_sha}"
+    )
+
+
 def _effective_base_bound_check_names(
     pr: dict[str, Any], expected_check_names: tuple[str, ...]
 ) -> set[str]:
@@ -3284,8 +3388,8 @@ def evaluate_review_gate(
     base_bound_check_names = _effective_base_bound_check_names(
         pr, expected_check_names
     )
-    stale_or_unbound_base_checks: set[str] = set()
     current_base_sha = pr.get("baseRefOid")
+    base_bound_check_matches = {name: False for name in base_bound_check_names}
     blocking_checks = []
     for check in checks:
         if not isinstance(check, dict):
@@ -3298,10 +3402,13 @@ def evaluate_review_gate(
             expected_check_buckets_by_name[name].append(bucket)
             if bucket not in PASS_CHECK_BUCKETS:
                 blocking_checks.append(check)
-            elif name in base_bound_check_names and not _check_link_matches_base_sha(
-                check, current_base_sha
+            elif name in base_bound_check_names and _check_has_exact_registry_freshness_binding(
+                check,
+                pr_number=pr.get("number"),
+                head_sha=pr.get("headRefOid"),
+                base_sha=current_base_sha,
             ):
-                stale_or_unbound_base_checks.add(name)
+                base_bound_check_matches[name] = True
             continue
         if bucket not in PASS_CHECK_BUCKETS and bucket != "skipping":
             blocking_checks.append(check)
@@ -3311,6 +3418,9 @@ def evaluate_review_gate(
         for name, buckets in expected_check_buckets_by_name.items()
         if not buckets or not all(bucket in PASS_CHECK_BUCKETS for bucket in buckets)
     ]
+    stale_or_unbound_base_checks = {
+        name for name, matched in base_bound_check_matches.items() if not matched
+    }
     if missing_expected_checks:
         failures.append(
             f"expected check(s) missing or non-green: {', '.join(missing_expected_checks)}"
