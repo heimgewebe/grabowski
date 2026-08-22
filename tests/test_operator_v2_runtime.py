@@ -2438,6 +2438,95 @@ class CaptainAuditTrailTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "digest unavailable"):
                 grabowski_mcp._append_verified_captain_audit({"operation": "test"})
 
+    def test_completion_audit_retries_only_pre_append_lock_timeout(self) -> None:
+        record = {"operation": "captain-run-audit-completion"}
+        with (
+            patch.object(
+                grabowski_mcp,
+                "_append_verified_captain_audit",
+                side_effect=[
+                    RuntimeError(grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR),
+                    RuntimeError(grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR),
+                    {"audit_chain_valid": True, "audit_record_sha256": "a" * 64},
+                ],
+            ) as append,
+            patch.object(grabowski_mcp.time, "sleep") as sleep,
+        ):
+            result = grabowski_mcp._append_verified_captain_completion_audit(record)
+        self.assertEqual("a" * 64, result["audit_record_sha256"])
+        self.assertEqual(3, append.call_count)
+        self.assertEqual(
+            [
+                unittest.mock.call(
+                    grabowski_mcp.CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS[0]
+                ),
+                unittest.mock.call(
+                    grabowski_mcp.CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS[1]
+                ),
+            ],
+            sleep.call_args_list,
+        )
+
+    def test_completion_audit_does_not_retry_ambiguous_runtime_error(self) -> None:
+        record = {"operation": "captain-run-audit-completion"}
+        with (
+            patch.object(
+                grabowski_mcp,
+                "_append_verified_captain_audit",
+                side_effect=RuntimeError("Audit append size postflight mismatch"),
+            ) as append,
+            patch.object(grabowski_mcp.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Audit append size postflight mismatch"
+            ):
+                grabowski_mcp._append_verified_captain_completion_audit(record)
+        append.assert_called_once_with(record)
+        sleep.assert_not_called()
+
+    def test_completion_audit_lock_retry_exhaustion_remains_visible(self) -> None:
+        record = {"operation": "captain-run-audit-completion"}
+        attempts = len(grabowski_mcp.CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS) + 1
+        with (
+            patch.object(
+                grabowski_mcp,
+                "_append_verified_captain_audit",
+                side_effect=RuntimeError(grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR),
+            ) as append,
+            patch.object(grabowski_mcp.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR
+            ):
+                grabowski_mcp._append_verified_captain_completion_audit(record)
+        self.assertEqual(attempts, append.call_count)
+        self.assertEqual(attempts - 1, sleep.call_count)
+
+    def test_intent_audit_lock_timeout_is_not_retried(self) -> None:
+        parameters = {"actions": []}
+        actor = grabowski_mcp.grabowski_merge_guard.issue_server_runtime_actor_identity(
+            object(), profile="test", now_unix=100
+        )
+        with (
+            patch.object(
+                grabowski_mcp.grabowski_merge_guard,
+                "verify_server_runtime_actor_identity",
+                return_value={"owner_id": "runtime-actor:test"},
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_append_verified_captain_audit",
+                side_effect=RuntimeError(grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR),
+            ) as append,
+            patch.object(grabowski_mcp.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR
+            ):
+                grabowski_mcp._captain_audit_intent(parameters, actor)
+        self.assertEqual(1, append.call_count)
+        sleep.assert_not_called()
+
     def test_intent_audit_failure_blocks_before_grip_dispatch(self) -> None:
         parameters = {"actions": [], "session_escalation": {"target": {}, "reason": "test"}}
         with (
@@ -2454,6 +2543,68 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("captain audit intent unavailable", result["output"]["error"])
         run.assert_not_called()
+
+    def test_completion_audit_failure_returns_bounded_error_code(self) -> None:
+        parameters = {"actions": [], "session_escalation": {"target": {}, "reason": "test"}}
+        grip_result = {
+            "receipt": {
+                "status": "passed",
+                "receipt_sha256": "c" * 64,
+                "output_sha256": "d" * 64,
+            },
+            "output": {},
+        }
+        with (
+            patch.object(grabowski_mcp, "_require_capability"),
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp,
+                "_session_grip_policy_decision",
+                return_value={
+                    "allowed": True,
+                    "session_profile": {"profile": "test"},
+                },
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_merge_guard,
+                "issue_server_runtime_actor_identity",
+                return_value={"identity": "server"},
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_captain_audit_intent",
+                return_value={
+                    "audit_chain_valid": True,
+                    "audit_record_sha256": "a" * 64,
+                },
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_captain_audit_completion",
+                side_effect=RuntimeError(
+                    grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR
+                ),
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_grips,
+                "grip_run",
+                return_value=grip_result,
+            ),
+        ):
+            result = grabowski_mcp.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                ctx=self.RequestContext(),
+            )
+        self.assertEqual("completion_failed", result["captain_audit"]["status"])
+        self.assertEqual("RuntimeError", result["captain_audit"]["error_class"])
+        self.assertEqual("audit_lock_timeout", result["captain_audit"]["error_code"])
+        self.assertNotIn(
+            grabowski_mcp.CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR,
+            json.dumps(result["captain_audit"], sort_keys=True),
+        )
 
     def test_successful_dispatch_returns_intent_and_completion_audit_refs(self) -> None:
         parameters = {"actions": [], "session_escalation": {"target": {}, "reason": "test"}}

@@ -95,8 +95,11 @@ MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
-TASK_OUTPUT_ROOT = Path(operator.HOME)
-TASK_OUTPUT_CONTRACT_VERSION = 1
+TASK_OUTPUT_ROOT = Path(operator.STATE_DIR) / "task-output"
+TASK_OUTPUT_LEGACY_ROOT = Path(operator.HOME)
+TASK_OUTPUT_CONTRACT_VERSION = 2
+TASK_OUTPUT_LEGACY_CONTRACT_VERSION = 1
+TASK_OUTPUT_LAUNCHER_BINDING_KEY = "task_output_managed_from_attempt"
 TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
 TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
 TASK_OUTPUT_TAIL_BYTES = 64 * 1024
@@ -4542,6 +4545,51 @@ def _dispatch(
     return result
 
 
+def _task_output_managed_from_attempt(record: dict[str, Any]) -> int | None:
+    raw = record.get("launcher_json")
+    if not isinstance(raw, str):
+        return None
+    try:
+        launcher = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("task output launcher binding is invalid JSON") from exc
+    if not isinstance(launcher, dict):
+        raise RuntimeError("task output launcher binding must be an object")
+    value = launcher.get(TASK_OUTPUT_LAUNCHER_BINDING_KEY)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RuntimeError("task output managed-attempt binding is invalid")
+    return value
+
+
+def _task_output_root(record: dict[str, Any]) -> Path:
+    attempt = record.get("attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise RuntimeError("task output identity has invalid attempt")
+    managed_from = _task_output_managed_from_attempt(record)
+    root = (
+        Path(TASK_OUTPUT_ROOT)
+        if managed_from is not None and attempt >= managed_from
+        else Path(TASK_OUTPUT_LEGACY_ROOT)
+    )
+    if not root.is_absolute():
+        raise RuntimeError("task output root must be absolute")
+    return root
+
+
+def _task_output_contract_version(record: dict[str, Any]) -> int:
+    attempt = record.get("attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise RuntimeError("task output identity has invalid attempt")
+    managed_from = _task_output_managed_from_attempt(record)
+    return (
+        TASK_OUTPUT_CONTRACT_VERSION
+        if managed_from is not None and attempt >= managed_from
+        else TASK_OUTPUT_LEGACY_CONTRACT_VERSION
+    )
+
+
 def _task_output_paths(record: dict[str, Any]) -> dict[str, Path]:
     task_id = str(record.get("task_id", ""))
     if TASK_ID.fullmatch(task_id) is None:
@@ -4549,17 +4597,82 @@ def _task_output_paths(record: dict[str, Any]) -> dict[str, Path]:
     attempt = record.get("attempt")
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
         raise RuntimeError("task output identity has invalid attempt")
-    root = Path(TASK_OUTPUT_ROOT)
-    if not root.is_absolute():
-        raise RuntimeError("task output root must be absolute")
-    directory = root / (
-        f"{TASK_OUTPUT_DIRECTORY_PREFIX}-{task_id}-a{attempt}"
-    )
+    root = _task_output_root(record)
+    directory = root / f"{TASK_OUTPUT_DIRECTORY_PREFIX}-{task_id}-a{attempt}"
     return {
         "directory": directory,
         "stdout": directory / "stdout.log",
         "stderr": directory / "stderr.log",
     }
+
+
+def _bind_task_output_managed_from_attempt(
+    task_id: str, *, expected_attempt: int, managed_from_attempt: int
+) -> dict[str, Any]:
+    identifier = _validate_task_id(task_id)
+    if (
+        isinstance(expected_attempt, bool)
+        or not isinstance(expected_attempt, int)
+        or expected_attempt < 1
+        or isinstance(managed_from_attempt, bool)
+        or not isinstance(managed_from_attempt, int)
+        or managed_from_attempt < 1
+    ):
+        raise ValueError("task output managed-attempt binding is invalid")
+    with _database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT attempt, launcher_json FROM tasks WHERE task_id=?",
+            (identifier,),
+        ).fetchone()
+        if row is None:
+            connection.rollback()
+            raise ValueError(f"Unknown task: {identifier}")
+        if int(row["attempt"]) != expected_attempt:
+            connection.rollback()
+            raise RuntimeError("task attempt changed before output-root binding")
+        try:
+            launcher = json.loads(str(row["launcher_json"]))
+        except json.JSONDecodeError as exc:
+            connection.rollback()
+            raise RuntimeError("task output launcher binding is invalid JSON") from exc
+        if not isinstance(launcher, dict):
+            connection.rollback()
+            raise RuntimeError("task output launcher binding must be an object")
+        existing = launcher.get(TASK_OUTPUT_LAUNCHER_BINDING_KEY)
+        created = False
+        if existing is None:
+            launcher[TASK_OUTPUT_LAUNCHER_BINDING_KEY] = managed_from_attempt
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (_canonical_json(launcher), identifier),
+            )
+            connection.commit()
+            created = True
+        elif (
+            isinstance(existing, bool)
+            or not isinstance(existing, int)
+            or existing < 1
+        ):
+            connection.rollback()
+            raise RuntimeError("task output managed-attempt binding is invalid")
+        elif existing == managed_from_attempt:
+            connection.commit()
+        else:
+            connection.rollback()
+            raise RuntimeError("task output managed-attempt binding conflicts with stored state")
+    if created:
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "task-output-root-cutover-bind",
+                "task_id": identifier,
+                "previous_attempt": expected_attempt,
+                "task_output_managed_from_attempt": managed_from_attempt,
+                "output_contract_version": TASK_OUTPUT_CONTRACT_VERSION,
+            }
+        )
+    return _row_raw(identifier)
 
 
 def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
@@ -4595,7 +4708,7 @@ def _task_output_public_result(
             _canonical_json(synthetic_argv).encode("utf-8")
         ).hexdigest(),
         "command": "grabowski-task-output-files-v1 --lines " + str(max_lines),
-        "cwd": str(TASK_OUTPUT_ROOT),
+        "cwd": str(paths["directory"].parent),
         "returncode": 0,
         "timed_out": False,
         "duration_seconds": duration_seconds,
@@ -4605,7 +4718,7 @@ def _task_output_public_result(
         "stderr_truncated": bool(stderr_truncated),
         "output_source": "private-task-files-v1",
         "output_reader": reader,
-        "output_contract_version": TASK_OUTPUT_CONTRACT_VERSION,
+        "output_contract_version": _task_output_contract_version(record),
         "output_directory_sha256": hashlib.sha256(
             str(paths["directory"]).encode("utf-8")
         ).hexdigest(),
@@ -4656,8 +4769,64 @@ def _task_output_inode_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _open_local_task_output_root() -> tuple[int, os.stat_result]:
+def _ensure_local_task_output_root() -> None:
     root = Path(TASK_OUTPUT_ROOT)
+    parent = root.parent
+    if not root.is_absolute() or root == parent:
+        raise RuntimeError("task output root is invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as exc:
+        raise RuntimeError("task output root parent could not be opened safely") from exc
+    try:
+        opened_parent = os.fstat(parent_fd)
+        linked_parent = parent.lstat()
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or stat.S_ISLNK(linked_parent.st_mode)
+            or _task_output_inode_identity(opened_parent)
+            != _task_output_inode_identity(linked_parent)
+            or opened_parent.st_uid != os.geteuid()
+            or opened_parent.st_gid != os.getegid()
+            or opened_parent.st_nlink < 1
+            or (stat.S_IMODE(opened_parent.st_mode) & 0o022) != 0
+        ):
+            raise RuntimeError("task output root parent identity is unsafe")
+        created = False
+        try:
+            os.mkdir(root.name, 0o700, dir_fd=parent_fd)
+            created = True
+        except FileExistsError:
+            pass
+        try:
+            root_fd = os.open(root.name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise RuntimeError("task output root could not be opened safely") from exc
+        try:
+            opened_root = os.fstat(root_fd)
+            linked_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened_root.st_mode)
+                or _task_output_inode_identity(opened_root)
+                != _task_output_inode_identity(linked_root)
+                or opened_root.st_uid != opened_parent.st_uid
+                or opened_root.st_gid != opened_parent.st_gid
+                or opened_root.st_nlink < 1
+                or stat.S_IMODE(opened_root.st_mode) != 0o700
+            ):
+                raise RuntimeError("task output root identity is unsafe")
+        finally:
+            os.close(root_fd)
+        if created:
+            os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _open_local_task_output_root(root: Path) -> tuple[int, os.stat_result]:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -4683,10 +4852,10 @@ def _open_local_task_output_root() -> tuple[int, os.stat_result]:
 
 
 def _revalidate_local_task_output_root(
-    descriptor: int, original: os.stat_result
+    root: Path, descriptor: int, original: os.stat_result
 ) -> None:
     current = os.fstat(descriptor)
-    linked = Path(TASK_OUTPUT_ROOT).lstat()
+    linked = root.lstat()
     if (
         _task_output_inode_identity(current)
         != _task_output_inode_identity(original)
@@ -4701,11 +4870,13 @@ def _read_local_task_output_files(
 ) -> dict[str, Any] | None:
     started = time.monotonic()
     paths = _task_output_paths(record)
-    root = Path(TASK_OUTPUT_ROOT)
+    root = paths["directory"].parent
     directory = paths["directory"]
     if directory.parent != root:
         raise RuntimeError("task output directory escaped its parent")
-    root_fd, opened_root = _open_local_task_output_root()
+    if not root.exists():
+        return None
+    root_fd, opened_root = _open_local_task_output_root(root)
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
@@ -4800,7 +4971,7 @@ def _read_local_task_output_files(
                 raise RuntimeError(
                     "task output directory changed identity during read"
                 )
-            _revalidate_local_task_output_root(root_fd, opened_root)
+            _revalidate_local_task_output_root(root, root_fd, opened_root)
             return _task_output_public_result(
                 record,
                 max_lines=max_lines,
@@ -7507,6 +7678,11 @@ def grabowski_task_start(
         )
         else None
     )
+    task_output_managed_from_attempt = (
+        1
+        if target["transport"] == "local" and execution_backend == "systemd-user"
+        else None
+    )
     record = {
         "task_id": task_id,
         "host": host,
@@ -7529,6 +7705,11 @@ def grabowski_task_start(
         "launcher_json": _canonical_json(
             {
                 "pending": True,
+                **(
+                    {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
+                    if task_output_managed_from_attempt is not None
+                    else {}
+                ),
                 "task_effect_classification": dict(
                     task_effect_classification
                 ),
@@ -7580,6 +7761,8 @@ def grabowski_task_start(
         ),
     }
     try:
+        if task_output_managed_from_attempt is not None:
+            _ensure_local_task_output_root()
         with _database_connection() as connection:
             connection.execute(
                 """
@@ -7621,6 +7804,11 @@ def grabowski_task_start(
     launcher = {
         **_launch(record),
         "task_effect_classification": dict(task_effect_classification),
+        **(
+            {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
+            if task_output_managed_from_attempt is not None
+            else {}
+        ),
     }
     if retry_binding is not None:
         launcher = {**launcher, "retry_binding": dict(retry_binding)}
@@ -7672,6 +7860,7 @@ def grabowski_task_start(
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
+        "task_output_managed_from_attempt": task_output_managed_from_attempt,
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
         "resource_keys": task_resources,
@@ -8019,6 +8208,26 @@ def grabowski_task_resume(
         if retained_retry_binding is not None:
             recovery_launcher_bindings["retry_binding"] = retained_retry_binding
     attempt = int(record["attempt"]) + 1
+    task_output_managed_from_attempt = _task_output_managed_from_attempt(record)
+    if not _is_root_systemd_backend(record):
+        _resolved_host, resume_target, _legacy_local_alias = (
+            _resolve_task_dispatch_host(str(record["host"]))
+        )
+        if task_output_managed_from_attempt is None:
+            if resume_target["transport"] == "local":
+                record = _bind_task_output_managed_from_attempt(
+                    task_id,
+                    expected_attempt=int(record["attempt"]),
+                    managed_from_attempt=attempt,
+                )
+                task_output_managed_from_attempt = attempt
+        elif resume_target["transport"] != "local":
+            raise RuntimeError(
+                "Task with managed local output cannot resume on non-local transport; "
+                "restore the fleet host to local transport or start a new task"
+            )
+    if task_output_managed_from_attempt is not None:
+        _ensure_local_task_output_root()
     unit = _task_unit(task_id, attempt)
     candidate = {**record, "attempt": attempt, "unit": unit, "authoritative_unit": unit}
     task_resources = _record_resource_keys(record)
@@ -8046,6 +8255,11 @@ def grabowski_task_resume(
             "launching",
             launcher={
                 "pending": True,
+                **(
+                    {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
+                    if task_output_managed_from_attempt is not None
+                    else {}
+                ),
                 **recovery_launcher_bindings,
             },
             observation=observation,
@@ -8087,6 +8301,11 @@ def grabowski_task_resume(
                 "reconciled" if lease_result.get("preserved") else "reacquired"
             )
     launcher = _launch(candidate)
+    if task_output_managed_from_attempt is not None:
+        launcher = {
+            **launcher,
+            TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt,
+        }
     if interrupted_recovery_binding is not None:
         launcher = {
             **launcher,
@@ -8115,6 +8334,7 @@ def grabowski_task_resume(
         "systemd_scope": _systemd_scope(record),
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
+        "task_output_managed_from_attempt": task_output_managed_from_attempt,
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
         "resource_keys": task_resources,
