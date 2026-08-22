@@ -125,7 +125,7 @@ def _plain_external_evidence(
     state: dict[str, object],
     *,
     provider: str = "grok",
-    model: str = "grok-4.5",
+    model: str = "grok-4.6",
 ) -> dict[str, object]:
     diff_filename = f"pr-7-{HEAD[:12]}.diff"
     packet_prompt = gate.build_external_review_prompt(
@@ -444,7 +444,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         state = _state()
         evidence = _plain_external_evidence(state)
         review = evidence["reviews"][0]
-        review["source"] = "plain-llm:gemini:grok-4.5"
+        review["source"] = "plain-llm:gemini:grok-4.6"
         review["tool_policy"] = "sandboxed_plan_mode"
         result = _evaluate_review_gate(
             state,

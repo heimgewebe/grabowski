@@ -2435,6 +2435,11 @@ def _local_workspace_path(raw: str | None, *, cwd: str) -> str:
     return str(resolved)
 
 
+def _workspace_has_git_marker(workspace: str) -> bool:
+    marker = Path(workspace) / ".git"
+    return not marker.is_symlink() and (marker.is_file() or marker.is_dir())
+
+
 def _mutating_agent_workspace(
     host: str,
     argv: list[str],
@@ -6939,11 +6944,9 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
-    reposkop_evaluation_id: str | None = None
-    reposkop_checkout_binding_sha256: str | None = None
-    if task_effect_classification["reposkop_policy"] == "required":
-        if mutating_agent_workspace is None:
-            raise RuntimeError("required Reposkop task has no local workspace")
+    checkout_head: str | None = None
+    checkout_branch: str | None = None
+    if mutating_agent_workspace is not None:
         if (
             repository_scope_manifest is not None
             and repository_scope_manifest["repository"]
@@ -6955,6 +6958,27 @@ def grabowski_task_start(
             checkout_head, checkout_branch = _workspace_scope_identity(
                 mutating_agent_workspace
             )
+        if (
+            task_effect_classification["reposkop_policy"] == "required"
+            and task_effect_classification["effect_profile"] == "workspace_write"
+            and not _workspace_has_git_marker(mutating_agent_workspace)
+        ):
+            task_effect_classification = {
+                **task_effect_classification,
+                "reposkop_policy": "not_required",
+                "reposkop_cohort": "not_applicable",
+                "reposkop_applicability": "no_git_marker",
+            }
+
+    reposkop_evaluation_id: str | None = None
+    reposkop_checkout_binding_sha256: str | None = None
+    if task_effect_classification["reposkop_policy"] == "required":
+        if (
+            mutating_agent_workspace is None
+            or checkout_head is None
+            or checkout_branch is None
+        ):
+            raise RuntimeError("required Reposkop task has no local workspace identity")
         reposkop_checkout_binding_sha256 = _sha256_json(
             {
                 "schema_version": 1,
@@ -7477,7 +7501,10 @@ def grabowski_task_start(
             evaluation_id=reposkop_evaluation_id,
             reposkop_cohort=task_effect_classification.get("reposkop_cohort"),
         )
-        if mutating_agent_workspace is not None
+        if (
+            mutating_agent_workspace is not None
+            and task_effect_classification.get("reposkop_cohort") != "not_applicable"
+        )
         else None
     )
     record = {
