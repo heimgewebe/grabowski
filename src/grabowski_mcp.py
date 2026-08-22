@@ -469,6 +469,8 @@ AUDIT_SEGMENT_CACHE_LOCK = threading.RLock()
 AUDIT_SEGMENT_VERIFICATION_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 AUDIT_LOCK_POLL_SECONDS = 0.02
+CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR = "Audit lock acquisition timed out"
+CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS = (0.05, 0.20)
 BASE_CAPABILITIES = (
     "file_read",
     "file_write",
@@ -8941,6 +8943,9 @@ def _repoground_context_evidence_status(
             or "query_unavailable"
         )
         return "unavailable", str(reason)
+    structured_evidence = query_context.get("structured_evidence")
+    if isinstance(structured_evidence, dict) and structured_evidence:
+        return "available", None
     citation_count = sum(
         1
         for snippet in snippets
@@ -9309,7 +9314,7 @@ def repoground_query(
         or availability.get("status") == "available"
     )
     strategy = str(retrieval.get("strategy") or "none")
-    return {
+    result = {
         "kind": "grabowski.repoground_query",
         "schema_version": 2,
         "repo": repo,
@@ -9359,6 +9364,9 @@ def repoground_query(
             "runtime_correctness",
         ],
     }
+    if "structured_evidence" in repoground_result:
+        result["structured_evidence"] = repoground_result["structured_evidence"]
+    return result
 
 
 @mcp.tool(name="repoground_query_existing_index", annotations=READ_ANNOTATIONS)
@@ -9665,6 +9673,11 @@ def repoground_context_pack(
         }
     snippets = _repoground_list_of_dicts(query_context.get("snippets"))
     ranges = _repoground_list_of_dicts(query_context.get("ranges"))
+    structured_evidence = (
+        query_context.get("structured_evidence")
+        if isinstance(query_context.get("structured_evidence"), dict)
+        else None
+    )
     evidence_status, evidence_reason = _repoground_context_evidence_status(
         query, query_context, snippets, ranges
     )
@@ -9693,6 +9706,8 @@ def repoground_context_pack(
         "query_status": query_context.get("status"),
         "query_available": query_context.get("available", False),
     }
+    if structured_evidence is not None:
+        bounded_evidence["structured_evidence"] = structured_evidence
     context_ref = {
         "schema_version": 1,
         "repo": repo,
@@ -9788,6 +9803,8 @@ def repoground_context_pack(
             "runtime_correctness",
         ],
     }
+    if structured_evidence is not None:
+        payload["query_context"]["structured_evidence"] = structured_evidence
     hashed_view = dict(payload)
     hashed_view["context_ref"] = {
         key: value for key, value in context_ref.items() if key != "generated_at"
@@ -9822,6 +9839,7 @@ def repoground_context_pack(
                 "bounded_evidence.normalized_query_shape",
                 "bounded_evidence.hit_count",
                 "bounded_evidence.result_count",
+                "bounded_evidence.structured_evidence",
                 "bounded_evidence.snippets",
                 "bounded_evidence.ranges",
             ],
@@ -10864,6 +10882,33 @@ def _append_verified_captain_audit(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _append_verified_captain_completion_audit(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Retry only audit-lock acquisition timeouts known to precede any append."""
+    retry_delays = CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            return _append_verified_captain_audit(record)
+        except RuntimeError as exc:
+            if (
+                str(exc) != CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR
+                or attempt == len(retry_delays)
+            ):
+                raise
+            time.sleep(retry_delays[attempt])
+    raise AssertionError("unreachable Captain audit completion retry state")
+
+
+def _captain_audit_completion_error_code(exc: BaseException) -> str:
+    if (
+        isinstance(exc, RuntimeError)
+        and str(exc) == CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR
+    ):
+        return "audit_lock_timeout"
+    return "audit_completion_error"
+
+
 def _captain_audit_intent(parameters: dict[str, Any], actor_identity: dict[str, Any]) -> dict[str, Any]:
     actor = grabowski_merge_guard.verify_server_runtime_actor_identity(actor_identity)
     material = _captain_audit_action_material(parameters)
@@ -10893,7 +10938,7 @@ def _captain_audit_completion(
         "receipt_sha256": result.get("receipt_sha256") or result.get("receipt", {}).get("receipt_sha256"),
         "output_sha256": result.get("receipt", {}).get("output_sha256"),
     }
-    return _append_verified_captain_audit(
+    return _append_verified_captain_completion_audit(
         {
             "operation": "captain-run-audit-completion",
             "kind": "grabowski_captain_run_audit",
@@ -11206,6 +11251,7 @@ def _grip_run_core(
                 "status": "completion_failed",
                 "intent": captain_intent_audit,
                 "error_class": type(exc).__name__,
+                "error_code": _captain_audit_completion_error_code(exc),
                 "does_not_establish": ["audited_execution_completion"],
             }
     return result
