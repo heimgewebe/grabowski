@@ -436,6 +436,114 @@ def _insert_baseline_generation(
     return existing
 
 
+def _reconcile_archived_evidence_generation(
+    connection: sqlite3.Connection,
+    *,
+    inputs: dict[str, Any],
+    evidence: dict[str, Any],
+    current: dict[str, Any],
+    now: int,
+) -> dict[str, Any]:
+    """Converge an immutable active generation to exact archived evidence.
+
+    Archive and safe identity-rebind paths may advance a checkout's head or
+    branch after its original identity generation was finalized.  The ledger
+    must preserve that historical generation while making the protected
+    lifecycle/archive identity current before any later reactivation or
+    owner-bound supersession is evaluated.
+    """
+    prior = evidence["prior_identity"]
+    current_identity = json.loads(current["identity_json"])
+    lifecycle = evidence.get("lifecycle")
+    retention = evidence.get("retention")
+    archive = evidence.get("archive")
+    immutable_fields = (
+        "owner_id",
+        "purpose",
+        "source_kind",
+        "source_id",
+        "artifact_class",
+    )
+    valid = bool(
+        current.get("state") == "active"
+        and evidence.get("protected") is True
+        and isinstance(lifecycle, dict)
+        and lifecycle.get("phase") == "archived"
+        and type(lifecycle.get("terminal_at_unix")) is int
+        and type(lifecycle.get("archived_at_unix")) is int
+        and isinstance(retention, dict)
+        and isinstance(archive, dict)
+        and archive.get("cleaned_at_unix") is None
+        and _identity_complete(current_identity)
+        and _identity_complete(prior)
+        and all(current_identity.get(field) == prior.get(field) for field in immutable_fields)
+        and archive.get("owner_id") == prior.get("owner_id")
+        and archive.get("head") == prior.get("expected_head")
+        and archive.get("branch") == prior.get("expected_branch")
+        and retention.get("owner_id") == prior.get("owner_id")
+        and retention.get("expected_head") == prior.get("expected_head")
+        and retention.get("expected_branch") == prior.get("expected_branch")
+        and type(archive.get("created_at_unix")) is int
+        and type(current.get("created_at_unix")) is int
+        and archive["created_at_unix"] >= current["created_at_unix"]
+    )
+    if not valid:
+        raise CheckoutIdentityConflict(
+            "identity ledger and protected checkout evidence disagree"
+        )
+
+    generation_id = _generation_id(
+        inputs["checkout_key"],
+        {
+            "kind": "archived-evidence-baseline",
+            "identity": prior,
+            "archive_id": archive["archive_id"],
+            "predecessor_generation_id": current["generation_id"],
+        },
+    )
+    if connection.execute(
+        "SELECT 1 FROM checkout_identity_generations WHERE generation_id=?",
+        (generation_id,),
+    ).fetchone() is not None:
+        raise CheckoutIdentityConflict(
+            "archived evidence baseline generation already exists in a conflicting state"
+        )
+    changed = connection.execute(
+        """
+        UPDATE checkout_identity_generations
+        SET state='superseded', superseded_by_generation_id=?,
+            superseded_at_unix=?, updated_at_unix=?
+        WHERE generation_id=? AND state='active'
+        """,
+        (generation_id, now, now, current["generation_id"]),
+    )
+    if changed.rowcount != 1:
+        raise CheckoutIdentityConflict(
+            "active checkout identity generation changed during evidence reconciliation"
+        )
+    _insert_generation(
+        connection,
+        generation_id=generation_id,
+        inputs=inputs,
+        identity=prior,
+        state="active",
+        predecessor_generation_id=current["generation_id"],
+        archive=archive,
+        now=now,
+    )
+    reconciled = _row_dict(
+        connection.execute(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (generation_id,),
+        ).fetchone()
+    )
+    if reconciled is None:
+        raise CheckoutIdentityConflict(
+            "archived evidence baseline generation was not persisted"
+        )
+    return reconciled
+
+
 def _validate_supersession(
     supersession: dict[str, Any],
     *,
@@ -701,8 +809,12 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
         if current is not None:
             current_identity = json.loads(current["identity_json"])
             if evidence["protected"] and current_identity != evidence["prior_identity"]:
-                raise CheckoutIdentityConflict(
-                    "identity ledger and protected checkout evidence disagree"
+                current = _reconcile_archived_evidence_generation(
+                    connection,
+                    inputs=prepared_inputs,
+                    evidence=evidence,
+                    current=current,
+                    now=now,
                 )
 
         exact_replay = _identity_matches(evidence["prior_identity"], identity)
