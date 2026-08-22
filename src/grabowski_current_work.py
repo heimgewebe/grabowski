@@ -209,6 +209,10 @@ def _set_projection_state(group: dict[str, Any], state: str) -> None:
     }
     if priority[state] >= priority[group["projection_state"]]:
         group["projection_state"] = state
+        if state == "hygiene":
+            group["work_class"] = "hygiene"
+        elif state in {"resumable", "active", "blocking"}:
+            group["work_class"] = "operational"
 
 
 def _blocking(group: dict[str, Any], reason: str) -> None:
@@ -219,10 +223,8 @@ def _blocking(group: dict[str, Any], reason: str) -> None:
 
 
 def _hygiene(group: dict[str, Any], reason: str) -> None:
-    group["work_class"] = "hygiene"
     group["action_required"] = True
-    if group["projection_state"] not in {"active", "blocking", "resumable"}:
-        group["projection_state"] = "hygiene"
+    _set_projection_state(group, "hygiene")
     if reason and reason not in group["action_reasons"]:
         group["action_reasons"].append(reason)
 
@@ -1074,8 +1076,14 @@ def _add_checkouts(
             for reason in item["binding_drift_reasons"]:
                 if reason not in group["action_reasons"]:
                     group["action_reasons"].append(reason)
-        if item["lifecycle_state"] == "managed_active_attention":
-            _blocking(group, "managed-active-lifecycle-attention")
+        if (
+            item["lifecycle_state"] == "managed_active_attention"
+            and item["binding_phase"] == "active"
+            and item["binding_consistent"]
+        ):
+            group["action_required"] = True
+            if "managed-active-lifecycle-attention" not in group["action_reasons"]:
+                group["action_reasons"].append("managed-active-lifecycle-attention")
 
         if item["dirty"]:
             identifying_live_lease = any(
@@ -1128,10 +1136,15 @@ def _add_checkouts(
                 if "closed-not-cleaned" not in group["action_reasons"]:
                     group["action_reasons"].append("closed-not-cleaned")
         elif item["binding_phase"] == "active" and item["binding_consistent"]:
-            if item["retention_active"] or item["coordination_blocking"]:
+            if (
+                item["retention_active"]
+                or item["coordination_blocking"]
+                or item["resource_leases"]
+                or item["processes"]
+            ):
                 _set_projection_state(group, "active")
             else:
-                _blocking(group, "managed-active-lifecycle-attention")
+                _set_projection_state(group, "hygiene")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:
@@ -1691,6 +1704,31 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
             "finishable_chain": True,
             "priority": 1,
         }
+
+    # Expired managed-active bindings remain actionable lifecycle attention even
+    # when they no longer establish coordination blocking. Preserve that signal
+    # in convergence guidance for both standalone hygiene and mixed live groups.
+    if "managed-active-lifecycle-attention" in action_reasons:
+        if projection_state == "hygiene":
+            return {
+                "convergence_stage": "hygiene",
+                "next_convergence_action": (
+                    "reconcile managed active lifecycle attention without "
+                    "treating it as coordination blocking"
+                ),
+                "finishable_chain": False,
+                "priority": 5,
+            }
+        if projection_state == "active":
+            return {
+                "convergence_stage": "active",
+                "next_convergence_action": (
+                    "monitor active work execution and reconcile managed active "
+                    "lifecycle attention"
+                ),
+                "finishable_chain": False,
+                "priority": 4,
+            }
 
     # Historical reconciliation without a current authority or physical surface is
     # hygiene.  It remains visible but must not displace operative work.

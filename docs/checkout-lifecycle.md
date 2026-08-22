@@ -52,7 +52,7 @@ Branch-Löschung.
 | `archived` | `archived_blocked`, `archived_not_remote_secured` | Eine konsistente `phase=archived`-Bindung besitzt ein passendes offenes Recovery-Archiv. Cleanup setzt zusätzlich Grace, Remote-Sicherung und Koordinationsfreiheit voraus. Lokale Remote-Tracking-Refs sind der schnelle Nachweis; nur der Cleanup-Dry-Run darf ersatzweise einen exakt passenden gemergten GitHub-PR-Head und `refs/pull/<n>/head` aktiv verifizieren. |
 | `terminal` | `externally_terminal_missing` | Der Checkout fehlt bereits und seine externe Quelle ist revisions- und receiptgebunden terminal. Das ist weder Archiv noch Cleanup-Kandidat. |
 | `obsolete` | `cleanup_candidate`, `prunable_or_missing` | Nur lokal gemeint: ein terminaler, sauberer, remote-gesicherter Checkout hat ein reifes Recovery-Archiv und ist lease-/prozess-/retentionfrei; vor Apply bleibt der Dry-Run Pflicht. Oder Git meldet den Worktree als prunable/missing. |
-| `unknown` | `unclassified_clean`, `managed_active_attention`, `managed_lifecycle_drift`, `archive_drifted`, `archive_closed`, `blocked_unarchived`, `unobservable` | Lokale Evidenz reicht nicht für eine sichere Lifecycle-Entscheidung. `unclassified_clean` bleibt unmanaged oder legacy; managed Retention-Ablauf und Identitätsdrift werden ausdrücklich blockierend. |
+| `unknown` | `unclassified_clean`, `managed_active_attention`, `managed_lifecycle_drift`, `archive_drifted`, `archive_closed`, `blocked_unarchived`, `unobservable` | Lokale Evidenz reicht nicht für eine sichere Lifecycle-Entscheidung. `unclassified_clean` bleibt unmanaged oder legacy; managed Retention-Ablauf bleibt als Lifecycle-Aufmerksamkeit sichtbar, ist ohne wirksame Retention oder andere Live-Koordination aber nicht coordination-blocking. Identitätsdrift bleibt ausdrücklich blockierend. |
 
 Die Entscheidung enthält zusätzlich:
 
@@ -104,12 +104,16 @@ Die Phasen werden read-only wie folgt projiziert:
 Checkout-Evidenz. Nur ein konsistentes Binding darf zugleich die exakte
 Owner-Zuordnung des Checkouts begründen. Ein widersprüchliches Binding bleibt
 blockierende Drift-Evidenz, wird aber weder als Owner-Autorität noch als
-terminale Konvergenzautorität verwendet. Konsistente aktive Bindungen bleiben
-aktiv; abgelaufene managed Bindungen blockieren; `completed_retained` und
-`archived` werden als `closed-not-cleaned` priorisiert, solange der Checkout
-noch existiert. `externally_terminal_missing` wird nur als terminale Evidenz
-projiziert und erzeugt keine Aufräumaktion. Daraus folgt keine Effekt- oder
-Löschautorität.
+terminale Konvergenzautorität verwendet. Konsistente aktive Bindungen mit
+wirksamer Retention, Ressourcenlease, Prozess oder anderer live
+`coordination_blocking`-Evidenz bleiben operativ `active`. Fehlen diese Signale,
+bleibt ein abgelaufenes managed Binding als `managed_active_attention` sichtbar,
+wird in `grabowski_current_work` aber als `hygiene` statt als operativer Blocker
+projiziert. Das erteilt keine Terminalitäts-, Cleanup- oder
+Wiederverwendungsautorität. `completed_retained` und `archived` werden als
+`closed-not-cleaned` priorisiert, solange der Checkout noch existiert.
+`externally_terminal_missing` wird nur als terminale Evidenz projiziert und
+erzeugt keine Aufräumaktion. Daraus folgt keine Effekt- oder Löschautorität.
 
 Eine vollständig verwaiste Binding-Zeile ohne Git-Worktree-Record gehört nicht
 zu dieser Worktree-Inventarsicht. `grabowski_checkout_binding_reconciliation`
