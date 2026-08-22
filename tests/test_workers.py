@@ -342,6 +342,7 @@ let historyCalls = 0;
 let describeCalls = 0;
 const activateScenario = scenario.startsWith('activate-');
 const readNameFallbackScenario = scenario === 'read-name-fallback';
+const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
 const activateTarget = 'https://private.invalid/issues';
 
 function message(target, payload) {
@@ -401,8 +402,8 @@ class FakeWebSocket {
         reply({nodes: [{
           backendDOMNodeId: 101,
           ignored: false,
-          role: {value: activateScenario ? 'link' : 'button'},
-          name: {value: readNameFallbackScenario ? '' : (activateScenario ? 'Issues' : 'Target')},
+          role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
+          name: {value: (readNameFallbackScenario || readValueRoleFallbackScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -419,6 +420,18 @@ class FakeWebSocket {
       case 'Runtime.callFunctionOn':
         if (readNameFallbackScenario) {
           reply({result: {value: '  Dismiss   onboarding  ' + 'x'.repeat(200)}});
+          return;
+        }
+        if (readValueRoleFallbackScenario) {
+          const role = request.params && request.params.arguments && request.params.arguments[0]
+            ? request.params.arguments[0].value : null;
+          const source = request.params && request.params.functionDeclaration
+            ? request.params.functionDeclaration : '';
+          if (role !== 'textbox' || !source.includes('visibleLabelRoles.has(role)')) {
+            fail();
+            return;
+          }
+          reply({result: {value: ''}});
           return;
         }
         reply({result: {value: null}});
@@ -3427,7 +3440,10 @@ globalThis.fetch = async () => ({
         self.assertIn("this.tagName", source)
         self.assertIn("['input', 'textarea', 'select', 'option'].includes(tag)", source)
         self.assertIn("this.isContentEditable === true", source)
-        self.assertIn("formControl ? '' : (this.innerText || this.textContent || '')", source)
+        self.assertIn("const visibleLabelRoles = new Set([", source)
+        self.assertIn("'button', 'link', 'tab', 'menuitem', 'treeitem', 'heading'", source)
+        self.assertIn("!formControl && visibleLabelRoles.has(role)", source)
+        self.assertNotIn("'textbox', 'combobox', 'listbox', 'option', 'slider', 'spinbutton'", source)
         self.assertNotIn("attr('value')", source)
         self.assertGreaterEqual(source.count("await readSemanticElementName("), 2)
         self.assertNotIn("document.querySelector", source)
@@ -3817,6 +3833,15 @@ globalThis.fetch = async () => ({
         self.assertEqual(element["role"], "button")
         self.assertTrue(element["name"].startswith("Dismiss onboarding "))
         self.assertEqual(len(element["name"]), 160)
+
+    def test_browser_semantic_node_keeps_dom_text_out_of_value_bearing_aria_role(self) -> None:
+        execution, receipt = self._run_browser_semantic_node("read-value-role-fallback")
+
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        element = receipt["state"]["elements"][0]
+        self.assertEqual(element["role"], "textbox")
+        self.assertEqual(element["name"], "")
 
     def test_browser_semantic_node_navigate_uses_page_navigate_and_error_text(self) -> None:
         source = workers.BROWSER_SEMANTIC_NODE_SOURCE

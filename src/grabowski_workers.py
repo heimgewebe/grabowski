@@ -2605,7 +2605,12 @@ async function readSemanticElementName(backendNodeId, role, accessibilityName) {
         const tag = clean(this.tagName).toLowerCase();
         const formControl = ['input', 'textarea', 'select', 'option'].includes(tag) ||
           this.isContentEditable === true;
-        const visibleLabel = formControl ? '' : (this.innerText || this.textContent || '');
+        const visibleLabelRoles = new Set([
+          'button', 'link', 'tab', 'menuitem', 'treeitem', 'heading'
+        ]);
+        const visibleLabel = !formControl && visibleLabelRoles.has(role)
+          ? (this.innerText || this.textContent || '')
+          : '';
         return clean(
           attr('aria-label') ||
           attr('title') ||
