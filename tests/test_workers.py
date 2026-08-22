@@ -343,6 +343,7 @@ let describeCalls = 0;
 const activateScenario = scenario.startsWith('activate-');
 const readNameFallbackScenario = scenario === 'read-name-fallback';
 const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
+const scrollFallbackRevalidationFailureScenario = scenario === 'scroll-fallback-revalidation-failure';
 const activateTarget = 'https://private.invalid/issues';
 
 function message(target, payload) {
@@ -403,35 +404,23 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
-          name: {value: (readNameFallbackScenario || readValueRoleFallbackScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
+          name: {value: (readNameFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
         reply({nodes: [{
           backendDOMNodeId: 101,
           ignored: false,
-          role: {value: 'link'},
-          name: {value: 'Issues'},
+          role: {value: scrollFallbackRevalidationFailureScenario ? 'button' : 'link'},
+          name: {value: scrollFallbackRevalidationFailureScenario ? '' : 'Issues'},
         }]});
         return;
       case 'DOM.resolveNode':
         reply({object: {objectId: 'link-object'}});
         return;
       case 'Runtime.callFunctionOn':
-        if (readNameFallbackScenario) {
-          reply({result: {value: '  Dismiss   onboarding  ' + 'x'.repeat(200)}});
-          return;
-        }
-        if (readValueRoleFallbackScenario) {
-          const role = request.params && request.params.arguments && request.params.arguments[0]
-            ? request.params.arguments[0].value : null;
-          const source = request.params && request.params.functionDeclaration
-            ? request.params.functionDeclaration : '';
-          if (role !== 'textbox' || !source.includes('visibleLabelRoles.has(role)')) {
-            fail();
-            return;
-          }
-          reply({result: {value: ''}});
+        if (readNameFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
+          fail();
           return;
         }
         reply({result: {value: null}});
@@ -447,6 +436,62 @@ class FakeWebSocket {
         return;
       case 'DOM.describeNode': {
         describeCalls += 1;
+        if (readNameFallbackScenario) {
+          reply({node: {
+            backendDOMNodeId: 101,
+            nodeType: 1,
+            localName: 'button',
+            nodeName: 'BUTTON',
+            attributes: ['aria-label', '   ', 'title', '\t'],
+            children: [{
+              backendDOMNodeId: 102,
+              nodeType: 1,
+              localName: 'span',
+              nodeName: 'SPAN',
+              attributes: [],
+              children: [{
+                backendDOMNodeId: 103,
+                nodeType: 3,
+                localName: '',
+                nodeName: '#text',
+                nodeValue: '  Dismiss   onboarding  ' + 'x'.repeat(200),
+              }],
+            }],
+          }});
+          return;
+        }
+        if (readValueRoleFallbackScenario) {
+          reply({node: {
+            backendDOMNodeId: 101,
+            nodeType: 1,
+            localName: 'div',
+            nodeName: 'DIV',
+            attributes: [],
+            children: [{
+              backendDOMNodeId: 102,
+              nodeType: 3,
+              localName: '',
+              nodeName: '#text',
+              nodeValue: 'secret-value',
+            }],
+          }});
+          return;
+        }
+        if (scrollFallbackRevalidationFailureScenario) {
+          if (describeCalls > 1) {
+            message(this, {id: request.id, error: {message: 'simulated describe failure'}});
+            return;
+          }
+          reply({node: {
+            backendDOMNodeId: 101,
+            nodeType: 1,
+            localName: 'button',
+            nodeName: 'BUTTON',
+            attributes: [],
+            children: [],
+          }});
+          return;
+        }
         let href = scenario === 'activate-target-drift' && describeCalls > 1
           ? 'https://private.invalid/pulls' : activateTarget;
         if (scenario === 'activate-backslash-target') {
@@ -515,6 +560,7 @@ globalThis.fetch = async () => ({
         )
         read_only = scenario.startswith("read-")
         activate = scenario.startswith("activate-")
+        scroll = scenario.startswith("scroll-")
         expected_element = (
             self._semantic_link(
                 name="Issues", target="https://private.invalid/issues"
@@ -523,7 +569,7 @@ globalThis.fetch = async () => ({
             else {
                 "backend_node_id": "101",
                 "role": "button",
-                "name": "Target",
+                "name": "" if scroll else "Target",
                 "navigation_target_sha256": None,
             }
         )
@@ -531,7 +577,7 @@ globalThis.fetch = async () => ({
             "schema_version": 1,
             "port": 9222,
             "timeout_ms": 250,
-            "op": "read_state" if read_only else ("activate" if activate else "navigate"),
+            "op": "read_state" if read_only else ("activate" if activate else ("scroll_into_view" if scroll else "navigate")),
             "expected_state": {
                 "origin": "https://before.invalid",
                 "ready_state": "complete",
@@ -542,7 +588,7 @@ globalThis.fetch = async () => ({
                 "elements": [expected_element],
             },
         }
-        if activate:
+        if activate or scroll:
             request["expected_element"] = expected_element
         elif not read_only:
             request["navigation_target"] = (
@@ -3435,15 +3481,21 @@ globalThis.fetch = async () => ({
         self.assertIn("Runtime.releaseObject", source)
         self.assertIn("Number.isSafeInteger", source)
         self.assertIn("async function readSemanticElementName", source)
-        self.assertIn("attr('aria-label')", source)
-        self.assertIn("attr('placeholder')", source)
-        self.assertIn("this.tagName", source)
-        self.assertIn("['input', 'textarea', 'select', 'option'].includes(tag)", source)
-        self.assertIn("this.isContentEditable === true", source)
-        self.assertIn("const visibleLabelRoles = new Set([", source)
-        self.assertIn("'button', 'link', 'tab', 'menuitem', 'treeitem', 'heading'", source)
-        self.assertIn("!formControl && visibleLabelRoles.has(role)", source)
-        self.assertNotIn("'textbox', 'combobox', 'listbox', 'option', 'slider', 'spinbutton'", source)
+        self.assertIn("function semanticDomAttribute", source)
+        self.assertIn("function boundedSemanticDomText", source)
+        name_reader = source[
+            source.index("async function readSemanticElementName") :
+            source.index("function sha256Text")
+        ]
+        self.assertIn("DOM.describeNode", name_reader)
+        self.assertIn("depth: 6", name_reader)
+        self.assertIn("semanticDomAttribute(node, 'aria-label')", name_reader)
+        self.assertIn("semanticDomAttribute(node, 'title')", name_reader)
+        self.assertIn("semanticDomAttribute(node, 'placeholder')", name_reader)
+        self.assertIn("candidates.find((candidate) => Boolean(candidate))", name_reader)
+        self.assertIn("'button', 'link', 'tab', 'menuitem', 'treeitem', 'heading'", name_reader)
+        self.assertNotIn("DOM.resolveNode", name_reader)
+        self.assertNotIn("Runtime.callFunctionOn", name_reader)
         self.assertNotIn("attr('value')", source)
         self.assertGreaterEqual(source.count("await readSemanticElementName("), 2)
         self.assertNotIn("document.querySelector", source)
@@ -3842,6 +3894,15 @@ globalThis.fetch = async () => ({
         element = receipt["state"]["elements"][0]
         self.assertEqual(element["role"], "textbox")
         self.assertEqual(element["name"], "")
+
+    def test_browser_semantic_node_fails_closed_when_fallback_revalidation_fails(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "scroll-fallback-revalidation-failure"
+        )
+
+        self.assertNotEqual(execution.returncode, 0)
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["result_code"], "stale-snapshot")
 
     def test_browser_semantic_node_navigate_uses_page_navigate_and_error_text(self) -> None:
         source = workers.BROWSER_SEMANTIC_NODE_SOURCE

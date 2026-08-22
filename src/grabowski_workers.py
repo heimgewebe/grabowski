@@ -2584,56 +2584,67 @@ function boundedText(value, limit) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
+function semanticDomAttribute(node, name) {
+  const attributes = Array.isArray(node && node.attributes) ? node.attributes : [];
+  for (let index = 0; index + 1 < attributes.length; index += 2) {
+    if (String(attributes[index] || '').toLowerCase() === name) {
+      return boundedText(attributes[index + 1], 160);
+    }
+  }
+  return '';
+}
+
+function boundedSemanticDomText(node) {
+  const blockedNames = new Set(['script', 'style', 'noscript', 'template']);
+  const pieces = [];
+  let visited = 0;
+  const walk = (current) => {
+    if (!current || visited >= 256) return;
+    visited += 1;
+    const localName = typeof current.localName === 'string'
+      ? current.localName.toLowerCase() : '';
+    const nodeName = typeof current.nodeName === 'string'
+      ? current.nodeName.toLowerCase() : '';
+    if (blockedNames.has(localName) || blockedNames.has(nodeName)) return;
+    if (current.nodeType === 3 || nodeName === '#text') {
+      const value = boundedText(current.nodeValue, 160);
+      if (value) pieces.push(value);
+      return;
+    }
+    for (const child of Array.isArray(current.children) ? current.children : []) {
+      walk(child);
+      if (boundedText(pieces.join(' '), 160).length >= 160) break;
+    }
+  };
+  walk(node);
+  return boundedText(pieces.join(' '), 160);
+}
+
 async function readSemanticElementName(backendNodeId, role, accessibilityName) {
   const primary = boundedText(accessibilityName, 160);
-  if (primary) return primary;
-  let resolved;
+  if (primary) return {ok: true, name: primary};
+  let described;
   try {
-    resolved = await call('DOM.resolveNode', {backendNodeId});
-  } catch {
-    return '';
-  }
-  const objectId = resolved && resolved.object && resolved.object.objectId;
-  if (typeof objectId !== 'string' || !objectId) return '';
-  try {
-    const response = await call('Runtime.callFunctionOn', {
-      objectId,
-      functionDeclaration: `function(role) {
-        const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, 160);
-        const attr = (name) => typeof this.getAttribute === 'function'
-          ? this.getAttribute(name) : '';
-        const tag = clean(this.tagName).toLowerCase();
-        const formControl = ['input', 'textarea', 'select', 'option'].includes(tag) ||
-          this.isContentEditable === true;
-        const visibleLabelRoles = new Set([
-          'button', 'link', 'tab', 'menuitem', 'treeitem', 'heading'
-        ]);
-        const visibleLabel = !formControl && visibleLabelRoles.has(role)
-          ? (this.innerText || this.textContent || '')
-          : '';
-        return clean(
-          attr('aria-label') ||
-          attr('title') ||
-          (role === 'textbox' ? attr('placeholder') : '') ||
-          visibleLabel
-        );
-      }`,
-      arguments: [{value: role}],
-      returnByValue: true,
-      awaitPromise: false,
+    described = await call('DOM.describeNode', {
+      backendNodeId, depth: 6, pierce: false,
     });
-    if (response && response.exceptionDetails) return '';
-    return boundedText(
-      response && response.result ? response.result.value : '',
-      160
-    );
   } catch {
-    return '';
-  } finally {
-    try {
-      await call('Runtime.releaseObject', {objectId});
-    } catch {}
+    return {ok: false, name: ''};
   }
+  const node = described && described.node ? described.node : null;
+  if (!node || node.backendDOMNodeId !== backendNodeId) {
+    return {ok: false, name: ''};
+  }
+  const candidates = [
+    semanticDomAttribute(node, 'aria-label'),
+    semanticDomAttribute(node, 'title'),
+    role === 'textbox' ? semanticDomAttribute(node, 'placeholder') : '',
+  ];
+  const visibleLabelRoles = new Set([
+    'button', 'link', 'tab', 'menuitem', 'treeitem', 'heading'
+  ]);
+  if (visibleLabelRoles.has(role)) candidates.push(boundedSemanticDomText(node));
+  return {ok: true, name: candidates.find((candidate) => Boolean(candidate)) || ''};
 }
 
 function sha256Text(value) {
@@ -2718,7 +2729,7 @@ async function readElements() {
       const binding = await readLinkNavigationBinding(node.backendDOMNodeId, baseUrl);
       navigationTargetSha256 = binding ? binding.sha256 : null;
     }
-    const name = await readSemanticElementName(
+    const naming = await readSemanticElementName(
       node.backendDOMNodeId,
       role,
       node.name && node.name.value
@@ -2726,7 +2737,7 @@ async function readElements() {
     elements.push({
       backend_node_id: String(node.backendDOMNodeId),
       role,
-      name,
+      name: naming.ok ? naming.name : '',
       navigation_target_sha256: navigationTargetSha256,
     });
   }
@@ -2823,12 +2834,13 @@ async function verifyElementImmediately(expected) {
   const node = nodes.find((item) => item && item.backendDOMNodeId === backendNodeId);
   if (!node || node.ignored === true) throw new Error('stale-snapshot');
   const role = boundedText(node.role && node.role.value, 64);
-  const name = await readSemanticElementName(
+  const naming = await readSemanticElementName(
     backendNodeId,
     role,
     node.name && node.name.value
   );
-  if (role !== expected.role || name !== expected.name) throw new Error('stale-snapshot');
+  if (!naming.ok) throw new Error('stale-snapshot');
+  if (role !== expected.role || naming.name !== expected.name) throw new Error('stale-snapshot');
   let resolved;
   try {
     resolved = await call('DOM.resolveNode', {backendNodeId});
