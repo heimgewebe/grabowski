@@ -1546,6 +1546,23 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
         unsupported_blob.assert_not_called()
 
+    def test_sidecar_git_blob_accepts_sha256_object_id(self) -> None:
+        repo = ROOT
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"blob", stderr=b""
+        )
+        with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(
+                b"blob",
+                SELF_DEPLOY._sidecar_git_blob(
+                    repo, "a" * 64, SELF_DEPLOY.SIDECAR_ROUTER_SOURCE_RELATIVE
+                ),
+            )
+        self.assertIn(
+            f"{'a' * 64}:{SELF_DEPLOY.SIDECAR_ROUTER_SOURCE_RELATIVE.as_posix()}",
+            run.call_args.args[0],
+        )
+
     def test_sidecar_readback_is_exact_head_and_runtime_catalog_bound(self) -> None:
         repo = ROOT
         marker = 'runtime_python="$HOME/.local/share/grabowski-mcp/.venv/bin/python"'

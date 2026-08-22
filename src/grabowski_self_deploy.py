@@ -1554,7 +1554,7 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
 
 def _sidecar_git_blob(repository: Path, expected_head: str, relative: Path) -> bytes:
     if (
-        re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+        OBJECT_ID_RE.fullmatch(expected_head) is None
         or relative not in {SIDECAR_ROUTER_SOURCE_RELATIVE, SIDECAR_SCHEDULER_SOURCE_RELATIVE}
     ):
         raise RuntimeError("sidecar source binding is invalid")
