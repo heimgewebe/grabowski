@@ -1747,9 +1747,7 @@ def _sidecars_match_deploy_head(command_fields: dict[str, Any]) -> bool:
             return False
         recommendation = _sidecar_json_readback(
             [
-                str(SIDECAR_RUNTIME_PYTHON),
-                "-m",
-                "grabowski_coding_agent_router_cli",
+                str(SIDECAR_ROUTER_TARGET),
                 "recommend",
                 "--task-class",
                 "complex-patch",

@@ -1589,8 +1589,36 @@ class SelfDeployToolTests(unittest.TestCase):
             ],
         ), patch.object(
             SELF_DEPLOY, "_sidecar_json_readback", side_effect=[runtime, recommendation]
-        ):
+        ) as readback:
             self.assertTrue(SELF_DEPLOY._sidecars_match_deploy_head(fields))
+        self.assertEqual(
+            [
+                call(
+                    [
+                        str(SELF_DEPLOY.SIDECAR_RUNTIME_PYTHON),
+                        "-m",
+                        "grabowski_coding_agent_router_cli",
+                        "validate",
+                    ]
+                ),
+                call(
+                    [
+                        str(SELF_DEPLOY.SIDECAR_ROUTER_TARGET),
+                        "recommend",
+                        "--task-class",
+                        "complex-patch",
+                        "--changed-files",
+                        "50",
+                        "--duration-minutes",
+                        "600",
+                        "--novelty",
+                        "high",
+                        "--need-review",
+                    ]
+                ),
+            ],
+            readback.call_args_list,
+        )
 
         with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
             SELF_DEPLOY, "_sidecar_git_blob", side_effect=[router_template, scheduler]
