@@ -28,8 +28,14 @@ _OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _GITHUB_SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?github\.com:(?P<path>[^?#\s]+)\Z", re.IGNORECASE)
 _MERGE_GUARD_TTL_SECONDS = 300
-_MERGE_GUARD_MAX_CHANGED_PATHS = 100
-_MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 8 * 1024
+_MERGE_GUARD_MAX_CHANGED_PATHS = 3000
+_MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 512 * 1024
+_MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES = 8 * 1024
+_MERGE_GUARD_GITHUB_DIFF_MAX_FILES = 300
+_MERGE_GUARD_MAX_DIFF_BYTES = 32 * 1024 * 1024
+_MERGE_GUARD_BINARY_DIFF_RE = re.compile(
+    rb"(?m)^(?:GIT binary patch|Binary files [^\r\n]+ and [^\r\n]+ differ)\r?$"
+)
 _MERGE_GUARD_REPLAY_PARAMETERS = frozenset({"merge_lease_snapshot", "merge_guard_receipt"})
 _CODEX_REVIEW_ACTORS = frozenset({
     "chatgpt-codex-connector",
@@ -899,6 +905,364 @@ def merge_guard_resource_keys(
             f"deployment:github:{repository_id}:{base_branch_id}",
         }
     )
+
+
+def _merge_guard_git_environment() -> dict[str, str]:
+    return {
+        "HOME": str(Path.home()),
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LC_ALL": "C",
+    }
+
+
+def _merge_guard_local_git_bytes(
+    repo_path: Path, args: list[str], *, timeout: int = 30
+) -> dict[str, Any]:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_path),
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "diff.external=",
+            "-c",
+            "diff.trustExitCode=false",
+            *args,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=timeout,
+        env=_merge_guard_git_environment(),
+    )
+    return {
+        "returncode": completed.returncode,
+        "stdout_bytes": completed.stdout,
+        "stderr_bytes": completed.stderr,
+    }
+
+
+def _merge_guard_commit_probe(
+    repo_path: Path, sha: str
+) -> tuple[bool, dict[str, Any]]:
+    info: dict[str, Any] = {"sha": sha}
+    if not isinstance(sha, str) or _SHA40_RE.fullmatch(sha) is None:
+        info["returncode"] = None
+        info["valid"] = False
+        return False, info
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["cat-file", "-e", f"{sha}^{{commit}}"]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        info.update({"returncode": None, "error_class": type(exc).__name__})
+        return False, info
+    stderr = result["stderr_bytes"]
+    info.update(
+        {
+            "returncode": result["returncode"],
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        }
+    )
+    return result["returncode"] == 0, info
+
+
+def _merge_guard_ensure_pr_objects(
+    repo_path: Path,
+    *,
+    base_branch: str,
+    pr_number: int,
+    base_sha: str,
+    head_sha: str,
+) -> tuple[dict[str, Any], list[str]]:
+    receipt: dict[str, Any] = {
+        "source": "local-git-object-availability",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "fetch_attempted": False,
+    }
+    if (
+        not isinstance(base_branch, str)
+        or not base_branch
+        or "\x00" in base_branch
+        or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number < 1
+        or not isinstance(base_sha, str)
+        or _SHA40_RE.fullmatch(base_sha) is None
+        or not isinstance(head_sha, str)
+        or _SHA40_RE.fullmatch(head_sha) is None
+    ):
+        return receipt, ["merge_guard_pr_object_binding_invalid"]
+
+    base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
+    head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
+    receipt["before"] = {"base": base_probe, "head": head_probe}
+    if base_present and head_present:
+        receipt["available"] = True
+        return receipt, []
+
+    base_ref = f"refs/heads/{base_branch}"
+    pr_head_ref = f"refs/pull/{pr_number}/head"
+    fetch_args = [
+        "-c",
+        "remote.origin.uploadpack=git-upload-pack",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "protocol.file.allow=never",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--no-recurse-submodules",
+        "--",
+        "origin",
+        base_ref,
+        pr_head_ref,
+    ]
+    receipt["fetch_attempted"] = True
+    receipt["fetch_refs"] = [base_ref, pr_head_ref]
+    try:
+        fetched = _merge_guard_local_git_bytes(repo_path, fetch_args, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        receipt["fetch"] = {"returncode": None, "error_class": type(exc).__name__}
+        return receipt, [f"merge_guard_pr_object_fetch_exception:{type(exc).__name__}"]
+    fetch_stdout = fetched["stdout_bytes"]
+    fetch_stderr = fetched["stderr_bytes"]
+    receipt["fetch"] = {
+        "returncode": fetched["returncode"],
+        "stdout_sha256": hashlib.sha256(fetch_stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(fetch_stderr).hexdigest(),
+    }
+    if fetched["returncode"] != 0:
+        return receipt, ["merge_guard_pr_object_fetch_failed"]
+
+    base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
+    head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
+    receipt["after"] = {"base": base_probe, "head": head_probe}
+    receipt["available"] = base_present and head_present
+    errors: list[str] = []
+    if not base_present:
+        errors.append("merge_guard_base_object_unavailable_after_fetch")
+    if not head_present:
+        errors.append("merge_guard_head_object_unavailable_after_fetch")
+    return receipt, errors
+
+
+def _merge_guard_diff_contains_binary_metadata(diff_bytes: bytes) -> bool:
+    return _MERGE_GUARD_BINARY_DIFF_RE.search(diff_bytes) is not None
+
+
+def _merge_guard_local_changed_paths(
+    repo_path: Path, *, base_sha: str, head_sha: str
+) -> tuple[list[str], dict[str, Any], list[str]]:
+    info: dict[str, Any] = {
+        "source": "local-bound-git-name-only",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    if (
+        not isinstance(base_sha, str)
+        or not isinstance(head_sha, str)
+        or _SHA40_RE.fullmatch(base_sha) is None
+        or _SHA40_RE.fullmatch(head_sha) is None
+    ):
+        return [], info, ["merge_guard_local_changed_paths_revision_invalid"]
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path,
+            [
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                base_sha,
+                head_sha,
+                "--",
+            ],
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        info["error_class"] = type(exc).__name__
+        return [], info, [f"merge_guard_local_changed_paths_exception:{type(exc).__name__}"]
+    stdout = result["stdout_bytes"]
+    stderr = result["stderr_bytes"]
+    info.update(
+        {
+            "returncode": result["returncode"],
+            "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+            "stdout_bytes": len(stdout),
+        }
+    )
+    if result["returncode"] != 0:
+        return [], info, ["merge_guard_local_changed_paths_failed"]
+    if len(stdout) > _MERGE_GUARD_MAX_CHANGED_PATH_BYTES:
+        return [], info, ["merge_guard_local_changed_paths_exceed_byte_limit"]
+    raw_paths = stdout.split(b"\x00")
+    if raw_paths and raw_paths[-1] == b"":
+        raw_paths.pop()
+    paths: list[str] = []
+    for index, raw_path in enumerate(raw_paths):
+        try:
+            path = raw_path.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return [], info, [f"merge_guard_local_changed_path_not_utf8:{index}"]
+        if (
+            not path
+            or path.startswith("/")
+            or "\x00" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or len(path.encode("utf-8")) > _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES
+        ):
+            return [], info, [f"merge_guard_local_changed_path_invalid:{index}"]
+        paths.append(path)
+    if len(paths) != len(set(paths)):
+        return [], info, ["merge_guard_local_changed_paths_duplicate"]
+    if len(paths) > _MERGE_GUARD_MAX_CHANGED_PATHS:
+        return [], info, ["merge_guard_local_changed_paths_exceed_entry_limit"]
+    return sorted(paths), info, []
+
+
+def _merge_guard_local_diff_bytes(
+    repo_path: Path, *, base_sha: str, head_sha: str
+) -> tuple[bytes, dict[str, Any], list[str]]:
+    info: dict[str, Any] = {
+        "source": "local-bound-git-diff",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    if (
+        not isinstance(base_sha, str)
+        or not isinstance(head_sha, str)
+        or _SHA40_RE.fullmatch(base_sha) is None
+        or _SHA40_RE.fullmatch(head_sha) is None
+    ):
+        return b"", info, ["merge_guard_local_diff_revision_invalid"]
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path,
+            [
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--no-color",
+                base_sha,
+                head_sha,
+                "--",
+            ],
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        info["error_class"] = type(exc).__name__
+        return b"", info, [f"merge_guard_local_diff_exception:{type(exc).__name__}"]
+    stdout = result["stdout_bytes"]
+    stderr = result["stderr_bytes"]
+    info.update(
+        {
+            "returncode": result["returncode"],
+            "raw_sha256": hashlib.sha256(stdout).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+            "source_bytes": len(stdout),
+        }
+    )
+    if result["returncode"] != 0:
+        return b"", info, ["merge_guard_local_diff_failed"]
+    if not stdout:
+        return b"", info, ["merge_guard_local_diff_empty"]
+    if len(stdout) > _MERGE_GUARD_MAX_DIFF_BYTES:
+        return b"", info, ["merge_guard_local_diff_exceeds_byte_limit"]
+    if _merge_guard_diff_contains_binary_metadata(stdout):
+        return b"", info, ["merge_guard_local_diff_binary_unsupported"]
+    canonical = canonicalize_github_pr_diff_identity(stdout)
+    info.update(
+        {
+            "bytes": len(canonical),
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+            "canonicalization": "local-bound-git-diff+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION,
+        }
+    )
+    return stdout, info, []
+
+
+def _merge_guard_github_diff_too_large(
+    info: dict[str, Any], *, changed_files: int
+) -> bool:
+    if changed_files <= _MERGE_GUARD_GITHUB_DIFF_MAX_FILES or info.get("returncode") == 0:
+        return False
+    message = f"{info.get('stderr', '')}\n{info.get('stdout', '')}"
+    return (
+        "PullRequest.diff too_large" in message
+        or "diff exceeded the maximum number of files" in message
+    )
+
+
+def _merge_guard_github_file_records(
+    repo_path: Path,
+    github_runner: Any,
+    *,
+    repo_slug: str,
+    pr_number: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    args = [
+        "api",
+        "--paginate",
+        f"repos/{repo_slug}/pulls/{pr_number}/files?per_page=100",
+        "--jq",
+        ".[] | [.filename,.status,(.previous_filename // null)] | @json",
+    ]
+    try:
+        raw = github_runner(repo_path, args)
+    except Exception as exc:
+        return [], {"command": ["gh", *args], "error_class": type(exc).__name__}, [
+            f"merge_guard_live_files_exception:{type(exc).__name__}"
+        ]
+    info = _merge_guard_result_info(raw)
+    receipt = {
+        "command": ["gh", *args],
+        "returncode": info["returncode"],
+        "stdout_sha256": hashlib.sha256(info["stdout"].encode()).hexdigest(),
+        "stderr_sha256": hashlib.sha256(info["stderr"].encode()).hexdigest(),
+    }
+    if info["returncode"] != 0:
+        return [], receipt, ["merge_guard_live_files_failed"]
+    records: list[dict[str, Any]] = []
+    status_map = {
+        "added": "ADDED",
+        "modified": "MODIFIED",
+        "removed": "DELETED",
+        "renamed": "RENAMED",
+        "copied": "COPIED",
+    }
+    for index, line in enumerate(info["stdout"].splitlines()):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            return [], receipt, [f"merge_guard_live_files_invalid_json:{index}"]
+        if not isinstance(item, list) or len(item) != 3:
+            return [], receipt, [f"merge_guard_live_files_invalid_record:{index}"]
+        path, status, previous_path = item
+        mapped_status = status_map.get(status) if isinstance(status, str) else None
+        record: dict[str, Any] = {"path": path, "changeType": mapped_status}
+        if previous_path is not None:
+            record["previousPath"] = previous_path
+        records.append(record)
+        if len(records) > _MERGE_GUARD_MAX_CHANGED_PATHS:
+            return [], receipt, ["merge_guard_live_files_exceed_entry_limit"]
+    receipt["record_count"] = len(records)
+    receipt["records_sha256"] = _sha256_json(records)
+    return records, receipt, []
 
 
 def _merge_guard_result_info(result: Any) -> dict[str, Any]:
@@ -2882,6 +3246,26 @@ class CaptainMergeGuardRunner:
         changed_paths: list[str] = []
         if type(changed_files) is not int or changed_files < 1:
             errors.append("merge_guard_changed_file_count_invalid")
+        elif changed_files > _MERGE_GUARD_MAX_CHANGED_PATHS:
+            errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
+        if (
+            type(changed_files) is int
+            and 100 < changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
+        ):
+            complete_files, files_receipt, files_errors = _merge_guard_github_file_records(
+                self.repo_path,
+                self.github_runner,
+                repo_slug=repo_slug,
+                pr_number=pr_number,
+            )
+            self.receipt["live_files"] = files_receipt
+            errors.extend(files_errors)
+            if not files_errors:
+                raw_files = complete_files
+            else:
+                errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
+                if isinstance(raw_files, list) and len(raw_files) > 128:
+                    errors.append("merge_guard_changed_path_count_exceeds_limit")
         if not isinstance(raw_files, list):
             errors.append("merge_guard_changed_file_list_missing")
         else:
@@ -2907,8 +3291,6 @@ class CaptainMergeGuardRunner:
                     errors.append(f"merge_guard_change_type_invalid:{index}")
                     continue
                 changed_paths.append(path)
-            if type(changed_files) is int and changed_files > _MERGE_GUARD_MAX_CHANGED_PATHS:
-                errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
             if type(changed_files) is int and changed_files != len(raw_files):
                 errors.append("merge_guard_changed_file_list_incomplete")
             if len(raw_files) > _MERGE_GUARD_MAX_CHANGED_PATHS:
@@ -2918,8 +3300,13 @@ class CaptainMergeGuardRunner:
         changed_paths = sorted(set(changed_paths))
         if not changed_paths:
             errors.append("merge_guard_changed_paths_empty")
-        elif len(_canonical_json(changed_paths).encode("utf-8")) > (
-            _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
+        elif (
+            any(
+                len(path.encode("utf-8")) > _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES
+                for path in changed_paths
+            )
+            or len(_canonical_json(changed_paths).encode("utf-8"))
+            > _MERGE_GUARD_MAX_CHANGED_PATH_BYTES
         ):
             errors.append("merge_guard_changed_paths_exceed_byte_limit")
 
@@ -2930,12 +3317,60 @@ class CaptainMergeGuardRunner:
             errors.append(f"merge_guard_live_diff_exception:{type(exc).__name__}")
             return None, errors
         diff_info = _merge_guard_result_info(diff_raw)
-        if isinstance(diff_info.get("stdout_bytes"), bytes):
-            raw_live_diff_bytes = diff_info["stdout_bytes"]
-            diff_source = "raw-command-bytes"
-        else:
-            raw_live_diff_bytes = diff_info["stdout"].encode("utf-8")
-            diff_source = "utf8-runner-text-exact-fallback"
+        provider_stdout_bytes = (
+            diff_info["stdout_bytes"]
+            if isinstance(diff_info.get("stdout_bytes"), bytes)
+            else diff_info["stdout"].encode("utf-8")
+        )
+        provider_attempt = {
+            "command": ["gh", *diff_args],
+            "returncode": diff_info["returncode"],
+            "stdout_sha256": hashlib.sha256(provider_stdout_bytes).hexdigest(),
+            "stderr_sha256": hashlib.sha256(diff_info["stderr"].encode()).hexdigest(),
+            "source_bytes": len(provider_stdout_bytes),
+        }
+        raw_live_diff_bytes = provider_stdout_bytes
+        diff_source = (
+            "raw-command-bytes"
+            if isinstance(diff_info.get("stdout_bytes"), bytes)
+            else "utf8-runner-text-exact-fallback"
+        )
+        selected_diff_returncode = diff_info["returncode"]
+        if type(changed_files) is int and _merge_guard_github_diff_too_large(
+            diff_info, changed_files=changed_files
+        ):
+            object_receipt, object_errors = _merge_guard_ensure_pr_objects(
+                self.repo_path,
+                base_branch=expected_base,
+                pr_number=pr_number,
+                base_sha=base_sha,
+                head_sha=expected_head,
+            )
+            self.receipt["local_object_fallback"] = object_receipt
+            errors.extend(object_errors)
+            local_paths: list[str] = []
+            local_paths_info: dict[str, Any] = {"skipped": bool(object_errors)}
+            local_path_errors: list[str] = []
+            if not object_errors:
+                local_paths, local_paths_info, local_path_errors = (
+                    _merge_guard_local_changed_paths(
+                        self.repo_path, base_sha=base_sha, head_sha=expected_head
+                    )
+                )
+            self.receipt["local_changed_paths_fallback"] = local_paths_info
+            errors.extend(local_path_errors)
+            if not local_path_errors and local_paths != changed_paths:
+                errors.append("merge_guard_local_changed_paths_drift")
+            if not local_path_errors and local_paths == changed_paths:
+                local_diff, local_diff_info, local_diff_errors = _merge_guard_local_diff_bytes(
+                    self.repo_path, base_sha=base_sha, head_sha=expected_head
+                )
+                self.receipt["local_diff_fallback"] = local_diff_info
+                errors.extend(local_diff_errors)
+                if not local_diff_errors:
+                    raw_live_diff_bytes = local_diff
+                    diff_source = "local-bound-git-diff-after-github-too-large"
+                    selected_diff_returncode = 0
         live_diff_bytes = canonicalize_github_pr_diff_identity(raw_live_diff_bytes)
         live_diff_sha256 = github_pr_diff_identity_sha256(raw_live_diff_bytes)
         diff_canonicalization = diff_source
@@ -2943,7 +3378,9 @@ class CaptainMergeGuardRunner:
             diff_canonicalization += "+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
         self.receipt["live_diff"] = {
             "command": ["gh", *diff_args],
-            "returncode": diff_info["returncode"],
+            "returncode": selected_diff_returncode,
+            "provider_attempt": provider_attempt,
+            "source": diff_source,
             "source_bytes": len(raw_live_diff_bytes),
             "bytes": len(live_diff_bytes),
             "canonicalization": diff_canonicalization,
@@ -2951,7 +3388,7 @@ class CaptainMergeGuardRunner:
             "sha256": live_diff_sha256,
             "stderr_sha256": hashlib.sha256(diff_info["stderr"].encode()).hexdigest(),
         }
-        if diff_info["returncode"] != 0:
+        if selected_diff_returncode != 0:
             errors.append("merge_guard_live_diff_failed")
         elif not live_diff_bytes:
             errors.append("merge_guard_live_diff_empty")
@@ -3123,9 +3560,13 @@ class CaptainMergeGuardRunner:
         self.owner_id = "captain-merge:" + hashlib.sha256(
             f"{self.execution_intent_sha256}:{time.time_ns()}".encode("utf-8")
         ).hexdigest()[:24]
+        metadata_bindings = {
+            key: value for key, value in bindings.items() if key != "changed_paths"
+        }
         metadata = {
             "merge_guard": {
-                **bindings,
+                **metadata_bindings,
+                "changed_path_count": len(bindings["changed_paths"]),
                 "resource_keys_sha256": _sha256_json(self.resource_keys),
                 "observed_at_unix_ns": observed_at_ns,
             }
