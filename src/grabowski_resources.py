@@ -2770,8 +2770,11 @@ def _absolute_paths_overlap(left: str, right: str) -> bool:
     return common == left or common == right
 
 
-_MERGE_GUARD_MAX_CHANGED_PATHS = 128
-_MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 8 * 1024
+_MERGE_GUARD_MAX_CHANGED_PATHS = 3000
+_MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 512 * 1024
+_MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES = 8 * 1024
+_MERGE_GUARD_EXACT_METADATA_MAX_PATHS = 128
+_MERGE_GUARD_EXACT_METADATA_MAX_BYTES = 8 * 1024
 
 
 def _normalize_merge_guard_changed_paths(
@@ -2783,6 +2786,8 @@ def _normalize_merge_guard_changed_paths(
     for raw in values:
         if not isinstance(raw, str) or not raw or "\x00" in raw:
             raise ValueError("merge guard changed path is invalid")
+        if len(raw.encode("utf-8")) > _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES:
+            raise ValueError("merge guard changed path exceeds byte limit")
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             raise ValueError("merge guard changed paths must be absolute")
@@ -2830,6 +2835,22 @@ def _merge_guard_changed_paths_from_row(
     metadata = _row_metadata(row)
     guard = metadata.get("merge_guard")
     if not isinstance(guard, dict):
+        return None
+    mode = guard.get("local_changed_paths_mode")
+    if mode == "repository_wide":
+        count = guard.get("local_changed_path_count")
+        digest = guard.get("local_changed_paths_sha256")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= _MERGE_GUARD_MAX_CHANGED_PATHS
+            or not isinstance(digest, str)
+            or SHA256_RE.fullmatch(digest) is None
+            or "local_changed_paths" in guard
+        ):
+            return None
+        return [os.path.normpath(repository)]
+    if mode not in {None, "exact"}:
         return None
     values = guard.get("local_changed_paths")
     if not isinstance(values, list):
@@ -4345,7 +4366,27 @@ def acquire_merge_guard_resources(
         _canonical_json(effect_resource_keys).encode("utf-8")
     ).hexdigest()
     guard_metadata["local_resource_repository"] = canonical_repository
-    guard_metadata["local_changed_paths"] = relative_changed_paths
+    relative_changed_paths_json = _canonical_json(relative_changed_paths).encode("utf-8")
+    relative_changed_paths_sha256 = hashlib.sha256(
+        relative_changed_paths_json
+    ).hexdigest()
+    declared_changed_paths_sha256 = guard_metadata.get("changed_paths_sha256")
+    if (
+        declared_changed_paths_sha256 is not None
+        and declared_changed_paths_sha256 != relative_changed_paths_sha256
+    ):
+        raise ValueError("merge guard changed path digest does not match local scope")
+    guard_metadata["local_changed_path_count"] = len(relative_changed_paths)
+    guard_metadata["local_changed_paths_sha256"] = relative_changed_paths_sha256
+    if (
+        len(relative_changed_paths) <= _MERGE_GUARD_EXACT_METADATA_MAX_PATHS
+        and len(relative_changed_paths_json) <= _MERGE_GUARD_EXACT_METADATA_MAX_BYTES
+    ):
+        guard_metadata["local_changed_paths_mode"] = "exact"
+        guard_metadata["local_changed_paths"] = relative_changed_paths
+    else:
+        guard_metadata["local_changed_paths_mode"] = "repository_wide"
+        guard_metadata.pop("local_changed_paths", None)
     normalized_metadata["merge_guard"] = guard_metadata
     if delegated_operator is not None:
         normalized_metadata["operator_lease_delegation"] = {
