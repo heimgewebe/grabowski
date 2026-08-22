@@ -62,6 +62,8 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
             "lane_id": lane_id,
             "state": "ready",
             "receipt_sha256": "d" * 64,
+            "created_at_unix": 100,
+            "inputs": {"source": {"kind": "direct-user", "id": "request-123"}},
             "terminal_closeout": {
                 "schema_version": 1,
                 "kind": "grabowski.work_lane_terminal_closeout",
@@ -82,7 +84,13 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
             evidence = sources.work_lane_terminal_evidence(lane_id)
         self.assertEqual(evidence["kind"], "work_lane")
         self.assertEqual(evidence["source_id"], lane_id)
+        self.assertEqual(
+            evidence["source_binding"],
+            {"kind": "direct-user", "id": "request-123"},
+        )
         self.assertEqual(evidence["terminal_state"], "pr_merged")
+        self.assertEqual(evidence["started_at_unix"], 100)
+        self.assertEqual(evidence["closed_at_unix"], 200)
         self.assertEqual(evidence["lane_receipt_sha256"], "d" * 64)
         self.assertEqual(
             evidence["terminal_closeout_audit_record_sha256"],
@@ -94,6 +102,34 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
                 {key: value for key, value in evidence.items() if key != "evidence_sha256"}
             ),
         )
+
+    def test_work_lane_terminal_evidence_rejects_missing_original_source_binding(self) -> None:
+        lane_id = "1" * 32
+        record = {
+            "lane_id": lane_id,
+            "receipt_sha256": "d" * 64,
+            "created_at_unix": 100,
+            "inputs": {},
+        }
+        assessment = {
+            "closeout_state": "pr_merged",
+            "assessment_sha256": "e" * 64,
+            "observed_at_unix": 200,
+        }
+        with (
+            patch.object(work_acquire, "_read_state", return_value=record),
+            patch.object(
+                work_acquire, "_terminal_closeout_assessment", return_value=assessment
+            ),
+            patch.object(work_acquire, "_terminal_closeout_audit_event", return_value={}),
+            patch.object(
+                work_acquire,
+                "_find_terminal_closeout_audit",
+                return_value="f" * 64,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "original source binding"):
+                sources.work_lane_terminal_evidence(lane_id)
 
     def test_invalid_lane_identity_is_rejected_before_observation(self) -> None:
         with self.assertRaisesRegex(ValueError, "32-character lowercase hex lane id"):
