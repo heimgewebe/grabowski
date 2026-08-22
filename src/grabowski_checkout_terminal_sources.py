@@ -255,12 +255,53 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
     audit_record_sha256 = work_acquire._find_terminal_closeout_audit(audit_event)
     if audit_record_sha256 is None:
         raise RuntimeError("work lane terminal closeout audit is missing")
+
+    outcome_projection: dict[str, Any] = {}
+    # Legacy terminal receipts predate the canonical lane input envelope. Keep
+    # their established evidence shape while strictly validating current lanes.
+    if "inputs" in record or "created_at_unix" in record:
+        inputs = record.get("inputs")
+        source_binding = inputs.get("source") if isinstance(inputs, dict) else None
+        if (
+            not isinstance(source_binding, dict)
+            or set(source_binding) != {"kind", "id"}
+            or not isinstance(source_binding.get("kind"), str)
+            or not source_binding["kind"]
+            or not isinstance(source_binding.get("id"), str)
+            or not source_binding["id"]
+        ):
+            raise RuntimeError(
+                "work lane source receipt has no authoritative original source binding"
+            )
+        started_at_unix = record.get("created_at_unix")
+        closed_at_unix = assessment.get("observed_at_unix")
+        if (
+            isinstance(started_at_unix, bool)
+            or not isinstance(started_at_unix, int)
+            or started_at_unix < 0
+            or isinstance(closed_at_unix, bool)
+            or not isinstance(closed_at_unix, int)
+            or closed_at_unix < started_at_unix
+        ):
+            raise RuntimeError(
+                "work lane source receipt has invalid start or closeout time evidence"
+            )
+        outcome_projection = {
+            "source_binding": {
+                "kind": source_binding["kind"],
+                "id": source_binding["id"],
+            },
+            "started_at_unix": started_at_unix,
+            "closed_at_unix": closed_at_unix,
+        }
+
     return _terminal_evidence(
         {
             "schema_version": SCHEMA_VERSION,
             "kind": "work_lane",
             "source_id": source_id,
             "terminal_state": closeout_state,
+            **outcome_projection,
             "lane_receipt_sha256": record.get("receipt_sha256"),
             "assessment_sha256": assessment_sha256,
             "terminal_closeout_audit_record_sha256": audit_record_sha256,
