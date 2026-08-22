@@ -90,8 +90,8 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             "codex": ["exec", "--sandbox", "workspace-write"],
             "claude": ["--permission-mode", "acceptEdits"],
             "agy": ["--model", "gemini-3.1-pro-high"],
-            "grok": ["--model", "grok-4.5"],
-            "grok-cli": ["--model", "grok-4.5"],
+            "grok": ["--model", "grok-4.6"],
+            "grok-cli": ["--model", "grok-4.6"],
         }
         for executable, tail in cases.items():
             with self.subTest(executable=executable):
@@ -210,7 +210,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
     def test_remote_agent_is_classified_without_local_reposkop_claim(self) -> None:
         result = effectiveness.classify_task_effect(
             transport="ssh",
-            argv=["/opt/grok", "--model", "grok-4.5"],
+            argv=["/opt/grok", "--model", "grok-4.6"],
             mutating_workspace=None,
         )
         self.assertEqual(result["effect_profile"], "remote_write")

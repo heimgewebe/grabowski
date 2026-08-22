@@ -237,6 +237,100 @@ class CheckoutIdentityTests(unittest.TestCase):
             "recovery_refs": recovery_refs,
         }
 
+    def _archive_existing_prior(
+        self,
+        prior: dict[str, object],
+        *,
+        head: str = NEW_HEAD,
+        branch: str = "archived-topic",
+        owner: str | None = None,
+        purpose: str | None = None,
+    ) -> dict[str, object]:
+        checkout_key = str(prior["checkout_key"])
+        archive_owner = owner or str(prior["owner_id"])
+        archive_purpose = purpose or str(prior["purpose"])
+        archive_id = f"20260806T000000Z-{checkout_key[:12]}"
+        recovery_refs = [
+            {
+                "role": "head",
+                "ref": f"refs/grabowski/checkouts/{checkout_key[:16]}/advanced-head",
+                "target": head,
+            }
+        ]
+        with checkouts._database() as connection:
+            connection.execute(
+                """
+                UPDATE lifecycle_bindings
+                SET owner_id=?, purpose=?, phase='archived',
+                    retention_until_unix=?, expected_head=?, expected_branch=?,
+                    updated_at_unix=?, terminal_at_unix=?, archived_at_unix=?
+                WHERE checkout_key=?
+                """,
+                (
+                    archive_owner,
+                    archive_purpose,
+                    self.now + 1800,
+                    head,
+                    branch,
+                    self.now,
+                    self.now,
+                    self.now,
+                    checkout_key,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE retention
+                SET owner_id=?, purpose=?, retention_until_unix=?,
+                    expected_head=?, expected_branch=?, updated_at_unix=?
+                WHERE checkout_key=?
+                """,
+                (
+                    archive_owner,
+                    archive_purpose,
+                    self.now + 1800,
+                    head,
+                    branch,
+                    self.now,
+                    checkout_key,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO archives(
+                    archive_id, checkout_key, repo_common_dir, repo_path,
+                    checkout_path, head, branch, owner_id, purpose,
+                    retention_until_unix, recovery_refs_json, manifest_path,
+                    created_at_unix, cleaned_at_unix, cleanup_plan_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    archive_id,
+                    checkout_key,
+                    str(self.common_dir.resolve()),
+                    str(self.repo.resolve()),
+                    str(self.checkout.resolve(strict=False)),
+                    head,
+                    branch,
+                    archive_owner,
+                    archive_purpose,
+                    self.now + 1800,
+                    json.dumps(recovery_refs, sort_keys=True),
+                    str(self.root / "archives" / archive_id / "manifest.json"),
+                    self.now,
+                ),
+            )
+            connection.commit()
+        return {
+            **prior,
+            "archive_id": archive_id,
+            "owner_id": archive_owner,
+            "purpose": archive_purpose,
+            "head": head,
+            "branch": branch,
+            "recovery_refs": recovery_refs,
+        }
+
     def _supersession(
         self,
         prior: dict[str, object],
@@ -349,6 +443,199 @@ class CheckoutIdentityTests(unittest.TestCase):
                 ).fetchall()
             ]
         self.assertEqual({"active", "superseded"}, {row["state"] for row in generations})
+
+    def test_archived_identity_evolution_reconciles_generation_lineage_before_handoff(self) -> None:
+        prior = self._seed_prior(
+            phase="active", active_retention=True, archive=False
+        )
+        prior_inputs = self._inputs(
+            owner=str(prior["owner_id"]),
+            purpose=str(prior["purpose"]),
+            source_kind=str(prior["source_kind"]),
+            source_id=str(prior["source_id"]),
+            artifact_class=str(prior["artifact_class"]),
+            head=str(prior["head"]),
+            branch=str(prior["branch"]),
+            idempotency_key="seed-old-generation",
+        )
+        seeded = identity.prepare(prior_inputs)
+        self.assertEqual("replay", seeded["action"])
+        old_generation_id = str(seeded["generation_id"])
+
+        archived = self._archive_existing_prior(
+            prior, head=NEW_HEAD, branch="archived-topic"
+        )
+        inputs = self._inputs(
+            head=OTHER_HEAD,
+            branch="replacement-topic",
+            idempotency_key="handoff-after-archive-evolution",
+        )
+        inputs["identity_supersession"] = self._supersession(
+            archived,
+            inputs,
+            expected_generation_id=old_generation_id,
+        )
+        reservation = identity.prepare(inputs)
+        self.assertEqual("supersession", reservation["action"])
+        self.assertEqual("reserved", reservation["state"])
+
+        old_generation = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (old_generation_id,),
+        )
+        baseline_generation = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (reservation["prior_generation_id"],),
+        )
+        new_generation = self._fetchone(
+            "SELECT * FROM checkout_identity_generations WHERE generation_id=?",
+            (reservation["generation_id"],),
+        )
+        self.assertIsNotNone(old_generation)
+        self.assertIsNotNone(baseline_generation)
+        self.assertIsNotNone(new_generation)
+        assert old_generation is not None
+        assert baseline_generation is not None
+        assert new_generation is not None
+        old_identity = json.loads(str(old_generation["identity_json"]))
+        baseline_identity = json.loads(str(baseline_generation["identity_json"]))
+        self.assertEqual(OLD_HEAD, old_identity["expected_head"])
+        self.assertEqual("old-topic", old_identity["expected_branch"])
+        self.assertEqual(NEW_HEAD, baseline_identity["expected_head"])
+        self.assertEqual("archived-topic", baseline_identity["expected_branch"])
+        self.assertEqual("superseded", old_generation["state"])
+        self.assertEqual(
+            baseline_generation["generation_id"],
+            old_generation["superseded_by_generation_id"],
+        )
+        self.assertEqual(
+            old_generation_id, baseline_generation["predecessor_generation_id"]
+        )
+        self.assertEqual("superseded", baseline_generation["state"])
+        self.assertEqual(
+            reservation["generation_id"],
+            baseline_generation["superseded_by_generation_id"],
+        )
+        self.assertEqual(
+            baseline_generation["generation_id"],
+            new_generation["predecessor_generation_id"],
+        )
+        archive_supersession = self._fetchone(
+            "SELECT * FROM checkout_identity_archive_supersessions WHERE archive_id=?",
+            (archived["archive_id"],),
+        )
+        self.assertIsNotNone(archive_supersession)
+        assert archive_supersession is not None
+        self.assertEqual(
+            baseline_generation["generation_id"],
+            archive_supersession["prior_generation_id"],
+        )
+
+    def test_archived_identity_reconciliation_rolls_back_without_handoff_authority(self) -> None:
+        prior = self._seed_prior(
+            phase="active", active_retention=True, archive=False
+        )
+        prior_inputs = self._inputs(
+            owner=str(prior["owner_id"]),
+            purpose=str(prior["purpose"]),
+            source_kind=str(prior["source_kind"]),
+            source_id=str(prior["source_id"]),
+            artifact_class=str(prior["artifact_class"]),
+            head=str(prior["head"]),
+            branch=str(prior["branch"]),
+            idempotency_key="seed-before-unauthorized-handoff",
+        )
+        seeded = identity.prepare(prior_inputs)
+        archived = self._archive_existing_prior(
+            prior, head=NEW_HEAD, branch="archived-topic"
+        )
+        unauthorized = self._inputs(
+            head=OTHER_HEAD,
+            branch="replacement-topic",
+            idempotency_key="missing-handoff-authority",
+        )
+        with self.assertRaisesRegex(
+            identity.CheckoutIdentityConflict,
+            "explicit owner-bound supersession is required",
+        ):
+            identity.prepare(unauthorized)
+
+        current = self._fetchone(
+            """
+            SELECT * FROM checkout_identity_generations
+            WHERE checkout_key=? AND state IN ('reserved', 'active', 'blocking')
+            """,
+            (prior["checkout_key"],),
+        )
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(seeded["generation_id"], current["generation_id"])
+        self.assertEqual("active", current["state"])
+        self.assertIsNone(current["superseded_by_generation_id"])
+        generation_count = self._fetchone(
+            "SELECT count(*) AS total FROM checkout_identity_generations WHERE checkout_key=?",
+            (prior["checkout_key"],),
+        )
+        self.assertIsNotNone(generation_count)
+        assert generation_count is not None
+        self.assertEqual(1, generation_count["total"])
+        lifecycle = self._fetchone(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (prior["checkout_key"],),
+        )
+        self.assertIsNotNone(lifecycle)
+        assert lifecycle is not None
+        self.assertEqual("archived", lifecycle["phase"])
+        self.assertEqual(archived["head"], lifecycle["expected_head"])
+        self.assertEqual(archived["branch"], lifecycle["expected_branch"])
+
+    def test_archived_identity_reconciliation_rejects_immutable_owner_drift(self) -> None:
+        prior = self._seed_prior(
+            phase="active", active_retention=True, archive=False
+        )
+        prior_inputs = self._inputs(
+            owner=str(prior["owner_id"]),
+            purpose=str(prior["purpose"]),
+            source_kind=str(prior["source_kind"]),
+            source_id=str(prior["source_id"]),
+            artifact_class=str(prior["artifact_class"]),
+            head=str(prior["head"]),
+            branch=str(prior["branch"]),
+            idempotency_key="seed-before-owner-drift",
+        )
+        seeded = identity.prepare(prior_inputs)
+        self._archive_existing_prior(
+            prior,
+            head=NEW_HEAD,
+            branch="archived-topic",
+            owner="owner-tampered",
+        )
+        tampered_inputs = self._inputs(
+            owner="owner-tampered",
+            purpose=str(prior["purpose"]),
+            source_kind=str(prior["source_kind"]),
+            source_id=str(prior["source_id"]),
+            artifact_class=str(prior["artifact_class"]),
+            head=NEW_HEAD,
+            branch="archived-topic",
+            idempotency_key="tampered-archive-replay",
+        )
+        with self.assertRaisesRegex(
+            identity.CheckoutIdentityConflict,
+            "identity ledger and protected checkout evidence disagree",
+        ):
+            identity.prepare(tampered_inputs)
+        current = self._fetchone(
+            """
+            SELECT * FROM checkout_identity_generations
+            WHERE checkout_key=? AND state IN ('reserved', 'active', 'blocking')
+            """,
+            (prior["checkout_key"],),
+        )
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual(seeded["generation_id"], current["generation_id"])
+        self.assertEqual("active", current["state"])
 
     def test_supersession_rejects_wrong_prior_bindings(self) -> None:
         prior = self._seed_prior(

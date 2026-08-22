@@ -1799,7 +1799,13 @@ def _resource_related(resource_key: str, paths: list[Path]) -> bool:
     return any(_paths_related(resource_path, path) for path in paths)
 
 
-def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
+def _task_records(
+    paths: list[Path],
+    *,
+    resource_paths: list[Path] | None = None,
+    exact_resource_keys: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Match task CWDs narrowly while retaining explicit resource-scope overlap."""
     try:
         connection = _readonly_connection(tasks.TASK_DB)
     except sqlite3.Error as exc:
@@ -1819,6 +1825,10 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
         raise RuntimeError("Task inventory projection is unavailable") from exc
     finally:
         connection.close()
+    effective_resource_paths = paths if resource_paths is None else resource_paths
+    effective_exact_resource_keys = frozenset(
+        str(item) for item in exact_resource_keys
+    )
     results: list[dict[str, Any]] = []
     for row in rows:
         related = False
@@ -1834,7 +1844,11 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
             if isinstance(raw_keys, list):
                 resource_keys = [str(item) for item in raw_keys if isinstance(item, str)]
                 related = related or any(
-                    _resource_related(key, paths) for key in resource_keys
+                    (
+                        _resource_related(key, effective_resource_paths)
+                        or key in effective_exact_resource_keys
+                    )
+                    for key in resource_keys
                 )
         except json.JSONDecodeError:
             resource_keys = []
@@ -1968,11 +1982,11 @@ def _linked_checkout_coordination(
     if owner_id is not None:
         _owner(owner_id)
     ignored_owners = {_owner(item) for item in ignored_lease_owner_ids}
+    branch_resource_key = (
+        f"repo:{repo_path}:branch:{branch}" if isinstance(branch, str) and branch else None
+    )
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
-        branch_resource_key = (
-            f"repo:{repo_path}:branch:{branch}" if isinstance(branch, str) and branch else None
-        )
         for lease in _read_resource_leases():
             if lease["owner_id"] in ignored_owners:
                 continue
@@ -1984,7 +1998,17 @@ def _linked_checkout_coordination(
                 continue
             lease = {**lease, "blocking": True}
             resource_blockers.append(lease)
-    task_blockers = _task_records([checkout_path, repo_path]) if include_tasks else []
+    task_blockers = (
+        _task_records(
+            [checkout_path],
+            resource_paths=[checkout_path, repo_common_dir],
+            exact_resource_keys=(
+                () if branch_resource_key is None else (branch_resource_key,)
+            ),
+        )
+        if include_tasks
+        else []
+    )
     process_blockers = _processes_under([checkout_path]) if include_processes else []
     return _coordination_result(resource_blockers, task_blockers, process_blockers)
 
