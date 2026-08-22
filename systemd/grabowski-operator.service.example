@@ -19,6 +19,7 @@ UMask=0077
 Environment=HOME=/home/alex
 Environment=PATH=/home/alex/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=HEIM_NODE_RUNTIME_ENV_DIR=/home/alex/.local/state/grabowski/node-runtime-env
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=yes

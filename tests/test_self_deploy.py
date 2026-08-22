@@ -1323,6 +1323,492 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
                     SELF_DEPLOY._matching_inflight_deploy_job(command, repo)
 
+    def test_missing_finalization_success_is_pruned_when_runtime_proves_exact_head(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": previous,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                "cwd": str(repo),
+            }
+            status = {
+                "final_status": "missing_finalization_evidence",
+                "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+                "properties": {
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                },
+            }
+            deployment = {
+                "completion_status": "complete",
+                "repo_head": "a" * 40,
+                "manifest_parse_valid": True,
+                "manifest_schema_valid": True,
+                "release_path_valid": True,
+                "release_id_valid": True,
+                "repo_head_valid": True,
+                "stable_runtime_manifest_valid": True,
+                "runtime_pointer_valid": True,
+                "artifact_integrity_valid": True,
+                "runtime_asset_identity_valid": True,
+                "release_python_identity_valid": True,
+                "environment_compatibility_valid": True,
+                "runtime_binding_valid": True,
+                "provenance_valid": True,
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ), patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ), patch.object(
+                SELF_DEPLOY, "_sidecars_match_deploy_head", return_value=True
+            ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index:
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+        write_index.assert_called_once_with(root, units=[], pending_unit=None)
+
+    def test_missing_finalization_success_blocks_when_runtime_head_mismatches(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": previous,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                "cwd": str(repo),
+            }
+            status = {
+                "final_status": "missing_finalization_evidence",
+                "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+                "properties": {
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                },
+            }
+            deployment = {
+                "completion_status": "complete",
+                "repo_head": "c" * 40,
+                "manifest_parse_valid": True,
+                "manifest_schema_valid": True,
+                "release_path_valid": True,
+                "release_id_valid": True,
+                "repo_head_valid": True,
+                "stable_runtime_manifest_valid": True,
+                "runtime_pointer_valid": True,
+                "artifact_integrity_valid": True,
+                "runtime_asset_identity_valid": True,
+                "release_python_identity_valid": True,
+                "environment_compatibility_valid": True,
+                "runtime_binding_valid": True,
+                "provenance_valid": True,
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ), patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                    SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_missing_finalization_runtime_match_still_requires_sidecar_readback(self) -> None:
+        status = {
+            "final_status": "missing_finalization_evidence",
+            "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        }
+        deployment = {
+            "completion_status": "complete",
+            "repo_head": "a" * 40,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "release_path_valid": True,
+            "release_id_valid": True,
+            "repo_head_valid": True,
+            "stable_runtime_manifest_valid": True,
+            "runtime_pointer_valid": True,
+            "artifact_integrity_valid": True,
+            "runtime_asset_identity_valid": True,
+            "release_python_identity_valid": True,
+            "environment_compatibility_valid": True,
+            "runtime_binding_valid": True,
+            "provenance_valid": True,
+        }
+        command_fields = {
+            "source_kind": "canonical-main",
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "expected_head": "a" * 40,
+        }
+        with patch.object(
+            SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+        ), patch.object(
+            SELF_DEPLOY, "_sidecars_match_deploy_head", return_value=False
+        ):
+            self.assertFalse(
+                SELF_DEPLOY._missing_finalization_deploy_is_runtime_proven(
+                    status, command_fields
+                )
+            )
+
+    def test_missing_finalization_requires_full_runtime_provenance(self) -> None:
+        status = {
+            "final_status": "missing_finalization_evidence",
+            "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        }
+        deployment = {
+            "completion_status": "complete",
+            "repo_head": "a" * 40,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "release_path_valid": True,
+            "release_id_valid": True,
+            "repo_head_valid": True,
+            "stable_runtime_manifest_valid": True,
+            "runtime_pointer_valid": True,
+            "artifact_integrity_valid": True,
+            "runtime_asset_identity_valid": True,
+            "release_python_identity_valid": True,
+            "runtime_binding_valid": True,
+            "environment_compatibility_valid": True,
+            "provenance_valid": True,
+        }
+        command_fields = {
+            "source_kind": "canonical-main",
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "expected_head": "a" * 40,
+        }
+        for invalid_field in ("runtime_binding_valid", "provenance_valid"):
+            with self.subTest(invalid_field=invalid_field), patch.object(
+                SELF_DEPLOY.base,
+                "_deployment_metadata",
+                return_value={**deployment, invalid_field: False},
+                create=True,
+            ), patch.object(
+                SELF_DEPLOY, "_sidecars_match_deploy_head", return_value=True
+            ) as sidecar_readback:
+                self.assertFalse(
+                    SELF_DEPLOY._missing_finalization_deploy_is_runtime_proven(
+                        status, command_fields
+                    )
+                )
+                sidecar_readback.assert_not_called()
+
+    def test_missing_finalization_runtime_proof_is_cached_per_deploy_identity(self) -> None:
+        status = {
+            "final_status": "missing_finalization_evidence",
+            "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        }
+        deployment = {
+            "completion_status": "complete",
+            "repo_head": "a" * 40,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "release_path_valid": True,
+            "release_id_valid": True,
+            "repo_head_valid": True,
+            "stable_runtime_manifest_valid": True,
+            "runtime_pointer_valid": True,
+            "artifact_integrity_valid": True,
+            "runtime_asset_identity_valid": True,
+            "release_python_identity_valid": True,
+            "runtime_binding_valid": True,
+            "environment_compatibility_valid": True,
+            "provenance_valid": True,
+        }
+        fields = {
+            "source_kind": "canonical-main",
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "expected_head": "a" * 40,
+        }
+        cache: dict[tuple[str, str, str], bool] = {}
+        with patch.object(
+            SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+        ) as deployment_readback, patch.object(
+            SELF_DEPLOY, "_sidecars_match_deploy_head", return_value=True
+        ) as sidecar_readback:
+            for _ in range(2):
+                self.assertTrue(
+                    SELF_DEPLOY._missing_finalization_deploy_is_runtime_proven(
+                        status, fields, runtime_proof_cache=cache
+                    )
+                )
+        deployment_readback.assert_called_once_with()
+        sidecar_readback.assert_called_once_with(fields)
+
+    def test_sidecar_readback_allows_detached_worktree_source_kind(self) -> None:
+        repo = ROOT
+        fields = {
+            "source_kind": "detached-worktree",
+            "canonical_repository": str(repo),
+            "expected_head": "a" * 40,
+        }
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+            SELF_DEPLOY, "_sidecar_git_blob", return_value=b"invalid-router"
+        ) as git_blob:
+            self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
+        git_blob.assert_called_once_with(
+            repo, "a" * 40, SELF_DEPLOY.SIDECAR_ROUTER_SOURCE_RELATIVE
+        )
+
+        fields["source_kind"] = "unsupported"
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+            SELF_DEPLOY, "_sidecar_git_blob"
+        ) as unsupported_blob:
+            self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
+        unsupported_blob.assert_not_called()
+
+    def test_sidecar_git_blob_accepts_sha256_object_id(self) -> None:
+        repo = ROOT
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=b"blob", stderr=b""
+        )
+        with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(
+                b"blob",
+                SELF_DEPLOY._sidecar_git_blob(
+                    repo, "a" * 64, SELF_DEPLOY.SIDECAR_ROUTER_SOURCE_RELATIVE
+                ),
+            )
+        self.assertIn(
+            f"{'a' * 64}:{SELF_DEPLOY.SIDECAR_ROUTER_SOURCE_RELATIVE.as_posix()}",
+            run.call_args.args[0],
+        )
+
+    def test_sidecar_readback_is_exact_head_and_runtime_catalog_bound(self) -> None:
+        repo = ROOT
+        marker = 'runtime_python="$HOME/.local/share/grabowski-mcp/.venv/bin/python"'
+        router_template = f"#!/bin/sh\n{marker}\n".encode("utf-8")
+        expected_router = (
+            f"#!/bin/sh\nruntime_python={SELF_DEPLOY.SIDECAR_RUNTIME_PYTHON}\n".encode("utf-8")
+        )
+        scheduler = b"#!/usr/bin/env python3\nprint('scheduler')\n"
+        router_sha256 = hashlib.sha256(expected_router).hexdigest()
+        runtime = {
+            "valid": True,
+            "catalog_source": "deployment_catalog",
+            "catalog_sha256": "c" * 64,
+        }
+        recommendation = {
+            "catalog_sha256": "c" * 64,
+            "decision": "controller",
+            "controller": "grabowski-primary",
+            "primary_role": "controller-integrator",
+            "delegated_scoped_writers_allowed": True,
+            "controller_integration_required": True,
+            "single_mutating_writer": True,
+            "single_mutating_writer_scope": "overlapping-resource-lane",
+            "external_primary_writer_forbidden": False,
+            "automatic_execution_authorized": True,
+        }
+        fields = {
+            "source_kind": "canonical-main",
+            "canonical_repository": str(repo),
+            "expected_head": "a" * 40,
+        }
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+            SELF_DEPLOY, "_sidecar_git_blob", side_effect=[router_template, scheduler]
+        ), patch.object(
+            SELF_DEPLOY,
+            "_sidecar_file_bytes",
+            side_effect=[
+                expected_router,
+                scheduler,
+                f"{router_sha256}\n".encode("ascii"),
+            ],
+        ), patch.object(
+            SELF_DEPLOY, "_sidecar_json_readback", side_effect=[runtime, recommendation]
+        ) as readback:
+            self.assertTrue(SELF_DEPLOY._sidecars_match_deploy_head(fields))
+        self.assertEqual(
+            [
+                call(
+                    [
+                        str(SELF_DEPLOY.SIDECAR_RUNTIME_PYTHON),
+                        "-m",
+                        "grabowski_coding_agent_router_cli",
+                        "validate",
+                    ]
+                ),
+                call(
+                    [
+                        str(SELF_DEPLOY.SIDECAR_ROUTER_TARGET),
+                        "recommend",
+                        "--task-class",
+                        "complex-patch",
+                        "--changed-files",
+                        "50",
+                        "--duration-minutes",
+                        "600",
+                        "--novelty",
+                        "high",
+                        "--need-review",
+                    ]
+                ),
+            ],
+            readback.call_args_list,
+        )
+
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+            SELF_DEPLOY, "_sidecar_git_blob", side_effect=[router_template, scheduler]
+        ), patch.object(
+            SELF_DEPLOY,
+            "_sidecar_file_bytes",
+            side_effect=[
+                expected_router,
+                b"#!/usr/bin/env python3\n# drifted\n",
+                f"{router_sha256}\n".encode("ascii"),
+            ],
+        ), patch.object(SELF_DEPLOY, "_sidecar_json_readback") as readback:
+            self.assertFalse(SELF_DEPLOY._sidecars_match_deploy_head(fields))
+            readback.assert_not_called()
+
+    def test_invalid_finalization_evidence_blocks_even_when_runtime_head_matches(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        deployment = {
+            "completion_status": "complete",
+            "repo_head": "a" * 40,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "release_path_valid": True,
+            "release_id_valid": True,
+            "repo_head_valid": True,
+            "stable_runtime_manifest_valid": True,
+            "runtime_pointer_valid": True,
+            "artifact_integrity_valid": True,
+            "runtime_asset_identity_valid": True,
+            "release_python_identity_valid": True,
+            "environment_compatibility_valid": True,
+            "runtime_binding_valid": True,
+            "provenance_valid": True,
+        }
+        for finalization_state in ("invalid_contract", "invalid_receipt"):
+            with self.subTest(finalization_state=finalization_state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                job_dir = root / "grabowski-job-abcdef012345"
+                job_dir.mkdir()
+                metadata = {
+                    "argv": previous,
+                    "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                    "cwd": str(repo),
+                }
+                status = {
+                    "final_status": "missing_finalization_evidence",
+                    "finalization_receipt": {"valid": False, "state": finalization_state},
+                    "properties": {
+                        "ActiveState": "inactive",
+                        "SubState": "dead",
+                        "Result": "success",
+                        "ExecMainStatus": "0",
+                    },
+                }
+                with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                    SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+                ), patch.object(
+                    SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+                ), patch.object(
+                    SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+                ), patch.object(
+                    SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
+                        SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_inflight_evidence_prunes_runtime_proven_missing_finalization(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": previous,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                "cwd": str(repo),
+            }
+            status = {
+                "final_status": "missing_finalization_evidence",
+                "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+                "properties": {
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                },
+            }
+            deployment = {
+                "completion_status": "complete",
+                "repo_head": "a" * 40,
+                "manifest_parse_valid": True,
+                "manifest_schema_valid": True,
+                "release_path_valid": True,
+                "release_id_valid": True,
+                "repo_head_valid": True,
+                "stable_runtime_manifest_valid": True,
+                "runtime_pointer_valid": True,
+                "artifact_integrity_valid": True,
+                "runtime_asset_identity_valid": True,
+                "release_python_identity_valid": True,
+                "environment_compatibility_valid": True,
+                "runtime_binding_valid": True,
+                "provenance_valid": True,
+            }
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ), patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ), patch.object(
+                SELF_DEPLOY, "_sidecars_match_deploy_head", return_value=True
+            ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index:
+                evidence = SELF_DEPLOY.inflight_runtime_job_evidence(prune=True)
+        self.assertEqual([job_dir.name], evidence["pruned_units"])
+        self.assertEqual([], evidence["blocking_units"])
+        write_index.assert_called_once_with(root, units=[], pending_unit=None)
+
     def test_matching_deploy_blocks_durable_outcome_unknown_before_retry(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"

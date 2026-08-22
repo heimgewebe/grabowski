@@ -346,8 +346,9 @@ def _run_text(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> st
         timeout = int(exc.timeout or 90)
         raise RuntimeError(f"command timed out after {timeout}s: {_command_label(argv)}") from exc
     if completed.returncode != 0 and not allow_nonzero:
-        detail = _brief_error(completed.stderr)
-        raise RuntimeError(detail or f"command failed: {_command_label(argv)}")
+        # stderr is an external payload and may contain sensitive material.
+        # Keep the failure useful without copying that payload forward.
+        raise RuntimeError(f"command failed: {_command_label(argv)}")
     return completed.stdout
 
 
@@ -370,9 +371,8 @@ def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> b
         timeout = int(exc.timeout or 90)
         raise RuntimeError(f"command timed out after {timeout}s: {_command_label(argv)}") from exc
     if completed.returncode != 0 and not allow_nonzero:
-        stderr = completed.stderr.decode("utf-8", errors="replace")
-        detail = _brief_error(stderr)
-        raise RuntimeError(detail or f"command failed: {_command_label(argv)}")
+        # Binary-command stderr is likewise external diagnostic material.
+        raise RuntimeError(f"command failed: {_command_label(argv)}")
     return completed.stdout
 
 
@@ -518,13 +518,34 @@ def _trusted_review_items(items: list[dict[str, Any]], trusted_actors: set[str])
     return [item for item in items if bool(_actor_logins(item) & trusted_actors)]
 
 
+def _canonical_blocking_review_state(item: dict[str, Any]) -> str:
+    state = _review_state(item)
+    if state == "CHANGES_REQUESTED":
+        return "CHANGES_REQUESTED"
+    if state == "DISMISSED":
+        return "DISMISSED"
+    if state == "PENDING":
+        return "PENDING"
+    return ""
+
+
 def _blocking_review_states(items: list[dict[str, Any]], trusted_actors: set[str]) -> list[str]:
-    states = {state for item in _trusted_review_items(items, trusted_actors) if (state := _review_state(item)) in BLOCKING_REVIEW_STATES}
+    states = {
+        state
+        for item in _trusted_review_items(items, trusted_actors)
+        if (state := _canonical_blocking_review_state(item))
+    }
     return sorted(states)
 
 
 def _has_trusted_actor(items: list[dict[str, Any]], trusted_actors: set[str]) -> bool:
-    return any(_review_state(item) not in BLOCKING_REVIEW_STATES for item in _trusted_review_items(items, trusted_actors))
+    # External review-state strings select a branch only; never propagate the
+    # provider value itself into the diagnostic result/JSON contract.
+    for item in _trusted_review_items(items, trusted_actors):
+        if _review_state(item) in BLOCKING_REVIEW_STATES:
+            continue
+        return True
+    return False
 
 
 def _item_head_sha(item: dict[str, Any]) -> str:
@@ -3386,6 +3407,32 @@ def resolve_inside_repo(repo: Path, raw: str | None, *, label: str = "self-revie
     return resolved
 
 
+def _sanitize_for_log(value: Any) -> str:
+    text = str(value)
+    patterns = [
+        # Redact auth schemes before generic key/value pairs so a value such as
+        # ``Authorization: Bearer <token>`` cannot leave the token behind.
+        r"(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+\b",
+        r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization)\s*[:=]\s*([^\s,;]+)",
+        r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b",
+        r"\b[A-Za-z0-9+/]{32,}={0,2}\b",
+        r"\b[0-9a-fA-F]{32,}\b",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "[REDACTED]", text)
+    return text
+
+
+def _sanitize_result_for_output(result: dict[str, Any]) -> dict[str, Any]:
+    """Return an output copy with user-visible diagnostics redacted."""
+    sanitized = dict(result)
+    for key in ("failures", "warnings"):
+        items = result.get(key)
+        if isinstance(items, list):
+            sanitized[key] = [_sanitize_for_log(item) for item in items]
+    return sanitized
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -3456,16 +3503,31 @@ def main(argv: list[str] | None = None) -> int:
             result["self_review_audit"] = write_self_review_audit(
                 audit_path, state, result, self_review
             )
-    except Exception as exc:
+    except GateInputError as exc:
+        # GateInputError messages are authored by this module and form part of
+        # the CLI's actionable validation contract.
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
+    except Exception:
+        # Unknown exceptions can embed arbitrary external payloads.
+        result = {
+            "schema_version": 1,
+            "verdict": "BLOCK",
+            "failures": ["review gate evaluation failed"],
+            "warnings": [],
+        }
     if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
+        # --json is a machine-readable stdout protocol, not a diagnostic log.
+        # Keep it distinct from the human-readable print/log sinks below.
+        sys.stdout.write(
+            json.dumps(_sanitize_result_for_output(result), indent=2, sort_keys=True)
+            + "\n"
+        )
     else:
         print(result["verdict"])
         for item in result.get("failures", []):
-            print(f"BLOCK: {item}")
+            print(f"BLOCK: {_sanitize_for_log(item)}")
         for item in result.get("warnings", []):
-            print(f"WARN: {item}")
+            print(f"WARN: {_sanitize_for_log(item)}")
     return 0 if result.get("verdict") == "PASS" else 2
 
 

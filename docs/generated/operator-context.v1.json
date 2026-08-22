@@ -3058,6 +3058,11 @@
       },
       {
         "kind": "python_module",
+        "launcher_module": "grabowski_self_deploy",
+        "spawned_module": "grabowski_coding_agent_router_cli"
+      },
+      {
+        "kind": "python_module",
         "launcher_module": "grabowski_grips",
         "spawned_module": "grabowski_grips"
       },
@@ -3557,7 +3562,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "a565e5590d773cfa336311179a54227e57709119260d2fe32a083a3eb1b23e7b"
+      "sha256": "1370a21d6428d6e37f3730ef64c3f24a79f64fc07d732adc0592c181bfefcd59"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
