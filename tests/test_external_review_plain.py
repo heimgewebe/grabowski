@@ -271,7 +271,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                 self.assertIn("--tools=", argv)
                 self.assertEqual(
                     argv[argv.index("--model") + 1],
-                    "grok-4.5",
+                    "grok-4.6",
                 )
                 self.assertNotIn("--single", argv)
                 isolated = Path(str(kwargs["cwd"]))
@@ -310,13 +310,13 @@ class PlainExternalReviewTests(unittest.TestCase):
                     output,
                     provider="grok",
                     executable="grok",
-                    model="grok-4.5",
+                    model="grok-4.6",
                 )
 
             review = evidence["reviews"][0]
             self.assertEqual(
                 review["source"],
-                "plain-llm:grok:grok-4.5",
+                "plain-llm:grok:grok-4.6",
             )
             self.assertEqual(
                 review["tool_policy"],
@@ -479,7 +479,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                         root / "out.json",
                         provider="grok",
                         executable="grok",
-                        model="grok-4.5",
+                        model="grok-4.6",
                     )
                 run.assert_not_called()
 
@@ -925,7 +925,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                         transmitted_prompt_path=None,
                         provider="grok",
                         executable="grok",
-                        model="grok-4.5",
+                        model="grok-4.6",
                         timeout_seconds=timeout_seconds,
                         max_prompt_bytes=100_000,
                     )
@@ -1217,7 +1217,7 @@ class PlainExternalReviewTests(unittest.TestCase):
             home = root / "home"
             bin_directory = home / ".grok" / "bin"
             bin_directory.mkdir(parents=True, mode=0o700)
-            native = bin_directory / "grok-4.5"
+            native = bin_directory / "grok-4.6"
             native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             native.chmod(0o700)
             canonical = bin_directory / "grok"
@@ -1310,7 +1310,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                     output,
                     provider="grok",
                     executable="grok",
-                    model="grok-4.5",
+                    model="grok-4.6",
                 )
             self.assertFalse(output.exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
@@ -1358,7 +1358,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                     output,
                     provider="grok",
                     executable="grok",
-                    model="grok-4.5",
+                    model="grok-4.6",
                 )
 
             self.assertEqual(len(workspaces), 1)
@@ -1417,7 +1417,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                     output,
                     provider="grok",
                     executable="grok",
-                    model="grok-4.5",
+                    model="grok-4.6",
                 )
 
             self.assertIsNotNone(workspace_prompt_identity)
