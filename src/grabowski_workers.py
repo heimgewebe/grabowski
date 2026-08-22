@@ -2851,8 +2851,54 @@ function semanticOverflowClipping(overflowText) {
   return {ok: false, clips: true};
 }
 
-function semanticLayoutVisibility(strings, styleIndexes) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 8) {
+function semanticAlphaVisibilityToken(token) {
+  const trimmed = token.trim().toLowerCase();
+  const percentage = trimmed.endsWith('%');
+  const numericToken = percentage ? trimmed.slice(0, -1).trim() : trimmed;
+  const value = Number(numericToken);
+  if (!Number.isFinite(value)) return {ok: false, visible: false};
+  const alpha = percentage ? value / 100 : value;
+  return {ok: true, visible: alpha > 0};
+}
+
+function semanticCssColorVisibility(colorText) {
+  const normalized = colorText.trim().toLowerCase();
+  if (!normalized || Buffer.byteLength(normalized, 'utf8') > 256) {
+    return {ok: false, visible: false};
+  }
+  if (normalized === 'transparent') return {ok: true, visible: false};
+  if (normalized.endsWith(')')) {
+    const slashIndex = normalized.lastIndexOf('/');
+    if (slashIndex >= 0) {
+      return semanticAlphaVisibilityToken(normalized.slice(slashIndex + 1, -1));
+    }
+    if (normalized.startsWith('rgba(') || normalized.startsWith('hsla(')) {
+      const body = normalized.slice(normalized.indexOf('(') + 1, -1);
+      const parts = body.split(',');
+      if (parts.length !== 4) return {ok: false, visible: false};
+      return semanticAlphaVisibilityToken(parts[3]);
+    }
+  }
+  return {ok: true, visible: true};
+}
+
+function semanticTextPaintVisibility(strings, styleIndexes) {
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 10) {
+    return {ok: false, visible: false};
+  }
+  const colorText = semanticSnapshotString(strings, styleIndexes[8], 256);
+  const textFillColorText = semanticSnapshotString(strings, styleIndexes[9], 256);
+  if (colorText === null || textFillColorText === null) {
+    return {ok: false, visible: false};
+  }
+  const normalizedFill = textFillColorText.trim().toLowerCase();
+  const effectiveFill = normalizedFill === 'currentcolor' ? colorText : textFillColorText;
+  return semanticCssColorVisibility(effectiveFill);
+}
+
+function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true) {
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 10 ||
+      typeof checkVisibility !== 'boolean') {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
   const visibility = semanticSnapshotString(strings, styleIndexes[0], 64);
@@ -2881,7 +2927,7 @@ function semanticLayoutVisibility(strings, styleIndexes) {
   if (!Number.isFinite(opacity)) {
     return {ok: false, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
   }
-  if (['hidden', 'collapse'].includes(normalizedVisibility) ||
+  if ((checkVisibility && ['hidden', 'collapse'].includes(normalizedVisibility)) ||
       normalizedContentVisibility === 'hidden' || opacity <= 0) {
     return {ok: true, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
   }
@@ -2949,7 +2995,9 @@ function semanticSnapshotBoundsWithinClippingAncestors(
           layoutIndex >= layoutStyles.length) {
         return {ok: false, visible: false};
       }
-      const visibility = semanticLayoutVisibility(strings, layoutStyles[layoutIndex]);
+      const visibility = semanticLayoutVisibility(
+        strings, layoutStyles[layoutIndex], current === nodeIndex
+      );
       if (!visibility.ok) return {ok: false, visible: false};
       if (!visibility.visible) return {ok: true, visible: false};
       const clipping = semanticLayoutBoundsWithinClipping(
@@ -2989,7 +3037,9 @@ function semanticSnapshotTargetAncestorsLayoutVisible(
       if (!Number.isInteger(layoutIndex) || layoutIndex < 0 || layoutIndex >= layoutStyles.length) {
         return {ok: false, visible: false};
       }
-      const visibility = semanticLayoutVisibility(strings, layoutStyles[layoutIndex]);
+      const visibility = semanticLayoutVisibility(
+        strings, layoutStyles[layoutIndex], current === targetIndex
+      );
       if (!visibility.ok) return {ok: false, visible: false};
       if (!visibility.visible) return {ok: true, visible: false};
     }
@@ -3225,7 +3275,7 @@ async function captureSemanticVisibleSnapshot() {
       return {ok: false, snapshot: null};
     }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
-      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y'],
+      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y', 'color', '-webkit-text-fill-color'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
@@ -3325,6 +3375,9 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
     const renderedGeometry = semanticLayoutBoundsVisibility(layoutBounds[layoutIndex]);
     if (!renderedGeometry.ok) return {ok: false, name: ''};
     if (!renderedGeometry.visible) continue;
+    const textPaint = semanticTextPaintVisibility(strings, layoutStyles[layoutIndex]);
+    if (!textPaint.ok) return {ok: false, name: ''};
+    if (!textPaint.visible) continue;
     const clipping = semanticSnapshotBoundsWithinClippingAncestors(
       document, strings, nodeIndex, layoutByNode, layoutBounds[layoutIndex]
     );
@@ -3342,7 +3395,9 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
       }
       const ancestorLayoutIndex = layoutByNode.get(pathIndex);
       if (ancestorLayoutIndex === undefined) continue;
-      const visibility = semanticLayoutVisibility(strings, layoutStyles[ancestorLayoutIndex]);
+      const visibility = semanticLayoutVisibility(
+        strings, layoutStyles[ancestorLayoutIndex], pathIndex === nodeIndex
+      );
       if (!visibility.ok) return {ok: false, name: ''};
       if (!visibility.visible) {
         allowed = false;
