@@ -3424,8 +3424,11 @@ globalThis.fetch = async () => ({
         self.assertIn("async function readSemanticElementName", source)
         self.assertIn("attr('aria-label')", source)
         self.assertIn("attr('placeholder')", source)
-        self.assertIn("this.innerText", source)
-        self.assertIn("this.textContent", source)
+        self.assertIn("this.tagName", source)
+        self.assertIn("['input', 'textarea', 'select', 'option'].includes(tag)", source)
+        self.assertIn("this.isContentEditable === true", source)
+        self.assertIn("formControl ? '' : (this.innerText || this.textContent || '')", source)
+        self.assertNotIn("attr('value')", source)
         self.assertGreaterEqual(source.count("await readSemanticElementName("), 2)
         self.assertNotIn("document.querySelector", source)
         verify = "const objectId = await verifyElementImmediately(expectedElement);"

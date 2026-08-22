@@ -2602,13 +2602,15 @@ async function readSemanticElementName(backendNodeId, role, accessibilityName) {
         const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim().slice(0, 160);
         const attr = (name) => typeof this.getAttribute === 'function'
           ? this.getAttribute(name) : '';
+        const tag = clean(this.tagName).toLowerCase();
+        const formControl = ['input', 'textarea', 'select', 'option'].includes(tag) ||
+          this.isContentEditable === true;
+        const visibleLabel = formControl ? '' : (this.innerText || this.textContent || '');
         return clean(
           attr('aria-label') ||
           attr('title') ||
           (role === 'textbox' ? attr('placeholder') : '') ||
-          this.innerText ||
-          this.textContent ||
-          (role === 'button' ? attr('value') : '')
+          visibleLabel
         );
       }`,
       arguments: [{value: role}],
