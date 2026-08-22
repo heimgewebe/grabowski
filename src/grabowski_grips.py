@@ -691,6 +691,44 @@ GRIP_SPECS: dict[str, GripSpec] = {
         runner="mechanic_loop",
         uses_github=True,
     ),
+    "saga-plan": GripSpec(
+        name="saga-plan",
+        version="1.0",
+        summary="Build one immutable five-phase operator saga plan without executing effects.",
+        effect=READ_ONLY,
+        required_parameters=("saga_kind", "target", "idempotency_key"),
+        acceptance_ids=("named-saga", "five-phase-contract", "identity-bound", "captain-boundary"),
+        runner="saga_plan",
+    ),
+    "saga-run": GripSpec(
+        name="saga-run",
+        version="1.0",
+        summary="Run only the normal Mechanic prepare phase of one exact saga and emit a Captain handoff.",
+        effect=MUTATING,
+        required_parameters=("saga_kind", "target", "idempotency_key", "expected_plan_sha256"),
+        acceptance_ids=("plan-bound", "mechanic-receipts", "captain-handoff-only", "no-blind-retry"),
+        runner="saga_run",
+        uses_github=True,
+        operation_effect_class="orchestration",
+        operation_class="operator-saga-prepare",
+    ),
+    "saga-settle": GripSpec(
+        name="saga-settle",
+        version="1.0",
+        summary="Settle one exact saga from its run receipt, Captain receipt and typed live readback.",
+        effect=READ_ONLY,
+        required_parameters=(
+            "saga_kind",
+            "target",
+            "idempotency_key",
+            "expected_plan_sha256",
+            "run_receipt",
+            "captain_result",
+        ),
+        acceptance_ids=("plan-run-captain-bound", "captain-audit-bound", "live-readback-bound", "partial-failure-explicit", "authority-preserved"),
+        runner="saga_settle",
+        uses_github=True,
+    ),
     "captain-preflight": GripSpec(
         name="captain-preflight",
         version="1.2",
@@ -895,6 +933,9 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "gate-evidence-preflight",
         "convergence-state-classify",
         "mechanic-loop",
+        "saga-plan",
+        "saga-run",
+        "saga-settle",
         "captain-preflight",
         "captain-run",
         "pr-check-readiness",
@@ -946,6 +987,9 @@ GRIP_SURFACE_TARGETS = {
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
     "convergence-state-classify": "bounded historical convergence state records",
     "mechanic-loop": "bounded normal grip action sequence",
+    "saga-plan": "one immutable named five-phase operator saga plan",
+    "saga-run": "one exact saga prepare phase through mechanic-loop plus Captain handoff",
+    "saga-settle": "one exact Saga run/Captain/live-readback settlement",
     "captain-preflight": "high-impact Captain action preflight only",
     "captain-run": "action-specific high-impact Captain execution",
     "pr-check-readiness": "pull request readiness evidence",
@@ -965,6 +1009,15 @@ GRIP_SURFACE_RECOVERY_PATHS = {
     MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
 }
 GRIP_RECOVERY_PATHS_BY_NAME = {
+    "saga-run": (
+        "inspect the nested mechanic-loop receipts; never invoke Captain from the saga runner. "
+        "If Captain was later invoked and its outcome is ambiguous, obtain the target-specific typed readback "
+        "and use saga-settle; never replay Captain from the saga receipt"
+    ),
+    "saga-settle": (
+        "read-only repeat is allowed for runtime readback_pending; for recovery_required, repair named evidence "
+        "and obtain authoritative target readback before any new Captain intent"
+    ),
     "agent-execution-happy-path": (
         "read back the exact Source-derived Work Lane, Workspace coordinator status, continuation job and any nested "
         "candidate-integration-ready receipt or immutable CandidateDeliveryManifest.v1; never replay an unknown lane/workspace/collect/revision/close/commit/adoption/push/PR "
@@ -9028,6 +9081,381 @@ def _run_mechanic_loop(
     return grabowski_grip_orchestration.run_mechanic_loop(sys.modules[__name__], spec, parameters, receipt, runner, github_runner)
 
 
+def _saga_allowed_parameters(parameters: dict[str, Any], allowed: set[str]) -> None:
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError("saga grip received unknown parameter(s): " + ", ".join(unknown))
+
+
+def _saga_plan_from_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return grabowski_grip_orchestration.build_plan(
+            parameters.get("saga_kind"),
+            parameters.get("target"),
+            parameters.get("idempotency_key"),
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
+
+
+def _saga_expected_plan(plan: dict[str, Any], parameters: dict[str, Any]) -> None:
+    expected = parameters.get("expected_plan_sha256")
+    if not _is_sha256_hex(expected):
+        raise GripPreflightError("expected_plan_sha256 must be a lowercase SHA-256")
+    if expected != plan.get("plan_sha256"):
+        raise GripPreflightError("saga plan changed since the caller-bound preflight")
+
+
+def _run_saga_plan(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    _saga_allowed_parameters(parameters, {"saga_kind", "target", "idempotency_key"})
+    plan = _saga_plan_from_parameters(parameters)
+    _check(receipt, "named-saga", "pass", str(plan["saga_kind"]))
+    phase_names = [item.get("name") for item in plan.get("phases", []) if isinstance(item, dict)]
+    _check(
+        receipt,
+        "five-phase-contract",
+        "pass" if phase_names == list(grabowski_grip_orchestration.PHASES) else "fail",
+        ",".join(str(item) for item in phase_names),
+    )
+    _check(receipt, "identity-bound", "pass", str(plan["plan_sha256"]))
+    handoff = plan.get("captain_handoff")
+    captain_bound = (
+        isinstance(handoff, dict)
+        and handoff.get("grip") == "captain-run"
+        and handoff.get("profile") == "captain"
+        and handoff.get("action") in CAPTAIN_HIGH_IMPACT_ACTIONS
+    )
+    _check(receipt, "captain-boundary", "pass" if captain_bound else "fail", str(handoff.get("action") if isinstance(handoff, dict) else "missing"))
+    if not captain_bound:
+        return {"receipt_status": "blocked", "error": "saga Captain boundary is invalid"}
+    return {**plan, "receipt_status": "passed"}
+
+
+def _run_saga_run(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    del spec
+    _saga_allowed_parameters(
+        parameters,
+        {"saga_kind", "target", "idempotency_key", "expected_plan_sha256"},
+    )
+    plan = _saga_plan_from_parameters(parameters)
+    _saga_expected_plan(plan, parameters)
+    _check(receipt, "plan-bound", "pass", str(plan["plan_sha256"]))
+    mechanic = run_grip(
+        "mechanic-loop",
+        {"actions": plan["mechanic_actions"]},
+        allow_mutation=True,
+        command_runner=runner,
+        github_runner=github_runner,
+    )
+    try:
+        run_receipt = grabowski_grip_orchestration.build_run_receipt(
+            plan,
+            mechanic,
+            receipt_sha256_json=sha256_json,
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripActionError(str(exc)) from exc
+    child_hashes = run_receipt.get("child_receipt_sha256s")
+    receipt_bound = isinstance(child_hashes, list) and all(_is_sha256_hex(item) for item in child_hashes)
+    _check(
+        receipt,
+        "mechanic-receipts",
+        "pass" if receipt_bound else "fail",
+        f"children={len(child_hashes) if isinstance(child_hashes, list) else 0}",
+    )
+    captain_only = (
+        run_receipt.get("captain_handoff") is None
+        or (
+            isinstance(run_receipt.get("captain_handoff"), dict)
+            and run_receipt["captain_handoff"].get("grip") == "captain-run"
+        )
+    )
+    _check(receipt, "captain-handoff-only", "pass" if captain_only else "fail", str(run_receipt.get("state")))
+    _check(
+        receipt,
+        "no-blind-retry",
+        "pass",
+        "captain is never invoked by saga-run; ambiguous apply requires typed readback before any new Captain intent",
+    )
+    return {
+        "schema_version": 1,
+        "kind": "operator_saga_run",
+        "plan": plan,
+        "run_receipt": run_receipt,
+        "mechanic": mechanic,
+        "state": run_receipt["state"],
+        "captain_handoff": run_receipt.get("captain_handoff"),
+        "required_readback": run_receipt.get("required_readback"),
+        "receipt_status": run_receipt["receipt_status"],
+    }
+
+
+def _saga_verified_audit_records(
+    record_sha256s: list[str],
+) -> dict[str, dict[str, Any]]:
+    if (
+        not record_sha256s
+        or len(record_sha256s) != len(set(record_sha256s))
+        or any(not _is_sha256_hex(item) for item in record_sha256s)
+    ):
+        raise GripPreflightError("Captain audit record SHA-256 set is invalid")
+    try:
+        import grabowski_audit_query
+
+        snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        raise GripPreflightError(
+            f"verified Captain audit snapshot unavailable: {type(exc).__name__}"
+        ) from exc
+    pending = set(record_sha256s)
+    needles = {item: f'"record_sha256":"{item}"'.encode("ascii") for item in pending}
+    found: dict[str, dict[str, Any]] = {}
+    remaining = 100_000
+    for segment in reversed(snapshot.segments):
+        if remaining <= 0 or not pending:
+            break
+        try:
+            data = (
+                segment.captured_data
+                if segment.captured_data is not None
+                else grabowski_audit_query._load_snapshot_segment(segment)
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise GripPreflightError(
+                f"verified Captain audit segment unavailable: {type(exc).__name__}"
+            ) from exc
+        lines = data.splitlines()
+        selected = lines[-min(len(lines), remaining):]
+        remaining -= len(selected)
+        for raw_line in reversed(selected):
+            candidates = [item for item in pending if needles[item] in raw_line]
+            if not candidates:
+                continue
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise GripPreflightError("verified Captain audit record is not valid JSON") from exc
+            if not isinstance(record, dict):
+                continue
+            record_sha = record.get("record_sha256")
+            if record_sha in pending:
+                found[str(record_sha)] = record
+                pending.remove(str(record_sha))
+                if not pending:
+                    break
+    if pending:
+        raise GripPreflightError(
+            "Captain audit record is absent from the bounded verified audit window: "
+            + ",".join(sorted(pending))
+        )
+    return found
+
+
+def _saga_verified_audit_record(record_sha256: str) -> dict[str, Any]:
+    return _saga_verified_audit_records([record_sha256])[record_sha256]
+
+
+def _saga_captain_audit_binding(
+    plan: dict[str, Any], captain_result_value: Any
+) -> dict[str, Any]:
+    if not isinstance(captain_result_value, dict):
+        raise GripPreflightError("captain_result must be an object")
+    captain_result = dict(captain_result_value)
+    try:
+        receipt, _output = grabowski_grip_orchestration._validate_grip_result(
+            captain_result,
+            expected_grip="captain-run",
+            field="captain_result",
+            receipt_sha256_json=sha256_json,
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    audit = captain_result.get("captain_audit")
+    if not isinstance(audit, dict) or audit.get("status") != "complete":
+        raise GripPreflightError("captain_result lacks a complete server Captain audit")
+    intent_meta = audit.get("intent")
+    completion_meta = audit.get("completion")
+    if not isinstance(intent_meta, dict) or not isinstance(completion_meta, dict):
+        raise GripPreflightError("captain_result Captain audit metadata is incomplete")
+    if intent_meta.get("audit_chain_valid") is not True or completion_meta.get("audit_chain_valid") is not True:
+        raise GripPreflightError("captain_result Captain audit chain was not verified")
+    intent_sha = intent_meta.get("audit_record_sha256")
+    completion_sha = completion_meta.get("audit_record_sha256")
+    if not _is_sha256_hex(intent_sha) or not _is_sha256_hex(completion_sha):
+        raise GripPreflightError("captain_result Captain audit record identity is invalid")
+    verified_records = _saga_verified_audit_records(
+        [str(intent_sha), str(completion_sha)]
+    )
+    intent = verified_records[str(intent_sha)]
+    completion = verified_records[str(completion_sha)]
+    expected_identity = plan["expected_identity"]
+    expected_base = expected_identity.get("base") if plan["saga_kind"] == "pr-settlement" else None
+    expected_base_sha = expected_identity.get("expected_base_sha") if plan["saga_kind"] == "pr-settlement" else None
+    expected_common = {
+        "kind": "grabowski_captain_run_audit",
+        "action": plan["captain_handoff"]["action"],
+        "target_sha256": sha256_json(plan["captain_handoff"]["target"]),
+        "expected_head": expected_identity["expected_head"],
+        "expected_base": expected_base,
+        "expected_base_sha": expected_base_sha,
+    }
+    for phase, record in (("intent", intent), ("completion", completion)):
+        if record.get("operation") != f"captain-run-audit-{phase}" or record.get("phase") != phase:
+            raise GripPreflightError(f"Captain audit {phase} record has the wrong operation")
+        drift = [key for key, expected in expected_common.items() if record.get(key) != expected]
+        if drift:
+            raise GripPreflightError(
+                f"Captain audit {phase} differs from saga plan: " + ", ".join(drift)
+            )
+    if completion.get("intent_audit_sha256") != intent_sha:
+        raise GripPreflightError("Captain audit completion is not bound to its intent")
+    for field in ("actor_id", "context_sha256", "request_sha256"):
+        if completion.get(field) != intent.get(field):
+            raise GripPreflightError(f"Captain audit {field} changed between intent and completion")
+    execution_result = completion.get("execution_result")
+    if not isinstance(execution_result, dict):
+        raise GripPreflightError("Captain audit completion lacks execution result binding")
+    expected_execution = {
+        "status": receipt["status"],
+        "receipt_sha256": receipt["receipt_sha256"],
+        "output_sha256": receipt["output_sha256"],
+    }
+    if execution_result != expected_execution:
+        raise GripPreflightError("Captain audit completion differs from Captain receipt")
+    if completion.get("execution_result_sha256") != sha256_json(execution_result):
+        raise GripPreflightError("Captain audit execution result digest mismatch")
+    body = {
+        "schema_version": 1,
+        "kind": grabowski_grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
+        "authority": "verified_grabowski_audit_chain",
+        "intent_record_sha256": intent_sha,
+        "completion_record_sha256": completion_sha,
+        "action": expected_common["action"],
+        "target_sha256": expected_common["target_sha256"],
+        "expected_head": expected_common["expected_head"],
+        "expected_base": expected_base,
+        "expected_base_sha": expected_base_sha,
+        "receipt_sha256": receipt["receipt_sha256"],
+        "output_sha256": receipt["output_sha256"],
+        "status": receipt["status"],
+    }
+    return {**body, "binding_sha256": sha256_json(body)}
+
+
+def _saga_live_readback(
+    plan: dict[str, Any], github_runner: GithubRunner
+) -> tuple[dict[str, Any], str]:
+    target = plan["target"]
+    expected = plan["expected_identity"]
+    if plan["saga_kind"] == "pr-settlement":
+        result = _github(
+            Path(str(target["repository_path"])),
+            github_runner,
+            [
+                "pr",
+                "view",
+                str(expected["pr"]),
+                "--repo",
+                str(expected["repository"]),
+                "--json",
+                "number,state,baseRefName,headRefOid,mergeCommit",
+            ],
+        )
+        readback = _json_stdout(result)
+        if not isinstance(readback, dict):
+            raise GripActionError("typed PR readback must be a JSON object")
+        return dict(readback), "github-pr-view"
+
+    try:
+        import grabowski_read_surface
+
+        readback = grabowski_read_surface.grabowski_deployment_identity()
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise GripActionError(
+            f"typed deployment identity readback failed: {type(exc).__name__}"
+        ) from exc
+    if not isinstance(readback, dict):
+        raise GripActionError("typed deployment identity readback must be an object")
+    return dict(readback), "grabowski-deployment-identity"
+
+
+def _run_saga_settle(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    _saga_allowed_parameters(
+        parameters,
+        {
+            "saga_kind",
+            "target",
+            "idempotency_key",
+            "expected_plan_sha256",
+            "run_receipt",
+            "captain_result",
+        },
+    )
+    plan = _saga_plan_from_parameters(parameters)
+    _saga_expected_plan(plan, parameters)
+    captain_audit_binding = _saga_captain_audit_binding(
+        plan, parameters.get("captain_result")
+    )
+    readback, readback_source = _saga_live_readback(plan, github_runner)
+    try:
+        settlement = grabowski_grip_orchestration.settle(
+            plan_value=plan,
+            run_receipt_value=parameters.get("run_receipt"),
+            captain_result_value=parameters.get("captain_result"),
+            captain_audit_binding_value=captain_audit_binding,
+            readback_value=readback,
+            receipt_sha256_json=sha256_json,
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    _check(receipt, "plan-run-captain-bound", "pass", str(settlement["settlement_sha256"]))
+    _check(
+        receipt,
+        "captain-audit-bound",
+        "pass",
+        str(captain_audit_binding["completion_record_sha256"]),
+    )
+    _check(
+        receipt,
+        "live-readback-bound",
+        "pass" if _is_sha256_hex(settlement.get("readback_sha256")) else "fail",
+        readback_source,
+    )
+    explicit = settlement.get("state") in {
+        "settled",
+        "readback_pending",
+        "apply_blocked",
+        "recovery_required",
+    }
+    _check(receipt, "partial-failure-explicit", "pass" if explicit else "fail", str(settlement.get("state")))
+    _check(
+        receipt,
+        "authority-preserved",
+        "pass",
+        "settlement is read-only; Captain remains the sole high-impact apply authority",
+    )
+    return {**settlement, "live_readback_source": readback_source}
+
+
 def _captain_wildcardish(value: Any) -> bool:
     if not isinstance(value, str):
         return True
@@ -12975,6 +13403,9 @@ _RUNNERS = {
     "operator_obligation_close": _run_operator_obligation_close,
     "operator_obligation_resolve": _run_operator_obligation_resolve,
     "mechanic_loop": _run_mechanic_loop,
+    "saga_plan": _run_saga_plan,
+    "saga_run": _run_saga_run,
+    "saga_settle": _run_saga_settle,
     "captain_preflight": _run_captain_preflight,
     "captain_run": _run_captain_run,
     "branch_publish": _run_branch_publish,
