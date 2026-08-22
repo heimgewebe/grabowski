@@ -2584,14 +2584,22 @@ function boundedText(value, limit) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
-function semanticDomAttribute(node, name) {
+function semanticDomRawAttribute(node, name, maxBytes = 4096) {
   const attributes = Array.isArray(node && node.attributes) ? node.attributes : [];
   for (let index = 0; index + 1 < attributes.length; index += 2) {
-    if (String(attributes[index] || '').toLowerCase() === name) {
-      return boundedText(attributes[index + 1], 160);
+    if (String(attributes[index] || '').toLowerCase() !== name) continue;
+    const value = String(attributes[index + 1] || '');
+    if (Buffer.byteLength(value, 'utf8') > maxBytes) {
+      return {found: true, valid: false, value: ''};
     }
+    return {found: true, valid: true, value};
   }
-  return '';
+  return {found: false, valid: true, value: ''};
+}
+
+function semanticDomAttribute(node, name) {
+  const raw = semanticDomRawAttribute(node, name);
+  return raw.found && raw.valid ? boundedText(raw.value, 160) : '';
 }
 
 function semanticDomTextSubtreeBlocked(node) {
@@ -2609,14 +2617,23 @@ function semanticDomTextSubtreeBlocked(node) {
   ]);
   if (inertNames.has(localName) || inertNames.has(nodeName)) return true;
   if (valueBearingTags.has(localName) || valueBearingTags.has(nodeName)) return true;
-  const roleTokens = semanticDomAttribute(node, 'role')
-    .toLowerCase().split(/\s+/).filter(Boolean);
+
+  const hidden = semanticDomRawAttribute(node, 'hidden', 64);
+  const inert = semanticDomRawAttribute(node, 'inert', 64);
+  if (hidden.found || inert.found) return true;
+  const ariaHidden = semanticDomRawAttribute(node, 'aria-hidden', 64);
+  if (!ariaHidden.valid) return true;
+  if (ariaHidden.found && ariaHidden.value.trim().toLowerCase() === 'true') return true;
+
+  const rawRole = semanticDomRawAttribute(node, 'role', 512);
+  if (!rawRole.valid) return true;
+  const roleTokens = rawRole.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
   if (roleTokens.some((token) => valueBearingRoles.has(token))) return true;
-  const attributes = Array.isArray(node && node.attributes) ? node.attributes : [];
-  for (let index = 0; index + 1 < attributes.length; index += 2) {
-    if (String(attributes[index] || '').toLowerCase() !== 'contenteditable') continue;
-    const value = String(attributes[index + 1] || '').trim().toLowerCase();
-    return value !== 'false';
+
+  const contentEditable = semanticDomRawAttribute(node, 'contenteditable', 64);
+  if (!contentEditable.valid) return true;
+  if (contentEditable.found) {
+    return contentEditable.value.trim().toLowerCase() !== 'false';
   }
   return false;
 }

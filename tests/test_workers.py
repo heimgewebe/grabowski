@@ -345,6 +345,8 @@ const readNameFallbackScenario = scenario === 'read-name-fallback';
 const readSensitiveDescendantFallbackScenario = scenario === 'read-sensitive-descendant-fallback';
 const readSensitiveRootFallbackScenario = scenario === 'read-sensitive-root-fallback';
 const readRoleTokenDescendantFallbackScenario = scenario === 'read-role-token-descendant-fallback';
+const readLongRoleTokenFallbackScenario = scenario === 'read-long-role-token-fallback';
+const readHiddenDescendantFallbackScenario = scenario === 'read-hidden-descendant-fallback';
 const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
 const scrollFallbackRevalidationFailureScenario = scenario === 'scroll-fallback-revalidation-failure';
 const activateTarget = 'https://private.invalid/issues';
@@ -407,7 +409,7 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
-          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
+          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -547,6 +549,79 @@ class FakeWebSocket {
                 nodeName: 'SPAN',
                 attributes: [],
                 children: [{backendNodeId: 105, nodeType: 3, nodeName: '#text', nodeValue: 'Proceed'}],
+              },
+            ],
+          }});
+          return;
+        }
+        if (readLongRoleTokenFallbackScenario) {
+          const longRole = Array.from({length: 45}, (_, index) => 'future' + index).join(' ') + ' textbox';
+          reply({node: {
+            backendNodeId: 101,
+            nodeType: 1,
+            localName: 'div',
+            nodeName: 'DIV',
+            attributes: ['role', 'button'],
+            children: [
+              {
+                backendNodeId: 102,
+                nodeType: 1,
+                localName: 'div',
+                nodeName: 'DIV',
+                attributes: ['role', longRole],
+                children: [{backendNodeId: 103, nodeType: 3, nodeName: '#text', nodeValue: 'long-role-secret'}],
+              },
+              {
+                backendNodeId: 104,
+                nodeType: 1,
+                localName: 'span',
+                nodeName: 'SPAN',
+                attributes: [],
+                children: [{backendNodeId: 105, nodeType: 3, nodeName: '#text', nodeValue: 'Proceed'}],
+              },
+            ],
+          }});
+          return;
+        }
+        if (readHiddenDescendantFallbackScenario) {
+          reply({node: {
+            backendNodeId: 101,
+            nodeType: 1,
+            localName: 'button',
+            nodeName: 'BUTTON',
+            attributes: [],
+            children: [
+              {
+                backendNodeId: 102,
+                nodeType: 1,
+                localName: 'span',
+                nodeName: 'SPAN',
+                attributes: ['hidden', ''],
+                children: [{backendNodeId: 103, nodeType: 3, nodeName: '#text', nodeValue: 'hidden-secret'}],
+              },
+              {
+                backendNodeId: 104,
+                nodeType: 1,
+                localName: 'span',
+                nodeName: 'SPAN',
+                attributes: ['aria-hidden', 'true'],
+                children: [{backendNodeId: 105, nodeType: 3, nodeName: '#text', nodeValue: 'aria-hidden-secret'}],
+              },
+              {
+                backendNodeId: 106,
+                nodeType: 1,
+                localName: 'span',
+                nodeName: 'SPAN',
+                attributes: ['inert', ''],
+                children: [{backendNodeId: 107, nodeType: 3, nodeName: '#text', nodeValue: 'inert-secret'}],
+              },
+              {
+                backendNodeId: 108,
+                nodeType: 1,
+                localName: 'span',
+                nodeName: 'SPAN',
+                attributes: [],
+                children: [{backendNodeId: 109, nodeType: 3, nodeName: '#text', nodeValue: 'Continue'}],
               },
             ],
           }});
@@ -3574,13 +3649,20 @@ globalThis.fetch = async () => ({
         self.assertIn("Number.isSafeInteger", source)
         self.assertIn("async function readSemanticElementName", source)
         self.assertIn("function semanticDomAttribute", source)
+        self.assertIn("function semanticDomRawAttribute", source)
+        self.assertIn("Buffer.byteLength(value, 'utf8') > maxBytes", source)
         self.assertIn("function semanticDomTextSubtreeBlocked", source)
         self.assertIn("function boundedSemanticDomText", source)
         self.assertIn("'input', 'textarea', 'select', 'option', 'optgroup', 'output', 'meter', 'progress'", source)
         self.assertIn("'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'slider', 'spinbutton'", source)
-        self.assertIn("value !== 'false'", source)
-        self.assertIn(".toLowerCase().split(/\\s+/).filter(Boolean)", source)
+        self.assertIn("contentEditable.value.trim().toLowerCase() !== 'false'", source)
+        self.assertIn(".toLowerCase().trim().split(/\\s+/).filter(Boolean)", source)
+        self.assertIn("const rawRole = semanticDomRawAttribute(node, 'role', 512)", source)
+        self.assertIn("if (!rawRole.valid) return true", source)
         self.assertIn("roleTokens.some((token) => valueBearingRoles.has(token))", source)
+        self.assertIn("semanticDomRawAttribute(node, 'hidden', 64)", source)
+        self.assertIn("semanticDomRawAttribute(node, 'aria-hidden', 64)", source)
+        self.assertIn("semanticDomRawAttribute(node, 'inert', 64)", source)
         self.assertIn("if (semanticDomTextSubtreeBlocked(current)) return;", source)
         self.assertNotIn("!root && semanticDomTextSubtreeBlocked(current)", source)
         name_reader = source[
@@ -3987,6 +4069,28 @@ globalThis.fetch = async () => ({
         self.assertEqual(element["role"], "button")
         self.assertTrue(element["name"].startswith("Dismiss onboarding "))
         self.assertEqual(len(element["name"]), 160)
+
+    def test_browser_semantic_node_fails_closed_on_overlong_descendant_role_tokens(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-long-role-token-fallback"
+        )
+
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        element = receipt["state"]["elements"][0]
+        self.assertEqual(element["name"], "Proceed")
+        self.assertNotIn("secret", element["name"])
+
+    def test_browser_semantic_node_excludes_hidden_descendant_subtrees(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-hidden-descendant-fallback"
+        )
+
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        element = receipt["state"]["elements"][0]
+        self.assertEqual(element["name"], "Continue")
+        self.assertNotIn("secret", element["name"])
 
     def test_browser_semantic_node_excludes_value_bearing_root_text(self) -> None:
         execution, receipt = self._run_browser_semantic_node(
