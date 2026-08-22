@@ -59,6 +59,9 @@ HEIMGEWEBE_GITHUB_ORIGIN_PREFIXES = (
     "https://github.com/heimgewebe/",
     "ssh://git@github.com/heimgewebe/",
 )
+HEIMGEWEBE_GITHUB_SCP_ORIGIN_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}@github\.com:heimgewebe/"
+)
 GIT_REPOSITORY_OVERRIDE_ENV = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -596,22 +599,43 @@ def _bureau_repo_resource_from_origin(origin: str) -> str | None:
         or "\r" in origin
     ):
         return None
+    repository: str | None = None
     for prefix in HEIMGEWEBE_GITHUB_ORIGIN_PREFIXES:
-        if not origin.startswith(prefix):
-            continue
-        repository = origin[len(prefix) :]
-        if repository.endswith("/"):
-            repository = repository[:-1]
-        if repository.endswith(".git"):
-            repository = repository[:-4]
-        if "/" in repository or BUREAU_REPO_SLUG_RE.fullmatch(repository) is None:
+        if origin.startswith(prefix):
+            repository = origin[len(prefix) :]
+            break
+    if repository is None:
+        match = HEIMGEWEBE_GITHUB_SCP_ORIGIN_RE.match(origin)
+        if match is None:
             return None
-        return f"repo.{repository}"
-    return None
+        repository = origin[match.end() :]
+    if repository.endswith("/"):
+        repository = repository[:-1]
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    canonical_repository = repository.lower()
+    if (
+        not repository.isascii()
+        or "/" in repository
+        or BUREAU_REPO_SLUG_RE.fullmatch(canonical_repository) is None
+    ):
+        return None
+    return f"repo.{canonical_repository}"
 
 
 def _canonical_bureau_repo_resource(value: Any) -> str | None:
     if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    owner_prefix = "heimgewebe/"
+    if value.startswith(owner_prefix):
+        repository_slug = value[len(owner_prefix) :]
+        canonical_repository_slug = repository_slug.lower()
+        if (
+            repository_slug.isascii()
+            and "/" not in repository_slug
+            and BUREAU_REPO_SLUG_RE.fullmatch(canonical_repository_slug) is not None
+        ):
+            return f"repo.{canonical_repository_slug}"
         return None
     repository = Path(value)
     if not repository.is_absolute() or str(repository) != value:
