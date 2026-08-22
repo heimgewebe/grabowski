@@ -363,6 +363,8 @@ const readDesignModeFallbackScenario = scenario === 'read-design-mode-fallback';
 const readChildDesignModeFallbackScenario = scenario === 'read-child-design-mode-fallback';
 const readTransformZeroFallbackScenario = scenario === 'read-transform-zero-fallback';
 const readTransformZeroDescendantFallbackScenario = scenario === 'read-transform-zero-descendant-fallback';
+const readClipPathFallbackScenario = scenario === 'read-clip-path-fallback';
+const readEmbeddingOpacityFallbackScenario = scenario === 'read-embedding-opacity-fallback';
 const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
 const scrollFallbackRevalidationFailureScenario = scenario === 'scroll-fallback-revalidation-failure';
 const activateTarget = 'https://private.invalid/issues';
@@ -371,7 +373,7 @@ function message(target, payload) {
   if (target.onmessage) target.onmessage({data: JSON.stringify(payload)});
 }
 
-function makeSemanticSnapshot(spec) {
+function makeSemanticSnapshot(spec, child = null) {
   const strings = [];
   const stringIndex = (value) => {
     const text = String(value);
@@ -379,26 +381,44 @@ function makeSemanticSnapshot(spec) {
     if (index < 0) { index = strings.length; strings.push(text); }
     return index;
   };
-  const nodes = {parentIndex: [], nodeType: [], nodeName: [], backendNodeId: [], attributes: []};
-  const layout = {nodeIndex: [], styles: [], bounds: [], text: []};
-  spec.forEach((node, nodeIndex) => {
-    nodes.parentIndex.push(node.parent);
-    nodes.nodeType.push(node.nodeType || (node.nodeName === '#text' ? 3 : 1));
-    nodes.nodeName.push(stringIndex(node.nodeName));
-    nodes.backendNodeId.push(node.backendNodeId);
-    nodes.attributes.push((node.attributes || []).map(stringIndex));
-    if (node.layout === false) return;
-    layout.nodeIndex.push(nodeIndex);
-    layout.styles.push([
-      stringIndex(node.visibility || 'visible'),
-      stringIndex(node.opacity === undefined ? '1' : node.opacity),
-      stringIndex(node.contentVisibility || 'visible'),
-      stringIndex(node.filter || 'none'),
-    ]);
-    layout.bounds.push(node.bounds || [10 + nodeIndex, 10 + nodeIndex, 100, 20]);
-    layout.text.push(stringIndex(node.layoutText || ''));
-  });
-  return {strings, documents: [{nodes, layout}]};
+  const makeDocument = (documentSpec) => {
+    const nodes = {
+      parentIndex: [], nodeType: [], nodeName: [], backendNodeId: [], attributes: [],
+      contentDocumentIndex: {index: [], value: []},
+    };
+    const layout = {nodeIndex: [], styles: [], bounds: [], text: []};
+    documentSpec.forEach((node, nodeIndex) => {
+      nodes.parentIndex.push(node.parent);
+      nodes.nodeType.push(node.nodeType || (node.nodeName === '#text' ? 3 : 1));
+      nodes.nodeName.push(stringIndex(node.nodeName));
+      nodes.backendNodeId.push(node.backendNodeId);
+      nodes.attributes.push((node.attributes || []).map(stringIndex));
+      if (node.layout === false) return;
+      layout.nodeIndex.push(nodeIndex);
+      layout.styles.push([
+        stringIndex(node.visibility || 'visible'),
+        stringIndex(node.opacity === undefined ? '1' : node.opacity),
+        stringIndex(node.contentVisibility || 'visible'),
+        stringIndex(node.filter || 'none'),
+        stringIndex(node.clipPath || 'none'),
+        stringIndex(node.clip || 'auto'),
+      ]);
+      layout.bounds.push(node.bounds || [10 + nodeIndex, 10 + nodeIndex, 100, 20]);
+      layout.text.push(stringIndex(node.layoutText || ''));
+    });
+    return {nodes, layout};
+  };
+  const documents = [makeDocument(spec)];
+  if (child) {
+    if (!Number.isInteger(child.ownerNodeIndex) || child.ownerNodeIndex < 0 ||
+        child.ownerNodeIndex >= spec.length || !Array.isArray(child.spec)) {
+      throw new Error('invalid child semantic snapshot fixture');
+    }
+    documents[0].nodes.contentDocumentIndex.index.push(child.ownerNodeIndex);
+    documents[0].nodes.contentDocumentIndex.value.push(1);
+    documents.push(makeDocument(child.spec));
+  }
+  return {strings, documents};
 }
 
 function fallbackSnapshot() {
@@ -546,6 +566,18 @@ function fallbackSnapshot() {
     {parent: 0, backendNodeId: 104, nodeName: 'SPAN'},
     {parent: 3, backendNodeId: 105, nodeName: '#text', layoutText: 'Continue', bounds: [60, 18, 55, 15]},
   ]);
+  if (readClipPathFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' '], clipPath: 'inset(100%)'},
+    {parent: 0, backendNodeId: 102, nodeName: '#text', layoutText: 'clipped-' + marker, clipPath: 'inset(100%)'},
+  ]);
+  if (readEmbeddingOpacityFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 200, nodeName: 'DIV', opacity: '0'},
+    {parent: 0, backendNodeId: 201, nodeName: 'IFRAME'},
+  ], {ownerNodeIndex: 1, spec: [
+    {parent: -1, backendNodeId: 300, nodeName: 'HTML'},
+    {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
+    {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'embedded-' + marker},
+  ]});
   if (readDesignModeFallbackScenario) return makeSemanticSnapshot([
     {parent: -1, backendNodeId: 100, nodeName: 'HTML'},
     {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
@@ -595,7 +627,7 @@ class FakeWebSocket {
         const loaderId = ['correlated-new-document', 'activate-correlated-new-document'].includes(scenario) && after
           ? 'loader-after' : 'loader-before';
         const frameTree = {frame: {id: 'main-frame', loaderId}};
-        if (readChildDesignModeFallbackScenario) {
+        if (readChildDesignModeFallbackScenario || readEmbeddingOpacityFallbackScenario) {
           frameTree.childFrames = [{frame: {id: 'child-frame', loaderId: 'child-loader'}}];
         }
         reply({frameTree});
@@ -604,7 +636,7 @@ class FakeWebSocket {
       case 'Page.createIsolatedWorld': {
         const params = request.params || {};
         const validFrame = params.frameId === 'main-frame' ||
-          (readChildDesignModeFallbackScenario && params.frameId === 'child-frame');
+          ((readChildDesignModeFallbackScenario || readEmbeddingOpacityFallbackScenario) && params.frameId === 'child-frame');
         if (!validFrame || params.worldName !== 'grabowski-semantic-design-mode-v1' ||
             params.grantUniveralAccess !== false) {
           fail();
@@ -643,7 +675,7 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
-          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
+          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -658,7 +690,7 @@ class FakeWebSocket {
         reply({object: {objectId: 'link-object'}});
         return;
       case 'Runtime.callFunctionOn':
-        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
+        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
           fail();
           return;
         }
@@ -674,7 +706,7 @@ class FakeWebSocket {
         }});
         return;
       case 'DOMSnapshot.captureSnapshot': {
-        const expectedStyles = ['visibility', 'opacity', 'content-visibility', 'filter'];
+        const expectedStyles = ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip'];
         if (JSON.stringify(request.params && request.params.computedStyles) !== JSON.stringify(expectedStyles) ||
             request.params.includePaintOrder !== false || request.params.includeDOMRects !== false) {
           fail();
@@ -865,7 +897,7 @@ class FakeWebSocket {
           }});
           return;
         }
-        if (readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readMeterRoleFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario) {
+        if (readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readMeterRoleFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readClipPathFallbackScenario || readEmbeddingOpacityFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario) {
           reply({node: {
             backendNodeId: 101,
             nodeType: 1,
@@ -3958,6 +3990,11 @@ globalThis.fetch = async () => ({
         self.assertIn("if (value === 'false') return {ok: true, editable: false}", source)
         self.assertIn("function semanticFilterOpacityVisibility", source)
         self.assertIn("function semanticLayoutVisibility", source)
+        self.assertIn("normalizedClipPath", source)
+        self.assertIn("normalizedClip", source)
+        self.assertIn("function semanticSnapshotContentDocumentOwners", source)
+        self.assertIn("function semanticSnapshotEmbeddingChainVisible", source)
+        self.assertIn("contentDocumentIndex", source)
         self.assertIn("function semanticSnapshotTargetAncestorsLayoutVisible", source)
         self.assertIn("semanticLayoutVisibility(strings, layoutStyles[layoutIndex])", source)
         self.assertIn("function semanticFrameIds", source)
@@ -3970,7 +4007,7 @@ globalThis.fetch = async () => ({
         self.assertIn("function semanticDesignModesAllOff", source)
         self.assertIn("async function captureSemanticVisibleSnapshot", source)
         self.assertIn("DOMSnapshot.captureSnapshot", source)
-        self.assertIn("computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter']", source)
+        self.assertIn("computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip']", source)
         self.assertIn("includePaintOrder: false", source)
         self.assertIn("includeDOMRects: false", source)
         self.assertIn("function semanticVisibleTextFromSnapshot", source)
@@ -4549,6 +4586,20 @@ globalThis.fetch = async () => ({
         self.assertEqual(execution.returncode, 0, execution.stderr)
         self.assertTrue(receipt["ok"])
         self.assertEqual(receipt["state"]["elements"][0]["name"], "Continue")
+
+    def test_browser_semantic_node_excludes_clip_path_hidden_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node("read-clip-path-fallback")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "")
+
+    def test_browser_semantic_node_excludes_hidden_embedding_frame_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-embedding-opacity-fallback"
+        )
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "")
 
     def test_browser_semantic_node_excludes_design_mode_editable_text(self) -> None:
         execution, receipt = self._run_browser_semantic_node("read-design-mode-fallback")

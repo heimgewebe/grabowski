@@ -2833,20 +2833,33 @@ function semanticLayoutBoundsVisibility(bounds) {
 }
 
 function semanticLayoutVisibility(strings, styleIndexes) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 4) return {ok: false, visible: false};
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 6) return {ok: false, visible: false};
   const visibility = semanticSnapshotString(strings, styleIndexes[0], 64);
   const opacityText = semanticSnapshotString(strings, styleIndexes[1], 64);
   const contentVisibility = semanticSnapshotString(strings, styleIndexes[2], 64);
   const filterText = semanticSnapshotString(strings, styleIndexes[3], 512);
-  if (visibility === null || opacityText === null || contentVisibility === null || filterText === null) {
+  const clipPathText = semanticSnapshotString(strings, styleIndexes[4], 512);
+  const clipText = semanticSnapshotString(strings, styleIndexes[5], 512);
+  if (visibility === null || opacityText === null || contentVisibility === null ||
+      filterText === null || clipPathText === null || clipText === null) {
     return {ok: false, visible: false};
   }
   const normalizedVisibility = visibility.trim().toLowerCase();
   const normalizedContentVisibility = contentVisibility.trim().toLowerCase();
+  const normalizedClipPath = clipPathText.trim().toLowerCase();
+  const normalizedClip = clipText.trim().toLowerCase();
   const opacity = Number(opacityText.trim());
   if (!Number.isFinite(opacity)) return {ok: false, visible: false};
   if (['hidden', 'collapse'].includes(normalizedVisibility) ||
       normalizedContentVisibility === 'hidden' || opacity <= 0) {
+    return {ok: true, visible: false};
+  }
+  // A non-default clipping primitive can remove all rendered pixels while
+  // retaining normal layout bounds.  The semantic fallback cannot safely
+  // prove partial paint visibility from DOMSnapshot alone, so fail closed for
+  // any explicit clip-path / legacy clip rather than publishing hidden text.
+  if ((normalizedClipPath && normalizedClipPath !== 'none') ||
+      (normalizedClip && normalizedClip !== 'auto')) {
     return {ok: true, visible: false};
   }
   return semanticFilterOpacityVisibility(filterText);
@@ -2883,6 +2896,141 @@ function semanticSnapshotTargetAncestorsLayoutVisible(
     }
     if (parent === -1) return {ok: true, visible: true};
     current = parent;
+  }
+  return {ok: false, visible: false};
+}
+
+function semanticSnapshotContentDocumentOwners(documents) {
+  if (!Array.isArray(documents) || documents.length < 1 || documents.length > 32) {
+    return {ok: false, owners: null, rootDocumentIndex: null};
+  }
+  const owners = new Map();
+  for (let documentIndex = 0; documentIndex < documents.length; documentIndex += 1) {
+    const document = documents[documentIndex];
+    const nodes = document && document.nodes ? document.nodes : null;
+    const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+    const contentDocumentIndex = nodes && nodes.contentDocumentIndex;
+    const ownerIndexes = contentDocumentIndex && Array.isArray(contentDocumentIndex.index)
+      ? contentDocumentIndex.index : null;
+    const childIndexes = contentDocumentIndex && Array.isArray(contentDocumentIndex.value)
+      ? contentDocumentIndex.value : null;
+    if (!backendNodeIds || backendNodeIds.length > 50000 || !ownerIndexes || !childIndexes ||
+        ownerIndexes.length !== childIndexes.length || ownerIndexes.length > documents.length - 1) {
+      return {ok: false, owners: null, rootDocumentIndex: null};
+    }
+    for (let offset = 0; offset < ownerIndexes.length; offset += 1) {
+      const ownerNodeIndex = ownerIndexes[offset];
+      const childDocumentIndex = childIndexes[offset];
+      if (!Number.isInteger(ownerNodeIndex) || ownerNodeIndex < 0 ||
+          ownerNodeIndex >= backendNodeIds.length || !Number.isInteger(childDocumentIndex) ||
+          childDocumentIndex < 0 || childDocumentIndex >= documents.length ||
+          childDocumentIndex === documentIndex || owners.has(childDocumentIndex)) {
+        return {ok: false, owners: null, rootDocumentIndex: null};
+      }
+      owners.set(childDocumentIndex, {documentIndex, nodeIndex: ownerNodeIndex});
+    }
+  }
+  const roots = [];
+  for (let documentIndex = 0; documentIndex < documents.length; documentIndex += 1) {
+    if (!owners.has(documentIndex)) roots.push(documentIndex);
+  }
+  if (roots.length !== 1 || owners.size !== documents.length - 1) {
+    return {ok: false, owners: null, rootDocumentIndex: null};
+  }
+  const rootDocumentIndex = roots[0];
+  for (let start = 0; start < documents.length; start += 1) {
+    const seen = new Set();
+    let current = start;
+    for (let depth = 0; depth <= documents.length; depth += 1) {
+      if (current === rootDocumentIndex) break;
+      if (seen.has(current)) return {ok: false, owners: null, rootDocumentIndex: null};
+      seen.add(current);
+      const owner = owners.get(current);
+      if (!owner) return {ok: false, owners: null, rootDocumentIndex: null};
+      current = owner.documentIndex;
+      if (depth === documents.length) {
+        return {ok: false, owners: null, rootDocumentIndex: null};
+      }
+    }
+  }
+  return {ok: true, owners, rootDocumentIndex};
+}
+
+function semanticSnapshotLayoutIndexMap(document) {
+  const nodes = document && document.nodes ? document.nodes : null;
+  const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+  const layout = document && document.layout ? document.layout : null;
+  const layoutNodeIndexes = layout && Array.isArray(layout.nodeIndex) ? layout.nodeIndex : null;
+  const layoutStyles = layout && Array.isArray(layout.styles) ? layout.styles : null;
+  const layoutBounds = layout && Array.isArray(layout.bounds) ? layout.bounds : null;
+  if (!backendNodeIds || backendNodeIds.length > 50000 || !layoutNodeIndexes || !layoutStyles ||
+      !layoutBounds || layoutNodeIndexes.length > 50000 ||
+      layoutStyles.length !== layoutNodeIndexes.length || layoutBounds.length !== layoutNodeIndexes.length) {
+    return {ok: false, layoutByNode: null, layoutStyles: null, layoutBounds: null};
+  }
+  const layoutByNode = new Map();
+  for (let layoutIndex = 0; layoutIndex < layoutNodeIndexes.length; layoutIndex += 1) {
+    const nodeIndex = layoutNodeIndexes[layoutIndex];
+    if (!Number.isInteger(nodeIndex) || nodeIndex < 0 || nodeIndex >= backendNodeIds.length ||
+        layoutByNode.has(nodeIndex)) {
+      return {ok: false, layoutByNode: null, layoutStyles: null, layoutBounds: null};
+    }
+    layoutByNode.set(nodeIndex, layoutIndex);
+  }
+  return {ok: true, layoutByNode, layoutStyles, layoutBounds};
+}
+
+function semanticSnapshotEmbeddingChainVisible(documents, strings, targetDocumentIndex) {
+  const ownership = semanticSnapshotContentDocumentOwners(documents);
+  if (!ownership.ok || !Number.isInteger(targetDocumentIndex) || targetDocumentIndex < 0 ||
+      targetDocumentIndex >= documents.length) {
+    return {ok: false, visible: false};
+  }
+  let currentDocumentIndex = targetDocumentIndex;
+  const seen = new Set();
+  for (let depth = 0; depth < documents.length; depth += 1) {
+    if (currentDocumentIndex === ownership.rootDocumentIndex) {
+      return {ok: true, visible: true};
+    }
+    if (seen.has(currentDocumentIndex)) return {ok: false, visible: false};
+    seen.add(currentDocumentIndex);
+    const owner = ownership.owners.get(currentDocumentIndex);
+    if (!owner) return {ok: false, visible: false};
+    const parentDocument = documents[owner.documentIndex];
+    const ownerNode = semanticSnapshotNode(parentDocument, strings, owner.nodeIndex);
+    if (!ownerNode) return {ok: false, visible: false};
+    if (semanticDomVisibilitySubtreeBlocked(ownerNode) ||
+        semanticDomValueBearingSubtreeBlocked(ownerNode)) {
+      return {ok: true, visible: false};
+    }
+    const hiddenAncestor = semanticSnapshotHasHiddenAncestor(
+      parentDocument, strings, owner.nodeIndex
+    );
+    if (!hiddenAncestor.ok) return {ok: false, visible: false};
+    if (hiddenAncestor.blocked) return {ok: true, visible: false};
+    const valueBearingAncestor = semanticSnapshotHasValueBearingAncestor(
+      parentDocument, strings, owner.nodeIndex
+    );
+    if (!valueBearingAncestor.ok) return {ok: false, visible: false};
+    if (valueBearingAncestor.blocked) return {ok: true, visible: false};
+    const effectiveEditable = semanticSnapshotEffectiveContentEditable(
+      parentDocument, strings, owner.nodeIndex
+    );
+    if (!effectiveEditable.ok) return {ok: false, visible: false};
+    if (effectiveEditable.editable) return {ok: true, visible: false};
+    const layoutInfo = semanticSnapshotLayoutIndexMap(parentDocument);
+    if (!layoutInfo.ok) return {ok: false, visible: false};
+    const ownerLayoutIndex = layoutInfo.layoutByNode.get(owner.nodeIndex);
+    if (ownerLayoutIndex === undefined) return {ok: true, visible: false};
+    const geometry = semanticLayoutBoundsVisibility(layoutInfo.layoutBounds[ownerLayoutIndex]);
+    if (!geometry.ok) return {ok: false, visible: false};
+    if (!geometry.visible) return {ok: true, visible: false};
+    const visibility = semanticSnapshotTargetAncestorsLayoutVisible(
+      parentDocument, strings, owner.nodeIndex, layoutInfo.layoutByNode
+    );
+    if (!visibility.ok) return {ok: false, visible: false};
+    if (!visibility.visible) return {ok: true, visible: false};
+    currentDocumentIndex = owner.documentIndex;
   }
   return {ok: false, visible: false};
 }
@@ -2967,7 +3115,7 @@ async function captureSemanticVisibleSnapshot() {
       return {ok: false, snapshot: null};
     }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
-      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter'],
+      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
@@ -2989,16 +3137,22 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
     return {ok: false, name: ''};
   }
   let selected = null;
-  for (const document of documents) {
+  for (let documentIndex = 0; documentIndex < documents.length; documentIndex += 1) {
+    const document = documents[documentIndex];
     const nodes = document && document.nodes ? document.nodes : null;
     const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
     if (!backendNodeIds || backendNodeIds.length > 50000) return {ok: false, name: ''};
     const targetIndex = backendNodeIds.indexOf(backendNodeId);
     if (targetIndex < 0) continue;
     if (selected !== null) return {ok: false, name: ''};
-    selected = {document, targetIndex};
+    selected = {document, documentIndex, targetIndex};
   }
   if (selected === null) return {ok: false, name: ''};
+  const embeddingVisibility = semanticSnapshotEmbeddingChainVisible(
+    documents, strings, selected.documentIndex
+  );
+  if (!embeddingVisibility.ok) return {ok: false, name: ''};
+  if (!embeddingVisibility.visible) return {ok: true, name: ''};
   const document = selected.document;
   const nodes = document.nodes;
   const nodeCount = nodes.backendNodeId.length;
