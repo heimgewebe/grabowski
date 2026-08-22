@@ -2802,6 +2802,9 @@ function semanticSnapshotEffectiveContentEditable(document, strings, targetIndex
 function semanticFilterOpacityVisibility(filterText) {
   const normalized = filterText.trim().toLowerCase();
   if (!normalized || normalized === 'none') return {ok: true, visible: true};
+  // URL-backed SVG filters can arbitrarily rewrite alpha (including fully
+  // transparent output), which this bounded parser cannot prove visible.
+  if (normalized.includes('url(')) return {ok: true, visible: false};
   const pattern = /opacity\(([^()]*)\)/g;
   let matched = false;
   for (const match of normalized.matchAll(pattern)) {
