@@ -102,10 +102,38 @@ async def grabowski_operator_optimization_report(
     repositories: list[str],
     window: str = "7d",
     view: str = "minimal",
-    top_limit: int = 10,
-    friction_limit: int = 100,
-    outcome_limit: int = 200,
-    current_work_limit: int = 50,
+    top_limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=grabowski_operator_optimization.MAX_TOP_LIMIT,
+            description="Maximum number of ranked findings returned by the bounded report.",
+        ),
+    ] = 10,
+    friction_limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=grabowski_operator_optimization.MAX_FRICTION_LIMIT,
+            description="Maximum number of friction records inspected by the report.",
+        ),
+    ] = 100,
+    outcome_limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=grabowski_operator_optimization.MAX_OUTCOME_LIMIT,
+            description="Maximum number of execution outcomes inspected by the report.",
+        ),
+    ] = 200,
+    current_work_limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=grabowski_operator_optimization.MAX_CURRENT_WORK_LIMIT,
+            description="Server-side page size for current-work evidence used by the report.",
+        ),
+    ] = 50,
 ) -> dict[str, object]:
     """Audit bounded operator friction without blocking the MCP event loop."""
     return await asyncio.to_thread(
