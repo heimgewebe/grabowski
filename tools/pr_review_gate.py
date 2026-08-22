@@ -539,7 +539,13 @@ def _blocking_review_states(items: list[dict[str, Any]], trusted_actors: set[str
 
 
 def _has_trusted_actor(items: list[dict[str, Any]], trusted_actors: set[str]) -> bool:
-    return any(_review_state(item) not in BLOCKING_REVIEW_STATES for item in _trusted_review_items(items, trusted_actors))
+    # External review-state strings select a branch only; never propagate the
+    # provider value itself into the diagnostic result/JSON contract.
+    for item in _trusted_review_items(items, trusted_actors):
+        if _review_state(item) in BLOCKING_REVIEW_STATES:
+            continue
+        return True
+    return False
 
 
 def _item_head_sha(item: dict[str, Any]) -> str:
