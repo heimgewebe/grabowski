@@ -3389,6 +3389,12 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
     for (const pathIndex of ancestry.path) {
       const node = semanticSnapshotNode(document, strings, pathIndex);
       if (!node) return {ok: false, name: ''};
+      // SVG text uses fill/stroke paint rather than the HTML text-color path.
+      // Exclude SVG subtrees conservatively unless a dedicated paint proof exists.
+      if (node.localName === 'svg') {
+        allowed = false;
+        break;
+      }
       if (semanticDomTextSubtreeBlocked(node)) {
         allowed = false;
         break;
@@ -3428,7 +3434,7 @@ async function readSemanticElementName(
   let described;
   try {
     described = await call('DOM.describeNode', {
-      backendNodeId, depth: 6, pierce: false,
+      backendNodeId, depth: 0, pierce: false,
     });
   } catch {
     return {ok: false, name: ''};
