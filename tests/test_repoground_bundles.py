@@ -2030,6 +2030,59 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
 
         self.assertNotIn("structured_evidence", result_without_structure)
 
+    def test_context_pack_preserves_structure_only_evidence(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        structured_evidence = {
+            "language_structure": {
+                "evidence": {
+                    "records": [
+                        {"language": "rust", "symbol": "helper"},
+                    ]
+                },
+                "budget": {"used_bytes": 512, "hard_limit_bytes": 4096},
+            }
+        }
+        payload = {
+            "status": "available",
+            "route": "structure_only",
+            "retrieval": {"strategy": "structure_only", "match_count": 0},
+            "resolved_ranges": [],
+            "structured_evidence": structured_evidence,
+        }
+        preflight = {
+            "status": "pass",
+            "available": True,
+            "answer_compliance_template": {},
+        }
+
+        with (
+            patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
+            patch.object(mcp, "_repoground_agent_query", return_value=payload),
+        ):
+            result = mcp.repoground_context_pack(
+                "demo-repo", query="rust helper"
+            )
+
+        self.assertIs(
+            result["bounded_evidence"]["structured_evidence"], structured_evidence
+        )
+        self.assertIs(result["query_context"]["structured_evidence"], structured_evidence)
+        self.assertEqual(
+            result["bounded_evidence"]["resolved_evidence_status"], "available"
+        )
+        self.assertEqual(result["context_ref"]["resolved_evidence_status"], "available")
+        self.assertEqual(result["snippets"], [])
+        self.assertEqual(result["ranges"], [])
+        self.assertIn(
+            "bounded_evidence.structured_evidence",
+            result["determinism"]["retrieval_contract"]["semantic_fields"],
+        )
+        self.assertEqual(
+            result["determinism"]["content_sha256"],
+            _recomputed_content_sha256(result),
+        )
+
     def test_agent_query_preserves_or_fallback_and_drops_empty_ranges(self) -> None:
         _repo, head = self._git_repo("demo-repo")
         self._write_bundle("demo-repo-max-260701-1200", commit=head)
