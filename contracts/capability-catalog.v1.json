@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "2ae85246fc566463d3cd9af1659ebec1471e85b69d2a162d58dac7c2d95862fa",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "1999a55d4302823421a6b673de37270040056e97e5a8e7b9651752f516e032cb",
+  "contract_sha256": "a565e5590d773cfa336311179a54227e57709119260d2fe32a083a3eb1b23e7b",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -2107,7 +2107,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Start one agent-owned browser with loopback-only CDP in a separate unit.",
+      "description": "Start Chrome/CDP, optionally arming one fail-closed startup-only BiDi standby.\n\nSupplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first\nstarts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes\nready. Only when CDP startup remains unavailable before any worker is returned does\nGrabowski terminalize that private primary attempt and start a new Chrome/WebDriver-\nBiDi worker on the same leased loopback port. No later worker/backend switch exists.",
       "effects": [
         "process-start",
         "profile-create-or-use",
