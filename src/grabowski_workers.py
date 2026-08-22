@@ -877,6 +877,27 @@ def _cleanup_browser_semantic_temps(
     return removed, preserved, errors
 
 
+def _cleanup_browser_bidi_session_file(directory: Path) -> dict[str, Any]:
+    target = directory / BROWSER_BIDI_SESSION_NAME
+    removed: list[str] = []
+    absent: list[str] = []
+    errors: list[dict[str, str]] = []
+    try:
+        target.unlink()
+        removed.append(str(target))
+    except FileNotFoundError:
+        absent.append(str(target))
+    except OSError as exc:
+        errors.append({"path": str(target), "error": str(exc)})
+    return {
+        "status": "partial" if errors else "completed",
+        "removed": removed,
+        "already_absent": absent,
+        "preserved_evidence": [],
+        "errors": errors,
+    }
+
+
 def _cleanup(record: dict[str, Any]) -> dict[str, Any]:
     removed: list[str] = []
     absent: list[str] = []
@@ -898,14 +919,10 @@ def _cleanup(record: dict[str, Any]) -> dict[str, Any]:
             absent.append(str(handle_key))
         except OSError as exc:
             errors.append({"path": str(handle_key), "error": str(exc)})
-        bidi_session = evidence_directory / BROWSER_BIDI_SESSION_NAME
-        try:
-            bidi_session.unlink()
-            removed.append(str(bidi_session))
-        except FileNotFoundError:
-            absent.append(str(bidi_session))
-        except OSError as exc:
-            errors.append({"path": str(bidi_session), "error": str(exc)})
+        bidi_cleanup = _cleanup_browser_bidi_session_file(evidence_directory)
+        removed.extend(bidi_cleanup["removed"])
+        absent.extend(bidi_cleanup["already_absent"])
+        errors.extend(bidi_cleanup["errors"])
     for raw in json.loads(record["ephemeral_paths_json"]):
         path = Path(raw)
         if path == evidence_directory:
@@ -4897,7 +4914,11 @@ def _reconcile_stopped_record(
             if not _browser_private_cleanup_pending(record):
                 return record, observation
             terminalization = dict(terminalization)
-            terminalization["cleanup"] = _cleanup(record)
+            terminalization["private_session_cleanup"] = (
+                _cleanup_browser_bidi_session_file(
+                    WORKER_STATE / "instances" / str(record["worker_id"])
+                )
+            )
             observation = {
                 **observation,
                 "observed_at_unix": _now(),
@@ -4949,7 +4970,23 @@ def worker_status(worker_id: str, *, expected_kind: str | None = None) -> dict[s
         observation = json.loads(record["last_observation_json"])
         terminalization = observation.get("terminalization")
         if _terminalization_settled(observation):
-            stored = record
+            if _browser_private_cleanup_pending(record):
+                terminalization = dict(terminalization)
+                terminalization["private_session_cleanup"] = (
+                    _cleanup_browser_bidi_session_file(
+                        WORKER_STATE / "instances" / str(record["worker_id"])
+                    )
+                )
+                observation = {
+                    **observation,
+                    "observed_at_unix": _now(),
+                    "terminalization": terminalization,
+                }
+                stored = _update(
+                    worker_id, record["state"], observation=observation
+                )
+            else:
+                stored = record
         elif isinstance(terminalization, dict) and _terminalization_core_complete(
             terminalization
         ):

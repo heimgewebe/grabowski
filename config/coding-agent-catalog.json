@@ -1,5 +1,5 @@
 {
-  "catalog_version": "lane-scoped-writer-v7",
+  "catalog_version": "lane-scoped-writer-v8",
   "harnesses": {
     "antigravity": {
       "aliases": [
@@ -459,13 +459,13 @@
         "speed": 8
       }
     },
-    "grok-4.5": {
+    "grok-4.6": {
       "availability": "live-verified-via-supergrok",
       "base_quality_rank": 84,
-      "evidence": "grok-subscription-tier-supergrok-and-grok-4.5-build-smoke-2026-07-29",
-      "family": "xai-grok-4.5",
+      "evidence": "grok-cli-1.0.4-valid-supergrok-oidc-and-grok-4.6-model-list-2026-08-22",
+      "family": "xai-grok-4.6",
       "identity_kind": "model",
-      "name": "Grok 4.5",
+      "name": "Grok 4.6",
       "provider_family": "xai",
       "quality": {
         "architecture": 9,
@@ -751,7 +751,7 @@
         "claude-opus-5-high",
         "codex-terra-high",
         "claude-sonnet-5-high",
-        "grok-4.5-review-high",
+        "grok-4.6-review-high",
         "antigravity-gemini-pro-review-high"
       ],
       "paid_contrast_routes": [
@@ -776,7 +776,7 @@
           "claude-opus-5",
           "gpt-5.6-terra",
           "claude-sonnet-5",
-          "grok-4.5"
+          "grok-4.6"
         ]
       },
       "B": {
@@ -1040,7 +1040,7 @@
       ],
       "overage_action": "block_and_surface",
       "plan": "SuperGrok",
-      "plan_evidence": "grok-auth-subscription-tier-supergrok; grok-4.5-build-smoke-2026-07-29",
+      "plan_evidence": "grok-auth-supergrok-oidc-valid; grok-cli-1.0.4-model-list-grok-4.6-2026-08-22",
       "entitlement_contract": {
         "kind": "grok_oidc_tier_claim_v1",
         "issuer": "https://auth.x.ai",
@@ -2130,7 +2130,7 @@
       "argv_prefix": [
         "grok",
         "--model",
-        "grok-4.5"
+        "grok-4.6"
       ],
       "base_quality_rank": 84,
       "burn_weight": 1.4,
@@ -2139,10 +2139,10 @@
       "enabled": true,
       "harness": "grok",
       "harness_quality": 7,
-      "id": "grok-4.5-high",
-      "independence_group": "xai-grok-4.5",
+      "id": "grok-4.6-high",
+      "independence_group": "xai-grok-4.6",
       "min_duration_minutes": 10,
-      "model": "grok-4.5",
+      "model": "grok-4.6",
       "priority": 97,
       "quality_class": "A",
       "quota_pools": [
@@ -2601,7 +2601,7 @@
       "argv_prefix": [
         "grok",
         "--model",
-        "grok-4.5"
+        "grok-4.6"
       ],
       "base_quality_rank": 84,
       "burn_weight": 1.4,
@@ -2611,10 +2611,10 @@
       "enabled": true,
       "harness": "grok",
       "harness_quality": 8,
-      "id": "grok-4.5-review-high",
-      "independence_group": "xai-grok-4.5",
+      "id": "grok-4.6-review-high",
+      "independence_group": "xai-grok-4.6",
       "min_duration_minutes": 10,
-      "model": "grok-4.5",
+      "model": "grok-4.6",
       "priority": 104,
       "quality_class": "A",
       "quota_pools": [
