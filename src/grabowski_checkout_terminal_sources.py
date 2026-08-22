@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -13,7 +14,7 @@ import grabowski_operator_obligation as operator_obligation
 
 
 SCHEMA_VERSION = checkouts.TERMINAL_RECONCILIATION_SCHEMA_VERSION
-TERMINAL_TASK_STATES = frozenset({"verified", "cancelled", "obsolete", "rejected"})
+TERMINAL_TASK_STATES = frozenset({"verified", "cancelled", "superseded"})
 GITHUB_ISSUE_SOURCE_RE = re.compile(
     r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*):(?P<suffix>[^\x00]+)\Z"
 )
@@ -42,6 +43,139 @@ def _github_json(arguments: list[str], *, timeout_seconds: int = 30) -> Any:
         raise RuntimeError("GitHub observation returned invalid JSON") from exc
 
 
+def _bureau_json(
+    arguments: list[str],
+    *,
+    control_root: Path,
+    timeout_seconds: int = 30,
+) -> dict[str, Any]:
+    legacy_root = Path(
+        os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
+    ).expanduser()
+    state_root = Path(
+        os.environ.get("GRABOWSKI_BUREAU_COORDINATION_ROOT", str(legacy_root))
+    ).expanduser()
+    state_root = Path(os.path.abspath(os.fspath(state_root)))
+
+    runtime = bureau_leases._contract_runtime()
+    bureau_leases._assert_contract_runtime_unchanged(runtime)
+    contract_arguments = [
+        "--state-root",
+        str(state_root),
+        "--json",
+        *arguments,
+    ]
+    descriptor = -1
+    try:
+        if runtime["runtime_kind"] == "legacy-venv":
+            wrapper_binding = json.dumps(
+                {
+                    "module_paths": {
+                        name: str(path)
+                        for name, path in runtime["module_paths"].items()
+                    },
+                    "package_files": {
+                        relative: {
+                            "path": str(runtime["package_paths"][relative]),
+                            "sha256": identity["sha256"],
+                        }
+                        for relative, identity in runtime[
+                            "package_identities"
+                        ].items()
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            argv = [
+                str(runtime["python_launcher"]),
+                "-I",
+                "-c",
+                bureau_leases._CONTRACT_WRAPPER,
+                wrapper_binding,
+                *contract_arguments,
+            ]
+            pass_fds: tuple[int, ...] = ()
+        else:
+            descriptor = bureau_leases._open_bound_launcher(runtime)
+            argv = [
+                str(runtime["python_launcher"]),
+                "-I",
+                f"/proc/self/fd/{descriptor}",
+                *contract_arguments,
+            ]
+            pass_fds = (descriptor,)
+        completed = subprocess.run(
+            argv,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            cwd=str(control_root),
+            env=bureau_leases._safe_environment(),
+            pass_fds=pass_fds,
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    bureau_leases._assert_contract_runtime_unchanged(runtime)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        raise RuntimeError(detail or "Bureau status projection failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Bureau status projection returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Bureau status projection returned an invalid payload")
+    return payload
+
+
+def _bureau_task_projection(
+    source_id: str, *, control_root: Path
+) -> dict[str, Any]:
+    payload = _bureau_json(
+        ["status-projection", "--skip-github"],
+        control_root=control_root,
+    )
+    if payload.get("schema_version") != 1:
+        raise RuntimeError("Bureau status projection envelope schema is unsupported")
+    result = payload.get("result")
+    if not isinstance(result, dict) or result.get("schema_version") != 1:
+        raise RuntimeError("Bureau status projection result schema is unsupported")
+    tasks = result.get("tasks")
+    if not isinstance(tasks, list):
+        raise RuntimeError("Bureau status projection has no authoritative task list")
+    matches = [
+        item
+        for item in tasks
+        if isinstance(item, dict) and item.get("task_id") == source_id
+    ]
+    if not matches:
+        raise RuntimeError(f"Bureau status projection task is missing: {source_id}")
+    if len(matches) != 1:
+        raise RuntimeError(f"Bureau status projection task is ambiguous: {source_id}")
+    task = matches[0]
+    state = task.get("effective_state")
+    if not isinstance(state, str):
+        raise RuntimeError("Bureau status projection effective state is invalid")
+    if state not in TERMINAL_TASK_STATES:
+        raise RuntimeError(f"Bureau task source is not terminal: {state}")
+    registry_state = task.get("registry_state")
+    task_spec_state = task.get("task_spec_state")
+    if registry_state is not None and not isinstance(registry_state, str):
+        raise RuntimeError("Bureau status projection registry state is invalid")
+    if task_spec_state is not None and not isinstance(task_spec_state, str):
+        raise RuntimeError("Bureau status projection TaskSpec state is invalid")
+    return {
+        "task_id": source_id,
+        "effective_state": state,
+        "registry_state": registry_state,
+        "task_spec_state": task_spec_state,
+    }
+
+
 def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
     if not isinstance(source_id, str) or not source_id.strip():
         raise ValueError("bureau task source id is invalid")
@@ -61,9 +195,23 @@ def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
         raise RuntimeError("Bureau task source is invalid JSON") from exc
     if not isinstance(task, dict) or task.get("id") != source_id:
         raise RuntimeError("Bureau task source identity differs")
-    state = task.get("state")
-    if state not in TERMINAL_TASK_STATES:
-        raise RuntimeError(f"Bureau task source is not terminal: {state}")
+    projection = _bureau_task_projection(source_id, control_root=control_root)
+    post_control = bureau_leases.inspect_bureau_control_checkout(require_current=True)
+    if (
+        post_control.get("head") != control["head"]
+        or post_control.get("control_root") != control["control_root"]
+    ):
+        raise RuntimeError("Bureau control checkout changed during terminal observation")
+    post_github_main = _github_json(["api", "repos/heimgewebe/bureau/commits/main"])
+    if (
+        not isinstance(post_github_main, dict)
+        or post_github_main.get("sha") != control["head"]
+    ):
+        raise RuntimeError("Bureau control checkout changed during terminal observation")
+    if projection["registry_state"] != task.get("state"):
+        raise RuntimeError(
+            "Bureau status projection registry state differs from inspected control revision"
+        )
     registry_tree = checkouts._git_read(
         control_root,
         ["rev-parse", f"{control['head']}:registry"],
@@ -73,7 +221,11 @@ def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
             "schema_version": SCHEMA_VERSION,
             "kind": "bureau_task",
             "source_id": source_id,
-            "terminal_state": state,
+            "terminal_state": projection["effective_state"],
+            "git_registry_state": task.get("state"),
+            "projected_registry_state": projection["registry_state"],
+            "task_spec_state": projection["task_spec_state"],
+            "task_projection_sha256": checkouts._sha256_json(projection),
             "registry_commit": control["head"],
             "registry_tree": registry_tree,
             "task_json_sha256": checkouts._sha256_json(task),
