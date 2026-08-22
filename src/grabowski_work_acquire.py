@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterator
 import grabowski_checkouts as checkouts
 import grabowski_execution_plan as execution_plan_contract
 import grabowski_lane_closeout as lane_closeout
+import grabowski_operator_obligation as operator_obligation
 import grabowski_operator_core as operator
 import grabowski_resources as resources
 import grabowski_work_admission as work_admission
@@ -1073,6 +1074,19 @@ def acquire_work(
                 "durable_receipt_path": str(receipt_path),
                 "replayed": True,
             }
+        source = inputs["source"]
+        if (
+            source["kind"] == "operator_obligation"
+            and operator_obligation.OBLIGATION_ID_RE.fullmatch(source["id"]) is None
+        ):
+            if existing is not None:
+                raise RuntimeError(
+                    "historical operator_obligation lane with noncanonical source_id "
+                    "cannot resume effectful execution; reconcile it instead"
+                )
+            raise ValueError(
+                "source_id for operator_obligation must match goo-[a-z0-9-]"
+            )
         attempt = int(existing.get("attempt_count", 0)) + 1 if existing else 1
         base_record = {
             "kind": LANE_KIND,
