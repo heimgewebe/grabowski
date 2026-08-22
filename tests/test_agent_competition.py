@@ -257,16 +257,16 @@ class AgentCompetitionTests(unittest.TestCase):
                 "authority": "advisory_only",
                 "automatic_patch_apply": False,
             }
-        elif route_id == "grok-4.5-review-high":
+        elif route_id == "grok-4.6-review-high":
             contract = {
                 "schema_version": 1,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "grok",
                 "harness_binary": "grok",
-                "model": "grok-4.5",
+                "model": "grok-4.6",
                 "effort": "high",
-                "argv_prefix": ["grok", "--model", "grok-4.5"],
+                "argv_prefix": ["grok", "--model", "grok-4.6"],
                 "permission_mode": None,
                 "quota_pools": ["grok-com"],
                 "paid_only": False,
@@ -1634,7 +1634,7 @@ class AgentCompetitionTests(unittest.TestCase):
 
     def test_route_bound_grok_receipt_preserves_offline_single_turn_binding(self) -> None:
         self._assert_zero_budget_route_receipt(
-            provider="grok", route_id="grok-4.5-review-high"
+            provider="grok", route_id="grok-4.6-review-high"
         )
 
     def test_route_bound_opencode_receipt_preserves_route_and_zero_budget_binding(self) -> None:

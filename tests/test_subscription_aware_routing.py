@@ -81,7 +81,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertEqual(models["claude-sonnet-5"]["availability"], "live-verified-via-claude-pro")
         self.assertEqual(models["gemini-3.1-pro"]["availability"], "live-verified-via-google-ai")
         self.assertEqual(models["gpt-5.6-sol"]["availability"], "live-verified-via-chatgpt-pro")
-        self.assertEqual(models["grok-4.5"]["availability"], "live-verified-via-supergrok")
+        self.assertEqual(models["grok-4.6"]["availability"], "live-verified-via-supergrok")
         self.assertEqual(models["gemini-3.6-flash"]["availability"], "live-listed")
         self.assertEqual(models["claude-opus-4.8"]["availability"], "compatibility-only-superseded")
 
@@ -112,7 +112,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         expected = {
             "claude-opus-5-high": ("claude", "anthropic-claude-pro"),
             "antigravity-gemini-pro-review-high": ("antigravity", "google-gemini-pro"),
-            "grok-4.5-review-high": ("grok", "xai-grok-4.5"),
+            "grok-4.6-review-high": ("grok", "xai-grok-4.6"),
         }
         for route_id, (harness, group) in expected.items():
             with self.subTest(route=route_id):
@@ -145,10 +145,10 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
         self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
         self.assertNotIn("claude-opus-5-writer-high", frontier["upper_review_or_contrast_routes"])
-        grok_writer = self.routes["grok-4.5-high"]
-        grok_reviewer = self.routes["grok-4.5-review-high"]
+        grok_writer = self.routes["grok-4.6-high"]
+        grok_reviewer = self.routes["grok-4.6-review-high"]
         self.assertTrue(grok_writer["enabled"])
-        self.assertEqual(grok_writer["independence_group"], "xai-grok-4.5")
+        self.assertEqual(grok_writer["independence_group"], "xai-grok-4.6")
         self.assertTrue(grok_reviewer["enabled"])
         self.assertTrue(grok_reviewer["review_only"])
 
@@ -193,8 +193,8 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
             ["agy", "--model", "gemini-3.1-pro-high"],
         )
         self.assertEqual(
-            self.routes["grok-4.5-review-high"]["argv_prefix"],
-            ["grok", "--model", "grok-4.5"],
+            self.routes["grok-4.6-review-high"]["argv_prefix"],
+            ["grok", "--model", "grok-4.6"],
         )
 
 

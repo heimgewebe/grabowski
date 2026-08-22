@@ -765,14 +765,14 @@ class CodingAgentRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(
             router.CodingAgentRouterError, "enabled contrast route"
         ):
-            router.contrast_route_execution_contract("grok-4.5-review-high")
-        review = router.review_route_execution_contract("grok-4.5-review-high")
+            router.contrast_route_execution_contract("grok-4.6-review-high")
+        review = router.review_route_execution_contract("grok-4.6-review-high")
         advisory = router.advisory_route_execution_contract(
-            "grok-4.5-review-high"
+            "grok-4.6-review-high"
         )
         self.assertEqual(review, advisory)
         self.assertEqual(review["harness"], "grok")
-        self.assertEqual(review["model"], "grok-4.5")
+        self.assertEqual(review["model"], "grok-4.6")
         self.assertEqual(review["quota_pools"], ["grok-com"])
         self.assertFalse(review["paid_only"])
         self.assertIsNone(review["permission_mode"])
@@ -1066,7 +1066,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertIn("inconsistent counters", reasons[0])
 
         grok_route = next(
-            route for route in self.catalog["routes"] if route["id"] == "grok-4.5-high"
+            route for route in self.catalog["routes"] if route["id"] == "grok-4.6-high"
         )
         logged_out_state = self._fresh_state()
         logged_out_state["catalog"]["providers"]["grok"]["logged_in"] = False

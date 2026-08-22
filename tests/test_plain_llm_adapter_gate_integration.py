@@ -173,7 +173,7 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
                     transmitted_prompt_path=None,
                     provider="grok",
                     executable="grok",
-                    model="grok-4.5",
+                    model="grok-4.6",
                     timeout_seconds=300,
                     max_prompt_bytes=100_000,
                 )
