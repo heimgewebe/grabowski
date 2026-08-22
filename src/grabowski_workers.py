@@ -898,6 +898,14 @@ def _cleanup(record: dict[str, Any]) -> dict[str, Any]:
             absent.append(str(handle_key))
         except OSError as exc:
             errors.append({"path": str(handle_key), "error": str(exc)})
+        bidi_session = evidence_directory / BROWSER_BIDI_SESSION_NAME
+        try:
+            bidi_session.unlink()
+            removed.append(str(bidi_session))
+        except FileNotFoundError:
+            absent.append(str(bidi_session))
+        except OSError as exc:
+            errors.append({"path": str(bidi_session), "error": str(exc)})
     for raw in json.loads(record["ephemeral_paths_json"]):
         path = Path(raw)
         if path == evidence_directory:

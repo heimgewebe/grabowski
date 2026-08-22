@@ -2323,6 +2323,49 @@ globalThis.fetch = async () => ({
         self.assertEqual(terminalization["cleanup"]["status"], "completed")
         self.assertIn(str(handle_key), terminalization["cleanup"]["removed"])
 
+    def test_stop_removes_private_bidi_session_file(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9381, runtime_seconds=60)
+        worker = started["worker"]
+        config_path = Path(workers._row(worker["worker_id"])["config_path"])
+        session_path = workers._write_private_worker_json(
+            config_path.parent,
+            workers.BROWSER_BIDI_SESSION_NAME,
+            {"schema_version": 1, "session_id": "dead-session"},
+        )
+        self.assertTrue(session_path.is_file())
+
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(worker["worker_id"], expected_kind="browser")
+
+        self.assertFalse(session_path.exists())
+        terminalization = stopped["worker"]["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertIn(str(session_path), terminalization["cleanup"]["removed"])
+
+    def test_stop_unlinks_bidi_session_symlink_without_following_target(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9382, runtime_seconds=60)
+        worker = started["worker"]
+        config_path = Path(workers._row(worker["worker_id"])["config_path"])
+        session_path = config_path.parent / workers.BROWSER_BIDI_SESSION_NAME
+        target = self.root / "bidi-session-cleanup-target"
+        target.write_text("preserve-me", encoding="utf-8")
+        session_path.symlink_to(target)
+
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(worker["worker_id"], expected_kind="browser")
+
+        self.assertFalse(session_path.exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve-me")
+        terminalization = stopped["worker"]["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertIn(str(session_path), terminalization["cleanup"]["removed"])
+
     def test_stop_removes_semantic_temp_files_but_preserves_symlinks(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()
