@@ -2818,6 +2818,20 @@ function semanticFilterOpacityVisibility(filterText) {
   return {ok: true, visible: true};
 }
 
+function semanticLayoutBoundsVisibility(bounds) {
+  if (!Array.isArray(bounds) || bounds.length !== 4) return {ok: false, visible: false};
+  const values = bounds.map((value) => Number(value));
+  if (values.some((value) => !Number.isFinite(value) || Math.abs(value) > 1000000000)) {
+    return {ok: false, visible: false};
+  }
+  const width = values[2];
+  const height = values[3];
+  if (width < 0 || height < 0) return {ok: false, visible: false};
+  // DOMSnapshot bounds already include transforms.  Reject collapsed or
+  // sub-pixel-degenerate rendered text instead of treating it as a visible label.
+  return {ok: true, visible: width >= 0.5 && height >= 0.5};
+}
+
 function semanticLayoutVisibility(strings, styleIndexes) {
   if (!Array.isArray(styleIndexes) || styleIndexes.length !== 4) return {ok: false, visible: false};
   const visibility = semanticSnapshotString(strings, styleIndexes[0], 64);
@@ -3010,9 +3024,11 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
   const layout = document && document.layout ? document.layout : null;
   const layoutNodeIndexes = layout && Array.isArray(layout.nodeIndex) ? layout.nodeIndex : null;
   const layoutStyles = layout && Array.isArray(layout.styles) ? layout.styles : null;
+  const layoutBounds = layout && Array.isArray(layout.bounds) ? layout.bounds : null;
   const layoutText = layout && Array.isArray(layout.text) ? layout.text : null;
-  if (!layoutNodeIndexes || !layoutStyles || !layoutText || layoutNodeIndexes.length > 50000 ||
-      layoutStyles.length !== layoutNodeIndexes.length || layoutText.length !== layoutNodeIndexes.length) {
+  if (!layoutNodeIndexes || !layoutStyles || !layoutBounds || !layoutText ||
+      layoutNodeIndexes.length > 50000 || layoutStyles.length !== layoutNodeIndexes.length ||
+      layoutBounds.length !== layoutNodeIndexes.length || layoutText.length !== layoutNodeIndexes.length) {
     return {ok: false, name: ''};
   }
   const layoutByNode = new Map();
@@ -3042,6 +3058,9 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
     const text = semanticSnapshotString(strings, layoutText[layoutIndex], 4096);
     if (text === null) return {ok: false, name: ''};
     if (!boundedText(text, 160)) continue;
+    const renderedGeometry = semanticLayoutBoundsVisibility(layoutBounds[layoutIndex]);
+    if (!renderedGeometry.ok) return {ok: false, name: ''};
+    if (!renderedGeometry.visible) continue;
     visitedTextLayouts += 1;
     if (visitedTextLayouts > 512) return {ok: false, name: ''};
     let allowed = true;

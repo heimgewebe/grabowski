@@ -361,6 +361,8 @@ const readTextHeavyPageFallbackScenario = scenario === 'read-text-heavy-page-fal
 const readLongUnrelatedTextFallbackScenario = scenario === 'read-long-unrelated-text-fallback';
 const readDesignModeFallbackScenario = scenario === 'read-design-mode-fallback';
 const readChildDesignModeFallbackScenario = scenario === 'read-child-design-mode-fallback';
+const readTransformZeroFallbackScenario = scenario === 'read-transform-zero-fallback';
+const readTransformZeroDescendantFallbackScenario = scenario === 'read-transform-zero-descendant-fallback';
 const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
 const scrollFallbackRevalidationFailureScenario = scenario === 'scroll-fallback-revalidation-failure';
 const activateTarget = 'https://private.invalid/issues';
@@ -378,7 +380,7 @@ function makeSemanticSnapshot(spec) {
     return index;
   };
   const nodes = {parentIndex: [], nodeType: [], nodeName: [], backendNodeId: [], attributes: []};
-  const layout = {nodeIndex: [], styles: [], text: []};
+  const layout = {nodeIndex: [], styles: [], bounds: [], text: []};
   spec.forEach((node, nodeIndex) => {
     nodes.parentIndex.push(node.parent);
     nodes.nodeType.push(node.nodeType || (node.nodeName === '#text' ? 3 : 1));
@@ -393,6 +395,7 @@ function makeSemanticSnapshot(spec) {
       stringIndex(node.contentVisibility || 'visible'),
       stringIndex(node.filter || 'none'),
     ]);
+    layout.bounds.push(node.bounds || [10 + nodeIndex, 10 + nodeIndex, 100, 20]);
     layout.text.push(stringIndex(node.layoutText || ''));
   });
   return {strings, documents: [{nodes, layout}]};
@@ -532,6 +535,17 @@ function fallbackSnapshot() {
     {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
     {parent: 3, backendNodeId: 102, nodeName: '#text', layoutText: 'Continue'},
   ]);
+  if (readTransformZeroFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
+    {parent: 0, backendNodeId: 102, nodeName: '#text', layoutText: 'collapsed-' + marker, bounds: [49.328125, 18.5, 0.015625, 0]},
+  ]);
+  if (readTransformZeroDescendantFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
+    {parent: 0, backendNodeId: 102, nodeName: 'SPAN'},
+    {parent: 1, backendNodeId: 103, nodeName: '#text', layoutText: 'collapsed-' + marker, bounds: [49.328125, 18.5, 0.015625, 0]},
+    {parent: 0, backendNodeId: 104, nodeName: 'SPAN'},
+    {parent: 3, backendNodeId: 105, nodeName: '#text', layoutText: 'Continue', bounds: [60, 18, 55, 15]},
+  ]);
   if (readDesignModeFallbackScenario) return makeSemanticSnapshot([
     {parent: -1, backendNodeId: 100, nodeName: 'HTML'},
     {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
@@ -629,7 +643,7 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
-          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
+          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -644,7 +658,7 @@ class FakeWebSocket {
         reply({object: {objectId: 'link-object'}});
         return;
       case 'Runtime.callFunctionOn':
-        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
+        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readMeterRoleFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
           fail();
           return;
         }
@@ -851,7 +865,7 @@ class FakeWebSocket {
           }});
           return;
         }
-        if (readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readMeterRoleFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario) {
+        if (readAncestorOpacityFallbackScenario || readAncestorFilterOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readLongUnrelatedTextFallbackScenario || readMeterRoleFallbackScenario || readTransformZeroFallbackScenario || readTransformZeroDescendantFallbackScenario || readDesignModeFallbackScenario || readChildDesignModeFallbackScenario) {
           reply({node: {
             backendNodeId: 101,
             nodeType: 1,
@@ -3963,7 +3977,10 @@ globalThis.fetch = async () => ({
         self.assertIn("nodes.parentIndex", source)
         self.assertIn("layout.nodeIndex", source)
         self.assertIn("layout.styles", source)
+        self.assertIn("layout.bounds", source)
         self.assertIn("layout.text", source)
+        self.assertIn("function semanticLayoutBoundsVisibility", source)
+        self.assertIn("width >= 0.5 && height >= 0.5", source)
         self.assertNotIn("function boundedSemanticDomText", source)
         self.assertIn("'input', 'textarea', 'select', 'option', 'optgroup', 'output', 'meter', 'progress'", source)
         self.assertIn("'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'slider', 'spinbutton'", source)
@@ -4515,6 +4532,20 @@ globalThis.fetch = async () => ({
 
     def test_browser_semantic_node_ignores_overlong_unrelated_layout_text(self) -> None:
         execution, receipt = self._run_browser_semantic_node("read-long-unrelated-text-fallback")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "Continue")
+
+    def test_browser_semantic_node_excludes_transform_collapsed_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node("read-transform-zero-fallback")
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "")
+
+    def test_browser_semantic_node_filters_transform_collapsed_descendant_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-transform-zero-descendant-fallback"
+        )
         self.assertEqual(execution.returncode, 0, execution.stderr)
         self.assertTrue(receipt["ok"])
         self.assertEqual(receipt["state"]["elements"][0]["name"], "Continue")
