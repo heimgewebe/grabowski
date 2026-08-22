@@ -19,14 +19,14 @@ Codex is an explicit contrast surface only. Because ChatGPT and Codex are in the
 
 ## Verified subscription baselines
 
-Observed on 2026-07-29:
+Baseline observations are from 2026-07-29; xAI model discovery was refreshed on 2026-08-22:
 
 | Provider | Canonical local plan label | Live evidence | Included routing surface | Excluded cost surfaces |
 | --- | --- | --- | --- | --- |
 | OpenAI | ChatGPT Pro | owner assertion; `codex login status` reports ChatGPT login; `gpt-5.6-sol` xhigh smoke passed | Codex CLI contrast | OpenAI API, purchased Codex credits |
 | Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed | Claude Code review and contrast | Anthropic API, usage credits |
 | Google | Google AI subscription | owner assertion; Antigravity `gemini-3.1-pro-high` smoke passed | Antigravity and Jules baseline | Vertex AI API, Google AI Studio API, purchased AI credits |
-| xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; `grok-4.6-build` smoke passed | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
+| xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; authenticated `grok models` readback exposes `grok-4.6` | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
 
 The exact Google AI tier is not exposed by the local harness. The catalog therefore records the subscription family and the verified Antigravity entitlement without inventing a narrower tier.
 
@@ -41,7 +41,7 @@ The live harness probes supersede stale catalog generations:
 - Fable 5 returns `usage-credits-required`; it is not part of the Claude Pro baseline.
 - Antigravity exposes Gemini 3.1 Pro and Gemini 3.6 Flash.
 - Codex resolves its current high-end subscription route to GPT-5.6 Sol.
-- Grok Build resolves the SuperGrok route to Grok 4.6 Build.
+- The authenticated Grok CLI model listing exposes `grok-4.6` for the SuperGrok account.
 
 Old model identifiers may remain as disabled compatibility records. They are not preferred routes.
 
