@@ -565,6 +565,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         for value in (
             "other/bureau",
             "heimgewebe/bureau/extra",
+            "heimgewebe/Kernel",
             "heimgewebe/",
         ):
             self.assertIsNone(intake._canonical_bureau_repo_resource(value))
@@ -696,6 +697,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             "org-236528253@github.com.evil:heimgewebe/grabowski.git",
             "org-236528253@github.com:other/grabowski.git",
             "org-236528253@github.com:heimgewebe/grabowski/extra.git",
+            "org-236528253@github.com:heimgewebe/Kernel.git",
         ):
             self.assertIsNone(intake._bureau_repo_resource_from_origin(origin))
         self.assertIsNone(

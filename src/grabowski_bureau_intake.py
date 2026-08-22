@@ -615,7 +615,8 @@ def _bureau_repo_resource_from_origin(origin: str) -> str | None:
         repository = repository[:-4]
     canonical_repository = repository.lower()
     if (
-        "/" in repository
+        not repository.isascii()
+        or "/" in repository
         or BUREAU_REPO_SLUG_RE.fullmatch(canonical_repository) is None
     ):
         return None
@@ -630,7 +631,8 @@ def _canonical_bureau_repo_resource(value: Any) -> str | None:
         repository_slug = value[len(owner_prefix) :]
         canonical_repository_slug = repository_slug.lower()
         if (
-            "/" not in repository_slug
+            repository_slug.isascii()
+            and "/" not in repository_slug
             and BUREAU_REPO_SLUG_RE.fullmatch(canonical_repository_slug) is not None
         ):
             return f"repo.{canonical_repository_slug}"
