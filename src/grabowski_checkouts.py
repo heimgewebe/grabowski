@@ -1800,7 +1800,10 @@ def _resource_related(resource_key: str, paths: list[Path]) -> bool:
 
 
 def _task_records(
-    paths: list[Path], *, resource_paths: list[Path] | None = None
+    paths: list[Path],
+    *,
+    resource_paths: list[Path] | None = None,
+    exact_resource_keys: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     """Match task CWDs narrowly while retaining explicit resource-scope overlap."""
     try:
@@ -1823,6 +1826,9 @@ def _task_records(
     finally:
         connection.close()
     effective_resource_paths = paths if resource_paths is None else resource_paths
+    effective_exact_resource_keys = frozenset(
+        str(item) for item in exact_resource_keys
+    )
     results: list[dict[str, Any]] = []
     for row in rows:
         related = False
@@ -1838,7 +1844,10 @@ def _task_records(
             if isinstance(raw_keys, list):
                 resource_keys = [str(item) for item in raw_keys if isinstance(item, str)]
                 related = related or any(
-                    _resource_related(key, effective_resource_paths)
+                    (
+                        _resource_related(key, effective_resource_paths)
+                        or key in effective_exact_resource_keys
+                    )
                     for key in resource_keys
                 )
         except json.JSONDecodeError:
@@ -1973,11 +1982,11 @@ def _linked_checkout_coordination(
     if owner_id is not None:
         _owner(owner_id)
     ignored_owners = {_owner(item) for item in ignored_lease_owner_ids}
+    branch_resource_key = (
+        f"repo:{repo_path}:branch:{branch}" if isinstance(branch, str) and branch else None
+    )
     resource_blockers: list[dict[str, Any]] = []
     if include_resources:
-        branch_resource_key = (
-            f"repo:{repo_path}:branch:{branch}" if isinstance(branch, str) and branch else None
-        )
         for lease in _read_resource_leases():
             if lease["owner_id"] in ignored_owners:
                 continue
@@ -1993,6 +2002,9 @@ def _linked_checkout_coordination(
         _task_records(
             [checkout_path],
             resource_paths=[checkout_path, repo_common_dir],
+            exact_resource_keys=(
+                () if branch_resource_key is None else (branch_resource_key,)
+            ),
         )
         if include_tasks
         else []

@@ -822,6 +822,29 @@ class CheckoutLifecycleTests(unittest.TestCase):
             0,
         )
 
+    def test_archive_preserves_same_branch_scoped_task_blocker(self) -> None:
+        self._insert_running_task(
+            marker="j",
+            cwd=self.repo,
+            resource_keys=[f"repo:{self.repo}:branch:topic"],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "tasks=1"):
+            self._archive()
+
+    def test_archive_ignores_other_branch_scoped_task(self) -> None:
+        self._insert_running_task(
+            marker="k",
+            cwd=self.repo,
+            resource_keys=[f"repo:{self.repo}:branch:other"],
+        )
+
+        archived = self._archive()
+        self.assertEqual(
+            archived["audit"]["coordination_checked"]["tasks"],
+            0,
+        )
+
     def test_archive_preserves_repo_scoped_task_blocker(self) -> None:
         self._insert_running_task(
             marker="e",
