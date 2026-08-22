@@ -3389,8 +3389,10 @@ def resolve_inside_repo(repo: Path, raw: str | None, *, label: str = "self-revie
 def _sanitize_for_log(value: Any) -> str:
     text = str(value)
     patterns = [
-        r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization)\s*[:=]\s*([^\s,;]+)",
+        # Redact auth schemes before generic key/value pairs so a value such as
+        # ``Authorization: Bearer <token>`` cannot leave the token behind.
         r"(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+\b",
+        r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|authorization)\s*[:=]\s*([^\s,;]+)",
         r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b",
         r"\b[A-Za-z0-9+/]{32,}={0,2}\b",
         r"\b[0-9a-fA-F]{32,}\b",
@@ -3398,6 +3400,16 @@ def _sanitize_for_log(value: Any) -> str:
     for pattern in patterns:
         text = re.sub(pattern, "[REDACTED]", text)
     return text
+
+
+def _sanitize_result_for_output(result: dict[str, Any]) -> dict[str, Any]:
+    """Return an output copy with user-visible diagnostics redacted."""
+    sanitized = dict(result)
+    for key in ("failures", "warnings"):
+        items = result.get(key)
+        if isinstance(items, list):
+            sanitized[key] = [_sanitize_for_log(item) for item in items]
+    return sanitized
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3473,7 +3485,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
     if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
+        print(json.dumps(_sanitize_result_for_output(result), indent=2, sort_keys=True))
     else:
         print(result["verdict"])
         for item in result.get("failures", []):
