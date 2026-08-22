@@ -2632,7 +2632,7 @@ async function readSemanticElementName(backendNodeId, role, accessibilityName) {
     return {ok: false, name: ''};
   }
   const node = described && described.node ? described.node : null;
-  if (!node || node.backendDOMNodeId !== backendNodeId) {
+  if (!node || node.backendNodeId !== backendNodeId) {
     return {ok: false, name: ''};
   }
   const candidates = [

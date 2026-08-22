@@ -438,19 +438,19 @@ class FakeWebSocket {
         describeCalls += 1;
         if (readNameFallbackScenario) {
           reply({node: {
-            backendDOMNodeId: 101,
+            backendNodeId: 101,
             nodeType: 1,
             localName: 'button',
             nodeName: 'BUTTON',
             attributes: ['aria-label', '   ', 'title', '\t'],
             children: [{
-              backendDOMNodeId: 102,
+              backendNodeId: 102,
               nodeType: 1,
               localName: 'span',
               nodeName: 'SPAN',
               attributes: [],
               children: [{
-                backendDOMNodeId: 103,
+                backendNodeId: 103,
                 nodeType: 3,
                 localName: '',
                 nodeName: '#text',
@@ -462,13 +462,13 @@ class FakeWebSocket {
         }
         if (readValueRoleFallbackScenario) {
           reply({node: {
-            backendDOMNodeId: 101,
+            backendNodeId: 101,
             nodeType: 1,
             localName: 'div',
             nodeName: 'DIV',
             attributes: [],
             children: [{
-              backendDOMNodeId: 102,
+              backendNodeId: 102,
               nodeType: 3,
               localName: '',
               nodeName: '#text',
@@ -483,7 +483,7 @@ class FakeWebSocket {
             return;
           }
           reply({node: {
-            backendDOMNodeId: 101,
+            backendNodeId: 101,
             nodeType: 1,
             localName: 'button',
             nodeName: 'BUTTON',
@@ -498,7 +498,7 @@ class FakeWebSocket {
           href = activateTarget + String.fromCharCode(92);
         }
         reply({node: {
-          backendDOMNodeId: 101,
+          backendNodeId: 101,
           localName: 'a',
           nodeName: 'A',
           attributes: ['href', href],
@@ -3489,6 +3489,8 @@ globalThis.fetch = async () => ({
         ]
         self.assertIn("DOM.describeNode", name_reader)
         self.assertIn("depth: 6", name_reader)
+        self.assertIn("node.backendNodeId !== backendNodeId", name_reader)
+        self.assertNotIn("node.backendDOMNodeId !== backendNodeId", name_reader)
         self.assertIn("semanticDomAttribute(node, 'aria-label')", name_reader)
         self.assertIn("semanticDomAttribute(node, 'title')", name_reader)
         self.assertIn("semanticDomAttribute(node, 'placeholder')", name_reader)
