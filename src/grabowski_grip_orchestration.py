@@ -1034,6 +1034,12 @@ def _validate_mechanic_result(
     )
     planned_actions = plan["mechanic_actions"]
     child_actions = output.get("actions")
+    if (
+        child_actions is None
+        and receipt.get("status") == "blocked"
+        and receipt.get("phase") == "preflight"
+    ):
+        return receipt, output, []
     if not isinstance(child_actions, list):
         raise SagaError("mechanic_result actions are missing")
     if output.get("requested_action_count") != len(planned_actions):

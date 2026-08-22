@@ -1153,6 +1153,7 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
 }
 MECHANIC_NORMAL_GRIPS = frozenset(
     {
+        "bureau-pickup-status",
         "repo-orient",
         "worktree-orient",
         "work-acquire",
@@ -8888,6 +8889,11 @@ def _validate_mechanic_target_matches_parameters(
     *,
     index: int,
 ) -> None:
+    if action_name == "bureau-pickup-status":
+        if target.get("bureau_run_id") != parameters.get("run_id"):
+            raise GripPreflightError(
+                f"actions[{index}].target.bureau_run_id must match parameters.run_id"
+            )
     if action_name == "branch-publish":
         branch = parameters.get("branch")
         if target.get("branch") != branch:
