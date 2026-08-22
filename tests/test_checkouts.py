@@ -450,6 +450,42 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(result["lifecycle_binding"]["expected_head"], merge_head)
         self.assertIsNone(result["lifecycle_binding"]["expected_branch"])
 
+    def test_terminal_detached_archive_rolls_back_retention_with_lifecycle_failure(self) -> None:
+        binding = self._managed_binding()
+        checkout_key = str(binding["checkout_key"])
+        retention_before = checkouts._retention_records([checkout_key])[checkout_key]
+        _, merge_head = self._detached_merged_topic()
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            patch.object(
+                checkouts,
+                "_mark_checkout_archived_in_connection",
+                side_effect=RuntimeError("simulated detached lifecycle failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated detached lifecycle failure"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "rollback detached archive identity",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+            )
+
+        retention_after = checkouts._retention_records([checkout_key])[checkout_key]
+        self.assertEqual(retention_after, retention_before)
+        lifecycle = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual(lifecycle["phase"], "active")
+        self.assertEqual(lifecycle["expected_head"], self.head)
+        self.assertEqual(lifecycle["expected_branch"], "topic")
+        self.assertIsNone(checkouts._latest_archive_for_key(checkout_key))
+
     def test_archive_rejects_detached_checkout_when_source_is_not_terminal(self) -> None:
         self._managed_binding()
         _, merge_head = self._detached_merged_topic()

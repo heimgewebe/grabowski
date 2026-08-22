@@ -1159,6 +1159,75 @@ def _latest_archive_for_key(checkout_key: str) -> dict[str, Any] | None:
     return None if row is None else _archive_public(row)
 
 
+def _upsert_retention_in_connection(
+    connection: sqlite3.Connection,
+    *,
+    checkout_key: str,
+    repo_common_dir: Path,
+    repo_path: Path,
+    checkout_path: Path,
+    owner_id: str,
+    purpose: str,
+    retention_until_unix: int,
+    expected_head: str | None,
+    expected_branch: str | None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    owner = _owner(owner_id)
+    retain_purpose = _purpose(purpose)
+    until = _retention_until(retention_until_unix)
+    observed_now = _now() if now is None else now
+    existing = connection.execute(
+        "SELECT * FROM retention WHERE checkout_key=?",
+        (checkout_key,),
+    ).fetchone()
+    if (
+        existing is not None
+        and existing["retention_until_unix"] > observed_now
+        and existing["owner_id"] != owner
+    ):
+        raise PermissionError("Active checkout retention is owned by another owner")
+    created_at = observed_now if existing is None else existing["created_at_unix"]
+    connection.execute(
+        """
+        INSERT INTO retention(
+            checkout_key, repo_common_dir, repo_path, checkout_path,
+            owner_id, purpose, retention_until_unix, expected_head,
+            expected_branch, created_at_unix, updated_at_unix
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(checkout_key) DO UPDATE SET
+            repo_common_dir=excluded.repo_common_dir,
+            repo_path=excluded.repo_path,
+            checkout_path=excluded.checkout_path,
+            owner_id=excluded.owner_id,
+            purpose=excluded.purpose,
+            retention_until_unix=excluded.retention_until_unix,
+            expected_head=excluded.expected_head,
+            expected_branch=excluded.expected_branch,
+            updated_at_unix=excluded.updated_at_unix
+        """,
+        (
+            checkout_key,
+            str(repo_common_dir),
+            str(repo_path),
+            str(checkout_path),
+            owner,
+            retain_purpose,
+            until,
+            expected_head,
+            expected_branch,
+            created_at,
+            observed_now,
+        ),
+    )
+    row = connection.execute(
+        "SELECT * FROM retention WHERE checkout_key=?",
+        (checkout_key,),
+    ).fetchone()
+    assert row is not None
+    return _retention_public(row)
+
+
 def _upsert_retention(
     *,
     checkout_key: str,
@@ -1171,61 +1240,21 @@ def _upsert_retention(
     expected_head: str | None,
     expected_branch: str | None,
 ) -> dict[str, Any]:
-    owner = _owner(owner_id)
-    retain_purpose = _purpose(purpose)
-    until = _retention_until(retention_until_unix)
-    now = _now()
     with _database() as connection:
-        existing = connection.execute(
-            "SELECT * FROM retention WHERE checkout_key=?",
-            (checkout_key,),
-        ).fetchone()
-        if (
-            existing is not None
-            and existing["retention_until_unix"] > now
-            and existing["owner_id"] != owner
-        ):
-            raise PermissionError("Active checkout retention is owned by another owner")
-        created_at = now if existing is None else existing["created_at_unix"]
-        connection.execute(
-            """
-            INSERT INTO retention(
-                checkout_key, repo_common_dir, repo_path, checkout_path,
-                owner_id, purpose, retention_until_unix, expected_head,
-                expected_branch, created_at_unix, updated_at_unix
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(checkout_key) DO UPDATE SET
-                repo_common_dir=excluded.repo_common_dir,
-                repo_path=excluded.repo_path,
-                checkout_path=excluded.checkout_path,
-                owner_id=excluded.owner_id,
-                purpose=excluded.purpose,
-                retention_until_unix=excluded.retention_until_unix,
-                expected_head=excluded.expected_head,
-                expected_branch=excluded.expected_branch,
-                updated_at_unix=excluded.updated_at_unix
-            """,
-            (
-                checkout_key,
-                str(repo_common_dir),
-                str(repo_path),
-                str(checkout_path),
-                owner,
-                retain_purpose,
-                until,
-                expected_head,
-                expected_branch,
-                created_at,
-                now,
-            ),
+        retention = _upsert_retention_in_connection(
+            connection,
+            checkout_key=checkout_key,
+            repo_common_dir=repo_common_dir,
+            repo_path=repo_path,
+            checkout_path=checkout_path,
+            owner_id=owner_id,
+            purpose=purpose,
+            retention_until_unix=retention_until_unix,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
         )
         connection.commit()
-        row = connection.execute(
-            "SELECT * FROM retention WHERE checkout_key=?",
-            (checkout_key,),
-        ).fetchone()
-    assert row is not None
-    return _retention_public(row)
+    return retention
 
 
 def _lease_ttl(retention_until_unix: int) -> int:
@@ -3654,6 +3683,7 @@ def grabowski_checkout_archive(
     owner = _owner(owner_id)
     until = _retention_until(retention_until_unix)
     archive_purpose = _purpose(purpose)
+    _require_retention_owner(record["checkout_key"], owner)
     lifecycle_before = _lifecycle_bindings([record["checkout_key"]]).get(
         record["checkout_key"]
     )
@@ -3702,17 +3732,6 @@ def grabowski_checkout_archive(
                     top_level, record, lifecycle
                 )
 
-        retention = _upsert_retention(
-            checkout_key=record["checkout_key"],
-            repo_common_dir=common_dir,
-            repo_path=top_level,
-            checkout_path=checkout,
-            owner_id=owner,
-            purpose=archive_purpose,
-            retention_until_unix=until,
-            expected_head=expected_head,
-            expected_branch=expected_branch,
-        )
         archive_id = _new_archive_id()
         path_hash = record["checkout_key"][:16]
         ref_base = f"{ARCHIVE_REF_ROOT}/{path_hash}/{archive_id}"
@@ -3783,6 +3802,19 @@ def grabowski_checkout_archive(
         created = _now()
         with _database() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            retention = _upsert_retention_in_connection(
+                connection,
+                checkout_key=record["checkout_key"],
+                repo_common_dir=common_dir,
+                repo_path=top_level,
+                checkout_path=checkout,
+                owner_id=owner,
+                purpose=archive_purpose,
+                retention_until_unix=until,
+                expected_head=expected_head,
+                expected_branch=expected_branch,
+                now=created,
+            )
             connection.execute(
                 """
                 INSERT INTO archives(
