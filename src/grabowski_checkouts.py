@@ -1159,6 +1159,75 @@ def _latest_archive_for_key(checkout_key: str) -> dict[str, Any] | None:
     return None if row is None else _archive_public(row)
 
 
+def _upsert_retention_in_connection(
+    connection: sqlite3.Connection,
+    *,
+    checkout_key: str,
+    repo_common_dir: Path,
+    repo_path: Path,
+    checkout_path: Path,
+    owner_id: str,
+    purpose: str,
+    retention_until_unix: int,
+    expected_head: str | None,
+    expected_branch: str | None,
+    now: int | None = None,
+) -> dict[str, Any]:
+    owner = _owner(owner_id)
+    retain_purpose = _purpose(purpose)
+    until = _retention_until(retention_until_unix)
+    observed_now = _now() if now is None else now
+    existing = connection.execute(
+        "SELECT * FROM retention WHERE checkout_key=?",
+        (checkout_key,),
+    ).fetchone()
+    if (
+        existing is not None
+        and existing["retention_until_unix"] > observed_now
+        and existing["owner_id"] != owner
+    ):
+        raise PermissionError("Active checkout retention is owned by another owner")
+    created_at = observed_now if existing is None else existing["created_at_unix"]
+    connection.execute(
+        """
+        INSERT INTO retention(
+            checkout_key, repo_common_dir, repo_path, checkout_path,
+            owner_id, purpose, retention_until_unix, expected_head,
+            expected_branch, created_at_unix, updated_at_unix
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(checkout_key) DO UPDATE SET
+            repo_common_dir=excluded.repo_common_dir,
+            repo_path=excluded.repo_path,
+            checkout_path=excluded.checkout_path,
+            owner_id=excluded.owner_id,
+            purpose=excluded.purpose,
+            retention_until_unix=excluded.retention_until_unix,
+            expected_head=excluded.expected_head,
+            expected_branch=excluded.expected_branch,
+            updated_at_unix=excluded.updated_at_unix
+        """,
+        (
+            checkout_key,
+            str(repo_common_dir),
+            str(repo_path),
+            str(checkout_path),
+            owner,
+            retain_purpose,
+            until,
+            expected_head,
+            expected_branch,
+            created_at,
+            observed_now,
+        ),
+    )
+    row = connection.execute(
+        "SELECT * FROM retention WHERE checkout_key=?",
+        (checkout_key,),
+    ).fetchone()
+    assert row is not None
+    return _retention_public(row)
+
+
 def _upsert_retention(
     *,
     checkout_key: str,
@@ -1171,61 +1240,21 @@ def _upsert_retention(
     expected_head: str | None,
     expected_branch: str | None,
 ) -> dict[str, Any]:
-    owner = _owner(owner_id)
-    retain_purpose = _purpose(purpose)
-    until = _retention_until(retention_until_unix)
-    now = _now()
     with _database() as connection:
-        existing = connection.execute(
-            "SELECT * FROM retention WHERE checkout_key=?",
-            (checkout_key,),
-        ).fetchone()
-        if (
-            existing is not None
-            and existing["retention_until_unix"] > now
-            and existing["owner_id"] != owner
-        ):
-            raise PermissionError("Active checkout retention is owned by another owner")
-        created_at = now if existing is None else existing["created_at_unix"]
-        connection.execute(
-            """
-            INSERT INTO retention(
-                checkout_key, repo_common_dir, repo_path, checkout_path,
-                owner_id, purpose, retention_until_unix, expected_head,
-                expected_branch, created_at_unix, updated_at_unix
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(checkout_key) DO UPDATE SET
-                repo_common_dir=excluded.repo_common_dir,
-                repo_path=excluded.repo_path,
-                checkout_path=excluded.checkout_path,
-                owner_id=excluded.owner_id,
-                purpose=excluded.purpose,
-                retention_until_unix=excluded.retention_until_unix,
-                expected_head=excluded.expected_head,
-                expected_branch=excluded.expected_branch,
-                updated_at_unix=excluded.updated_at_unix
-            """,
-            (
-                checkout_key,
-                str(repo_common_dir),
-                str(repo_path),
-                str(checkout_path),
-                owner,
-                retain_purpose,
-                until,
-                expected_head,
-                expected_branch,
-                created_at,
-                now,
-            ),
+        retention = _upsert_retention_in_connection(
+            connection,
+            checkout_key=checkout_key,
+            repo_common_dir=repo_common_dir,
+            repo_path=repo_path,
+            checkout_path=checkout_path,
+            owner_id=owner_id,
+            purpose=purpose,
+            retention_until_unix=retention_until_unix,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
         )
         connection.commit()
-        row = connection.execute(
-            "SELECT * FROM retention WHERE checkout_key=?",
-            (checkout_key,),
-        ).fetchone()
-    assert row is not None
-    return _retention_public(row)
+    return retention
 
 
 def _lease_ttl(retention_until_unix: int) -> int:
@@ -3548,6 +3577,90 @@ def grabowski_checkout_retain(
     return {"retention": retention, "lease": lease, "lease_release": lease_release, "audit": audit}
 
 
+def _terminal_detached_archive_transition(
+    repo: Path,
+    record: dict[str, Any],
+    lifecycle: dict[str, Any],
+) -> dict[str, Any]:
+    expected_branch = lifecycle.get("expected_branch")
+    if record.get("branch") is not None or not isinstance(expected_branch, str):
+        raise RuntimeError("Checkout lifecycle branch changed before archive")
+    if lifecycle.get("phase") not in {"active", "completed_retained"}:
+        raise RuntimeError(
+            "Detached checkout archive requires active or completed-retained lifecycle"
+        )
+    expected_head = _validate_git_object_id(
+        lifecycle.get("expected_head"), "lifecycle expected_head"
+    )
+    current_head = _validate_git_object_id(record.get("head"), "checkout head")
+
+    # Lazy import avoids a module cycle: terminal source readers use checkout helpers.
+    import grabowski_checkout_terminal_sources as terminal_sources
+
+    source_evidence = terminal_sources.source_terminal_evidence(lifecycle)
+    branch_ref = f"refs/heads/{expected_branch}"
+    branch_read = _git_read(
+        repo,
+        ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
+        check=False,
+    )
+    if branch_read.returncode != 0:
+        raise RuntimeError(
+            "Detached checkout archive requires the bound lifecycle branch ref"
+        )
+    branch_head = _validate_git_object_id(
+        branch_read.stdout.strip(), "lifecycle branch head"
+    )
+
+    bound_ancestry = _git_read(
+        repo,
+        ["merge-base", "--is-ancestor", expected_head, branch_head],
+        check=False,
+    )
+    if bound_ancestry.returncode != 0:
+        raise RuntimeError(
+            "Lifecycle branch head does not descend from the bound checkout head"
+        )
+    detached_ancestry = _git_read(
+        repo,
+        ["merge-base", "--is-ancestor", branch_head, current_head],
+        check=False,
+    )
+    if detached_ancestry.returncode != 0:
+        raise RuntimeError(
+            "Detached checkout head does not descend from the lifecycle branch head"
+        )
+
+    current_remote = _remote_secured_observation(
+        record, verify_github_pull_ref=True
+    )
+    branch_remote = _remote_secured_observation(
+        {**record, "head": branch_head, "branch": expected_branch},
+        verify_github_pull_ref=True,
+    )
+    if current_remote.get("remote_secured") is not True:
+        raise RuntimeError("Detached checkout head is not remotely secured")
+    if branch_remote.get("remote_secured") is not True:
+        raise RuntimeError("Lifecycle branch head is not remotely secured")
+
+    core = {
+        "schema_version": 1,
+        "kind": "checkout_terminal_detached_archive_transition",
+        "source_evidence": source_evidence,
+        "expected_head": expected_head,
+        "expected_branch": expected_branch,
+        "branch_head": branch_head,
+        "detached_head": current_head,
+        "current_remote_secured_refs": current_remote.get(
+            "remote_secured_refs", []
+        ),
+        "branch_remote_secured_refs": branch_remote.get(
+            "remote_secured_refs", []
+        ),
+    }
+    return {**core, "evidence_sha256": _sha256_json(core)}
+
+
 @mcp.tool(name="grabowski_checkout_archive", annotations=MUTATING)
 def grabowski_checkout_archive(
     repo: str,
@@ -3570,11 +3683,20 @@ def grabowski_checkout_archive(
     owner = _owner(owner_id)
     until = _retention_until(retention_until_unix)
     archive_purpose = _purpose(purpose)
+    _require_retention_owner(record["checkout_key"], owner)
+    lifecycle_before = _lifecycle_bindings([record["checkout_key"]]).get(
+        record["checkout_key"]
+    )
+    if lifecycle_before is not None and lifecycle_before["owner_id"] != owner:
+        raise PermissionError("Checkout lifecycle binding is owned by another owner")
+    lease_branch = record.get("branch")
+    if lease_branch is None and lifecycle_before is not None:
+        lease_branch = lifecycle_before.get("expected_branch")
     coordination = _linked_checkout_coordination(
         checkout,
         top_level,
         common_dir,
-        branch=record.get("branch"),
+        branch=lease_branch,
         owner_id=owner,
         include_processes=True,
         include_tasks=True,
@@ -3588,7 +3710,7 @@ def grabowski_checkout_archive(
         purpose=f"archive linked checkout: {archive_purpose}",
         retention_until_unix=until,
         repo_path=top_level,
-        branch=record.get("branch"),
+        branch=lease_branch,
         metadata={
             "checkout_path": str(checkout),
             "repo": str(top_level),
@@ -3601,27 +3723,15 @@ def grabowski_checkout_archive(
         lifecycle = _lifecycle_bindings([record["checkout_key"]]).get(
             record["checkout_key"]
         )
+        if lifecycle != lifecycle_before:
+            raise RuntimeError("Checkout lifecycle binding changed during archive preflight")
+        terminal_detached_transition = None
         if lifecycle is not None:
-            if lifecycle["owner_id"] != owner:
-                raise PermissionError(
-                    "Checkout lifecycle binding is owned by another owner"
-                )
             if lifecycle["expected_branch"] != record.get("branch"):
-                raise RuntimeError(
-                    "Checkout lifecycle branch changed before archive"
+                terminal_detached_transition = _terminal_detached_archive_transition(
+                    top_level, record, lifecycle
                 )
 
-        retention = _upsert_retention(
-            checkout_key=record["checkout_key"],
-            repo_common_dir=common_dir,
-            repo_path=top_level,
-            checkout_path=checkout,
-            owner_id=owner,
-            purpose=archive_purpose,
-            retention_until_unix=until,
-            expected_head=expected_head,
-            expected_branch=expected_branch,
-        )
         archive_id = _new_archive_id()
         path_hash = record["checkout_key"][:16]
         ref_base = f"{ARCHIVE_REF_ROOT}/{path_hash}/{archive_id}"
@@ -3667,6 +3777,7 @@ def grabowski_checkout_archive(
             "purpose": archive_purpose,
             "retention_until_unix": until,
             "created_at": _utc_timestamp(),
+            "terminal_detached_transition": terminal_detached_transition,
             "recovery_refs": public_refs,
             "cleanup": {
                 "requires_dry_run": True,
@@ -3691,6 +3802,19 @@ def grabowski_checkout_archive(
         created = _now()
         with _database() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            retention = _upsert_retention_in_connection(
+                connection,
+                checkout_key=record["checkout_key"],
+                repo_common_dir=common_dir,
+                repo_path=top_level,
+                checkout_path=checkout,
+                owner_id=owner,
+                purpose=archive_purpose,
+                retention_until_unix=until,
+                expected_head=expected_head,
+                expected_branch=expected_branch,
+                now=created,
+            )
             connection.execute(
                 """
                 INSERT INTO archives(
@@ -3740,6 +3864,7 @@ def grabowski_checkout_archive(
             "branch_preserved": bool(record.get("branch")),
             "status": status,
             "coordination_checked": coordination["blocking_counts"],
+            "terminal_detached_transition": terminal_detached_transition,
             "resource_keys": [
                 item["resource_key"] for item in lease["leases"]
             ],
@@ -3753,6 +3878,7 @@ def grabowski_checkout_archive(
             "lease": lease,
             "manifest": manifest,
             "audit": audit,
+            "terminal_detached_transition": terminal_detached_transition,
         }
     finally:
         lease_release = _release_checkout_resources(lease)
