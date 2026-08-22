@@ -1,6 +1,6 @@
 # Operator Sagas v1
 
-Status: implementation merged and saga grips present in the current runtime; live-pilot and Bureau acceptance remain pending.
+Status: implementation merged; live acceptance is receipt-bound and must not be inferred from this document alone.
 
 ## Decision
 
@@ -144,6 +144,12 @@ Focused unit and grip integration tests are required before publication. Bureau 
 2. use the runtime-deployment saga for the resulting merge commit, execute the existing Captain deploy under its normal gates, read `grabowski_deployment_identity` until exact convergence, verify the Captain audit pair, and settle the deployment.
 
 This ordering avoids replaying historical high-impact effects solely for testing. Live pilot receipts, before/after call counts, operator decisions, blocks, partial failures and elapsed times belong to the T121 closeout evidence and must be revision-bound to the final implementation head.
+
+### Live acceptance checkpoint — 2026-08-22
+
+The first real PR-settlement attempt exposed a Prepare-contract defect before any Captain effect: `saga-plan` could include `bureau-pickup-status`, while `mechanic-loop` did not admit that read-only child, and the resulting Mechanic preflight block was projected as a hard Saga error instead of `prepare_blocked`.
+
+PR #890 repaired that contract, added the corresponding regression coverage, and was merged only after exact-head validation, Captain gates and authoritative GitHub readback. The repair is a bootstrap prerequisite, not a substitute for the two required end-to-end Saga pilots. Pilot settlement and measured-effect evidence remain external, receipt-bound acceptance evidence so this repository document cannot claim success merely by being merged.
 
 ## Non-claims
 
