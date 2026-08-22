@@ -897,6 +897,81 @@ class WorkAcquireTests(unittest.TestCase):
         acquire.assert_not_called()
         ensure.assert_not_called()
 
+    def test_historical_invalid_operator_obligation_outcome_unknown_still_replays(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "operator_obligation"
+        params["source_id"] = "metarepo-local-mcp-single-lockfile-v1-20260822"
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        lane_id = str(inputs["lane_id"])
+        with work_acquire._lane_lock(lane_id) as receipt_path:
+            work_acquire._write_state(
+                receipt_path,
+                {
+                    "kind": work_acquire.LANE_KIND,
+                    "schema_version": work_acquire.SCHEMA_VERSION,
+                    "lane_id": lane_id,
+                    "inputs_sha256": work_acquire._sha(inputs),
+                    "inputs": inputs,
+                    "state": "outcome_unknown",
+                    "decision": "HARD_BLOCK",
+                    "attempt_count": 1,
+                    "created_at_unix": int(time.time()),
+                    "updated_at_unix": int(time.time()),
+                },
+            )
+        acquire = Mock()
+        ensure = Mock()
+        result = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertTrue(result["replayed"])
+        self.assertEqual(result["state"], "outcome_unknown")
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+
+    def test_historical_invalid_operator_obligation_ready_lane_cannot_resume_effects(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "operator_obligation"
+        params["source_id"] = "metarepo-local-mcp-single-lockfile-v1-20260822"
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        lane_id = str(inputs["lane_id"])
+        with work_acquire._lane_lock(lane_id) as receipt_path:
+            work_acquire._write_state(
+                receipt_path,
+                {
+                    "kind": work_acquire.LANE_KIND,
+                    "schema_version": work_acquire.SCHEMA_VERSION,
+                    "lane_id": lane_id,
+                    "inputs_sha256": work_acquire._sha(inputs),
+                    "inputs": inputs,
+                    "state": "ready",
+                    "decision": "ISOLATE_AND_EXECUTE",
+                    "attempt_count": 1,
+                    "created_at_unix": int(time.time()),
+                    "updated_at_unix": int(time.time()),
+                },
+            )
+        acquire = Mock()
+        ensure = Mock()
+        with self.assertRaisesRegex(RuntimeError, "cannot resume effectful execution"):
+            work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+
     def test_existing_evidence_source_remains_checkout_lifecycle_source(self) -> None:
         params = self.parameters()
         params["source_kind"] = "operator_obligation"

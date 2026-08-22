@@ -565,13 +565,6 @@ def _normalize(
         _text(parameters.get("source_kind"), "source_kind"),
         _text(parameters.get("source_id"), "source_id"),
     )
-    if (
-        source_kind == "operator_obligation"
-        and operator_obligation.OBLIGATION_ID_RE.fullmatch(source_id) is None
-    ):
-        raise ValueError(
-            "source_id for operator_obligation must match goo-[a-z0-9-]"
-        )
     repo = Path(_text(parameters.get("repo"), "repo")).expanduser().resolve(strict=True)
     if not repo.is_dir():
         raise ValueError("repo must be an existing directory")
@@ -1081,6 +1074,19 @@ def acquire_work(
                 "durable_receipt_path": str(receipt_path),
                 "replayed": True,
             }
+        source = inputs["source"]
+        if (
+            source["kind"] == "operator_obligation"
+            and operator_obligation.OBLIGATION_ID_RE.fullmatch(source["id"]) is None
+        ):
+            if existing is not None:
+                raise RuntimeError(
+                    "historical operator_obligation lane with noncanonical source_id "
+                    "cannot resume effectful execution; reconcile it instead"
+                )
+            raise ValueError(
+                "source_id for operator_obligation must match goo-[a-z0-9-]"
+            )
         attempt = int(existing.get("attempt_count", 0)) + 1 if existing else 1
         base_record = {
             "kind": LANE_KIND,
