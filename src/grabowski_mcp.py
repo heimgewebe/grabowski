@@ -11045,6 +11045,82 @@ def _n8n_provider_dispatcher(
     )
 
 
+def _operator_obligation_gate_attempt_record(
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    classification = parameters.get("closure_classification")
+    classification = classification if isinstance(classification, dict) else {}
+    plan = classification.get("system_convergence_plan")
+    plan = plan if isinstance(plan, dict) else {}
+    return {
+        "operation": "operator-obligation-convergence-gate-attempt",
+        "obligation_id": parameters.get("obligation_id"),
+        "requested_outcome": parameters.get("outcome"),
+        "parameters_sha256": grabowski_grips.sha256_json(parameters),
+        "requested_convergence_required": classification.get("convergence_required"),
+        "requested_completion_reason": classification.get("reason"),
+        "system_convergence_plan_sha256": plan.get("plan_sha256"),
+        "systemic_closure_gate": plan.get("systemic_closure_gate"),
+        "convergence_gate_outcome": "pending",
+    }
+
+
+def _operator_obligation_gate_result_record(
+    parameters: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    attempt_audit_sha256: str,
+) -> dict[str, Any]:
+    output = result.get("output")
+    output = output if isinstance(output, dict) else {}
+    classification = output.get("completion_classification")
+    classification = classification if isinstance(classification, dict) else {}
+    plan = classification.get("system_convergence_plan")
+    plan = plan if isinstance(plan, dict) else {}
+    grip_receipt_sha256 = result.get("receipt_sha256")
+    gate_outcome = output.get("convergence_gate_outcome")
+    if not isinstance(gate_outcome, str) or not gate_outcome:
+        receipt = result.get("receipt")
+        receipt_status = receipt.get("status") if isinstance(receipt, dict) else result.get("status")
+        gate_outcome = "blocked" if receipt_status in {"blocked", "failed"} else "pending"
+    return {
+        "operation": "operator-obligation-convergence-gate-result",
+        "attempt_audit_sha256": attempt_audit_sha256,
+        "obligation_id": parameters.get("obligation_id"),
+        "requested_outcome": parameters.get("outcome"),
+        "parameters_sha256": grabowski_grips.sha256_json(parameters),
+        "grip_receipt_sha256": grip_receipt_sha256,
+        "convergence_gate_outcome": gate_outcome,
+        "completion_scope": output.get("completion_scope"),
+        "systemic_convergence_claim": output.get("systemic_convergence_claim"),
+        "close_file_sha256": output.get("close_file_sha256"),
+        "system_convergence_plan_sha256": plan.get("plan_sha256"),
+        "convergence_receipt_sha256": classification.get("convergence_receipt_sha256"),
+        "replayed": output.get("replayed"),
+    }
+
+
+def _operator_obligation_gate_audit_preflight(
+    parameters: dict[str, Any],
+) -> str:
+    return _append_audit_with_digest(
+        _operator_obligation_gate_attempt_record(parameters)
+    )
+
+
+def _operator_obligation_gate_audit_complete(
+    parameters: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    attempt_audit_sha256: str,
+) -> str:
+    return _append_audit_with_digest(
+        _operator_obligation_gate_result_record(
+            parameters, result, attempt_audit_sha256=attempt_audit_sha256
+        )
+    )
+
+
 def _grip_run_core(
     name: str,
     parameters: dict[str, Any] | None = None,
@@ -11207,6 +11283,25 @@ def _grip_run_core(
         dispatch_parameters["_server_observed_tools"] = (
             _runtime_connector_observed_tools()
         )
+    gate_attempt_audit_sha256: str | None = None
+    if name == "operator-obligation-close" and allow_mutation:
+        try:
+            gate_attempt_audit_sha256 = _operator_obligation_gate_audit_preflight(
+                dispatch_parameters
+            )
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+            blocked = grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                "operator-obligation convergence gate audit unavailable before mutation: "
+                + type(exc).__name__,
+            )
+            blocked["gate_audit"] = {
+                "status": "preflight_failed",
+                "error_class": type(exc).__name__,
+                "does_not_establish": ["operator_obligation_close_effect_started"],
+            }
+            return blocked
     if name == "captain-run" and allow_mutation:
         if captain_actor_identity is None:
             return grabowski_grips._blocked_surface_receipt(
@@ -11233,6 +11328,29 @@ def _grip_run_core(
         transport_target_dispatcher=transport_target_dispatcher,
         n8n_provider_dispatcher=_n8n_provider_dispatcher,
     )
+    if (
+        name == "operator-obligation-close"
+        and allow_mutation
+        and gate_attempt_audit_sha256 is not None
+    ):
+        try:
+            result_audit_sha256 = _operator_obligation_gate_audit_complete(
+                dispatch_parameters,
+                result,
+                attempt_audit_sha256=gate_attempt_audit_sha256,
+            )
+            result["gate_audit"] = {
+                "status": "complete",
+                "attempt_audit_sha256": gate_attempt_audit_sha256,
+                "result_audit_sha256": result_audit_sha256,
+            }
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+            result["gate_audit"] = {
+                "status": "completion_failed",
+                "attempt_audit_sha256": gate_attempt_audit_sha256,
+                "error_class": type(exc).__name__,
+                "does_not_establish": ["convergence_gate_result_audit_completion"],
+            }
     if name == "captain-run" and allow_mutation and captain_actor_identity is not None and captain_intent_audit is not None:
         try:
             completion = _captain_audit_completion(
