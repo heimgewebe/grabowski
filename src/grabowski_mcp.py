@@ -469,6 +469,8 @@ AUDIT_SEGMENT_CACHE_LOCK = threading.RLock()
 AUDIT_SEGMENT_VERIFICATION_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 AUDIT_LOCK_POLL_SECONDS = 0.02
+CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR = "Audit lock acquisition timed out"
+CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS = (0.05, 0.20)
 BASE_CAPABILITIES = (
     "file_read",
     "file_write",
@@ -10864,6 +10866,33 @@ def _append_verified_captain_audit(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _append_verified_captain_completion_audit(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Retry only audit-lock acquisition timeouts known to precede any append."""
+    retry_delays = CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            return _append_verified_captain_audit(record)
+        except RuntimeError as exc:
+            if (
+                str(exc) != CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR
+                or attempt == len(retry_delays)
+            ):
+                raise
+            time.sleep(retry_delays[attempt])
+    raise AssertionError("unreachable Captain audit completion retry state")
+
+
+def _captain_audit_completion_error_code(exc: BaseException) -> str:
+    if (
+        isinstance(exc, RuntimeError)
+        and str(exc) == CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR
+    ):
+        return "audit_lock_timeout"
+    return "audit_completion_error"
+
+
 def _captain_audit_intent(parameters: dict[str, Any], actor_identity: dict[str, Any]) -> dict[str, Any]:
     actor = grabowski_merge_guard.verify_server_runtime_actor_identity(actor_identity)
     material = _captain_audit_action_material(parameters)
@@ -10893,7 +10922,7 @@ def _captain_audit_completion(
         "receipt_sha256": result.get("receipt_sha256") or result.get("receipt", {}).get("receipt_sha256"),
         "output_sha256": result.get("receipt", {}).get("output_sha256"),
     }
-    return _append_verified_captain_audit(
+    return _append_verified_captain_completion_audit(
         {
             "operation": "captain-run-audit-completion",
             "kind": "grabowski_captain_run_audit",
@@ -11206,6 +11235,7 @@ def _grip_run_core(
                 "status": "completion_failed",
                 "intent": captain_intent_audit,
                 "error_class": type(exc).__name__,
+                "error_code": _captain_audit_completion_error_code(exc),
                 "does_not_establish": ["audited_execution_completion"],
             }
     return result
