@@ -2602,7 +2602,7 @@ function semanticDomAttribute(node, name) {
   return raw.found && raw.valid ? boundedText(raw.value, 160) : '';
 }
 
-function semanticDomTextSubtreeBlocked(node) {
+function semanticDomValueBearingSubtreeBlocked(node) {
   const localName = typeof node.localName === 'string'
     ? node.localName.toLowerCase() : '';
   const nodeName = typeof node.nodeName === 'string'
@@ -2617,6 +2617,14 @@ function semanticDomTextSubtreeBlocked(node) {
   ]);
   if (inertNames.has(localName) || inertNames.has(nodeName)) return true;
   if (valueBearingTags.has(localName) || valueBearingTags.has(nodeName)) return true;
+  const rawRole = semanticDomRawAttribute(node, 'role', 512);
+  if (!rawRole.valid) return true;
+  const roleTokens = rawRole.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  return roleTokens.some((token) => valueBearingRoles.has(token));
+}
+
+function semanticDomTextSubtreeBlocked(node) {
+  if (semanticDomValueBearingSubtreeBlocked(node)) return true;
 
   const hidden = semanticDomRawAttribute(node, 'hidden', 64);
   const inert = semanticDomRawAttribute(node, 'inert', 64);
@@ -2624,11 +2632,6 @@ function semanticDomTextSubtreeBlocked(node) {
   const ariaHidden = semanticDomRawAttribute(node, 'aria-hidden', 64);
   if (!ariaHidden.valid) return true;
   if (ariaHidden.found && ariaHidden.value.trim().toLowerCase() === 'true') return true;
-
-  const rawRole = semanticDomRawAttribute(node, 'role', 512);
-  if (!rawRole.valid) return true;
-  const roleTokens = rawRole.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
-  if (roleTokens.some((token) => valueBearingRoles.has(token))) return true;
 
   const contentEditable = semanticDomRawAttribute(node, 'contenteditable', 64);
   if (!contentEditable.valid) return true;
@@ -2698,6 +2701,34 @@ function semanticSnapshotPathToTarget(parentIndex, nodeIndex, targetIndex, nodeC
     current = parent;
   }
   return {ok: false, path: null};
+}
+
+function semanticSnapshotHasValueBearingAncestor(document, strings, targetIndex) {
+  const nodes = document && document.nodes ? document.nodes : null;
+  const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+  const parentIndex = nodes && Array.isArray(nodes.parentIndex) ? nodes.parentIndex : null;
+  if (!backendNodeIds || !parentIndex || parentIndex.length !== backendNodeIds.length ||
+      !Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= backendNodeIds.length) {
+    return {ok: false, blocked: true};
+  }
+  let current = parentIndex[targetIndex];
+  for (let depth = 0; depth < 256; depth += 1) {
+    if (!Number.isInteger(current) || current < -1 || current >= backendNodeIds.length ||
+        current === targetIndex) {
+      return {ok: false, blocked: true};
+    }
+    if (current === -1) return {ok: true, blocked: false};
+    const node = semanticSnapshotNode(document, strings, current);
+    if (!node) return {ok: false, blocked: true};
+    if (semanticDomValueBearingSubtreeBlocked(node)) return {ok: true, blocked: true};
+    const parent = parentIndex[current];
+    if (!Number.isInteger(parent) || parent < -1 || parent >= backendNodeIds.length ||
+        parent === current) {
+      return {ok: false, blocked: true};
+    }
+    current = parent;
+  }
+  return {ok: false, blocked: true};
 }
 
 function semanticSnapshotEffectiveContentEditable(document, strings, targetIndex) {
@@ -2788,6 +2819,11 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
   const targetNode = semanticSnapshotNode(document, strings, selected.targetIndex);
   if (!targetNode || targetNode.backendNodeId !== backendNodeId) return {ok: false, name: ''};
   if (semanticDomTextSubtreeBlocked(targetNode)) return {ok: true, name: ''};
+  const valueBearingAncestor = semanticSnapshotHasValueBearingAncestor(
+    document, strings, selected.targetIndex
+  );
+  if (!valueBearingAncestor.ok) return {ok: false, name: ''};
+  if (valueBearingAncestor.blocked) return {ok: true, name: ''};
   const effectiveEditable = semanticSnapshotEffectiveContentEditable(
     document, strings, selected.targetIndex
   );

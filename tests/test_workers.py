@@ -350,6 +350,8 @@ const readHiddenDescendantFallbackScenario = scenario === 'read-hidden-descendan
 const readCssHiddenFallbackScenario = scenario === 'read-css-hidden-fallback';
 const readInheritedContentEditableFallbackScenario = scenario === 'read-inherited-contenteditable-fallback';
 const readContentEditableFalseBoundaryScenario = scenario === 'read-contenteditable-false-boundary-fallback';
+const readInheritedValueRoleFallbackScenario = scenario === 'read-inherited-value-role-fallback';
+const readInheritedValueTagFallbackScenario = scenario === 'read-inherited-value-tag-fallback';
 const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
 const scrollFallbackRevalidationFailureScenario = scenario === 'scroll-fallback-revalidation-failure';
 const activateTarget = 'https://private.invalid/issues';
@@ -459,6 +461,16 @@ function fallbackSnapshot() {
     {parent: 0, backendNodeId: 101, nodeName: 'DIV', attributes: ['role', 'button', 'contenteditable', 'false']},
     {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'Continue'},
   ]);
+  if (readInheritedValueRoleFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 100, nodeName: 'DIV', attributes: ['role', 'textbox']},
+    {parent: 0, backendNodeId: 101, nodeName: 'DIV', attributes: ['role', 'button', 'aria-label', ' ']},
+    {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'role-' + marker},
+  ]);
+  if (readInheritedValueTagFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 100, nodeName: 'TEXTAREA'},
+    {parent: 0, backendNodeId: 101, nodeName: 'DIV', attributes: ['role', 'button', 'aria-label', ' ']},
+    {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'tag-' + marker},
+  ]);
   if (scrollFallbackRevalidationFailureScenario) return makeSemanticSnapshot([
     {parent: -1, backendNodeId: 101, nodeName: 'BUTTON'},
   ]);
@@ -519,7 +531,7 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
-          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
+          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -534,7 +546,7 @@ class FakeWebSocket {
         reply({object: {objectId: 'link-object'}});
         return;
       case 'Runtime.callFunctionOn':
-        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
+        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
           fail();
           return;
         }
@@ -727,6 +739,17 @@ class FakeWebSocket {
             nodeName: 'DIV',
             attributes: ['role', 'button', 'contenteditable', 'false'],
             children: [{backendNodeId: 102, nodeType: 3, nodeName: '#text', nodeValue: 'Continue'}],
+          }});
+          return;
+        }
+        if (readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario) {
+          reply({node: {
+            backendNodeId: 101,
+            nodeType: 1,
+            localName: 'div',
+            nodeName: 'DIV',
+            attributes: ['role', 'button', 'aria-label', ' '],
+            children: [{backendNodeId: 102, nodeType: 3, nodeName: '#text', nodeValue: 'ancestor-secret'}],
           }});
           return;
         }
@@ -3802,6 +3825,9 @@ globalThis.fetch = async () => ({
         self.assertIn("function semanticSnapshotString", source)
         self.assertIn("function semanticSnapshotNode", source)
         self.assertIn("function semanticSnapshotPathToTarget", source)
+        self.assertIn("function semanticDomValueBearingSubtreeBlocked", source)
+        self.assertIn("function semanticSnapshotHasValueBearingAncestor", source)
+        self.assertIn("semanticDomValueBearingSubtreeBlocked(node)", source)
         self.assertIn("function semanticSnapshotEffectiveContentEditable", source)
         self.assertIn("semanticDomRawAttribute(node, 'contenteditable', 64)", source)
         self.assertIn("if (value === 'false') return {ok: true, editable: false}", source)
@@ -4289,6 +4315,28 @@ globalThis.fetch = async () => ({
         element = receipt["state"]["elements"][0]
         self.assertEqual(element["role"], "button")
         self.assertEqual(element["name"], "Continue")
+
+    def test_browser_semantic_node_excludes_inherited_value_role_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-inherited-value-role-fallback"
+        )
+
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        element = receipt["state"]["elements"][0]
+        self.assertEqual(element["role"], "button")
+        self.assertEqual(element["name"], "")
+
+    def test_browser_semantic_node_excludes_inherited_value_tag_text(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-inherited-value-tag-fallback"
+        )
+
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        element = receipt["state"]["elements"][0]
+        self.assertEqual(element["role"], "button")
+        self.assertEqual(element["name"], "")
 
     def test_browser_semantic_node_excludes_value_bearing_root_text(self) -> None:
         execution, receipt = self._run_browser_semantic_node(
