@@ -137,6 +137,9 @@ class TaskTests(unittest.TestCase):
         self.output_root_patch = patch.object(
             tasks, "TASK_OUTPUT_ROOT", self.output_root
         )
+        self.legacy_output_root_patch = patch.object(
+            tasks, "TASK_OUTPUT_LEGACY_ROOT", self.output_root
+        )
         self.resource_database = self.root / "state" / "resources.sqlite3"
         self.resource_patch = patch.object(
             tasks.resources, "RESOURCE_DB", self.resource_database
@@ -286,6 +289,7 @@ class TaskTests(unittest.TestCase):
         self.db_patch.start()
         self.outcomes_patch.start()
         self.output_root_patch.start()
+        self.legacy_output_root_patch.start()
         self.resource_patch.start()
         self.admission_patch.start()
         self.reposkop_attestation_mock = self.reposkop_patch.start()
@@ -301,6 +305,7 @@ class TaskTests(unittest.TestCase):
         self.reposkop_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
+        self.legacy_output_root_patch.stop()
         self.output_root_patch.stop()
         self.outcomes_patch.stop()
         self.db_patch.stop()
@@ -507,6 +512,75 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(first["stdout"].name, "stdout.log")
         self.assertEqual(first["stderr"].name, "stderr.log")
         self.assertEqual(first["directory"].parent, self.output_root)
+
+    def test_task_output_cutover_uses_legacy_before_binding_and_managed_after(self) -> None:
+        managed = self.root / "managed-output"
+        legacy = self.root / "legacy-output"
+        managed.mkdir(mode=0o700)
+        legacy.mkdir(mode=0o700)
+        record = {
+            "task_id": "e" * 24,
+            "attempt": 1,
+            "launcher_json": json.dumps(
+                {tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY: 2}
+            ),
+        }
+        with patch.object(tasks, "TASK_OUTPUT_ROOT", managed), patch.object(
+            tasks, "TASK_OUTPUT_LEGACY_ROOT", legacy
+        ):
+            first = tasks._task_output_paths(record)
+            second_record = {**record, "attempt": 2}
+            second = tasks._task_output_paths(second_record)
+            self.assertEqual(tasks._task_output_contract_version(record), 1)
+            self.assertEqual(tasks._task_output_contract_version(second_record), 2)
+        self.assertEqual(first["directory"].parent, legacy)
+        self.assertEqual(second["directory"].parent, managed)
+
+    def test_local_task_start_persists_managed_output_binding(self) -> None:
+        started = self._start()
+        task = started["task"]
+        self.assertEqual(
+            task["launcher"][tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY],
+            1,
+        )
+        self.assertEqual(
+            tasks._task_output_paths(tasks._row_raw(str(task["task_id"])))["directory"].parent,
+            self.output_root,
+        )
+        self.assertEqual(started["audit"]["task_output_managed_from_attempt"], 1)
+
+    def test_remote_task_start_retains_legacy_output_contract(self) -> None:
+        started = self._start(host="remote")
+        task = started["task"]
+        self.assertNotIn(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY, task["launcher"])
+        self.assertIsNone(started["audit"]["task_output_managed_from_attempt"])
+        self.assertEqual(
+            tasks._task_output_contract_version(tasks._row_raw(str(task["task_id"]))),
+            1,
+        )
+
+    def test_ensure_local_task_output_root_creates_private_idempotent_root(self) -> None:
+        parent = self.root / "managed-state"
+        parent.mkdir(mode=0o700)
+        managed = parent / "task-output"
+        with patch.object(tasks, "TASK_OUTPUT_ROOT", managed):
+            tasks._ensure_local_task_output_root()
+            before = managed.stat()
+            tasks._ensure_local_task_output_root()
+            after = managed.stat()
+        self.assertTrue(managed.is_dir())
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o700)
+        self.assertEqual((before.st_dev, before.st_ino), (after.st_dev, after.st_ino))
+
+    def test_ensure_local_task_output_root_rejects_group_writable_parent(self) -> None:
+        parent = self.root / "unsafe-managed-state"
+        parent.mkdir(mode=0o700)
+        os.chmod(parent, 0o775)
+        managed = parent / "task-output"
+        with patch.object(tasks, "TASK_OUTPUT_ROOT", managed):
+            with self.assertRaisesRegex(RuntimeError, "root parent identity is unsafe"):
+                tasks._ensure_local_task_output_root()
+        self.assertFalse(managed.exists())
 
     def test_capture_wrapper_bounds_streams_and_preserves_exit_status(self) -> None:
         child = (
@@ -2491,6 +2565,92 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["last_observation"]["properties"]["Result"], "success")
 
+    def test_legacy_local_resume_binds_managed_output_from_next_attempt(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        with tasks._database_connection() as connection:
+            row = connection.execute(
+                "SELECT launcher_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            assert row is not None
+            launcher = json.loads(str(row["launcher_json"]))
+            launcher.pop(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY, None)
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (tasks._canonical_json(launcher), task_id),
+            )
+        before = tasks._row_raw(task_id)
+        self.assertIsNone(tasks._task_output_managed_from_attempt(before))
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        captured: dict[str, object] = {}
+
+        def launch(candidate: dict[str, object]) -> dict[str, object]:
+            captured.update(candidate)
+            return _launcher()
+
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks, "_launch", side_effect=launch
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        self.assertEqual(
+            resumed["task"]["launcher"][tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY],
+            2,
+        )
+        self.assertEqual(resumed["audit"]["task_output_managed_from_attempt"], 2)
+        self.assertEqual(tasks._task_output_managed_from_attempt(captured), 2)
+        first_attempt = {**captured, "attempt": 1}
+        self.assertEqual(
+            tasks._task_output_contract_version(first_attempt),
+            tasks.TASK_OUTPUT_LEGACY_CONTRACT_VERSION,
+        )
+        self.assertEqual(
+            tasks._task_output_contract_version(captured),
+            tasks.TASK_OUTPUT_CONTRACT_VERSION,
+        )
+
+    def test_managed_local_resume_rejects_fleet_transition_to_ssh(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        before = tasks._row_raw(task_id)
+        self.assertEqual(tasks._task_output_managed_from_attempt(before), 1)
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(tasks, "_launch") as launch, patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "managed local output cannot resume on non-local transport"
+            ):
+                tasks.grabowski_task_resume(task_id)
+        launch.assert_not_called()
+        after = tasks._row_raw(task_id)
+        self.assertEqual(after["attempt"], before["attempt"])
+        self.assertEqual(
+            tasks._task_output_managed_from_attempt(after),
+            tasks._task_output_managed_from_attempt(before),
+        )
+
     def test_resume_renews_live_lease_without_rebinding_identity(self) -> None:
         key = "component:task-resume-renew"
         started = self._start(resource_keys=[key])
@@ -2506,7 +2666,9 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks, "_observe", return_value=observation), patch.object(
             tasks, "_launch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
         ):
             resumed = tasks.grabowski_task_resume(task_id)
@@ -2538,7 +2700,9 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks, "_observe", return_value=observation), patch.object(
             tasks, "_launch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
         ):
             resumed = tasks.grabowski_task_resume(task_id)
@@ -2567,7 +2731,9 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks, "_observe", return_value=observation), patch.object(
             tasks, "_launch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 126}
         ):
             resumed = tasks.grabowski_task_resume(task_id)
@@ -4426,6 +4592,7 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks, "_reconcile_observation", return_value=admitted),
             patch.object(tasks, "_observe", return_value=revalidated),
             patch.object(tasks, "_launch", side_effect=launch_with_persisted_binding),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks.base, "_append_audit"),
             patch.object(
                 tasks,
@@ -4509,6 +4676,7 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks, "_reconcile_observation", return_value=admitted),
             patch.object(tasks, "_observe", return_value=revalidated),
             patch.object(tasks, "_launch", side_effect=launch_with_retry_edge),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks.base, "_append_audit"),
             patch.object(
                 tasks,
@@ -4713,6 +4881,7 @@ class TaskTests(unittest.TestCase):
                 side_effect=fail_after_binding,
             ) as renew,
             patch.object(tasks, "_launch") as launch,
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(
                 tasks,
                 "_require_recovery_gate",
@@ -9522,8 +9691,15 @@ class TaskTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.TestCase):
-    def test_task_output_root_is_fixed_to_operator_home(self) -> None:
-        self.assertEqual(tasks.TASK_OUTPUT_ROOT, tasks.operator.HOME)
+    def test_task_output_root_is_managed_state_with_explicit_legacy_home(self) -> None:
+        self.assertEqual(
+            tasks.TASK_OUTPUT_ROOT,
+            tasks.operator.STATE_DIR / "task-output",
+        )
+        self.assertNotEqual(tasks.TASK_OUTPUT_ROOT, tasks.operator.HOME)
+        self.assertEqual(tasks.TASK_OUTPUT_LEGACY_ROOT, tasks.operator.HOME)
+        self.assertEqual(tasks.TASK_OUTPUT_CONTRACT_VERSION, 2)
+        self.assertEqual(tasks.TASK_OUTPUT_LEGACY_CONTRACT_VERSION, 1)
 
     def test_reconcile_service_example_uses_refresh_not_resume(self) -> None:
         source = (
