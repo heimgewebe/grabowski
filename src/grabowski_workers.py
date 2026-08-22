@@ -2594,29 +2594,51 @@ function semanticDomAttribute(node, name) {
   return '';
 }
 
+function semanticDomTextSubtreeBlocked(node) {
+  const localName = typeof node.localName === 'string'
+    ? node.localName.toLowerCase() : '';
+  const nodeName = typeof node.nodeName === 'string'
+    ? node.nodeName.toLowerCase() : '';
+  const inertNames = new Set(['script', 'style', 'noscript', 'template']);
+  const valueBearingTags = new Set([
+    'input', 'textarea', 'select', 'option', 'optgroup', 'output', 'meter', 'progress'
+  ]);
+  const valueBearingRoles = new Set([
+    'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'slider', 'spinbutton',
+    'scrollbar', 'progressbar'
+  ]);
+  if (inertNames.has(localName) || inertNames.has(nodeName)) return true;
+  if (valueBearingTags.has(localName) || valueBearingTags.has(nodeName)) return true;
+  if (valueBearingRoles.has(semanticDomAttribute(node, 'role').toLowerCase())) return true;
+  const attributes = Array.isArray(node && node.attributes) ? node.attributes : [];
+  for (let index = 0; index + 1 < attributes.length; index += 2) {
+    if (String(attributes[index] || '').toLowerCase() !== 'contenteditable') continue;
+    const value = String(attributes[index + 1] || '').trim().toLowerCase();
+    return value !== 'false';
+  }
+  return false;
+}
+
 function boundedSemanticDomText(node) {
-  const blockedNames = new Set(['script', 'style', 'noscript', 'template']);
   const pieces = [];
   let visited = 0;
-  const walk = (current) => {
+  const walk = (current, root = false) => {
     if (!current || visited >= 256) return;
     visited += 1;
-    const localName = typeof current.localName === 'string'
-      ? current.localName.toLowerCase() : '';
     const nodeName = typeof current.nodeName === 'string'
       ? current.nodeName.toLowerCase() : '';
-    if (blockedNames.has(localName) || blockedNames.has(nodeName)) return;
+    if (!root && semanticDomTextSubtreeBlocked(current)) return;
     if (current.nodeType === 3 || nodeName === '#text') {
       const value = boundedText(current.nodeValue, 160);
       if (value) pieces.push(value);
       return;
     }
     for (const child of Array.isArray(current.children) ? current.children : []) {
-      walk(child);
+      walk(child, false);
       if (boundedText(pieces.join(' '), 160).length >= 160) break;
     }
   };
-  walk(node);
+  walk(node, true);
   return boundedText(pieces.join(' '), 160);
 }
 
