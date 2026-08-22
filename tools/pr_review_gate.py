@@ -3516,7 +3516,12 @@ def main(argv: list[str] | None = None) -> int:
             "warnings": [],
         }
     if args.json:
-        print(json.dumps(_sanitize_result_for_output(result), indent=2, sort_keys=True))
+        # --json is a machine-readable stdout protocol, not a diagnostic log.
+        # Keep it distinct from the human-readable print/log sinks below.
+        sys.stdout.write(
+            json.dumps(_sanitize_result_for_output(result), indent=2, sort_keys=True)
+            + "\n"
+        )
     else:
         print(result["verdict"])
         for item in result.get("failures", []):
