@@ -346,8 +346,9 @@ def _run_text(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> st
         timeout = int(exc.timeout or 90)
         raise RuntimeError(f"command timed out after {timeout}s: {_command_label(argv)}") from exc
     if completed.returncode != 0 and not allow_nonzero:
-        detail = _brief_error(completed.stderr)
-        raise RuntimeError(detail or f"command failed: {_command_label(argv)}")
+        # stderr is an external payload and may contain sensitive material.
+        # Keep the failure useful without copying that payload forward.
+        raise RuntimeError(f"command failed: {_command_label(argv)}")
     return completed.stdout
 
 
@@ -370,9 +371,8 @@ def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> b
         timeout = int(exc.timeout or 90)
         raise RuntimeError(f"command timed out after {timeout}s: {_command_label(argv)}") from exc
     if completed.returncode != 0 and not allow_nonzero:
-        stderr = completed.stderr.decode("utf-8", errors="replace")
-        detail = _brief_error(stderr)
-        raise RuntimeError(detail or f"command failed: {_command_label(argv)}")
+        # Binary-command stderr is likewise external diagnostic material.
+        raise RuntimeError(f"command failed: {_command_label(argv)}")
     return completed.stdout
 
 
@@ -518,8 +518,23 @@ def _trusted_review_items(items: list[dict[str, Any]], trusted_actors: set[str])
     return [item for item in items if bool(_actor_logins(item) & trusted_actors)]
 
 
+def _canonical_blocking_review_state(item: dict[str, Any]) -> str:
+    state = _review_state(item)
+    if state == "CHANGES_REQUESTED":
+        return "CHANGES_REQUESTED"
+    if state == "DISMISSED":
+        return "DISMISSED"
+    if state == "PENDING":
+        return "PENDING"
+    return ""
+
+
 def _blocking_review_states(items: list[dict[str, Any]], trusted_actors: set[str]) -> list[str]:
-    states = {state for item in _trusted_review_items(items, trusted_actors) if (state := _review_state(item)) in BLOCKING_REVIEW_STATES}
+    states = {
+        state
+        for item in _trusted_review_items(items, trusted_actors)
+        if (state := _canonical_blocking_review_state(item))
+    }
     return sorted(states)
 
 
@@ -3482,8 +3497,18 @@ def main(argv: list[str] | None = None) -> int:
             result["self_review_audit"] = write_self_review_audit(
                 audit_path, state, result, self_review
             )
-    except Exception as exc:
+    except GateInputError as exc:
+        # GateInputError messages are authored by this module and form part of
+        # the CLI's actionable validation contract.
         result = {"schema_version": 1, "verdict": "BLOCK", "failures": [str(exc)], "warnings": []}
+    except Exception:
+        # Unknown exceptions can embed arbitrary external payloads.
+        result = {
+            "schema_version": 1,
+            "verdict": "BLOCK",
+            "failures": ["review gate evaluation failed"],
+            "warnings": [],
+        }
     if args.json:
         print(json.dumps(_sanitize_result_for_output(result), indent=2, sort_keys=True))
     else:

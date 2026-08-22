@@ -44,5 +44,54 @@ class PrReviewGateRedactionTests(unittest.TestCase):
         self.assertNotIn(github_token, output)
         self.assertEqual(result["failures"], [f"password={password}"])
         self.assertEqual(result["warnings"], [f"Authorization: Bearer {github_token}"])
+
+class PrReviewGateSourceHardeningTests(unittest.TestCase):
+    def test_text_command_failure_does_not_forward_stderr(self) -> None:
+        sensitive_value = "SENTINEL_PAYLOAD_123"
+        completed = mock.Mock(returncode=1, stdout="", stderr=sensitive_value)
+        with (
+            mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(pr_review_gate.subprocess, "run", return_value=completed),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"^command failed: gh pr view 880$"
+            ) as raised:
+                pr_review_gate._run_text(ROOT, ["gh", "pr", "view", "880"])
+        self.assertNotIn(sensitive_value, str(raised.exception))
+
+    def test_binary_command_failure_does_not_forward_stderr(self) -> None:
+        sensitive_value = b"SENTINEL_PAYLOAD_456"
+        completed = mock.Mock(returncode=1, stdout=b"", stderr=sensitive_value)
+        with (
+            mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(pr_review_gate.subprocess, "run", return_value=completed),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"^command failed: gh pr diff 880$"
+            ) as raised:
+                pr_review_gate._run_bytes(ROOT, ["gh", "pr", "diff", "880"])
+        self.assertNotIn(sensitive_value.decode(), str(raised.exception))
+
+    def test_unexpected_exception_is_not_serialized(self) -> None:
+        sensitive_value = "SENTINEL_PAYLOAD_789"
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(pr_review_gate, "load_self_review", return_value=None),
+            mock.patch.object(pr_review_gate, "load_claude_evidence", return_value=None),
+            mock.patch.object(
+                pr_review_gate, "load_external_review_evidence", return_value=None
+            ),
+            mock.patch.object(pr_review_gate, "load_policy_waiver", return_value=None),
+            mock.patch.object(
+                pr_review_gate, "load_pr_state", side_effect=RuntimeError(sensitive_value)
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            rc = pr_review_gate.main(["--pr", "880", "--json"])
+        self.assertEqual(rc, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["failures"], ["review gate evaluation failed"])
+        self.assertNotIn(sensitive_value, stdout.getvalue())
+
 if __name__ == "__main__":
     unittest.main()
