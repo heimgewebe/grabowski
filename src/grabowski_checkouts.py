@@ -1799,7 +1799,10 @@ def _resource_related(resource_key: str, paths: list[Path]) -> bool:
     return any(_paths_related(resource_path, path) for path in paths)
 
 
-def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
+def _task_records(
+    paths: list[Path], *, resource_paths: list[Path] | None = None
+) -> list[dict[str, Any]]:
+    """Match task CWDs narrowly while retaining explicit resource-scope overlap."""
     try:
         connection = _readonly_connection(tasks.TASK_DB)
     except sqlite3.Error as exc:
@@ -1819,6 +1822,7 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
         raise RuntimeError("Task inventory projection is unavailable") from exc
     finally:
         connection.close()
+    effective_resource_paths = paths if resource_paths is None else resource_paths
     results: list[dict[str, Any]] = []
     for row in rows:
         related = False
@@ -1834,7 +1838,8 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
             if isinstance(raw_keys, list):
                 resource_keys = [str(item) for item in raw_keys if isinstance(item, str)]
                 related = related or any(
-                    _resource_related(key, paths) for key in resource_keys
+                    _resource_related(key, effective_resource_paths)
+                    for key in resource_keys
                 )
         except json.JSONDecodeError:
             resource_keys = []
@@ -1984,7 +1989,14 @@ def _linked_checkout_coordination(
                 continue
             lease = {**lease, "blocking": True}
             resource_blockers.append(lease)
-    task_blockers = _task_records([checkout_path, repo_path]) if include_tasks else []
+    task_blockers = (
+        _task_records(
+            [checkout_path],
+            resource_paths=[checkout_path, repo_common_dir],
+        )
+        if include_tasks
+        else []
+    )
     process_blockers = _processes_under([checkout_path]) if include_processes else []
     return _coordination_result(resource_blockers, task_blockers, process_blockers)
 

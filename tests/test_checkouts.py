@@ -153,6 +153,44 @@ class CheckoutLifecycleTests(unittest.TestCase):
             archive["retention_until_unix"] = created_at
         return result
 
+    def _insert_running_task(
+        self, *, marker: str, cwd: Path, resource_keys: list[str]
+    ) -> None:
+        with checkouts.tasks._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, host, unit, attempt, state, resume_policy,
+                    argv_json, argv_sha256, cwd, runtime_seconds,
+                    cpu_weight, io_weight, memory_max_bytes,
+                    created_at_unix, updated_at_unix, launcher_json,
+                    last_observation_json, resource_keys_json, lease_owner_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    marker * 24,
+                    "local",
+                    "grabowski-task-" + marker * 24 + "-a1.service",
+                    1,
+                    "running",
+                    "manual",
+                    '["/bin/true"]',
+                    "f" * 64,
+                    str(cwd),
+                    60,
+                    100,
+                    100,
+                    None,
+                    int(time.time()),
+                    int(time.time()),
+                    "{}",
+                    None,
+                    json.dumps(resource_keys),
+                    "task:" + marker * 24,
+                ),
+            )
+            connection.commit()
+
     def _common_dir(self) -> Path:
         raw = Path(self._git("rev-parse", "--git-common-dir").stdout.strip())
         return (self.repo / raw).resolve() if not raw.is_absolute() else raw.resolve()
@@ -756,41 +794,40 @@ class CheckoutLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "resources=1"):
             self._archive()
 
+    def test_archive_ignores_repo_cwd_task_without_related_resources(self) -> None:
+        self._insert_running_task(marker="g", cwd=self.repo, resource_keys=[])
+
+        archived = self._archive()
+        self.assertEqual(
+            archived["audit"]["coordination_checked"]["tasks"],
+            0,
+        )
+
+    def test_archive_preserves_checkout_cwd_task_blocker(self) -> None:
+        self._insert_running_task(marker="h", cwd=self.checkout, resource_keys=[])
+
+        with self.assertRaisesRegex(RuntimeError, "tasks=1"):
+            self._archive()
+
+    def test_archive_ignores_disjoint_source_path_task_resource(self) -> None:
+        self._insert_running_task(
+            marker="i",
+            cwd=self.repo,
+            resource_keys=[f"path:{self.repo / 'src' / 'unrelated.py'}"],
+        )
+
+        archived = self._archive()
+        self.assertEqual(
+            archived["audit"]["coordination_checked"]["tasks"],
+            0,
+        )
+
     def test_archive_preserves_repo_scoped_task_blocker(self) -> None:
-        with checkouts.tasks._database() as connection:
-            connection.execute(
-                """
-                INSERT INTO tasks(
-                    task_id, host, unit, attempt, state, resume_policy,
-                    argv_json, argv_sha256, cwd, runtime_seconds,
-                    cpu_weight, io_weight, memory_max_bytes,
-                    created_at_unix, updated_at_unix, launcher_json,
-                    last_observation_json, resource_keys_json, lease_owner_id
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "e" * 24,
-                    "local",
-                    "grabowski-task-" + "e" * 24 + "-a1.service",
-                    1,
-                    "running",
-                    "manual",
-                    '["/bin/true"]',
-                    "f" * 64,
-                    str(self.repo),
-                    60,
-                    100,
-                    100,
-                    None,
-                    int(time.time()),
-                    int(time.time()),
-                    "{}",
-                    None,
-                    json.dumps([f"repo:{self.repo}"]),
-                    "task:" + "e" * 24,
-                ),
-            )
-            connection.commit()
+        self._insert_running_task(
+            marker="e",
+            cwd=self.repo,
+            resource_keys=[f"repo:{self.repo}"],
+        )
 
         with self.assertRaisesRegex(RuntimeError, "tasks=1"):
             self._archive()
