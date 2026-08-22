@@ -2873,13 +2873,41 @@ function semanticSnapshotTargetAncestorsLayoutVisible(
   return {ok: false, visible: false};
 }
 
+async function readSemanticDesignMode() {
+  try {
+    const response = await call('Runtime.evaluate', {
+      expression: 'document.designMode',
+      returnByValue: true,
+      awaitPromise: false,
+    });
+    if (response.exceptionDetails || !response.result ||
+        typeof response.result.value !== 'string') {
+      return {ok: false, value: ''};
+    }
+    const value = response.result.value.trim().toLowerCase();
+    if (!['on', 'off'].includes(value)) return {ok: false, value: ''};
+    return {ok: true, value};
+  } catch {
+    return {ok: false, value: ''};
+  }
+}
+
 async function captureSemanticVisibleSnapshot() {
   try {
+    const designModeBefore = await readSemanticDesignMode();
+    if (!designModeBefore.ok || designModeBefore.value !== 'off') {
+      return {ok: false, snapshot: null};
+    }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
       computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
+    const designModeAfter = await readSemanticDesignMode();
+    if (!designModeAfter.ok || designModeAfter.value !== 'off' ||
+        designModeAfter.value !== designModeBefore.value) {
+      return {ok: false, snapshot: null};
+    }
     return {ok: true, snapshot};
   } catch {
     return {ok: false, snapshot: null};
