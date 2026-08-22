@@ -41,7 +41,12 @@ class SagaContractTests(unittest.TestCase):
         }
 
     def grip_result(
-        self, name: str, status: str, output: dict[str, object]
+        self,
+        name: str,
+        status: str,
+        output: dict[str, object],
+        *,
+        phase: str | None = None,
     ) -> dict[str, object]:
         receipt: dict[str, object] = {
             "kind": "grabowski.operator_grip_receipt",
@@ -50,6 +55,8 @@ class SagaContractTests(unittest.TestCase):
             "status": status,
             "output_sha256": sagas.sha256_json(output),
         }
+        if phase is not None:
+            receipt["phase"] = phase
         receipt["receipt_sha256"] = sagas.sha256_json(receipt)
         return {
             "status": status,
@@ -245,6 +252,27 @@ class SagaContractTests(unittest.TestCase):
         self.assertFalse(blocked["captain_ready"])
         self.assertIsNone(blocked["captain_handoff"])
         self.assertEqual("blocked", blocked["receipt_status"])
+
+    def test_run_receipt_preserves_mechanic_preflight_block_without_child_actions(self) -> None:
+        plan = sagas.build_plan("pr-settlement", self.pr_target(), "t121-pr-pilot")
+        mechanic = self.grip_result(
+            "mechanic-loop",
+            "blocked",
+            {"error": "planned child is not dispatchable"},
+            phase="preflight",
+        )
+
+        blocked = sagas.build_run_receipt(plan, mechanic)
+
+        self.assertEqual("prepare_blocked", blocked["state"])
+        self.assertFalse(blocked["captain_ready"])
+        self.assertEqual([], blocked["child_receipt_sha256s"])
+        self.assertIsNone(blocked["captain_handoff"])
+        self.assertEqual("blocked", blocked["receipt_status"])
+
+        action_block = self.grip_result("mechanic-loop", "blocked", {}, phase="action")
+        with self.assertRaisesRegex(sagas.SagaError, "actions are missing"):
+            sagas.build_run_receipt(plan, action_block)
 
     def test_run_receipt_digest_and_plan_binding_are_fail_closed(self) -> None:
         plan = sagas.build_plan("pr-settlement", self.pr_target(), "t121-pr-pilot")

@@ -14495,6 +14495,70 @@ class BureauPickupGripTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("passed", result["output"]["receipt_status"])
 
+    def test_status_grip_is_mechanic_normal_with_bound_run_id(self) -> None:
+        expected = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup_status",
+            "run_id": self.RUN_ID,
+            "coordination": {"status": "coordinated", "lease": {"status": "active-bound"}},
+            "journal_available": True,
+        }
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_status.return_value = expected
+        action = {
+            "action": "bureau-pickup-status",
+            "parameters": {"run_id": self.RUN_ID},
+            "target": {"bureau_run_id": self.RUN_ID},
+            "scope": {
+                "allowed_effects": ["read"],
+                "forbidden_effects": ["pr-merge", "runtime-deploy"],
+            },
+            "receipt_path": "receipts/sagas/bureau-pickup-status.json",
+        }
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.run_grip(
+                "mechanic-loop",
+                {"actions": [action]},
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        pickup.grabowski_bureau_pickup_status.assert_called_once_with(self.RUN_ID)
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["complete"])
+        self.assertEqual(
+            "bureau-pickup-status", result["output"]["actions"][0]["grip"]
+        )
+
+    def test_mechanic_status_grip_rejects_run_id_target_drift(self) -> None:
+        pickup = self.pickup()
+        action = {
+            "action": "bureau-pickup-status",
+            "parameters": {"run_id": self.RUN_ID},
+            "target": {"bureau_run_id": "BUR-RUN-20260725T081705Z-ffffffffffff"},
+            "scope": {
+                "allowed_effects": ["read"],
+                "forbidden_effects": ["pr-merge", "runtime-deploy"],
+            },
+            "receipt_path": "receipts/sagas/bureau-pickup-status.json",
+        }
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.run_grip(
+                "mechanic-loop",
+                {"actions": [action]},
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        pickup.grabowski_bureau_pickup_status.assert_not_called()
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn(
+            "target.bureau_run_id must match parameters.run_id",
+            result["output"]["error"],
+        )
+
     def test_execute_requires_mutation_permission_before_dispatch(self) -> None:
         pickup = self.pickup()
         with patch.object(grips, "_bureau_pickup_module", return_value=pickup):

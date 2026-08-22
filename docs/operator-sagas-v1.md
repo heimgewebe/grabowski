@@ -1,6 +1,6 @@
 # Operator Sagas v1
 
-Status: T121 implementation candidate (not runtime truth until merged and deployed)
+Status: implementation merged and saga grips present in the current runtime; live-pilot and Bureau acceptance remain pending.
 
 ## Decision
 
@@ -138,13 +138,13 @@ No state called `outcome_unknown` is hidden inside success. An invoked-but-unver
 
 ## Pilots and measurement
 
-Focused unit and grip integration tests are required before publication. The two live end-to-end pilots are intentionally deferred until this exact implementation has a current-head PR:
+Focused unit and grip integration tests are required before publication. Bureau acceptance additionally requires two live end-to-end pilots after the implementation has landed:
 
-1. use the PR-settlement saga to prepare that PR, execute the existing Captain merge under its normal gates, read GitHub back, verify the Captain intent/completion pair from the audit chain, and settle the exact merge;
+1. use the PR-settlement saga to prepare a necessary T121 closeout PR, execute the existing Captain merge under its normal gates, read GitHub back, verify the Captain intent/completion pair from the audit chain, and settle the exact merge;
 2. use the runtime-deployment saga for the resulting merge commit, execute the existing Captain deploy under its normal gates, read `grabowski_deployment_identity` until exact convergence, verify the Captain audit pair, and settle the deployment.
 
-This ordering avoids manufacturing a high-impact pilot effect solely for testing. Live pilot receipts, before/after call counts, operator decisions, blocks, partial failures and elapsed times belong to the T121 closeout evidence and must be revision-bound to the final implementation head.
+This ordering avoids replaying historical high-impact effects solely for testing. Live pilot receipts, before/after call counts, operator decisions, blocks, partial failures and elapsed times belong to the T121 closeout evidence and must be revision-bound to the final implementation head.
 
 ## Non-claims
 
-This document does not establish that the candidate is merged, deployed, live-tested or accepted by Bureau. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
+This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
