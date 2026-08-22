@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import stat
+from types import SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -84,6 +86,147 @@ class OperatorObligationTests(unittest.TestCase):
             },
         ]
 
+    @staticmethod
+    def _process_only() -> dict[str, object]:
+        return {"convergence_required": False, "reason": "process_only"}
+
+    @staticmethod
+    def _system_convergence_plan(
+        *,
+        gate: str = "hard",
+        change_risk: str = "R2",
+        target_criticality: str = "essential",
+        protocol_head: str = "a" * 40,
+    ) -> dict[str, object]:
+        material: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski.system_convergence_plan",
+            "status": "planned",
+            "change_risk": change_risk,
+            "target_criticality": target_criticality,
+            "protocol_head": protocol_head,
+            "profile_id": "profile-test",
+            "profile_cell_id": "cell-test",
+            "profile_sha256": "e" * 64,
+            "protocol_source": "immutable_bundle",
+            "bundle_identity_sha256": "f" * 64,
+            "wheel_sha256": "0" * 64,
+            "required_effects": [],
+            "required_verifications": [],
+            "required_closure_fields": [],
+            "requires_resilience_evidence": gate == "hard",
+            "requires_independent_recovery": gate == "hard",
+            "systemic_closure_gate": gate,
+            "hard_gate_required": True if gate == "hard" else False,
+            "criticality_resolution_required": gate == "classification_required",
+            "admission_blocking": False,
+            "next_action": "test convergence plan",
+            "does_not_establish": ["systemic convergence"],
+        }
+        return {**material, "plan_sha256": obligation._sha256(material)}
+
+    def _convergence_receipt(
+        self,
+        obligation_id: str,
+        *,
+        target_obligation_id: str | None = None,
+        assessment_status: str = "terminally_closed",
+        assessment_schema_version: int = 2,
+    ) -> dict[str, object]:
+        target_id = target_obligation_id or obligation_id
+        assessment_id = f"assessment-{obligation_id}"
+        request = {
+            "assessment_id": assessment_id,
+            "closure": {
+                "schema_version": 1,
+                "closure_id": f"operator-obligation:{target_id}",
+                "status": "closed",
+                "residual_risks": [],
+            },
+        }
+        raw = json.dumps(
+            request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        request_path = (Path(self.temporary.name) / f"{obligation_id}-convergence.json").resolve()
+        request_path.write_bytes(raw)
+        request_sha256 = hashlib.sha256(raw).hexdigest()
+        protocol_head = "a" * 40
+        allowed = assessment_status == "terminally_closed"
+        output = {
+            "schema_version": 1,
+            "kind": "grabowski.convergence_assessment",
+            "request_path": str(request_path),
+            "request_sha256": request_sha256,
+            "protocol_repo": None,
+            "protocol_head": protocol_head,
+            "protocol_source": "immutable_bundle",
+            "bundle_manifest_path": "/tmp/bundle.json",
+            "bundle_identity_sha256": "b" * 64,
+            "contracts_sha256": "c" * 64,
+            "executable_sha256": "d" * 64,
+            "assessment": {
+                "schema_version": assessment_schema_version,
+                "assessment_id": assessment_id,
+                "status": assessment_status,
+                "change_risk": "R2",
+                "target_criticality": "essential",
+                "profile_id": "profile-test",
+                "profile_cell_id": "cell-test",
+                "profile_sha256": "e" * 64,
+            },
+            "closure_allowed": allowed,
+            "decision": "allow_closure" if allowed else "block_closure",
+            "does_not_establish": [],
+            "receipt_status": "passed" if allowed else "blocked",
+        }
+        parameters = {
+            "request_path": str(request_path),
+            "expected_request_sha256": request_sha256,
+            "expected_protocol_head": protocol_head,
+        }
+        check_status = "pass" if allowed else "fail"
+        receipt = {
+            "kind": "grabowski.operator_grip_receipt",
+            "schema_version": 1,
+            "grip": {"name": "convergence-assess", "version": "1.0", "effect": "read_only"},
+            "status": "passed" if allowed else "blocked",
+            "phase": "action",
+            "started_at": "2026-08-22T05:00:00Z",
+            "ended_at": "2026-08-22T05:00:01Z",
+            "parameters_sha256": obligation._sha256(parameters),
+            "acceptance_ids": [
+                "protocol-identity-bound",
+                "request-hash-bound",
+                "deterministic-assessment",
+                "terminal-closure-gate",
+            ],
+            "checks": [
+                {"id": "protocol-identity-bound", "status": "pass", "detail": protocol_head},
+                {"id": "request-hash-bound", "status": "pass", "detail": request_sha256},
+                {"id": "deterministic-assessment", "status": "pass", "detail": assessment_id},
+                {"id": "terminal-closure-gate", "status": check_status, "detail": assessment_status},
+            ],
+            "output_sha256": obligation._sha256(output),
+        }
+        receipt["receipt_sha256"] = obligation._sha256(receipt)
+        return {
+            "status": receipt["status"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "receipt": receipt,
+            "output": output,
+        }
+
+    @staticmethod
+    def _rehash_grip_result(result: dict[str, object]) -> None:
+        receipt = result["receipt"]
+        output = result["output"]
+        assert isinstance(receipt, dict)
+        assert isinstance(output, dict)
+        receipt["output_sha256"] = obligation._sha256(output)
+        receipt.pop("receipt_sha256", None)
+        receipt["receipt_sha256"] = obligation._sha256(receipt)
+        result["receipt_sha256"] = receipt["receipt_sha256"]
+
     def test_open_is_private_idempotent_and_requires_continuation(self) -> None:
         first = obligation.open_obligation(self._open_parameters())
         second = obligation.open_obligation(self._open_parameters())
@@ -105,6 +248,33 @@ class OperatorObligationTests(unittest.TestCase):
         directory = self.root / "goo-example-work-0001"
         self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE((directory / "open.json").stat().st_mode), 0o600)
+
+    def test_projection_rejects_gate_outcome_drift_from_classification(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan(gate="hard")
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            status = obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": False,
+                        "reason": "process_only",
+                        "system_convergence_plan": plan,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+        status["convergence_gate_outcome"] = "explicit_non_systemic"
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationIntegrityError,
+            "disagrees with classification",
+        ):
+            obligation._status_projection_requires_attention(status)
 
     def test_list_finds_open_work_by_origin_without_claiming_completion(self) -> None:
         obligation.open_obligation(self._open_parameters())
@@ -163,6 +333,7 @@ class OperatorObligationTests(unittest.TestCase):
             {
                 "obligation_id": "goo-completed-work-0004",
                 "outcome": "completed",
+                    "closure_classification": self._process_only(),
                 "evidence": self._passed_evidence(),
             }
         )
@@ -231,6 +402,618 @@ class OperatorObligationTests(unittest.TestCase):
         with self.assertRaises(obligation.OperatorObligationConflictError):
             obligation.open_obligation(changed)
 
+    def test_completed_close_requires_explicit_classification(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationCompletionClassificationError,
+            "requires closure_classification",
+        ):
+            obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "evidence": self._passed_evidence(),
+                }
+            )
+        self.assertEqual("open", obligation.status_obligation("goo-example-work-0001")["state"])
+
+    def test_process_only_completion_is_explicitly_non_systemic(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        result = obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "completed",
+                "closure_classification": self._process_only(),
+                "evidence": self._passed_evidence(),
+            }
+        )
+        self.assertEqual(obligation.CLOSE_SCHEMA_VERSION, result["close_schema_version"])
+        self.assertEqual("process_only", result["completion_scope"])
+        self.assertFalse(result["systemic_convergence_claim"])
+        self.assertIn("does not establish systemic convergence", result["non_claims"][0])
+
+    def test_systemic_completion_requires_exact_terminal_convergence_receipt(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        convergence_receipt = self._convergence_receipt("goo-example-work-0001")
+        result = obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "completed",
+                "closure_classification": {
+                    "convergence_required": True,
+                    "reason": "systemic",
+                    "convergence_receipt": convergence_receipt,
+                },
+                "evidence": self._passed_evidence(),
+            }
+        )
+        self.assertEqual("systemic", result["completion_scope"])
+        self.assertTrue(result["systemic_convergence_claim"])
+        self.assertEqual(
+            convergence_receipt["receipt_sha256"],
+            result["completion_classification"]["convergence_receipt_sha256"],
+        )
+        self.assertEqual([], result["non_claims"])
+
+    def test_process_only_hard_plan_is_explicit_non_systemic_bypass(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan(gate="hard")
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            result = obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": False,
+                        "reason": "process_only",
+                        "system_convergence_plan": plan,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+
+        self.assertEqual("process_only", result["completion_scope"])
+        self.assertFalse(result["systemic_convergence_claim"])
+        self.assertEqual(
+            "explicit_non_systemic_bypass", result["convergence_gate_outcome"]
+        )
+        self.assertEqual(
+            plan["plan_sha256"],
+            result["completion_classification"]["system_convergence_plan"][
+                "plan_sha256"
+            ],
+        )
+        self.assertIn(
+            "explicitly bypassed a bound systemic convergence gate",
+            " ".join(result["non_claims"]),
+        )
+
+    def test_systemic_plan_must_match_assessment_profile_cell(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan()
+        receipt = self._convergence_receipt("goo-example-work-0001")
+        receipt["output"]["assessment"]["change_risk"] = "R1"
+        self._rehash_grip_result(receipt)
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            with self.assertRaisesRegex(
+                obligation.OperatorObligationCompletionClassificationError,
+                "change_risk",
+            ):
+                obligation.close_obligation(
+                    {
+                        "obligation_id": "goo-example-work-0001",
+                        "outcome": "completed",
+                        "closure_classification": {
+                            "convergence_required": True,
+                            "reason": "systemic",
+                            "convergence_receipt": receipt,
+                            "system_convergence_plan": plan,
+                        },
+                        "evidence": self._passed_evidence(),
+                    }
+                )
+
+    def test_passed_convergence_receipt_rejects_auxiliary_failed_check(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        receipt = self._convergence_receipt("goo-example-work-0001")
+        receipt["receipt"]["checks"].append(
+            {"id": "resilience-evidence", "status": "fail", "detail": "missing"}
+        )
+        receipt["receipt"].pop("receipt_sha256")
+        receipt["receipt"]["receipt_sha256"] = obligation._sha256(receipt["receipt"])
+        receipt["receipt_sha256"] = receipt["receipt"]["receipt_sha256"]
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationCompletionClassificationError,
+            "explicitly failing check",
+        ):
+            obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": True,
+                        "reason": "systemic",
+                        "convergence_receipt": receipt,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+
+    def test_system_convergence_plan_rejects_integer_hard_gate_flag(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan()
+        plan["hard_gate_required"] = 1
+        material = {key: value for key, value in plan.items() if key != "plan_sha256"}
+        plan["plan_sha256"] = obligation._sha256(material)
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            with self.assertRaisesRegex(
+                obligation.OperatorObligationCompletionClassificationError,
+                "hard_gate_required",
+            ):
+                obligation.close_obligation(
+                    {
+                        "obligation_id": "goo-example-work-0001",
+                        "outcome": "completed",
+                        "closure_classification": {
+                            "convergence_required": False,
+                            "reason": "process_only",
+                            "system_convergence_plan": plan,
+                        },
+                        "evidence": self._passed_evidence(),
+                    }
+                )
+
+    def test_process_only_not_required_plan_is_not_applicable(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan(
+            gate="not_required", change_risk="R1", target_criticality="ordinary"
+        )
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            result = obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": False,
+                        "reason": "process_only",
+                        "system_convergence_plan": plan,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+
+        self.assertEqual("not_applicable", result["convergence_gate_outcome"])
+
+    def test_systemic_plan_and_receipt_must_share_protocol_head(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan(protocol_head="b" * 40)
+        receipt = self._convergence_receipt("goo-example-work-0001")
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            with self.assertRaises(
+                obligation.OperatorObligationCompletionClassificationError
+            ):
+                obligation.close_obligation(
+                    {
+                        "obligation_id": "goo-example-work-0001",
+                        "outcome": "completed",
+                        "closure_classification": {
+                            "convergence_required": True,
+                            "reason": "systemic",
+                            "convergence_receipt": receipt,
+                            "system_convergence_plan": plan,
+                        },
+                        "evidence": self._passed_evidence(),
+                    }
+                )
+
+    def test_process_only_plan_replay_does_not_rebuild_canonical_policy(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan(gate="assessment_required")
+        parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "outcome": "completed",
+            "closure_classification": {
+                "convergence_required": False,
+                "reason": "process_only",
+                "system_convergence_plan": plan,
+            },
+            "evidence": self._passed_evidence(),
+        }
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            first = obligation.close_obligation(parameters)
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            side_effect=AssertionError("replay must not rebuild convergence policy"),
+        ):
+            replay = obligation.close_obligation(parameters)
+
+        self.assertTrue(first["created"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(
+            "explicit_non_systemic_bypass", replay["convergence_gate_outcome"]
+        )
+
+    def test_systemic_plan_and_receipt_replay_without_volatile_sources(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan()
+        receipt = self._convergence_receipt("goo-example-work-0001")
+        parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "outcome": "completed",
+            "closure_classification": {
+                "convergence_required": True,
+                "reason": "systemic",
+                "convergence_receipt": receipt,
+                "system_convergence_plan": plan,
+            },
+            "evidence": self._passed_evidence(),
+        }
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            first = obligation.close_obligation(parameters)
+        Path(receipt["output"]["request_path"]).unlink()
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            side_effect=AssertionError("exact replay must not rebuild convergence policy"),
+        ):
+            replay = obligation.close_obligation(parameters)
+        self.assertTrue(first["created"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual("pass", replay["convergence_gate_outcome"])
+        self.assertEqual(
+            plan["profile_cell_id"],
+            replay["completion_classification"]["system_convergence_plan"][
+                "profile_cell_id"
+            ],
+        )
+
+    def test_systemic_completion_replays_after_request_file_is_removed(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        convergence_receipt = self._convergence_receipt("goo-example-work-0001")
+        parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "outcome": "completed",
+            "closure_classification": {
+                "convergence_required": True,
+                "reason": "systemic",
+                "convergence_receipt": convergence_receipt,
+            },
+            "evidence": self._passed_evidence(),
+        }
+        first = obligation.close_obligation(parameters)
+        Path(convergence_receipt["output"]["request_path"]).unlink()
+
+        replay = obligation.close_obligation(parameters)
+
+        self.assertTrue(first["created"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(first["close_file_sha256"], replay["close_file_sha256"])
+        self.assertEqual("systemic", replay["completion_scope"])
+        self.assertTrue(replay["systemic_convergence_claim"])
+
+    def test_systemic_replay_shortcut_requires_exact_bound_receipt(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        original_receipt = self._convergence_receipt("goo-example-work-0001")
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "completed",
+                "closure_classification": {
+                    "convergence_required": True,
+                    "reason": "systemic",
+                    "convergence_receipt": original_receipt,
+                },
+                "evidence": self._passed_evidence(),
+            }
+        )
+
+        different_receipt = self._convergence_receipt("goo-example-work-0001")
+        different_receipt["output"]["assessment"]["assessment_id"] = "assessment-different"
+        self._rehash_grip_result(different_receipt)
+        Path(different_receipt["output"]["request_path"]).unlink()
+
+        with self.assertRaises(
+            obligation.OperatorObligationCompletionClassificationError
+        ):
+            obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": True,
+                        "reason": "systemic",
+                        "convergence_receipt": different_receipt,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+
+    def test_legacy_v1_convergence_assessment_blocks_systemic_completion(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        convergence_receipt = self._convergence_receipt(
+            "goo-example-work-0001", assessment_schema_version=1
+        )
+        with self.assertRaises(obligation.OperatorObligationCompletionClassificationError):
+            obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": True,
+                        "reason": "systemic",
+                        "convergence_receipt": convergence_receipt,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+
+    def test_nonterminal_convergence_assessment_blocks_systemic_completion(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        convergence_receipt = self._convergence_receipt(
+            "goo-example-work-0001", assessment_status="evidence_missing"
+        )
+        with self.assertRaises(obligation.OperatorObligationCompletionClassificationError):
+            obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": True,
+                        "reason": "systemic",
+                        "convergence_receipt": convergence_receipt,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+
+    def test_systemic_completion_blocks_request_target_protocol_and_receipt_drift(self) -> None:
+        for label in ("request", "target", "protocol", "receipt"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as isolated:
+                if label == "target":
+                    convergence_receipt = self._convergence_receipt(
+                        "goo-example-work-0001",
+                        target_obligation_id="goo-other-work-0002",
+                    )
+                else:
+                    convergence_receipt = self._convergence_receipt("goo-example-work-0001")
+
+                if label == "request":
+                    request_path = Path(convergence_receipt["output"]["request_path"])
+                    request_path.write_text("{}", encoding="utf-8")
+                elif label == "protocol":
+                    convergence_receipt["output"]["protocol_head"] = "f" * 40
+                    self._rehash_grip_result(convergence_receipt)
+                elif label == "receipt":
+                    convergence_receipt["output"]["decision"] = "block_closure"
+
+                with patch.dict(
+                    os.environ,
+                    {"GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(Path(isolated) / "obligations")},
+                ):
+                    obligation.open_obligation(self._open_parameters())
+                    with self.assertRaises(
+                        obligation.OperatorObligationCompletionClassificationError
+                    ):
+                        obligation.close_obligation(
+                            {
+                                "obligation_id": "goo-example-work-0001",
+                                "outcome": "completed",
+                                "closure_classification": {
+                                    "convergence_required": True,
+                                    "reason": "systemic",
+                                    "convergence_receipt": convergence_receipt,
+                                },
+                                "evidence": self._passed_evidence(),
+                            }
+                        )
+
+    def test_persisted_systemic_plan_assessment_drift_fails_closed_on_read(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        plan = self._system_convergence_plan()
+        receipt = self._convergence_receipt("goo-example-work-0001")
+        with patch.object(
+            obligation.grabowski_convergence,
+            "build_system_convergence_plan",
+            return_value=plan,
+        ):
+            obligation.close_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "outcome": "completed",
+                    "closure_classification": {
+                        "convergence_required": True,
+                        "reason": "systemic",
+                        "convergence_receipt": receipt,
+                        "system_convergence_plan": plan,
+                    },
+                    "evidence": self._passed_evidence(),
+                }
+            )
+        target = self.root / "goo-example-work-0001" / "close.json"
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        payload["completion_classification"]["system_convergence_plan"][
+            "change_risk"
+        ] = "R1"
+        material = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"closed_at", "material_sha256", "record_sha256"}
+        }
+        payload["material_sha256"] = obligation._sha256(material)
+        payload.pop("record_sha256")
+        payload["record_sha256"] = obligation._sha256(payload)
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        target.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationIntegrityError,
+            "close record semantics are invalid",
+        ):
+            obligation.status_obligation("goo-example-work-0001")
+
+    def test_persisted_systemic_classification_cannot_rebind_to_another_obligation(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        convergence_receipt = self._convergence_receipt("goo-example-work-0001")
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "completed",
+                "closure_classification": {
+                    "convergence_required": True,
+                    "reason": "systemic",
+                    "convergence_receipt": convergence_receipt,
+                },
+                "evidence": self._passed_evidence(),
+            }
+        )
+        target = self.root / "goo-example-work-0001" / "close.json"
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        payload["completion_classification"]["closure_id"] = (
+            "operator-obligation:goo-other-work-0002"
+        )
+        material = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"closed_at", "material_sha256", "record_sha256"}
+        }
+        payload["material_sha256"] = obligation._sha256(material)
+        payload.pop("record_sha256")
+        payload["record_sha256"] = obligation._sha256(payload)
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        target.chmod(0o600)
+
+        with self.assertRaises(obligation.OperatorObligationIntegrityError):
+            obligation.status_obligation("goo-example-work-0001")
+
+    def test_legacy_v1_completed_close_remains_readable_but_not_systemic(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "completed",
+                "closure_classification": self._process_only(),
+                "evidence": self._passed_evidence(),
+            }
+        )
+        target = self.root / "goo-example-work-0001" / "close.json"
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        payload["schema_version"] = obligation.LEGACY_CLOSE_SCHEMA_VERSION
+        payload.pop("completion_classification")
+        material = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"closed_at", "material_sha256", "record_sha256"}
+        }
+        payload["material_sha256"] = obligation._sha256(material)
+        payload.pop("record_sha256")
+        payload["record_sha256"] = obligation._sha256(payload)
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        target.chmod(0o600)
+
+        status = obligation.status_obligation("goo-example-work-0001")
+        self.assertEqual("legacy_unclassified", status["completion_scope"])
+        self.assertIsNone(status["systemic_convergence_claim"])
+        self.assertIn("does not establish systemic convergence", status["non_claims"][0])
+
+    def test_task_backed_exact_completed_replay_does_not_require_live_task_truth(self) -> None:
+        task_id = "task-replay-0001"
+        params = self._open_parameters()
+        params["references"] = [
+            {
+                "kind": "grabowski_task",
+                "id": task_id,
+                "observation_tool": "grabowski_task_status",
+            }
+        ]
+        obligation.open_obligation(params)
+        lifecycle_sha = "9" * 64
+        task_record = {
+            "task_id": task_id,
+            "attempt": 1,
+            "state": "completed",
+            "lifecycle_receipt_sha256": lifecycle_sha,
+        }
+        closeout = {
+            "terminal": True,
+            "lifecycle_evidence_valid": True,
+            "outcome_receipt_sha256": lifecycle_sha,
+            "task_binding": {"task_id": task_id, "attempt": 1},
+            "closeout_state": "ready_to_archive",
+        }
+        evidence = self._passed_evidence()
+        evidence[0] = {
+            "acceptance_id": "implementation",
+            "status": "passed",
+            "source": "receipt",
+            "reference": f"task:{task_id}",
+            "sha256": lifecycle_sha,
+        }
+        parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "outcome": "completed",
+            "closure_classification": self._process_only(),
+            "evidence": evidence,
+        }
+        task_rows: list[dict[str, object]] = []
+
+        def row_first(_task_id: str) -> dict[str, object]:
+            task_rows.append(task_record)
+            return task_record
+
+        tasks_module = SimpleNamespace(_row=row_first)
+        attention_module = SimpleNamespace(
+            terminal_closeout_plan=lambda _record: closeout
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "grabowski_tasks": tasks_module,
+                "grabowski_task_attention": attention_module,
+            },
+        ):
+            first = obligation.close_obligation(parameters)
+            task_rows.clear()
+
+            def unavailable(_task_id: str) -> dict[str, object]:
+                task_rows.append(task_record)
+                raise OSError("task store unavailable")
+
+            tasks_module._row = unavailable
+            replay = obligation.close_obligation(parameters)
+        self.assertTrue(first["created"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(first["close_file_sha256"], replay["close_file_sha256"])
+        self.assertEqual([], task_rows)
+
     def test_completed_close_requires_passed_evidence_for_every_acceptance(self) -> None:
         obligation.open_obligation(self._open_parameters())
         with self.assertRaises(obligation.OperatorObligationInputError):
@@ -238,6 +1021,7 @@ class OperatorObligationTests(unittest.TestCase):
                 {
                     "obligation_id": "goo-example-work-0001",
                     "outcome": "completed",
+                    "closure_classification": self._process_only(),
                     "evidence": self._passed_evidence()[:1],
                 }
             )
@@ -255,6 +1039,7 @@ class OperatorObligationTests(unittest.TestCase):
                 {
                     "obligation_id": "goo-example-work-0001",
                     "outcome": "completed",
+                    "closure_classification": self._process_only(),
                     "evidence": evidence,
                 }
             )
@@ -268,6 +1053,7 @@ class OperatorObligationTests(unittest.TestCase):
         parameters = {
             "obligation_id": "goo-example-work-0001",
             "outcome": "completed",
+                    "closure_classification": self._process_only(),
             "evidence": self._passed_evidence(),
         }
         first = obligation.close_obligation(parameters)
@@ -299,6 +1085,7 @@ class OperatorObligationTests(unittest.TestCase):
                 {
                     "obligation_id": completed_id,
                     "outcome": "completed",
+                    "closure_classification": self._process_only(),
                     "evidence": self._passed_evidence(),
                 }
             )
@@ -338,6 +1125,7 @@ class OperatorObligationTests(unittest.TestCase):
             {
                 "obligation_id": "goo-example-work-0001",
                 "outcome": "completed",
+                    "closure_classification": self._process_only(),
                 "evidence": self._passed_evidence(),
             }
         )
@@ -395,6 +1183,7 @@ class OperatorObligationTests(unittest.TestCase):
         )
 
         self.assertEqual(result["state"], "blocked")
+        self.assertEqual(obligation.LEGACY_CLOSE_SCHEMA_VERSION, result["close_schema_version"])
         self.assertTrue(result["response_may_end"])
         self.assertTrue(result["continuation_required"])
         self.assertTrue(result["follow_up_required"])
@@ -424,6 +1213,7 @@ class OperatorObligationTests(unittest.TestCase):
             }
         )
         self.assertEqual(result["state"], "delegated")
+        self.assertEqual(obligation.LEGACY_CLOSE_SCHEMA_VERSION, result["close_schema_version"])
         self.assertTrue(result["continuation_required"])
         self.assertTrue(result["follow_up_required"])
         self.assertFalse(result["work_complete"])
@@ -450,6 +1240,7 @@ class OperatorObligationTests(unittest.TestCase):
             {
                 "obligation_id": "goo-example-work-0001",
                 "outcome": "completed",
+                    "closure_classification": self._process_only(),
                 "evidence": self._passed_evidence(),
             }
         )
@@ -496,6 +1287,7 @@ class OperatorObligationTests(unittest.TestCase):
             {
                 "obligation_id": "goo-example-work-0001",
                 "outcome": "completed",
+                    "closure_classification": self._process_only(),
                 "evidence": self._passed_evidence(),
             }
         )
@@ -1250,6 +2042,7 @@ class OperatorObligationTests(unittest.TestCase):
             {
                 "obligation_id": "goo-example-work-0001",
                 "outcome": "completed",
+                    "closure_classification": self._process_only(),
                 "evidence": [
                     {
                         "acceptance_id": "implementation",

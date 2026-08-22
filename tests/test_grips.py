@@ -881,6 +881,93 @@ class WorktreeOrientCleanupTests(unittest.TestCase):
 
 
 class GripFoundationTests(unittest.TestCase):
+    @staticmethod
+    def _systemic_convergence_fixture(
+        root: Path, obligation_id: str
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        assessment_id = f"assessment-{obligation_id}"
+        request = {
+            "assessment_id": assessment_id,
+            "closure": {
+                "schema_version": 1,
+                "closure_id": f"operator-obligation:{obligation_id}",
+                "status": "closed",
+                "residual_risks": [],
+            },
+        }
+        request_path = (root / f"{obligation_id}-convergence.json").resolve()
+        raw = json.dumps(
+            request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        request_path.write_bytes(raw)
+        request_sha256 = hashlib.sha256(raw).hexdigest()
+        protocol_head = "a" * 40
+        output: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski.convergence_assessment",
+            "request_path": str(request_path),
+            "request_sha256": request_sha256,
+            "protocol_repo": None,
+            "protocol_head": protocol_head,
+            "protocol_source": "immutable_bundle",
+            "bundle_manifest_path": None,
+            "bundle_identity_sha256": None,
+            "contracts_sha256": None,
+            "executable_sha256": "d" * 64,
+            "assessment": {
+                "schema_version": 2,
+                "assessment_id": assessment_id,
+                "status": "terminally_closed",
+                "change_risk": "R2",
+                "target_criticality": "essential",
+                "profile_id": "profile-test",
+                "profile_cell_id": "cell-test",
+                "profile_sha256": "e" * 64,
+            },
+            "closure_allowed": True,
+            "decision": "allow_closure",
+            "does_not_establish": [],
+            "receipt_status": "passed",
+        }
+        parameters = {
+            "request_path": str(request_path),
+            "expected_request_sha256": request_sha256,
+            "expected_protocol_head": protocol_head,
+        }
+        receipt: dict[str, object] = {
+            "kind": "grabowski.operator_grip_receipt",
+            "schema_version": 1,
+            "grip": {
+                "name": "convergence-assess",
+                "version": "1.0",
+                "effect": "read_only",
+            },
+            "status": "passed",
+            "phase": "action",
+            "parameters_sha256": grips.grabowski_operator_obligation._sha256(parameters),
+            "checks": [
+                {"id": "protocol-identity-bound", "status": "pass", "detail": protocol_head},
+                {"id": "request-hash-bound", "status": "pass", "detail": request_sha256},
+                {"id": "deterministic-assessment", "status": "pass", "detail": assessment_id},
+                {"id": "terminal-closure-gate", "status": "pass", "detail": "terminally_closed"},
+            ],
+            "output_sha256": grips.grabowski_operator_obligation._sha256(output),
+        }
+        receipt["receipt_sha256"] = grips.grabowski_operator_obligation._sha256(receipt)
+        classification = {
+            "convergence_required": True,
+            "reason": "systemic",
+            "convergence_receipt": {
+                "status": "passed",
+                "receipt_sha256": receipt["receipt_sha256"],
+                "receipt": receipt,
+                "output": output,
+            },
+        }
+        live_output = deepcopy(output)
+        live_output.pop("receipt_status")
+        return classification, live_output
+
     def test_orchestration_runners_live_outside_core_grip_surface(self) -> None:
         core_source = inspect.getsource(grips)
         orchestration_source = inspect.getsource(grip_orchestration)
@@ -2265,6 +2352,165 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(completion_sha, binding["completion_record_sha256"])
         self.assertEqual(receipt["receipt_sha256"], binding["receipt_sha256"])
 
+    def test_operator_obligation_close_revalidates_systemic_convergence_live(self) -> None:
+        obligation_id = "goo-grip-systemic-live-0001"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(Path(tmp) / "obligations")},
+        ):
+            grips.grip_run(
+                "operator-obligation-open",
+                {
+                    "obligation_id": obligation_id,
+                    "objective": "Close only after a fresh systemic convergence readback.",
+                    "acceptance": [{"id": "verified", "description": "Verification passed."}],
+                },
+                allow_mutation=True,
+            )
+            classification, live_output = self._systemic_convergence_fixture(
+                Path(tmp), obligation_id
+            )
+            with patch.object(
+                grips.grabowski_convergence, "assess", return_value=live_output
+            ) as assess:
+                result = grips.grip_run(
+                    "operator-obligation-close",
+                    {
+                        "obligation_id": obligation_id,
+                        "outcome": "completed",
+                        "closure_classification": classification,
+                        "evidence": [
+                            {
+                                "acceptance_id": "verified",
+                                "status": "passed",
+                                "source": "test",
+                                "reference": "unit:systemic-live-readback",
+                                "sha256": "a" * 64,
+                            }
+                        ],
+                    },
+                    allow_mutation=True,
+                )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["systemic_convergence_claim"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["systemic_convergence_gate"])
+        assess.assert_called_once_with(
+            {
+                "request_path": live_output["request_path"],
+                "expected_request_sha256": live_output["request_sha256"],
+                "expected_protocol_head": live_output["protocol_head"],
+            },
+            unittest.mock.ANY,
+        )
+
+    def test_operator_obligation_close_replays_systemic_without_live_request_file(self) -> None:
+        obligation_id = "goo-grip-systemic-replay-0001"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(Path(tmp) / "obligations")},
+        ):
+            grips.grip_run(
+                "operator-obligation-open",
+                {
+                    "obligation_id": obligation_id,
+                    "objective": "Replay an already-bound systemic close safely.",
+                    "acceptance": [{"id": "verified", "description": "Verification passed."}],
+                },
+                allow_mutation=True,
+            )
+            classification, live_output = self._systemic_convergence_fixture(
+                Path(tmp), obligation_id
+            )
+            parameters = {
+                "obligation_id": obligation_id,
+                "outcome": "completed",
+                "closure_classification": classification,
+                "evidence": [
+                    {
+                        "acceptance_id": "verified",
+                        "status": "passed",
+                        "source": "test",
+                        "reference": "unit:systemic-replay",
+                        "sha256": "c" * 64,
+                    }
+                ],
+            }
+            with patch.object(
+                grips.grabowski_convergence, "assess", return_value=live_output
+            ) as assess:
+                first = grips.grip_run(
+                    "operator-obligation-close",
+                    parameters,
+                    allow_mutation=True,
+                )
+            Path(live_output["request_path"]).unlink()
+            with patch.object(grips.grabowski_convergence, "assess") as replay_assess:
+                replay = grips.grip_run(
+                    "operator-obligation-close",
+                    parameters,
+                    allow_mutation=True,
+                )
+
+        self.assertEqual("passed", first["receipt"]["status"])
+        self.assertEqual("passed", replay["receipt"]["status"])
+        self.assertTrue(replay["output"]["replayed"])
+        self.assertTrue(replay["output"]["systemic_convergence_claim"])
+        assess.assert_called_once()
+        replay_assess.assert_not_called()
+
+    def test_operator_obligation_close_blocks_systemic_receipt_when_live_output_differs(self) -> None:
+        obligation_id = "goo-grip-systemic-drift-0001"
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(Path(tmp) / "obligations")},
+        ):
+            grips.grip_run(
+                "operator-obligation-open",
+                {
+                    "obligation_id": obligation_id,
+                    "objective": "Reject a stale or fabricated systemic receipt.",
+                    "acceptance": [{"id": "verified", "description": "Verification passed."}],
+                },
+                allow_mutation=True,
+            )
+            classification, live_output = self._systemic_convergence_fixture(
+                Path(tmp), obligation_id
+            )
+            live_output["protocol_source"] = "live-revalidation-drift"
+            with patch.object(
+                grips.grabowski_convergence, "assess", return_value=live_output
+            ):
+                result = grips.grip_run(
+                    "operator-obligation-close",
+                    {
+                        "obligation_id": obligation_id,
+                        "outcome": "completed",
+                        "closure_classification": classification,
+                        "evidence": [
+                            {
+                                "acceptance_id": "verified",
+                                "status": "passed",
+                                "source": "test",
+                                "reference": "unit:systemic-live-drift",
+                                "sha256": "b" * 64,
+                            }
+                        ],
+                    },
+                    allow_mutation=True,
+                )
+            status_result = grips.grip_run(
+                "operator-obligation-status", {"obligation_id": obligation_id}
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(
+            ["completion_classification_invalid"], result["output"]["blocked_reasons"]
+        )
+        self.assertIn("live output differs", result["output"]["error"])
+        self.assertEqual("open", status_result["output"]["state"])
+
     def test_operator_obligation_grips_enforce_response_end_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             "os.environ",
@@ -2307,11 +2553,36 @@ class GripFoundationTests(unittest.TestCase):
                 },
                 allow_mutation=True,
             )
+            missing_classification = grips.grip_run(
+                "operator-obligation-close",
+                {
+                    "obligation_id": "goo-grip-contract-0001",
+                    "outcome": "completed",
+                    "evidence": [
+                        {
+                            "acceptance_id": "implemented",
+                            "status": "passed",
+                            "source": "git",
+                            "reference": "commit:a",
+                            "sha256": "a" * 64,
+                        },
+                        {
+                            "acceptance_id": "verified",
+                            "status": "passed",
+                            "source": "test",
+                            "reference": "unit:test",
+                            "sha256": "b" * 64,
+                        },
+                    ],
+                },
+                allow_mutation=True,
+            )
             close_result = grips.grip_run(
                 "operator-obligation-close",
                 {
                     "obligation_id": "goo-grip-contract-0001",
                     "outcome": "completed",
+                    "closure_classification": {"convergence_required": False, "reason": "process_only"},
                     "evidence": [
                         {
                             "acceptance_id": "implemented",
@@ -2340,7 +2611,18 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("passed", status_open["receipt"]["status"])
         self.assertTrue(status_open["output"]["continuation_required"])
         self.assertEqual("blocked", invalid_close["receipt"]["status"])
+        self.assertEqual("blocked", missing_classification["receipt"]["status"])
+        blocked_checks = {
+            item["id"]: item["status"] for item in missing_classification["receipt"]["checks"]
+        }
+        self.assertEqual("fail", blocked_checks["completion_classification"])
+        self.assertEqual("fail", blocked_checks["systemic_convergence_gate"])
         self.assertEqual("passed", close_result["receipt"]["status"])
+        close_checks = {item["id"]: item["status"] for item in close_result["receipt"]["checks"]}
+        self.assertEqual("pass", close_checks["completion_classification"])
+        self.assertEqual("skip", close_checks["systemic_convergence_gate"])
+        self.assertEqual("process_only", close_result["output"]["completion_scope"])
+        self.assertFalse(close_result["output"]["systemic_convergence_claim"])
         self.assertTrue(close_result["output"]["response_may_end"])
         self.assertTrue(close_result["output"]["work_complete"])
 

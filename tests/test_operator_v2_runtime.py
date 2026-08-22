@@ -960,6 +960,181 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         self.assertNotIn("server runtime lease identity failed", json.dumps(result))
         github.assert_not_called()
 
+    @staticmethod
+    def _gate_audit_close_result(*, gate_outcome: str = "pass", status: str = "passed") -> dict[str, object]:
+        return {
+            "status": status,
+            "receipt_sha256": "d" * 64,
+            "receipt": {"status": status},
+            "output": {
+                "convergence_gate_outcome": gate_outcome,
+                "completion_scope": "systemic" if gate_outcome == "pass" else None,
+                "systemic_convergence_claim": gate_outcome == "pass",
+                "close_file_sha256": "e" * 64 if status == "passed" else None,
+                "completion_classification": {
+                    "convergence_receipt_sha256": "f" * 64,
+                    "system_convergence_plan": {
+                        "plan_sha256": "c" * 64,
+                        "systemic_closure_gate": "hard",
+                    },
+                },
+                "replayed": False,
+            },
+        }
+
+    @staticmethod
+    def _gate_audit_parameters() -> dict[str, object]:
+        return {
+            "obligation_id": "goo-gate-audit-0001",
+            "outcome": "completed",
+            "evidence": [],
+            "closure_classification": {
+                "convergence_required": True,
+                "reason": "systemic",
+                "convergence_receipt": {"status": "passed"},
+                "system_convergence_plan": {
+                    "plan_sha256": "c" * 64,
+                    "systemic_closure_gate": "hard",
+                },
+            },
+        }
+
+    def test_operator_obligation_close_audits_pending_and_terminal_gate_result(self) -> None:
+        allowed = {"allowed": True, "session_profile": {"profile": "test"}}
+        parameters = self._gate_audit_parameters()
+        inner = self._gate_audit_close_result()
+        with (
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp, "_session_grip_policy_decision", return_value=allowed
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_grips, "grip_run", return_value=inner
+            ) as grip_run,
+            patch.object(
+                grabowski_mcp,
+                "_append_audit_with_digest",
+                side_effect=["a" * 64, "b" * 64],
+            ) as append_audit,
+        ):
+            result = grabowski_mcp._grip_run_core(
+                "operator-obligation-close",
+                parameters,
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        grip_run.assert_called_once()
+        self.assertEqual(2, append_audit.call_count)
+        attempt = append_audit.call_args_list[0].args[0]
+        completion = append_audit.call_args_list[1].args[0]
+        self.assertEqual("operator-obligation-convergence-gate-attempt", attempt["operation"])
+        self.assertEqual("pending", attempt["convergence_gate_outcome"])
+        self.assertEqual("hard", attempt["systemic_closure_gate"])
+        self.assertEqual("operator-obligation-convergence-gate-result", completion["operation"])
+        self.assertEqual("a" * 64, completion["attempt_audit_sha256"])
+        self.assertEqual("d" * 64, completion["grip_receipt_sha256"])
+        self.assertEqual("pass", completion["convergence_gate_outcome"])
+        self.assertEqual("c" * 64, completion["system_convergence_plan_sha256"])
+        self.assertEqual(
+            {
+                "status": "complete",
+                "attempt_audit_sha256": "a" * 64,
+                "result_audit_sha256": "b" * 64,
+            },
+            result["gate_audit"],
+        )
+
+    def test_operator_obligation_close_records_blocked_gate_result(self) -> None:
+        allowed = {"allowed": True, "session_profile": {"profile": "test"}}
+        inner = self._gate_audit_close_result(gate_outcome="blocked", status="blocked")
+        with (
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp, "_session_grip_policy_decision", return_value=allowed
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_grips, "grip_run", return_value=inner
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_append_audit_with_digest",
+                side_effect=["a" * 64, "b" * 64],
+            ) as append_audit,
+        ):
+            result = grabowski_mcp._grip_run_core(
+                "operator-obligation-close",
+                self._gate_audit_parameters(),
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        completion = append_audit.call_args_list[1].args[0]
+        self.assertEqual("blocked", completion["convergence_gate_outcome"])
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("complete", result["gate_audit"]["status"])
+
+    def test_operator_obligation_close_audit_preflight_failure_prevents_effect(self) -> None:
+        allowed = {"allowed": True, "session_profile": {"profile": "test"}}
+        with (
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp, "_session_grip_policy_decision", return_value=allowed
+            ),
+            patch.object(grabowski_mcp.grabowski_grips, "grip_run") as grip_run,
+            patch.object(
+                grabowski_mcp, "_append_audit_with_digest", side_effect=OSError("audit down")
+            ),
+        ):
+            result = grabowski_mcp._grip_run_core(
+                "operator-obligation-close",
+                self._gate_audit_parameters(),
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        grip_run.assert_not_called()
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("preflight_failed", result["gate_audit"]["status"])
+        self.assertIn(
+            "operator_obligation_close_effect_started",
+            result["gate_audit"]["does_not_establish"],
+        )
+
+    def test_operator_obligation_close_result_audit_failure_preserves_effect_result(self) -> None:
+        allowed = {"allowed": True, "session_profile": {"profile": "test"}}
+        inner = self._gate_audit_close_result()
+
+        def append(record: dict[str, object]) -> str:
+            if record["operation"] == "operator-obligation-convergence-gate-attempt":
+                return "a" * 64
+            raise OSError("audit completion down")
+
+        with (
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp, "_session_grip_policy_decision", return_value=allowed
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_grips, "grip_run", return_value=inner
+            ),
+            patch.object(grabowski_mcp, "_append_audit_with_digest", side_effect=append),
+        ):
+            result = grabowski_mcp._grip_run_core(
+                "operator-obligation-close",
+                self._gate_audit_parameters(),
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("completion_failed", result["gate_audit"]["status"])
+        self.assertEqual("a" * 64, result["gate_audit"]["attempt_audit_sha256"])
+        self.assertIn(
+            "convergence_gate_result_audit_completion",
+            result["gate_audit"]["does_not_establish"],
+        )
+
     def test_grip_core_uses_per_grip_capability_without_terminal_leakage(self) -> None:
         allowed = {
             "allowed": True,
