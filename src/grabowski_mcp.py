@@ -8943,6 +8943,9 @@ def _repoground_context_evidence_status(
             or "query_unavailable"
         )
         return "unavailable", str(reason)
+    structured_evidence = query_context.get("structured_evidence")
+    if isinstance(structured_evidence, dict) and structured_evidence:
+        return "available", None
     citation_count = sum(
         1
         for snippet in snippets
@@ -9311,7 +9314,7 @@ def repoground_query(
         or availability.get("status") == "available"
     )
     strategy = str(retrieval.get("strategy") or "none")
-    return {
+    result = {
         "kind": "grabowski.repoground_query",
         "schema_version": 2,
         "repo": repo,
@@ -9361,6 +9364,9 @@ def repoground_query(
             "runtime_correctness",
         ],
     }
+    if "structured_evidence" in repoground_result:
+        result["structured_evidence"] = repoground_result["structured_evidence"]
+    return result
 
 
 @mcp.tool(name="repoground_query_existing_index", annotations=READ_ANNOTATIONS)
@@ -9667,6 +9673,11 @@ def repoground_context_pack(
         }
     snippets = _repoground_list_of_dicts(query_context.get("snippets"))
     ranges = _repoground_list_of_dicts(query_context.get("ranges"))
+    structured_evidence = (
+        query_context.get("structured_evidence")
+        if isinstance(query_context.get("structured_evidence"), dict)
+        else None
+    )
     evidence_status, evidence_reason = _repoground_context_evidence_status(
         query, query_context, snippets, ranges
     )
@@ -9695,6 +9706,8 @@ def repoground_context_pack(
         "query_status": query_context.get("status"),
         "query_available": query_context.get("available", False),
     }
+    if structured_evidence is not None:
+        bounded_evidence["structured_evidence"] = structured_evidence
     context_ref = {
         "schema_version": 1,
         "repo": repo,
@@ -9790,6 +9803,8 @@ def repoground_context_pack(
             "runtime_correctness",
         ],
     }
+    if structured_evidence is not None:
+        payload["query_context"]["structured_evidence"] = structured_evidence
     hashed_view = dict(payload)
     hashed_view["context_ref"] = {
         key: value for key, value in context_ref.items() if key != "generated_at"
@@ -9824,6 +9839,7 @@ def repoground_context_pack(
                 "bounded_evidence.normalized_query_shape",
                 "bounded_evidence.hit_count",
                 "bounded_evidence.result_count",
+                "bounded_evidence.structured_evidence",
                 "bounded_evidence.snippets",
                 "bounded_evidence.ranges",
             ],
