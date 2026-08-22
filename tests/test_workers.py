@@ -353,6 +353,8 @@ const readContentEditableFalseBoundaryScenario = scenario === 'read-contentedita
 const readInheritedValueRoleFallbackScenario = scenario === 'read-inherited-value-role-fallback';
 const readInheritedValueTagFallbackScenario = scenario === 'read-inherited-value-tag-fallback';
 const readAncestorOpacityFallbackScenario = scenario === 'read-ancestor-opacity-fallback';
+const readAncestorAriaHiddenFallbackScenario = scenario === 'read-ancestor-aria-hidden-fallback';
+const readAncestorInertFallbackScenario = scenario === 'read-ancestor-inert-fallback';
 const readTextHeavyPageFallbackScenario = scenario === 'read-text-heavy-page-fallback';
 const readValueRoleFallbackScenario = scenario === 'read-value-role-fallback';
 const scrollFallbackRevalidationFailureScenario = scenario === 'scroll-fallback-revalidation-failure';
@@ -478,6 +480,16 @@ function fallbackSnapshot() {
     {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
     {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'ancestor-opacity-' + marker},
   ]);
+  if (readAncestorAriaHiddenFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 100, nodeName: 'DIV', attributes: ['aria-hidden', 'true']},
+    {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
+    {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'ancestor-aria-' + marker},
+  ]);
+  if (readAncestorInertFallbackScenario) return makeSemanticSnapshot([
+    {parent: -1, backendNodeId: 100, nodeName: 'DIV', attributes: ['inert', '']},
+    {parent: 0, backendNodeId: 101, nodeName: 'BUTTON', attributes: ['aria-label', ' ']},
+    {parent: 1, backendNodeId: 102, nodeName: '#text', layoutText: 'ancestor-inert-' + marker},
+  ]);
   if (readTextHeavyPageFallbackScenario) {
     const spec = [{parent: -1, backendNodeId: 100, nodeName: 'DIV'}];
     for (let index = 0; index < 520; index += 1) {
@@ -555,7 +567,7 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: readValueRoleFallbackScenario ? 'textbox' : (activateScenario ? 'link' : 'button')},
-          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readTextHeavyPageFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
+          name: {value: (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -570,7 +582,7 @@ class FakeWebSocket {
         reply({object: {objectId: 'link-object'}});
         return;
       case 'Runtime.callFunctionOn':
-        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readTextHeavyPageFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
+        if (readNameFallbackScenario || readSensitiveDescendantFallbackScenario || readSensitiveRootFallbackScenario || readRoleTokenDescendantFallbackScenario || readLongRoleTokenFallbackScenario || readHiddenDescendantFallbackScenario || readCssHiddenFallbackScenario || readInheritedContentEditableFallbackScenario || readContentEditableFalseBoundaryScenario || readInheritedValueRoleFallbackScenario || readInheritedValueTagFallbackScenario || readAncestorOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario || readValueRoleFallbackScenario || scrollFallbackRevalidationFailureScenario) {
           fail();
           return;
         }
@@ -777,7 +789,7 @@ class FakeWebSocket {
           }});
           return;
         }
-        if (readAncestorOpacityFallbackScenario || readTextHeavyPageFallbackScenario) {
+        if (readAncestorOpacityFallbackScenario || readAncestorAriaHiddenFallbackScenario || readAncestorInertFallbackScenario || readTextHeavyPageFallbackScenario) {
           reply({node: {
             backendNodeId: 101,
             nodeType: 1,
@@ -3860,6 +3872,8 @@ globalThis.fetch = async () => ({
         self.assertIn("function semanticSnapshotString", source)
         self.assertIn("function semanticSnapshotNode", source)
         self.assertIn("function semanticSnapshotPathToTarget", source)
+        self.assertIn("function semanticDomVisibilitySubtreeBlocked", source)
+        self.assertIn("function semanticSnapshotHasHiddenAncestor", source)
         self.assertIn("function semanticDomValueBearingSubtreeBlocked", source)
         self.assertIn("function semanticSnapshotHasValueBearingAncestor", source)
         self.assertIn("semanticDomValueBearingSubtreeBlocked(node)", source)
@@ -4385,6 +4399,22 @@ globalThis.fetch = async () => ({
         element = receipt["state"]["elements"][0]
         self.assertEqual(element["role"], "button")
         self.assertEqual(element["name"], "")
+
+    def test_browser_semantic_node_excludes_aria_hidden_target_ancestor(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-ancestor-aria-hidden-fallback"
+        )
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "")
+
+    def test_browser_semantic_node_excludes_inert_target_ancestor(self) -> None:
+        execution, receipt = self._run_browser_semantic_node(
+            "read-ancestor-inert-fallback"
+        )
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        self.assertEqual(receipt["state"]["elements"][0]["name"], "")
 
     def test_browser_semantic_node_counts_only_target_subtree_text_limit(self) -> None:
         execution, receipt = self._run_browser_semantic_node(
