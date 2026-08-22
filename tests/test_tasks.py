@@ -2620,6 +2620,37 @@ class TaskTests(unittest.TestCase):
             tasks.TASK_OUTPUT_CONTRACT_VERSION,
         )
 
+    def test_managed_local_resume_rejects_fleet_transition_to_ssh(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        before = tasks._row_raw(task_id)
+        self.assertEqual(tasks._task_output_managed_from_attempt(before), 1)
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(tasks, "_launch") as launch, patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "managed local output cannot resume on non-local transport"
+            ):
+                tasks.grabowski_task_resume(task_id)
+        launch.assert_not_called()
+        after = tasks._row_raw(task_id)
+        self.assertEqual(after["attempt"], before["attempt"])
+        self.assertEqual(
+            tasks._task_output_managed_from_attempt(after),
+            tasks._task_output_managed_from_attempt(before),
+        )
+
     def test_resume_renews_live_lease_without_rebinding_identity(self) -> None:
         key = "component:task-resume-renew"
         started = self._start(resource_keys=[key])

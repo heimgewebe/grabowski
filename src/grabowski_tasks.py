@@ -8209,20 +8209,23 @@ def grabowski_task_resume(
             recovery_launcher_bindings["retry_binding"] = retained_retry_binding
     attempt = int(record["attempt"]) + 1
     task_output_managed_from_attempt = _task_output_managed_from_attempt(record)
-    if (
-        task_output_managed_from_attempt is None
-        and not _is_root_systemd_backend(record)
-    ):
+    if not _is_root_systemd_backend(record):
         _resolved_host, resume_target, _legacy_local_alias = (
             _resolve_task_dispatch_host(str(record["host"]))
         )
-        if resume_target["transport"] == "local":
-            record = _bind_task_output_managed_from_attempt(
-                task_id,
-                expected_attempt=int(record["attempt"]),
-                managed_from_attempt=attempt,
+        if task_output_managed_from_attempt is None:
+            if resume_target["transport"] == "local":
+                record = _bind_task_output_managed_from_attempt(
+                    task_id,
+                    expected_attempt=int(record["attempt"]),
+                    managed_from_attempt=attempt,
+                )
+                task_output_managed_from_attempt = attempt
+        elif resume_target["transport"] != "local":
+            raise RuntimeError(
+                "Task with managed local output cannot resume on non-local transport; "
+                "restore the fleet host to local transport or start a new task"
             )
-            task_output_managed_from_attempt = attempt
     if task_output_managed_from_attempt is not None:
         _ensure_local_task_output_root()
     unit = _task_unit(task_id, attempt)
