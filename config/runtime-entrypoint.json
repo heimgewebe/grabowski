@@ -525,6 +525,10 @@
       "source": "src/grabowski_text_artifact_reconcile.py"
     },
     {
+      "module": "grabowski_browser_bidi",
+      "source": "src/grabowski_browser_bidi.py"
+    },
+    {
       "module": "grabowski_workers",
       "source": "src/grabowski_workers.py"
     },

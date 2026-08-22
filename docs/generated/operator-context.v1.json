@@ -2167,7 +2167,7 @@
     },
     {
       "category": "browser-worker",
-      "description": "Start one agent-owned browser with loopback-only CDP in a separate unit.",
+      "description": "Start Chrome/CDP, optionally arming one fail-closed startup-only BiDi standby.\n\nSupplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first\nstarts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes\nready. Only when CDP startup remains unavailable before any worker is returned does\nGrabowski terminalize that private primary attempt and start a new Chrome/WebDriver-\nBiDi worker on the same leased loopback port. No later worker/backend switch exists.",
       "effects": [
         "process-start",
         "profile-create-or-use",
@@ -3409,6 +3409,10 @@
         "source": "src/grabowski_text_artifact_reconcile.py"
       },
       {
+        "module": "grabowski_browser_bidi",
+        "source": "src/grabowski_browser_bidi.py"
+      },
+      {
         "module": "grabowski_workers",
         "source": "src/grabowski_workers.py"
       },
@@ -3558,7 +3562,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "bfaeba2ebdff6c9ebdfde865571bfff1992876e8e11eaebee013cd0f5b7c2da9"
+      "sha256": "1370a21d6428d6e37f3730ef64c3f24a79f64fc07d732adc0592c181bfefcd59"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3577,6 +3581,7 @@
       "src/grabowski_blockade_runtime.py": "be0b1f21d621aa59352d188060fed24e879a22029f94f6d441b56132e0309c24",
       "src/grabowski_blockade_store.py": "672a526a50eb9bc3db0445c3ae60decad3a532955e418594be03c876fb5637c8",
       "src/grabowski_blockades.py": "870aeb3fc51fee885ac52fd3301e1b29410600a5f40b85db8df653e447391e64",
+      "src/grabowski_browser_bidi.py": "b35e24650ae413e8a02ecc481f11df5a105262c8f48ad4f0cffd118530a8efa9",
       "src/grabowski_bureau_intake.py": "7979060977df8e4a1916234fee65467d21433faa2e32c38bf3a9197fafc960bb",
       "src/grabowski_bureau_launcher_contract.py": "001193c607e8110947282c78d23e48c292718f028af1be4d0e00cc24c0fec824",
       "src/grabowski_bureau_leases.py": "b47ca45533721975b2c6d31f74811a3e75ce93e9ad8dbe4e1fb6498d90b02b7c",
@@ -3674,7 +3679,7 @@
       "src/grabowski_work_acquire.py": "1df373f2c392655d0eda5ffbbd00106875d50cf8e5b3d6b27ff5f6603fc7823e",
       "src/grabowski_work_admission.py": "5c7529ac26df8ae698d59dbac8267dc1065711b9579274267e9a661e55748c2a",
       "src/grabowski_worker_process.py": "36b8bef1785e9e41c4a8a041b95cc69f3686c881680a89ac6680f2074f5919c0",
-      "src/grabowski_workers.py": "0f6e0eb18b45ec7f822b62feedc7adb9565be158be096eecc18e20e3cba3bab9",
+      "src/grabowski_workers.py": "99f7ae5b0beb2f986dcc403cc666a2e95f1218aade668014dea00c6a7b110e99",
       "src/grabowski_worktree_ensure.py": "4b16010a5209e0b1ca02633eee2ce14da9fe1ff989fc04110995a3bc62abaff0"
     }
   }
