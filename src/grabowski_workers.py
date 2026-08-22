@@ -2700,6 +2700,39 @@ function semanticSnapshotPathToTarget(parentIndex, nodeIndex, targetIndex, nodeC
   return {ok: false, path: null};
 }
 
+function semanticSnapshotEffectiveContentEditable(document, strings, targetIndex) {
+  const nodes = document && document.nodes ? document.nodes : null;
+  const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+  const parentIndex = nodes && Array.isArray(nodes.parentIndex) ? nodes.parentIndex : null;
+  if (!backendNodeIds || !parentIndex || parentIndex.length !== backendNodeIds.length ||
+      !Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= backendNodeIds.length) {
+    return {ok: false, editable: true};
+  }
+  let current = targetIndex;
+  for (let depth = 0; depth < 256; depth += 1) {
+    const node = semanticSnapshotNode(document, strings, current);
+    if (!node) return {ok: false, editable: true};
+    const contentEditable = semanticDomRawAttribute(node, 'contenteditable', 64);
+    if (!contentEditable.valid) return {ok: false, editable: true};
+    if (contentEditable.found) {
+      const value = contentEditable.value.trim().toLowerCase();
+      if (value === 'false') return {ok: true, editable: false};
+      // The empty string, true and plaintext-only are editing hosts. Unknown or
+      // future tokens are treated conservatively as editable rather than risking
+      // publication of inherited user-entered content.
+      return {ok: true, editable: true};
+    }
+    const parent = parentIndex[current];
+    if (!Number.isInteger(parent) || parent < -1 || parent >= backendNodeIds.length ||
+        parent === current) {
+      return {ok: false, editable: true};
+    }
+    if (parent === -1) return {ok: true, editable: false};
+    current = parent;
+  }
+  return {ok: false, editable: true};
+}
+
 function semanticLayoutVisibility(strings, styleIndexes) {
   if (!Array.isArray(styleIndexes) || styleIndexes.length !== 3) return {ok: false, visible: false};
   const visibility = semanticSnapshotString(strings, styleIndexes[0], 64);
@@ -2755,6 +2788,11 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
   const targetNode = semanticSnapshotNode(document, strings, selected.targetIndex);
   if (!targetNode || targetNode.backendNodeId !== backendNodeId) return {ok: false, name: ''};
   if (semanticDomTextSubtreeBlocked(targetNode)) return {ok: true, name: ''};
+  const effectiveEditable = semanticSnapshotEffectiveContentEditable(
+    document, strings, selected.targetIndex
+  );
+  if (!effectiveEditable.ok) return {ok: false, name: ''};
+  if (effectiveEditable.editable) return {ok: true, name: ''};
 
   const layout = document && document.layout ? document.layout : null;
   const layoutNodeIndexes = layout && Array.isArray(layout.nodeIndex) ? layout.nodeIndex : null;
