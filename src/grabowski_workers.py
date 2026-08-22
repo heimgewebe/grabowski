@@ -2609,7 +2609,9 @@ function semanticDomTextSubtreeBlocked(node) {
   ]);
   if (inertNames.has(localName) || inertNames.has(nodeName)) return true;
   if (valueBearingTags.has(localName) || valueBearingTags.has(nodeName)) return true;
-  if (valueBearingRoles.has(semanticDomAttribute(node, 'role').toLowerCase())) return true;
+  const roleTokens = semanticDomAttribute(node, 'role')
+    .toLowerCase().split(/\s+/).filter(Boolean);
+  if (roleTokens.some((token) => valueBearingRoles.has(token))) return true;
   const attributes = Array.isArray(node && node.attributes) ? node.attributes : [];
   for (let index = 0; index + 1 < attributes.length; index += 2) {
     if (String(attributes[index] || '').toLowerCase() !== 'contenteditable') continue;
@@ -2622,23 +2624,23 @@ function semanticDomTextSubtreeBlocked(node) {
 function boundedSemanticDomText(node) {
   const pieces = [];
   let visited = 0;
-  const walk = (current, root = false) => {
+  const walk = (current) => {
     if (!current || visited >= 256) return;
     visited += 1;
     const nodeName = typeof current.nodeName === 'string'
       ? current.nodeName.toLowerCase() : '';
-    if (!root && semanticDomTextSubtreeBlocked(current)) return;
+    if (semanticDomTextSubtreeBlocked(current)) return;
     if (current.nodeType === 3 || nodeName === '#text') {
       const value = boundedText(current.nodeValue, 160);
       if (value) pieces.push(value);
       return;
     }
     for (const child of Array.isArray(current.children) ? current.children : []) {
-      walk(child, false);
+      walk(child);
       if (boundedText(pieces.join(' '), 160).length >= 160) break;
     }
   };
-  walk(node, true);
+  walk(node);
   return boundedText(pieces.join(' '), 160);
 }
 
