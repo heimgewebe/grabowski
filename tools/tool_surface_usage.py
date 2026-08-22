@@ -41,6 +41,13 @@ WRITE_ANNOTATION_NAMES = {
     "MUTATING",
     "DEPLOY_MUTATING",
 }
+MUTATION_USAGE_EVIDENCE_GAPS = {
+    "grabowski_recovery_provenance_repair": (
+        "Successful integrity repair deliberately bypasses transport roundtrip evidence, "
+        "so it does not emit effect-admission; any admission count for this tool does "
+        "not establish successful recovery mutation usage."
+    )
+}
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -63,6 +70,25 @@ def git(repo: Path, *arguments: str) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def clean_repository_head(repo: Path) -> str:
+    head = git(repo, "rev-parse", "HEAD")
+    dirty = git(repo, "status", "--porcelain", "--untracked-files=normal")
+    if dirty:
+        raise RuntimeError(
+            "tool-surface usage analysis requires a clean repository checkout"
+        )
+    return head
+
+
+def require_stable_repository_head(repo: Path, expected_head: str) -> None:
+    observed_head = clean_repository_head(repo)
+    if observed_head != expected_head:
+        raise RuntimeError(
+            "repository HEAD changed during tool-surface usage analysis: "
+            f"expected {expected_head}, observed {observed_head}"
+        )
 
 
 def _audit_query_module() -> Any:
@@ -240,8 +266,18 @@ def summarize_effect_admissions(
         if declaration["mode"] == "read_only"
     )
     observed_expected = sorted(name for name in expected if counts[name] > 0)
-    observed_mutating = sorted(name for name in mutating_tools if counts[name] > 0)
-    unobserved_mutating = sorted(name for name in mutating_tools if counts[name] == 0)
+    mutation_usage_gap_tools = sorted(
+        name for name in mutating_tools if name in MUTATION_USAGE_EVIDENCE_GAPS
+    )
+    measurable_mutating_tools = sorted(
+        name for name in mutating_tools if name not in MUTATION_USAGE_EVIDENCE_GAPS
+    )
+    observed_mutating = sorted(
+        name for name in measurable_mutating_tools if counts[name] > 0
+    )
+    unobserved_mutating = sorted(
+        name for name in measurable_mutating_tools if counts[name] == 0
+    )
     unexpected_admissions = sorted(name for name in counts if name not in expected_set)
 
     return {
@@ -256,6 +292,9 @@ def summarize_effect_admissions(
             "declared_expected_tool_count": len(expected_declarations),
             "read_only_tool_count": len(read_only_tools),
             "mutating_tool_count": len(mutating_tools),
+            "mutation_usage_measurable_tool_count": len(measurable_mutating_tools),
+            "mutation_usage_gap_tool_count": len(mutation_usage_gap_tools),
+            "mutation_usage_gap_tools": mutation_usage_gap_tools,
             "unknown_annotation_tool_count": len(unknown_annotation_tools),
             "missing_declarations": missing_declarations,
             "unknown_annotation_tools": unknown_annotation_tools,
@@ -288,7 +327,18 @@ def summarize_effect_admissions(
                     "treating absence of a public tool from this report as evidence "
                     "for P9 removal"
                 ),
-            }
+            },
+            *[
+                {
+                    "kind": "mutation_tool_usage",
+                    "tool": name,
+                    "reason": MUTATION_USAGE_EVIDENCE_GAPS[name],
+                    "needed_for": (
+                        "classifying this mutation tool as observed or unobserved usage"
+                    ),
+                }
+                for name in mutation_usage_gap_tools
+            ],
         ],
         "does_not_establish": [
             "successful domain effects from admission counts",
@@ -314,6 +364,7 @@ def build_report(
         raise ValueError(f"top must be between 1 and {MAX_TOP}")
     observed_now = int(time.time()) if now_unix is None else int(now_unix)
     cutoff_unix = observed_now - window_hours * 3600
+    repo_head = clean_repository_head(repo)
     audit_query = _audit_query_module()
     snapshot = audit_query.capture_verified_audit_snapshot()
     declarations = tool_declarations(repo)
@@ -326,13 +377,14 @@ def build_report(
         declarations=declarations,
         top=top,
     )
+    require_stable_repository_head(repo, repo_head)
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_tool_surface_usage_v1",
         "authority": "derived_from_verified_grabowski_audit_chain",
         "repository": str(repo),
-        "repo_head": git(repo, "rev-parse", "HEAD"),
-        "repo_dirty": bool(git(repo, "status", "--porcelain")),
+        "repo_head": repo_head,
+        "repo_dirty": False,
         "observed_at_unix": observed_now,
         "window_hours": window_hours,
         "cutoff_unix": cutoff_unix,

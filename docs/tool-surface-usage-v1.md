@@ -39,6 +39,12 @@ Ein Tool ohne Mutations-Admission kann ein häufig genutzter read-only Pfad oder
 
 Der Report führt deshalb `read_only_tool_usage` als `evidence_gap` und nennt `safe public tool removal` ausdrücklich unter `does_not_establish`.
 
+Auch `grabowski_recovery_provenance_repair` ist absichtlich nicht vollständig über `effect-admission` messbar: ein erfolgreicher Integritäts-Reparaturlauf umgeht den normalen Transportnachweis und erzeugt deshalb keine Mutation-Admission. Der Analyzer führt diesen Pfad als eigene `mutation_tool_usage`-Evidenzlücke und nimmt ihn weder in die beobachteten noch in die unbeobachteten Mutations-Tools auf.
+
+## Repository-Bindung
+
+Ein Report wird nur aus einem sauberen Git-Checkout erzeugt. Der Analyzer bindet den Ausgangs-HEAD vor der Audit-Auswertung und prüft nach der Auswertung erneut, dass Checkout und HEAD unverändert und sauber sind. Bei Dirty-State oder HEAD-Drift bricht er ohne Report ab. Damit bleibt die statische Toolklassifikation später auf den angegebenen Commit rekonstruierbar.
+
 ## Nutzung
 
 Mit dem bereits installierten Grabowski-Runtime-Python:

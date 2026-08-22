@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "tool_surface_usage.py"
@@ -116,6 +117,51 @@ def qualified_tool():
             {"tool": "write_hot", "count": 2},
         )
         self.assertNotIn("must-not-leak", str(result))
+
+    def test_recovery_repair_is_excluded_from_mutation_usage_claims(self) -> None:
+        recovery = "grabowski_recovery_provenance_repair"
+        result = usage.summarize_effect_admissions(
+            [
+                {
+                    "timestamp_unix": 100,
+                    "operation": "effect-admission",
+                    "tool": recovery,
+                }
+            ],
+            cutoff_unix=100,
+            until_unix=100,
+            expected=[recovery, "write_unused"],
+            declarations={
+                recovery: {"mode": "mutating"},
+                "write_unused": {"mode": "mutating"},
+            },
+            top=10,
+        )
+        self.assertEqual(result["surface"]["mutating_tool_count"], 2)
+        self.assertEqual(result["surface"]["mutation_usage_measurable_tool_count"], 1)
+        self.assertEqual(result["surface"]["mutation_usage_gap_tools"], [recovery])
+        self.assertEqual(result["mutation_usage"]["observed_mutating_tool_count"], 0)
+        self.assertEqual(
+            result["mutation_usage"]["unobserved_mutating_tools"], ["write_unused"]
+        )
+        self.assertEqual(
+            [
+                gap.get("tool")
+                for gap in result["evidence_gaps"]
+                if gap["kind"] == "mutation_tool_usage"
+            ],
+            [recovery],
+        )
+
+    def test_clean_repository_head_rejects_dirty_checkout(self) -> None:
+        with patch.object(usage, "git", side_effect=["a" * 40, " M tools/example.py"]):
+            with self.assertRaisesRegex(RuntimeError, "requires a clean repository"):
+                usage.clean_repository_head(ROOT)
+
+    def test_stable_repository_head_rejects_head_drift(self) -> None:
+        with patch.object(usage, "git", side_effect=["b" * 40, ""]):
+            with self.assertRaisesRegex(RuntimeError, "HEAD changed"):
+                usage.require_stable_repository_head(ROOT, "a" * 40)
 
     def test_summary_keeps_read_only_absence_as_evidence_gap(self) -> None:
         result = usage.summarize_effect_admissions(
