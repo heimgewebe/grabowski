@@ -33,6 +33,9 @@ _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 512 * 1024
 _MERGE_GUARD_MAX_SINGLE_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_GITHUB_DIFF_MAX_FILES = 300
 _MERGE_GUARD_MAX_DIFF_BYTES = 32 * 1024 * 1024
+_MERGE_GUARD_BINARY_DIFF_RE = re.compile(
+    rb"(?m)^(?:GIT binary patch|Binary files [^\r\n]+ and [^\r\n]+ differ)\r?$"
+)
 _MERGE_GUARD_REPLAY_PARAMETERS = frozenset({"merge_lease_snapshot", "merge_guard_receipt"})
 _CODEX_REVIEW_ACTORS = frozenset({
     "chatgpt-codex-connector",
@@ -946,6 +949,117 @@ def _merge_guard_local_git_bytes(
     }
 
 
+def _merge_guard_commit_probe(
+    repo_path: Path, sha: str
+) -> tuple[bool, dict[str, Any]]:
+    info: dict[str, Any] = {"sha": sha}
+    if not isinstance(sha, str) or _SHA40_RE.fullmatch(sha) is None:
+        info["returncode"] = None
+        info["valid"] = False
+        return False, info
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["cat-file", "-e", f"{sha}^{{commit}}"]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        info.update({"returncode": None, "error_class": type(exc).__name__})
+        return False, info
+    stderr = result["stderr_bytes"]
+    info.update(
+        {
+            "returncode": result["returncode"],
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        }
+    )
+    return result["returncode"] == 0, info
+
+
+def _merge_guard_ensure_pr_objects(
+    repo_path: Path,
+    *,
+    base_branch: str,
+    pr_number: int,
+    base_sha: str,
+    head_sha: str,
+) -> tuple[dict[str, Any], list[str]]:
+    receipt: dict[str, Any] = {
+        "source": "local-git-object-availability",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "fetch_attempted": False,
+    }
+    if (
+        not isinstance(base_branch, str)
+        or not base_branch
+        or "\x00" in base_branch
+        or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number < 1
+        or not isinstance(base_sha, str)
+        or _SHA40_RE.fullmatch(base_sha) is None
+        or not isinstance(head_sha, str)
+        or _SHA40_RE.fullmatch(head_sha) is None
+    ):
+        return receipt, ["merge_guard_pr_object_binding_invalid"]
+
+    base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
+    head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
+    receipt["before"] = {"base": base_probe, "head": head_probe}
+    if base_present and head_present:
+        receipt["available"] = True
+        return receipt, []
+
+    base_ref = f"refs/heads/{base_branch}"
+    pr_head_ref = f"refs/pull/{pr_number}/head"
+    fetch_args = [
+        "-c",
+        "remote.origin.uploadpack=git-upload-pack",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "protocol.file.allow=never",
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "--no-recurse-submodules",
+        "--",
+        "origin",
+        base_ref,
+        pr_head_ref,
+    ]
+    receipt["fetch_attempted"] = True
+    receipt["fetch_refs"] = [base_ref, pr_head_ref]
+    try:
+        fetched = _merge_guard_local_git_bytes(repo_path, fetch_args, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        receipt["fetch"] = {"returncode": None, "error_class": type(exc).__name__}
+        return receipt, [f"merge_guard_pr_object_fetch_exception:{type(exc).__name__}"]
+    fetch_stdout = fetched["stdout_bytes"]
+    fetch_stderr = fetched["stderr_bytes"]
+    receipt["fetch"] = {
+        "returncode": fetched["returncode"],
+        "stdout_sha256": hashlib.sha256(fetch_stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(fetch_stderr).hexdigest(),
+    }
+    if fetched["returncode"] != 0:
+        return receipt, ["merge_guard_pr_object_fetch_failed"]
+
+    base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
+    head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
+    receipt["after"] = {"base": base_probe, "head": head_probe}
+    receipt["available"] = base_present and head_present
+    errors: list[str] = []
+    if not base_present:
+        errors.append("merge_guard_base_object_unavailable_after_fetch")
+    if not head_present:
+        errors.append("merge_guard_head_object_unavailable_after_fetch")
+    return receipt, errors
+
+
+def _merge_guard_diff_contains_binary_metadata(diff_bytes: bytes) -> bool:
+    return _MERGE_GUARD_BINARY_DIFF_RE.search(diff_bytes) is not None
+
+
 def _merge_guard_local_changed_paths(
     repo_path: Path, *, base_sha: str, head_sha: str
 ) -> tuple[list[str], dict[str, Any], list[str]]:
@@ -1067,7 +1181,7 @@ def _merge_guard_local_diff_bytes(
         return b"", info, ["merge_guard_local_diff_empty"]
     if len(stdout) > _MERGE_GUARD_MAX_DIFF_BYTES:
         return b"", info, ["merge_guard_local_diff_exceeds_byte_limit"]
-    if b"GIT binary patch" in stdout or b"Binary files " in stdout:
+    if _merge_guard_diff_contains_binary_metadata(stdout):
         return b"", info, ["merge_guard_local_diff_binary_unsupported"]
     canonical = canonicalize_github_pr_diff_identity(stdout)
     info.update(
@@ -3225,9 +3339,24 @@ class CaptainMergeGuardRunner:
         if type(changed_files) is int and _merge_guard_github_diff_too_large(
             diff_info, changed_files=changed_files
         ):
-            local_paths, local_paths_info, local_path_errors = _merge_guard_local_changed_paths(
-                self.repo_path, base_sha=base_sha, head_sha=expected_head
+            object_receipt, object_errors = _merge_guard_ensure_pr_objects(
+                self.repo_path,
+                base_branch=expected_base,
+                pr_number=pr_number,
+                base_sha=base_sha,
+                head_sha=expected_head,
             )
+            self.receipt["local_object_fallback"] = object_receipt
+            errors.extend(object_errors)
+            local_paths: list[str] = []
+            local_paths_info: dict[str, Any] = {"skipped": bool(object_errors)}
+            local_path_errors: list[str] = []
+            if not object_errors:
+                local_paths, local_paths_info, local_path_errors = (
+                    _merge_guard_local_changed_paths(
+                        self.repo_path, base_sha=base_sha, head_sha=expected_head
+                    )
+                )
             self.receipt["local_changed_paths_fallback"] = local_paths_info
             errors.extend(local_path_errors)
             if not local_path_errors and local_paths != changed_paths:

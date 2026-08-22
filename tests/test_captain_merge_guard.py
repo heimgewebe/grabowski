@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -171,6 +172,79 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             ["MODIFIED", "ADDED", "DELETED", "RENAMED"],
         )
         self.assertEqual(records[-1]["previousPath"], "old-d.txt")
+
+    def test_missing_pr_object_fetches_bounded_refs_and_reprobes_exact_shas(self) -> None:
+        base_sha = "a" * 40
+        head_sha = "b" * 40
+        results = [
+            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+            {"returncode": 1, "stdout_bytes": b"", "stderr_bytes": b"missing"},
+            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+        ]
+        with mock.patch.object(
+            merge_guard, "_merge_guard_local_git_bytes", side_effect=results
+        ) as local_git:
+            receipt, errors = merge_guard._merge_guard_ensure_pr_objects(
+                Path("/repo"),
+                base_branch="main",
+                pr_number=212,
+                base_sha=base_sha,
+                head_sha=head_sha,
+            )
+
+        self.assertEqual(errors, [])
+        self.assertTrue(receipt["fetch_attempted"])
+        self.assertTrue(receipt["available"])
+        self.assertEqual(
+            receipt["fetch_refs"], ["refs/heads/main", "refs/pull/212/head"]
+        )
+        fetch_args = local_git.call_args_list[2].args[1]
+        self.assertEqual(
+            fetch_args,
+            [
+                "-c",
+                "remote.origin.uploadpack=git-upload-pack",
+                "-c",
+                "protocol.ext.allow=never",
+                "-c",
+                "protocol.file.allow=never",
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--",
+                "origin",
+                "refs/heads/main",
+                "refs/pull/212/head",
+            ],
+        )
+        self.assertEqual(
+            local_git.call_args_list[3].args[1],
+            ["cat-file", "-e", f"{base_sha}^{{commit}}"],
+        )
+        self.assertEqual(
+            local_git.call_args_list[4].args[1],
+            ["cat-file", "-e", f"{head_sha}^{{commit}}"],
+        )
+
+    def test_binary_detection_is_anchored_to_diff_metadata(self) -> None:
+        text_diff = (
+            b"diff --git a/note.txt b/note.txt\n"
+            b"--- a/note.txt\n+++ b/note.txt\n@@ -0,0 +1 @@\n"
+            b"+Binary files alpha and beta differ\n"
+        )
+        binary_diff = (
+            b"diff --git a/blob.bin b/blob.bin\n"
+            b"Binary files a/blob.bin and b/blob.bin differ\n"
+        )
+        patch_binary_diff = b"diff --git a/blob.bin b/blob.bin\nGIT binary patch\n"
+        self.assertFalse(merge_guard._merge_guard_diff_contains_binary_metadata(text_diff))
+        self.assertTrue(merge_guard._merge_guard_diff_contains_binary_metadata(binary_diff))
+        self.assertTrue(
+            merge_guard._merge_guard_diff_contains_binary_metadata(patch_binary_diff)
+        )
 
     def test_local_bound_diff_supports_large_text_release(self) -> None:
         temporary, repo, base_sha, head_sha, expected_paths = _large_git_repo()
