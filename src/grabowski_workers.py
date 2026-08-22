@@ -2638,30 +2638,191 @@ function semanticDomTextSubtreeBlocked(node) {
   return false;
 }
 
-function boundedSemanticDomText(node) {
-  const pieces = [];
-  let visited = 0;
-  const walk = (current) => {
-    if (!current || visited >= 256) return;
-    visited += 1;
-    const nodeName = typeof current.nodeName === 'string'
-      ? current.nodeName.toLowerCase() : '';
-    if (semanticDomTextSubtreeBlocked(current)) return;
-    if (current.nodeType === 3 || nodeName === '#text') {
-      const value = boundedText(current.nodeValue, 160);
-      if (value) pieces.push(value);
-      return;
-    }
-    for (const child of Array.isArray(current.children) ? current.children : []) {
-      walk(child);
-      if (boundedText(pieces.join(' '), 160).length >= 160) break;
-    }
-  };
-  walk(node);
-  return boundedText(pieces.join(' '), 160);
+function semanticSnapshotString(strings, index, maxBytes = 4096) {
+  if (!Array.isArray(strings) || !Number.isInteger(index) || index < 0 || index >= strings.length) {
+    return null;
+  }
+  const value = strings[index];
+  if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > maxBytes) return null;
+  return value;
 }
 
-async function readSemanticElementName(backendNodeId, role, accessibilityName) {
+function semanticSnapshotNode(document, strings, nodeIndex) {
+  const nodes = document && document.nodes ? document.nodes : null;
+  const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+  const nodeTypes = nodes && Array.isArray(nodes.nodeType) ? nodes.nodeType : null;
+  const nodeNames = nodes && Array.isArray(nodes.nodeName) ? nodes.nodeName : null;
+  const attributes = nodes && Array.isArray(nodes.attributes) ? nodes.attributes : null;
+  if (!backendNodeIds || !nodeTypes || !nodeNames || !attributes ||
+      !Number.isInteger(nodeIndex) || nodeIndex < 0 || nodeIndex >= backendNodeIds.length ||
+      nodeTypes.length !== backendNodeIds.length || nodeNames.length !== backendNodeIds.length ||
+      attributes.length !== backendNodeIds.length) {
+    return null;
+  }
+  const nodeName = semanticSnapshotString(strings, nodeNames[nodeIndex], 256);
+  const encodedAttributes = attributes[nodeIndex];
+  if (nodeName === null || !Array.isArray(encodedAttributes) ||
+      encodedAttributes.length > 128 || encodedAttributes.length % 2 !== 0) {
+    return null;
+  }
+  const decodedAttributes = [];
+  for (const stringIndex of encodedAttributes) {
+    const value = semanticSnapshotString(strings, stringIndex, 4096);
+    if (value === null) return null;
+    decodedAttributes.push(value);
+  }
+  return {
+    backendNodeId: backendNodeIds[nodeIndex],
+    nodeType: nodeTypes[nodeIndex],
+    nodeName,
+    localName: nodeName.toLowerCase(),
+    attributes: decodedAttributes,
+  };
+}
+
+function semanticSnapshotPathToTarget(parentIndex, nodeIndex, targetIndex, nodeCount) {
+  if (!Array.isArray(parentIndex) || parentIndex.length !== nodeCount) return {ok: false, path: null};
+  const path = [];
+  let current = nodeIndex;
+  for (let depth = 0; depth < 256; depth += 1) {
+    if (!Number.isInteger(current) || current < 0 || current >= nodeCount) {
+      return {ok: false, path: null};
+    }
+    path.push(current);
+    if (current === targetIndex) return {ok: true, path};
+    const parent = parentIndex[current];
+    if (!Number.isInteger(parent) || parent < -1 || parent >= nodeCount || parent === current) {
+      return {ok: false, path: null};
+    }
+    if (parent === -1) return {ok: true, path: null};
+    current = parent;
+  }
+  return {ok: false, path: null};
+}
+
+function semanticLayoutVisibility(strings, styleIndexes) {
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 3) return {ok: false, visible: false};
+  const visibility = semanticSnapshotString(strings, styleIndexes[0], 64);
+  const opacityText = semanticSnapshotString(strings, styleIndexes[1], 64);
+  const contentVisibility = semanticSnapshotString(strings, styleIndexes[2], 64);
+  if (visibility === null || opacityText === null || contentVisibility === null) {
+    return {ok: false, visible: false};
+  }
+  const normalizedVisibility = visibility.trim().toLowerCase();
+  const normalizedContentVisibility = contentVisibility.trim().toLowerCase();
+  const opacity = Number(opacityText.trim());
+  if (!Number.isFinite(opacity)) return {ok: false, visible: false};
+  if (['hidden', 'collapse'].includes(normalizedVisibility) ||
+      normalizedContentVisibility === 'hidden' || opacity <= 0) {
+    return {ok: true, visible: false};
+  }
+  return {ok: true, visible: true};
+}
+
+async function captureSemanticVisibleSnapshot() {
+  try {
+    const snapshot = await call('DOMSnapshot.captureSnapshot', {
+      computedStyles: ['visibility', 'opacity', 'content-visibility'],
+      includePaintOrder: false,
+      includeDOMRects: false,
+    });
+    return {ok: true, snapshot};
+  } catch {
+    return {ok: false, snapshot: null};
+  }
+}
+
+function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
+  const strings = snapshot && Array.isArray(snapshot.strings) ? snapshot.strings : null;
+  const documents = snapshot && Array.isArray(snapshot.documents) ? snapshot.documents : null;
+  if (!strings || !documents || documents.length < 1 || documents.length > 32) {
+    return {ok: false, name: ''};
+  }
+  let selected = null;
+  for (const document of documents) {
+    const nodes = document && document.nodes ? document.nodes : null;
+    const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+    if (!backendNodeIds || backendNodeIds.length > 50000) return {ok: false, name: ''};
+    const targetIndex = backendNodeIds.indexOf(backendNodeId);
+    if (targetIndex < 0) continue;
+    if (selected !== null) return {ok: false, name: ''};
+    selected = {document, targetIndex};
+  }
+  if (selected === null) return {ok: false, name: ''};
+  const document = selected.document;
+  const nodes = document.nodes;
+  const nodeCount = nodes.backendNodeId.length;
+  const targetNode = semanticSnapshotNode(document, strings, selected.targetIndex);
+  if (!targetNode || targetNode.backendNodeId !== backendNodeId) return {ok: false, name: ''};
+  if (semanticDomTextSubtreeBlocked(targetNode)) return {ok: true, name: ''};
+
+  const layout = document && document.layout ? document.layout : null;
+  const layoutNodeIndexes = layout && Array.isArray(layout.nodeIndex) ? layout.nodeIndex : null;
+  const layoutStyles = layout && Array.isArray(layout.styles) ? layout.styles : null;
+  const layoutText = layout && Array.isArray(layout.text) ? layout.text : null;
+  if (!layoutNodeIndexes || !layoutStyles || !layoutText || layoutNodeIndexes.length > 50000 ||
+      layoutStyles.length !== layoutNodeIndexes.length || layoutText.length !== layoutNodeIndexes.length) {
+    return {ok: false, name: ''};
+  }
+  const layoutByNode = new Map();
+  for (let index = 0; index < layoutNodeIndexes.length; index += 1) {
+    const nodeIndex = layoutNodeIndexes[index];
+    if (!Number.isInteger(nodeIndex) || nodeIndex < 0 || nodeIndex >= nodeCount || layoutByNode.has(nodeIndex)) {
+      return {ok: false, name: ''};
+    }
+    layoutByNode.set(nodeIndex, index);
+  }
+
+  const pieces = [];
+  let visitedTextLayouts = 0;
+  for (let layoutIndex = 0; layoutIndex < layoutNodeIndexes.length; layoutIndex += 1) {
+    const text = semanticSnapshotString(strings, layoutText[layoutIndex], 4096);
+    if (text === null) return {ok: false, name: ''};
+    if (!boundedText(text, 160)) continue;
+    visitedTextLayouts += 1;
+    if (visitedTextLayouts > 512) return {ok: false, name: ''};
+    const nodeIndex = layoutNodeIndexes[layoutIndex];
+    const ancestry = semanticSnapshotPathToTarget(
+      nodes.parentIndex, nodeIndex, selected.targetIndex, nodeCount
+    );
+    if (!ancestry.ok) return {ok: false, name: ''};
+    if (!ancestry.path) continue;
+    let allowed = true;
+    for (const pathIndex of ancestry.path) {
+      const node = semanticSnapshotNode(document, strings, pathIndex);
+      if (!node) return {ok: false, name: ''};
+      if (semanticDomTextSubtreeBlocked(node)) {
+        allowed = false;
+        break;
+      }
+      const ancestorLayoutIndex = layoutByNode.get(pathIndex);
+      if (ancestorLayoutIndex === undefined) continue;
+      const visibility = semanticLayoutVisibility(strings, layoutStyles[ancestorLayoutIndex]);
+      if (!visibility.ok) return {ok: false, name: ''};
+      if (!visibility.visible) {
+        allowed = false;
+        break;
+      }
+    }
+    if (!allowed) continue;
+    pieces.push(text);
+    if (boundedText(pieces.join(' '), 160).length >= 160) break;
+  }
+  return {ok: true, name: boundedText(pieces.join(' '), 160)};
+}
+
+async function readSemanticVisibleDomText(backendNodeId, snapshotProvider) {
+  const captured = await snapshotProvider();
+  if (!captured || !captured.ok) return {ok: false, name: ''};
+  return semanticVisibleTextFromSnapshot(captured.snapshot, backendNodeId);
+}
+
+async function readSemanticElementName(
+  backendNodeId,
+  role,
+  accessibilityName,
+  snapshotProvider = captureSemanticVisibleSnapshot
+) {
   const primary = boundedText(accessibilityName, 160);
   if (primary) return {ok: true, name: primary};
   let described;
@@ -2681,11 +2842,13 @@ async function readSemanticElementName(backendNodeId, role, accessibilityName) {
     semanticDomAttribute(node, 'title'),
     role === 'textbox' ? semanticDomAttribute(node, 'placeholder') : '',
   ];
+  const labeled = candidates.find((candidate) => Boolean(candidate));
+  if (labeled) return {ok: true, name: labeled};
   const visibleLabelRoles = new Set([
     'button', 'link', 'tab', 'menuitem', 'treeitem', 'heading'
   ]);
-  if (visibleLabelRoles.has(role)) candidates.push(boundedSemanticDomText(node));
-  return {ok: true, name: candidates.find((candidate) => Boolean(candidate)) || ''};
+  if (!visibleLabelRoles.has(role)) return {ok: true, name: ''};
+  return readSemanticVisibleDomText(backendNodeId, snapshotProvider);
 }
 
 function sha256Text(value) {
@@ -2757,6 +2920,11 @@ async function readElements() {
   const elements = [];
   const seen = new Set();
   let baseUrl = null;
+  let cachedVisibleSnapshot = null;
+  const observedSnapshotProvider = async () => {
+    if (cachedVisibleSnapshot === null) cachedVisibleSnapshot = await captureSemanticVisibleSnapshot();
+    return cachedVisibleSnapshot;
+  };
   for (const node of Array.isArray(tree.nodes) ? tree.nodes : []) {
     if (elements.length >= 80) break;
     if (!node || node.ignored === true || !Number.isInteger(node.backendDOMNodeId)) continue;
@@ -2773,7 +2941,8 @@ async function readElements() {
     const naming = await readSemanticElementName(
       node.backendDOMNodeId,
       role,
-      node.name && node.name.value
+      node.name && node.name.value,
+      observedSnapshotProvider
     );
     elements.push({
       backend_node_id: String(node.backendDOMNodeId),
