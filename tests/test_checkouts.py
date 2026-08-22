@@ -396,6 +396,173 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertTrue(record["lifecycle_decision"]["binding_consistent"])
         self.assertEqual(record["lifecycle_decision"]["binding_drift_reasons"], [])
 
+    def _terminal_source_evidence(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "bureau_task",
+            "source_id": "GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+            "terminal_state": "verified",
+            "evidence_sha256": "a" * 64,
+        }
+
+    def _detached_merged_topic(self, *, publish_remote: bool = True) -> tuple[str, str]:
+        (self.checkout / "README.md").write_text("topic terminal head\n", encoding="utf-8")
+        self._git("add", "README.md", cwd=self.checkout)
+        self._git("commit", "-m", "topic terminal head", cwd=self.checkout)
+        topic_head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        self._git("merge", "--no-ff", "topic", "-m", "merge topic", cwd=self.repo)
+        merge_head = self._git("rev-parse", "HEAD", cwd=self.repo).stdout.strip()
+        if publish_remote:
+            self._publish_remote()
+        self._git("checkout", "--detach", merge_head, cwd=self.checkout)
+        return topic_head, merge_head
+
+    def test_archive_allows_terminal_remote_secured_detached_merge_descendant(self) -> None:
+        self._managed_binding()
+        topic_head, merge_head = self._detached_merged_topic()
+
+        with patch(
+            "grabowski_checkout_terminal_sources.source_terminal_evidence",
+            return_value=self._terminal_source_evidence(),
+        ):
+            result = checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "archive terminal detached merge",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+            )
+
+        transition = result["terminal_detached_transition"]
+        self.assertEqual(transition["expected_head"], self.head)
+        self.assertEqual(transition["expected_branch"], "topic")
+        self.assertEqual(transition["branch_head"], topic_head)
+        self.assertEqual(transition["detached_head"], merge_head)
+        self.assertTrue(transition["current_remote_secured_refs"])
+        self.assertTrue(transition["branch_remote_secured_refs"])
+        lease_keys = {item["resource_key"] for item in result["lease"]["leases"]}
+        self.assertIn(f"repo:{self.repo.resolve()}:branch:topic", lease_keys)
+        self.assertEqual(result["manifest"]["terminal_detached_transition"], transition)
+        self.assertEqual(result["audit"]["terminal_detached_transition"], transition)
+        self.assertEqual(result["lifecycle_binding"]["phase"], "archived")
+        self.assertEqual(result["lifecycle_binding"]["expected_head"], merge_head)
+        self.assertIsNone(result["lifecycle_binding"]["expected_branch"])
+
+    def test_terminal_detached_archive_rolls_back_retention_with_lifecycle_failure(self) -> None:
+        binding = self._managed_binding()
+        checkout_key = str(binding["checkout_key"])
+        retention_before = checkouts._retention_records([checkout_key])[checkout_key]
+        _, merge_head = self._detached_merged_topic()
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            patch.object(
+                checkouts,
+                "_mark_checkout_archived_in_connection",
+                side_effect=RuntimeError("simulated detached lifecycle failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated detached lifecycle failure"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "rollback detached archive identity",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+            )
+
+        retention_after = checkouts._retention_records([checkout_key])[checkout_key]
+        self.assertEqual(retention_after, retention_before)
+        lifecycle = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual(lifecycle["phase"], "active")
+        self.assertEqual(lifecycle["expected_head"], self.head)
+        self.assertEqual(lifecycle["expected_branch"], "topic")
+        self.assertIsNone(checkouts._latest_archive_for_key(checkout_key))
+
+    def test_archive_rejects_detached_checkout_when_source_is_not_terminal(self) -> None:
+        self._managed_binding()
+        _, merge_head = self._detached_merged_topic()
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                side_effect=RuntimeError("source is not terminal"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "source is not terminal"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "reject nonterminal detached merge",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+            )
+
+        with checkouts._database() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM archives").fetchone()[0], 0)
+
+    def test_archive_rejects_detached_head_outside_lifecycle_branch_genealogy(self) -> None:
+        self._managed_binding()
+        (self.checkout / "README.md").write_text("topic head\n", encoding="utf-8")
+        self._git("add", "README.md", cwd=self.checkout)
+        self._git("commit", "-m", "topic head", cwd=self.checkout)
+        (self.repo / "main-only.txt").write_text("main only\n", encoding="utf-8")
+        self._git("add", "main-only.txt", cwd=self.repo)
+        self._git("commit", "-m", "main only", cwd=self.repo)
+        main_head = self._git("rev-parse", "HEAD", cwd=self.repo).stdout.strip()
+        self._publish_remote()
+        self._git("checkout", "--detach", main_head, cwd=self.checkout)
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Detached checkout head does not descend from the lifecycle branch head",
+            ),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "reject divergent detached head",
+                int(time.time()) + 3600,
+                main_head,
+                None,
+            )
+
+    def test_archive_rejects_terminal_detached_head_without_remote_security(self) -> None:
+        self._managed_binding()
+        _, merge_head = self._detached_merged_topic(publish_remote=False)
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "Detached checkout head is not remotely secured"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "reject unsecured detached head",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+            )
+
     def test_archive_rejects_managed_binding_branch_drift_before_effects(self) -> None:
         binding = self._managed_binding()
         checkout_key = str(binding["checkout_key"])
