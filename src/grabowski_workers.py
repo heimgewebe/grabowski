@@ -2627,7 +2627,7 @@ function semanticDomValueBearingSubtreeBlocked(node) {
   ]);
   const valueBearingRoles = new Set([
     'textbox', 'searchbox', 'combobox', 'listbox', 'option', 'slider', 'spinbutton',
-    'scrollbar', 'progressbar'
+    'scrollbar', 'progressbar', 'meter'
   ]);
   if (valueBearingTags.has(localName) || valueBearingTags.has(nodeName)) return true;
   const rawRole = semanticDomRawAttribute(node, 'role', 512);
@@ -2799,12 +2799,32 @@ function semanticSnapshotEffectiveContentEditable(document, strings, targetIndex
   return {ok: false, editable: true};
 }
 
+function semanticFilterOpacityVisibility(filterText) {
+  const normalized = filterText.trim().toLowerCase();
+  if (!normalized || normalized === 'none') return {ok: true, visible: true};
+  const pattern = /opacity\(([^()]*)\)/g;
+  let matched = false;
+  for (const match of normalized.matchAll(pattern)) {
+    matched = true;
+    const token = match[1].trim();
+    const percentage = token.endsWith('%');
+    const numericToken = percentage ? token.slice(0, -1).trim() : token;
+    const value = Number(numericToken);
+    if (!Number.isFinite(value)) return {ok: false, visible: false};
+    const opacity = percentage ? value / 100 : value;
+    if (opacity <= 0) return {ok: true, visible: false};
+  }
+  if (normalized.includes('opacity(') && !matched) return {ok: false, visible: false};
+  return {ok: true, visible: true};
+}
+
 function semanticLayoutVisibility(strings, styleIndexes) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 3) return {ok: false, visible: false};
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 4) return {ok: false, visible: false};
   const visibility = semanticSnapshotString(strings, styleIndexes[0], 64);
   const opacityText = semanticSnapshotString(strings, styleIndexes[1], 64);
   const contentVisibility = semanticSnapshotString(strings, styleIndexes[2], 64);
-  if (visibility === null || opacityText === null || contentVisibility === null) {
+  const filterText = semanticSnapshotString(strings, styleIndexes[3], 512);
+  if (visibility === null || opacityText === null || contentVisibility === null || filterText === null) {
     return {ok: false, visible: false};
   }
   const normalizedVisibility = visibility.trim().toLowerCase();
@@ -2815,7 +2835,7 @@ function semanticLayoutVisibility(strings, styleIndexes) {
       normalizedContentVisibility === 'hidden' || opacity <= 0) {
     return {ok: true, visible: false};
   }
-  return {ok: true, visible: true};
+  return semanticFilterOpacityVisibility(filterText);
 }
 
 function semanticSnapshotTargetAncestorsLayoutVisible(
@@ -2856,7 +2876,7 @@ function semanticSnapshotTargetAncestorsLayoutVisible(
 async function captureSemanticVisibleSnapshot() {
   try {
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
-      computedStyles: ['visibility', 'opacity', 'content-visibility'],
+      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
@@ -2931,15 +2951,15 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
   const pieces = [];
   let visitedTextLayouts = 0;
   for (let layoutIndex = 0; layoutIndex < layoutNodeIndexes.length; layoutIndex += 1) {
-    const text = semanticSnapshotString(strings, layoutText[layoutIndex], 4096);
-    if (text === null) return {ok: false, name: ''};
-    if (!boundedText(text, 160)) continue;
     const nodeIndex = layoutNodeIndexes[layoutIndex];
     const ancestry = semanticSnapshotPathToTarget(
       nodes.parentIndex, nodeIndex, selected.targetIndex, nodeCount
     );
     if (!ancestry.ok) return {ok: false, name: ''};
     if (!ancestry.path) continue;
+    const text = semanticSnapshotString(strings, layoutText[layoutIndex], 4096);
+    if (text === null) return {ok: false, name: ''};
+    if (!boundedText(text, 160)) continue;
     visitedTextLayouts += 1;
     if (visitedTextLayouts > 512) return {ok: false, name: ''};
     let allowed = true;
