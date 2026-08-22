@@ -2873,29 +2873,83 @@ function semanticSnapshotTargetAncestorsLayoutVisible(
   return {ok: false, visible: false};
 }
 
-async function readSemanticDesignMode() {
-  try {
-    const response = await call('Runtime.evaluate', {
-      expression: 'document.designMode',
-      returnByValue: true,
-      awaitPromise: false,
-    });
-    if (response.exceptionDetails || !response.result ||
-        typeof response.result.value !== 'string') {
-      return {ok: false, value: ''};
+function semanticFrameIds(frameTree) {
+  if (!frameTree || typeof frameTree !== 'object') return {ok: false, frameIds: null};
+  const frameIds = [];
+  const seen = new Set();
+  const stack = [frameTree];
+  while (stack.length > 0) {
+    if (frameIds.length >= 64) return {ok: false, frameIds: null};
+    const current = stack.pop();
+    const frame = current && current.frame ? current.frame : null;
+    const frameId = frame && typeof frame.id === 'string' ? frame.id : '';
+    if (!frameId || Buffer.byteLength(frameId, 'utf8') > 256 || seen.has(frameId)) {
+      return {ok: false, frameIds: null};
     }
-    const value = response.result.value.trim().toLowerCase();
-    if (!['on', 'off'].includes(value)) return {ok: false, value: ''};
-    return {ok: true, value};
-  } catch {
-    return {ok: false, value: ''};
+    seen.add(frameId);
+    frameIds.push(frameId);
+    const children = current.childFrames === undefined ? [] : current.childFrames;
+    if (!Array.isArray(children) || children.length > 64) {
+      return {ok: false, frameIds: null};
+    }
+    for (let index = children.length - 1; index >= 0; index -= 1) {
+      stack.push(children[index]);
+    }
   }
+  return frameIds.length > 0 ? {ok: true, frameIds} : {ok: false, frameIds: null};
+}
+
+async function readSemanticDesignModes() {
+  try {
+    const frameTree = await call('Page.getFrameTree');
+    const frames = semanticFrameIds(frameTree && frameTree.frameTree);
+    if (!frames.ok) return {ok: false, values: null};
+    const values = [];
+    for (const frameId of frames.frameIds) {
+      const world = await call('Page.createIsolatedWorld', {
+        frameId,
+        worldName: 'grabowski-semantic-design-mode-v1',
+        grantUniveralAccess: false,
+      });
+      const contextId = world && world.executionContextId;
+      if (!Number.isSafeInteger(contextId) || contextId <= 0) {
+        return {ok: false, values: null};
+      }
+      const response = await call('Runtime.evaluate', {
+        expression: 'document.designMode',
+        contextId,
+        returnByValue: true,
+        awaitPromise: false,
+      });
+      if (response.exceptionDetails || !response.result ||
+          typeof response.result.value !== 'string') {
+        return {ok: false, values: null};
+      }
+      const value = response.result.value.trim().toLowerCase();
+      if (!['on', 'off'].includes(value)) return {ok: false, values: null};
+      values.push([frameId, value]);
+    }
+    return {ok: true, values};
+  } catch {
+    return {ok: false, values: null};
+  }
+}
+
+function semanticDesignModesAllOff(observation) {
+  if (!observation || !observation.ok || !Array.isArray(observation.values) ||
+      observation.values.length < 1 || observation.values.length > 64) {
+    return false;
+  }
+  return observation.values.every((entry) =>
+    Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' &&
+    entry[0] && entry[1] === 'off'
+  );
 }
 
 async function captureSemanticVisibleSnapshot() {
   try {
-    const designModeBefore = await readSemanticDesignMode();
-    if (!designModeBefore.ok || designModeBefore.value !== 'off') {
+    const designModesBefore = await readSemanticDesignModes();
+    if (!semanticDesignModesAllOff(designModesBefore)) {
       return {ok: false, snapshot: null};
     }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
@@ -2903,9 +2957,9 @@ async function captureSemanticVisibleSnapshot() {
       includePaintOrder: false,
       includeDOMRects: false,
     });
-    const designModeAfter = await readSemanticDesignMode();
-    if (!designModeAfter.ok || designModeAfter.value !== 'off' ||
-        designModeAfter.value !== designModeBefore.value) {
+    const designModesAfter = await readSemanticDesignModes();
+    if (!semanticDesignModesAllOff(designModesAfter) ||
+        JSON.stringify(designModesAfter.values) !== JSON.stringify(designModesBefore.values)) {
       return {ok: false, snapshot: null};
     }
     return {ok: true, snapshot};
