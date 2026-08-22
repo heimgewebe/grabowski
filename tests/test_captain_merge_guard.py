@@ -114,6 +114,10 @@ def _large_git_repo(
     temporary = tempfile.TemporaryDirectory()
     repo = Path(temporary.name)
     _git(repo, "init", "-q")
+    # Keep the temporary repository synchronous. Detached auto-maintenance can
+    # race TemporaryDirectory cleanup on fast CI runners after the test ends.
+    _git(repo, "config", "gc.auto", "0")
+    _git(repo, "config", "maintenance.auto", "false")
     _git(repo, "config", "user.email", "captain-test@example.invalid")
     _git(repo, "config", "user.name", "Captain Test")
     (repo / "seed.txt").write_text("base\n", encoding="utf-8")
