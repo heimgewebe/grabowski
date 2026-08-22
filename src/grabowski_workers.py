@@ -2783,6 +2783,41 @@ function semanticLayoutVisibility(strings, styleIndexes) {
   return {ok: true, visible: true};
 }
 
+function semanticSnapshotTargetAncestorsLayoutVisible(
+  document, strings, targetIndex, layoutByNode
+) {
+  const nodes = document && document.nodes ? document.nodes : null;
+  const backendNodeIds = nodes && Array.isArray(nodes.backendNodeId) ? nodes.backendNodeId : null;
+  const parentIndex = nodes && Array.isArray(nodes.parentIndex) ? nodes.parentIndex : null;
+  const layout = document && document.layout ? document.layout : null;
+  const layoutStyles = layout && Array.isArray(layout.styles) ? layout.styles : null;
+  if (!backendNodeIds || !parentIndex || !layoutStyles || !(layoutByNode instanceof Map) ||
+      parentIndex.length !== backendNodeIds.length ||
+      !Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= backendNodeIds.length) {
+    return {ok: false, visible: false};
+  }
+  let current = targetIndex;
+  for (let depth = 0; depth < 256; depth += 1) {
+    const layoutIndex = layoutByNode.get(current);
+    if (layoutIndex !== undefined) {
+      if (!Number.isInteger(layoutIndex) || layoutIndex < 0 || layoutIndex >= layoutStyles.length) {
+        return {ok: false, visible: false};
+      }
+      const visibility = semanticLayoutVisibility(strings, layoutStyles[layoutIndex]);
+      if (!visibility.ok) return {ok: false, visible: false};
+      if (!visibility.visible) return {ok: true, visible: false};
+    }
+    const parent = parentIndex[current];
+    if (!Number.isInteger(parent) || parent < -1 || parent >= backendNodeIds.length ||
+        parent === current) {
+      return {ok: false, visible: false};
+    }
+    if (parent === -1) return {ok: true, visible: true};
+    current = parent;
+  }
+  return {ok: false, visible: false};
+}
+
 async function captureSemanticVisibleSnapshot() {
   try {
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
@@ -2847,20 +2882,26 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
     layoutByNode.set(nodeIndex, index);
   }
 
+  const targetVisibility = semanticSnapshotTargetAncestorsLayoutVisible(
+    document, strings, selected.targetIndex, layoutByNode
+  );
+  if (!targetVisibility.ok) return {ok: false, name: ''};
+  if (!targetVisibility.visible) return {ok: true, name: ''};
+
   const pieces = [];
   let visitedTextLayouts = 0;
   for (let layoutIndex = 0; layoutIndex < layoutNodeIndexes.length; layoutIndex += 1) {
     const text = semanticSnapshotString(strings, layoutText[layoutIndex], 4096);
     if (text === null) return {ok: false, name: ''};
     if (!boundedText(text, 160)) continue;
-    visitedTextLayouts += 1;
-    if (visitedTextLayouts > 512) return {ok: false, name: ''};
     const nodeIndex = layoutNodeIndexes[layoutIndex];
     const ancestry = semanticSnapshotPathToTarget(
       nodes.parentIndex, nodeIndex, selected.targetIndex, nodeCount
     );
     if (!ancestry.ok) return {ok: false, name: ''};
     if (!ancestry.path) continue;
+    visitedTextLayouts += 1;
+    if (visitedTextLayouts > 512) return {ok: false, name: ''};
     let allowed = true;
     for (const pathIndex of ancestry.path) {
       const node = semanticSnapshotNode(document, strings, pathIndex);
