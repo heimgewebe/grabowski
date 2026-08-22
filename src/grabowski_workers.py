@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import grabowski_mcp as base
 import grabowski_resources as resources
+import grabowski_browser_bidi as browser_bidi
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -49,6 +50,9 @@ BROWSER_SEMANTIC_TEMP_NAME = re.compile(
     r"\.browser-semantic-[0-9a-f]{32}\.(?:json|mjs)\Z"
 )
 BROWSER_SEMANTIC_TEMP_CLEANUP_LIMIT = 256
+BROWSER_BIDI_SESSION_NAME = ".webdriver-bidi-session.json"
+BROWSER_BIDI_ADAPTER_ID = "chrome-webdriver-bidi"
+BROWSER_FALLBACK_SAFE_START_ARGS = frozenset({"--headless", "--headless=new", "--disable-gpu", "--no-default-browser-check", "--disable-dev-shm-usage"})
 WORKER_LIMIT_CORE_PROPERTY = "--property=LimitCORE=0"
 DEFAULT_BROWSER_EXECUTABLES = (
     "/usr/bin/google-chrome",
@@ -311,6 +315,61 @@ def _browser_adapter_policy(
     }
 
 
+def _browser_record_adapter(record: dict[str, Any]) -> dict[str, Any]:
+    base_adapter = _browser_adapter_policy(record["executable"], require_supported=False)
+    try:
+        argv = json.loads(record.get("argv_json") or "[]")
+    except json.JSONDecodeError:
+        argv = []
+    expected_port = record.get("port")
+    if (
+        isinstance(argv, list)
+        and len(argv) == 4
+        and isinstance(argv[0], str)
+        and Path(argv[0]).is_absolute()
+        and isinstance(expected_port, int)
+        and not isinstance(expected_port, bool)
+        and argv[1:] == [
+            f"--port={expected_port}",
+            "--allowed-ips=127.0.0.1",
+            "--verbose",
+        ]
+        and base_adapter.get("family") == "chrome-stable"
+    ):
+        return {
+            **base_adapter,
+            "adapter_id": BROWSER_BIDI_ADAPTER_ID,
+            "protocol": "webdriver-bidi",
+            "selection_role": "qualified-pre-effect-fallback",
+            "implemented": True,
+        }
+    return base_adapter
+
+
+def _chromedriver_executable(raw: str) -> Path:
+    if not isinstance(raw, str):
+        raise ValueError("chromedriver executable must be text")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("chromedriver executable must be absolute")
+    resolved = candidate.resolve(strict=True)
+    metadata = resolved.stat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not os.access(resolved, os.X_OK)
+    ):
+        raise PermissionError("chromedriver executable metadata is unsafe")
+    configured = _configured_executables("GRABOWSKI_CHROMEDRIVER_EXECUTABLES", ())
+    cache_root = (operator.HOME / ".cache" / "selenium" / "chromedriver").resolve(strict=False)
+    if resolved not in configured and not resolved.is_relative_to(cache_root):
+        raise PermissionError(
+            "chromedriver executable is outside GRABOWSKI_CHROMEDRIVER_EXECUTABLES and the bounded Selenium cache"
+        )
+    return resolved
+
+
 _BROWSER_CDP_ADAPTER_IDS = frozenset({"chrome-cdp", "chromium-cdp"})
 _BROWSER_CDP_CAPABILITIES = (
     "loopback-debugging",
@@ -328,10 +387,22 @@ def _browser_adapter_runtime_contract(
             "capabilities": [],
             "endpoint": {"address": None, "port": port, "loopback_only": False},
         }
-    if adapter.get("adapter_id") not in _BROWSER_CDP_ADAPTER_IDS:
+    adapter_id = adapter.get("adapter_id")
+    if adapter_id in _BROWSER_CDP_ADAPTER_IDS:
+        capabilities = list(_BROWSER_CDP_CAPABILITIES)
+    elif adapter_id == BROWSER_BIDI_ADAPTER_ID:
+        capabilities = [
+            "loopback-webdriver",
+            "webdriver-bidi",
+            "profile-isolation",
+            "exclusive-profile-lease",
+            "terminal-outcome-readback",
+            "qualified-pre-effect-fallback",
+        ]
+    else:
         raise ValueError("browser adapter runtime contract is not implemented")
     return {
-        "capabilities": list(_BROWSER_CDP_CAPABILITIES),
+        "capabilities": capabilities,
         "endpoint": {
             "address": "127.0.0.1",
             "port": port,
@@ -400,7 +471,7 @@ def _browser_profile_identity(profile_path: str | None) -> str | None:
 def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
     if record.get("kind") != "browser":
         raise ValueError("browser control-plane projection requires a browser worker")
-    adapter = _browser_adapter_policy(record["executable"], require_supported=False)
+    adapter = _browser_record_adapter(record)
     runtime_contract = _browser_adapter_runtime_contract(
         adapter, port=record.get("port")
     )
@@ -460,7 +531,11 @@ def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
         "does_not_establish": [
             "browser authentication success",
             "profile credential contents",
-            "Firefox or WebDriver BiDi availability",
+            *(
+                ["Firefox availability", "WebDriver BiDi availability beyond this exact worker session"]
+                if adapter["adapter_id"] == BROWSER_BIDI_ADAPTER_ID
+                else ["Firefox or WebDriver BiDi availability"]
+            ),
             "remote debugging beyond loopback",
         ],
     }
@@ -489,6 +564,53 @@ def _write_config(directory: Path, config: dict[str, Any]) -> Path:
     finally:
         os.close(directory_fd)
     return target
+
+
+def _write_private_worker_json(directory: Path, name: str, value: dict[str, Any]) -> Path:
+    target = directory / name
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"private worker file already exists: {name}")
+    payload = (_canonical_json(value) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(target, flags, 0o600)
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return target
+
+
+def _read_browser_bidi_session(record: dict[str, Any]) -> dict[str, str]:
+    directory = Path(record["config_path"]).parent
+    target = directory / BROWSER_BIDI_SESSION_NAME
+    if target.is_symlink():
+        raise PermissionError("BiDi session file may not be a symlink")
+    metadata = target.stat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > 32 * 1024
+    ):
+        raise PermissionError("BiDi session file metadata is unsafe")
+    value = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise RuntimeError("BiDi session file contract mismatch")
+    result: dict[str, str] = {}
+    for key in ("session_id", "websocket_url", "browser_version", "driver_version"):
+        field = value.get(key)
+        if not isinstance(field, str) or not field:
+            raise RuntimeError("BiDi session identity is incomplete")
+        result[key] = field
+    return result
 
 
 def _write_browser_semantic_handle_key(directory: Path) -> None:
@@ -3032,6 +3154,134 @@ def _bounded_browser_state(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+BROWSER_BIDI_STATE_EXPRESSION = r"""JSON.stringify((()=>{
+  const semanticRoles=new Set(['button','link','textbox','checkbox','radio','combobox','listbox','option','slider','spinbutton','switch','tab','menuitem','treeitem','heading']);
+  const ids=globalThis.__grabowskiSemanticIds||(globalThis.__grabowskiSemanticIds=new WeakMap());
+  const counter=globalThis.__grabowskiSemanticCounter||(globalThis.__grabowskiSemanticCounter={value:1});
+  const nodeId=(el)=>{let value=ids.get(el);if(!value){value=counter.value++;ids.set(el,value)}return String(value)};
+  const clean=(v,n)=>String(v||'').replace(/\s+/g,' ').trim().slice(0,n);
+  const visible=(el)=>{const s=getComputedStyle(el);return !el.hidden&&el.getAttribute('aria-hidden')!=='true'&&s.display!=='none'&&s.visibility!=='hidden'};
+  const role=(el)=>{const explicit=clean(el.getAttribute('role'),64);if(semanticRoles.has(explicit))return explicit;const t=el.tagName.toLowerCase();if(t==='a'&&el.hasAttribute('href'))return 'link';if(t==='button')return 'button';if(/^h[1-6]$/.test(t))return 'heading';if(t==='textarea')return 'textbox';if(t==='select')return el.multiple?'listbox':'combobox';if(t==='option')return 'option';if(t==='input'){const ty=(el.getAttribute('type')||'text').toLowerCase();if(ty==='checkbox')return 'checkbox';if(ty==='radio')return 'radio';if(ty==='range')return 'slider';if(ty==='number')return 'spinbutton';if(['button','submit','reset'].includes(ty))return 'button';if(!['hidden','file','image','color','date','datetime-local','month','time','week'].includes(ty))return 'textbox'}return ''};
+  const name=(el,r)=>clean(el.getAttribute('aria-label')||el.getAttribute('title')||(r==='textbox'?el.getAttribute('placeholder'):'')||el.innerText||el.textContent||el.getAttribute('value'),160);
+  const target=(el)=>{if(el.tagName.toLowerCase()!=='a')return null;const raw=el.getAttribute('href');if(typeof raw!=='string'||!raw||raw!==raw.trim()||raw.includes('\\')||raw.length>4096||/[\u0000-\u0020\u007f]/.test(raw))return null;try{const u=new URL(raw,document.baseURI);if(!['http:','https:'].includes(u.protocol)||!u.hostname||u.username||u.password||u.port==='0'||u.href.length>4096)return null;return u.href}catch{return null}};
+  const nodes=[...document.querySelectorAll('a[href],button,input,textarea,select,option,[role],h1,h2,h3,h4,h5,h6')];
+  const elements=[];for(const el of nodes){if(elements.length>=80||!visible(el))continue;const r=role(el);if(!r)continue;elements.push({backend_node_id:nodeId(el),role:r,name:name(el,r),navigation_target:r==='link'?target(el):null})}
+  return {origin:location.origin,ready_state:document.readyState,title:clean(document.title,200),href:location.href,time_origin:String(performance.timeOrigin||''),elements};
+})())"""
+
+BROWSER_BIDI_TARGET_EXPRESSION_TEMPLATE = r"""JSON.stringify((()=>{const wanted='__NODE_ID__';const ids=globalThis.__grabowskiSemanticIds||(globalThis.__grabowskiSemanticIds=new WeakMap());const counter=globalThis.__grabowskiSemanticCounter||(globalThis.__grabowskiSemanticCounter={value:1});const nodeId=(el)=>{let value=ids.get(el);if(!value){value=counter.value++;ids.set(el,value)}return String(value)};const nodes=[...document.querySelectorAll('a[href],button,input,textarea,select,option,[role],h1,h2,h3,h4,h5,h6')];const semanticRoles=new Set(['button','link','textbox','checkbox','radio','combobox','listbox','option','slider','spinbutton','switch','tab','menuitem','treeitem','heading']);const visible=(el)=>{const s=getComputedStyle(el);return !el.hidden&&el.getAttribute('aria-hidden')!=='true'&&s.display!=='none'&&s.visibility!=='hidden'};const role=(el)=>{const e=(el.getAttribute('role')||'').trim();if(semanticRoles.has(e))return e;const t=el.tagName.toLowerCase();if(t==='a'&&el.hasAttribute('href'))return 'link';if(t==='button')return 'button';if(/^h[1-6]$/.test(t))return 'heading';if(t==='textarea')return 'textbox';if(t==='select')return el.multiple?'listbox':'combobox';if(t==='option')return 'option';if(t==='input'){const y=(el.getAttribute('type')||'text').toLowerCase();if(y==='checkbox')return 'checkbox';if(y==='radio')return 'radio';if(y==='range')return 'slider';if(y==='number')return 'spinbutton';if(['button','submit','reset'].includes(y))return 'button';if(!['hidden','file','image','color','date','datetime-local','month','time','week'].includes(y))return 'textbox'}return ''};let el=null;for(const item of nodes){if(!visible(item)||!role(item))continue;if(nodeId(item)===wanted){el=item;break}}if(!el||el.tagName.toLowerCase()!=='a')return null;const raw=el.getAttribute('href');if(typeof raw!=='string'||!raw||raw!==raw.trim()||raw.includes('\\')||raw.length>4096||/[\u0000-\u0020\u007f]/.test(raw))return null;try{const u=new URL(raw,document.baseURI);if(!['http:','https:'].includes(u.protocol)||!u.hostname||u.username||u.password||u.port==='0'||u.href.length>4096)return null;return u.href}catch{return null}})())"""
+
+BROWSER_BIDI_SCROLL_EXPRESSION_TEMPLATE = r"""JSON.stringify((()=>{const wanted='__NODE_ID__';const ids=globalThis.__grabowskiSemanticIds||(globalThis.__grabowskiSemanticIds=new WeakMap());const counter=globalThis.__grabowskiSemanticCounter||(globalThis.__grabowskiSemanticCounter={value:1});const nodeId=(el)=>{let value=ids.get(el);if(!value){value=counter.value++;ids.set(el,value)}return String(value)};const clean=(v,n)=>String(v||'').replace(/\s+/g,' ').trim().slice(0,n);const nodes=[...document.querySelectorAll('a[href],button,input,textarea,select,option,[role],h1,h2,h3,h4,h5,h6')];const semanticRoles=new Set(['button','link','textbox','checkbox','radio','combobox','listbox','option','slider','spinbutton','switch','tab','menuitem','treeitem','heading']);const visible=(el)=>{const s=getComputedStyle(el);return !el.hidden&&el.getAttribute('aria-hidden')!=='true'&&s.display!=='none'&&s.visibility!=='hidden'};const role=(el)=>{const e=clean(el.getAttribute('role'),64);if(semanticRoles.has(e))return e;const t=el.tagName.toLowerCase();if(t==='a'&&el.hasAttribute('href'))return 'link';if(t==='button')return 'button';if(/^h[1-6]$/.test(t))return 'heading';if(t==='textarea')return 'textbox';if(t==='select')return el.multiple?'listbox':'combobox';if(t==='option')return 'option';if(t==='input'){const y=(el.getAttribute('type')||'text').toLowerCase();if(y==='checkbox')return 'checkbox';if(y==='radio')return 'radio';if(y==='range')return 'slider';if(y==='number')return 'spinbutton';if(['button','submit','reset'].includes(y))return 'button';if(!['hidden','file','image','color','date','datetime-local','month','time','week'].includes(y))return 'textbox'}return ''};const name=(el,r)=>clean(el.getAttribute('aria-label')||el.getAttribute('title')||(r==='textbox'?el.getAttribute('placeholder'):'')||el.innerText||el.textContent||el.getAttribute('value'),160);let el=null;let r='';for(const item of nodes){if(!visible(item))continue;const candidate=role(item);if(!candidate)continue;if(nodeId(item)===wanted){el=item;r=candidate;break}}if(!el)return null;const n=name(el,r);el.scrollIntoView({block:'center',inline:'center'});return {role:r,name:n}})())"""
+
+_BROWSER_BIDI_ALLOWED_ROLES = frozenset({
+    "button", "link", "textbox", "checkbox", "radio", "combobox", "listbox",
+    "option", "slider", "spinbutton", "switch", "tab", "menuitem", "treeitem",
+    "heading",
+})
+
+
+def _browser_bidi_remote_value(result: dict[str, Any]) -> Any:
+    remote = result.get("result")
+    if not isinstance(remote, dict):
+        raise _BrowserSemanticError("protocol")
+    value_type = remote.get("type")
+    if value_type in {"string", "boolean"}:
+        return remote.get("value")
+    if value_type == "null":
+        return None
+    raise _BrowserSemanticError("protocol")
+
+
+def _browser_bidi_context(connection: browser_bidi.BidiJsonConnection) -> str:
+    try:
+        result = connection.call("browsingContext.getTree", {"maxDepth": 0})
+    except (browser_bidi.BrowserBidiError, OSError) as exc:
+        raise _BrowserSemanticError("transport") from exc
+    contexts = result.get("contexts")
+    if not isinstance(contexts, list) or len(contexts) != 1 or not isinstance(contexts[0], dict):
+        raise _BrowserSemanticError("protocol")
+    context = contexts[0].get("context")
+    if not isinstance(context, str) or not context:
+        raise _BrowserSemanticError("protocol")
+    return context
+
+
+def _browser_bidi_evaluate(connection: browser_bidi.BidiJsonConnection, context: str, expression: str) -> Any:
+    try:
+        result = connection.call("script.evaluate", {"expression": expression, "target": {"context": context, "sandbox": "grabowski-semantic"}, "awaitPromise": True, "resultOwnership": "none"})
+    except (browser_bidi.BrowserBidiError, OSError) as exc:
+        raise _BrowserSemanticError("transport") from exc
+    return _browser_bidi_remote_value(result)
+
+
+def _bounded_browser_bidi_state(raw: Any, *, context: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise _BrowserSemanticError("protocol")
+    elements: list[dict[str, Any]] = []
+    raw_elements = raw.get("elements") if isinstance(raw.get("elements"), list) else []
+    for index, item in enumerate(raw_elements):
+        if len(elements) >= BROWSER_MAX_ELEMENTS or not isinstance(item, dict):
+            continue
+        role = _bounded_semantic_text(item.get("role"), BROWSER_ELEMENT_ROLE_MAX)
+        if role not in _BROWSER_BIDI_ALLOWED_ROLES:
+            continue
+        target_digest = None
+        target = item.get("navigation_target")
+        if role == "link" and isinstance(target, str):
+            try:
+                canonical = _validate_browser_navigation_target(target)
+            except ValueError:
+                canonical = None
+            if canonical is not None:
+                target_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        backend_node_id = str(item.get("backend_node_id") or "")
+        if re.fullmatch(r"[1-9][0-9]{0,19}", backend_node_id) is None:
+            continue
+        elements.append({"backend_node_id": backend_node_id, "role": role, "name": _bounded_semantic_text(item.get("name"), BROWSER_ELEMENT_NAME_MAX), "navigation_target_sha256": target_digest})
+    href = str(raw.get("href") or "")[:4096]
+    time_origin = str(raw.get("time_origin") or "")[:128]
+    return _bounded_browser_state({
+        "origin": str(raw.get("origin") or "")[:512],
+        "ready_state": str(raw.get("ready_state") or "")[:32],
+        "title": str(raw.get("title") or "")[:200],
+        "main_frame_id": context[:128],
+        "loader_id": hashlib.sha256(f"{context}:{time_origin}".encode("utf-8")).hexdigest(),
+        "navigation_entry_id": hashlib.sha256(href.encode("utf-8")).hexdigest(),
+        "elements": elements,
+    })
+
+
+def _browser_bidi_decode_state(connection: browser_bidi.BidiJsonConnection, context: str) -> dict[str, Any]:
+    serialized = _browser_bidi_evaluate(connection, context, BROWSER_BIDI_STATE_EXPRESSION)
+    if not isinstance(serialized, str):
+        raise _BrowserSemanticError("protocol")
+    try:
+        raw = json.loads(serialized)
+    except json.JSONDecodeError as exc:
+        raise _BrowserSemanticError("protocol") from exc
+    return _bounded_browser_bidi_state(raw, context=context)
+
+
+def _browser_bidi_element_node_id(element: dict[str, Any]) -> str:
+    raw = str(element.get("backend_node_id") or "")
+    if re.fullmatch(r"[1-9][0-9]{0,19}", raw) is None:
+        raise _BrowserSemanticError("element-contract")
+    return raw
+
+
+def _browser_bidi_wait_for_post_state(connection: browser_bidi.BidiJsonConnection, context: str, *, expected_state: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_state: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        last_state = _browser_bidi_decode_state(connection, context)
+        if last_state["ready_state"] == "complete" and last_state != expected_state:
+            return last_state
+        time.sleep(0.05)
+    if last_state == expected_state:
+        raise _BrowserSemanticError("navigation-uncorrelated")
+    raise _BrowserSemanticError("transport")
+
+
 class CDPAdapter:
     """Internal browser-adapter boundary; no CDP vocabulary crosses it."""
 
@@ -3158,13 +3408,151 @@ class ChromeCDPAdapter(CDPAdapter):
         return state
 
 
+class ChromeWebDriverBidiAdapter(CDPAdapter):
+    """Qualified Chrome/WebDriver-BiDi semantic adapter for pre-effect fallback workers."""
+
+    def __init__(self, record: dict[str, Any], *, timeout_seconds: int) -> None:
+        self._record = record
+        self._timeout_seconds = timeout_seconds
+        self._session = _read_browser_bidi_session(record)
+
+    def _connection(self) -> browser_bidi.BidiJsonConnection:
+        return browser_bidi.BidiJsonConnection(
+            self._session["websocket_url"], timeout_seconds=self._timeout_seconds
+        )
+
+    def observe_state(self) -> dict[str, Any]:
+        with self._connection() as connection:
+            context = _browser_bidi_context(connection)
+            return _browser_bidi_decode_state(connection, context)
+
+    def _revalidate(
+        self,
+        connection: browser_bidi.BidiJsonConnection,
+        context: str,
+        expected_state: dict[str, Any],
+    ) -> None:
+        fresh_state = _browser_bidi_decode_state(connection, context)
+        if fresh_state != expected_state:
+            raise _BrowserSemanticError("stale-snapshot")
+
+    def _navigate_with_readback(
+        self,
+        connection: browser_bidi.BidiJsonConnection,
+        context: str,
+        target: str,
+        *,
+        expected_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            connection.call(
+                "browsingContext.navigate",
+                {"context": context, "url": target, "wait": "complete"},
+            )
+        except (browser_bidi.BrowserBidiError, OSError) as exc:
+            raise _BrowserSemanticError("transport") from exc
+        return _browser_bidi_wait_for_post_state(
+            connection,
+            context,
+            expected_state=expected_state,
+            timeout_seconds=self._timeout_seconds,
+        )
+
+    def perform_local_ui_effect(
+        self,
+        intent: dict[str, Any],
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, Any],
+    ) -> dict[str, Any]:
+        if intent.get("action_kind") != "scroll_into_view":
+            raise _BrowserSemanticError("unsupported-op")
+        node_id = _browser_bidi_element_node_id(expected_element)
+        with self._connection() as connection:
+            context = _browser_bidi_context(connection)
+            self._revalidate(connection, context, expected_state)
+            expression = BROWSER_BIDI_SCROLL_EXPRESSION_TEMPLATE.replace(
+                "__NODE_ID__", node_id
+            )
+            serialized = _browser_bidi_evaluate(connection, context, expression)
+            if not isinstance(serialized, str):
+                raise _BrowserSemanticError("element-contract")
+            try:
+                observed = json.loads(serialized)
+            except json.JSONDecodeError as exc:
+                raise _BrowserSemanticError("protocol") from exc
+            if not isinstance(observed, dict) or (
+                _bounded_semantic_text(observed.get("role"), BROWSER_ELEMENT_ROLE_MAX)
+                != expected_element.get("role")
+                or _bounded_semantic_text(observed.get("name"), BROWSER_ELEMENT_NAME_MAX)
+                != expected_element.get("name")
+            ):
+                raise _BrowserSemanticError("stale-snapshot")
+            return _browser_bidi_decode_state(connection, context)
+
+    def navigate(
+        self,
+        navigation_target: str,
+        *,
+        expected_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        target = _validate_browser_navigation_target(navigation_target)
+        with self._connection() as connection:
+            context = _browser_bidi_context(connection)
+            self._revalidate(connection, context, expected_state)
+            return self._navigate_with_readback(
+                connection, context, target, expected_state=expected_state
+            )
+
+    def activate_link(
+        self,
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, Any],
+    ) -> dict[str, Any]:
+        node_id = _browser_bidi_element_node_id(expected_element)
+        expected_digest = expected_element.get("navigation_target_sha256")
+        if not isinstance(expected_digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", expected_digest
+        ) is None:
+            raise _BrowserSemanticError("element-contract")
+        with self._connection() as connection:
+            context = _browser_bidi_context(connection)
+            self._revalidate(connection, context, expected_state)
+            expression = BROWSER_BIDI_TARGET_EXPRESSION_TEMPLATE.replace(
+                "__NODE_ID__", node_id
+            )
+            serialized = _browser_bidi_evaluate(connection, context, expression)
+            if not isinstance(serialized, str):
+                raise _BrowserSemanticError("element-contract")
+            try:
+                target_value = json.loads(serialized)
+            except json.JSONDecodeError as exc:
+                raise _BrowserSemanticError("protocol") from exc
+            if not isinstance(target_value, str):
+                raise _BrowserSemanticError("element-contract")
+            try:
+                target = _validate_browser_navigation_target(target_value)
+            except ValueError as exc:
+                raise _BrowserSemanticError("element-contract") from exc
+            observed_digest = hashlib.sha256(target.encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(observed_digest, expected_digest):
+                raise _BrowserSemanticError("stale-snapshot")
+            return self._navigate_with_readback(
+                connection, context, target, expected_state=expected_state
+            )
+
+
 def _browser_semantic_adapter(
     record: dict[str, Any], *, timeout_seconds: int
 ) -> CDPAdapter:
-    adapter = _browser_adapter_policy(record["executable"], require_supported=False)
-    if adapter.get("adapter_id") not in _BROWSER_CDP_ADAPTER_IDS:
-        raise RuntimeError("browser worker has no implemented semantic adapter")
-    return ChromeCDPAdapter(record, timeout_seconds=timeout_seconds)
+    adapter = _browser_record_adapter(record)
+    adapter_id = adapter.get("adapter_id")
+    if adapter_id in _BROWSER_CDP_ADAPTER_IDS:
+        return ChromeCDPAdapter(record, timeout_seconds=timeout_seconds)
+    if adapter_id == BROWSER_BIDI_ADAPTER_ID:
+        return ChromeWebDriverBidiAdapter(record, timeout_seconds=timeout_seconds)
+    raise RuntimeError("browser worker has no implemented semantic adapter")
 
 
 def _browser_semantic_handle_key(record: dict[str, Any]) -> bytes:
@@ -4148,23 +4536,15 @@ def browser_semantic_gateway(
 # --- End browser semantic contract ------------------------------------------
 
 
-def browser_start(
-    executable: str,
+def _browser_start_cdp_worker(
     *,
+    binary: Path,
+    adapter: dict[str, Any],
     port: int,
-    args: list[str] | None = None,
-    persistent_profile: str | None = None,
-    runtime_seconds: int = 3600,
+    extra: list[str],
+    persistent_profile: str | None,
+    runtime: int,
 ) -> dict[str, Any]:
-    runtime = operator._job_runtime(runtime_seconds)
-    binary = _executable(
-        executable,
-        environment_name="GRABOWSKI_BROWSER_EXECUTABLES",
-        defaults=DEFAULT_BROWSER_EXECUTABLES,
-    )
-    adapter = _browser_adapter_policy(binary)
-    extra = _validate_args(args)
-    _browser_adapter_launch_preflight(adapter, port=port, args=extra)
     worker_id = uuid.uuid4().hex[:20]
     profile, ephemeral = _browser_profile(worker_id, persistent_profile)
     argv = _browser_adapter_launch_argv(
@@ -4175,7 +4555,6 @@ def browser_start(
         args=extra,
     )
     lease_keys = [f"port:{port}", f"browser-profile:{profile}"]
-    ephemeral_paths = [profile] if ephemeral else []
     config = {
         "schema_version": 1,
         "kind": "browser",
@@ -4193,9 +4572,204 @@ def browser_start(
         port=port,
         display_number=None,
         lease_keys=lease_keys,
-        ephemeral_paths=ephemeral_paths,
+        ephemeral_paths=[profile] if ephemeral else [],
         runtime_seconds=runtime,
         writable_paths=[WORKER_STATE, profile],
+    )
+
+
+def _browser_start_bidi_worker(
+    *,
+    binary: Path,
+    driver: Path,
+    port: int,
+    extra: list[str],
+    runtime: int,
+    fallback_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    worker_id = uuid.uuid4().hex[:20]
+    profile, ephemeral = _browser_profile(worker_id, None)
+    if not ephemeral:
+        raise RuntimeError("qualified BiDi fallback unexpectedly received a persistent profile")
+    argv = [
+        str(driver),
+        f"--port={port}",
+        "--allowed-ips=127.0.0.1",
+        "--verbose",
+    ]
+    lease_keys = [f"port:{port}", f"browser-profile:{profile}"]
+    config = {
+        "schema_version": 1,
+        "kind": "browser",
+        "argv": argv,
+        "environment": {"HOME": str(operator.HOME)},
+        "xvfb_argv": None,
+        "worker_id": worker_id,
+    }
+    result = _start(
+        kind="browser",
+        executable=binary,
+        argv=argv,
+        config=config,
+        profile_path=profile,
+        port=port,
+        display_number=None,
+        lease_keys=lease_keys,
+        ephemeral_paths=[profile],
+        runtime_seconds=runtime,
+        writable_paths=[WORKER_STATE, profile],
+    )
+    if result["worker"]["state"] != "running":
+        result["fallback"] = {
+            **fallback_evidence,
+            "selected_adapter": BROWSER_BIDI_ADAPTER_ID,
+            "session_ready": False,
+        }
+        return result
+    try:
+        browser_bidi.driver_ready(port, timeout_seconds=min(10.0, float(runtime)))
+        session = browser_bidi.create_chrome_session(
+            port=port,
+            chrome=binary,
+            profile=profile,
+            args=extra,
+            timeout_seconds=min(10.0, float(runtime)),
+        )
+        record = _row(worker_id)
+        directory = Path(record["config_path"]).parent
+        _write_private_worker_json(
+            directory,
+            BROWSER_BIDI_SESSION_NAME,
+            {"schema_version": 1, **session},
+        )
+    except Exception as session_error:
+        try:
+            stopped = worker_stop(worker_id, expected_kind="browser")
+            settled = worker_status(worker_id, expected_kind="browser")
+        except Exception as compensation_error:
+            raise RuntimeError(
+                "BiDi session setup failed and worker compensation could not be verified"
+            ) from compensation_error
+        if (
+            stopped["worker"]["state"] != "stopped"
+            or settled["state"] != "stopped"
+            or resources.inspect_resource(f"port:{port}") is not None
+            or resources.inspect_resource(f"browser-profile:{profile}") is not None
+            or profile.exists()
+        ):
+            raise RuntimeError(
+                "BiDi session setup failed and worker compensation remained incomplete"
+            ) from session_error
+        raise
+    result["worker"] = _public(_row(worker_id))
+    result["fallback"] = {
+        **fallback_evidence,
+        "selected_adapter": BROWSER_BIDI_ADAPTER_ID,
+        "session_ready": True,
+    }
+    return result
+
+
+def browser_start(
+    executable: str,
+    *,
+    port: int,
+    args: list[str] | None = None,
+    persistent_profile: str | None = None,
+    runtime_seconds: int = 3600,
+    chromedriver_executable: str | None = None,
+) -> dict[str, Any]:
+    runtime = operator._job_runtime(runtime_seconds)
+    binary = _executable(
+        executable,
+        environment_name="GRABOWSKI_BROWSER_EXECUTABLES",
+        defaults=DEFAULT_BROWSER_EXECUTABLES,
+    )
+    adapter = _browser_adapter_policy(binary)
+    extra = _validate_args(args)
+    _browser_adapter_launch_preflight(adapter, port=port, args=extra)
+
+    if chromedriver_executable is None:
+        return _browser_start_cdp_worker(
+            binary=binary,
+            adapter=adapter,
+            port=port,
+            extra=extra,
+            persistent_profile=persistent_profile,
+            runtime=runtime,
+        )
+
+    if adapter.get("family") != "chrome-stable":
+        raise ValueError("qualified BiDi fallback is limited to Chrome Stable")
+    if persistent_profile is not None:
+        raise ValueError("qualified BiDi fallback requires an ephemeral primary and standby")
+    if any(item not in BROWSER_FALLBACK_SAFE_START_ARGS for item in extra):
+        raise PermissionError(
+            "qualified BiDi fallback requires effect-free Chrome startup arguments"
+        )
+    driver = _chromedriver_executable(chromedriver_executable)
+
+    primary = _browser_start_cdp_worker(
+        binary=binary,
+        adapter=adapter,
+        port=port,
+        extra=extra,
+        persistent_profile=None,
+        runtime=runtime,
+    )
+    primary_worker = primary["worker"]
+    primary_id = primary_worker["worker_id"]
+    primary_ready = False
+    if primary_worker["state"] == "running":
+        primary_ready = browser_bidi.cdp_endpoint_ready(
+            port, timeout_seconds=min(5.0, float(runtime))
+        )
+    if primary_ready:
+        primary["fallback"] = {
+            "schema_version": 1,
+            "armed": True,
+            "selected": False,
+            "selected_adapter": "chrome-cdp",
+            "decision_reason": "primary_cdp_ready_before_worker_return",
+            "effect_started": False,
+            "effect_state": "not_started",
+        }
+        return primary
+
+    if primary_worker["state"] == "running":
+        stopped = worker_stop(primary_id, expected_kind="browser")
+        primary_state = stopped["worker"]["state"]
+        if primary_state != "stopped":
+            raise RuntimeError("CDP primary could not be terminalized before fallback")
+    else:
+        primary_state = worker_status(primary_id, expected_kind="browser")["state"]
+        if primary_state not in WORKER_HISTORY_STATES:
+            raise RuntimeError("CDP primary startup outcome is not terminal")
+
+    if resources.inspect_resource(f"port:{port}") is not None:
+        raise RuntimeError("CDP primary port lease remains active after terminalization")
+    if browser_bidi.cdp_endpoint_ready(port, timeout_seconds=0.5):
+        raise RuntimeError("CDP primary endpoint remains reachable after terminalization")
+
+    fallback_evidence = {
+        "schema_version": 1,
+        "armed": True,
+        "selected": True,
+        "primary_worker_id": primary_id,
+        "primary_adapter": "chrome-cdp",
+        "primary_state": primary_state,
+        "decision_reason": "primary_cdp_unavailable_before_worker_return",
+        "effect_started": False,
+        "effect_state": "not_started",
+        "fallback_authorized": True,
+    }
+    return _browser_start_bidi_worker(
+        binary=binary,
+        driver=driver,
+        port=port,
+        extra=extra,
+        runtime=runtime,
+        fallback_evidence=fallback_evidence,
     )
 
 
@@ -4667,8 +5241,16 @@ def grabowski_browser_worker_start(
     args: list[str] | None = None,
     persistent_profile: str | None = None,
     runtime_seconds: int = 3600,
+    chromedriver_executable: str | None = None,
 ) -> dict[str, Any]:
-    """Start one agent-owned browser with loopback-only CDP in a separate unit."""
+    """Start Chrome/CDP, optionally arming one fail-closed startup-only BiDi standby.
+
+    Supplying ``chromedriver_executable`` does not select BiDi directly. Grabowski first
+    starts the canonical Chrome/CDP worker and returns it when the CDP endpoint becomes
+    ready. Only when CDP startup remains unavailable before any worker is returned does
+    Grabowski terminalize that private primary attempt and start a new Chrome/WebDriver-
+    BiDi worker on the same leased loopback port. No later worker/backend switch exists.
+    """
     operator._require_operator_mutation("browser_worker")
     result = browser_start(
         executable,
@@ -4676,6 +5258,7 @@ def grabowski_browser_worker_start(
         args=args,
         persistent_profile=persistent_profile,
         runtime_seconds=runtime_seconds,
+        chromedriver_executable=chromedriver_executable,
     )
     _audit("browser-worker-start", result)
     return result
