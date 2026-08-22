@@ -877,6 +877,26 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(ensure_parameters["source_kind"], "work_lane")
         self.assertEqual(ensure_parameters["source_id"], result["lane_id"])
 
+    def test_invalid_operator_obligation_source_is_rejected_before_effects(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "operator_obligation"
+        params["source_id"] = "metarepo-local-mcp-single-lockfile-v1-20260822"
+        acquire = Mock()
+        ensure = Mock()
+        with self.assertRaisesRegex(
+            ValueError, "source_id for operator_obligation must match goo-"
+        ):
+            work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+
     def test_existing_evidence_source_remains_checkout_lifecycle_source(self) -> None:
         params = self.parameters()
         params["source_kind"] = "operator_obligation"

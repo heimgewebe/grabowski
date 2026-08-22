@@ -26,6 +26,10 @@ class DurableSystemdContractTests(unittest.TestCase):
         )
         self.assertIn("Environment=XDG_RUNTIME_DIR=/run/user/1000", text)
         self.assertIn(
+            "Environment=HEIM_NODE_RUNTIME_ENV_DIR=/home/alex/.local/state/grabowski/node-runtime-env",
+            text,
+        )
+        self.assertIn(
             "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus", text
         )
         self.assertIn("WantedBy=multi-user.target", text)
