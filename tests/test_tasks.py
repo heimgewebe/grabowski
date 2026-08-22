@@ -2666,7 +2666,9 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks, "_observe", return_value=observation), patch.object(
             tasks, "_launch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
         ):
             resumed = tasks.grabowski_task_resume(task_id)
@@ -2698,7 +2700,9 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks, "_observe", return_value=observation), patch.object(
             tasks, "_launch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
         ):
             resumed = tasks.grabowski_task_resume(task_id)
@@ -2727,7 +2731,9 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks, "_observe", return_value=observation), patch.object(
             tasks, "_launch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 126}
         ):
             resumed = tasks.grabowski_task_resume(task_id)
@@ -4586,6 +4592,7 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks, "_reconcile_observation", return_value=admitted),
             patch.object(tasks, "_observe", return_value=revalidated),
             patch.object(tasks, "_launch", side_effect=launch_with_persisted_binding),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks.base, "_append_audit"),
             patch.object(
                 tasks,
@@ -4669,6 +4676,7 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks, "_reconcile_observation", return_value=admitted),
             patch.object(tasks, "_observe", return_value=revalidated),
             patch.object(tasks, "_launch", side_effect=launch_with_retry_edge),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks.base, "_append_audit"),
             patch.object(
                 tasks,
@@ -4873,6 +4881,7 @@ class TaskTests(unittest.TestCase):
                 side_effect=fail_after_binding,
             ) as renew,
             patch.object(tasks, "_launch") as launch,
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(
                 tasks,
                 "_require_recovery_gate",
