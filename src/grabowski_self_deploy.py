@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+from contextvars import ContextVar
 from pathlib import Path
 import re
 import secrets
@@ -91,6 +92,9 @@ SIDECAR_ROUTER_PIN = (
 SIDECAR_RUNTIME_PYTHON = Path.home() / ".local/share/grabowski-mcp/.venv/bin/python"
 MAX_SIDECAR_SOURCE_BYTES = 1024 * 1024
 MAX_SIDECAR_READBACK_BYTES = 256 * 1024
+_RUNTIME_PROOF_CACHE: ContextVar[dict[tuple[str, str, str], bool] | None] = ContextVar(
+    "grabowski_runtime_proof_cache", default=None
+)
 
 
 class BlueGreenCutoverError(RuntimeError):
@@ -1769,7 +1773,10 @@ def _sidecars_match_deploy_head(command_fields: dict[str, Any]) -> bool:
 
 
 def _missing_finalization_deploy_is_runtime_proven(
-    status: dict[str, Any], command_fields: dict[str, Any]
+    status: dict[str, Any],
+    command_fields: dict[str, Any],
+    *,
+    runtime_proof_cache: dict[tuple[str, str, str], bool] | None = None,
 ) -> bool:
     """Treat an exited deploy as terminal only when its active release proves the head.
 
@@ -1798,6 +1805,18 @@ def _missing_finalization_deploy_is_runtime_proven(
         or str(properties.get("ExecMainStatus")) != "0"
     ):
         return False
+    effective_cache = (
+        runtime_proof_cache
+        if runtime_proof_cache is not None
+        else _RUNTIME_PROOF_CACHE.get()
+    )
+    cache_key = (
+        str(command_fields.get("source_kind")),
+        str(command_fields.get("canonical_repository")),
+        str(command_fields.get("expected_head")),
+    )
+    if effective_cache is not None and cache_key in effective_cache:
+        return effective_cache[cache_key]
     deployment = base._deployment_metadata()
     required_release_integrity = (
         "manifest_parse_valid",
@@ -1814,13 +1833,16 @@ def _missing_finalization_deploy_is_runtime_proven(
         "environment_compatibility_valid",
         "provenance_valid",
     )
-    return bool(
+    proven = bool(
         isinstance(deployment, dict)
         and deployment.get("completion_status") == "complete"
         and deployment.get("repo_head") == command_fields.get("expected_head")
         and all(deployment.get(key) is True for key in required_release_integrity)
         and _sidecars_match_deploy_head(command_fields)
     )
+    if effective_cache is not None:
+        effective_cache[cache_key] = proven
+    return proven
 
 
 def inflight_runtime_job_evidence(
@@ -1859,16 +1881,21 @@ def inflight_runtime_job_evidence(
         evidence["inflight_units"].append(str(pending))
         evidence["blocking_units"].append(str(pending))
     retained: list[str] = []
+    runtime_proof_cache: dict[tuple[str, str, str], bool] = {}
     for unit in index["units"]:
+        cache_token = _RUNTIME_PROOF_CACHE.set(runtime_proof_cache)
         try:
-            classified = _classify_indexed_job(jobs_root / unit)
-        except IndexedRuntimeJobConflict as exc:
-            # Unreadable is not absent.  An entry this reader cannot judge must
-            # close the gate rather than vanish from it.
-            evidence["blocking_units"].append(str(unit))
-            evidence["error"] = str(exc)
-            retained.append(str(unit))
-            continue
+            try:
+                classified = _classify_indexed_job(jobs_root / unit)
+            except IndexedRuntimeJobConflict as exc:
+                # Unreadable is not absent.  An entry this reader cannot judge must
+                # close the gate rather than vanish from it.
+                evidence["blocking_units"].append(str(unit))
+                evidence["error"] = str(exc)
+                retained.append(str(unit))
+                continue
+        finally:
+            _RUNTIME_PROOF_CACHE.reset(cache_token)
         if classified["terminal"]:
             evidence["pruned_units"].append(str(unit))
             continue
@@ -1929,6 +1956,7 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
 
     matches: list[dict[str, Any]] = []
     retained_units: list[str] = []
+    runtime_proof_cache: dict[tuple[str, str, str], bool] = {}
     for entry in reversed(entries):
         if entry.is_symlink() or not entry.is_dir():
             raise RuntimeError(f"durable job entry is not a real directory: {entry.name}")
@@ -2004,7 +2032,9 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
             )
         if final_status in TERMINAL_JOB_STATUSES:
             continue
-        if _missing_finalization_deploy_is_runtime_proven(status, candidate_fields):
+        if _missing_finalization_deploy_is_runtime_proven(
+            status, candidate_fields, runtime_proof_cache=runtime_proof_cache
+        ):
             continue
         retained_units.append(entry.name)
         if final_status not in REUSABLE_JOB_STATUSES:

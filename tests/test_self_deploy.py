@@ -1524,6 +1524,54 @@ class SelfDeployToolTests(unittest.TestCase):
                 )
                 sidecar_readback.assert_not_called()
 
+    def test_missing_finalization_runtime_proof_is_cached_per_deploy_identity(self) -> None:
+        status = {
+            "final_status": "missing_finalization_evidence",
+            "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+            "properties": {
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+            },
+        }
+        deployment = {
+            "completion_status": "complete",
+            "repo_head": "a" * 40,
+            "manifest_parse_valid": True,
+            "manifest_schema_valid": True,
+            "release_path_valid": True,
+            "release_id_valid": True,
+            "repo_head_valid": True,
+            "stable_runtime_manifest_valid": True,
+            "runtime_pointer_valid": True,
+            "artifact_integrity_valid": True,
+            "runtime_asset_identity_valid": True,
+            "release_python_identity_valid": True,
+            "runtime_binding_valid": True,
+            "environment_compatibility_valid": True,
+            "provenance_valid": True,
+        }
+        fields = {
+            "source_kind": "canonical-main",
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "expected_head": "a" * 40,
+        }
+        cache: dict[tuple[str, str, str], bool] = {}
+        with patch.object(
+            SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+        ) as deployment_readback, patch.object(
+            SELF_DEPLOY, "_sidecars_match_deploy_head", return_value=True
+        ) as sidecar_readback:
+            for _ in range(2):
+                self.assertTrue(
+                    SELF_DEPLOY._missing_finalization_deploy_is_runtime_proven(
+                        status, fields, runtime_proof_cache=cache
+                    )
+                )
+        deployment_readback.assert_called_once_with()
+        sidecar_readback.assert_called_once_with(fields)
+
     def test_sidecar_readback_allows_detached_worktree_source_kind(self) -> None:
         repo = ROOT
         fields = {
