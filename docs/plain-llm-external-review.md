@@ -129,7 +129,7 @@ python3 tools/external_review_plain.py \
   --manifest .review-packets/pr-123/manifest.json \
   --output .review-audits/pr-123-grok-external.json \
   --provider grok \
-  --model grok-4.5
+  --model grok-4.6
 ```
 
 The default executable name is `grok`, but it must resolve to the canonical

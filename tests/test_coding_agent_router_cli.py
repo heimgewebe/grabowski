@@ -161,7 +161,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(stored["pools"], {})
         self.assertEqual(stored["catalog"], fake_probe)
         self.assertEqual(stored["catalog_sha256"], validation["catalog_sha256"])
-        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v7")
+        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v8")
 
         status, readback = self._main(["status"])
         self.assertEqual(status, 0)
@@ -264,7 +264,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             if harness == "grok" and arguments == ["models"]:
                 return {
                     "ok": True,
-                    "stdout": "Default model: grok-4.5\nAvailable models:\n* grok-4.5 default\n",
+                    "stdout": "Default model: grok-4.6\nAvailable models:\n* grok-4.6 default\n",
                     "stderr": "",
                 }
             return {"ok": False, "stdout": "", "stderr": ""}
