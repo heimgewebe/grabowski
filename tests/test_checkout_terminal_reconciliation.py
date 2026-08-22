@@ -732,6 +732,77 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual("ready", evidence["task_spec_state"])
         self.assertEqual("e" * 40, evidence["registry_commit"])
 
+    def test_bureau_task_rejects_control_revision_change_during_projection(self) -> None:
+        task = {"id": "TASK-T001", "state": "planned"}
+        completed = subprocess.CompletedProcess(
+            ["git"], 0, stdout=json.dumps(task), stderr=""
+        )
+        projection = {
+            "schema_version": 1,
+            "result": {
+                "schema_version": 1,
+                "tasks": [
+                    {
+                        "task_id": "TASK-T001",
+                        "effective_state": "verified",
+                        "registry_state": "planned",
+                        "task_spec_state": "ready",
+                    }
+                ],
+            },
+        }
+        before = {"head": "e" * 40, "control_root": str(self.repo)}
+        after = {"head": "f" * 40, "control_root": str(self.repo)}
+        with (
+            patch.object(
+                sources.bureau_leases,
+                "inspect_bureau_control_checkout",
+                side_effect=[before, after],
+            ),
+            patch.object(sources, "_github_json", return_value={"sha": "e" * 40}),
+            patch.object(sources, "_bureau_json", return_value=projection),
+            patch.object(checkouts, "_git_read", return_value=completed),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "changed during terminal observation"
+            ):
+                sources.bureau_task_terminal_evidence("TASK-T001")
+
+    def test_bureau_task_rejects_projection_from_other_registry_revision(self) -> None:
+        task = {"id": "TASK-T001", "state": "planned"}
+        completed = subprocess.CompletedProcess(
+            ["git"], 0, stdout=json.dumps(task), stderr=""
+        )
+        projection = {
+            "schema_version": 1,
+            "result": {
+                "schema_version": 1,
+                "tasks": [
+                    {
+                        "task_id": "TASK-T001",
+                        "effective_state": "verified",
+                        "registry_state": "ready",
+                        "task_spec_state": "ready",
+                    }
+                ],
+            },
+        }
+        control = {"head": "e" * 40, "control_root": str(self.repo)}
+        with (
+            patch.object(
+                sources.bureau_leases,
+                "inspect_bureau_control_checkout",
+                return_value=control,
+            ),
+            patch.object(sources, "_github_json", return_value={"sha": "e" * 40}),
+            patch.object(sources, "_bureau_json", return_value=projection),
+            patch.object(checkouts, "_git_read", return_value=completed),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "registry state differs from inspected control revision"
+            ):
+                sources.bureau_task_terminal_evidence("TASK-T001")
+
     def test_bureau_task_does_not_fallback_to_terminal_git_state(self) -> None:
         task = {"id": "TASK-T001", "state": "verified"}
         raw = json.dumps(task)

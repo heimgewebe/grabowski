@@ -196,6 +196,22 @@ def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
     if not isinstance(task, dict) or task.get("id") != source_id:
         raise RuntimeError("Bureau task source identity differs")
     projection = _bureau_task_projection(source_id, control_root=control_root)
+    post_control = bureau_leases.inspect_bureau_control_checkout(require_current=True)
+    if (
+        post_control.get("head") != control["head"]
+        or post_control.get("control_root") != control["control_root"]
+    ):
+        raise RuntimeError("Bureau control checkout changed during terminal observation")
+    post_github_main = _github_json(["api", "repos/heimgewebe/bureau/commits/main"])
+    if (
+        not isinstance(post_github_main, dict)
+        or post_github_main.get("sha") != control["head"]
+    ):
+        raise RuntimeError("Bureau control checkout changed during terminal observation")
+    if projection["registry_state"] != task.get("state"):
+        raise RuntimeError(
+            "Bureau status projection registry state differs from inspected control revision"
+        )
     registry_tree = checkouts._git_read(
         control_root,
         ["rev-parse", f"{control['head']}:registry"],
