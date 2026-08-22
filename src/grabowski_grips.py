@@ -777,13 +777,15 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "operator-obligation-close": GripSpec(
         name="operator-obligation-close",
-        version="1.0",
-        summary="Close an operator obligation only as completed, explicitly blocked, or durably delegated.",
+        version="1.1",
+        summary="Close an operator obligation with explicit process-only or convergence-bound completion semantics.",
         effect=MUTATING,
         required_parameters=("obligation_id", "outcome", "evidence"),
         acceptance_ids=(
             "open-binding",
             "delegation-live-observation",
+            "completion-classification",
+            "systemic-convergence-gate",
             "terminal-shape",
             "create-only-close",
             "response-end-decision",
@@ -1119,6 +1121,13 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
         "source_kind may be bureau_task, github_issue, operator_obligation, thread_focus, work_lane, direct or direct-user; "
         "direct and direct-user are rebound server-side to durable work_lane lifecycle evidence, while unsupported "
         "source kinds fail closed before checkout creation",
+    ),
+    "operator-obligation-close": (
+        "outcome=completed requires closure_classification with explicit convergence_required and reason; missing classification never defaults to process-only",
+        "convergence_required=false is accepted only with reason=process_only and makes no systemic-convergence claim; an optional canonical system_convergence_plan is persisted as an explicit non-systemic/bypass binding",
+        "convergence_required=true requires reason=systemic plus the exact passed convergence-assess grip result with a v2 terminally_closed assessment; its receipt, output, parameters, request file, protocol head, assessment id and closure_id=operator-obligation:<obligation_id> are revalidated before the create-only close",
+        "when system_convergence_plan is supplied it is recomputed by the canonical convergence module, not by obligation code; systemic plan and assessment protocol heads must match",
+        "blocked and delegated outcomes may not carry closure_classification",
     ),
     "n8n-workflow-edge-verify": (
         "provider_profile must be a server-known fixed target; expected_state must be isolated or final; "
@@ -13237,13 +13246,69 @@ def _operator_delegation_terminal_observation(value: Any) -> dict[str, str]:
     }
 
 
+def _revalidate_operator_obligation_systemic_convergence(
+    dispatch_parameters: dict[str, Any],
+    runner: CommandRunner,
+) -> dict[str, Any] | None:
+    if dispatch_parameters.get("outcome") != "completed":
+        return None
+    obligation_id = dispatch_parameters.get("obligation_id")
+    if not isinstance(obligation_id, str):
+        return None
+    replay_classification = (
+        grabowski_operator_obligation.exact_completion_replay_classification(
+            dispatch_parameters
+        )
+    )
+    if replay_classification is not None:
+        return replay_classification
+    classification = grabowski_operator_obligation.validate_completion_classification(
+        dispatch_parameters.get("closure_classification"),
+        obligation_id=obligation_id,
+    )
+    if classification.get("convergence_required") is not True:
+        return classification
+    assess_parameters = {
+        "request_path": classification["request_path"],
+        "expected_request_sha256": classification["request_sha256"],
+        "expected_protocol_head": classification["protocol_head"],
+    }
+    try:
+        live_output = grabowski_convergence.assess(assess_parameters, runner)
+    except (
+        grabowski_convergence.ConvergenceInputError,
+        grabowski_convergence.ConvergenceExecutionError,
+    ) as exc:
+        raise grabowski_operator_obligation.OperatorObligationCompletionClassificationError(
+            f"systemic convergence live revalidation failed: {exc}"
+        ) from exc
+    live_receipt_output = {
+        **live_output,
+        "receipt_status": (
+            "passed" if live_output.get("closure_allowed") is True else "blocked"
+        ),
+    }
+    if (
+        live_output.get("closure_allowed") is not True
+        or live_output.get("decision") != "allow_closure"
+    ):
+        raise grabowski_operator_obligation.OperatorObligationCompletionClassificationError(
+            "systemic convergence is no longer terminally closed at close time"
+        )
+    if sha256_json(live_receipt_output) != classification["output_sha256"]:
+        raise grabowski_operator_obligation.OperatorObligationCompletionClassificationError(
+            "systemic convergence live output differs from the supplied convergence receipt"
+        )
+    return classification
+
+
 def _run_operator_obligation_close(
     spec: GripSpec,
     parameters: dict[str, Any],
     receipt: Receipt,
     runner: CommandRunner,
 ) -> dict[str, Any]:
-    del spec, runner
+    del spec
     dispatch_parameters = dict(parameters)
     if dispatch_parameters.get("outcome") == "delegated":
         try:
@@ -13269,8 +13334,28 @@ def _run_operator_obligation_close(
         )
     else:
         _check(receipt, "delegation_live_observation", "skip", "outcome is not delegated")
+    if dispatch_parameters.get("outcome") != "completed":
+        _check(receipt, "completion_classification", "skip", "outcome is not completed")
+        _check(receipt, "systemic_convergence_gate", "skip", "outcome is not completed")
     try:
+        _revalidate_operator_obligation_systemic_convergence(
+            dispatch_parameters,
+            runner,
+        )
         output = grabowski_operator_obligation.close_obligation(dispatch_parameters)
+    except grabowski_operator_obligation.OperatorObligationCompletionClassificationError as exc:
+        _check(receipt, "completion_classification", "fail", str(exc))
+        _check(receipt, "systemic_convergence_gate", "fail", str(exc))
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["completion_classification_invalid"],
+            "error": str(exc),
+            "continuation_required": True,
+            "response_may_end": False,
+            "work_complete": False,
+            "convergence_gate_outcome": "blocked",
+        }
     except grabowski_operator_obligation.OperatorObligationInputError as exc:
         raise GripPreflightError(str(exc)) from exc
     except FileNotFoundError as exc:
@@ -13292,6 +13377,30 @@ def _run_operator_obligation_close(
     except grabowski_operator_obligation.OperatorObligationError as exc:
         raise GripActionError(str(exc)) from exc
     _check(receipt, "open_binding", "pass", output["open_file_sha256"])
+    if dispatch_parameters.get("outcome") == "completed":
+        classification = output.get("completion_classification")
+        if not isinstance(classification, dict):
+            raise GripActionError("completed obligation close did not return completion classification")
+        _check(
+            receipt,
+            "completion_classification",
+            "pass",
+            f"reason={classification.get('reason')}; convergence_required={str(classification.get('convergence_required')).lower()}",
+        )
+        if classification.get("convergence_required") is True:
+            _check(
+                receipt,
+                "systemic_convergence_gate",
+                "pass",
+                str(classification.get("convergence_receipt_sha256", "")),
+            )
+        else:
+            _check(
+                receipt,
+                "systemic_convergence_gate",
+                "skip",
+                "process_only completion explicitly makes no systemic-convergence claim",
+            )
     _check(receipt, "terminal_shape", "pass", output["state"])
     _check(receipt, "create_only_close", "pass", output["close_file_sha256"])
     _check(

@@ -13,6 +13,7 @@ import stat
 import time
 from typing import Any, Iterator
 
+import grabowski_convergence
 import grabowski_private_io as private_io
 
 try:
@@ -24,6 +25,9 @@ except ModuleNotFoundError as exc:
 
 
 SCHEMA_VERSION = 1
+LEGACY_CLOSE_SCHEMA_VERSION = 1
+CLOSE_SCHEMA_VERSION = 2
+COMPLETION_CLASSIFICATION_SCHEMA_VERSION = 1
 LEGACY_RESOLUTION_SCHEMA_VERSION = 1
 RESOLUTION_SCHEMA_VERSION = 2
 OPEN_KIND = "grabowski.operator_obligation"
@@ -34,6 +38,9 @@ ACCEPTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 CODE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_RECORD_BYTES = 256 * 1024
+MAX_CONVERGENCE_REQUEST_BYTES = 4 * 1024 * 1024
+SYSTEM_CONVERGENCE_GATES = frozenset({"hard", "assessment_required", "classification_required", "not_required"})
+SYSTEM_CONVERGENCE_BYPASS_GATES = frozenset({"hard", "assessment_required", "classification_required"})
 MAX_ACCEPTANCE = 64
 MAX_REFERENCES = 32
 MAX_EVIDENCE = 128
@@ -87,6 +94,10 @@ class OperatorObligationError(RuntimeError):
 
 
 class OperatorObligationInputError(ValueError):
+    pass
+
+
+class OperatorObligationCompletionClassificationError(OperatorObligationInputError):
     pass
 
 
@@ -221,6 +232,48 @@ def _status_projection_requires_attention(status: dict[str, Any]) -> bool:
         raise OperatorObligationIntegrityError(
             "operator obligation status projection has inconsistent response-end state"
         )
+
+    gate_outcome = status.get("convergence_gate_outcome")
+    allowed_gate_outcomes = {
+        "pending",
+        "pass",
+        "blocked",
+        "explicit_non_systemic",
+        "explicit_non_systemic_bypass",
+        "explicit_non_systemic_legacy",
+        "not_applicable",
+    }
+    if gate_outcome not in allowed_gate_outcomes:
+        raise OperatorObligationIntegrityError(
+            "operator obligation status projection has invalid convergence gate outcome"
+        )
+    if state == "open" and gate_outcome != "pending":
+        raise OperatorObligationIntegrityError(
+            "open obligation must project pending convergence gate outcome"
+        )
+    if state in {"blocked", "delegated"} and gate_outcome != "not_applicable":
+        raise OperatorObligationIntegrityError(
+            "non-completed terminal obligation has an inapplicable convergence gate outcome"
+        )
+    if state == "completed":
+        completion_scope = status.get("completion_scope")
+        if completion_scope == "systemic" and gate_outcome != "pass":
+            raise OperatorObligationIntegrityError(
+                "systemic completion must project a passed convergence gate"
+            )
+        if completion_scope == "legacy_unclassified" and gate_outcome != "explicit_non_systemic_legacy":
+            raise OperatorObligationIntegrityError(
+                "legacy completion must remain explicitly non-systemic"
+            )
+        classification = status.get("completion_classification")
+        if completion_scope in {"systemic", "process_only"}:
+            expected_gate_outcome = completion_convergence_gate_outcome(
+                classification if isinstance(classification, dict) else None
+            )
+            if gate_outcome != expected_gate_outcome:
+                raise OperatorObligationIntegrityError(
+                    "completed obligation convergence gate outcome disagrees with classification"
+                )
 
     follow_up_required = status.get("follow_up_required")
     if follow_up_required is not None and (
@@ -385,6 +438,689 @@ def _normalize_evidence(value: Any, *, acceptance_ids: set[str]) -> list[dict[st
             entry["sha256"] = _validate_sha256(item["sha256"], label=f"evidence[{index}].sha256")
         normalized.append(entry)
     return sorted(normalized, key=lambda item: item["acceptance_id"])
+
+
+def _validate_git_oid(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None:
+        raise OperatorObligationInputError(f"{label} must be a lowercase 40- or 64-hex Git object id")
+    return value
+
+
+def _normalize_system_convergence_plan_binding(
+    value: Any, *, canonical: bool
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise OperatorObligationInputError(
+            "system_convergence_plan must be an object"
+        )
+    plan_sha256 = _validate_sha256(
+        value.get("plan_sha256"), label="system_convergence_plan.plan_sha256"
+    )
+    material = {key: item for key, item in value.items() if key != "plan_sha256"}
+    if _sha256(material) != plan_sha256:
+        raise OperatorObligationInputError(
+            "system_convergence_plan SHA-256 binding is invalid"
+        )
+    if (
+        value.get("kind") != "grabowski.system_convergence_plan"
+        or value.get("schema_version") != 1
+        or value.get("status") != "planned"
+    ):
+        raise OperatorObligationInputError(
+            "system_convergence_plan is not a planned canonical convergence plan"
+        )
+    change_risk = _validate_text(
+        value.get("change_risk"), label="system_convergence_plan.change_risk", maximum=8
+    )
+    target_criticality = _validate_text(
+        value.get("target_criticality"),
+        label="system_convergence_plan.target_criticality",
+        maximum=64,
+    )
+    protocol_head = _validate_git_oid(
+        value.get("protocol_head"), label="system_convergence_plan.protocol_head"
+    )
+    gate = _validate_text(
+        value.get("systemic_closure_gate"),
+        label="system_convergence_plan.systemic_closure_gate",
+        maximum=64,
+    )
+    if gate not in SYSTEM_CONVERGENCE_GATES:
+        raise OperatorObligationInputError(
+            "system_convergence_plan systemic closure gate is unsupported"
+        )
+    hard_gate_required = value.get("hard_gate_required")
+    if hard_gate_required is not None and not isinstance(hard_gate_required, bool):
+        raise OperatorObligationInputError(
+            "system_convergence_plan hard_gate_required is invalid"
+        )
+    if canonical:
+        try:
+            expected = grabowski_convergence.build_system_convergence_plan(
+                {
+                    "change_risk": change_risk,
+                    "target_criticality": target_criticality,
+                    "expected_protocol_head": protocol_head,
+                }
+            )
+        except (
+            grabowski_convergence.ConvergenceInputError,
+            grabowski_convergence.ConvergenceExecutionError,
+        ) as exc:
+            raise OperatorObligationInputError(
+                f"system_convergence_plan canonical validation failed: {exc}"
+            ) from exc
+        if value != expected:
+            raise OperatorObligationInputError(
+                "system_convergence_plan does not match the canonical convergence policy"
+            )
+    profile_id = _validate_text(
+        value.get("profile_id"), label="system_convergence_plan.profile_id", maximum=256
+    )
+    profile_cell_id = _validate_text(
+        value.get("profile_cell_id"),
+        label="system_convergence_plan.profile_cell_id",
+        maximum=256,
+    )
+    profile_sha256 = _validate_sha256(
+        value.get("profile_sha256"), label="system_convergence_plan.profile_sha256"
+    )
+    return {
+        "plan_sha256": plan_sha256,
+        "change_risk": change_risk,
+        "target_criticality": target_criticality,
+        "protocol_head": protocol_head,
+        "profile_id": profile_id,
+        "profile_cell_id": profile_cell_id,
+        "profile_sha256": profile_sha256,
+        "systemic_closure_gate": gate,
+        "hard_gate_required": hard_gate_required,
+    }
+
+
+def _validate_persisted_system_convergence_plan_binding(
+    value: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OperatorObligationInputError(
+            "persisted system_convergence_plan binding must be an object"
+        )
+    required = {
+        "plan_sha256",
+        "change_risk",
+        "target_criticality",
+        "protocol_head",
+        "profile_id",
+        "profile_cell_id",
+        "profile_sha256",
+        "systemic_closure_gate",
+        "hard_gate_required",
+    }
+    if set(value) != required:
+        raise OperatorObligationInputError(
+            "persisted system_convergence_plan binding shape is invalid"
+        )
+    _validate_sha256(value.get("plan_sha256"), label="completion_classification.system_convergence_plan.plan_sha256")
+    _validate_text(value.get("change_risk"), label="completion_classification.system_convergence_plan.change_risk", maximum=8)
+    _validate_text(value.get("target_criticality"), label="completion_classification.system_convergence_plan.target_criticality", maximum=64)
+    _validate_git_oid(value.get("protocol_head"), label="completion_classification.system_convergence_plan.protocol_head")
+    _validate_text(value.get("profile_id"), label="completion_classification.system_convergence_plan.profile_id", maximum=256)
+    _validate_text(value.get("profile_cell_id"), label="completion_classification.system_convergence_plan.profile_cell_id", maximum=256)
+    _validate_sha256(value.get("profile_sha256"), label="completion_classification.system_convergence_plan.profile_sha256")
+    gate = _validate_text(value.get("systemic_closure_gate"), label="completion_classification.system_convergence_plan.systemic_closure_gate", maximum=64)
+    if gate not in SYSTEM_CONVERGENCE_GATES:
+        raise OperatorObligationInputError(
+            "persisted system convergence gate is unsupported"
+        )
+    hard_gate_required = value.get("hard_gate_required")
+    if hard_gate_required is not None and not isinstance(hard_gate_required, bool):
+        raise OperatorObligationInputError(
+            "persisted system convergence hard_gate_required is invalid"
+        )
+    return dict(value)
+
+
+def _read_bound_convergence_request(path_value: Any, expected_sha256: str) -> tuple[str, dict[str, Any]]:
+    path_text = _validate_text(path_value, label="convergence_receipt.output.request_path", maximum=4096)
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        raise OperatorObligationInputError("convergence request_path must be absolute")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise OperatorObligationInputError("convergence request_path is unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_CONVERGENCE_REQUEST_BYTES:
+            raise OperatorObligationInputError("convergence request_path is not a bounded regular file")
+        chunks: list[bytes] = []
+        remaining = MAX_CONVERGENCE_REQUEST_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_CONVERGENCE_REQUEST_BYTES:
+        raise OperatorObligationInputError("convergence request_path exceeds the size bound")
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise OperatorObligationInputError("convergence request_path SHA-256 drifted after assessment")
+    try:
+        parsed = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OperatorObligationInputError("convergence request_path is not valid UTF-8 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise OperatorObligationInputError("convergence request_path must contain a JSON object")
+    return str(path.resolve()), parsed
+
+
+def _normalize_convergence_receipt_binding(
+    value: Any, *, obligation_id: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OperatorObligationInputError(
+            "convergence_required completion requires a convergence_receipt object"
+        )
+    _validate_exact_keys(
+        value,
+        allowed={"status", "receipt_sha256", "receipt", "output"},
+        required={"status", "receipt_sha256", "receipt", "output"},
+        label="closure_classification.convergence_receipt",
+    )
+    if value.get("status") != "passed":
+        raise OperatorObligationInputError(
+            "convergence_receipt top-level status must be passed"
+        )
+    receipt = value.get("receipt")
+    output = value.get("output")
+    if not isinstance(receipt, dict) or not isinstance(output, dict):
+        raise OperatorObligationInputError(
+            "convergence_receipt receipt and output must be objects"
+        )
+    receipt_sha256 = _validate_sha256(
+        value.get("receipt_sha256"), label="convergence_receipt.receipt_sha256"
+    )
+    nested_receipt_sha256 = _validate_sha256(
+        receipt.get("receipt_sha256"),
+        label="convergence_receipt.receipt.receipt_sha256",
+    )
+    if receipt_sha256 != nested_receipt_sha256:
+        raise OperatorObligationInputError(
+            "convergence_receipt top-level and nested receipt SHA-256 disagree"
+        )
+    actual_receipt_sha256 = _sha256(
+        {key: item for key, item in receipt.items() if key != "receipt_sha256"}
+    )
+    if actual_receipt_sha256 != receipt_sha256:
+        raise OperatorObligationInputError(
+            "convergence_receipt receipt SHA-256 binding is invalid"
+        )
+    grip = receipt.get("grip")
+    if (
+        receipt.get("kind") != "grabowski.operator_grip_receipt"
+        or receipt.get("schema_version") != 1
+        or receipt.get("status") != "passed"
+        or receipt.get("phase") != "action"
+        or not isinstance(grip, dict)
+        or grip.get("name") != "convergence-assess"
+        or grip.get("effect") != "read_only"
+    ):
+        raise OperatorObligationInputError(
+            "convergence_receipt is not a passed convergence-assess grip receipt"
+        )
+    output_sha256 = _validate_sha256(
+        receipt.get("output_sha256"),
+        label="convergence_receipt.receipt.output_sha256",
+    )
+    if _sha256(output) != output_sha256:
+        raise OperatorObligationInputError(
+            "convergence_receipt output SHA-256 binding is invalid"
+        )
+    assessment = output.get("assessment")
+    if (
+        output.get("kind") != "grabowski.convergence_assessment"
+        or output.get("closure_allowed") is not True
+        or output.get("decision") != "allow_closure"
+        or output.get("receipt_status") != "passed"
+        or not isinstance(assessment, dict)
+        or assessment.get("schema_version") != 2
+        or assessment.get("status") != "terminally_closed"
+    ):
+        raise OperatorObligationInputError(
+            "convergence_receipt does not establish a v2 terminally_closed assessment"
+        )
+    required_checks = {
+        "protocol-identity-bound",
+        "request-hash-bound",
+        "deterministic-assessment",
+        "terminal-closure-gate",
+    }
+    checks = receipt.get("checks")
+    if not isinstance(checks, list):
+        raise OperatorObligationInputError("convergence_receipt checks are invalid")
+    check_statuses: dict[str, list[str]] = {}
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        check_id = item.get("id")
+        status_value = item.get("status")
+        if isinstance(check_id, str) and isinstance(status_value, str):
+            check_statuses.setdefault(check_id, []).append(status_value)
+    if any(
+        check_statuses.get(check_id) != ["pass"]
+        for check_id in required_checks
+    ):
+        raise OperatorObligationInputError(
+            "convergence_receipt required gate checks are not uniquely passed"
+        )
+    failing_statuses = {"fail", "failed", "error", "blocked"}
+    if any(
+        status_value in failing_statuses
+        for statuses in check_statuses.values()
+        for status_value in statuses
+    ):
+        raise OperatorObligationInputError(
+            "passed convergence_receipt contains an explicitly failing check"
+        )
+    request_sha256 = _validate_sha256(
+        output.get("request_sha256"),
+        label="convergence_receipt.output.request_sha256",
+    )
+    protocol_head = _validate_git_oid(
+        output.get("protocol_head"),
+        label="convergence_receipt.output.protocol_head",
+    )
+    request_path = _validate_text(
+        output.get("request_path"),
+        label="convergence_receipt.output.request_path",
+        maximum=4096,
+    )
+    expected_parameters = {
+        "request_path": request_path,
+        "expected_request_sha256": request_sha256,
+        "expected_protocol_head": protocol_head,
+    }
+    parameters_sha256 = _validate_sha256(
+        receipt.get("parameters_sha256"),
+        label="convergence_receipt.receipt.parameters_sha256",
+    )
+    if parameters_sha256 != _sha256(expected_parameters):
+        raise OperatorObligationInputError(
+            "convergence_receipt parameters do not exactly bind request and protocol"
+        )
+    assessment_id = _validate_text(
+        assessment.get("assessment_id"),
+        label="convergence_receipt.assessment.assessment_id",
+        maximum=1024,
+    )
+    assessment_change_risk = _validate_text(
+        assessment.get("change_risk"),
+        label="convergence_receipt.assessment.change_risk",
+        maximum=8,
+    )
+    assessment_target_criticality = _validate_text(
+        assessment.get("target_criticality"),
+        label="convergence_receipt.assessment.target_criticality",
+        maximum=64,
+    )
+    assessment_profile_id = _validate_text(
+        assessment.get("profile_id"),
+        label="convergence_receipt.assessment.profile_id",
+        maximum=256,
+    )
+    assessment_profile_cell_id = _validate_text(
+        assessment.get("profile_cell_id"),
+        label="convergence_receipt.assessment.profile_cell_id",
+        maximum=256,
+    )
+    assessment_profile_sha256 = _validate_sha256(
+        assessment.get("profile_sha256"),
+        label="convergence_receipt.assessment.profile_sha256",
+    )
+    return {
+        "convergence_receipt_sha256": receipt_sha256,
+        "output_sha256": output_sha256,
+        "parameters_sha256": parameters_sha256,
+        "request_path": request_path,
+        "request_sha256": request_sha256,
+        "protocol_head": protocol_head,
+        "assessment_id": assessment_id,
+        "assessment_status": "terminally_closed",
+        "assessment_change_risk": assessment_change_risk,
+        "assessment_target_criticality": assessment_target_criticality,
+        "assessment_profile_id": assessment_profile_id,
+        "assessment_profile_cell_id": assessment_profile_cell_id,
+        "assessment_profile_sha256": assessment_profile_sha256,
+        "closure_id": f"operator-obligation:{obligation_id}",
+    }
+
+
+def _normalize_convergence_receipt(
+    value: Any, *, obligation_id: str
+) -> dict[str, Any]:
+    binding = _normalize_convergence_receipt_binding(
+        value, obligation_id=obligation_id
+    )
+    resolved_request_path, request = _read_bound_convergence_request(
+        binding["request_path"], binding["request_sha256"]
+    )
+    if resolved_request_path != binding["request_path"]:
+        raise OperatorObligationInputError(
+            "convergence_receipt request_path is not canonical"
+        )
+    closure = request.get("closure")
+    if (
+        not isinstance(closure, dict)
+        or closure.get("closure_id") != binding["closure_id"]
+        or closure.get("status") != "closed"
+    ):
+        raise OperatorObligationInputError(
+            "convergence request is not bound to this completed operator-obligation close"
+        )
+    if request.get("assessment_id") != binding["assessment_id"]:
+        raise OperatorObligationInputError(
+            "convergence assessment id does not match its bound request"
+        )
+    return binding
+
+
+def _replay_completion_classification(
+    directory: Path,
+    *,
+    open_record: dict[str, Any],
+    open_file_sha256: str,
+    value: Any,
+    obligation_id: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    convergence_required = value.get("convergence_required")
+    reason = value.get("reason")
+    base_keys = {"convergence_required", "reason"}
+    if "system_convergence_plan" in value:
+        base_keys.add("system_convergence_plan")
+    if convergence_required is True and reason == "systemic":
+        expected_keys = base_keys | {"convergence_receipt"}
+    elif convergence_required is False and reason == "process_only":
+        expected_keys = base_keys
+    else:
+        return None
+    if set(value) != expected_keys:
+        return None
+    target = directory / "close.json"
+    if not os.path.lexists(target):
+        return None
+    winner, _close_file_sha256 = _read_private_json(target)
+    _validate_close_record(
+        winner,
+        open_record=open_record,
+        open_file_sha256=open_file_sha256,
+    )
+    if (
+        winner.get("outcome") != "completed"
+        or winner.get("schema_version") != CLOSE_SCHEMA_VERSION
+    ):
+        return None
+    persisted = _validate_persisted_completion_classification(
+        winner.get("completion_classification"),
+        obligation_id=obligation_id,
+    )
+    try:
+        plan_binding = _normalize_system_convergence_plan_binding(
+            value.get("system_convergence_plan"), canonical=False
+        )
+        candidate: dict[str, Any] = {
+            "schema_version": COMPLETION_CLASSIFICATION_SCHEMA_VERSION,
+            "convergence_required": convergence_required,
+            "reason": reason,
+        }
+        if plan_binding is not None:
+            candidate["system_convergence_plan"] = plan_binding
+        if convergence_required is True:
+            binding = _normalize_convergence_receipt_binding(
+                value.get("convergence_receipt"),
+                obligation_id=obligation_id,
+            )
+            candidate.update(binding)
+    except OperatorObligationInputError as exc:
+        raise OperatorObligationCompletionClassificationError(str(exc)) from exc
+    return candidate if candidate == persisted else None
+
+
+def exact_completion_replay_classification(
+    parameters: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(parameters, dict) or parameters.get("outcome") != "completed":
+        return None
+    obligation_id = _validate_obligation_id(parameters.get("obligation_id"))
+    directory = _state_root() / obligation_id
+    with _state_lock():
+        if not directory.exists():
+            return None
+        _ensure_private_directory(directory, create=False)
+        open_record, open_file_sha256 = _read_private_json(directory / "open.json")
+        _validate_open_record(open_record, expected_id=obligation_id)
+        return _replay_completion_classification(
+            directory,
+            open_record=open_record,
+            open_file_sha256=open_file_sha256,
+            value=parameters.get("closure_classification"),
+            obligation_id=obligation_id,
+        )
+
+
+def _assert_plan_assessment_agreement(
+    plan_binding: dict[str, Any],
+    assessment_binding: dict[str, Any],
+) -> None:
+    pairs = (
+        ("protocol_head", "protocol_head"),
+        ("change_risk", "assessment_change_risk"),
+        ("target_criticality", "assessment_target_criticality"),
+        ("profile_id", "assessment_profile_id"),
+        ("profile_cell_id", "assessment_profile_cell_id"),
+        ("profile_sha256", "assessment_profile_sha256"),
+    )
+    drift = [
+        plan_key
+        for plan_key, assessment_key in pairs
+        if plan_binding[plan_key] != assessment_binding[assessment_key]
+    ]
+    if drift:
+        raise OperatorObligationInputError(
+            "system_convergence_plan and convergence assessment differ: "
+            + ", ".join(drift)
+        )
+
+
+def _validate_persisted_completion_classification(
+    value: Any, *, obligation_id: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OperatorObligationInputError("completion_classification must be an object")
+    convergence_required = value.get("convergence_required")
+    has_plan = "system_convergence_plan" in value
+    if convergence_required is False:
+        expected = {"schema_version", "convergence_required", "reason"}
+        if has_plan:
+            expected.add("system_convergence_plan")
+        if (
+            set(value) != expected
+            or value.get("schema_version") != COMPLETION_CLASSIFICATION_SCHEMA_VERSION
+            or value.get("reason") != "process_only"
+        ):
+            raise OperatorObligationInputError(
+                "process-only completion_classification shape is invalid"
+            )
+        if has_plan:
+            _validate_persisted_system_convergence_plan_binding(
+                value["system_convergence_plan"]
+            )
+        return dict(value)
+    if convergence_required is True:
+        expected = {
+            "schema_version", "convergence_required", "reason",
+            "convergence_receipt_sha256", "output_sha256", "parameters_sha256",
+            "request_path", "request_sha256", "protocol_head", "assessment_id",
+            "assessment_status", "assessment_change_risk",
+            "assessment_target_criticality", "assessment_profile_id",
+            "assessment_profile_cell_id", "assessment_profile_sha256", "closure_id",
+        }
+        if has_plan:
+            expected.add("system_convergence_plan")
+        if (
+            set(value) != expected
+            or value.get("schema_version") != COMPLETION_CLASSIFICATION_SCHEMA_VERSION
+            or value.get("reason") != "systemic"
+        ):
+            raise OperatorObligationInputError(
+                "systemic completion_classification shape is invalid"
+            )
+        for key in (
+            "convergence_receipt_sha256", "output_sha256",
+            "parameters_sha256", "request_sha256",
+        ):
+            _validate_sha256(value.get(key), label=f"completion_classification.{key}")
+        _validate_git_oid(
+            value.get("protocol_head"), label="completion_classification.protocol_head"
+        )
+        _validate_text(
+            value.get("request_path"),
+            label="completion_classification.request_path",
+            maximum=4096,
+        )
+        _validate_text(
+            value.get("assessment_id"),
+            label="completion_classification.assessment_id",
+            maximum=1024,
+        )
+        if value.get("assessment_status") != "terminally_closed":
+            raise OperatorObligationInputError(
+                "systemic completion_classification assessment is not terminal"
+            )
+        _validate_text(value.get("assessment_change_risk"), label="completion_classification.assessment_change_risk", maximum=8)
+        _validate_text(value.get("assessment_target_criticality"), label="completion_classification.assessment_target_criticality", maximum=64)
+        _validate_text(value.get("assessment_profile_id"), label="completion_classification.assessment_profile_id", maximum=256)
+        _validate_text(value.get("assessment_profile_cell_id"), label="completion_classification.assessment_profile_cell_id", maximum=256)
+        _validate_sha256(value.get("assessment_profile_sha256"), label="completion_classification.assessment_profile_sha256")
+        closure_id = _validate_text(
+            value.get("closure_id"),
+            label="completion_classification.closure_id",
+            maximum=1024,
+        )
+        if closure_id != f"operator-obligation:{obligation_id}":
+            raise OperatorObligationInputError(
+                "systemic completion_classification names another obligation"
+            )
+        if has_plan:
+            plan_binding = _validate_persisted_system_convergence_plan_binding(
+                value["system_convergence_plan"]
+            )
+            _assert_plan_assessment_agreement(plan_binding, value)
+        return dict(value)
+    raise OperatorObligationInputError(
+        "completion_classification.convergence_required must be boolean"
+    )
+
+
+def validate_completion_classification(
+    value: Any, *, obligation_id: str
+) -> dict[str, Any]:
+    try:
+        if not isinstance(value, dict):
+            raise OperatorObligationInputError(
+                "completed outcome requires closure_classification"
+            )
+        _validate_exact_keys(
+            value,
+            allowed={
+                "convergence_required",
+                "reason",
+                "convergence_receipt",
+                "system_convergence_plan",
+            },
+            required={"convergence_required", "reason"},
+            label="closure_classification",
+        )
+        convergence_required = value.get("convergence_required")
+        if not isinstance(convergence_required, bool):
+            raise OperatorObligationInputError(
+                "closure_classification.convergence_required must be boolean"
+            )
+        reason = _validate_text(
+            value.get("reason"), label="closure_classification.reason", maximum=64
+        )
+        plan_binding = _normalize_system_convergence_plan_binding(
+            value.get("system_convergence_plan"), canonical=True
+        )
+        if not convergence_required:
+            if reason != "process_only":
+                raise OperatorObligationInputError(
+                    "non-systemic completed close requires reason=process_only"
+                )
+            if "convergence_receipt" in value:
+                raise OperatorObligationInputError(
+                    "process_only completion may not contain convergence_receipt"
+                )
+            result: dict[str, Any] = {
+                "schema_version": COMPLETION_CLASSIFICATION_SCHEMA_VERSION,
+                "convergence_required": False,
+                "reason": "process_only",
+            }
+            if plan_binding is not None:
+                result["system_convergence_plan"] = plan_binding
+            return result
+        if reason != "systemic":
+            raise OperatorObligationInputError(
+                "convergence_required completed close requires reason=systemic"
+            )
+        if "convergence_receipt" not in value:
+            raise OperatorObligationInputError(
+                "convergence_required completed close requires convergence_receipt"
+            )
+        binding = _normalize_convergence_receipt(
+            value.get("convergence_receipt"), obligation_id=obligation_id
+        )
+        if plan_binding is not None:
+            _assert_plan_assessment_agreement(plan_binding, binding)
+        result = {
+            "schema_version": COMPLETION_CLASSIFICATION_SCHEMA_VERSION,
+            "convergence_required": True,
+            "reason": "systemic",
+            **binding,
+        }
+        if plan_binding is not None:
+            result["system_convergence_plan"] = plan_binding
+        return result
+    except OperatorObligationCompletionClassificationError:
+        raise
+    except OperatorObligationInputError as exc:
+        raise OperatorObligationCompletionClassificationError(str(exc)) from exc
+
+
+def completion_convergence_gate_outcome(
+    classification: dict[str, Any] | None,
+) -> str:
+    if not isinstance(classification, dict):
+        return "pending"
+    if classification.get("convergence_required") is True:
+        return "pass"
+    plan = classification.get("system_convergence_plan")
+    gate = plan.get("systemic_closure_gate") if isinstance(plan, dict) else None
+    if gate in SYSTEM_CONVERGENCE_BYPASS_GATES:
+        return "explicit_non_systemic_bypass"
+    if gate == "not_required":
+        return "not_applicable"
+    return "explicit_non_systemic"
 
 
 def _normalize_blockers(value: Any) -> list[dict[str, str]]:
@@ -696,20 +1432,17 @@ def _validate_open_record(record: dict[str, Any], *, expected_id: str) -> None:
 
 
 def _validate_close_record(record: dict[str, Any], *, open_record: dict[str, Any], open_file_sha256: str) -> None:
-    required = {
-        "kind",
-        "schema_version",
-        "obligation_id",
-        "open_file_sha256",
-        "outcome",
-        "evidence",
-        "blockers",
-        "delegation",
-        "next_action",
-        "closed_at",
-        "material_sha256",
-        "record_sha256",
+    base_required = {
+        "kind", "schema_version", "obligation_id", "open_file_sha256", "outcome",
+        "evidence", "blockers", "delegation", "next_action", "closed_at",
+        "material_sha256", "record_sha256",
     }
+    schema_version = record.get("schema_version")
+    required = set(base_required)
+    if schema_version == CLOSE_SCHEMA_VERSION:
+        required.add("completion_classification")
+    elif schema_version != LEGACY_CLOSE_SCHEMA_VERSION:
+        raise OperatorObligationIntegrityError("operator obligation close schema version is unsupported")
     optional = {"task_closeout_binding"}
     if not required.issubset(record) or set(record) - required - optional:
         raise OperatorObligationIntegrityError("operator obligation close record shape is invalid")
@@ -720,7 +1453,6 @@ def _validate_close_record(record: dict[str, Any], *, open_record: dict[str, Any
     record_material = {key: record[key] for key in set(record) - {"record_sha256"}}
     if (
         record["kind"] != CLOSE_KIND
-        or record["schema_version"] != SCHEMA_VERSION
         or record["obligation_id"] != open_record["obligation_id"]
         or record["open_file_sha256"] != open_file_sha256
         or not isinstance(record["outcome"], str)
@@ -742,6 +1474,11 @@ def _validate_close_record(record: dict[str, Any], *, open_record: dict[str, Any
                 raise OperatorObligationInputError("completed close evidence must be SHA-256 bound")
             if record["blockers"] or record["delegation"] or record["next_action"]:
                 raise OperatorObligationInputError("completed close contains incompatible continuation fields")
+            if schema_version == CLOSE_SCHEMA_VERSION:
+                _validate_persisted_completion_classification(
+                    record["completion_classification"],
+                    obligation_id=open_record["obligation_id"],
+                )
             task_references = [
                 item for item in open_record.get("references", [])
                 if item.get("kind") == "grabowski_task"
@@ -764,11 +1501,15 @@ def _validate_close_record(record: dict[str, Any], *, open_record: dict[str, Any
             elif binding is not None:
                 raise OperatorObligationInputError("non-task obligation may not contain task closeout binding")
         elif outcome == "blocked":
+            if schema_version != LEGACY_CLOSE_SCHEMA_VERSION:
+                raise OperatorObligationInputError("blocked close must use the legacy close schema")
             _normalize_blockers(record["blockers"])
             if record["delegation"]:
                 raise OperatorObligationInputError("blocked close contains delegation")
             _validate_text(record["next_action"], label="close.next_action")
         elif outcome == "delegated":
+            if schema_version != LEGACY_CLOSE_SCHEMA_VERSION:
+                raise OperatorObligationInputError("delegated close must use the legacy close schema")
             _normalize_delegation(record["delegation"])
             if record["blockers"]:
                 raise OperatorObligationInputError("delegated close contains blockers")
@@ -1062,6 +1803,11 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
             "follow_up_required": True,
             "open_file_sha256": open_file_sha256,
             "close_file_sha256": None,
+            "close_schema_version": None,
+            "completion_classification": None,
+            "completion_scope": None,
+            "systemic_convergence_claim": False,
+            "convergence_gate_outcome": "pending",
             "recommended_next_action": "continue work; the chat response must not imply completion",
         }
     _validate_close_record(
@@ -1074,6 +1820,24 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         if item["id"] not in evidence_by_id
     ]
     outcome = close_record["outcome"]
+    close_schema_version = close_record["schema_version"]
+    completion_classification: dict[str, Any] | None = None
+    completion_scope: str | None = None
+    systemic_convergence_claim: bool | None = False
+    if outcome == "completed":
+        if close_schema_version == CLOSE_SCHEMA_VERSION:
+            completion_classification = dict(close_record["completion_classification"])
+            systemic_convergence_claim = bool(completion_classification["convergence_required"])
+            completion_scope = "systemic" if systemic_convergence_claim else "process_only"
+            convergence_gate_outcome = completion_convergence_gate_outcome(
+                completion_classification
+            )
+        else:
+            systemic_convergence_claim = None
+            completion_scope = "legacy_unclassified"
+            convergence_gate_outcome = "explicit_non_systemic_legacy"
+    else:
+        convergence_gate_outcome = "not_applicable"
     resolution_chain = _read_resolution_chain(
         directory,
         open_record=open_record,
@@ -1100,7 +1864,13 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         and not deferred_is_parked
     )
     recommended_next_action = (
-        "report acceptance-bound completion"
+        (
+            "report acceptance-bound and convergence-bound systemic completion"
+            if completion_scope == "systemic"
+            else "report acceptance-bound process completion without systemic convergence claim"
+            if completion_scope == "process_only"
+            else "report legacy acceptance completion without inferring systemic convergence"
+        )
         if outcome == "completed"
         else (
             resolution_record["next_action"]
@@ -1148,6 +1918,11 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         "follow_up_required": continuation_required,
         "open_file_sha256": open_file_sha256,
         "close_file_sha256": close_file_sha256,
+        "close_schema_version": close_schema_version,
+        "completion_classification": completion_classification,
+        "completion_scope": completion_scope,
+        "systemic_convergence_claim": systemic_convergence_claim,
+        "convergence_gate_outcome": convergence_gate_outcome,
         "resolution_file_sha256": resolution_file_sha256,
         "resolution_sequence": resolution_record["sequence"]
         if resolution_record
@@ -1156,7 +1931,18 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         "recommended_next_action": recommended_next_action,
         "non_claims": (
             []
-            if outcome == "completed"
+            if completion_scope == "systemic"
+            else [
+                "process-only completion does not establish systemic convergence",
+                *(
+                    ["process-only completion explicitly bypassed a bound systemic convergence gate"]
+                    if convergence_gate_outcome == "explicit_non_systemic_bypass"
+                    else []
+                ),
+            ]
+            if completion_scope == "process_only"
+            else ["legacy v1 completed close predates explicit convergence classification and does not establish systemic convergence"]
+            if completion_scope == "legacy_unclassified"
             else [
                 "terminal chat closeout does not establish acceptance-bound completion; historical resolution does not rewrite the original close outcome"
             ]
@@ -1266,6 +2052,9 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
                     "continuation_required": requires_attention,
                     "response_may_end": status["response_may_end"],
                     "work_complete": status["work_complete"],
+                    "completion_scope": status.get("completion_scope"),
+                    "systemic_convergence_claim": status.get("systemic_convergence_claim"),
+                    "convergence_gate_outcome": status.get("convergence_gate_outcome"),
                     "recommended_next_action": status["recommended_next_action"],
                 }
             )
@@ -1544,7 +2333,10 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
 
 
 def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"obligation_id", "outcome", "evidence", "blockers", "delegation", "next_action"}
+    allowed = {
+        "obligation_id", "outcome", "evidence", "blockers", "delegation",
+        "next_action", "closure_classification",
+    }
     _validate_exact_keys(
         parameters,
         allowed=allowed,
@@ -1565,6 +2357,7 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
         blockers: list[dict[str, str]] = []
         delegation: dict[str, str] = {}
         next_action = ""
+        completion_classification: dict[str, Any] = {}
         if outcome == "completed":
             passed = {item["acceptance_id"] for item in evidence if item["status"] == "passed"}
             if passed != acceptance_ids or len(evidence) != len(acceptance_ids):
@@ -1576,16 +2369,43 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise OperatorObligationInputError("completed outcome evidence must be SHA-256 bound")
             if any(key in parameters for key in ("blockers", "delegation", "next_action")):
                 raise OperatorObligationInputError("completed outcome may not contain continuation fields")
-            task_closeout_binding = _validate_completed_task_closeout(
-                open_record,
-                evidence,
+            replay_classification = _replay_completion_classification(
+                directory,
+                open_record=open_record,
+                open_file_sha256=open_file_sha256,
+                value=parameters.get("closure_classification"),
+                obligation_id=obligation_id,
             )
+            if replay_classification is not None:
+                completion_classification = replay_classification
+                persisted_close, _persisted_close_sha256 = _read_private_json(
+                    directory / "close.json"
+                )
+                _validate_close_record(
+                    persisted_close,
+                    open_record=open_record,
+                    open_file_sha256=open_file_sha256,
+                )
+                task_closeout_binding = persisted_close.get("task_closeout_binding")
+            else:
+                completion_classification = validate_completion_classification(
+                    parameters.get("closure_classification"),
+                    obligation_id=obligation_id,
+                )
+                task_closeout_binding = _validate_completed_task_closeout(
+                    open_record,
+                    evidence,
+                )
         elif outcome == "blocked":
+            if "closure_classification" in parameters:
+                raise OperatorObligationInputError("blocked outcome may not contain closure_classification")
             blockers = _normalize_blockers(parameters.get("blockers"))
             next_action = _validate_text(parameters.get("next_action"), label="next_action")
             if "delegation" in parameters:
                 raise OperatorObligationInputError("blocked outcome may not contain delegation")
         else:
+            if "closure_classification" in parameters:
+                raise OperatorObligationInputError("delegated outcome may not contain closure_classification")
             delegation = _normalize_delegation(parameters.get("delegation"))
             next_action = _validate_text(parameters.get("next_action"), label="next_action")
             if "blockers" in parameters:
@@ -1594,7 +2414,11 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
             task_closeout_binding = None
         material = {
             "kind": CLOSE_KIND,
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": (
+                CLOSE_SCHEMA_VERSION
+                if outcome == "completed"
+                else LEGACY_CLOSE_SCHEMA_VERSION
+            ),
             "obligation_id": obligation_id,
             "open_file_sha256": open_file_sha256,
             "outcome": outcome,
@@ -1603,6 +2427,8 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
             "delegation": delegation,
             "next_action": next_action,
         }
+        if outcome == "completed":
+            material["completion_classification"] = completion_classification
         if task_closeout_binding is not None:
             material["task_closeout_binding"] = task_closeout_binding
         material_sha256 = _sha256(material)
