@@ -3616,6 +3616,75 @@ class TaskTests(unittest.TestCase):
             False,
         )
 
+    def test_unversioned_workspace_write_skips_checkout_reposkop(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with tempfile.TemporaryDirectory(dir=self.root.parent) as scratch_name:
+            scratch = Path(scratch_name)
+            with patch.object(
+                tasks, "_workspace_scope_identity", return_value=("0" * 40, "unversioned")
+            ), patch.object(
+                tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+            ), patch.object(
+                tasks, "_validate_command", return_value=argv
+            ), patch.object(
+                tasks, "_dispatch", return_value=_launcher()
+            ) as dispatch, patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
+            ):
+                result = tasks.grabowski_task_start(
+                    "local", argv, cwd=str(scratch), runtime_seconds=60
+                )
+
+            dispatch.assert_called_once()
+            classification = result["task_effect_classification"]
+            self.assertEqual(classification["effect_profile"], "workspace_write")
+            self.assertEqual(classification["reposkop_policy"], "not_required")
+            self.assertEqual(classification["reposkop_cohort"], "not_applicable")
+            self.assertEqual(
+                classification["reposkop_applicability"], "no_git_marker"
+            )
+            self.assertIs(classification["prospective_admission_verified"], False)
+            self.assertIsNone(result["reposkop_execution_attestation"])
+            self.assertIsNone(result["reposkop_checkout_shadow_before"])
+            self.reposkop_attestation_mock.assert_not_called()
+            self.reposkop_shadow_before_mock.assert_not_called()
+            self.assertIsNotNone(
+                tasks.resources.inspect_resource(f"repo:{scratch}")
+            )
+
+    def test_unversioned_repository_write_remains_reposkop_required(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with tempfile.TemporaryDirectory(dir=self.root.parent) as scratch_name:
+            scratch = Path(scratch_name)
+            with patch.object(
+                tasks, "_workspace_scope_identity", return_value=("0" * 40, "unversioned")
+            ), patch.object(
+                tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+            ), patch.object(
+                tasks, "_validate_command", return_value=argv
+            ), patch.object(
+                tasks, "_dispatch", return_value=_launcher()
+            ) as dispatch, patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
+            ):
+                result = tasks.grabowski_task_start(
+                    "local",
+                    argv,
+                    cwd=str(scratch),
+                    runtime_seconds=60,
+                    effect_profile="repository_write",
+                )
+
+            dispatch.assert_called_once()
+            classification = result["task_effect_classification"]
+            self.assertEqual(classification["effect_profile"], "repository_write")
+            self.assertEqual(classification["reposkop_policy"], "required")
+            self.assertEqual(
+                classification["reposkop_cohort"], "repository_write_required"
+            )
+            self.reposkop_attestation_mock.assert_called_once()
+            self.reposkop_shadow_before_mock.assert_called_once()
+
     def test_main_branch_and_exact_path_writers_remain_reposkop_required(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         tasks.resources.work_admission.require_repository_admission.return_value = {

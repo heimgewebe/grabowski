@@ -19,14 +19,14 @@ Codex is an explicit contrast surface only. Because ChatGPT and Codex are in the
 
 ## Verified subscription baselines
 
-Observed on 2026-07-29:
+Baseline observations are from 2026-07-29; xAI model discovery was refreshed on 2026-08-22:
 
 | Provider | Canonical local plan label | Live evidence | Included routing surface | Excluded cost surfaces |
 | --- | --- | --- | --- | --- |
 | OpenAI | ChatGPT Pro | owner assertion; `codex login status` reports ChatGPT login; `gpt-5.6-sol` xhigh smoke passed | Codex CLI contrast | OpenAI API, purchased Codex credits |
 | Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed | Claude Code review and contrast | Anthropic API, usage credits |
 | Google | Google AI subscription | owner assertion; Antigravity `gemini-3.1-pro-high` smoke passed | Antigravity and Jules baseline | Vertex AI API, Google AI Studio API, purchased AI credits |
-| xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; `grok-4.5-build` smoke passed | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
+| xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; authenticated `grok models` readback exposes `grok-4.6` | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
 
 The exact Google AI tier is not exposed by the local harness. The catalog therefore records the subscription family and the verified Antigravity entitlement without inventing a narrower tier.
 
@@ -41,7 +41,7 @@ The live harness probes supersede stale catalog generations:
 - Fable 5 returns `usage-credits-required`; it is not part of the Claude Pro baseline.
 - Antigravity exposes Gemini 3.1 Pro and Gemini 3.6 Flash.
 - Codex resolves its current high-end subscription route to GPT-5.6 Sol.
-- Grok Build resolves the SuperGrok route to Grok 4.5 Build.
+- The authenticated Grok CLI model listing exposes `grok-4.6` for the SuperGrok account.
 
 Old model identifiers may remain as disabled compatibility records. They are not preferred routes.
 
@@ -62,7 +62,7 @@ Provider diversity is used only when it improves independence or technical cover
 
 - `claude-opus-5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
 - `antigravity-gemini-pro-review-high`: independent Google-family review through the Google AI baseline.
-- `grok-4.5-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, no tools, and schema-constrained structured output.
+- `grok-4.6-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, no tools, and schema-constrained structured output.
 
 All direct Claude Pro routes use the same `anthropic-claude-pro` independence group. Two Claude models therefore never satisfy a two-provider independence requirement.
 
@@ -81,7 +81,7 @@ The recurring metadata probe does not spend Grok model quota. It marks `grok-com
 1. the catalog requires the exact `SuperGrok` OIDC entitlement contract;
 2. the owner-private `~/.grok/auth.json` record is opened descriptor-bound without following symlinks;
 3. its JWT claim is unexpired and its issuer, principal, team, account and numeric tier match the private record and catalog contract;
-4. a server-side `grok models` readback accepts the same account and exposes `grok-4.5`;
+4. a server-side `grok models` readback accepts the same account and exposes `grok-4.6`;
 5. the account-binding hash is unchanged before and after that server readback.
 
 The probe publishes only the canonical plan label, verification state and a non-secret binding hash. Tokens, email addresses and raw account identifiers are never copied into router state. Generic Grok login is insufficient to enable the SuperGrok pool.
@@ -107,7 +107,7 @@ The Grok candidate runner uses a route-bound schema-3 packet and resolves the ow
 The logical receipt remains bound to this constrained command shape:
 
 ```text
-grok --model grok-4.5 --prompt-file <isolated-prompt.txt> \
+grok --model grok-4.6 --prompt-file <isolated-prompt.txt> \
   --max-turns 1 --disable-web-search --no-subagents --no-memory \
   --permission-mode plan --tools= --json-schema <candidate-schema>
 ```
