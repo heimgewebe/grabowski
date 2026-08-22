@@ -531,6 +531,44 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual(request_path.stem, result["adapter_request_sha256"])
         self.assertEqual(str(repository), request["repo"])
 
+    def test_candidate_repo_path_normalization_accepts_safe_scp_ssh_username(self) -> None:
+        repository = self._git_repository(
+            "alternate-ssh-user",
+            origin="org-236528253@github.com:heimgewebe/heim-pc.git",
+        )
+        self.assertEqual(
+            "repo.heim-pc",
+            intake._canonical_bureau_repo_resource(str(repository)),
+        )
+        mixed_case_repository = self._git_repository(
+            "mixed-case-repo",
+            origin="org-236528253@github.com:heimgewebe/semantAH.git",
+        )
+        self.assertEqual(
+            "repo.semantah",
+            intake._canonical_bureau_repo_resource(str(mixed_case_repository)),
+        )
+
+    def test_candidate_repo_identity_normalizes_exact_heimgewebe_owner_slug(self) -> None:
+        self.assertEqual(
+            "repo.bureau",
+            intake._canonical_bureau_repo_resource("heimgewebe/bureau"),
+        )
+        self.assertEqual(
+            {"repo": "repo.bureau"},
+            intake._normalize_candidate_request({"repo": "heimgewebe/bureau"}),
+        )
+        self.assertEqual(
+            "repo.semantah",
+            intake._canonical_bureau_repo_resource("heimgewebe/semantAH"),
+        )
+        for value in (
+            "other/bureau",
+            "heimgewebe/bureau/extra",
+            "heimgewebe/",
+        ):
+            self.assertIsNone(intake._canonical_bureau_repo_resource(value))
+
     def test_candidate_repo_path_normalization_fails_closed_for_untrusted_shapes(self) -> None:
         foreign = self._git_repository(
             "foreign", origin="git@github.com:other/foreign.git"
@@ -641,15 +679,35 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                 "https://github.com/heimgewebe/grabowski"
             ),
         )
+        self.assertEqual(
+            "repo.heim-pc",
+            intake._bureau_repo_resource_from_origin(
+                "org-236528253@github.com:heimgewebe/heim-pc.git"
+            ),
+        )
+        self.assertEqual(
+            "repo.audio",
+            intake._bureau_repo_resource_from_origin(
+                "deploy.user@github.com:heimgewebe/audio.git"
+            ),
+        )
+        for origin in (
+            "-oProxyCommand@github.com:heimgewebe/grabowski.git",
+            "org-236528253@github.com.evil:heimgewebe/grabowski.git",
+            "org-236528253@github.com:other/grabowski.git",
+            "org-236528253@github.com:heimgewebe/grabowski/extra.git",
+        ):
+            self.assertIsNone(intake._bureau_repo_resource_from_origin(origin))
         self.assertIsNone(
             intake._bureau_repo_resource_from_origin(
                 "https://github.com/other/grabowski.git"
             )
         )
-        self.assertIsNone(
+        self.assertEqual(
+            "repo.grabowski",
             intake._bureau_repo_resource_from_origin(
                 "https://github.com/heimgewebe/Grabowski.git"
-            )
+            ),
         )
         self.assertEqual(
             {"repo": "repo.grabowski"},
