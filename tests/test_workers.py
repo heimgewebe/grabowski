@@ -341,6 +341,7 @@ let frameTreeCalls = 0;
 let historyCalls = 0;
 let describeCalls = 0;
 const activateScenario = scenario.startsWith('activate-');
+const readNameFallbackScenario = scenario === 'read-name-fallback';
 const activateTarget = 'https://private.invalid/issues';
 
 function message(target, payload) {
@@ -401,7 +402,7 @@ class FakeWebSocket {
           backendDOMNodeId: 101,
           ignored: false,
           role: {value: activateScenario ? 'link' : 'button'},
-          name: {value: activateScenario ? 'Issues' : 'Target'},
+          name: {value: readNameFallbackScenario ? '' : (activateScenario ? 'Issues' : 'Target')},
         }]});
         return;
       case 'Accessibility.getPartialAXTree':
@@ -414,6 +415,13 @@ class FakeWebSocket {
         return;
       case 'DOM.resolveNode':
         reply({object: {objectId: 'link-object'}});
+        return;
+      case 'Runtime.callFunctionOn':
+        if (readNameFallbackScenario) {
+          reply({result: {value: '  Dismiss   onboarding  ' + 'x'.repeat(200)}});
+          return;
+        }
+        reply({result: {value: null}});
         return;
       case 'Runtime.releaseObject':
         reply();
@@ -492,6 +500,7 @@ globalThis.fetch = async () => ({
 """,
             encoding="utf-8",
         )
+        read_only = scenario.startswith("read-")
         activate = scenario.startswith("activate-")
         expected_element = (
             self._semantic_link(
@@ -509,7 +518,7 @@ globalThis.fetch = async () => ({
             "schema_version": 1,
             "port": 9222,
             "timeout_ms": 250,
-            "op": "activate" if activate else "navigate",
+            "op": "read_state" if read_only else ("activate" if activate else "navigate"),
             "expected_state": {
                 "origin": "https://before.invalid",
                 "ready_state": "complete",
@@ -522,7 +531,7 @@ globalThis.fetch = async () => ({
         }
         if activate:
             request["expected_element"] = expected_element
-        else:
+        elif not read_only:
             request["navigation_target"] = (
                 "https://private.invalid/path?secret=value"
             )
@@ -3412,6 +3421,12 @@ globalThis.fetch = async () => ({
         self.assertIn("Runtime.callFunctionOn", source)
         self.assertIn("Runtime.releaseObject", source)
         self.assertIn("Number.isSafeInteger", source)
+        self.assertIn("async function readSemanticElementName", source)
+        self.assertIn("attr('aria-label')", source)
+        self.assertIn("attr('placeholder')", source)
+        self.assertIn("this.innerText", source)
+        self.assertIn("this.textContent", source)
+        self.assertGreaterEqual(source.count("await readSemanticElementName("), 2)
         self.assertNotIn("document.querySelector", source)
         verify = "const objectId = await verifyElementImmediately(expectedElement);"
         effect = "effect = await call('Runtime.callFunctionOn'"
@@ -3789,6 +3804,16 @@ globalThis.fetch = async () => ({
         self.assertIsNone(outcome["post_action_snapshot_id"])
         self.assertEqual(outcome["observation"]["snapshot_id"], observation["snapshot_id"])
         self.assertEqual(run.call_count, 2)
+
+    def test_browser_semantic_node_uses_bounded_dom_name_fallback_for_empty_ax_name(self) -> None:
+        execution, receipt = self._run_browser_semantic_node("read-name-fallback")
+
+        self.assertEqual(execution.returncode, 0, execution.stderr)
+        self.assertTrue(receipt["ok"])
+        element = receipt["state"]["elements"][0]
+        self.assertEqual(element["role"], "button")
+        self.assertTrue(element["name"].startswith("Dismiss onboarding "))
+        self.assertEqual(len(element["name"]), 160)
 
     def test_browser_semantic_node_navigate_uses_page_navigate_and_error_text(self) -> None:
         source = workers.BROWSER_SEMANTIC_NODE_SOURCE
