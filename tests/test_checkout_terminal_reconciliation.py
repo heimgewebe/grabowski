@@ -623,7 +623,9 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(["git"], 0, stdout=raw, stderr="")
         tree = subprocess.CompletedProcess(["git"], 0, stdout="d" * 40 + "\n", stderr="")
         projection = {
+            "schema_version": 1,
             "result": {
+                "schema_version": 1,
                 "tasks": [
                     {
                         "task_id": "TASK-T001",
@@ -656,7 +658,9 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         raw = json.dumps(task)
         completed = subprocess.CompletedProcess(["git"], 0, stdout=raw, stderr="")
         projection = {
+            "schema_version": 1,
             "result": {
+                "schema_version": 1,
                 "tasks": [
                     {
                         "task_id": "TASK-T001",
@@ -680,9 +684,54 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "not terminal: planned"):
                 sources.bureau_task_terminal_evidence("TASK-T001")
 
+    def test_bureau_task_projection_rejects_schema_drift(self) -> None:
+        projection = {
+            "schema_version": 2,
+            "result": {"schema_version": 1, "tasks": []},
+        }
+        with patch.object(sources, "_bureau_json", return_value=projection):
+            with self.assertRaisesRegex(RuntimeError, "envelope schema is unsupported"):
+                sources._bureau_task_projection("TASK-T001", control_root=self.repo)
+
+    def test_bureau_task_projection_distinguishes_missing_and_ambiguous(self) -> None:
+        missing = {
+            "schema_version": 1,
+            "result": {"schema_version": 1, "tasks": []},
+        }
+        duplicate = {
+            "schema_version": 1,
+            "result": {
+                "schema_version": 1,
+                "tasks": [
+                    {"task_id": "TASK-T001", "effective_state": "verified"},
+                    {"task_id": "TASK-T001", "effective_state": "verified"},
+                ],
+            },
+        }
+        with patch.object(sources, "_bureau_json", return_value=missing):
+            with self.assertRaisesRegex(RuntimeError, "task is missing"):
+                sources._bureau_task_projection("TASK-T001", control_root=self.repo)
+        with patch.object(sources, "_bureau_json", return_value=duplicate):
+            with self.assertRaisesRegex(RuntimeError, "task is ambiguous"):
+                sources._bureau_task_projection("TASK-T001", control_root=self.repo)
+
+    def test_bureau_task_projection_rejects_invalid_effective_state_shape(self) -> None:
+        projection = {
+            "schema_version": 1,
+            "result": {
+                "schema_version": 1,
+                "tasks": [{"task_id": "TASK-T001", "effective_state": None}],
+            },
+        }
+        with patch.object(sources, "_bureau_json", return_value=projection):
+            with self.assertRaisesRegex(RuntimeError, "effective state is invalid"):
+                sources._bureau_task_projection("TASK-T001", control_root=self.repo)
+
     def test_bureau_task_projection_allows_missing_task_spec_state(self) -> None:
         projection = {
+            "schema_version": 1,
             "result": {
+                "schema_version": 1,
                 "tasks": [
                     {
                         "task_id": "TASK-T001",
@@ -702,7 +751,9 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
 
     def test_bureau_task_accepts_superseded_effective_state(self) -> None:
         projection = {
+            "schema_version": 1,
             "result": {
+                "schema_version": 1,
                 "tasks": [
                     {
                         "task_id": "TASK-T001",

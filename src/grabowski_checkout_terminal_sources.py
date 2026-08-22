@@ -90,8 +90,12 @@ def _bureau_task_projection(
         ["status-projection", "--skip-github"],
         control_root=control_root,
     )
+    if payload.get("schema_version") != 1:
+        raise RuntimeError("Bureau status projection envelope schema is unsupported")
     result = payload.get("result")
-    tasks = result.get("tasks") if isinstance(result, dict) else None
+    if not isinstance(result, dict) or result.get("schema_version") != 1:
+        raise RuntimeError("Bureau status projection result schema is unsupported")
+    tasks = result.get("tasks")
     if not isinstance(tasks, list):
         raise RuntimeError("Bureau status projection has no authoritative task list")
     matches = [
@@ -99,12 +103,14 @@ def _bureau_task_projection(
         for item in tasks
         if isinstance(item, dict) and item.get("task_id") == source_id
     ]
+    if not matches:
+        raise RuntimeError(f"Bureau status projection task is missing: {source_id}")
     if len(matches) != 1:
-        raise RuntimeError(
-            f"Bureau status projection task identity is ambiguous or missing: {source_id}"
-        )
+        raise RuntimeError(f"Bureau status projection task is ambiguous: {source_id}")
     task = matches[0]
     state = task.get("effective_state")
+    if not isinstance(state, str):
+        raise RuntimeError("Bureau status projection effective state is invalid")
     if state not in TERMINAL_TASK_STATES:
         raise RuntimeError(f"Bureau task source is not terminal: {state}")
     registry_state = task.get("registry_state")
