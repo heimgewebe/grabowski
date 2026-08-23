@@ -83,6 +83,7 @@ DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "heimgewebe/hauski": ("Detect changes",),
     "heimgewebe/hauski-audio": ("scan",),
+    "hall-of-memory/hall-of-memory": ("verify",),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
