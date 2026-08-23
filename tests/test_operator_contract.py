@@ -212,6 +212,59 @@ class OperatorContractTests(unittest.TestCase):
         )
         self.assertIsInstance(tree, ast.Module)
 
+    def test_managed_runtime_environment_is_xdg_bound_and_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        managed = operator._managed_runtime_environment(
+            {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "HEIM_NODE_RUNTIME_ENV_DIR": "/stale/node",
+                "UV_CACHE_DIR": "/stale/uv",
+            }
+        )
+        self.assertEqual(
+            {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "HEIM_NODE_RUNTIME_ENV_DIR": "/run/user/1000/grabowski-node-runtime-env",
+                "UV_CACHE_DIR": "/run/user/1000/grabowski-uv-cache",
+            },
+            managed,
+        )
+        self.assertEqual({}, operator._managed_runtime_environment({}))
+        with self.assertRaisesRegex(RuntimeError, "explicit XDG_RUNTIME_DIR"):
+            operator._managed_runtime_environment(
+                {"HEIM_NODE_RUNTIME_ENV_DIR": "/stale/node"}
+            )
+        with self.assertRaisesRegex(RuntimeError, "explicit XDG_RUNTIME_DIR"):
+            operator._managed_runtime_environment({"UV_CACHE_DIR": "/stale/uv"})
+        with self.assertRaisesRegex(RuntimeError, "absolute normalized path"):
+            operator._managed_runtime_environment({"XDG_RUNTIME_DIR": "relative/runtime"})
+        for root in ("/", "//"):
+            with self.subTest(root=root), self.assertRaisesRegex(
+                RuntimeError, "filesystem root"
+            ):
+                operator._managed_runtime_environment({"XDG_RUNTIME_DIR": root})
+
+    def test_safe_environment_overrides_stale_managed_runtime_paths(self) -> None:
+        operator = _load_operator_module()
+        with patch.dict(
+            operator.os.environ,
+            {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "HEIM_NODE_RUNTIME_ENV_DIR": "/stale/node",
+                "UV_CACHE_DIR": "/stale/uv",
+            },
+            clear=False,
+        ):
+            environment = operator._safe_environment()
+        self.assertEqual(
+            "/run/user/1000/grabowski-node-runtime-env",
+            environment["HEIM_NODE_RUNTIME_ENV_DIR"],
+        )
+        self.assertEqual(
+            "/run/user/1000/grabowski-uv-cache",
+            environment["UV_CACHE_DIR"],
+        )
+
     def test_http_recovery_contract_is_loopback_bound(self) -> None:
         operator = _load_operator_module()
         metadata = operator._protected_resource_metadata(
@@ -1045,9 +1098,16 @@ class OperatorContractTests(unittest.TestCase):
                 "stdout_truncated": False,
                 "stderr_truncated": False,
             }
+            managed_runtime = {
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "HEIM_NODE_RUNTIME_ENV_DIR": "/run/user/1000/grabowski-node-runtime-env",
+                "UV_CACHE_DIR": "/run/user/1000/grabowski-uv-cache",
+            }
             with patch.object(operator, "STATE_DIR", state), patch.object(
                 operator, "JOBS_DIR", jobs
             ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_managed_runtime_environment", return_value=managed_runtime
+            ), patch.object(
                 operator, "_run", return_value=launcher
             ) as run:
                 job = operator.grabowski_job_start(command, cwd=str(cwd), runtime_seconds=60)
@@ -1100,6 +1160,15 @@ class OperatorContractTests(unittest.TestCase):
             self.assertNotIn("--property=UMask=0077", invoked)
             self.assertTrue(any(item.startswith("--setenv=GRABOWSKI_JOB_ORIGIN_SHA256=") for item in invoked))
             self.assertIn("--setenv=GRABOWSKI_JOB_INVOKER_TOOL=grabowski_job_start", invoked)
+            self.assertIn("--setenv=XDG_RUNTIME_DIR=/run/user/1000", invoked)
+            self.assertIn(
+                "--setenv=HEIM_NODE_RUNTIME_ENV_DIR=/run/user/1000/grabowski-node-runtime-env",
+                invoked,
+            )
+            self.assertIn(
+                "--setenv=UV_CACHE_DIR=/run/user/1000/grabowski-uv-cache",
+                invoked,
+            )
             self.assertTrue(any(" -I -m grabowski_job_finalizer" in item for item in invoked))
             self.assertEqual(job["schema_version"], 2)
             self.assertEqual(job["origin"]["invoker_tool"], "grabowski_job_start")
