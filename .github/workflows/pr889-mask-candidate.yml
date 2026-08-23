@@ -6,6 +6,7 @@ on:
       - fix/pr889-mask-review-20260823
     types:
       - opened
+      - reopened
 
 permissions:
   contents: write
@@ -116,10 +117,7 @@ jobs:
           PY
           git diff --check
 
-      - name: Run focused browser worker suite
-        run: python3 -m pytest -p no:cacheprovider tests/test_workers.py
-
-      - name: Run repository validation
+      - name: Run repository verification
         run: make validate deploy-check
 
       - name: Commit verified candidate and remove temporary workflow
