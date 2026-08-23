@@ -816,6 +816,87 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(result["unit"], unit)
         self.assertEqual(SELF_DEPLOY.base._append_audit.call_count, 2)
 
+    def test_schedule_retries_only_audit_lock_contention_without_restarting_job(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "c" * 40
+        identity = _source_identity(repo, expected)
+        unit = "grabowski-job-abcdef012345"
+        job_dir = Path("/state") / unit
+        command = SELF_DEPLOY._deploy_command(
+            repo,
+            runner,
+            expected,
+            9,
+            canonical_repository=repo,
+            source_kind="canonical-main",
+            source_identity_sha256=identity["identity_sha256"],
+        )
+        job = {
+            "unit": unit,
+            "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+        }
+        fixed_uuid = Mock(hex="abcdef012345ffffffffffffffffffff")
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        SELF_DEPLOY.privileged.ensure_rootbroker_authority.reset_mock()
+        SELF_DEPLOY.operator._start_job.return_value = job
+        timeout = RuntimeError(SELF_DEPLOY.AUDIT_LOCK_TIMEOUT_ERROR)
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(repo, runner, identity),
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None
+        ), patch.object(
+            SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_index", return_value={"units": [], "pending_unit": None}
+        ), patch.object(SELF_DEPLOY, "_write_deploy_index"), patch.object(
+            SELF_DEPLOY.uuid, "uuid4", return_value=fixed_uuid
+        ), patch.object(
+            SELF_DEPLOY.base,
+            "_append_audit",
+            side_effect=[timeout, None, timeout, None],
+        ) as audit:
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 9)
+
+        self.assertTrue(result["scheduled"])
+        self.assertFalse(result["already_scheduled"])
+        SELF_DEPLOY.operator._start_job.assert_called_once_with(
+            command,
+            cwd=str(repo),
+            runtime_seconds=3600,
+            finalization_expected_head=expected,
+            reserved_unit=unit,
+            allow_reserved_runtime_deploy=True,
+        )
+        SELF_DEPLOY.privileged.ensure_rootbroker_authority.assert_called_once_with(expected)
+        self.assertEqual(4, audit.call_count)
+        self.assertEqual(
+            [
+                "runtime-deploy-schedule-intent",
+                "runtime-deploy-schedule-intent",
+                "runtime-deploy-scheduled",
+                "runtime-deploy-scheduled",
+            ],
+            [entry.args[0]["operation"] for entry in audit.call_args_list],
+        )
+
+    def test_deploy_audit_retry_does_not_swallow_other_audit_failures(self) -> None:
+        with patch.object(
+            SELF_DEPLOY.base,
+            "_append_audit",
+            side_effect=RuntimeError("audit unavailable"),
+        ) as audit:
+            with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                SELF_DEPLOY._append_deploy_audit({"operation": "test"})
+        audit.assert_called_once_with({"operation": "test"})
+
     def test_public_github_main_lookup_is_fixed_and_credential_free(self) -> None:
         expected = "d" * 40
         completed = subprocess.CompletedProcess(
