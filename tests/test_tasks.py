@@ -392,10 +392,17 @@ class TaskTests(unittest.TestCase):
         selected = LOCAL_HOST if host == "local" else REMOTE_HOST
         self.start_counter += 1
         command_argument = "ok" if self.start_counter == 1 else f"ok-{self.start_counter}"
+        managed_runtime = {
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "HEIM_NODE_RUNTIME_ENV_DIR": "/run/user/1000/grabowski-node-runtime-env",
+            "UV_CACHE_DIR": "/run/user/1000/grabowski-uv-cache",
+        }
         with patch.object(tasks.fleet, "fleet_host", return_value=selected), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ) as dispatch, patch.object(tasks.base, "_append_audit"), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+        ), patch.object(
+            tasks.operator, "_managed_runtime_environment", return_value=managed_runtime
         ):
             result = tasks.grabowski_task_start(
                 host,
@@ -424,6 +431,15 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=ProtectHome=no", launch)
         self.assertIn("--property=MemoryDenyWriteExecute=no", launch)
         self.assertIn("--property=UMask=0077", launch)
+        managed_launch_env = {
+            "--setenv=XDG_RUNTIME_DIR=/run/user/1000",
+            "--setenv=HEIM_NODE_RUNTIME_ENV_DIR=/run/user/1000/grabowski-node-runtime-env",
+            "--setenv=UV_CACHE_DIR=/run/user/1000/grabowski-uv-cache",
+        }
+        if selected["transport"] == "local":
+            self.assertTrue(managed_launch_env.issubset(set(launch)))
+        else:
+            self.assertTrue(managed_launch_env.isdisjoint(set(launch)))
         self.assertEqual(launch.count("--property=StandardOutput=null"), 1)
         self.assertEqual(launch.count("--property=StandardError=journal"), 1)
         self.assertEqual(tasks.TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS, 30)
