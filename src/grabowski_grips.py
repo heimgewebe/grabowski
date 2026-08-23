@@ -3050,6 +3050,9 @@ def _run_pr_check_readiness(
             self_review_audit,
             expected_head=expected_head_for_review,
             expected_diff_sha256=expected_review_diff,
+            expected_base_sha=parameters.get("expected_base_sha"),
+            expected_repo=parameters.get("expected_repo"),
+            expected_pr=parameters.get("expected_pr"),
         )
         if evidence_errors:
             _check(receipt, "self_review_audit", "fail", "; ".join(evidence_errors))

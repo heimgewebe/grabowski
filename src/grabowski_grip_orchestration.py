@@ -804,6 +804,9 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
                 parameters={
                     "repo": normalized["repository_path"],
                     "expected_head": normalized["expected_head"],
+                    "expected_base_sha": normalized["expected_base_sha"],
+                    "expected_repo": normalized["repository"],
+                    "expected_pr": normalized["pr"],
                     "expected_diff_sha256": normalized["expected_diff_sha256"],
                     "self_review_audit": normalized["self_review_audit"],
                 },

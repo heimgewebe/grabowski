@@ -238,6 +238,9 @@ class SagaContractTests(unittest.TestCase):
         readiness = plan["mechanic_actions"][1]
         self.assertEqual("pr-check-readiness", readiness["action"])
         self.assertEqual(HEAD, readiness["parameters"]["expected_head"])
+        self.assertEqual(BASE, readiness["parameters"]["expected_base_sha"])
+        self.assertEqual("heimgewebe/grabowski", readiness["parameters"]["expected_repo"])
+        self.assertEqual(876, readiness["parameters"]["expected_pr"])
         self.assertEqual(DIFF, readiness["parameters"]["expected_diff_sha256"])
         self.assertEqual(self.self_review_audit(), readiness["parameters"]["self_review_audit"])
         self.assertEqual(DIFF, plan["expected_identity"]["expected_diff_sha256"])
