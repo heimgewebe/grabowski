@@ -1088,9 +1088,9 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 GRIP_CONDITIONAL_PRECONDITIONS = {
     "agent-execution-happy-path": (
         "exactly one mode is required: workspace_id resumes one lane-backed Agent Workspace; otherwise source_kind, source_id, repo, source_revision, write_paths, objective, test_argv and retention_until_unix form one bounded Source request",
-        "Source mode derives branch, target checkout, idempotency identity, canonical route, ExecutionPlan.v1 and route-bound writer/reviewer commands server-side; effect_profile defaults to candidate and delivery is an explicit scoped-writer-only opt-in; resume derives the profile from the lane plan",
+        "Source mode derives branch, target checkout, idempotency identity and canonical route server-side; mutable controller/scoped-writer routes additionally derive ExecutionPlan.v1, while direct-review routes return only a read-only source/revision/route binding; effect_profile defaults to candidate and delivery is an explicit scoped-writer-only opt-in; resume derives the profile from the lane plan",
         "callers cannot select branch, target, Candidate, delivery action or revision identities",
-        "Source mode always materializes one controller-owned Work Lane; controller routes stop at a lane-bound controller execution boundary, while scoped-writer routes bind scoped-writer authority without scoped_writer_argv so Agent Workspace remains the only delegated writer-start owner",
+        "Source mode materializes one controller-owned Work Lane only for mutable controller or scoped-writer routes; direct_review_required routes create no Work Lane or Agent Workspace and hand back one read-only controller review binding; mutable controller routes stop at a lane-bound controller execution boundary, while scoped-writer routes bind scoped-writer authority without scoped_writer_argv so Agent Workspace remains the only delegated writer-start owner",
         "the internal execution coordinator owns no state store and may only collect, consume the one bounded candidate revision, or close through existing workspace seams",
         "ordinary pending async progress is handed to one deterministic existing Grabowski job; a continuation runner never creates another continuation job",
         "candidate-integration-ready remains the candidate-default P1-P5 path; delivery commit/push/PR runs internally only after exact closed PASS Candidate bindings and candidate/commit tree equality are revalidated",
@@ -6345,13 +6345,17 @@ def _agent_execution_source_request(
         raise GripPreflightError("canonical route effect profile differs from the request")
     try:
         execution_plan.route_binding_from_decision(route)
-        plan = _agent_execution_build_plan(
-            execution_plan,
-            source_kind=source_kind,
-            source_id=source_id,
-            route=route,
-            write_paths=write_paths,
-            runtime_seconds=runtime_seconds,
+        plan = (
+            None
+            if route.get("direct_review_required") is True
+            else _agent_execution_build_plan(
+                execution_plan,
+                source_kind=source_kind,
+                source_id=source_id,
+                route=route,
+                write_paths=write_paths,
+                runtime_seconds=runtime_seconds,
+            )
         )
     except Exception as exc:
         raise GripPreflightError(
@@ -6391,7 +6395,7 @@ def _agent_execution_source_request(
         "source_identity_sha256": source_identity_sha256,
         "request_sha256": request_sha256,
         "route_recommendation_sha256": route.get("recommendation_sha256"),
-        "execution_plan_id": plan.get("plan_id"),
+        "execution_plan_id": plan.get("plan_id") if isinstance(plan, dict) else None,
         "executor": route.get("executor"),
         "writer_route": route.get("writer_route"),
         "verification_policy": verification_policy,
@@ -6412,8 +6416,17 @@ def _agent_execution_source_request(
         return {
             **frontdoor,
             "state": "controller_handback",
-            "execution_plan": plan,
-            "next_action": "controller_review_bound_plan",
+            "execution_plan": None,
+            "review_binding": {
+                "schema_version": 1,
+                "kind": "controller_review_binding",
+                "source": {"kind": source_kind, "id": source_id},
+                "source_revision": source_revision,
+                "route_recommendation_sha256": route.get("recommendation_sha256"),
+                "verification_policy": verification_policy,
+                "read_only": True,
+            },
+            "next_action": "controller_review_bound_source",
             "receipt_status": "passed",
             "stop": True,
         }

@@ -5355,8 +5355,11 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("controller_handback", result["output"]["state"])
-        self.assertEqual("controller_review_bound_plan", result["output"]["next_action"])
+        self.assertEqual("controller_review_bound_source", result["output"]["next_action"])
         self.assertIsNone(result["output"]["lane_id"])
+        self.assertIsNone(result["output"]["execution_plan"])
+        self.assertTrue(result["output"]["review_binding"]["read_only"])
+        self.assertEqual(head, result["output"]["review_binding"]["source_revision"])
         work_acquire.acquire_work.assert_not_called()
         workspace.grabowski_agent_workspace_create.assert_not_called()
 
