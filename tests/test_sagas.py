@@ -15,10 +15,33 @@ import grabowski_sagas as sagas
 
 HEAD = "a" * 40
 BASE = "b" * 40
+DIFF = "0" * 64
 RUN_ID = "BUR-RUN-20260821T130302Z-9eb40cfeb0"
 
 
 class SagaContractTests(unittest.TestCase):
+    def self_review_audit(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_self_review_audit",
+            "repo": "heimgewebe/grabowski",
+            "pr": 876,
+            "generated_at": "2026-08-23T12:00:00+00:00",
+            "head_sha": HEAD,
+            "base_sha": BASE,
+            "diff_sha256": DIFF,
+            "review_tier": "standard",
+            "gate_verdict": "PASS",
+            "self_review_gate_valid": True,
+            "minimum_review_iterations": 2,
+            "actual_review_iterations": 2,
+            "all_findings_triaged": True,
+            "material_findings_remaining": 0,
+            "residual_risk_accepted": False,
+            "residual_risk_reason": "",
+            "tuning_signal": "observe",
+        }
+
     def pr_target(self) -> dict[str, object]:
         return {
             "repository_path": str(ROOT),
@@ -27,6 +50,8 @@ class SagaContractTests(unittest.TestCase):
             "base": "main",
             "expected_head": HEAD,
             "expected_base_sha": BASE,
+            "expected_diff_sha256": DIFF,
+            "self_review_audit": self.self_review_audit(),
             "bureau_run_id": RUN_ID,
             "merge_method": "squash",
         }
@@ -213,8 +238,20 @@ class SagaContractTests(unittest.TestCase):
         readiness = plan["mechanic_actions"][1]
         self.assertEqual("pr-check-readiness", readiness["action"])
         self.assertEqual(HEAD, readiness["parameters"]["expected_head"])
+        self.assertEqual(DIFF, readiness["parameters"]["expected_diff_sha256"])
+        self.assertEqual(self.self_review_audit(), readiness["parameters"]["self_review_audit"])
+        self.assertEqual(DIFF, plan["expected_identity"]["expected_diff_sha256"])
         self.assertEqual(plan, sagas.validate_plan(plan))
         self.assertIn("cross-system-atomicity", plan["does_not_establish"])
+
+    def test_pr_plan_requires_diff_bound_self_review_evidence(self) -> None:
+        for field in ("expected_diff_sha256", "self_review_audit"):
+            target = self.pr_target()
+            target.pop(field)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                sagas.SagaError, "target shape is invalid"
+            ):
+                sagas.build_plan("pr-settlement", target, "semantic-readiness-evidence")
 
     def test_runtime_plan_uses_registered_adapter_and_runtime_readback(self) -> None:
         plan = sagas.build_plan(

@@ -655,6 +655,8 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
         "base",
         "expected_head",
         "expected_base_sha",
+        "expected_diff_sha256",
+        "self_review_audit",
         "bureau_run_id",
         "merge_method",
     }
@@ -666,6 +668,8 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
         "base",
         "expected_head",
         "expected_base_sha",
+        "expected_diff_sha256",
+        "self_review_audit",
     }
     missing = sorted(required - set(raw))
     if unknown or missing:
@@ -678,6 +682,12 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
     base = _branch(raw.get("base"), "target.base")
     expected_head = _sha40(raw.get("expected_head"), "target.expected_head")
     expected_base_sha = _sha40(raw.get("expected_base_sha"), "target.expected_base_sha")
+    expected_diff_sha256 = _sha256(
+        raw.get("expected_diff_sha256"), "target.expected_diff_sha256"
+    )
+    self_review_audit = _bounded_mapping(
+        raw.get("self_review_audit"), "target.self_review_audit"
+    )
     bureau_run_id = _optional_bureau_run_id(raw.get("bureau_run_id"))
     merge_method = raw.get("merge_method")
     if merge_method is not None:
@@ -691,6 +701,8 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
         "base": base,
         "expected_head": expected_head,
         "expected_base_sha": expected_base_sha,
+        "expected_diff_sha256": expected_diff_sha256,
+        "self_review_audit": self_review_audit,
         "bureau_run_id": bureau_run_id,
         "merge_method": merge_method,
     }
@@ -792,6 +804,8 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
                 parameters={
                     "repo": normalized["repository_path"],
                     "expected_head": normalized["expected_head"],
+                    "expected_diff_sha256": normalized["expected_diff_sha256"],
+                    "self_review_audit": normalized["self_review_audit"],
                 },
                 target={
                     "repository": normalized["repository"],
@@ -814,6 +828,7 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
             "base": normalized["base"],
             "expected_head": normalized["expected_head"],
             "expected_base_sha": normalized["expected_base_sha"],
+            "expected_diff_sha256": normalized["expected_diff_sha256"],
         }
         captain_handoff = {
             "profile": "captain",
