@@ -5217,7 +5217,9 @@ def _task_output_cleanup_run(
     }
 
 
-def _launch_argv(record: dict[str, Any]) -> list[str]:
+def _launch_argv(
+    record: dict[str, Any], *, include_managed_runtime: bool
+) -> list[str]:
     command = _task_output_capture_argv(record)
     unit = _authoritative_unit(record)
     argv = [
@@ -5248,6 +5250,11 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
     ]
     if record["memory_max_bytes"] is not None:
         argv.append(f"--property=MemoryMax={record['memory_max_bytes']}")
+    if include_managed_runtime:
+        argv.extend(
+            f"--setenv={key}={value}"
+            for key, value in operator._managed_runtime_environment().items()
+        )
     return [*argv, "--", *command_identity.systemd_escape_argv(command)]
 
 
@@ -5300,7 +5307,15 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
                 "launch_not_dispatched": True,
                 "privileged_broker": None,
             }
-    return _dispatch(record["host"], _launch_argv(record), timeout_seconds=60)
+    target = fleet.fleet_host(record["host"])
+    return _dispatch(
+        record["host"],
+        _launch_argv(
+            record,
+            include_managed_runtime=target["transport"] == "local",
+        ),
+        timeout_seconds=60,
+    )
 
 
 def _launch_state(result: dict[str, Any]) -> str:
