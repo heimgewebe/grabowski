@@ -852,7 +852,6 @@ def _collect_findings(
     findings: list[dict[str, Any]] = []
     for analyzer in (
         _runtime_findings,
-        _outcome_findings,
         _bureau_contract_findings,
         _resource_findings,
         _audit_signal_findings,

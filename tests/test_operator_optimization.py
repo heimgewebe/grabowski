@@ -178,7 +178,6 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         finding_ids = {item["id"] for item in result["findings"]}
         self.assertTrue(
             {
-                "fresh_execution_outcomes_missing",
                 "repeated_bureau_contract_failures",
                 "repeated_resource_reclamation",
                 "repeated_blockade",
@@ -273,6 +272,16 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         evidence = result["source_evidence"]
         self.assertIn("audit_candidate_patterns", evidence)
         self.assertIn("friction_failure_classification", evidence)
+        self.assertNotIn(
+            "fresh_execution_outcomes_missing",
+            {item["id"] for item in result["findings"]},
+        )
+        self.assertTrue(result["source_health"]["execution_outcomes_available"])
+        self.assertEqual(
+            result["source_bindings"]["execution_outcomes"]["summary_sha256"],
+            "outcome-summary-sha",
+        )
+        self.assertIn("execution_governor_candidates", evidence)
         self.assertNotIn("events", evidence)
         self.assertNotIn("work", evidence["current_work_summary"])
 
