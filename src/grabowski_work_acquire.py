@@ -497,6 +497,14 @@ def persist_terminal_closeout(
             return result
         if record.get("receipt_sha256") != expected_receipt_sha256:
             raise RuntimeError("work-lane terminal closeout CAS preimage changed")
+        # Converge managed checkout lifecycle before publishing terminal_closeout.
+        # If this step fails, callers continue to observe no terminal closeout and
+        # therefore retry the same evidence-bound terminalization path.  The
+        # lifecycle transition itself is idempotent, so a later receipt-write
+        # failure is likewise safe to retry without reopening or deleting work.
+        lifecycle = _converge_terminal_checkout_lifecycle(
+            record, assessment=validated
+        )
         stored = _write_state(receipt_path, {**record, "terminal_closeout": wrapper, "updated_at_unix": int(time.time())})
         result = {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
         audit_record_sha256 = _ensure_terminal_closeout_audit(
@@ -504,9 +512,6 @@ def persist_terminal_closeout(
         )
         if audit_record_sha256 is not None:
             result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
-        lifecycle = _converge_terminal_checkout_lifecycle(
-            stored, assessment=validated
-        )
         if lifecycle is not None:
             result["checkout_lifecycle_closeout"] = lifecycle
         return result

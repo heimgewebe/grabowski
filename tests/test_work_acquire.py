@@ -1660,6 +1660,32 @@ class WorkAcquireTests(unittest.TestCase):
         clean.assert_called_once_with(observed)
         mark.assert_not_called()
 
+    def test_terminal_closeout_lifecycle_failure_keeps_receipt_retryable(self) -> None:
+        params = self.parameters()
+        _, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        assessment = self.terminal_assessment(lane_id, 200)
+        before = work_acquire._read_state(
+            self.state / f"{lane_id}.json"
+        )
+        self.assertIsNotNone(before)
+        with patch.object(
+            work_acquire,
+            "_converge_terminal_checkout_lifecycle",
+            side_effect=RuntimeError("lifecycle temporarily unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lifecycle temporarily unavailable"):
+                work_acquire.persist_terminal_closeout(
+                    lane_id,
+                    assessment,
+                    expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                )
+        after = work_acquire._read_state(self.state / f"{lane_id}.json")
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertNotIn("terminal_closeout", after)
+        self.assertEqual(after["receipt_sha256"], receipt["receipt_sha256"])
+
     def test_terminal_closeout_replay_retries_checkout_lifecycle_convergence(self) -> None:
         params = self.parameters()
         _, receipt = self.store_lane(params)
