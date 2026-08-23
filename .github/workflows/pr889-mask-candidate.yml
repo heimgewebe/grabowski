@@ -1,36 +1,40 @@
 name: pr889-mask-candidate
 
 on:
-  push:
+  pull_request:
     branches:
       - fix/pr889-mask-review-20260823
+    types:
+      - opened
 
 permissions:
   contents: write
 
 jobs:
   patch-and-verify:
+    if: github.event.pull_request.head.ref == 'fix/pr889-mask-review-work-20260823'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout isolated candidate branch
+      - name: Checkout isolated candidate head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: fix/pr889-mask-review-20260823
-          fetch-depth: 2
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
-      - name: Assert exact parent and apply bounded patch
+      - name: Assert exact source identity and apply bounded patch
         env:
-          EXPECTED_PARENT: 5875e550d588e0f3d24ce653ac15f0fb2dd42b5c
+          EXPECTED_SOURCE_BLOB: 837a0fa1feb9215de5450d1f0cf896e3c7781b4c
+          EXPECTED_TESTS_BLOB: 077ca9e08e51566e78274fec772f56bc675a9d02
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
-          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = ".github/workflows/pr889-mask-candidate.yml"
+          test "$(git hash-object src/grabowski_workers.py)" = "$EXPECTED_SOURCE_BLOB"
+          test "$(git hash-object tests/test_workers.py)" = "$EXPECTED_TESTS_BLOB"
           python3 - <<'PY'
           from pathlib import Path
 
@@ -42,12 +46,7 @@ jobs:
 
           source_path = Path("src/grabowski_workers.py")
           source = source_path.read_text(encoding="utf-8")
-          source = replace_exact(
-              source,
-              "styleIndexes.length !== 10",
-              "styleIndexes.length !== 11",
-              expected=2,
-          )
+          source = replace_exact(source, "styleIndexes.length !== 10", "styleIndexes.length !== 11", expected=2)
           source = replace_exact(
               source,
               "  const overflowYText = semanticSnapshotString(strings, styleIndexes[7], 64);\n  if (visibility === null || opacityText === null || contentVisibility === null ||\n      filterText === null || clipPathText === null || clipText === null ||\n      overflowXText === null || overflowYText === null) {",
@@ -116,7 +115,6 @@ jobs:
           tests_path.write_text(tests, encoding="utf-8")
           PY
           git diff --check
-          git diff -- src/grabowski_workers.py tests/test_workers.py
 
       - name: Run focused browser worker suite
         run: python3 -m pytest -p no:cacheprovider tests/test_workers.py
@@ -131,7 +129,7 @@ jobs:
           git config user.name "pr889-candidate-bot"
           git config user.email "pr889-candidate-bot@users.noreply.github.com"
           git add src/grabowski_workers.py tests/test_workers.py .github/workflows/pr889-mask-candidate.yml
-          test "$(git diff --cached --name-only)" = $'src/grabowski_workers.py\ntests/test_workers.py'
+          test "$(git diff --cached --name-only)" = $'.github/workflows/pr889-mask-candidate.yml\nsrc/grabowski_workers.py\ntests/test_workers.py'
           git diff --cached --check
           git commit -m "fix(browser): reject masked semantic fallback text"
-          git push origin HEAD:fix/pr889-mask-review-20260823
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
