@@ -42,6 +42,8 @@ def _run(
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ALLOW_PROTOCOL": "file",
+            "GIT_SSH_COMMAND": "false",
             "LC_ALL": "C",
         },
     )
@@ -118,6 +120,8 @@ class _RealGitCasFixture:
         self.control = self.root / "control"
 
         _run(["git", "init", "--bare", "--quiet", str(self.remote)])
+        _bare_git(self.remote, "config", "gc.auto", "0")
+        _bare_git(self.remote, "config", "maintenance.auto", "false")
         _run(["git", "init", "--quiet", str(self.seed)])
         _git(self.seed, "config", "gc.auto", "0")
         _git(self.seed, "config", "maintenance.auto", "false")
@@ -228,7 +232,7 @@ class CaptainExactBaseCasRealGitIntegrationTests(unittest.TestCase):
             f"--force-with-lease={_BASE_REF}:{fixture.base_sha}",
             push,
         )
-        self.assertIn(f"HEAD:{_BASE_REF}", push)
+        self.assertIn(f"HEAD:{_BASE_REF", push)
         self.assertEqual(f":{_HEAD_REF}", push[-1])
 
     def test_real_atomic_head_race_rejects_entire_push_and_preserves_base(self) -> None:
