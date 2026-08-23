@@ -20,6 +20,7 @@ import grabowski_convergence
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
 import grabowski_operator_obligation
+import grabowski_operator_obligation_evidence
 import grabowski_worktree_ensure
 import grabowski_merge_guard
 
@@ -775,6 +776,15 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("integrity-bound-read", "continuation-decision", "no-completion-inference"),
         runner="operator_obligation_status",
     ),
+    "operator-obligation-evidence-assess": GripSpec(
+        name="operator-obligation-evidence-assess",
+        version="1.0",
+        summary="Shadow-assess operator-obligation acceptance evidence without changing closeout truth.",
+        effect=READ_ONLY,
+        required_parameters=("mode",),
+        acceptance_ids=("read-only-shadow", "bounded-assessment", "no-completion-authority"),
+        runner="operator_obligation_evidence_assess",
+    ),
     "operator-obligation-close": GripSpec(
         name="operator-obligation-close",
         version="1.1",
@@ -945,6 +955,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "operator-obligation-open",
         "operator-obligation-list",
         "operator-obligation-status",
+        "operator-obligation-evidence-assess",
         "operator-obligation-close",
         "operator-obligation-resolve",
         "branch-publish",
@@ -999,6 +1010,7 @@ GRIP_SURFACE_TARGETS = {
     "operator-obligation-open": "one durable operator obligation open record",
     "operator-obligation-list": "bounded operator obligation continuation inventory",
     "operator-obligation-status": "one integrity-bound operator obligation status",
+    "operator-obligation-evidence-assess": "one read-only operator obligation evidence shadow assessment",
     "operator-obligation-close": "one create-only operator obligation terminal record",
     "operator-obligation-resolve": "one create-only historical operator obligation resolution",
     "branch-publish": "git branch publication",
@@ -12852,6 +12864,57 @@ def _run_operator_obligation_status(
     return {**output, "receipt_status": "passed"}
 
 
+def _run_operator_obligation_evidence_assess(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    mode = parameters.get("mode")
+    try:
+        if mode == "exact":
+            if set(parameters) != {"mode", "obligation_id"}:
+                raise GripPreflightError("exact evidence assessment requires only mode and obligation_id")
+            output = grabowski_operator_obligation_evidence.assess_obligation(
+                parameters["obligation_id"]
+            )
+        elif mode == "sample":
+            if set(parameters) - {"mode", "limit"}:
+                raise GripPreflightError("sample evidence assessment accepts only mode and optional limit")
+            output = grabowski_operator_obligation_evidence.sample_completed(
+                parameters.get("limit", grabowski_operator_obligation_evidence.MIN_ROLLOUT_SAMPLE)
+            )
+        else:
+            raise GripPreflightError("mode must be exact or sample")
+    except grabowski_operator_obligation_evidence.EvidenceAssessmentError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except grabowski_operator_obligation.OperatorObligationInputError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except FileNotFoundError as exc:
+        _check(receipt, "bounded_assessment", "fail", "obligation record not found")
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["obligation_not_found"],
+            "error": str(exc),
+        }
+    except grabowski_operator_obligation.OperatorObligationError as exc:
+        raise GripActionError(str(exc)) from exc
+    _check(receipt, "read_only_shadow", "pass", f"mode={mode}")
+    digest = output.get("assessment_sha256") or output.get("sample_sha256")
+    if not _is_sha256_hex(digest):
+        raise GripActionError("evidence shadow assessment lacks a canonical SHA-256 digest")
+    _check(receipt, "bounded_assessment", "pass", digest)
+    _check(
+        receipt,
+        "no_completion_authority",
+        "pass",
+        "assessment does not mutate or establish operator-obligation completion",
+    )
+    return {**output, "receipt_status": "passed"}
+
+
 def _run_operator_obligation_resolve(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -13633,6 +13696,7 @@ _RUNNERS = {
     "operator_obligation_open": _run_operator_obligation_open,
     "operator_obligation_list": _run_operator_obligation_list,
     "operator_obligation_status": _run_operator_obligation_status,
+    "operator_obligation_evidence_assess": _run_operator_obligation_evidence_assess,
     "operator_obligation_close": _run_operator_obligation_close,
     "operator_obligation_resolve": _run_operator_obligation_resolve,
     "mechanic_loop": _run_mechanic_loop,
