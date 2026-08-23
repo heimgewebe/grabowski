@@ -69,6 +69,7 @@ DEPLOY_JOB_PREFIX = operator.JOB_PREFIX
 DEPLOY_JOB_ROOT = operator.JOBS_DIR
 DEPLOY_SCHEDULE_LOCK_TIMEOUT_SECONDS = 10.0
 DEPLOY_SCHEDULE_LOCK_POLL_SECONDS = 0.05
+AUDIT_LOCK_TIMEOUT_ERROR = "Audit lock acquisition timed out"
 MAX_JOB_SCAN_ENTRIES = 2_000
 MAX_DEPLOY_INDEX_ENTRIES = 512
 DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
@@ -1044,6 +1045,23 @@ def _deploy_identity(command: Any) -> tuple[str, ...] | None:
         fields["source_identity_sha256"],
         fields["expected_head"],
     )
+
+
+def _append_deploy_audit(record: dict[str, Any]) -> None:
+    """Persist deploy audit evidence despite transient audit-lock contention.
+
+    The audit coordination lock is process-bound. Its exact timeout is raised
+    before the append critical section is entered, so retrying only the audit
+    append cannot duplicate a deployment, Rootbroker refresh, or job start.
+    Other audit failures remain fail-closed.
+    """
+    while True:
+        try:
+            base._append_audit(record)
+            return
+        except RuntimeError as exc:
+            if str(exc) != AUDIT_LOCK_TIMEOUT_ERROR:
+                raise
 
 
 @contextmanager
@@ -2522,7 +2540,7 @@ def grabowski_runtime_deploy_schedule(
                     != source_identity["identity_sha256"]
                 ),
             }
-            base._append_audit(observed)
+            _append_deploy_audit(observed)
             return _schedule_result(
                 expected_head=expected_head,
                 requested_delay_seconds=delay_seconds,
@@ -2560,7 +2578,7 @@ def grabowski_runtime_deploy_schedule(
                 )
             },
         }
-        base._append_audit(intent)
+        _append_deploy_audit(intent)
         jobs_root = operator._jobs_root()
         index = _deploy_index(jobs_root)
         reserved_unit = DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
@@ -2618,7 +2636,7 @@ def grabowski_runtime_deploy_schedule(
             "argv_sha256": job["argv_sha256"],
             "source_identity_sha256": source_identity["identity_sha256"],
         }
-        base._append_audit(scheduled)
+        _append_deploy_audit(scheduled)
         return _schedule_result(
             expected_head=expected_head,
             requested_delay_seconds=delay_seconds,
