@@ -1691,7 +1691,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 confirmation="remove-linked-checkout",
             )
 
-    def test_completed_retained_limit_blocks_transition_without_deleting_checkout(self) -> None:
+    def test_completed_retained_threshold_is_advisory_for_terminal_transition(self) -> None:
         common_dir = self._common_dir()
         first_path = self.root / "worktrees" / "first-managed"
         second_path = self.root / "worktrees" / "second-managed"
@@ -1743,18 +1743,34 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 expected_head=self.head,
                 expected_branch="topic-one",
             )
-            with self.assertRaisesRegex(RuntimeError, "completed-retained checkout limit"):
-                checkouts._mark_checkout_completed_retained(
-                    checkout_key=second["checkout_key"],
-                    owner_id="owner-a",
-                    expected_head=self.head,
-                    expected_branch="topic-two",
-                )
+            second_completed = checkouts._mark_checkout_completed_retained(
+                checkout_key=second["checkout_key"],
+                owner_id="owner-a",
+                expected_head=self.head,
+                expected_branch="topic-two",
+            )
         bindings = checkouts._lifecycle_bindings(
             [first["checkout_key"], second["checkout_key"]]
         )
         self.assertEqual(bindings[first["checkout_key"]]["phase"], "completed_retained")
-        self.assertEqual(bindings[second["checkout_key"]]["phase"], "active")
+        self.assertEqual(bindings[second["checkout_key"]]["phase"], "completed_retained")
+        self.assertEqual(second_completed["limit"]["count_before"], 1)
+        self.assertEqual(second_completed["limit"]["maximum"], 1)
+        self.assertEqual(
+            second_completed["limit"]["enforcement"],
+            "advisory_hygiene_threshold",
+        )
+        self.assertTrue(second_completed["limit"]["over_threshold_before_transition"])
+        capacity = checkouts.active_capacity_projection(self.repo)
+        self.assertEqual(capacity["used"], 0)
+        self.assertEqual(capacity["free"], checkouts.MAX_ACTIVE_CHECKOUTS_PER_REPO)
+        with checkouts._database() as connection:
+            retained = connection.execute(
+                "SELECT count(*) FROM retention "
+                "WHERE checkout_key IN (?, ?) AND retention_until_unix>?",
+                (first["checkout_key"], second["checkout_key"], int(time.time())),
+            ).fetchone()[0]
+        self.assertEqual(retained, 2)
         self.assertTrue(self.checkout.is_dir())
 
     def test_retention_can_protect_dirty_checkout_and_rejects_foreign_owner(self) -> None:
