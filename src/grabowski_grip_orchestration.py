@@ -655,6 +655,8 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
         "base",
         "expected_head",
         "expected_base_sha",
+        "expected_diff_sha256",
+        "self_review_audit",
         "bureau_run_id",
         "merge_method",
     }
@@ -666,6 +668,8 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
         "base",
         "expected_head",
         "expected_base_sha",
+        "expected_diff_sha256",
+        "self_review_audit",
     }
     missing = sorted(required - set(raw))
     if unknown or missing:
@@ -678,6 +682,12 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
     base = _branch(raw.get("base"), "target.base")
     expected_head = _sha40(raw.get("expected_head"), "target.expected_head")
     expected_base_sha = _sha40(raw.get("expected_base_sha"), "target.expected_base_sha")
+    expected_diff_sha256 = _sha256(
+        raw.get("expected_diff_sha256"), "target.expected_diff_sha256"
+    )
+    self_review_audit = _bounded_mapping(
+        raw.get("self_review_audit"), "target.self_review_audit"
+    )
     bureau_run_id = _optional_bureau_run_id(raw.get("bureau_run_id"))
     merge_method = raw.get("merge_method")
     if merge_method is not None:
@@ -691,6 +701,8 @@ def _normalize_pr_target(value: Any) -> dict[str, Any]:
         "base": base,
         "expected_head": expected_head,
         "expected_base_sha": expected_base_sha,
+        "expected_diff_sha256": expected_diff_sha256,
+        "self_review_audit": self_review_audit,
         "bureau_run_id": bureau_run_id,
         "merge_method": merge_method,
     }
@@ -792,6 +804,8 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
                 parameters={
                     "repo": normalized["repository_path"],
                     "expected_head": normalized["expected_head"],
+                    "expected_diff_sha256": normalized["expected_diff_sha256"],
+                    "self_review_audit": normalized["self_review_audit"],
                 },
                 target={
                     "repository": normalized["repository"],
@@ -814,6 +828,7 @@ def build_plan(saga_kind: Any, target: Any, idempotency_key: Any) -> dict[str, A
             "base": normalized["base"],
             "expected_head": normalized["expected_head"],
             "expected_base_sha": normalized["expected_base_sha"],
+            "expected_diff_sha256": normalized["expected_diff_sha256"],
         }
         captain_handoff = {
             "profile": "captain",
@@ -1019,12 +1034,29 @@ def _validate_grip_result(
     return receipt, output
 
 
+def _child_semantically_ready(
+    plan: dict[str, Any], planned: Mapping[str, Any], child_output: Mapping[str, Any]
+) -> bool:
+    if (
+        plan.get("saga_kind") != "pr-settlement"
+        or planned.get("action") != "pr-check-readiness"
+    ):
+        return True
+    blocking_reasons = child_output.get("blocking_reasons")
+    return (
+        child_output.get("ready") is True
+        and child_output.get("verdict") == "ready"
+        and isinstance(blocking_reasons, list)
+        and not blocking_reasons
+    )
+
+
 def _validate_mechanic_result(
     plan: dict[str, Any],
     mechanic_result: Any,
     *,
     receipt_sha256_json: ReceiptHasher | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], dict[str, Any], list[str], bool]:
     receipt_hasher = receipt_sha256_json or sha256_json
     receipt, output = _validate_grip_result(
         mechanic_result,
@@ -1039,7 +1071,7 @@ def _validate_mechanic_result(
         and receipt.get("status") == "blocked"
         and receipt.get("phase") == "preflight"
     ):
-        return receipt, output, []
+        return receipt, output, [], False
     if not isinstance(child_actions, list):
         raise SagaError("mechanic_result actions are missing")
     if output.get("requested_action_count") != len(planned_actions):
@@ -1050,6 +1082,7 @@ def _validate_mechanic_result(
         raise SagaError("mechanic_result executed unplanned actions")
 
     child_receipts: list[str] = []
+    semantic_child_results: list[bool] = []
     for index, record_value in enumerate(child_actions):
         if not isinstance(record_value, Mapping):
             raise SagaError(f"mechanic_result.actions[{index}] must be an object")
@@ -1102,9 +1135,12 @@ def _validate_mechanic_result(
         if record.get("receipt_status") != child_receipt.get("status"):
             raise SagaError(f"mechanic_result.actions[{index}] child status mismatch")
         child_receipts.append(child_sha)
+        semantic_child_results.append(
+            _child_semantically_ready(plan, planned, child_output)
+        )
 
     complete = output.get("complete") is True
-    prepare_passed = (
+    mechanic_passed = (
         receipt.get("status") == "passed"
         and complete
         and len(child_actions) == len(planned_actions)
@@ -1113,9 +1149,10 @@ def _validate_mechanic_result(
             for item in child_actions
         )
     )
-    if receipt.get("status") == "passed" and not prepare_passed:
+    if receipt.get("status") == "passed" and not mechanic_passed:
         raise SagaError("mechanic_result claims pass without complete planned child success")
-    return receipt, output, child_receipts
+    prepare_passed = mechanic_passed and all(semantic_child_results)
+    return receipt, output, child_receipts, prepare_passed
 
 
 def build_run_receipt(
@@ -1125,12 +1162,11 @@ def build_run_receipt(
     receipt_sha256_json: ReceiptHasher | None = None,
 ) -> dict[str, Any]:
     plan = validate_plan(plan_value)
-    receipt, output, child_receipts = _validate_mechanic_result(
+    receipt, output, child_receipts, prepare_passed = _validate_mechanic_result(
         plan,
         mechanic_result,
         receipt_sha256_json=receipt_sha256_json,
     )
-    prepare_passed = receipt.get("status") == "passed" and output.get("complete") is True
     state = "captain_required" if prepare_passed else "prepare_blocked"
     body = {
         "schema_version": SCHEMA_VERSION,
