@@ -614,6 +614,35 @@ def _audit_bureau_failure_identity(
     return completeness, safe
 
 
+def _audit_bureau_identity_public_group(
+    group: dict[str, Any],
+    *,
+    reason_limit: int,
+) -> dict[str, Any]:
+    reason_counts = Counter(group.get("failure_reason_counts", {}))
+    attributed = sum(reason_counts.values())
+    unknown = int(group.get("failure_reason_unknown_count", 0))
+    total = attributed + unknown
+    public = {
+        key: value
+        for key, value in group.items()
+        if key not in {"failure_reason_counts", "failure_reason_unknown_count"}
+    }
+    public.update(
+        {
+            "failure_reason_class_count": len(reason_counts),
+            "failure_reason_attributed_count": attributed,
+            "failure_reason_unknown_count": unknown,
+            "failure_reason_coverage": round(attributed / total, 6) if total else 0.0,
+            "top_failure_reason_classes": [
+                {"reason": item["key"], "count": item["count"]}
+                for item in _audit_top(reason_counts, reason_limit)
+            ],
+        }
+    )
+    return public
+
+
 def _audit_bureau_identity_summary(
     quality: Counter[str],
     groups: dict[str, dict[str, Any]],
@@ -638,10 +667,14 @@ def _audit_bureau_identity_summary(
         "exact_identity_group_count": len(exact_groups),
     }
     if include_groups:
-        payload["top_exact_identity_groups"] = sorted(
+        selected = sorted(
             exact_groups,
             key=lambda item: (-int(item["count"]), str(item["identity_sha256"])),
         )[:top_limit]
+        payload["top_exact_identity_groups"] = [
+            _audit_bureau_identity_public_group(group, reason_limit=min(top_limit, 5))
+            for group in selected
+        ]
     return payload
 
 
@@ -753,6 +786,8 @@ def _audit_window_projection(
                         **identity,
                         "count": 0,
                         "failure_code_counts": {},
+                        "failure_reason_counts": {},
+                        "failure_reason_unknown_count": 0,
                         "failure_retryable_count": 0,
                         "failure_nonretryable_count": 0,
                         "failure_retryability_unknown_count": 0,
@@ -762,6 +797,12 @@ def _audit_window_projection(
                 code_key = _audit_label(record.get("bureau_code"), fallback="unknown")
                 code_counts = group["failure_code_counts"]
                 code_counts[code_key] = int(code_counts.get(code_key, 0)) + 1
+                failure_reason = record.get("bureau_failure_reason")
+                if isinstance(failure_reason, str) and failure_reason:
+                    reason_counts = group["failure_reason_counts"]
+                    reason_counts[failure_reason] = int(reason_counts.get(failure_reason, 0)) + 1
+                else:
+                    group["failure_reason_unknown_count"] += 1
                 if retryable is True:
                     group["failure_retryable_count"] += 1
                 elif retryable is False:
