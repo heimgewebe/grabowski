@@ -1456,6 +1456,90 @@ class CodingAgentRouterTests(unittest.TestCase):
             result["excluded"]["scoped-writer:codex-spark-low"][0],
         )
 
+    def test_ox_alpha_openrouter_preview_route_is_conservative_and_contrast_only(
+        self,
+    ) -> None:
+        validation = router._validate_catalog(self.catalog)
+        self.assertTrue(validation["valid"])
+        model = self.catalog["models"]["ox-alpha"]
+        pool = self.catalog["quota_pools"]["openrouter-ox-alpha-preview"]
+        route = next(
+            item
+            for item in self.catalog["routes"]
+            if item["id"] == "opencode-openrouter-ox-alpha-free-preview"
+        )
+        self.assertEqual(route["harness"], "opencode")
+        self.assertEqual(route["model"], "ox-alpha")
+        self.assertIn("openrouter/stealth/ox-alpha", route["argv_prefix"])
+        self.assertTrue(route["contrast_only"])
+        self.assertFalse(route["enabled"])
+        self.assertFalse(route.get("review_only", False))
+        self.assertEqual(route["quality_class"], "C")
+        self.assertEqual(
+            route["quota_pools"], ["openrouter-ox-alpha-preview"]
+        )
+        self.assertEqual(
+            set(route["task_classes"]),
+            {"mechanical", "docs", "tests", "bounded-patch", "triage"},
+        )
+        # The route must not silently reuse the opencode-free pool: OpenRouter
+        # free-preview pricing is a distinct, separately revalidated cost surface.
+        self.assertNotIn("opencode-free", route["quota_pools"])
+        self.assertEqual(model["provider_family"], "stealth")
+        self.assertEqual(model["quality_prior_class"], "C")
+        self.assertLessEqual(model["quality"]["reliability"], 5)
+        self.assertEqual(pool["cost_mode"], "temporary-free-account")
+        self.assertEqual(pool["marginal_cost_usd"], 0)
+        self.assertEqual(pool["max_concurrency"], 1)
+        self.assertFalse(pool["payg_fallback_allowed"])
+        self.assertEqual(pool["unknown_execution"], "advisory-only")
+        self.assertIn("revalidated", pool["note"])
+
+    def test_ox_alpha_route_fails_closed_without_local_openrouter_evidence(
+        self,
+    ) -> None:
+        route = next(
+            item
+            for item in self.catalog["routes"]
+            if item["id"] == "opencode-openrouter-ox-alpha-free-preview"
+        )
+        state = self._fresh_state()
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "OpenCode free model entitlement is unverified")
+
+        # Even if OpenCode's own free tier is verified, the OpenRouter provider
+        # and its stealth/ox-alpha model must be separately present before the
+        # route is usable; missing OpenRouter provider/auth fails closed.
+        state["catalog"]["providers"]["opencode"] = {
+            "free_model_verified": True,
+            "models": ["opencode/deepseek-v4-flash-free"],
+        }
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "OpenCode model is absent")
+
+        state["catalog"]["providers"]["opencode"]["models"].append(
+            "openrouter/stealth/ox-alpha"
+        )
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertTrue(available)
+
+    def test_openrouter_ox_alpha_preview_pool_requires_fresh_verification(
+        self,
+    ) -> None:
+        state = self._fresh_state()
+        state["catalog"]["observed_at"] = "2000-01-01T00:00:00Z"
+        allowed, reasons, _, execution = router._pool_gate(
+            "openrouter-ox-alpha-preview",
+            self.catalog,
+            state,
+            critical=False,
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("stale or future-dated", reasons[0])
+
     def test_controller_owned_work_has_no_scoped_writer(self) -> None:
         result = self._route("deployment")
         self.assertEqual(result["decision"], "controller")
