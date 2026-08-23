@@ -3053,7 +3053,9 @@ def _mapping_child_block(
     return None
 
 
-def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
+def _python_versions_from_validate_workflow(
+    text: str, *, job_key: str = "validate"
+) -> tuple[str, ...]:
     lines = text.splitlines()
     jobs_index = next(
         (
@@ -3078,7 +3080,7 @@ def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
         if indent == 0:
             break
         if indent == job_indent and re.fullmatch(
-            r"validate\s*:\s*(?:#.*)?", line.strip()
+            rf"{re.escape(job_key)}\s*:\s*(?:#.*)?", line.strip()
         ):
             validate_index = index
             break
@@ -3099,7 +3101,7 @@ def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
         validate_block, key="name", parent_indent=job_indent
     )
     if name_entry is not None:
-        raise GateInputError("target validate job uses a custom name")
+        raise GateInputError(f"target {job_key} job uses a custom name")
     strategy_entry = _mapping_child_block(
         validate_block, key="strategy", parent_indent=job_indent
     )
@@ -3177,14 +3179,22 @@ def expected_check_names_for_repo(
     if bootstrap is not None:
         return bootstrap
     workflow = _workflow_text_at_revision(repo, policy_sha) if policy_sha is not None else None
-    versions = _python_versions_from_validate_workflow(workflow) if workflow else ()
+    python_job = "validate"
+    versions = (
+        _python_versions_from_validate_workflow(workflow, job_key=python_job)
+        if workflow
+        else ()
+    )
+    if workflow and not versions:
+        python_job = "test"
+        versions = _python_versions_from_validate_workflow(workflow, job_key=python_job)
     if versions:
         if len(versions) != len(set(versions)) or not all(
             re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version)
             for version in versions
         ):
             raise GateInputError("target validate workflow has an invalid Python matrix")
-        return tuple(f"validate ({version})" for version in versions)
+        return tuple(f"{python_job} ({version})" for version in versions)
     if repo_name == "heimgewebe/grabowski":
         return DEFAULT_EXPECTED_CHECK_NAMES
     raise GateInputError("cannot derive expected checks from base required-check catalog, bootstrap policy, or validate workflow")
