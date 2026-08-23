@@ -125,6 +125,7 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         self.assertEqual(route["model"], "ox-alpha")
         self.assertIn("openrouter/stealth/ox-alpha", route["argv_prefix"])
         self.assertTrue(route["contrast_only"])
+        self.assertTrue(route["enabled"])
         self.assertEqual(route["quota_pools"], ["openrouter-ox-alpha-preview"])
         model = catalog["models"]["ox-alpha"]
         self.assertEqual(model["provider_family"], "stealth")

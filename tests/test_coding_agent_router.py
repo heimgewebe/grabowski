@@ -1472,7 +1472,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(route["model"], "ox-alpha")
         self.assertIn("openrouter/stealth/ox-alpha", route["argv_prefix"])
         self.assertTrue(route["contrast_only"])
-        self.assertFalse(route["enabled"])
+        self.assertTrue(route["enabled"])
         self.assertFalse(route.get("review_only", False))
         self.assertEqual(route["quality_class"], "C")
         self.assertEqual(
