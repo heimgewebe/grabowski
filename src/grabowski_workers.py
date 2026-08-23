@@ -2901,7 +2901,7 @@ function semanticCssColorVisibility(colorText) {
 }
 
 function semanticTextPaintVisibility(strings, styleIndexes) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 11) {
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 12) {
     return {ok: false, visible: false};
   }
   const colorText = semanticSnapshotString(strings, styleIndexes[8], 256);
@@ -2914,8 +2914,23 @@ function semanticTextPaintVisibility(strings, styleIndexes) {
   return semanticCssColorVisibility(effectiveFill);
 }
 
+function semanticPaintContainment(containText) {
+  const normalized = containText.trim().toLowerCase();
+  if (!normalized || Buffer.byteLength(normalized, 'utf8') > 256) {
+    return {ok: false, clips: true};
+  }
+  if (normalized === 'none') return {ok: true, clips: false};
+  if (['strict', 'content'].includes(normalized)) return {ok: true, clips: true};
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  const allowed = new Set(['size', 'inline-size', 'layout', 'style', 'paint']);
+  if (tokens.length < 1 || tokens.some((token) => !allowed.has(token))) {
+    return {ok: false, clips: true};
+  }
+  return {ok: true, clips: tokens.includes('paint')};
+}
+
 function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 11 ||
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 12 ||
       typeof checkVisibility !== 'boolean') {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
@@ -2928,14 +2943,20 @@ function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true)
   const overflowXText = semanticSnapshotString(strings, styleIndexes[6], 64);
   const overflowYText = semanticSnapshotString(strings, styleIndexes[7], 64);
   const maskImageText = semanticSnapshotString(strings, styleIndexes[10], 2048);
+  const containText = semanticSnapshotString(strings, styleIndexes[11], 256);
   if (visibility === null || opacityText === null || contentVisibility === null ||
       filterText === null || clipPathText === null || clipText === null ||
-      overflowXText === null || overflowYText === null || maskImageText === null) {
+      overflowXText === null || overflowYText === null || maskImageText === null ||
+      containText === null) {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
   const overflowX = semanticOverflowClipping(overflowXText);
   const overflowY = semanticOverflowClipping(overflowYText);
   if (!overflowX.ok || !overflowY.ok) {
+    return {ok: false, visible: false, clipsX: true, clipsY: true};
+  }
+  const paintContainment = semanticPaintContainment(containText);
+  if (!paintContainment.ok) {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
   const normalizedVisibility = visibility.trim().toLowerCase();
@@ -2968,7 +2989,8 @@ function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true)
   }
   return {
     ok: true, visible: filterVisibility.visible,
-    clipsX: overflowX.clips, clipsY: overflowY.clips,
+    clipsX: overflowX.clips || paintContainment.clips,
+    clipsY: overflowY.clips || paintContainment.clips,
   };
 }
 
@@ -3303,7 +3325,7 @@ async function captureSemanticVisibleSnapshot() {
       return {ok: false, snapshot: null};
     }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
-      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y', 'color', '-webkit-text-fill-color', 'mask-image'],
+      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y', 'color', '-webkit-text-fill-color', 'mask-image', 'contain'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
