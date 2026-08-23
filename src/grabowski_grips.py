@@ -6403,7 +6403,25 @@ def _agent_execution_source_request(
         "reconcile_required": False,
         **({"effect_profile": "delivery"} if effect_profile == "delivery" else {}),
     }
+    if route.get("direct_review_required") is True:
+        if route.get("executor") != "controller" or route.get("direct_work_required") is True:
+            raise GripPreflightError(
+                "canonical direct-review route has inconsistent mutable-work authority"
+            )
+        _check(receipt, "source-controller-boundary", "pass", "direct-review")
+        return {
+            **frontdoor,
+            "state": "controller_handback",
+            "execution_plan": plan,
+            "next_action": "controller_review_bound_plan",
+            "receipt_status": "passed",
+            "stop": True,
+        }
     if route.get("executor") == "controller":
+        if route.get("direct_work_required") is not True:
+            raise GripPreflightError(
+                "canonical controller route does not explicitly authorize direct mutable work"
+            )
         lane_parameters = {
             "source_kind": source_kind,
             "source_id": source_id,

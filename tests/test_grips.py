@@ -4996,6 +4996,8 @@ class GripFoundationTests(unittest.TestCase):
             "effect_profile": "candidate",
             "verification_policy": "independent_review",
             "task_class": "bounded-patch",
+            "direct_work_required": executor == "controller",
+            "direct_review_required": False,
             "scoped_writer": writer,
             "reviewers": [reviewer],
         }
@@ -5306,6 +5308,56 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("direct", acquired[0]["execution_plan"]["topology"])
         work_acquire.operator._require_operator_mutation.assert_called_once()
         work_acquire.operator._require_operator_capability.assert_called_once_with("git_cli")
+        workspace.grabowski_agent_workspace_create.assert_not_called()
+
+    def test_agent_execution_happy_path_source_mode_keeps_direct_review_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            head = "a" * 40
+            route = self._source_route_decision(executor="controller")
+            route["task_class"] = "independent-review"
+            route["direct_work_required"] = False
+            route["direct_review_required"] = True
+            route["recommendation_sha256"] = grips.sha256_json(
+                {key: value for key, value in route.items() if key != "recommendation_sha256"}
+            )
+            execution_plan = __import__("grabowski_execution_plan")
+            work_acquire = types.SimpleNamespace(acquire_work=Mock())
+            workspace = types.SimpleNamespace(grabowski_agent_workspace_create=Mock())
+            router = types.SimpleNamespace(
+                canonical_execution_route=Mock(return_value=route)
+            )
+            params = {
+                "base": "main",
+                "title": "Controller review boundary",
+                "source_kind": "direct-user",
+                "source_id": "controller-review-source",
+                "repo": str(repo),
+                "source_revision": head,
+                "write_paths": ["src/grabowski_grips.py"],
+                "objective": "Review the bounded source request without mutation",
+                "test_argv": ["python3", "-m", "pytest", "-q"],
+                "task_class": "independent-review",
+                "retention_until_unix": int(time.time()) + 9000,
+            }
+            with patch.object(
+                grips,
+                "_agent_execution_frontdoor_modules",
+                return_value=(router, execution_plan, work_acquire, workspace),
+            ):
+                result = grips.run_grip(
+                    "agent-execution-happy-path",
+                    params,
+                    allow_mutation=True,
+                    command_runner=FakeGit(head=head),
+                    github_runner=FakeGh(),
+                )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("controller_handback", result["output"]["state"])
+        self.assertEqual("controller_review_bound_plan", result["output"]["next_action"])
+        self.assertIsNone(result["output"]["lane_id"])
+        work_acquire.acquire_work.assert_not_called()
         workspace.grabowski_agent_workspace_create.assert_not_called()
 
     def test_agent_execution_happy_path_resume_mode_rejects_source_fields(self) -> None:
