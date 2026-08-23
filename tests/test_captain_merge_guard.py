@@ -442,5 +442,348 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                 resources.RESOURCE_DB = original_db
 
 
+_PLAN_LIMIT_403 = (
+    "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. "
+    "(HTTP 403)"
+)
+_CAS_BASE = "a" * 40
+_CAS_HEAD = "b" * 40
+_CAS_MERGE = "c" * 40
+_CAS_OTHER = "d" * 40
+_CAS_REF = "refs/heads/main"
+_CAS_HEAD_BRANCH = "feature/cas"
+_CAS_HEAD_REF = f"refs/heads/{_CAS_HEAD_BRANCH}"
+_CAS_PULL_REF = "refs/pull/153/head"
+
+
+class _PlanLimitedRulesGh:
+    def __init__(
+        self,
+        *,
+        private: bool = True,
+        allow_merge_commit: bool = True,
+        stderr: str = _PLAN_LIMIT_403,
+    ) -> None:
+        self.private = private
+        self.allow_merge_commit = allow_merge_commit
+        self.stderr = stderr
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, _repo: Path, args: list[str]) -> dict[str, object]:
+        self.calls.append(tuple(args))
+        if any("/rules/branches/" in item for item in args):
+            return {"returncode": 1, "stdout": "", "stderr": self.stderr}
+        if args[:2] == ["api", "repos/heimgewebe/infra"]:
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "private": self.private,
+                        "allow_merge_commit": self.allow_merge_commit,
+                    }
+                ),
+                "stderr": "",
+            }
+        return {"returncode": 1, "stdout": "", "stderr": "unexpected call"}
+
+
+class _ScriptedCasGit:
+    def __init__(
+        self,
+        *,
+        remote_before: str = _CAS_BASE,
+        remote_head_before: str = _CAS_HEAD,
+        remote_pr_head_before: str = _CAS_HEAD,
+        push_returncode: int = 0,
+        remote_url: str = "git@github.com:heimgewebe/infra.git",
+    ) -> None:
+        self.remote_before = remote_before
+        self.remote_head_before = remote_head_before
+        self.remote_pr_head_before = remote_pr_head_before
+        self.push_returncode = push_returncode
+        self.remote_url = remote_url
+        self.calls: list[tuple[str, ...]] = []
+        self.base_ls_remote_count = 0
+        self.pushed = False
+
+    def __call__(
+        self, _repo: Path, args: list[str], *, timeout: int = 60
+    ) -> dict[str, object]:
+        del timeout
+        self.calls.append(tuple(args))
+        if args[:1] == ["check-ref-format"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ["remote", "get-url", "origin"]:
+            return {"returncode": 0, "stdout": self.remote_url + "\n", "stderr": ""}
+        if args[:2] == ["init", "--quiet"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ["config", "core.hooksPath", "/dev/null"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args[:3] == ["remote", "add", "origin"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args[:1] == ["fetch"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ["rev-parse", "refs/captain/base^{commit}"]:
+            return {"returncode": 0, "stdout": _CAS_BASE + "\n", "stderr": ""}
+        if args == ["rev-parse", "refs/captain/head-branch^{commit}"]:
+            return {"returncode": 0, "stdout": _CAS_HEAD + "\n", "stderr": ""}
+        if args == ["rev-parse", "refs/captain/pr-head^{commit}"]:
+            return {"returncode": 0, "stdout": _CAS_HEAD + "\n", "stderr": ""}
+        if args[:3] == ["checkout", "--quiet", "--detach"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if "merge" in args:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if args == ["rev-list", "--parents", "-n", "1", "HEAD"]:
+            return {
+                "returncode": 0,
+                "stdout": f"{_CAS_MERGE} {_CAS_BASE} {_CAS_HEAD}\n",
+                "stderr": "",
+            }
+        if args == ["ls-remote", "origin", _CAS_HEAD_REF]:
+            if self.pushed:
+                return {"returncode": 0, "stdout": "", "stderr": ""}
+            return {
+                "returncode": 0,
+                "stdout": f"{self.remote_head_before}\t{_CAS_HEAD_REF}\n",
+                "stderr": "",
+            }
+        if args == ["ls-remote", "origin", _CAS_PULL_REF]:
+            return {
+                "returncode": 0,
+                "stdout": f"{self.remote_pr_head_before}\t{_CAS_PULL_REF}\n",
+                "stderr": "",
+            }
+        if args == ["ls-remote", "origin", _CAS_REF]:
+            self.base_ls_remote_count += 1
+            sha = self.remote_before if self.base_ls_remote_count == 1 else _CAS_MERGE
+            return {
+                "returncode": 0,
+                "stdout": f"{sha}\t{_CAS_REF}\n",
+                "stderr": "",
+            }
+        if args[:2] == ["push", "--porcelain"]:
+            if self.push_returncode == 0:
+                self.pushed = True
+            return {
+                "returncode": self.push_returncode,
+                "stdout": "ok\n" if self.push_returncode == 0 else "",
+                "stderr": "" if self.push_returncode == 0 else "rejected",
+            }
+        return {"returncode": 1, "stdout": "", "stderr": "unexpected git call"}
+
+
+class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
+    def test_plan_fallback_requires_explicit_same_repository_binding(self) -> None:
+        self.assertIsNone(
+            merge_guard._exact_base_git_cas_pr_scope_error(
+                {"is_cross_repository": False}
+            )
+        )
+        for value in (True, None):
+            with self.subTest(is_cross_repository=value):
+                self.assertEqual(
+                    "merge_guard_plan_fallback_requires_same_repository_pr",
+                    merge_guard._exact_base_git_cas_pr_scope_error(
+                        {"is_cross_repository": value}
+                    ),
+                )
+
+    def test_plan_fallback_requires_explicit_branch_deletion_scope(self) -> None:
+        self.assertEqual(
+            [],
+            merge_guard._exact_base_git_cas_effect_scope_errors(
+                {"scope": {"allowed_effects": ["pr-merge", "branch-deletion"]}}
+            ),
+        )
+        self.assertEqual(
+            ["merge_guard_plan_fallback_branch_deletion_scope_missing"],
+            merge_guard._exact_base_git_cas_effect_scope_errors(
+                {"scope": {"allowed_effects": ["pr-merge"]}}
+            ),
+        )
+        self.assertEqual(
+            ["merge_guard_plan_fallback_branch_deletion_forbidden"],
+            merge_guard._exact_base_git_cas_effect_scope_errors(
+                {
+                    "scope": {
+                        "allowed_effects": ["pr-merge", "branch-deletion"],
+                        "forbidden_effects": ["branch-deletion"],
+                    }
+                }
+            ),
+        )
+
+    def test_exact_plan_limit_private_repo_enables_cas_guard(self) -> None:
+        policy, evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            _PlanLimitedRulesGh(),
+            repo_slug="heimgewebe/infra",
+            base_branch="main",
+        )
+        self.assertEqual([], errors)
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertEqual("exact_base_git_cas", policy["mode"])
+        self.assertTrue(policy["private_repository"])
+        self.assertTrue(policy["merge_commit_allowed"])
+        self.assertTrue(evidence["active_rules"]["github_plan_limit"])
+        self.assertEqual([], evidence["errors"])
+
+    def test_generic_403_never_enables_cas_guard(self) -> None:
+        policy, _evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            _PlanLimitedRulesGh(stderr="gh: forbidden (HTTP 403)"),
+            repo_slug="heimgewebe/infra",
+            base_branch="main",
+        )
+        self.assertIsNone(policy)
+        self.assertIn("base_update_guard_active_rules_query_failed", errors)
+
+    def test_public_or_merge_commit_disabled_repo_is_ineligible(self) -> None:
+        for private, allow_merge_commit in ((False, True), (True, False)):
+            with self.subTest(private=private, allow_merge_commit=allow_merge_commit):
+                policy, _evidence, errors = merge_guard.verify_github_base_update_guard(
+                    Path.cwd(),
+                    _PlanLimitedRulesGh(
+                        private=private, allow_merge_commit=allow_merge_commit
+                    ),
+                    repo_slug="heimgewebe/infra",
+                    base_branch="main",
+                )
+                self.assertIsNone(policy)
+                self.assertIn("base_update_guard_plan_fallback_not_eligible", errors)
+
+    def test_exact_base_cas_builds_two_parent_merge_and_exact_old_value_lease(self) -> None:
+        git = _ScriptedCasGit()
+        dispatched: list[bool] = []
+        result, evidence = merge_guard._exact_base_git_cas_merge(
+            Path.cwd(),
+            repo_slug="heimgewebe/infra",
+            base_branch="main",
+            base_sha=_CAS_BASE,
+            head_sha=_CAS_HEAD,
+            head_branch=_CAS_HEAD_BRANCH,
+            pr_number=153,
+            git_runner=git,
+            on_dispatch=lambda: dispatched.append(True),
+        )
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual([True], dispatched)
+        self.assertEqual("pushed_and_read_back", evidence["status"])
+        self.assertFalse(evidence["protected_base_force_push"])
+        self.assertTrue(evidence["head_branch_delete_with_expected_old_lease"])
+        self.assertTrue(evidence["atomic_base_update_and_head_delete"])
+        push = next(call for call in git.calls if call[:2] == ("push", "--porcelain"))
+        self.assertIn("--atomic", push)
+        self.assertIn(f"--force-with-lease={_CAS_HEAD_REF}:{_CAS_HEAD}", push)
+        self.assertNotIn(f"--force-with-lease={_CAS_REF}:{_CAS_BASE}", push)
+        self.assertIn(f"HEAD:{_CAS_REF}", push)
+        self.assertEqual(f":{_CAS_HEAD_REF}", push[-1])
+
+    def test_exact_base_cas_blocks_head_drift_before_dispatch(self) -> None:
+        git = _ScriptedCasGit(remote_head_before=_CAS_OTHER)
+        dispatched: list[bool] = []
+        with self.assertRaisesRegex(RuntimeError, "head branch changed before dispatch"):
+            merge_guard._exact_base_git_cas_merge(
+                Path.cwd(),
+                repo_slug="heimgewebe/infra",
+                base_branch="main",
+                base_sha=_CAS_BASE,
+                head_sha=_CAS_HEAD,
+                head_branch=_CAS_HEAD_BRANCH,
+                pr_number=153,
+                git_runner=git,
+                on_dispatch=lambda: dispatched.append(True),
+            )
+        self.assertEqual([], dispatched)
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
+
+    def test_exact_base_cas_atomic_head_lease_rejection_fails_without_success(self) -> None:
+        git = _ScriptedCasGit(push_returncode=1)
+        dispatched: list[bool] = []
+        result, evidence = merge_guard._exact_base_git_cas_merge(
+            Path.cwd(),
+            repo_slug="heimgewebe/infra",
+            base_branch="main",
+            base_sha=_CAS_BASE,
+            head_sha=_CAS_HEAD,
+            head_branch=_CAS_HEAD_BRANCH,
+            pr_number=153,
+            git_runner=git,
+            on_dispatch=lambda: dispatched.append(True),
+        )
+        self.assertEqual([True], dispatched)
+        self.assertEqual(1, result["returncode"])
+        self.assertEqual("push_rejected_or_failed", evidence["status"])
+
+    def test_exact_base_cas_blocks_base_drift_before_dispatch(self) -> None:
+        git = _ScriptedCasGit(remote_before=_CAS_OTHER)
+        dispatched: list[bool] = []
+        with self.assertRaisesRegex(RuntimeError, "base changed before dispatch"):
+            merge_guard._exact_base_git_cas_merge(
+                Path.cwd(),
+                repo_slug="heimgewebe/infra",
+                base_branch="main",
+                base_sha=_CAS_BASE,
+                head_sha=_CAS_HEAD,
+                head_branch=_CAS_HEAD_BRANCH,
+                pr_number=153,
+                git_runner=git,
+                on_dispatch=lambda: dispatched.append(True),
+            )
+        self.assertEqual([], dispatched)
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
+
+    def test_exact_base_cas_blocks_origin_repository_drift(self) -> None:
+        git = _ScriptedCasGit(remote_url="git@github.com:heimgewebe/other.git")
+        with self.assertRaisesRegex(RuntimeError, "origin repository drift"):
+            merge_guard._exact_base_git_cas_merge(
+                Path.cwd(),
+                repo_slug="heimgewebe/infra",
+                base_branch="main",
+                base_sha=_CAS_BASE,
+                head_sha=_CAS_HEAD,
+                head_branch=_CAS_HEAD_BRANCH,
+                pr_number=153,
+                git_runner=git,
+            )
+        self.assertFalse(any(call[:1] == ("fetch",) for call in git.calls))
+
+    def test_exact_base_cas_rejects_https_origin_without_bounded_git_auth(self) -> None:
+        git = _ScriptedCasGit(remote_url="https://github.com/heimgewebe/infra.git")
+        with self.assertRaisesRegex(RuntimeError, "requires canonical SSH GitHub origin"):
+            merge_guard._exact_base_git_cas_merge(
+                Path.cwd(),
+                repo_slug="heimgewebe/infra",
+                base_branch="main",
+                base_sha=_CAS_BASE,
+                head_sha=_CAS_HEAD,
+                head_branch=_CAS_HEAD_BRANCH,
+                pr_number=153,
+                git_runner=git,
+            )
+        self.assertFalse(any(call[:1] == ("fetch",) for call in git.calls))
+
+    def test_exact_base_cas_surfaces_lease_rejection(self) -> None:
+        git = _ScriptedCasGit(push_returncode=1)
+        dispatched: list[bool] = []
+        result, evidence = merge_guard._exact_base_git_cas_merge(
+            Path.cwd(),
+            repo_slug="heimgewebe/infra",
+            base_branch="main",
+            base_sha=_CAS_BASE,
+            head_sha=_CAS_HEAD,
+            head_branch=_CAS_HEAD_BRANCH,
+            pr_number=153,
+            git_runner=git,
+            on_dispatch=lambda: dispatched.append(True),
+        )
+        self.assertEqual([True], dispatched)
+        self.assertEqual(1, result["returncode"])
+        self.assertEqual("push_rejected_or_failed", evidence["status"])
+
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2219,6 +2219,10 @@ class GripFoundationTests(unittest.TestCase):
             "base": "main",
             "expected_head": "a" * 40,
             "expected_base_sha": "b" * 40,
+            "expected_diff_sha256": "0" * 64,
+            "self_review_audit": _self_review_audit(
+                head="a" * 40, diff_sha256="0" * 64
+            ),
             "bureau_run_id": "BUR-RUN-20260821T130302Z-9eb40cfeb0",
             "merge_method": "squash",
         }
@@ -3184,6 +3188,47 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["normal-grips-only"])
         self.assertEqual("pass", checks["scope-visible"])
         self.assertEqual("pass", checks["receipt-per-grip"])
+
+    def test_pr_settlement_plan_executes_diff_bound_readiness_child(self) -> None:
+        head = "a" * 40
+        diff_sha256 = "0" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            target = {
+                "repository_path": tmp,
+                "repository": "heimgewebe/grabowski",
+                "pr": 7,
+                "base": "main",
+                "expected_head": head,
+                "expected_base_sha": "b" * 40,
+                "expected_diff_sha256": diff_sha256,
+                "self_review_audit": _self_review_audit(
+                    head=head, diff_sha256=diff_sha256
+                ),
+                "merge_method": "squash",
+            }
+            plan = sagas.build_plan(
+                "pr-settlement", target, "semantic-readiness-real-child"
+            )
+            result = grips.run_grip(
+                "mechanic-loop",
+                {"actions": plan["mechanic_actions"]},
+                allow_mutation=True,
+                command_runner=FakeGit(
+                    branch="feat/work", dirty=False, head=head
+                ),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        actions = result["output"]["actions"]
+        self.assertEqual(1, len(actions))
+        readiness = actions[0]["output"]
+        self.assertTrue(readiness["ready"])
+        self.assertEqual("ready", readiness["verdict"])
+        self.assertEqual([], readiness["blocking_reasons"])
+        run = sagas.build_run_receipt(plan, result)
+        self.assertEqual("captain_required", run["state"])
+        self.assertTrue(run["captain_ready"])
 
     def test_mechanic_loop_rejects_non_normal_or_recursive_grip(self) -> None:
         result = grips.run_grip(
