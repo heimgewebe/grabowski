@@ -6072,6 +6072,9 @@ _AGENT_EXECUTION_SOURCE_FIELDS = frozenset(
     }
 )
 _AGENT_EXECUTION_CONTINUATION_ENV = "GRABOWSKI_AEF_CONTINUATION"
+# Persisted lane identity predates model-neutral controller roles. Keep this stable
+# for replay/recovery compatibility; authority is still carried by controller_role.
+_AGENT_EXECUTION_CONTROLLER_ACTOR = "controller:chatgpt"
 
 
 def _agent_execution_frontdoor_modules() -> tuple[Any, Any, Any, Any]:
@@ -6144,6 +6147,7 @@ def _agent_execution_route_command(
     if role == "writer":
         if (
             route.get("route_role") != "scoped-writer"
+            or route.get("contrast_only") is True
             or route.get("execution_eligible_if_separately_authorized") is not True
         ):
             raise GripPreflightError(
@@ -6403,7 +6407,7 @@ def _agent_execution_source_request(
         lane_parameters = {
             "source_kind": source_kind,
             "source_id": source_id,
-            "controller_actor": "controller:primary",
+            "controller_actor": _AGENT_EXECUTION_CONTROLLER_ACTOR,
             "controller_role": "controller",
             "repo": str(repo),
             "base_head": source_revision,
@@ -6530,7 +6534,7 @@ def _agent_execution_source_request(
     lane_parameters = {
         "source_kind": source_kind,
         "source_id": source_id,
-        "controller_actor": "controller:primary",
+        "controller_actor": _AGENT_EXECUTION_CONTROLLER_ACTOR,
         "controller_role": "controller",
         "scoped_writer_actor": f"scoped-writer:{route['writer_route']}",
         "repo": str(repo),

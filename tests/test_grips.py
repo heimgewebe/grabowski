@@ -5037,9 +5037,9 @@ class GripFoundationTests(unittest.TestCase):
             command,
         )
 
-    def test_agent_execution_writer_command_accepts_legacy_contrast_only_when_explicitly_execution_eligible(self) -> None:
+    def test_agent_execution_writer_command_rejects_contrast_only_even_when_execution_eligible(self) -> None:
         route = {
-            "route": "legacy-contrast-writer",
+            "route": "contrast-writer",
             "harness": "codex",
             "argv_prefix": ["codex", "--model", "gpt-5.3-codex"],
             "route_role": "scoped-writer",
@@ -5048,24 +5048,15 @@ class GripFoundationTests(unittest.TestCase):
             "paid_only": False,
         }
 
-        command = grips._agent_execution_route_command(
-            route,
-            prompt="Implement the bounded source request",
-            role="writer",
-        )
-
-        self.assertEqual(
-            [
-                "codex",
-                "--model",
-                "gpt-5.3-codex",
-                "exec",
-                "--sandbox",
-                "workspace-write",
-                "Implement the bounded source request",
-            ],
-            command,
-        )
+        with self.assertRaisesRegex(
+            grips.GripPreflightError,
+            "not eligible as the authoritative lane-scoped writer",
+        ):
+            grips._agent_execution_route_command(
+                route,
+                prompt="Implement the bounded source request",
+                role="writer",
+            )
 
     def test_agent_execution_writer_command_requires_explicit_execution_eligibility(self) -> None:
         base = {
@@ -5073,7 +5064,7 @@ class GripFoundationTests(unittest.TestCase):
             "harness": "codex",
             "argv_prefix": ["codex", "--model", "gpt-5.3-codex"],
             "route_role": "scoped-writer",
-            "contrast_only": True,
+            "contrast_only": False,
             "paid_only": False,
         }
         for eligibility in (None, False):
@@ -5228,7 +5219,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("workspace_ready", result["output"]["frontdoor"]["state"])
         self.assertEqual(lane_id, result["output"]["frontdoor"]["lane_id"])
         self.assertEqual(1, len(acquired))
-        self.assertEqual("controller:primary", acquired[0]["controller_actor"])
+        self.assertEqual("controller:chatgpt", acquired[0]["controller_actor"])
         self.assertEqual(
             "claude-sonnet-5-high",
             acquired[0]["execution_plan"]["route_binding"]["writer_route"],
@@ -5311,7 +5302,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(lane_id, result["output"]["lane_id"])
         self.assertEqual(lane_receipt, result["output"]["lane_receipt_sha256"])
         self.assertEqual(1, len(acquired))
-        self.assertEqual("controller:primary", acquired[0]["controller_actor"])
+        self.assertEqual("controller:chatgpt", acquired[0]["controller_actor"])
         self.assertEqual("direct", acquired[0]["execution_plan"]["topology"])
         work_acquire.operator._require_operator_mutation.assert_called_once()
         work_acquire.operator._require_operator_capability.assert_called_once_with("git_cli")
