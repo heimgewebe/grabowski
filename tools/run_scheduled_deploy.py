@@ -11,6 +11,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -242,6 +243,30 @@ def child_environment() -> dict[str, str]:
     for name in FINALIZATION_ENV.values():
         environment.pop(name, None)
     return environment
+
+
+def _validation_temp_parent() -> Path:
+    runtime_root = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_root:
+        parent = Path(runtime_root)
+    else:
+        user_runtime_root = Path("/run/user") / str(os.getuid())
+        finalization_path = os.environ.get(FINALIZATION_ENV["finalization"])
+        if user_runtime_root.is_dir():
+            parent = user_runtime_root
+        elif finalization_path:
+            parent = Path(finalization_path).parent
+        else:
+            parent = Path.home() / ".local" / "state" / "grabowski"
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if parent.is_symlink() or not parent.is_dir():
+        raise RuntimeError("validation temporary parent is not a safe directory")
+    resolved = parent.resolve(strict=True)
+    if resolved != parent:
+        raise RuntimeError("validation temporary parent is not canonical")
+    if any((ancestor / ".git").exists() for ancestor in (resolved, *resolved.parents)):
+        raise RuntimeError("validation temporary parent must not be inside a Git worktree")
+    return resolved
 
 
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -859,16 +884,38 @@ def wait_for_deployment_window(
 
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
     emit(f"{phase}-start", argv=argv)
-    process = subprocess.Popen(argv, cwd=cwd, env=child_environment(), stdin=subprocess.DEVNULL, stdout=None, stderr=None, start_new_session=True)
+    environment = child_environment()
+    validation_tmp = None
     try:
-        returncode = process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        terminate_process_group(process)
-        emit(f"{phase}-timeout", timeout_seconds=timeout_seconds)
-        raise RuntimeError(f"{phase} timed out")
-    emit(f"{phase}-complete", returncode=returncode)
-    if returncode != 0:
-        raise RuntimeError(f"{phase} failed with return code {returncode}")
+        if phase == "validate":
+            validation_tmp = tempfile.TemporaryDirectory(
+                prefix="gdv-",
+                dir=_validation_temp_parent(),
+            )
+            environment.update(
+                {name: validation_tmp.name for name in ("TMPDIR", "TMP", "TEMP")}
+            )
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=None,
+            stderr=None,
+            start_new_session=True,
+        )
+        try:
+            returncode = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            emit(f"{phase}-timeout", timeout_seconds=timeout_seconds)
+            raise RuntimeError(f"{phase} timed out")
+        emit(f"{phase}-complete", returncode=returncode)
+        if returncode != 0:
+            raise RuntimeError(f"{phase} failed with return code {returncode}")
+    finally:
+        if validation_tmp is not None:
+            validation_tmp.cleanup()
 
 
 def verify_live_manifest(expected_head: str) -> dict[str, Any]:
