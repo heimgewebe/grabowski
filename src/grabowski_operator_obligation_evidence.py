@@ -343,21 +343,120 @@ def assess_obligation(obligation_id: str) -> dict[str, Any]:
     return assess_status(status)
 
 
+def _completed_population() -> tuple[list[dict[str, Any]], list[dict[str, str]], bool]:
+    """Read a bounded completed-obligation population from the existing truth owner."""
+
+    root = obligations._state_root()
+    try:
+        obligations._ensure_private_directory(root, create=False)
+    except FileNotFoundError:
+        return [], [], False
+
+    population: list[dict[str, Any]] = []
+    integrity_errors: list[dict[str, str]] = []
+    scanned = 0
+    scan_truncated = False
+    for child in sorted(root.iterdir(), key=lambda item: item.name):
+        if child.name == ".lock":
+            continue
+        if scanned >= obligations.MAX_LIST_SCAN:
+            scan_truncated = True
+            break
+        scanned += 1
+        if obligations.OBLIGATION_ID_RE.fullmatch(child.name) is None:
+            integrity_errors.append(
+                {
+                    "obligation_id": "invalid-name",
+                    "error": "unexpected_state_root_entry",
+                }
+            )
+            continue
+        try:
+            status = obligations.status_obligation(child.name)
+        except (
+            OSError,
+            obligations.OperatorObligationError,
+            obligations.OperatorObligationInputError,
+        ) as exc:
+            integrity_errors.append(
+                {"obligation_id": child.name, "error": type(exc).__name__}
+            )
+            continue
+        if status.get("state") != "completed":
+            continue
+        population.append(
+            {
+                "obligation_id": _text(
+                    status.get("obligation_id"), "population obligation_id"
+                ),
+                "close_schema_version": status.get("close_schema_version"),
+            }
+        )
+    return population, integrity_errors, scan_truncated
+
+
+def _selection_rank(obligation_id: str) -> str:
+    return _sha256(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski.operator_obligation_evidence_sample_selection_v1",
+            "obligation_id": obligation_id,
+        }
+    )
+
+
+def _rank_population(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        items,
+        key=lambda item: (
+            _selection_rank(str(item["obligation_id"])),
+            str(item["obligation_id"]),
+        ),
+    )
+
+
+def _select_sample_population(
+    population: list[dict[str, Any]], limit: int
+) -> list[dict[str, Any]]:
+    """Deterministically preserve current-schema visibility without claiming prevalence."""
+
+    legacy = [
+        item
+        for item in population
+        if item.get("close_schema_version") == obligations.LEGACY_CLOSE_SCHEMA_VERSION
+    ]
+    current = [
+        item
+        for item in population
+        if item.get("close_schema_version") != obligations.LEGACY_CLOSE_SCHEMA_VERSION
+    ]
+    if current and legacy:
+        current_target = min(len(current), max(1, limit // 2))
+    else:
+        current_target = min(len(current), limit)
+
+    selected = _rank_population(current)[:current_target]
+    remaining = limit - len(selected)
+    selected.extend(_rank_population(legacy)[:remaining])
+    remaining = limit - len(selected)
+    if remaining:
+        selected_ids = {str(item["obligation_id"]) for item in selected}
+        extras = [
+            item
+            for item in population
+            if str(item["obligation_id"]) not in selected_ids
+        ]
+        selected.extend(_rank_population(extras)[:remaining])
+    return selected[:limit]
+
+
 def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > MAX_SAMPLE:
         raise EvidenceAssessmentError(f"limit must be an integer from 1 to {MAX_SAMPLE}")
-    listed = obligations.list_obligations(
-        {"state": "completed", "limit": limit, "summary_only": False}
-    )
-    records = listed.get("records")
-    if not isinstance(records, list):
-        raise EvidenceAssessmentError("completed obligation list returned invalid records")
-    obligation_ids: list[str] = []
-    for record in records:
-        if not isinstance(record, Mapping):
-            raise EvidenceAssessmentError("completed obligation list returned invalid record")
-        obligation_ids.append(_text(record.get("obligation_id"), "sample obligation_id"))
-    obligation_ids = sorted(obligation_ids)[:limit]
+
+    population, integrity_errors, scan_truncated = _completed_population()
+    selected = _select_sample_population(population, limit)
+    obligation_ids = [str(item["obligation_id"]) for item in selected]
     assessments = [
         assess_status(obligations.status_obligation(obligation_id))
         for obligation_id in obligation_ids
@@ -392,13 +491,31 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         1 for item in assessments if item["false_confidence_risk"]
     )
     acceptance_verified = int(classification_counts.get("verified", 0))
-    if len(assessments) < MIN_ROLLOUT_SAMPLE:
+    if integrity_errors or scan_truncated:
+        signal = "inconclusive_population_integrity"
+    elif len(assessments) < MIN_ROLLOUT_SAMPLE:
         signal = "inconclusive_sample_too_small"
     elif fully_verified == len(assessments):
         signal = "fully_verifiable_sample"
     else:
         signal = "verifiability_gap_observed"
 
+    population_schema_counts = Counter(
+        str(item.get("close_schema_version")) for item in population
+    )
+    sample_schema_counts = Counter(
+        str(item.get("close_schema_version")) for item in selected
+    )
+    population_binding = sorted(
+        (
+            {
+                "obligation_id": str(item["obligation_id"]),
+                "close_schema_version": item.get("close_schema_version"),
+            }
+            for item in population
+        ),
+        key=lambda item: item["obligation_id"],
+    )
     summary = {
         "total": len(assessments),
         **{
@@ -417,11 +534,15 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         "sample_size": len(assessments),
         "minimum_sample": MIN_ROLLOUT_SAMPLE,
         "maximum_sample": MAX_SAMPLE,
-        "selection_order": "obligation_id_ascending",
+        "population_completed_total": len(population),
+        "population_close_schema_counts": dict(sorted(population_schema_counts.items())),
+        "sample_close_schema_counts": dict(sorted(sample_schema_counts.items())),
+        "selection_order": "schema_stratified_sha256_rank_v1",
         "selection_obligation_ids": obligation_ids,
         "selection_sha256": _sha256(obligation_ids),
-        "selection_scan_truncated": bool(listed.get("scan_truncated")),
-        "selection_integrity_errors": listed.get("integrity_errors", []),
+        "selection_population_sha256": _sha256(population_binding),
+        "selection_scan_truncated": scan_truncated,
+        "selection_integrity_errors": integrity_errors,
         "summary": summary,
         "acceptance_classification_counts": {
             name: int(classification_counts.get(name, 0))
@@ -457,6 +578,7 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         "does_not_establish": [
             "historical completion was incorrect",
             "a false DONE occurred",
+            "sample proportions estimate population prevalence",
             "causality",
             "permission to enforce verified completion",
             "permission to rewrite legacy obligation records",

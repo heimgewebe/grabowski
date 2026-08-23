@@ -176,6 +176,41 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual("unsupported", result["acceptance"][0]["classification"])
         self.assertFalse(result["fully_verified"])
 
+    def test_sample_selection_is_schema_stratified_and_input_order_independent(self) -> None:
+        legacy = [
+            {
+                "obligation_id": f"goo-legacy-sample-{index:04d}",
+                "close_schema_version": obligations.LEGACY_CLOSE_SCHEMA_VERSION,
+            }
+            for index in range(40)
+        ]
+        current = [
+            {
+                "obligation_id": f"goo-current-sample-{index:04d}",
+                "close_schema_version": obligations.CLOSE_SCHEMA_VERSION,
+            }
+            for index in range(5)
+        ]
+        population = legacy + current
+
+        first = evidence._select_sample_population(population, 30)
+        second = evidence._select_sample_population(list(reversed(population)), 30)
+
+        first_ids = [item["obligation_id"] for item in first]
+        self.assertEqual(first_ids, [item["obligation_id"] for item in second])
+        self.assertEqual(30, len(first_ids))
+        self.assertTrue(
+            {item["obligation_id"] for item in current}.issubset(set(first_ids))
+        )
+        self.assertEqual(
+            25,
+            sum(
+                item["close_schema_version"]
+                == obligations.LEGACY_CLOSE_SCHEMA_VERSION
+                for item in first
+            ),
+        )
+
     def test_sample_is_exactly_bounded_deterministic_and_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
@@ -226,6 +261,12 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             }
 
         self.assertEqual(30, first["sample_size"])
+        self.assertEqual(30, first["population_completed_total"])
+        self.assertEqual({"2": 30}, first["population_close_schema_counts"])
+        self.assertEqual({"2": 30}, first["sample_close_schema_counts"])
+        self.assertEqual("schema_stratified_sha256_rank_v1", first["selection_order"])
+        self.assertFalse(first["selection_scan_truncated"])
+        self.assertEqual([], first["selection_integrity_errors"])
         self.assertEqual(30, first["summary"]["total"])
         self.assertEqual(30, first["summary"]["acceptance_total"])
         self.assertEqual(0, first["summary"]["acceptance_verified"])
