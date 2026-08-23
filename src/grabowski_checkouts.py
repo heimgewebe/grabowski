@@ -970,11 +970,11 @@ def _mark_checkout_completed_retained(
             exclude_checkout_key=checkout_key,
         )
         limit = _phase_limit("completed_retained")
-        if count >= limit:
-            raise RuntimeError(
-                "Per-repository completed-retained checkout limit reached: "
-                f"completed_retained={count} limit={limit}"
-            )
+        over_threshold = count >= limit
+        # Completed-retained is preservation state, not active creation
+        # capacity.  Its count threshold is therefore advisory hygiene
+        # pressure only; a terminal transition must never stay active solely
+        # because retained evidence already reached that threshold.
         connection.execute(
             """
             UPDATE lifecycle_bindings
@@ -1007,6 +1007,8 @@ def _mark_checkout_completed_retained(
         "phase": "completed_retained",
         "count_before": count,
         "maximum": limit,
+        "enforcement": "advisory_hygiene_threshold",
+        "over_threshold_before_transition": over_threshold,
     }
     return public
 

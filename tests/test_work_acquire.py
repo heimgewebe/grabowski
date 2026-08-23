@@ -1472,6 +1472,256 @@ class WorkAcquireTests(unittest.TestCase):
             no_change_proven=True,
         ), observed_at_unix=observed_at)
 
+    def test_terminal_assessment_replay_hash_preserves_legacy_equivalence(self) -> None:
+        assessment = self.terminal_assessment("a" * 32, 200)
+        legacy = dict(assessment)
+        legacy.pop("terminal_head_sha")
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key not in {"assessment_sha256", "audit_record_sha256", "does_not_establish"}
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        self.assertEqual(
+            work_acquire._terminal_assessment_replay_sha256(assessment),
+            work_acquire._terminal_assessment_replay_sha256(legacy),
+        )
+
+    def test_terminal_checkout_lifecycle_convergence_preserves_blocked_followup_capacity(self) -> None:
+        inspect = Mock()
+        with patch.object(work_acquire.checkouts, "_worktree_for_path", inspect):
+            result = work_acquire._converge_terminal_checkout_lifecycle(
+                {},
+                assessment={
+                    "phase": "terminal",
+                    "lease_release_ready": False,
+                    "terminal_head_sha": SHA,
+                },
+            )
+        self.assertIsNone(result)
+        inspect.assert_not_called()
+
+    def test_terminal_checkout_lifecycle_convergence_releases_active_capacity_only(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "c" * 64
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_branch": "feat/authority-p0",
+        }
+        record = {
+            "inputs": inputs,
+            "worktree_receipt": {"lifecycle": lifecycle},
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": SHA,
+            "branch": "feat/authority-p0",
+        }
+        completed = {
+            **lifecycle,
+            "phase": "completed_retained",
+            "expected_head": SHA,
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", observed),
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_clean_linked",
+                return_value={"dirty": False},
+            ) as clean,
+            patch.object(
+                work_acquire.checkouts,
+                "_mark_checkout_completed_retained",
+                return_value=completed,
+            ) as mark,
+        ):
+            result = work_acquire._converge_terminal_checkout_lifecycle(
+                record,
+                assessment={
+                    "phase": "terminal",
+                    "lease_release_ready": True,
+                    "terminal_head_sha": SHA,
+                },
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "completed_retained")
+        self.assertTrue(result["active_capacity_released"])
+        self.assertTrue(result["retention_preserved"])
+        clean.assert_called_once_with(observed)
+        mark.assert_called_once_with(
+            checkout_key=checkout_key,
+            owner_id=inputs["lease_owner_id"],
+            expected_head=SHA,
+            expected_branch="feat/authority-p0",
+        )
+
+    def test_terminal_checkout_lifecycle_convergence_rejects_new_dirty_state(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "e" * 64
+        record = {
+            "inputs": inputs,
+            "worktree_receipt": {
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "checkout_path": str(self.target),
+                    "owner_id": inputs["lease_owner_id"],
+                    "expected_branch": "feat/authority-p0",
+                }
+            },
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": SHA,
+            "branch": "feat/authority-p0",
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", observed),
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_clean_linked",
+                side_effect=RuntimeError("Checkout must be clean before archival or cleanup"),
+            ),
+            patch.object(
+                work_acquire.checkouts, "_mark_checkout_completed_retained"
+            ) as mark,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Checkout must be clean"):
+                work_acquire._converge_terminal_checkout_lifecycle(
+                    record,
+                    assessment={
+                        "phase": "terminal",
+                        "lease_release_ready": True,
+                        "terminal_head_sha": SHA,
+                    },
+                )
+        mark.assert_not_called()
+
+    def test_terminal_checkout_lifecycle_convergence_rejects_head_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "d" * 64
+        record = {
+            "inputs": inputs,
+            "worktree_receipt": {
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "checkout_path": str(self.target),
+                    "owner_id": inputs["lease_owner_id"],
+                    "expected_branch": "feat/authority-p0",
+                }
+            },
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": "b" * 40,
+            "branch": "feat/authority-p0",
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", observed),
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_clean_linked",
+                return_value={"dirty": False},
+            ) as clean,
+            patch.object(
+                work_acquire.checkouts, "_mark_checkout_completed_retained"
+            ) as mark,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HEAD precondition failed"):
+                work_acquire._converge_terminal_checkout_lifecycle(
+                    record,
+                    assessment={
+                        "phase": "terminal",
+                        "lease_release_ready": True,
+                        "terminal_head_sha": SHA,
+                    },
+                )
+        clean.assert_called_once_with(observed)
+        mark.assert_not_called()
+
+    def test_terminal_closeout_lifecycle_failure_keeps_receipt_retryable(self) -> None:
+        params = self.parameters()
+        _, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        assessment = self.terminal_assessment(lane_id, 200)
+        before = work_acquire._read_state(
+            self.state / f"{lane_id}.json"
+        )
+        self.assertIsNotNone(before)
+        with patch.object(
+            work_acquire,
+            "_converge_terminal_checkout_lifecycle",
+            side_effect=RuntimeError("lifecycle temporarily unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lifecycle temporarily unavailable"):
+                work_acquire.persist_terminal_closeout(
+                    lane_id,
+                    assessment,
+                    expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                )
+        after = work_acquire._read_state(self.state / f"{lane_id}.json")
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertNotIn("terminal_closeout", after)
+        self.assertEqual(after["receipt_sha256"], receipt["receipt_sha256"])
+
+    def test_terminal_closeout_replay_retries_checkout_lifecycle_convergence(self) -> None:
+        params = self.parameters()
+        _, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        assessment = self.terminal_assessment(lane_id, 200)
+        lifecycle = {
+            "state": "completed_retained",
+            "active_capacity_released": True,
+            "retention_preserved": True,
+        }
+        with patch.object(
+            work_acquire,
+            "_converge_terminal_checkout_lifecycle",
+            return_value=lifecycle,
+        ) as converge:
+            first = work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+            replay = work_acquire.persist_terminal_closeout(
+                lane_id,
+                self.terminal_assessment(lane_id, 201),
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+        self.assertEqual(first["checkout_lifecycle_closeout"], lifecycle)
+        self.assertEqual(replay["checkout_lifecycle_closeout"], lifecycle)
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(converge.call_count, 2)
+        self.assertEqual(
+            converge.call_args_list[0].kwargs["assessment"]["terminal_head_sha"], SHA
+        )
+        self.assertEqual(
+            converge.call_args_list[1].kwargs["assessment"]["terminal_head_sha"], SHA
+        )
+
     def test_terminal_closeout_is_durable_idempotent_and_stops_reacquire(self) -> None:
         params = self.parameters()
         first = work_acquire.acquire_work(
@@ -1656,6 +1906,8 @@ class WorkAcquireTests(unittest.TestCase):
             )
         self.assertEqual(expected, result)
         self.assertEqual(persist.call_args.args[0], lane_id)
+        self.assertEqual(persist.call_args.args[1]["terminal_head_sha"], SHA)
+        self.assertNotIn("terminal_head_sha", persist.call_args.kwargs)
         acquire.assert_not_called()
 
     def test_mcp_entry_reuses_stored_system_convergence_plan_on_closeout(self) -> None:
