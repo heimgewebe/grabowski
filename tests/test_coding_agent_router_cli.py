@@ -705,6 +705,33 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             self.assertNotIn("cooldown_until", pool)
             self.assertNotIn("reset_at", pool)
 
+    def test_set_quota_registers_ox_alpha_openrouter_preview_pool_as_unknown(
+        self,
+    ) -> None:
+        status, _ = self._main(
+            [
+                "set-quota",
+                "--pool",
+                "openrouter-ox-alpha-preview",
+                "--status",
+                "unknown",
+            ]
+        )
+        self.assertEqual(status, 0)
+        pool = json.loads(self.state.read_text(encoding="utf-8"))["pools"][
+            "openrouter-ox-alpha-preview"
+        ]
+        self.assertEqual(pool["status"], "unknown")
+        allowed, reasons, _, execution = router._pool_gate(
+            "openrouter-ox-alpha-preview",
+            router._load_catalog()[0],
+            {"pools": {"openrouter-ox-alpha-preview": pool}},
+            critical=False,
+        )
+        self.assertFalse(allowed)
+        self.assertIn("stale or future-dated", reasons[0])
+        self.assertFalse(execution)
+
     def test_set_quota_available_clears_stale_status_fields(self) -> None:
         _, validation = router._load_catalog()
         initial = {

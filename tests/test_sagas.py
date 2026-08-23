@@ -15,10 +15,33 @@ import grabowski_sagas as sagas
 
 HEAD = "a" * 40
 BASE = "b" * 40
+DIFF = "0" * 64
 RUN_ID = "BUR-RUN-20260821T130302Z-9eb40cfeb0"
 
 
 class SagaContractTests(unittest.TestCase):
+    def self_review_audit(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_self_review_audit",
+            "repo": "heimgewebe/grabowski",
+            "pr": 876,
+            "generated_at": "2026-08-23T12:00:00+00:00",
+            "head_sha": HEAD,
+            "base_sha": BASE,
+            "diff_sha256": DIFF,
+            "review_tier": "standard",
+            "gate_verdict": "PASS",
+            "self_review_gate_valid": True,
+            "minimum_review_iterations": 2,
+            "actual_review_iterations": 2,
+            "all_findings_triaged": True,
+            "material_findings_remaining": 0,
+            "residual_risk_accepted": False,
+            "residual_risk_reason": "",
+            "tuning_signal": "observe",
+        }
+
     def pr_target(self) -> dict[str, object]:
         return {
             "repository_path": str(ROOT),
@@ -27,6 +50,8 @@ class SagaContractTests(unittest.TestCase):
             "base": "main",
             "expected_head": HEAD,
             "expected_base_sha": BASE,
+            "expected_diff_sha256": DIFF,
+            "self_review_audit": self.self_review_audit(),
             "bureau_run_id": RUN_ID,
             "merge_method": "squash",
         }
@@ -151,7 +176,11 @@ class SagaContractTests(unittest.TestCase):
         )
 
     def mechanic_result(
-        self, plan: dict[str, object], *, passed: bool = True
+        self,
+        plan: dict[str, object],
+        *,
+        passed: bool = True,
+        readiness_output: dict[str, object] | None = None,
     ) -> dict[str, object]:
         actions = plan["mechanic_actions"]
         assert isinstance(actions, list)
@@ -161,7 +190,14 @@ class SagaContractTests(unittest.TestCase):
         for index, planned in enumerate(selected):
             assert isinstance(planned, dict)
             child_status = "passed" if passed else "blocked"
-            child_output: dict[str, object] = {"fixture": index}
+            if planned["action"] == "pr-check-readiness" and passed:
+                child_output = copy.deepcopy(readiness_output) if readiness_output is not None else {
+                    "ready": True,
+                    "verdict": "ready",
+                    "blocking_reasons": [],
+                }
+            else:
+                child_output = {"fixture": index}
             child = self.grip_result(str(planned["action"]), child_status, child_output)
             records.append(
                 {
@@ -202,8 +238,20 @@ class SagaContractTests(unittest.TestCase):
         readiness = plan["mechanic_actions"][1]
         self.assertEqual("pr-check-readiness", readiness["action"])
         self.assertEqual(HEAD, readiness["parameters"]["expected_head"])
+        self.assertEqual(DIFF, readiness["parameters"]["expected_diff_sha256"])
+        self.assertEqual(self.self_review_audit(), readiness["parameters"]["self_review_audit"])
+        self.assertEqual(DIFF, plan["expected_identity"]["expected_diff_sha256"])
         self.assertEqual(plan, sagas.validate_plan(plan))
         self.assertIn("cross-system-atomicity", plan["does_not_establish"])
+
+    def test_pr_plan_requires_diff_bound_self_review_evidence(self) -> None:
+        for field in ("expected_diff_sha256", "self_review_audit"):
+            target = self.pr_target()
+            target.pop(field)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                sagas.SagaError, "target shape is invalid"
+            ):
+                sagas.build_plan("pr-settlement", target, "semantic-readiness-evidence")
 
     def test_runtime_plan_uses_registered_adapter_and_runtime_readback(self) -> None:
         plan = sagas.build_plan(
@@ -252,6 +300,50 @@ class SagaContractTests(unittest.TestCase):
         self.assertFalse(blocked["captain_ready"])
         self.assertIsNone(blocked["captain_handoff"])
         self.assertEqual("blocked", blocked["receipt_status"])
+
+    def test_pr_prepare_requires_semantic_readiness_not_wrapper_pass(self) -> None:
+        plan = sagas.build_plan("pr-settlement", self.pr_target(), "semantic-readiness")
+        blocked_outputs = (
+            {
+                "ready": False,
+                "verdict": "blocked",
+                "blocking_reasons": ["self-review audit missing"],
+            },
+            {"ready": False, "verdict": "blocked", "blocking_reasons": []},
+            {"ready": True, "verdict": "blocked", "blocking_reasons": []},
+            {
+                "ready": True,
+                "verdict": "ready",
+                "blocking_reasons": ["required checks missing"],
+            },
+            {},
+        )
+        for readiness_output in blocked_outputs:
+            with self.subTest(readiness_output=readiness_output):
+                mechanic = self.mechanic_result(
+                    plan, passed=True, readiness_output=readiness_output
+                )
+                receipt = mechanic["receipt"]
+                assert isinstance(receipt, dict)
+                self.assertEqual("passed", receipt["status"])
+
+                run = sagas.build_run_receipt(plan, mechanic)
+
+                self.assertEqual("prepare_blocked", run["state"])
+                self.assertFalse(run["captain_ready"])
+                self.assertEqual("blocked", run["phase_status"]["prepare"])
+                self.assertEqual("blocked", run["phase_status"]["apply"])
+                self.assertIsNone(run["captain_handoff"])
+                self.assertEqual("blocked", run["receipt_status"])
+                self.assertEqual(run, sagas.validate_run_receipt(run, plan_value=plan))
+
+    def test_runtime_prepare_does_not_require_pr_readiness_semantics(self) -> None:
+        plan = sagas.build_plan(
+            "runtime-deployment", self.runtime_target(), "runtime-semantic-scope"
+        )
+        run = sagas.build_run_receipt(plan, self.mechanic_result(plan, passed=True))
+        self.assertEqual("captain_required", run["state"])
+        self.assertTrue(run["captain_ready"])
 
     def test_run_receipt_preserves_mechanic_preflight_block_without_child_actions(self) -> None:
         plan = sagas.build_plan("pr-settlement", self.pr_target(), "t121-pr-pilot")

@@ -78,5 +78,6 @@ erfolgen.
 - Run at most two external candidates for one decision. Prefer one independent competitor and one deliberate contrast programmer rather than duplicate prompts.
 - Export only explicitly selected UTF-8 context files. Never include secrets, credentials, browser data or unrestricted environment values.
 - External patches are advisory. They may not modify the repository, commit, push, merge, deploy or update Bureau. The normal isolated Writer must explicitly integrate selected insights.
+- A canonical lane-backed `scoped_writer` is distinct from an advisory competitor or contrast agent. It may mutate only when the canonical route selects `executor=scoped_writer`, declares `route_role=scoped-writer`, sets `execution_eligible_if_separately_authorized=true`, is not `contrast_only`, and the exact Work Lane grants the requested write scope. Competition and `contrast_only` routes remain advisory.
 - Generate a contrast matrix from bound receipts. Convert shared risks and tests into deterministic validation; investigate divergent boundaries instead of voting by majority.
 - External agreement is not proof of correctness, and no automatic winner selection is permitted.

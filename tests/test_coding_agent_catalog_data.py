@@ -117,6 +117,30 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         self.assertEqual(routes["openhands-always-approve"]["harness"], "openhands")
         self.assertIn("--always-approve", routes["openhands-always-approve"]["argv_prefix"])
 
+    def test_ox_alpha_openrouter_preview_is_declared_conservatively(self) -> None:
+        catalog, _ = router._load_catalog()
+        routes = {item["id"]: item for item in catalog["routes"]}
+        route = routes["opencode-openrouter-ox-alpha-free-preview"]
+        self.assertEqual(route["harness"], "opencode")
+        self.assertEqual(route["model"], "ox-alpha")
+        self.assertIn("openrouter/stealth/ox-alpha", route["argv_prefix"])
+        self.assertTrue(route["contrast_only"])
+        self.assertEqual(route["quota_pools"], ["openrouter-ox-alpha-preview"])
+        model = catalog["models"]["ox-alpha"]
+        self.assertEqual(model["provider_family"], "stealth")
+        pool = catalog["quota_pools"]["openrouter-ox-alpha-preview"]
+        self.assertEqual(pool["marginal_cost_usd"], 0)
+        self.assertEqual(pool["max_concurrency"], 1)
+        self.assertFalse(pool["payg_fallback_allowed"])
+        self.assertEqual(pool["unknown_execution"], "advisory-only")
+        # The openrouter-paid hard block and PAYG/credits prohibition remain untouched.
+        self.assertEqual(
+            catalog["quota_pools"]["openrouter-paid"]["max_concurrency"], 0
+        )
+        self.assertFalse(
+            catalog["quota_pools"]["openrouter-paid"]["payg_fallback_allowed"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
