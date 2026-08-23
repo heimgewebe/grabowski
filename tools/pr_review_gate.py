@@ -101,6 +101,7 @@ DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate (attested)",
 }
 REGISTRY_FRESHNESS_CHECK_NAME = "registry-registration-preflight/freshness"
+REGISTRY_FRESHNESS_WORKFLOW_PATH = ".github/workflows/registry-registration-preflight.yml"
 BASE_BOUND_REQUIRED_CHECK_NAMES = {REGISTRY_FRESHNESS_CHECK_NAME}
 REGISTRY_TASK_PATH_PREFIX = "registry/tasks/"
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
@@ -282,7 +283,9 @@ PR_FIELDS = (
     "isDraft",
     "mergeStateStatus",
     "mergeable",
+    "headRefName",
     "headRefOid",
+    "baseRefName",
     "baseRefOid",
     "url",
     "changedFiles",
@@ -460,6 +463,23 @@ def _github_check_run_id(link: Any, *, repo_slug: str) -> int | None:
     return int(match.group("run_id")) if match is not None else None
 
 
+def _github_actions_run_id(link: Any, *, repo_slug: str) -> int | None:
+    if not isinstance(link, str) or not link:
+        return None
+    try:
+        parsed = urlparse(link)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        return None
+    match = re.fullmatch(
+        rf"/{re.escape(repo_slug)}/actions/runs/(?P<run_id>[1-9][0-9]*)(?:/job/[1-9][0-9]*)?",
+        parsed.path,
+        re.IGNORECASE,
+    )
+    return int(match.group("run_id")) if match is not None else None
+
+
 def _load_check_run_binding_evidence(
     repo: Path, *, repo_slug: str, run_id: int
 ) -> dict[str, Any] | None:
@@ -487,6 +507,73 @@ def _load_check_run_binding_evidence(
     return fields
 
 
+def _load_actions_workflow_binding_evidence(
+    repo: Path, *, repo_slug: str, run_id: int
+) -> dict[str, Any] | None:
+    payload = _run_json(repo, ["gh", "api", f"repos/{repo_slug}/actions/runs/{run_id}"])
+    if not isinstance(payload, dict):
+        return None
+    pull_requests = payload.get("pull_requests")
+    if not isinstance(pull_requests, list):
+        return None
+    normalized_pulls: list[dict[str, Any]] = []
+    for item in pull_requests:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        base = item.get("base")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number <= 0
+            or not isinstance(base, dict)
+        ):
+            continue
+        head = item.get("head")
+        base_ref = base.get("ref")
+        base_sha = base.get("sha")
+        head_ref = head.get("ref") if isinstance(head, dict) else None
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if (
+            not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+            or not isinstance(base_ref, str)
+            or not base_ref
+            or not isinstance(base_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
+        ):
+            continue
+        normalized_pulls.append(
+            {
+                "number": number,
+                "head_ref": head_ref,
+                "head_sha": head_sha,
+                "base_ref": base_ref,
+                "base_sha": base_sha,
+            }
+        )
+    fields = {
+        "source": "github-actions-workflow-run",
+        "repository": repo_slug,
+        "event": payload.get("event"),
+        "status": payload.get("status"),
+        "conclusion": payload.get("conclusion"),
+        "head_sha": payload.get("head_sha"),
+        "path": payload.get("path"),
+        "pull_requests": normalized_pulls,
+    }
+    if not all(
+        isinstance(fields[key], str) and fields[key]
+        for key in ("repository", "event", "status", "head_sha", "path")
+    ):
+        return None
+    if fields["conclusion"] is not None and not isinstance(fields["conclusion"], str):
+        return None
+    return fields
+
+
 def _attach_registry_freshness_binding_evidence(
     repo: Path, *, repo_slug: str, checks: Any
 ) -> Any:
@@ -508,6 +595,16 @@ def _attach_registry_freshness_binding_evidence(
                 evidence = None
             if evidence is not None:
                 copy["baseBindingEvidence"] = evidence
+        workflow_run_id = _github_actions_run_id(check.get("link"), repo_slug=repo_slug)
+        if workflow_run_id is not None:
+            try:
+                workflow_evidence = _load_actions_workflow_binding_evidence(
+                    repo, repo_slug=repo_slug, run_id=workflow_run_id
+                )
+            except RuntimeError:
+                workflow_evidence = None
+            if workflow_evidence is not None:
+                copy["workflowRunBindingEvidence"] = workflow_evidence
         enriched.append(copy)
     return enriched
 
@@ -3107,24 +3204,35 @@ def _check_link_matches_base_sha(check: dict[str, Any], base_sha: object) -> boo
 
 
 def _check_has_exact_registry_freshness_binding(
-    check: dict[str, Any], *, pr_number: object, head_sha: object, base_sha: object
+    check: dict[str, Any],
+    *,
+    repo_slug: object,
+    pr_number: object,
+    head_ref: object,
+    head_sha: object,
+    base_ref: object,
+    base_sha: object,
 ) -> bool:
     if _check_link_matches_base_sha(check, base_sha):
         return True
-    evidence = check.get("baseBindingEvidence")
-    if not isinstance(evidence, dict):
-        return False
     if (
-        isinstance(pr_number, bool)
+        not isinstance(repo_slug, str)
+        or not repo_slug
+        or isinstance(pr_number, bool)
         or not isinstance(pr_number, int)
         or pr_number <= 0
+        or not isinstance(head_ref, str)
+        or not head_ref
         or not isinstance(head_sha, str)
         or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or not isinstance(base_ref, str)
+        or not base_ref
         or not isinstance(base_sha, str)
         or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
     ):
         return False
-    return (
+    evidence = check.get("baseBindingEvidence")
+    if isinstance(evidence, dict) and (
         evidence.get("name") == REGISTRY_FRESHNESS_CHECK_NAME
         and evidence.get("status") == "completed"
         and evidence.get("conclusion") == "success"
@@ -3132,6 +3240,32 @@ def _check_has_exact_registry_freshness_binding(
         and evidence.get("app_slug") == "github-actions"
         and evidence.get("external_id")
         == f"registry-freshness:{pr_number}:{head_sha}:{base_sha}"
+    ):
+        return True
+    workflow = check.get("workflowRunBindingEvidence")
+    if not isinstance(workflow, dict):
+        return False
+    if not (
+        workflow.get("source") == "github-actions-workflow-run"
+        and workflow.get("repository") == repo_slug
+        and workflow.get("event") == "pull_request_target"
+        and workflow.get("status") == "completed"
+        and workflow.get("conclusion") == "success"
+        and workflow.get("head_sha") in {head_sha, base_sha}
+        and workflow.get("path") == REGISTRY_FRESHNESS_WORKFLOW_PATH
+    ):
+        return False
+    pulls = workflow.get("pull_requests")
+    if not isinstance(pulls, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("number") == pr_number
+        and item.get("head_ref") == head_ref
+        and item.get("head_sha") == head_sha
+        and item.get("base_ref") == base_ref
+        and item.get("base_sha") == base_sha
+        for item in pulls
     )
 
 
@@ -3404,8 +3538,11 @@ def evaluate_review_gate(
                 blocking_checks.append(check)
             elif name in base_bound_check_names and _check_has_exact_registry_freshness_binding(
                 check,
+                repo_slug=repo_name,
                 pr_number=pr.get("number"),
+                head_ref=pr.get("headRefName"),
                 head_sha=pr.get("headRefOid"),
+                base_ref=pr.get("baseRefName"),
                 base_sha=current_base_sha,
             ):
                 base_bound_check_matches[name] = True
