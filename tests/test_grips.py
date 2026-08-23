@@ -4966,6 +4966,7 @@ class GripFoundationTests(unittest.TestCase):
                 "argv_prefix": ["claude", "--model", "sonnet", "--effort", "high"],
                 "route_role": "scoped-writer",
                 "contrast_only": False,
+                "execution_eligible_if_separately_authorized": True,
                 "paid_only": False,
             }
             if executor == "scoped_writer"
@@ -4995,6 +4996,8 @@ class GripFoundationTests(unittest.TestCase):
             "effect_profile": "candidate",
             "verification_policy": "independent_review",
             "task_class": "bounded-patch",
+            "direct_work_required": executor == "controller",
+            "direct_review_required": False,
             "scoped_writer": writer,
             "reviewers": [reviewer],
         }
@@ -5013,6 +5016,7 @@ class GripFoundationTests(unittest.TestCase):
             ],
             "route_role": "scoped-writer",
             "contrast_only": False,
+            "execution_eligible_if_separately_authorized": True,
             "paid_only": False,
         }
         command = grips._agent_execution_route_command(
@@ -5034,6 +5038,51 @@ class GripFoundationTests(unittest.TestCase):
             ],
             command,
         )
+
+    def test_agent_execution_writer_command_rejects_contrast_only_even_when_execution_eligible(self) -> None:
+        route = {
+            "route": "contrast-writer",
+            "harness": "codex",
+            "argv_prefix": ["codex", "--model", "gpt-5.3-codex"],
+            "route_role": "scoped-writer",
+            "contrast_only": True,
+            "execution_eligible_if_separately_authorized": True,
+            "paid_only": False,
+        }
+
+        with self.assertRaisesRegex(
+            grips.GripPreflightError,
+            "not eligible as the authoritative lane-scoped writer",
+        ):
+            grips._agent_execution_route_command(
+                route,
+                prompt="Implement the bounded source request",
+                role="writer",
+            )
+
+    def test_agent_execution_writer_command_requires_explicit_execution_eligibility(self) -> None:
+        base = {
+            "route": "unproven-writer",
+            "harness": "codex",
+            "argv_prefix": ["codex", "--model", "gpt-5.3-codex"],
+            "route_role": "scoped-writer",
+            "contrast_only": False,
+            "paid_only": False,
+        }
+        for eligibility in (None, False):
+            with self.subTest(eligibility=eligibility):
+                route = dict(base)
+                if eligibility is not None:
+                    route["execution_eligible_if_separately_authorized"] = eligibility
+                with self.assertRaisesRegex(
+                    grips.GripPreflightError,
+                    "not eligible as the authoritative lane-scoped writer",
+                ):
+                    grips._agent_execution_route_command(
+                        route,
+                        prompt="Implement the bounded source request",
+                        role="writer",
+                    )
 
     def test_agent_execution_happy_path_source_mode_binds_route_plan_lane_workspace_without_lane_writer_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5172,6 +5221,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("workspace_ready", result["output"]["frontdoor"]["state"])
         self.assertEqual(lane_id, result["output"]["frontdoor"]["lane_id"])
         self.assertEqual(1, len(acquired))
+        self.assertEqual("controller:chatgpt", acquired[0]["controller_actor"])
         self.assertEqual(
             "claude-sonnet-5-high",
             acquired[0]["execution_plan"]["route_binding"]["writer_route"],
@@ -5184,13 +5234,41 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(writer_command, create_kwargs["writer_argv"])
         continuation.assert_called_once()
 
-    def test_agent_execution_happy_path_source_mode_returns_at_controller_boundary_without_lane_effect(self) -> None:
+    def test_agent_execution_happy_path_source_mode_binds_direct_controller_lane_without_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp).resolve()
             head = "a" * 40
             route = self._source_route_decision(executor="controller")
             execution_plan = __import__("grabowski_execution_plan")
-            work_acquire = types.SimpleNamespace(acquire_work=Mock())
+            lane_id = "d" * 32
+            lane_receipt = "e" * 64
+            acquired: list[dict[str, object]] = []
+
+            def acquire(parameters: dict[str, object], **kwargs: object) -> dict[str, object]:
+                del kwargs
+                acquired.append(deepcopy(parameters))
+                self.assertNotIn("scoped_writer_actor", parameters)
+                self.assertNotIn("scoped_writer_argv", parameters)
+                return {
+                    "state": "ready",
+                    "next_action": "controller_execute",
+                    "lane_id": lane_id,
+                    "receipt_sha256": lane_receipt,
+                    "inputs": {
+                        "execution_plan": deepcopy(parameters["execution_plan"]),
+                        "source": {"kind": "direct-user", "id": "controller-source"},
+                        "scoped_writer": None,
+                    },
+                }
+
+            work_acquire = types.SimpleNamespace(
+                acquire_work=Mock(side_effect=acquire),
+                operator=types.SimpleNamespace(
+                    _require_operator_mutation=Mock(),
+                    _require_operator_capability=Mock(),
+                    base=types.SimpleNamespace(_append_audit=Mock()),
+                ),
+            )
             workspace = types.SimpleNamespace(grabowski_agent_workspace_create=Mock())
             router = types.SimpleNamespace(
                 canonical_execution_route=Mock(return_value=route)
@@ -5221,8 +5299,67 @@ class GripFoundationTests(unittest.TestCase):
                 )
 
         self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("controller_lane_ready", result["output"]["state"])
+        self.assertEqual("controller_execute_bound_lane", result["output"]["next_action"])
+        self.assertEqual(lane_id, result["output"]["lane_id"])
+        self.assertEqual(lane_receipt, result["output"]["lane_receipt_sha256"])
+        self.assertEqual(1, len(acquired))
+        self.assertEqual("controller:chatgpt", acquired[0]["controller_actor"])
+        self.assertEqual("direct", acquired[0]["execution_plan"]["topology"])
+        work_acquire.operator._require_operator_mutation.assert_called_once()
+        work_acquire.operator._require_operator_capability.assert_called_once_with("git_cli")
+        workspace.grabowski_agent_workspace_create.assert_not_called()
+
+    def test_agent_execution_happy_path_source_mode_keeps_direct_review_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve()
+            head = "a" * 40
+            route = self._source_route_decision(executor="controller")
+            route["task_class"] = "independent-review"
+            route["direct_work_required"] = False
+            route["direct_review_required"] = True
+            route["recommendation_sha256"] = grips.sha256_json(
+                {key: value for key, value in route.items() if key != "recommendation_sha256"}
+            )
+            execution_plan = __import__("grabowski_execution_plan")
+            work_acquire = types.SimpleNamespace(acquire_work=Mock())
+            workspace = types.SimpleNamespace(grabowski_agent_workspace_create=Mock())
+            router = types.SimpleNamespace(
+                canonical_execution_route=Mock(return_value=route)
+            )
+            params = {
+                "base": "main",
+                "title": "Controller review boundary",
+                "source_kind": "direct-user",
+                "source_id": "controller-review-source",
+                "repo": str(repo),
+                "source_revision": head,
+                "write_paths": ["src/grabowski_grips.py"],
+                "objective": "Review the bounded source request without mutation",
+                "test_argv": ["python3", "-m", "pytest", "-q"],
+                "task_class": "independent-review",
+                "retention_until_unix": int(time.time()) + 9000,
+            }
+            with patch.object(
+                grips,
+                "_agent_execution_frontdoor_modules",
+                return_value=(router, execution_plan, work_acquire, workspace),
+            ):
+                result = grips.run_grip(
+                    "agent-execution-happy-path",
+                    params,
+                    allow_mutation=True,
+                    command_runner=FakeGit(head=head),
+                    github_runner=FakeGh(),
+                )
+
+        self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("controller_handback", result["output"]["state"])
-        self.assertEqual("controller_execute_bound_plan", result["output"]["next_action"])
+        self.assertEqual("controller_review_bound_source", result["output"]["next_action"])
+        self.assertIsNone(result["output"]["lane_id"])
+        self.assertIsNone(result["output"]["execution_plan"])
+        self.assertTrue(result["output"]["review_binding"]["read_only"])
+        self.assertEqual(head, result["output"]["review_binding"]["source_revision"])
         work_acquire.acquire_work.assert_not_called()
         workspace.grabowski_agent_workspace_create.assert_not_called()
 
