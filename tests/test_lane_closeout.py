@@ -194,6 +194,22 @@ class LaneCloseoutTests(unittest.TestCase):
         )
         self.assertEqual(result["closeout_state"], "no_change_proven")
 
+    def test_no_change_proof_requires_concrete_head(self) -> None:
+        result = closeout.classify(
+            self.observation(
+                head_sha=None,
+                remote_head_sha=None,
+                no_change_proven=True,
+            )
+        )
+        self.assertEqual(result["phase"], "rescue_required")
+        self.assertIsNone(result["closeout_state"])
+        self.assertFalse(result["lease_release_ready"])
+        self.assertIn(
+            "refresh_git_task_process_and_pr_readback",
+            result["recovery_actions"],
+        )
+
     def test_deployment_requires_exact_head_binding(self) -> None:
         success = closeout.classify(
             self.observation(

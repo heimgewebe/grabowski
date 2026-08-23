@@ -458,6 +458,7 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
         data["no_change_proven"] is True
         and data["git_dirty"] is False
         and data["ahead_commits"] == 0
+        and head is not None
         and (head == data["base_revision"] or head == remote)
     )
     if no_change_complete:
