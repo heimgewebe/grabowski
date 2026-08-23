@@ -1388,6 +1388,16 @@ def _recommendation(
     }
 
 
+def _automatic_scoped_writer_exclusion_reason(candidate: dict[str, Any]) -> str | None:
+    if candidate.get("route_role") != "scoped-writer":
+        return "route lacks scoped-writer authority; automatic scoped-writer execution is forbidden"
+    if candidate.get("contrast_only") is True:
+        return "contrast-only route is advisory; automatic authoritative scoped-writer execution is forbidden"
+    if candidate.get("execution_eligible_if_separately_authorized") is not True:
+        return "quota state permits advisory use only; automatic scoped-writer execution is forbidden"
+    return None
+
+
 def _rank_routes(
     task_class: str,
     catalog: dict[str, Any],
@@ -1993,12 +2003,11 @@ def canonical_execution_route(
                 )
                 execution_writers: list[dict[str, Any]] = []
                 for candidate in ranked_writers:
-                    if candidate.get("execution_eligible_if_separately_authorized") is True:
+                    exclusion_reason = _automatic_scoped_writer_exclusion_reason(candidate)
+                    if exclusion_reason is None:
                         execution_writers.append(candidate)
                         continue
-                    excluded[f"scoped-writer:{candidate['route']}"] = [
-                        "quota state permits advisory use only; automatic scoped-writer execution is forbidden"
-                    ]
+                    excluded[f"scoped-writer:{candidate['route']}"] = [exclusion_reason]
                 if execution_writers:
                     scoped_writer = execution_writers[0]
                     scoped_writer_fallbacks = execution_writers[1:6]

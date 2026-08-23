@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+import grabowski_coding_agent_router as router  # noqa: E402
+
 CATALOG = ROOT / "config" / "coding-agent-catalog.json"
 
 
@@ -162,6 +169,33 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         legacy_routes = [route for route in routes if route["id"] != "codex-spark-low"]
         self.assertTrue(legacy_routes)
         self.assertTrue(all(route.get("contrast_only") is True for route in legacy_routes))
+
+    def test_contrast_only_route_cannot_be_automatic_authoritative_writer(self) -> None:
+        contrast = {
+            "route_role": "scoped-writer",
+            "contrast_only": True,
+            "execution_eligible_if_separately_authorized": True,
+        }
+        writer = {
+            "route_role": "scoped-writer",
+            "contrast_only": False,
+            "execution_eligible_if_separately_authorized": True,
+        }
+        quota_blocked = {
+            "route_role": "scoped-writer",
+            "contrast_only": False,
+            "execution_eligible_if_separately_authorized": False,
+        }
+
+        self.assertIn(
+            "contrast-only route is advisory",
+            router._automatic_scoped_writer_exclusion_reason(contrast),
+        )
+        self.assertIsNone(router._automatic_scoped_writer_exclusion_reason(writer))
+        self.assertIn(
+            "quota state permits advisory use only",
+            router._automatic_scoped_writer_exclusion_reason(quota_blocked),
+        )
 
     def test_runtime_command_prefixes_do_not_duplicate_runner_owned_flags(self) -> None:
         self.assertEqual(
