@@ -2901,7 +2901,7 @@ function semanticCssColorVisibility(colorText) {
 }
 
 function semanticTextPaintVisibility(strings, styleIndexes) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 12) {
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 13) {
     return {ok: false, visible: false};
   }
   const colorText = semanticSnapshotString(strings, styleIndexes[8], 256);
@@ -2930,7 +2930,7 @@ function semanticPaintContainment(containText) {
 }
 
 function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 12 ||
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 13 ||
       typeof checkVisibility !== 'boolean') {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
@@ -2944,10 +2944,11 @@ function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true)
   const overflowYText = semanticSnapshotString(strings, styleIndexes[7], 64);
   const maskImageText = semanticSnapshotString(strings, styleIndexes[10], 2048);
   const containText = semanticSnapshotString(strings, styleIndexes[11], 256);
+  const backfaceVisibilityText = semanticSnapshotString(strings, styleIndexes[12], 64);
   if (visibility === null || opacityText === null || contentVisibility === null ||
       filterText === null || clipPathText === null || clipText === null ||
       overflowXText === null || overflowYText === null || maskImageText === null ||
-      containText === null) {
+      containText === null || backfaceVisibilityText === null) {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
   const overflowX = semanticOverflowClipping(overflowXText);
@@ -2958,6 +2959,13 @@ function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true)
   const paintContainment = semanticPaintContainment(containText);
   if (!paintContainment.ok) {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
+  }
+  const normalizedBackfaceVisibility = backfaceVisibilityText.trim().toLowerCase();
+  if (!['visible', 'hidden'].includes(normalizedBackfaceVisibility)) {
+    return {ok: false, visible: false, clipsX: true, clipsY: true};
+  }
+  if (normalizedBackfaceVisibility === 'hidden') {
+    return {ok: true, visible: false, clipsX: true, clipsY: true};
   }
   const normalizedVisibility = visibility.trim().toLowerCase();
   const normalizedContentVisibility = contentVisibility.trim().toLowerCase();
@@ -3325,7 +3333,7 @@ async function captureSemanticVisibleSnapshot() {
       return {ok: false, snapshot: null};
     }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
-      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y', 'color', '-webkit-text-fill-color', 'mask-image', 'contain'],
+      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y', 'color', '-webkit-text-fill-color', 'mask-image', 'contain', 'backface-visibility'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
