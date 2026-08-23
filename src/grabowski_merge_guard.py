@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
@@ -1299,6 +1301,321 @@ def _merge_guard_result_info(result: Any) -> dict[str, Any]:
     }
 
 
+def _github_rules_plan_limit_error(stderr: str) -> bool:
+    normalized = " ".join(str(stderr).casefold().split())
+    return (
+        "http 403" in normalized
+        and "upgrade to github pro" in normalized
+        and "make this repository public" in normalized
+    )
+
+
+def _merge_guard_git_command(repo_path: Path, args: list[str], *, timeout: int = 60) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=timeout,
+        env={
+            "HOME": str(Path.home()),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
+    )
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def _exact_base_git_cas_pr_scope_error(bindings: dict[str, Any]) -> str | None:
+    if bindings.get("is_cross_repository") is False:
+        return None
+    return "merge_guard_plan_fallback_requires_same_repository_pr"
+
+
+def _exact_base_git_cas_effect_scope_errors(action: dict[str, Any]) -> list[str]:
+    scope = action.get("scope")
+    if not isinstance(scope, dict):
+        return ["merge_guard_plan_fallback_scope_missing"]
+    allowed = {
+        str(item).strip().casefold()
+        for item in scope.get("allowed_effects", [])
+        if isinstance(item, str) and item.strip()
+    }
+    forbidden = {
+        str(item).strip().casefold()
+        for item in scope.get("forbidden_effects", [])
+        if isinstance(item, str) and item.strip()
+    }
+    errors: list[str] = []
+    if "branch-deletion" in forbidden:
+        errors.append("merge_guard_plan_fallback_branch_deletion_forbidden")
+    elif "branch-deletion" not in allowed:
+        errors.append("merge_guard_plan_fallback_branch_deletion_scope_missing")
+    return errors
+
+
+def _exact_base_git_cas_merge(
+    repo_path: Path,
+    *,
+    repo_slug: str,
+    base_branch: str,
+    base_sha: str,
+    head_sha: str,
+    head_branch: str,
+    pr_number: int,
+    git_runner: Any = _merge_guard_git_command,
+    on_dispatch: Any | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if _GITHUB_REPOSITORY_RE.fullmatch(repo_slug) is None:
+        raise RuntimeError("exact-base merge repository identity is invalid")
+    if _SHA40_RE.fullmatch(base_sha) is None or _SHA40_RE.fullmatch(head_sha) is None:
+        raise RuntimeError("exact-base merge requires canonical commit SHAs")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise RuntimeError("exact-base merge pull request number is invalid")
+    if not isinstance(head_branch, str) or not head_branch.strip():
+        raise RuntimeError("exact-base merge head branch is invalid")
+    if head_branch == base_branch:
+        raise RuntimeError("exact-base merge requires distinct base and head branches")
+    ref = f"refs/heads/{base_branch}"
+    head_ref = f"refs/heads/{head_branch}"
+    pull_ref = f"refs/pull/{pr_number}/head"
+    for candidate_ref, label in ((ref, "base"), (head_ref, "head")):
+        ref_check = _merge_guard_result_info(
+            git_runner(repo_path, ["check-ref-format", candidate_ref])
+        )
+        if ref_check["returncode"] != 0:
+            raise RuntimeError(f"exact-base merge {label} ref is invalid")
+    remote = _merge_guard_result_info(git_runner(repo_path, ["remote", "get-url", "origin"]))
+    if remote["returncode"] != 0 or not remote["stdout"].strip():
+        raise RuntimeError("exact-base merge cannot resolve origin")
+    remote_url = remote["stdout"].strip()
+    try:
+        remote_identity = _merge_guard_github_repository_identity(remote_url)
+    except RuntimeError as exc:
+        raise RuntimeError("exact-base merge origin is not canonical GitHub") from exc
+    if remote_identity.casefold() != repo_slug.casefold():
+        raise RuntimeError("exact-base merge origin repository drift")
+    if not (
+        remote_url.startswith("git@github.com:")
+        or remote_url.startswith("ssh://git@github.com/")
+    ):
+        raise RuntimeError("exact-base merge requires canonical SSH GitHub origin")
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_exact_base_git_cas_merge",
+        "repository": repo_slug,
+        "base_branch": base_branch,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "head_branch": head_branch,
+        "pull_request": pr_number,
+        "remote_sha256": hashlib.sha256(remote_url.encode("utf-8")).hexdigest(),
+        "protected_base_force_push": False,
+        "head_branch_delete_with_expected_old_lease": True,
+        "atomic_base_update_and_head_delete": True,
+        "base_update_mode": "fast_forward_no_force",
+        "explicit_effects": ["branch-deletion"],
+        "verified_fast_forward_from_expected_base": True,
+        "stages": [],
+    }
+
+    def run(stage: str, root: Path, args: list[str], *, timeout: int = 60) -> dict[str, Any]:
+        info = _merge_guard_result_info(git_runner(root, args, timeout=timeout))
+        evidence["stages"].append(
+            {
+                "stage": stage,
+                "returncode": info["returncode"],
+                "stdout_sha256": hashlib.sha256(info["stdout"].encode("utf-8")).hexdigest(),
+                "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
+            }
+        )
+        return info
+
+    temp_root = Path(tempfile.mkdtemp(prefix="grabowski-captain-merge-"))
+    try:
+        for stage, args in (
+            ("init", ["init", "--quiet"]),
+            ("disable-hooks", ["config", "core.hooksPath", "/dev/null"]),
+            ("remote-add", ["remote", "add", "origin", remote_url]),
+            (
+                "fetch-bound-refs",
+                [
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "origin",
+                    f"refs/heads/{base_branch}:refs/captain/base",
+                    f"{head_ref}:refs/captain/head-branch",
+                    f"{pull_ref}:refs/captain/pr-head",
+                ],
+            ),
+        ):
+            info = run(stage, temp_root, args)
+            if info["returncode"] != 0:
+                raise RuntimeError(f"exact-base merge {stage} failed")
+        base_read = run(
+            "verify-fetched-base", temp_root, ["rev-parse", "refs/captain/base^{commit}"]
+        )
+        head_branch_read = run(
+            "verify-fetched-head-branch",
+            temp_root,
+            ["rev-parse", "refs/captain/head-branch^{commit}"],
+        )
+        pr_head_read = run(
+            "verify-fetched-pr-head",
+            temp_root,
+            ["rev-parse", "refs/captain/pr-head^{commit}"],
+        )
+        if base_read["returncode"] != 0 or base_read["stdout"].strip() != base_sha:
+            raise RuntimeError("exact-base merge fetched base drift")
+        if (
+            head_branch_read["returncode"] != 0
+            or head_branch_read["stdout"].strip() != head_sha
+        ):
+            raise RuntimeError("exact-base merge fetched head branch drift")
+        if (
+            pr_head_read["returncode"] != 0
+            or pr_head_read["stdout"].strip() != head_sha
+        ):
+            raise RuntimeError("exact-base merge fetched PR head drift")
+        checkout = run(
+            "checkout-base",
+            temp_root,
+            ["checkout", "--quiet", "--detach", "refs/captain/base"],
+        )
+        if checkout["returncode"] != 0:
+            raise RuntimeError("exact-base merge checkout failed")
+        merged = run(
+            "create-merge",
+            temp_root,
+            [
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "user.name=Grabowski Captain",
+                "-c",
+                "user.email=grabowski@localhost",
+                "merge",
+                "--no-ff",
+                "-m",
+                f"Merge pull request #{pr_number}",
+                "refs/captain/pr-head",
+            ],
+        )
+        if merged["returncode"] != 0:
+            raise RuntimeError("exact-base merge construction failed")
+        parents = run(
+            "verify-merge-parents",
+            temp_root,
+            ["rev-list", "--parents", "-n", "1", "HEAD"],
+        )
+        parent_fields = parents["stdout"].strip().split() if parents["returncode"] == 0 else []
+        if len(parent_fields) != 3 or parent_fields[1:] != [base_sha, head_sha]:
+            raise RuntimeError("exact-base merge parent binding failed")
+        merge_sha = parent_fields[0]
+        if _SHA40_RE.fullmatch(merge_sha) is None:
+            raise RuntimeError("exact-base merge commit identity invalid")
+        evidence["merge_sha"] = merge_sha
+        remote_head_before = run(
+            "remote-head-branch-pre-push", temp_root, ["ls-remote", "origin", head_ref]
+        )
+        remote_head_before_fields = remote_head_before["stdout"].strip().split()
+        if (
+            remote_head_before["returncode"] != 0
+            or len(remote_head_before_fields) != 2
+            or remote_head_before_fields[0] != head_sha
+            or remote_head_before_fields[1] != head_ref
+        ):
+            raise RuntimeError("exact-base merge head branch changed before dispatch")
+        remote_pr_head_before = run(
+            "remote-pr-head-pre-push", temp_root, ["ls-remote", "origin", pull_ref]
+        )
+        remote_pr_head_before_fields = remote_pr_head_before["stdout"].strip().split()
+        if (
+            remote_pr_head_before["returncode"] != 0
+            or len(remote_pr_head_before_fields) != 2
+            or remote_pr_head_before_fields[0] != head_sha
+            or remote_pr_head_before_fields[1] != pull_ref
+        ):
+            raise RuntimeError("exact-base merge PR head changed before dispatch")
+        remote_before = run(
+            "remote-base-pre-push", temp_root, ["ls-remote", "origin", ref]
+        )
+        remote_before_fields = remote_before["stdout"].strip().split()
+        if (
+            remote_before["returncode"] != 0
+            or len(remote_before_fields) != 2
+            or remote_before_fields[0] != base_sha
+            or remote_before_fields[1] != ref
+        ):
+            raise RuntimeError("exact-base merge base changed before dispatch")
+        if on_dispatch is not None:
+            on_dispatch()
+        push = run(
+            "atomic-cas-push",
+            temp_root,
+            [
+                "push",
+                "--porcelain",
+                "--atomic",
+                f"--force-with-lease={head_ref}:{head_sha}",
+                "origin",
+                f"HEAD:{ref}",
+                f":{head_ref}",
+            ],
+            timeout=120,
+        )
+        if push["returncode"] != 0:
+            evidence["status"] = "push_rejected_or_failed"
+            return {
+                "returncode": push["returncode"],
+                "stdout": "",
+                "stderr": "exact-base CAS push rejected or failed",
+            }, evidence
+        remote_after = run(
+            "remote-base-post-push", temp_root, ["ls-remote", "origin", ref]
+        )
+        remote_after_fields = remote_after["stdout"].strip().split()
+        if (
+            remote_after["returncode"] != 0
+            or len(remote_after_fields) != 2
+            or remote_after_fields[0] != merge_sha
+            or remote_after_fields[1] != ref
+        ):
+            evidence["status"] = "post_push_readback_mismatch"
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "exact-base CAS push readback mismatch",
+            }, evidence
+        remote_head_after = run(
+            "remote-head-branch-post-push", temp_root, ["ls-remote", "origin", head_ref]
+        )
+        if remote_head_after["returncode"] != 0 or remote_head_after["stdout"].strip():
+            evidence["status"] = "post_push_head_branch_delete_mismatch"
+            return {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "exact-base CAS head branch delete readback mismatch",
+            }, evidence
+        evidence["status"] = "pushed_and_read_back"
+        return {
+            "returncode": 0,
+            "stdout": "merged via exact-base Git CAS\n",
+            "stderr": "",
+        }, evidence
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 _BASE_UPDATE_GUARD_MAX_ACTIVE_RULES = 100
 _BASE_UPDATE_GUARD_MAX_RULESETS = 16
 
@@ -1327,6 +1644,7 @@ def _github_json_call(
         "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
     }
     if info["returncode"] != 0:
+        evidence["github_plan_limit"] = _github_rules_plan_limit_error(info["stderr"])
         return None, evidence, [f"{label}_query_failed"]
     try:
         value = json.loads(info["stdout"])
@@ -1490,6 +1808,51 @@ def verify_github_base_update_guard(
         "rulesets": [],
     }
     if errors:
+        if active_evidence.get("github_plan_limit") is True:
+            fallback_args = [
+                "api",
+                f"repos/{repo_slug}",
+                "--jq",
+                '{"private":.private,"allow_merge_commit":.allow_merge_commit}',
+            ]
+            fallback_value, fallback_query, fallback_errors = _github_json_call(
+                repo_path,
+                github_runner,
+                fallback_args,
+                label="base_update_guard_plan_fallback_repository",
+            )
+            evidence["plan_fallback_repository"] = fallback_query
+            if (
+                not fallback_errors
+                and isinstance(fallback_value, dict)
+                and fallback_value.get("private") is True
+                and fallback_value.get("allow_merge_commit") is True
+            ):
+                policy = {
+                    "schema_version": 1,
+                    "kind": "grabowski_github_base_update_guard",
+                    "repository": repo_slug,
+                    "base_branch": base_branch,
+                    "mode": "exact_base_git_cas",
+                    "github_rules_api_plan_limited": True,
+                    "private_repository": True,
+                    "merge_commit_allowed": True,
+                    "does_not_establish": [
+                        "server_enforced_branch_protection",
+                        "absence_of_noncooperating_external_github_actors",
+                        "semantic_correctness_of_required_status_checks",
+                        "successful_future_push",
+                        "atomic_pr_head_ref_compare_and_swap",
+                    ],
+                }
+                policy["binding_sha256"] = _sha256_json(policy)
+                evidence["policy_sha256"] = _sha256_json(policy)
+                evidence["errors"] = []
+                return policy, evidence, []
+            fallback_codes = list(fallback_errors)
+            fallback_codes.append("base_update_guard_plan_fallback_not_eligible")
+            evidence["errors"] = fallback_codes
+            return None, evidence, fallback_codes
         evidence["errors"] = list(errors)
         return None, evidence, errors
     if not isinstance(active, list):
@@ -3177,7 +3540,7 @@ class CaptainMergeGuardRunner:
             "--repo",
             repo_slug,
             "--json",
-            "number,state,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus,changedFiles,files",
+            "number,state,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,isDraft,mergeable,mergeStateStatus,changedFiles,files",
         ]
         try:
             view_raw = self.github_runner(self.repo_path, view_args)
@@ -3402,6 +3765,7 @@ class CaptainMergeGuardRunner:
             "expected_base_sha": expected_base_sha,
             "head_branch": head_branch,
             "head_sha": expected_head,
+            "is_cross_repository": viewed.get("isCrossRepository"),
             "merge_state_status": merge_state_status,
             "diff_sha256": live_diff_sha256,
             "execution_intent_sha256": self.execution_intent_sha256,
@@ -3424,7 +3788,7 @@ class CaptainMergeGuardRunner:
             "--repo",
             str(target["repo"]),
             "--json",
-            "number,state,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
+            "number,state,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,isDraft,mergeable,mergeStateStatus",
         ]
         try:
             raw = self.github_runner(self.repo_path, view_args)
@@ -3468,6 +3832,8 @@ class CaptainMergeGuardRunner:
             "isDraft": False,
             "mergeable": "MERGEABLE",
         }
+        if isinstance(bindings.get("is_cross_repository"), bool):
+            expected["isCrossRepository"] = bindings["is_cross_repository"]
         for field, expected_value in expected.items():
             if viewed.get(field) != expected_value:
                 errors.append(f"merge_guard_dispatch_revalidation_drift:{field}")
@@ -3523,6 +3889,50 @@ class CaptainMergeGuardRunner:
                 and self._is_branch_merge_policy_query(args)
             ):
                 self._capture_branch_merge_policy_snapshot(args, result)
+            if (
+                args[:2] == ["pr", "view"]
+                and self.receipt.get("dispatch_mode") == "exact_base_git_cas"
+                and isinstance(self.receipt.get("exact_base_git_cas_merge"), dict)
+                and self.receipt["exact_base_git_cas_merge"].get("status")
+                == "pushed_and_read_back"
+            ):
+                info = _merge_guard_result_info(result)
+                expected_merge = self.receipt["exact_base_git_cas_merge"].get(
+                    "merge_sha"
+                )
+                evidence: dict[str, Any] = {
+                    "returncode": info["returncode"],
+                    "expected_merge_sha": expected_merge,
+                    "matched": False,
+                }
+                if info["returncode"] == 0:
+                    try:
+                        viewed = json.loads(info["stdout"])
+                    except json.JSONDecodeError:
+                        viewed = None
+                    if isinstance(viewed, dict) and viewed.get("state") == "MERGED":
+                        merge_commit = viewed.get("mergeCommit")
+                        observed_merge = (
+                            merge_commit.get("oid")
+                            if isinstance(merge_commit, dict)
+                            else None
+                        )
+                        evidence["observed_merge_sha"] = observed_merge
+                        evidence["matched"] = (
+                            isinstance(expected_merge, str)
+                            and _SHA40_RE.fullmatch(expected_merge) is not None
+                            and observed_merge == expected_merge
+                        )
+                        self.receipt["exact_base_git_cas_post_view"] = evidence
+                        if not evidence["matched"]:
+                            return {
+                                "returncode": 1,
+                                "stdout": "",
+                                "stderr": (
+                                    "exact-base CAS GitHub merge commit readback mismatch"
+                                ),
+                            }
+                self.receipt["exact_base_git_cas_post_view"] = evidence
             return result
         if self.receipt["status"] != "not_reached":
             raise RuntimeError("merge lease guard permits exactly one merge dispatch")
@@ -3709,6 +4119,81 @@ class CaptainMergeGuardRunner:
                     "merge lease guard dispatch revalidation blocked: "
                     + "; ".join(revalidation_errors)
                 )
+            dispatch_guard = self.receipt.get("dispatch_base_update_guard", {})
+            dispatch_policy = (
+                dispatch_guard.get("policy")
+                if isinstance(dispatch_guard, dict)
+                else None
+            )
+            dispatch_mode = (
+                dispatch_policy.get("mode")
+                if isinstance(dispatch_policy, dict)
+                else None
+            )
+            if dispatch_mode == "exact_base_git_cas":
+                expected_head = str(bindings["head_sha"])
+                scope_error = _exact_base_git_cas_pr_scope_error(bindings)
+                if scope_error is not None:
+                    self.receipt["status"] = "blocked_after_guard_revalidation"
+                    self.receipt["contract_satisfied"] = False
+                    self.receipt["errors"] = [scope_error]
+                    raise RuntimeError(
+                        "merge lease guard plan fallback requires same-repository PR"
+                    )
+                effect_scope_errors = _exact_base_git_cas_effect_scope_errors(
+                    self.action
+                )
+                if effect_scope_errors:
+                    self.receipt["status"] = "blocked_after_guard_revalidation"
+                    self.receipt["contract_satisfied"] = False
+                    self.receipt["errors"] = effect_scope_errors
+                    raise RuntimeError(
+                        "merge lease guard plan fallback requires explicit branch-deletion scope"
+                    )
+                if "--merge" not in args:
+                    self.receipt["status"] = "blocked_after_guard_revalidation"
+                    self.receipt["contract_satisfied"] = False
+                    self.receipt["errors"] = [
+                        "merge_guard_plan_fallback_requires_merge_commit_method"
+                    ]
+                    raise RuntimeError(
+                        "merge lease guard plan fallback requires merge-commit method"
+                    )
+                try:
+                    match_index = args.index("--match-head-commit")
+                    matched_head = args[match_index + 1]
+                except (ValueError, IndexError):
+                    matched_head = None
+                if matched_head != expected_head:
+                    self.receipt["status"] = "blocked_after_guard_revalidation"
+                    self.receipt["contract_satisfied"] = False
+                    self.receipt["errors"] = [
+                        "merge_guard_plan_fallback_head_binding_missing"
+                    ]
+                    raise RuntimeError(
+                        "merge lease guard plan fallback head binding missing"
+                    )
+
+                def mark_dispatch() -> None:
+                    self.receipt["dispatch_at_unix_ns"] = time.time_ns()
+                    self.receipt["dispatch_called"] = True
+                    self.dispatch_called = True
+
+                self.receipt["dispatch_mode"] = dispatch_mode
+                result, fallback_evidence = _exact_base_git_cas_merge(
+                    self.repo_path,
+                    repo_slug=str(bindings["repository"]),
+                    base_branch=str(bindings["base_branch"]),
+                    base_sha=str(bindings["base_sha"]),
+                    head_sha=expected_head,
+                    head_branch=str(bindings["head_branch"]),
+                    pr_number=int(bindings["pull_request"]),
+                    on_dispatch=mark_dispatch,
+                )
+                self.receipt["exact_base_git_cas_merge"] = fallback_evidence
+                return result
+
+            self.receipt["dispatch_mode"] = "github_pr_merge"
             self.receipt["dispatch_at_unix_ns"] = time.time_ns()
             self.receipt["dispatch_called"] = True
             self.dispatch_called = True
