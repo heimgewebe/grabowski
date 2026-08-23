@@ -26,11 +26,19 @@ class DurableSystemdContractTests(unittest.TestCase):
         )
         self.assertIn("Environment=XDG_RUNTIME_DIR=/run/user/1000", text)
         self.assertIn(
-            "Environment=HEIM_NODE_RUNTIME_ENV_DIR=/run/grabowski-node-runtime-env",
+            "Environment=HEIM_NODE_RUNTIME_ENV_DIR=/run/user/1000/grabowski-node-runtime-env",
             text,
         )
-        self.assertIn("RuntimeDirectory=grabowski-node-runtime-env", text)
+        self.assertIn(
+            "Environment=UV_CACHE_DIR=/run/user/1000/grabowski-uv-cache",
+            text,
+        )
+        self.assertIn(
+            "RuntimeDirectory=user/1000/grabowski-node-runtime-env user/1000/grabowski-uv-cache",
+            text,
+        )
         self.assertIn("RuntimeDirectoryMode=0700", text)
+        self.assertIn("RuntimeDirectoryPreserve=restart", text)
         self.assertNotIn(
             "Environment=HEIM_NODE_RUNTIME_ENV_DIR=/home/alex/.local/state/grabowski/node-runtime-env",
             text,

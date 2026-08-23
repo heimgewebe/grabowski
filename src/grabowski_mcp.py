@@ -5601,6 +5601,7 @@ def _operator_system_overview(
     runtime_healthy: bool,
     client_snapshot: dict[str, Any],
     coding_agent_catalog: dict[str, Any],
+    normal_mutation_path_ready: bool,
 ) -> dict[str, Any]:
     tasks: dict[str, Any] = {
         "available": False,
@@ -5694,6 +5695,40 @@ def _operator_system_overview(
         platform_publication_state == "platform_converged"
         and client_snapshot.get("platform_publication_pending") is False
     )
+    platform_publication_blocking = platform_publication_state in {
+        "invalid",
+        "outcome_unknown",
+        "runtime_contract_changed",
+    }
+    external_client_schema_fault = (
+        bool(client_snapshot.get("external_client_snapshot_observable"))
+        and bool(client_snapshot.get("schema_evidence_observed"))
+        and not bool(client_snapshot.get("historical_schema_evidence_only"))
+        and client_snapshot.get("schema_contract_matches") is not True
+    )
+    schema_match_explicit = (
+        client_snapshot.get("server_loopback_schema_contract_matches") is True
+        or client_snapshot.get("schema_contract_matches") is True
+    )
+    schema_evidence_explicit = (
+        "server_loopback_schema_contract_matches" in client_snapshot
+        or "schema_contract_matches" in client_snapshot
+        or bool(client_snapshot.get("schema_evidence_observed"))
+    )
+    client_schema_execution_ready = (
+        not external_client_schema_fault
+        and (
+            schema_match_explicit
+            or (not schema_evidence_explicit and bool(client_snapshot.get("matched")))
+        )
+    )
+    client_execution_ready = (
+        snapshot_observable
+        and bool(client_snapshot.get("fresh"))
+        and bool(client_snapshot.get("matched"))
+        and client_schema_execution_ready
+        and not bool(client_snapshot.get("runtime_fault_indicated"))
+    )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
     truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
@@ -5704,29 +5739,35 @@ def _operator_system_overview(
         and obligations.get("available") is True
         and not obligations.get("scan_truncated")
     )
-    operator_ready = (
+    execution_ready = (
         runtime_healthy
         and coding_agent_catalog_ready
-        and platform_publication_ready
+        and client_execution_ready
+        and normal_mutation_path_ready
+        and not platform_publication_blocking
         and truth_model_ready
         and components_observable
     )
+    operator_ready = execution_ready
+    end_to_end_ready = execution_ready and platform_publication_ready
     if not runtime_healthy:
         next_action = "repair runtime integrity before operator mutation"
     elif not coding_agent_catalog_ready:
         next_action = "repair coding-agent catalog semantics before routed execution"
-    elif not snapshot_observable:
+    elif not client_execution_ready:
         next_action = str(
             client_snapshot.get(
                 "recommended_next_action",
-                "bind the current connector client snapshot",
+                "bind a fresh matching connector client snapshot",
             )
         )
-    elif not platform_publication_ready:
+    elif not normal_mutation_path_ready:
+        next_action = "restore normal signed mutation path before operator mutation"
+    elif platform_publication_blocking:
         next_action = str(
             client_snapshot.get(
                 "recommended_next_action",
-                "complete the semantic platform publication lifecycle",
+                "repair the invalid platform publication state",
             )
         )
     elif not tasks.get("available"):
@@ -5743,6 +5784,13 @@ def _operator_system_overview(
         next_action = "resume or close the highest-priority operator obligation"
     elif (tasks.get("projection_counts") or {}).get("attention", 0):
         next_action = "inspect the highest-priority attention task"
+    elif not platform_publication_ready:
+        next_action = str(
+            client_snapshot.get(
+                "recommended_next_action",
+                "complete the semantic platform publication lifecycle",
+            )
+        )
     else:
         next_action = "none"
     source_registry = {
@@ -5833,10 +5881,17 @@ def _operator_system_overview(
         "schema_version": 2,
         "operator_ready": operator_ready,
         "readiness": {
+            "execution_ready": execution_ready,
+            "end_to_end_ready": end_to_end_ready,
             "runtime_ready": runtime_healthy,
             "coding_agent_catalog_ready": coding_agent_catalog_ready,
+            "client_execution_ready": client_execution_ready,
+            "client_schema_execution_ready": client_schema_execution_ready,
+            "external_client_schema_fault": external_client_schema_fault,
+            "normal_mutation_path_ready": normal_mutation_path_ready,
             "connector_snapshot_ready": platform_connector_snapshot_ready,
             "platform_publication_ready": platform_publication_ready,
+            "platform_publication_blocking": platform_publication_blocking,
             "platform_publication_state": platform_publication_state,
             "truth_model_ready": truth_model_ready,
             "components_observable": components_observable,
@@ -5977,6 +6032,10 @@ def grabowski_status(
         warnings.append({"code": "agent_instructions_drift"})
     client_snapshot = tool_contract.get("client_snapshot", {})
     transport_roundtrip = _transport_roundtrip_status(ctx)
+    normal_mutation_path_ready = (
+        transport_roundtrip.get("state") == "unavailable"
+        or transport_roundtrip.get("normal_mutation_path_ready") is True
+    )
     if not bool(tool_contract.get("client_snapshot_observable")):
         snapshot_state = str(client_snapshot.get("state", "unavailable"))
         warnings.append(
@@ -5992,10 +6051,7 @@ def grabowski_status(
     # Platform publication evidence is surfaced explicitly in tool_contract and
     # system_overview. Its absence must not inflate the compact operational warning
     # channel, which is reserved for immediate runtime/action gates.
-    if (
-        transport_roundtrip.get("state") != "unavailable"
-        and transport_roundtrip.get("normal_mutation_path_ready") is not True
-    ):
+    if not normal_mutation_path_ready:
         warnings.append(
             {
                 "code": "transport_roundtrip_required",
@@ -6020,6 +6076,7 @@ def grabowski_status(
             runtime_healthy=healthy,
             client_snapshot=client_snapshot,
             coding_agent_catalog=coding_agent_catalog,
+            normal_mutation_path_ready=normal_mutation_path_ready,
         )
     if bool(audit.get("valid")) and not audit_writable:
         recommended_next_action = "restore audit writability before operator mutation"
@@ -6036,16 +6093,28 @@ def grabowski_status(
                 "bind the current connector client snapshot",
             )
         )
-    elif (
-        transport_roundtrip.get("state") != "unavailable"
-        and transport_roundtrip.get("normal_mutation_path_ready") is not True
-    ):
+    elif not normal_mutation_path_ready:
         recommended_next_action = str(
             transport_roundtrip.get(
                 "recommended_next_action",
                 "complete a fresh transport roundtrip before mutation",
             )
         )
+    elif system_overview is not None:
+        recommended_next_action = str(system_overview["recommended_next_action"])
+    elif client_snapshot.get("platform_publication_state") in {
+        "invalid",
+        "outcome_unknown",
+        "runtime_contract_changed",
+    }:
+        recommended_next_action = str(
+            client_snapshot.get(
+                "recommended_next_action",
+                "repair the invalid platform publication state",
+            )
+        )
+    elif warnings:
+        recommended_next_action = "inspect warnings before mutation"
     elif client_snapshot.get("platform_publication_state") != "platform_converged":
         recommended_next_action = str(
             client_snapshot.get(
@@ -6053,10 +6122,6 @@ def grabowski_status(
                 "complete the semantic platform publication lifecycle",
             )
         )
-    elif system_overview is not None:
-        recommended_next_action = str(system_overview["recommended_next_action"])
-    elif warnings:
-        recommended_next_action = "inspect warnings before mutation"
     else:
         recommended_next_action = "none"
     base_payload: dict[str, Any] = {

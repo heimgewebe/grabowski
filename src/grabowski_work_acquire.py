@@ -276,6 +276,7 @@ def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
         if key
         not in {
             "observed_at_unix",
+            "terminal_head_sha",
             "assessment_sha256",
             "audit_record_sha256",
             "does_not_establish",
@@ -383,6 +384,75 @@ def _ensure_terminal_closeout_audit(
     return appended
 
 
+def _converge_terminal_checkout_lifecycle(
+    record: dict[str, Any],
+    *,
+    assessment: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Move one exact terminal Work Lane checkout out of active capacity.
+
+    The durable lane closeout stays the terminal truth.  This follow-on
+    transition only changes checkout lifecycle accounting: retention and the
+    checkout remain intact, while the active creation slot is released.
+    """
+    if not isinstance(assessment, dict):
+        raise RuntimeError("terminal Work Lane assessment is invalid")
+    if assessment.get("phase") != "terminal":
+        raise RuntimeError("checkout lifecycle convergence requires terminal assessment")
+    if assessment.get("lease_release_ready") is not True:
+        return None
+    terminal_head_sha = assessment.get("terminal_head_sha")
+    if terminal_head_sha is None:
+        return None
+    head = checkouts._validate_git_object_id(terminal_head_sha, "terminal_head_sha")
+    worktree_receipt = record.get("worktree_receipt")
+    if not isinstance(worktree_receipt, dict):
+        return None
+    lifecycle = worktree_receipt.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        return None
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict):
+        raise RuntimeError("terminal Work Lane inputs are missing")
+    checkout_key = lifecycle.get("checkout_key")
+    checkout_path = lifecycle.get("checkout_path")
+    owner_id = lifecycle.get("owner_id")
+    expected_branch = lifecycle.get("expected_branch")
+    if not all(isinstance(value, str) and value for value in (checkout_key, checkout_path, owner_id, expected_branch)):
+        raise RuntimeError("terminal Work Lane checkout lifecycle identity is incomplete")
+    if (
+        inputs.get("target_path") != checkout_path
+        or inputs.get("branch") != expected_branch
+        or inputs.get("lease_owner_id") != owner_id
+    ):
+        raise RuntimeError("terminal Work Lane checkout lifecycle identity drifted")
+    repo_value = inputs.get("repo")
+    if not isinstance(repo_value, str) or not repo_value:
+        raise RuntimeError("terminal Work Lane repository identity is missing")
+    _, _, worktree = checkouts._worktree_for_path(Path(repo_value), Path(checkout_path))
+    if worktree.get("checkout_key") != checkout_key:
+        raise RuntimeError("terminal Work Lane checkout key drifted")
+    checkouts._require_clean_linked(worktree)
+    checkouts._require_expected(worktree, head, expected_branch)
+    binding = checkouts._mark_checkout_completed_retained(
+        checkout_key=checkout_key,
+        owner_id=owner_id,
+        expected_head=head,
+        expected_branch=expected_branch,
+    )
+    if binding.get("phase") != "completed_retained":
+        raise RuntimeError("terminal checkout lifecycle transition did not converge")
+    return {
+        "state": "completed_retained",
+        "checkout_key": checkout_key,
+        "owner_id": owner_id,
+        "expected_head": binding.get("expected_head"),
+        "expected_branch": binding.get("expected_branch"),
+        "active_capacity_released": True,
+        "retention_preserved": True,
+    }
+
+
 def persist_terminal_closeout(
     lane_id: str,
     assessment: dict[str, Any],
@@ -419,9 +489,22 @@ def persist_terminal_closeout(
             result = {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
             if audit_record_sha256 is not None:
                 result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
+            lifecycle = _converge_terminal_checkout_lifecycle(
+                record, assessment=existing
+            )
+            if lifecycle is not None:
+                result["checkout_lifecycle_closeout"] = lifecycle
             return result
         if record.get("receipt_sha256") != expected_receipt_sha256:
             raise RuntimeError("work-lane terminal closeout CAS preimage changed")
+        # Converge managed checkout lifecycle before publishing terminal_closeout.
+        # If this step fails, callers continue to observe no terminal closeout and
+        # therefore retry the same evidence-bound terminalization path.  The
+        # lifecycle transition itself is idempotent, so a later receipt-write
+        # failure is likewise safe to retry without reopening or deleting work.
+        lifecycle = _converge_terminal_checkout_lifecycle(
+            record, assessment=validated
+        )
         stored = _write_state(receipt_path, {**record, "terminal_closeout": wrapper, "updated_at_unix": int(time.time())})
         result = {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
         audit_record_sha256 = _ensure_terminal_closeout_audit(
@@ -429,6 +512,8 @@ def persist_terminal_closeout(
         )
         if audit_record_sha256 is not None:
             result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
+        if lifecycle is not None:
+            result["checkout_lifecycle_closeout"] = lifecycle
         return result
 
 

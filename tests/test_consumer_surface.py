@@ -466,6 +466,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         ):
             overview = grabowski_mcp._operator_system_overview(
                 runtime_healthy=True,
+                normal_mutation_path_ready=True,
                 coding_agent_catalog={
                     "ready": True,
                     "source": "deployment_catalog",
@@ -500,7 +501,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         )
 
 
-    def test_operator_system_overview_requires_platform_publication_convergence(self) -> None:
+    def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {},
@@ -528,14 +529,19 @@ class ConsumerSurfaceTests(unittest.TestCase):
         ):
             overview = grabowski_mcp._operator_system_overview(
                 runtime_healthy=True,
+                normal_mutation_path_ready=True,
                 coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
                 client_snapshot={
                     "state": "matched",
                     "observable": True,
                     "fresh": True,
                     "matched": True,
-                    "external_client_snapshot_observable": True,
+                    "schema_contract_matches": False,
+                    "server_loopback_schema_contract_matches": True,
+                    "external_client_snapshot_observable": False,
                     "platform_connector_snapshot_observable": False,
+                    "platform_connector_snapshot_fresh": False,
+                    "platform_evidence_state": "stale",
                     "platform_publication_state": "publication_pending",
                     "platform_publication_pending": True,
                     "platform_publication_request_id": "gpp-pending",
@@ -548,9 +554,15 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 },
             )
 
-        self.assertFalse(overview["operator_ready"])
+        self.assertTrue(overview["operator_ready"])
+        self.assertTrue(overview["readiness"]["execution_ready"])
+        self.assertFalse(overview["readiness"]["end_to_end_ready"])
+        self.assertTrue(overview["readiness"]["client_execution_ready"])
+        self.assertTrue(overview["readiness"]["client_schema_execution_ready"])
+        self.assertTrue(overview["readiness"]["normal_mutation_path_ready"])
         self.assertFalse(overview["readiness"]["connector_snapshot_ready"])
         self.assertFalse(overview["readiness"]["platform_publication_ready"])
+        self.assertFalse(overview["readiness"]["platform_publication_blocking"])
         self.assertEqual(
             "publication_pending", overview["readiness"]["platform_publication_state"]
         )
@@ -563,7 +575,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         components = {
             item["id"]: item for item in overview["component_map"]["components"]
         }
-        self.assertEqual("green", components["connector"]["signal"])
+        self.assertEqual("unknown", components["connector"]["signal"])
         self.assertEqual("amber", components["platform_publication"]["signal"])
         self.assertEqual(
             "user-owned immutable platform publication journal",
@@ -598,6 +610,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         ):
             overview = grabowski_mcp._operator_system_overview(
                 runtime_healthy=True,
+                normal_mutation_path_ready=True,
                 coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
                 client_snapshot={
                     "state": "matched",
@@ -605,6 +618,9 @@ class ConsumerSurfaceTests(unittest.TestCase):
                     "fresh": True,
                     "matched": True,
                     "external_client_snapshot_observable": True,
+                    "schema_evidence_observed": True,
+                    "schema_contract_matches": True,
+                    "server_loopback_schema_contract_matches": False,
                     "platform_connector_snapshot_observable": False,
                     "platform_connector_snapshot_fresh": True,
                     "platform_connector_snapshot_matched": False,
@@ -618,14 +634,201 @@ class ConsumerSurfaceTests(unittest.TestCase):
             )
 
         self.assertTrue(overview["operator_ready"])
+        self.assertTrue(overview["readiness"]["execution_ready"])
+        self.assertTrue(overview["readiness"]["end_to_end_ready"])
+        self.assertTrue(overview["readiness"]["client_schema_execution_ready"])
+        self.assertFalse(overview["readiness"]["external_client_schema_fault"])
         self.assertFalse(overview["readiness"]["connector_snapshot_ready"])
         self.assertTrue(overview["readiness"]["platform_publication_ready"])
+        self.assertFalse(overview["readiness"]["platform_publication_blocking"])
         self.assertEqual("none", overview["recommended_next_action"])
         components = {
             item["id"]: item for item in overview["component_map"]["components"]
         }
         self.assertEqual("green", components["connector"]["signal"])
         self.assertEqual("green", components["platform_publication"]["signal"])
+
+    def test_operator_system_overview_blocks_fresh_external_schema_fault(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {},
+                "projection_counts": {},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+            }
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "state": "matched",
+                    "observable": True,
+                    "fresh": True,
+                    "matched": True,
+                    "schema_evidence_observed": True,
+                    "historical_schema_evidence_only": False,
+                    "schema_contract_matches": False,
+                    "external_client_snapshot_observable": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "platform_connector_snapshot_observable": False,
+                    "platform_publication_state": "publication_pending",
+                    "platform_publication_pending": True,
+                    "recommended_next_action": "bind corrected external schema",
+                },
+            )
+
+        self.assertFalse(overview["operator_ready"])
+        self.assertFalse(overview["readiness"]["execution_ready"])
+        self.assertFalse(overview["readiness"]["client_execution_ready"])
+        self.assertFalse(overview["readiness"]["client_schema_execution_ready"])
+        self.assertTrue(overview["readiness"]["external_client_schema_fault"])
+        self.assertFalse(overview["readiness"]["platform_publication_blocking"])
+        self.assertEqual(
+            "bind corrected external schema", overview["recommended_next_action"]
+        )
+
+    def test_operator_system_overview_blocks_hard_platform_publication_faults(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {},
+                "projection_counts": {},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+            }
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            for publication_state in (
+                "invalid",
+                "outcome_unknown",
+                "runtime_contract_changed",
+            ):
+                with self.subTest(publication_state=publication_state):
+                    overview = grabowski_mcp._operator_system_overview(
+                        runtime_healthy=True,
+                        normal_mutation_path_ready=True,
+                        coding_agent_catalog={
+                            "ready": True,
+                            "source": "deployment_catalog",
+                        },
+                        client_snapshot={
+                            "state": "matched",
+                            "observable": True,
+                            "fresh": True,
+                            "matched": True,
+                            "server_loopback_schema_contract_matches": True,
+                            "external_client_snapshot_observable": True,
+                            "platform_connector_snapshot_observable": False,
+                            "platform_publication_state": publication_state,
+                            "platform_publication_pending": True,
+                            "recommended_next_action": "repair publication",
+                        },
+                    )
+
+                    self.assertFalse(overview["operator_ready"])
+                    self.assertFalse(overview["readiness"]["execution_ready"])
+                    self.assertFalse(overview["readiness"]["end_to_end_ready"])
+                    self.assertTrue(
+                        overview["readiness"]["platform_publication_blocking"]
+                    )
+                    self.assertEqual(
+                        "repair publication", overview["recommended_next_action"]
+                    )
+                    components = {
+                        item["id"]: item
+                        for item in overview["component_map"]["components"]
+                    }
+                    self.assertEqual(
+                        "red", components["platform_publication"]["signal"]
+                    )
+
+    def test_operator_system_overview_blocks_unready_normal_mutation_path(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {},
+                "projection_counts": {},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+            }
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=False,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "state": "matched",
+                    "observable": True,
+                    "fresh": True,
+                    "matched": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "external_client_snapshot_observable": True,
+                    "platform_connector_snapshot_observable": True,
+                    "platform_connector_snapshot_fresh": True,
+                    "platform_connector_snapshot_matched": True,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                },
+            )
+
+        self.assertFalse(overview["operator_ready"])
+        self.assertFalse(overview["readiness"]["execution_ready"])
+        self.assertFalse(overview["readiness"]["end_to_end_ready"])
+        self.assertTrue(overview["readiness"]["platform_publication_ready"])
+        self.assertFalse(overview["readiness"]["normal_mutation_path_ready"])
+        self.assertEqual(
+            "restore normal signed mutation path before operator mutation",
+            overview["recommended_next_action"],
+        )
 
     def test_operator_system_overview_prioritizes_invalid_coding_catalog(self) -> None:
         fake_tasks = SimpleNamespace(
@@ -655,6 +858,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         ):
             overview = grabowski_mcp._operator_system_overview(
                 runtime_healthy=True,
+                normal_mutation_path_ready=True,
                 coding_agent_catalog={
                     "ready": False,
                     "error": "invalid catalog",

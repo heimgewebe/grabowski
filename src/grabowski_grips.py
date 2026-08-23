@@ -1088,9 +1088,9 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 GRIP_CONDITIONAL_PRECONDITIONS = {
     "agent-execution-happy-path": (
         "exactly one mode is required: workspace_id resumes one lane-backed Agent Workspace; otherwise source_kind, source_id, repo, source_revision, write_paths, objective, test_argv and retention_until_unix form one bounded Source request",
-        "Source mode derives branch, target checkout, idempotency identity, canonical route, ExecutionPlan.v1 and route-bound writer/reviewer commands server-side; effect_profile defaults to candidate and delivery is an explicit scoped-writer-only opt-in; resume derives the profile from the lane plan",
+        "Source mode derives branch, target checkout, idempotency identity and canonical route server-side; mutable controller/scoped-writer routes additionally derive ExecutionPlan.v1, while direct-review routes return only a read-only source/revision/route binding; effect_profile defaults to candidate and delivery is an explicit scoped-writer-only opt-in; resume derives the profile from the lane plan",
         "callers cannot select branch, target, Candidate, delivery action or revision identities",
-        "Work Lane binds scoped-writer authority but receives no scoped_writer_argv, so Agent Workspace is the only writer-start owner",
+        "Source mode materializes one controller-owned Work Lane only for mutable controller or scoped-writer routes; direct_review_required routes create no Work Lane or Agent Workspace and hand back one read-only controller review binding; mutable controller routes stop at a lane-bound controller execution boundary, while scoped-writer routes bind scoped-writer authority without scoped_writer_argv so Agent Workspace remains the only delegated writer-start owner",
         "the internal execution coordinator owns no state store and may only collect, consume the one bounded candidate revision, or close through existing workspace seams",
         "ordinary pending async progress is handed to one deterministic existing Grabowski job; a continuation runner never creates another continuation job",
         "candidate-integration-ready remains the candidate-default P1-P5 path; delivery commit/push/PR runs internally only after exact closed PASS Candidate bindings and candidate/commit tree equality are revalidated",
@@ -6072,6 +6072,9 @@ _AGENT_EXECUTION_SOURCE_FIELDS = frozenset(
     }
 )
 _AGENT_EXECUTION_CONTINUATION_ENV = "GRABOWSKI_AEF_CONTINUATION"
+# Persisted lane identity predates model-neutral controller roles. Keep this stable
+# for replay/recovery compatibility; authority is still carried by controller_role.
+_AGENT_EXECUTION_CONTROLLER_ACTOR = "controller:chatgpt"
 
 
 def _agent_execution_frontdoor_modules() -> tuple[Any, Any, Any, Any]:
@@ -6142,7 +6145,11 @@ def _agent_execution_route_command(
     if route.get("paid_only") is True:
         raise GripPreflightError(f"canonical {role} route requires paid execution")
     if role == "writer":
-        if route.get("route_role") != "scoped-writer" or route.get("contrast_only") is True:
+        if (
+            route.get("route_role") != "scoped-writer"
+            or route.get("contrast_only") is True
+            or route.get("execution_eligible_if_separately_authorized") is not True
+        ):
             raise GripPreflightError(
                 "canonical writer route is not eligible as the authoritative lane-scoped writer"
             )
@@ -6338,13 +6345,17 @@ def _agent_execution_source_request(
         raise GripPreflightError("canonical route effect profile differs from the request")
     try:
         execution_plan.route_binding_from_decision(route)
-        plan = _agent_execution_build_plan(
-            execution_plan,
-            source_kind=source_kind,
-            source_id=source_id,
-            route=route,
-            write_paths=write_paths,
-            runtime_seconds=runtime_seconds,
+        plan = (
+            None
+            if route.get("direct_review_required") is True
+            else _agent_execution_build_plan(
+                execution_plan,
+                source_kind=source_kind,
+                source_id=source_id,
+                route=route,
+                write_paths=write_paths,
+                runtime_seconds=runtime_seconds,
+            )
         )
     except Exception as exc:
         raise GripPreflightError(
@@ -6384,7 +6395,7 @@ def _agent_execution_source_request(
         "source_identity_sha256": source_identity_sha256,
         "request_sha256": request_sha256,
         "route_recommendation_sha256": route.get("recommendation_sha256"),
-        "execution_plan_id": plan.get("plan_id"),
+        "execution_plan_id": plan.get("plan_id") if isinstance(plan, dict) else None,
         "executor": route.get("executor"),
         "writer_route": route.get("writer_route"),
         "verification_policy": verification_policy,
@@ -6396,18 +6407,125 @@ def _agent_execution_source_request(
         "reconcile_required": False,
         **({"effect_profile": "delivery"} if effect_profile == "delivery" else {}),
     }
-    if route.get("executor") == "controller":
-        _check(
-            receipt,
-            "source-lane-workspace-bound",
-            "skip",
-            "canonical route stops at controller execution boundary",
-        )
+    if route.get("direct_review_required") is True:
+        if route.get("executor") != "controller" or route.get("direct_work_required") is True:
+            raise GripPreflightError(
+                "canonical direct-review route has inconsistent mutable-work authority"
+            )
+        _check(receipt, "source-controller-boundary", "pass", "direct-review")
         return {
             **frontdoor,
             "state": "controller_handback",
+            "execution_plan": None,
+            "review_binding": {
+                "schema_version": 1,
+                "kind": "controller_review_binding",
+                "source": {"kind": source_kind, "id": source_id},
+                "source_revision": source_revision,
+                "route_recommendation_sha256": route.get("recommendation_sha256"),
+                "verification_policy": verification_policy,
+                "read_only": True,
+            },
+            "next_action": "controller_review_bound_source",
+            "receipt_status": "passed",
+            "stop": True,
+        }
+    if route.get("executor") == "controller":
+        if route.get("direct_work_required") is not True:
+            raise GripPreflightError(
+                "canonical controller route does not explicitly authorize direct mutable work"
+            )
+        lane_parameters = {
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "controller_actor": _AGENT_EXECUTION_CONTROLLER_ACTOR,
+            "controller_role": "controller",
+            "repo": str(repo),
+            "base_head": source_revision,
+            "branch": branch,
+            "target_path": str(target),
+            "purpose": f"AEF P5 direct controller {source_kind}:{source_id} {request_sha256[:12]}",
+            "retention_until_unix": retention_until_unix,
+            "artifact_class": "implementation-worktree",
+            "idempotency_key": f"aef-{source_identity_sha256[:20]}-{request_sha256[:20]}",
+            "write_paths": write_paths,
             "execution_plan": plan,
-            "next_action": "controller_execute_bound_plan",
+            "ttl_seconds": min(86400, max(7200, runtime_seconds + 1800)),
+        }
+        try:
+            work_acquire.operator._require_operator_mutation(
+                "resource_lease", path=str(target), repo=str(repo)
+            )
+            work_acquire.operator._require_operator_capability("git_cli")
+            lane = work_acquire.acquire_work(
+                lane_parameters,
+                audit_fn=work_acquire.operator.base._append_audit,
+            )
+        except Exception as exc:
+            return {
+                **frontdoor,
+                "state": "lane_reconcile_required",
+                "execution_plan": plan,
+                "reconcile_required": True,
+                "next_action": "read_back_source_lane_and_checkout_before_retry",
+                "error": type(exc).__name__,
+                "receipt_status": "blocked",
+                "stop": True,
+            }
+        if not isinstance(lane, dict):
+            return {
+                **frontdoor,
+                "state": "lane_reconcile_required",
+                "execution_plan": plan,
+                "reconcile_required": True,
+                "next_action": "read_back_source_lane_and_checkout_before_retry",
+                "error": "invalid_work_lane_result",
+                "receipt_status": "blocked",
+                "stop": True,
+            }
+        lane_id = lane.get("lane_id")
+        lane_receipt_sha256 = lane.get("receipt_sha256")
+        lane_inputs = lane.get("inputs")
+        lane_exact = bool(
+            lane.get("state") == "ready"
+            and lane.get("next_action") == "controller_execute"
+            and isinstance(lane_id, str)
+            and re.fullmatch(r"[0-9a-f]{32}", lane_id)
+            and isinstance(lane_receipt_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", lane_receipt_sha256)
+            and isinstance(lane_inputs, dict)
+            and lane_inputs.get("execution_plan") == plan
+            and lane_inputs.get("source") == {"kind": source_kind, "id": source_id}
+            and lane_inputs.get("scoped_writer") is None
+            and not isinstance(lane.get("writer_job"), dict)
+            and not isinstance(lane.get("writer_start"), dict)
+        )
+        if not lane_exact:
+            return {
+                **frontdoor,
+                "state": "lane_reconcile_required",
+                "execution_plan": plan,
+                "lane_id": lane_id,
+                "lane_receipt_sha256": lane_receipt_sha256,
+                "reconcile_required": True,
+                "next_action": "read_back_source_lane_and_checkout_before_retry",
+                "error": "work_lane_binding_not_exact",
+                "receipt_status": "blocked",
+                "stop": True,
+            }
+        _check(
+            receipt,
+            "source-lane-workspace-bound",
+            "pass",
+            f"controller-lane:{lane_id}",
+        )
+        return {
+            **frontdoor,
+            "state": "controller_lane_ready",
+            "execution_plan": plan,
+            "lane_id": lane_id,
+            "lane_receipt_sha256": lane_receipt_sha256,
+            "next_action": "controller_execute_bound_lane",
             "receipt_status": "passed",
             "stop": True,
         }
@@ -6447,7 +6565,7 @@ def _agent_execution_source_request(
     lane_parameters = {
         "source_kind": source_kind,
         "source_id": source_id,
-        "controller_actor": "controller:chatgpt",
+        "controller_actor": _AGENT_EXECUTION_CONTROLLER_ACTOR,
         "controller_role": "controller",
         "scoped_writer_actor": f"scoped-writer:{route['writer_route']}",
         "repo": str(repo),
