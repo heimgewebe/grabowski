@@ -64,6 +64,7 @@ def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN"
             "isDraft": False,
             "mergeStateStatus": merge_state,
             "mergeable": mergeable,
+            "headRefName": "feature/test",
             "headRefOid": HEAD,
             "baseRefName": "main",
             "baseRefOid": BASE,
@@ -286,7 +287,7 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
                     "head_sha": HEAD,
                     "path": pr_review_gate.REGISTRY_FRESHNESS_WORKFLOW_PATH,
                     "pull_requests": [
-                        {"number": 58, "base_ref": "main", "base_sha": BASE}
+                        {"number": 58, "head_ref": "feature/test", "head_sha": HEAD, "base_ref": "main", "base_sha": BASE}
                     ],
                 },
             }
@@ -301,6 +302,14 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
 
+        state["checks"][-1]["workflowRunBindingEvidence"]["head_sha"] = BASE
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=paths),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+
     def test_registry_freshness_workflow_run_fails_closed_on_wrong_identity(self) -> None:
         good = {
             "source": "github-actions-workflow-run",
@@ -310,7 +319,7 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
             "conclusion": "success",
             "head_sha": HEAD,
             "path": pr_review_gate.REGISTRY_FRESHNESS_WORKFLOW_PATH,
-            "pull_requests": [{"number": 58, "base_ref": "main", "base_sha": BASE}],
+            "pull_requests": [{"number": 58, "head_ref": "feature/test", "head_sha": HEAD, "base_ref": "main", "base_sha": BASE}],
         }
         cases = (
             {**good, "repository": "other/repo"},
@@ -319,9 +328,11 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
             {**good, "conclusion": "failure"},
             {**good, "head_sha": "d" * 40},
             {**good, "path": ".github/workflows/other.yml"},
-            {**good, "pull_requests": [{"number": 59, "base_ref": "main", "base_sha": BASE}]},
-            {**good, "pull_requests": [{"number": 58, "base_ref": "dev", "base_sha": BASE}]},
-            {**good, "pull_requests": [{"number": 58, "base_ref": "main", "base_sha": "e" * 40}]},
+            {**good, "pull_requests": [{"number": 59, "head_ref": "feature/test", "head_sha": HEAD, "base_ref": "main", "base_sha": BASE}]},
+            {**good, "pull_requests": [{"number": 58, "head_ref": "other", "head_sha": HEAD, "base_ref": "main", "base_sha": BASE}]},
+            {**good, "pull_requests": [{"number": 58, "head_ref": "feature/test", "head_sha": "d" * 40, "base_ref": "main", "base_sha": BASE}]},
+            {**good, "pull_requests": [{"number": 58, "head_ref": "feature/test", "head_sha": HEAD, "base_ref": "dev", "base_sha": BASE}]},
+            {**good, "pull_requests": [{"number": 58, "head_ref": "feature/test", "head_sha": HEAD, "base_ref": "main", "base_sha": "e" * 40}]},
         )
         for workflow_evidence in cases:
             with self.subTest(workflow_evidence=workflow_evidence):

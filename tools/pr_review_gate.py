@@ -283,6 +283,7 @@ PR_FIELDS = (
     "isDraft",
     "mergeStateStatus",
     "mergeable",
+    "headRefName",
     "headRefOid",
     "baseRefName",
     "baseRefOid",
@@ -528,17 +529,30 @@ def _load_actions_workflow_binding_evidence(
             or not isinstance(base, dict)
         ):
             continue
+        head = item.get("head")
         base_ref = base.get("ref")
         base_sha = base.get("sha")
+        head_ref = head.get("ref") if isinstance(head, dict) else None
+        head_sha = head.get("sha") if isinstance(head, dict) else None
         if (
-            not isinstance(base_ref, str)
+            not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+            or not isinstance(base_ref, str)
             or not base_ref
             or not isinstance(base_sha, str)
             or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
         ):
             continue
         normalized_pulls.append(
-            {"number": number, "base_ref": base_ref, "base_sha": base_sha}
+            {
+                "number": number,
+                "head_ref": head_ref,
+                "head_sha": head_sha,
+                "base_ref": base_ref,
+                "base_sha": base_sha,
+            }
         )
     fields = {
         "source": "github-actions-workflow-run",
@@ -3194,6 +3208,7 @@ def _check_has_exact_registry_freshness_binding(
     *,
     repo_slug: object,
     pr_number: object,
+    head_ref: object,
     head_sha: object,
     base_ref: object,
     base_sha: object,
@@ -3206,6 +3221,8 @@ def _check_has_exact_registry_freshness_binding(
         or isinstance(pr_number, bool)
         or not isinstance(pr_number, int)
         or pr_number <= 0
+        or not isinstance(head_ref, str)
+        or not head_ref
         or not isinstance(head_sha, str)
         or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
         or not isinstance(base_ref, str)
@@ -3234,7 +3251,7 @@ def _check_has_exact_registry_freshness_binding(
         and workflow.get("event") == "pull_request_target"
         and workflow.get("status") == "completed"
         and workflow.get("conclusion") == "success"
-        and workflow.get("head_sha") == head_sha
+        and workflow.get("head_sha") in {head_sha, base_sha}
         and workflow.get("path") == REGISTRY_FRESHNESS_WORKFLOW_PATH
     ):
         return False
@@ -3244,6 +3261,8 @@ def _check_has_exact_registry_freshness_binding(
     return any(
         isinstance(item, dict)
         and item.get("number") == pr_number
+        and item.get("head_ref") == head_ref
+        and item.get("head_sha") == head_sha
         and item.get("base_ref") == base_ref
         and item.get("base_sha") == base_sha
         for item in pulls
@@ -3521,6 +3540,7 @@ def evaluate_review_gate(
                 check,
                 repo_slug=repo_name,
                 pr_number=pr.get("number"),
+                head_ref=pr.get("headRefName"),
                 head_sha=pr.get("headRefOid"),
                 base_ref=pr.get("baseRefName"),
                 base_sha=current_base_sha,
