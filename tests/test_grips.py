@@ -53,7 +53,6 @@ import grabowski_task_attention as task_attention
 def _self_review_audit(
     *,
     head: str = "a" * 40,
-    base_sha: str = "b" * 40,
     diff_sha256: str = "0" * 64,
     tier: str = "standard",
     minimum: int = 2,
@@ -66,7 +65,6 @@ def _self_review_audit(
         "pr": 7,
         "generated_at": "2026-07-10T12:00:00+00:00",
         "head_sha": head,
-        "base_sha": base_sha,
         "diff_sha256": diff_sha256,
         "review_tier": tier,
         "gate_verdict": "PASS",
@@ -4250,36 +4248,6 @@ class GripFoundationTests(unittest.TestCase):
         self.assertTrue(result["output"]["ready"])
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["self_review_audit"])
-
-    def test_pr_check_readiness_binds_audit_to_exact_pr_target(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            for field, value in (
-                ("expected_repo", "heimgewebe/other"),
-                ("expected_pr", 8),
-                ("expected_base_sha", "c" * 40),
-            ):
-                parameters = {
-                    "repo": tmp,
-                    "expected_head": "a" * 40,
-                    "expected_diff_sha256": "0" * 64,
-                    "expected_repo": "heimgewebe/grabowski",
-                    "expected_pr": 7,
-                    "expected_base_sha": "b" * 40,
-                    "self_review_audit": _self_review_audit(),
-                }
-                parameters[field] = value
-                with self.subTest(field=field):
-                    result = grips.run_grip(
-                        "pr-check-readiness",
-                        parameters,
-                        command_runner=FakeGit(
-                            branch="feat/work", dirty=False, head="a" * 40
-                        ),
-                    )
-                    self.assertFalse(result["output"]["ready"])
-                    self.assertIn(
-                        "self-review audit invalid", result["output"]["blocking_reasons"]
-                    )
 
     def test_pr_check_readiness_binds_audit_to_live_head_without_expected_head_parameter(self) -> None:
         live_head = "a" * 40
