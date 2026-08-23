@@ -101,6 +101,7 @@ DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate (attested)",
 }
 REGISTRY_FRESHNESS_CHECK_NAME = "registry-registration-preflight/freshness"
+REGISTRY_FRESHNESS_WORKFLOW_PATH = ".github/workflows/registry-registration-preflight.yml"
 BASE_BOUND_REQUIRED_CHECK_NAMES = {REGISTRY_FRESHNESS_CHECK_NAME}
 REGISTRY_TASK_PATH_PREFIX = "registry/tasks/"
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
@@ -282,7 +283,9 @@ PR_FIELDS = (
     "isDraft",
     "mergeStateStatus",
     "mergeable",
+    "headRefName",
     "headRefOid",
+    "baseRefName",
     "baseRefOid",
     "url",
     "changedFiles",
@@ -460,6 +463,23 @@ def _github_check_run_id(link: Any, *, repo_slug: str) -> int | None:
     return int(match.group("run_id")) if match is not None else None
 
 
+def _github_actions_run_id(link: Any, *, repo_slug: str) -> int | None:
+    if not isinstance(link, str) or not link:
+        return None
+    try:
+        parsed = urlparse(link)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        return None
+    match = re.fullmatch(
+        rf"/{re.escape(repo_slug)}/actions/runs/(?P<run_id>[1-9][0-9]*)(?:/job/[1-9][0-9]*)?",
+        parsed.path,
+        re.IGNORECASE,
+    )
+    return int(match.group("run_id")) if match is not None else None
+
+
 def _load_check_run_binding_evidence(
     repo: Path, *, repo_slug: str, run_id: int
 ) -> dict[str, Any] | None:
@@ -487,6 +507,73 @@ def _load_check_run_binding_evidence(
     return fields
 
 
+def _load_actions_workflow_binding_evidence(
+    repo: Path, *, repo_slug: str, run_id: int
+) -> dict[str, Any] | None:
+    payload = _run_json(repo, ["gh", "api", f"repos/{repo_slug}/actions/runs/{run_id}"])
+    if not isinstance(payload, dict):
+        return None
+    pull_requests = payload.get("pull_requests")
+    if not isinstance(pull_requests, list):
+        return None
+    normalized_pulls: list[dict[str, Any]] = []
+    for item in pull_requests:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        base = item.get("base")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number <= 0
+            or not isinstance(base, dict)
+        ):
+            continue
+        head = item.get("head")
+        base_ref = base.get("ref")
+        base_sha = base.get("sha")
+        head_ref = head.get("ref") if isinstance(head, dict) else None
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if (
+            not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+            or not isinstance(base_ref, str)
+            or not base_ref
+            or not isinstance(base_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
+        ):
+            continue
+        normalized_pulls.append(
+            {
+                "number": number,
+                "head_ref": head_ref,
+                "head_sha": head_sha,
+                "base_ref": base_ref,
+                "base_sha": base_sha,
+            }
+        )
+    fields = {
+        "source": "github-actions-workflow-run",
+        "repository": repo_slug,
+        "event": payload.get("event"),
+        "status": payload.get("status"),
+        "conclusion": payload.get("conclusion"),
+        "head_sha": payload.get("head_sha"),
+        "path": payload.get("path"),
+        "pull_requests": normalized_pulls,
+    }
+    if not all(
+        isinstance(fields[key], str) and fields[key]
+        for key in ("repository", "event", "status", "head_sha", "path")
+    ):
+        return None
+    if fields["conclusion"] is not None and not isinstance(fields["conclusion"], str):
+        return None
+    return fields
+
+
 def _attach_registry_freshness_binding_evidence(
     repo: Path, *, repo_slug: str, checks: Any
 ) -> Any:
@@ -508,6 +595,16 @@ def _attach_registry_freshness_binding_evidence(
                 evidence = None
             if evidence is not None:
                 copy["baseBindingEvidence"] = evidence
+        workflow_run_id = _github_actions_run_id(check.get("link"), repo_slug=repo_slug)
+        if workflow_run_id is not None:
+            try:
+                workflow_evidence = _load_actions_workflow_binding_evidence(
+                    repo, repo_slug=repo_slug, run_id=workflow_run_id
+                )
+            except RuntimeError:
+                workflow_evidence = None
+            if workflow_evidence is not None:
+                copy["workflowRunBindingEvidence"] = workflow_evidence
         enriched.append(copy)
     return enriched
 
@@ -2956,7 +3053,9 @@ def _mapping_child_block(
     return None
 
 
-def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
+def _python_versions_from_validate_workflow(
+    text: str, *, job_key: str = "validate"
+) -> tuple[str, ...]:
     lines = text.splitlines()
     jobs_index = next(
         (
@@ -2981,7 +3080,7 @@ def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
         if indent == 0:
             break
         if indent == job_indent and re.fullmatch(
-            r"validate\s*:\s*(?:#.*)?", line.strip()
+            rf"{re.escape(job_key)}\s*:\s*(?:#.*)?", line.strip()
         ):
             validate_index = index
             break
@@ -3002,40 +3101,43 @@ def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
         validate_block, key="name", parent_indent=job_indent
     )
     if name_entry is not None:
-        raise GateInputError("target validate job uses a custom name")
+        raise GateInputError(f"target {job_key} job uses a custom name")
     strategy_entry = _mapping_child_block(
         validate_block, key="strategy", parent_indent=job_indent
     )
     if strategy_entry is None or strategy_entry[1]:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     strategy_block, _ = strategy_entry
     strategy_indent = _direct_child_indent(strategy_block, job_indent)
     if strategy_indent is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     matrix_entry = _mapping_child_block(
         strategy_block, key="matrix", parent_indent=strategy_indent - 1
     )
     if matrix_entry is None or matrix_entry[1]:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     matrix_block, _ = matrix_entry
     matrix_indent = _direct_child_indent(matrix_block, strategy_indent)
     if matrix_indent is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     versions_entry = _mapping_child_block(
         matrix_block, key="python-version", parent_indent=matrix_indent - 1
     )
     if versions_entry is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     version_block, inline = versions_entry
     if inline.startswith("[") and inline.endswith("]"):
-        return tuple(
+        values = tuple(
             value.strip().strip("\"'")
             for value in inline[1:-1].split(",")
             if value.strip().strip("\"'")
         )
+        if not values:
+            raise GateInputError(f"target {job_key} job Python matrix is empty")
+        return values
     version_indent = _direct_child_indent(version_block, matrix_indent)
     if version_indent is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     values: list[str] = []
     for line in version_block:
         if not line.strip() or line.lstrip().startswith("#"):
@@ -3050,6 +3152,8 @@ def _python_versions_from_validate_workflow(text: str) -> tuple[str, ...]:
         if item is None:
             return ()
         values.append(item.group("version"))
+    if not values:
+        raise GateInputError(f"target {job_key} job Python matrix is empty")
     return tuple(values)
 
 
@@ -3080,14 +3184,22 @@ def expected_check_names_for_repo(
     if bootstrap is not None:
         return bootstrap
     workflow = _workflow_text_at_revision(repo, policy_sha) if policy_sha is not None else None
-    versions = _python_versions_from_validate_workflow(workflow) if workflow else ()
+    python_job = "validate"
+    versions = (
+        _python_versions_from_validate_workflow(workflow, job_key=python_job)
+        if workflow
+        else ()
+    )
+    if workflow and not versions:
+        python_job = "test"
+        versions = _python_versions_from_validate_workflow(workflow, job_key=python_job)
     if versions:
         if len(versions) != len(set(versions)) or not all(
             re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", version)
             for version in versions
         ):
             raise GateInputError("target validate workflow has an invalid Python matrix")
-        return tuple(f"validate ({version})" for version in versions)
+        return tuple(f"{python_job} ({version})" for version in versions)
     if repo_name == "heimgewebe/grabowski":
         return DEFAULT_EXPECTED_CHECK_NAMES
     raise GateInputError("cannot derive expected checks from base required-check catalog, bootstrap policy, or validate workflow")
@@ -3107,24 +3219,35 @@ def _check_link_matches_base_sha(check: dict[str, Any], base_sha: object) -> boo
 
 
 def _check_has_exact_registry_freshness_binding(
-    check: dict[str, Any], *, pr_number: object, head_sha: object, base_sha: object
+    check: dict[str, Any],
+    *,
+    repo_slug: object,
+    pr_number: object,
+    head_ref: object,
+    head_sha: object,
+    base_ref: object,
+    base_sha: object,
 ) -> bool:
     if _check_link_matches_base_sha(check, base_sha):
         return True
-    evidence = check.get("baseBindingEvidence")
-    if not isinstance(evidence, dict):
-        return False
     if (
-        isinstance(pr_number, bool)
+        not isinstance(repo_slug, str)
+        or not repo_slug
+        or isinstance(pr_number, bool)
         or not isinstance(pr_number, int)
         or pr_number <= 0
+        or not isinstance(head_ref, str)
+        or not head_ref
         or not isinstance(head_sha, str)
         or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or not isinstance(base_ref, str)
+        or not base_ref
         or not isinstance(base_sha, str)
         or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
     ):
         return False
-    return (
+    evidence = check.get("baseBindingEvidence")
+    if isinstance(evidence, dict) and (
         evidence.get("name") == REGISTRY_FRESHNESS_CHECK_NAME
         and evidence.get("status") == "completed"
         and evidence.get("conclusion") == "success"
@@ -3132,6 +3255,32 @@ def _check_has_exact_registry_freshness_binding(
         and evidence.get("app_slug") == "github-actions"
         and evidence.get("external_id")
         == f"registry-freshness:{pr_number}:{head_sha}:{base_sha}"
+    ):
+        return True
+    workflow = check.get("workflowRunBindingEvidence")
+    if not isinstance(workflow, dict):
+        return False
+    if not (
+        workflow.get("source") == "github-actions-workflow-run"
+        and workflow.get("repository") == repo_slug
+        and workflow.get("event") == "pull_request_target"
+        and workflow.get("status") == "completed"
+        and workflow.get("conclusion") == "success"
+        and workflow.get("head_sha") in {head_sha, base_sha}
+        and workflow.get("path") == REGISTRY_FRESHNESS_WORKFLOW_PATH
+    ):
+        return False
+    pulls = workflow.get("pull_requests")
+    if not isinstance(pulls, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("number") == pr_number
+        and item.get("head_ref") == head_ref
+        and item.get("head_sha") == head_sha
+        and item.get("base_ref") == base_ref
+        and item.get("base_sha") == base_sha
+        for item in pulls
     )
 
 
@@ -3404,8 +3553,11 @@ def evaluate_review_gate(
                 blocking_checks.append(check)
             elif name in base_bound_check_names and _check_has_exact_registry_freshness_binding(
                 check,
+                repo_slug=repo_name,
                 pr_number=pr.get("number"),
+                head_ref=pr.get("headRefName"),
                 head_sha=pr.get("headRefOid"),
+                base_ref=pr.get("baseRefName"),
                 base_sha=current_base_sha,
             ):
                 base_bound_check_matches[name] = True
