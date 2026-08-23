@@ -65,6 +65,7 @@ def _state(*, actor: str = "chatgpt-codex-connector", merge_state: str = "CLEAN"
             "mergeStateStatus": merge_state,
             "mergeable": mergeable,
             "headRefOid": HEAD,
+            "baseRefName": "main",
             "baseRefOid": BASE,
             "changedFiles": 1,
             "additions": 1,
@@ -268,6 +269,100 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
                     f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
                     result["failures"],
                 )
+
+    def test_registry_freshness_accepts_exact_pull_request_target_workflow_run(self) -> None:
+        state, paths = _registry_state()
+        state["checks"].append(
+            {
+                "bucket": "pass",
+                "name": FRESHNESS,
+                "link": "https://github.com/heimgewebe/grabowski/actions/runs/32619059187/job/97144293316",
+                "workflowRunBindingEvidence": {
+                    "source": "github-actions-workflow-run",
+                    "repository": "heimgewebe/grabowski",
+                    "event": "pull_request_target",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "head_sha": HEAD,
+                    "path": pr_review_gate.REGISTRY_FRESHNESS_WORKFLOW_PATH,
+                    "pull_requests": [
+                        {"number": 58, "base_ref": "main", "base_sha": BASE}
+                    ],
+                },
+            }
+        )
+
+        result = pr_review_gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(reviewed_files=paths),
+            expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+        )
+
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["check_policy"]["base_bound_check_names"], [FRESHNESS])
+
+    def test_registry_freshness_workflow_run_fails_closed_on_wrong_identity(self) -> None:
+        good = {
+            "source": "github-actions-workflow-run",
+            "repository": "heimgewebe/grabowski",
+            "event": "pull_request_target",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": HEAD,
+            "path": pr_review_gate.REGISTRY_FRESHNESS_WORKFLOW_PATH,
+            "pull_requests": [{"number": 58, "base_ref": "main", "base_sha": BASE}],
+        }
+        cases = (
+            {**good, "repository": "other/repo"},
+            {**good, "event": "push"},
+            {**good, "status": "in_progress"},
+            {**good, "conclusion": "failure"},
+            {**good, "head_sha": "d" * 40},
+            {**good, "path": ".github/workflows/other.yml"},
+            {**good, "pull_requests": [{"number": 59, "base_ref": "main", "base_sha": BASE}]},
+            {**good, "pull_requests": [{"number": 58, "base_ref": "dev", "base_sha": BASE}]},
+            {**good, "pull_requests": [{"number": 58, "base_ref": "main", "base_sha": "e" * 40}]},
+        )
+        for workflow_evidence in cases:
+            with self.subTest(workflow_evidence=workflow_evidence):
+                state, paths = _registry_state()
+                state["checks"].append(
+                    {
+                        "bucket": "pass",
+                        "name": FRESHNESS,
+                        "link": "https://github.com/heimgewebe/grabowski/actions/runs/32619059187/job/97144293316",
+                        "workflowRunBindingEvidence": workflow_evidence,
+                    }
+                )
+                result = pr_review_gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(reviewed_files=paths),
+                    expected_check_names=("validate (3.10)", "validate (3.12)", FRESHNESS),
+                )
+                self.assertEqual(result["verdict"], "BLOCK")
+                self.assertIn(
+                    f"base-bound expected check(s) stale or unbound for current base: {FRESHNESS}",
+                    result["failures"],
+                )
+
+    def test_github_actions_run_id_is_repo_bound(self) -> None:
+        for link in (
+            "https://github.com/heimgewebe/bureau/actions/runs/32619059187",
+            "https://github.com/heimgewebe/bureau/actions/runs/32619059187/job/97144293316",
+        ):
+            self.assertEqual(
+                pr_review_gate._github_actions_run_id(link, repo_slug="heimgewebe/bureau"),
+                32619059187,
+            )
+        for link in (
+            "https://github.com/other/bureau/actions/runs/32619059187/job/97144293316",
+            "https://example.com/heimgewebe/bureau/actions/runs/32619059187/job/97144293316",
+            "https://github.com/heimgewebe/bureau/runs/97144293316",
+            "https://github.com/heimgewebe/bureau/actions/workflows/32619059187",
+        ):
+            self.assertIsNone(
+                pr_review_gate._github_actions_run_id(link, repo_slug="heimgewebe/bureau")
+            )
 
     def test_github_check_run_id_is_repo_bound(self) -> None:
         self.assertEqual(
