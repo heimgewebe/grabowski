@@ -119,6 +119,57 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
             ("test (3.10)", "test (3.11)", "test (3.12)", "test (3.13)"),
         )
 
+    def test_unparsed_validate_job_blocks_before_test_fallback(self) -> None:
+        workflow = """jobs:
+  validate:
+    strategy: {matrix: {python-version: ["3.11"]}}
+  test:
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+"""
+        with mock.patch.object(
+            pr_review_gate, "_required_check_catalog_text_at_revision", return_value=None
+        ), mock.patch.object(
+            pr_review_gate, "_workflow_text_at_revision", return_value=workflow
+        ):
+            with self.assertRaisesRegex(
+                pr_review_gate.GateInputError, "not unambiguously parseable"
+            ):
+                pr_review_gate.expected_check_names_for_repo(
+                    Path("/tmp"),
+                    repo_name="heimgewebe/example",
+                    head_sha=HEAD,
+                    base_sha=BASE,
+                )
+
+    def test_validate_matrix_alias_blocks_before_test_fallback(self) -> None:
+        workflow = """x-python-matrix: &python-matrix
+  python-version: ["3.11"]
+jobs:
+  validate:
+    strategy:
+      matrix: *python-matrix
+  test:
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+"""
+        with mock.patch.object(
+            pr_review_gate, "_required_check_catalog_text_at_revision", return_value=None
+        ), mock.patch.object(
+            pr_review_gate, "_workflow_text_at_revision", return_value=workflow
+        ):
+            with self.assertRaisesRegex(
+                pr_review_gate.GateInputError, "not unambiguously parseable"
+            ):
+                pr_review_gate.expected_check_names_for_repo(
+                    Path("/tmp"),
+                    repo_name="heimgewebe/example",
+                    head_sha=HEAD,
+                    base_sha=BASE,
+                )
+
     def test_validate_job_remains_preferred_over_test_job(self) -> None:
         workflow = """jobs:
   test:

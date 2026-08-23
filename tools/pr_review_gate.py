@@ -3106,35 +3106,38 @@ def _python_versions_from_validate_workflow(
         validate_block, key="strategy", parent_indent=job_indent
     )
     if strategy_entry is None or strategy_entry[1]:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     strategy_block, _ = strategy_entry
     strategy_indent = _direct_child_indent(strategy_block, job_indent)
     if strategy_indent is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     matrix_entry = _mapping_child_block(
         strategy_block, key="matrix", parent_indent=strategy_indent - 1
     )
     if matrix_entry is None or matrix_entry[1]:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     matrix_block, _ = matrix_entry
     matrix_indent = _direct_child_indent(matrix_block, strategy_indent)
     if matrix_indent is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     versions_entry = _mapping_child_block(
         matrix_block, key="python-version", parent_indent=matrix_indent - 1
     )
     if versions_entry is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     version_block, inline = versions_entry
     if inline.startswith("[") and inline.endswith("]"):
-        return tuple(
+        values = tuple(
             value.strip().strip("\"'")
             for value in inline[1:-1].split(",")
             if value.strip().strip("\"'")
         )
+        if not values:
+            raise GateInputError(f"target {job_key} job Python matrix is empty")
+        return values
     version_indent = _direct_child_indent(version_block, matrix_indent)
     if version_indent is None:
-        return ()
+        raise GateInputError(f"target {job_key} job Python matrix is not unambiguously parseable")
     values: list[str] = []
     for line in version_block:
         if not line.strip() or line.lstrip().startswith("#"):
@@ -3149,6 +3152,8 @@ def _python_versions_from_validate_workflow(
         if item is None:
             return ()
         values.append(item.group("version"))
+    if not values:
+        raise GateInputError(f"target {job_key} job Python matrix is empty")
     return tuple(values)
 
 
