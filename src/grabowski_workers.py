@@ -2845,6 +2845,21 @@ function semanticLayoutBoundsVisibility(bounds) {
   return {ok: true, visible: parsed.box.width >= 0.5 && parsed.box.height >= 0.5};
 }
 
+function semanticLayoutBoundsWithinDocument(bounds, document) {
+  const candidate = semanticLayoutBoundsBox(bounds);
+  const width = Number(document && document.contentWidth);
+  const height = Number(document && document.contentHeight);
+  if (!candidate.ok || !Number.isFinite(width) || !Number.isFinite(height) ||
+      width < 0.5 || height < 0.5 || width > 1000000000 || height > 1000000000) {
+    return {ok: false, visible: false};
+  }
+  return {
+    ok: true,
+    visible: candidate.box.right > 0 && candidate.box.bottom > 0 &&
+      candidate.box.left < width && candidate.box.top < height,
+  };
+}
+
 function semanticOverflowClipping(overflowText) {
   const normalized = overflowText.trim().toLowerCase();
   if (normalized === 'visible') return {ok: true, clips: false};
@@ -3187,6 +3202,11 @@ function semanticSnapshotEmbeddingChainVisible(documents, strings, targetDocumen
     const geometry = semanticLayoutBoundsVisibility(layoutInfo.layoutBounds[ownerLayoutIndex]);
     if (!geometry.ok) return {ok: false, visible: false};
     if (!geometry.visible) return {ok: true, visible: false};
+    const documentBounds = semanticLayoutBoundsWithinDocument(
+      layoutInfo.layoutBounds[ownerLayoutIndex], parentDocument
+    );
+    if (!documentBounds.ok) return {ok: false, visible: false};
+    if (!documentBounds.visible) return {ok: true, visible: false};
     const clipping = semanticSnapshotBoundsWithinClippingAncestors(
       parentDocument, strings, owner.nodeIndex, layoutInfo.layoutByNode,
       layoutInfo.layoutBounds[ownerLayoutIndex]
@@ -3383,6 +3403,9 @@ function semanticVisibleTextFromSnapshot(snapshot, backendNodeId) {
     const renderedGeometry = semanticLayoutBoundsVisibility(layoutBounds[layoutIndex]);
     if (!renderedGeometry.ok) return {ok: false, name: ''};
     if (!renderedGeometry.visible) continue;
+    const documentBounds = semanticLayoutBoundsWithinDocument(layoutBounds[layoutIndex], document);
+    if (!documentBounds.ok) return {ok: false, name: ''};
+    if (!documentBounds.visible) continue;
     const textPaint = semanticTextPaintVisibility(strings, layoutStyles[layoutIndex]);
     if (!textPaint.ok) return {ok: false, name: ''};
     if (!textPaint.visible) continue;
