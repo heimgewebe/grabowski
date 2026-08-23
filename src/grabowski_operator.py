@@ -1569,7 +1569,7 @@ def _managed_runtime_environment(
     if not runtime_root.is_absolute() or ".." in runtime_root.parts:
         raise RuntimeError("XDG_RUNTIME_DIR must be an absolute normalized path")
     normalized_runtime_root = Path(os.path.normpath(raw_runtime_root))
-    if normalized_runtime_root == Path("/"):
+    if normalized_runtime_root.resolve(strict=False) == Path("/"):
         raise RuntimeError("XDG_RUNTIME_DIR may not be the filesystem root")
     return {
         "XDG_RUNTIME_DIR": str(normalized_runtime_root),

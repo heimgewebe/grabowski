@@ -23,6 +23,7 @@ Environment=HEIM_NODE_RUNTIME_ENV_DIR=/run/user/1000/grabowski-node-runtime-env
 Environment=UV_CACHE_DIR=/run/user/1000/grabowski-uv-cache
 RuntimeDirectory=user/1000/grabowski-node-runtime-env user/1000/grabowski-uv-cache
 RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=PYTHONUNBUFFERED=1
 NoNewPrivileges=yes

@@ -38,6 +38,7 @@ class DurableSystemdContractTests(unittest.TestCase):
             text,
         )
         self.assertIn("RuntimeDirectoryMode=0700", text)
+        self.assertIn("RuntimeDirectoryPreserve=restart", text)
         self.assertNotIn(
             "Environment=HEIM_NODE_RUNTIME_ENV_DIR=/home/alex/.local/state/grabowski/node-runtime-env",
             text,

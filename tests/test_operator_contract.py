@@ -238,8 +238,11 @@ class OperatorContractTests(unittest.TestCase):
             operator._managed_runtime_environment({"UV_CACHE_DIR": "/stale/uv"})
         with self.assertRaisesRegex(RuntimeError, "absolute normalized path"):
             operator._managed_runtime_environment({"XDG_RUNTIME_DIR": "relative/runtime"})
-        with self.assertRaisesRegex(RuntimeError, "filesystem root"):
-            operator._managed_runtime_environment({"XDG_RUNTIME_DIR": "/"})
+        for root in ("/", "//"):
+            with self.subTest(root=root), self.assertRaisesRegex(
+                RuntimeError, "filesystem root"
+            ):
+                operator._managed_runtime_environment({"XDG_RUNTIME_DIR": root})
 
     def test_safe_environment_overrides_stale_managed_runtime_paths(self) -> None:
         operator = _load_operator_module()
