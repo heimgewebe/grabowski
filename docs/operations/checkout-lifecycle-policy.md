@@ -20,12 +20,12 @@ Before a managed worktree is created, the caller must provide and Grabowski must
 
 Limits apply to explicitly managed lifecycle state for one Git common directory, but the two phases have different admission semantics:
 
-- at most **8 concurrently retained active** managed checkouts;
-- at most **4 completed-retained** managed checkouts.
+- at most **8 capacity-consuming active** managed checkouts at once;
+- **4 completed-retained** managed checkouts as an advisory hygiene threshold, not an admission ceiling.
 
 For active creation admission, an `active` binding reserves one of the eight global slots only while its `retention_until_unix` is still effective. An expired active row remains durable lifecycle and hygiene evidence and may still point at a present or dirty checkout, but it no longer consumes global creation concurrency. Expiry therefore grants **no** terminality, cleanup, archive, deletion, branch reuse or checkout-path reuse authority. Exact target-path, branch, Git-worktree, owner and identity conflicts remain independent fail-closed gates. Renewing or reactivating an expired active binding must pass the current active-capacity check, so a stale row cannot bypass a genuinely full set of unexpired active slots.
 
-The completed-retained limit remains row-based. A completed-retained transition that would exceed it fails closed and preserves the checkout in its prior active state. Neither limit counts an unmanaged foreign checkout as owned or authorizes deleting work merely because capacity is exhausted.
+The completed-retained threshold remains row-based but is advisory. Crossing it reports preservation pressure for later hygiene; it does **not** keep an otherwise safely terminal checkout in `active`, because retained evidence is not execution concurrency. The transition still requires its exact owner, branch/head and clean-state invariants, preserves the retention record and checkout, and grants no cleanup or deletion authority. The active admission limit likewise never counts an unmanaged foreign checkout as owned or authorizes deleting work merely because capacity is exhausted.
 
 ## Completion and immediate cleanup eligibility
 
