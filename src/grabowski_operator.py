@@ -1547,6 +1547,39 @@ def _limit(text: str, limit: int) -> tuple[str, bool]:
     return clipped + "\n<OUTPUT_TRUNCATED>", True
 
 
+MANAGED_NODE_RUNTIME_DIRECTORY_NAME = "grabowski-node-runtime-env"
+MANAGED_UV_CACHE_DIRECTORY_NAME = "grabowski-uv-cache"
+
+
+def _managed_runtime_environment(
+    source: dict[str, str] | None = None,
+) -> dict[str, str]:
+    environment = os.environ if source is None else source
+    raw_runtime_root = environment.get("XDG_RUNTIME_DIR", "").strip()
+    if not raw_runtime_root:
+        if any(
+            environment.get(key, "").strip()
+            for key in ("HEIM_NODE_RUNTIME_ENV_DIR", "UV_CACHE_DIR")
+        ):
+            raise RuntimeError(
+                "managed runtime paths require an explicit XDG_RUNTIME_DIR"
+            )
+        return {}
+    runtime_root = Path(raw_runtime_root)
+    if not runtime_root.is_absolute() or ".." in runtime_root.parts:
+        raise RuntimeError("XDG_RUNTIME_DIR must be an absolute normalized path")
+    normalized_runtime_root = Path(os.path.normpath(raw_runtime_root))
+    if normalized_runtime_root.resolve(strict=False) == Path("/"):
+        raise RuntimeError("XDG_RUNTIME_DIR may not be the filesystem root")
+    return {
+        "XDG_RUNTIME_DIR": str(normalized_runtime_root),
+        "HEIM_NODE_RUNTIME_ENV_DIR": str(
+            normalized_runtime_root / MANAGED_NODE_RUNTIME_DIRECTORY_NAME
+        ),
+        "UV_CACHE_DIR": str(normalized_runtime_root / MANAGED_UV_CACHE_DIRECTORY_NAME),
+    }
+
+
 def _safe_environment() -> dict[str, str]:
     if _trusted_owner_mode():
         environment = dict(os.environ)
@@ -1557,6 +1590,7 @@ def _safe_environment() -> dict[str, str]:
             if any(part in upper for part in SENSITIVE_ENV_PARTS):
                 continue
             environment[key] = value
+    environment.update(_managed_runtime_environment(environment))
     environment["GRABOWSKI_EVIDENCE_ROOT"] = str(EVIDENCE_ROOT)
     environment["GRABOWSKI_TRUSTED_OWNER"] = "1" if _trusted_owner_mode() else "0"
     return environment
@@ -4314,6 +4348,7 @@ def _start_job(
         f"--property=StandardError=append:{stderr_path}",
     ]
     environment = {
+        **_managed_runtime_environment(),
         "GRABOWSKI_JOB_ID": finalization_contract["job_id"],
         "GRABOWSKI_JOB_UNIT": finalization_contract["unit"],
         "GRABOWSKI_JOB_ARGV_SHA256": finalization_contract["argv_sha256"],

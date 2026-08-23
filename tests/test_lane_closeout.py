@@ -194,6 +194,22 @@ class LaneCloseoutTests(unittest.TestCase):
         )
         self.assertEqual(result["closeout_state"], "no_change_proven")
 
+    def test_no_change_proof_requires_concrete_head(self) -> None:
+        result = closeout.classify(
+            self.observation(
+                head_sha=None,
+                remote_head_sha=None,
+                no_change_proven=True,
+            )
+        )
+        self.assertEqual(result["phase"], "rescue_required")
+        self.assertIsNone(result["closeout_state"])
+        self.assertFalse(result["lease_release_ready"])
+        self.assertIn(
+            "refresh_git_task_process_and_pr_readback",
+            result["recovery_actions"],
+        )
+
     def test_deployment_requires_exact_head_binding(self) -> None:
         success = closeout.classify(
             self.observation(
@@ -421,8 +437,48 @@ class LaneCloseoutTests(unittest.TestCase):
         )
         self.assertEqual(result["audit_record_sha256"], "e" * 64)
         self.assertRegex(result["assessment_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(result["terminal_head_sha"], HEAD)
+        self.assertEqual(records[0]["terminal_head_sha"], HEAD)
         self.assertIn("workspace_cleanup_authority", result["does_not_establish"])
         self.assertEqual(records[0]["operation"], "lane-closeout-assessment")
+
+    def test_nonterminal_assessment_does_not_bind_checkout_head(self) -> None:
+        assessment = closeout.assess(
+            self.observation(writer_state="running", task_active=True),
+            observed_at_unix=200,
+        )
+        self.assertEqual(assessment["phase"], "active")
+        self.assertIsNone(assessment["terminal_head_sha"])
+
+    def test_terminal_assessment_validator_preserves_legacy_receipts(self) -> None:
+        assessment = closeout.assess(
+            self.observation(pr_number=631, pr_state="open", pr_head_sha=HEAD),
+            observed_at_unix=200,
+        )
+        legacy = dict(assessment)
+        legacy.pop("terminal_head_sha")
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key not in {"assessment_sha256", "audit_record_sha256", "does_not_establish"}
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        self.assertEqual(closeout.validate_terminal_assessment(legacy), legacy)
+
+    def test_terminal_assessment_validator_rejects_invalid_bound_head(self) -> None:
+        assessment = closeout.assess(
+            self.observation(pr_number=631, pr_state="open", pr_head_sha=HEAD),
+            observed_at_unix=200,
+        )
+        assessment["terminal_head_sha"] = "not-a-git-object"
+        material = {
+            key: value
+            for key, value in assessment.items()
+            if key not in {"assessment_sha256", "audit_record_sha256", "does_not_establish"}
+        }
+        assessment["assessment_sha256"] = closeout.sha256_json(material)
+        with self.assertRaisesRegex(closeout.LaneCloseoutError, "head is invalid"):
+            closeout.validate_terminal_assessment(assessment)
 
     def test_terminal_assessment_validator_rejects_tampering(self) -> None:
         assessment = closeout.assess(

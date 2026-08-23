@@ -98,6 +98,11 @@ def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
         raise LaneCloseoutError("terminal closeout assessment must be a mapping")
     if value.get("phase") != "terminal" or value.get("closeout_state") not in TERMINAL_CLOSEOUT_STATES:
         raise LaneCloseoutError("lane closeout assessment is not terminal")
+    terminal_head_sha = value.get("terminal_head_sha")
+    if terminal_head_sha is not None and (
+        not isinstance(terminal_head_sha, str) or SHA.fullmatch(terminal_head_sha) is None
+    ):
+        raise LaneCloseoutError("terminal closeout assessment head is invalid")
     supplied = value.get("assessment_sha256")
     material = {
         key: item for key, item in value.items()
@@ -453,6 +458,7 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
         data["no_change_proven"] is True
         and data["git_dirty"] is False
         and data["ahead_commits"] == 0
+        and head is not None
         and (head == data["base_revision"] or head == remote)
     )
     if no_change_complete:
@@ -512,6 +518,9 @@ def assess(
         "kind": KIND,
         "observed_at_unix": observed_at,
         "observation_sha256": sha256_json(data),
+        "terminal_head_sha": (
+            data["head_sha"] if assessment.get("phase") == "terminal" else None
+        ),
         **assessment,
     }
     assessment_sha256 = sha256_json(material)
