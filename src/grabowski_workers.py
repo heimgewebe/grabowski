@@ -2886,7 +2886,7 @@ function semanticCssColorVisibility(colorText) {
 }
 
 function semanticTextPaintVisibility(strings, styleIndexes) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 10) {
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 11) {
     return {ok: false, visible: false};
   }
   const colorText = semanticSnapshotString(strings, styleIndexes[8], 256);
@@ -2900,7 +2900,7 @@ function semanticTextPaintVisibility(strings, styleIndexes) {
 }
 
 function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true) {
-  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 10 ||
+  if (!Array.isArray(styleIndexes) || styleIndexes.length !== 11 ||
       typeof checkVisibility !== 'boolean') {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
@@ -2912,9 +2912,10 @@ function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true)
   const clipText = semanticSnapshotString(strings, styleIndexes[5], 512);
   const overflowXText = semanticSnapshotString(strings, styleIndexes[6], 64);
   const overflowYText = semanticSnapshotString(strings, styleIndexes[7], 64);
+  const maskImageText = semanticSnapshotString(strings, styleIndexes[10], 2048);
   if (visibility === null || opacityText === null || contentVisibility === null ||
       filterText === null || clipPathText === null || clipText === null ||
-      overflowXText === null || overflowYText === null) {
+      overflowXText === null || overflowYText === null || maskImageText === null) {
     return {ok: false, visible: false, clipsX: true, clipsY: true};
   }
   const overflowX = semanticOverflowClipping(overflowXText);
@@ -2926,6 +2927,7 @@ function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true)
   const normalizedContentVisibility = contentVisibility.trim().toLowerCase();
   const normalizedClipPath = clipPathText.trim().toLowerCase();
   const normalizedClip = clipText.trim().toLowerCase();
+  const normalizedMaskImage = maskImageText.trim().toLowerCase();
   const opacity = Number(opacityText.trim());
   if (!Number.isFinite(opacity)) {
     return {ok: false, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
@@ -2938,8 +2940,11 @@ function semanticLayoutVisibility(strings, styleIndexes, checkVisibility = true)
   // retaining normal layout bounds.  The semantic fallback cannot safely
   // prove partial paint visibility from DOMSnapshot alone, so fail closed for
   // any explicit clip-path / legacy clip rather than publishing hidden text.
+  if (!normalizedMaskImage) {
+    return {ok: false, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
+  }
   if ((normalizedClipPath && normalizedClipPath !== 'none') ||
-      (normalizedClip && normalizedClip !== 'auto')) {
+      (normalizedClip && normalizedClip !== 'auto') || normalizedMaskImage !== 'none') {
     return {ok: true, visible: false, clipsX: overflowX.clips, clipsY: overflowY.clips};
   }
   const filterVisibility = semanticFilterOpacityVisibility(filterText);
@@ -3278,7 +3283,7 @@ async function captureSemanticVisibleSnapshot() {
       return {ok: false, snapshot: null};
     }
     const snapshot = await call('DOMSnapshot.captureSnapshot', {
-      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y', 'color', '-webkit-text-fill-color'],
+      computedStyles: ['visibility', 'opacity', 'content-visibility', 'filter', 'clip-path', 'clip', 'overflow-x', 'overflow-y', 'color', '-webkit-text-fill-color', 'mask-image'],
       includePaintOrder: false,
       includeDOMRects: false,
     });
