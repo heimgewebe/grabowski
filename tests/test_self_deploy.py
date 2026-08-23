@@ -2154,7 +2154,11 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         process = Mock()
         process.wait.return_value = 0
         bindings = {name: "secret-binding" for name in RUNNER.FINALIZATION_ENV.values()}
-        with patch.dict(os.environ, bindings, clear=False), patch.object(
+        with tempfile.TemporaryDirectory() as temporary_parent, patch.dict(
+            os.environ, bindings, clear=False
+        ), patch.object(
+            RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
+        ), patch.object(
             RUNNER.subprocess, "Popen", return_value=process
         ) as popen:
             RUNNER.run_streamed(
@@ -2166,6 +2170,27 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         environment = popen.call_args.kwargs["env"]
         for name in bindings:
             self.assertNotIn(name, environment)
+        self.assertEqual(environment["TMPDIR"], environment["TMP"])
+        self.assertEqual(environment["TMPDIR"], environment["TEMP"])
+        self.assertEqual(Path(environment["TMPDIR"]).parent, Path(temporary_parent))
+        self.assertFalse(Path(environment["TMPDIR"]).exists())
+
+    def test_validation_temp_parent_rejects_git_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".git").mkdir()
+            runtime_root = root / "runtime"
+            runtime_root.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "XDG_RUNTIME_DIR": str(runtime_root),
+                    RUNNER.FINALIZATION_ENV["finalization"]: "",
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Git worktree"):
+                    RUNNER._validation_temp_parent()
 
     def test_sidecar_reconciliation_applies_checks_and_hash_binds_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
