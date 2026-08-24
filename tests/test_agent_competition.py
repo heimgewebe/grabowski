@@ -227,7 +227,7 @@ class AgentCompetitionTests(unittest.TestCase):
     def _route_contract(self, route_id: str, *, paid: bool = False) -> dict:
         if route_id == "codex-sol-high":
             contract = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "codex",
@@ -243,7 +243,7 @@ class AgentCompetitionTests(unittest.TestCase):
             }
         elif route_id == "antigravity-gemini-flash-medium":
             contract = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "antigravity",
@@ -259,7 +259,7 @@ class AgentCompetitionTests(unittest.TestCase):
             }
         elif route_id == "grok-4.6-review-high":
             contract = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "grok",
@@ -275,7 +275,7 @@ class AgentCompetitionTests(unittest.TestCase):
             }
         elif route_id == "opencode-deepseek-v4-flash-free":
             contract = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "opencode",
@@ -294,7 +294,7 @@ class AgentCompetitionTests(unittest.TestCase):
             }
         elif route_id == "opencode-openrouter-ox-alpha-review-preview":
             contract = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "opencode",
@@ -313,7 +313,7 @@ class AgentCompetitionTests(unittest.TestCase):
             }
         elif route_id == "openhands-always-approve":
             contract = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "openhands",
@@ -336,7 +336,7 @@ class AgentCompetitionTests(unittest.TestCase):
                     "paid-only route requires explicit paid execution authorization"
                 )
             contract = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
                 "harness": "claude",
@@ -1491,6 +1491,47 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertFalse(packet["budget_contract"]["paid_execution_authorized"])
         self.assertEqual(result["route_id"], "codex-sol-high")
         start.assert_called_once()
+
+    def test_legacy_v1_codexr_receipt_remains_readable(self) -> None:
+        contract = self._route_contract("codex-sol-high")
+        contract["schema_version"] = 1
+        contract["argv_prefix"] = ["codexr", "architecture"]
+        contract["route_contract_sha256"] = competition._sha256_json(
+            {key: value for key, value in contract.items() if key != "route_contract_sha256"}
+        )
+        self.assertEqual(competition._validate_route_contract(contract), contract)
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "advisory_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-codex-legacy-receipt"),
+            ),
+        ):
+            started = competition.grabowski_agent_competition_start(
+                request_id="codex-legacy-route-receipt",
+                provider="codex",
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Read historical contrast result",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id="codex-sol-high",
+            )
+        self._write_receipt(started["competition_id"], changed_paths=[], risks=[], tests=[])
+        manifest = competition._validated_manifest(started["competition_id"])
+        receipt = competition._receipt(started["competition_id"], manifest)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["route_contract"], contract)
+        self.assertEqual(receipt["command_shape"][:3], ["codexr", "architecture", "exec"])
 
     def test_route_bound_codex_receipt_preserves_route_and_zero_budget_binding(self) -> None:
         contract = self._route_contract("codex-sol-high")

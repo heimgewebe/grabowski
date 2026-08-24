@@ -116,7 +116,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 else ["openai-agentic"]
             )
             route = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "catalog_sha256": "9" * 64,
                 "route_id": route_id,
                 "harness": provider,
@@ -185,6 +185,29 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             "confidence": "medium",
         }
 
+
+    def test_legacy_v1_codexr_contract_remains_readable_but_v2_rejects_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo = root / "repo"
+            repo.mkdir()
+            packet_path = self._packet(root, repo, provider="codex", schema_version=3)
+            packet = json.loads(packet_path.read_text())
+        legacy = dict(packet["route_contract"])
+        legacy["schema_version"] = 1
+        legacy["argv_prefix"] = ["codexr", "architecture"]
+        legacy["route_contract_sha256"] = candidate_tool.sha256_json(
+            {key: value for key, value in legacy.items() if key != "route_contract_sha256"}
+        )
+        self.assertEqual(candidate_tool.validate_route_contract(legacy), legacy)
+
+        current = dict(legacy)
+        current["schema_version"] = 2
+        current["route_contract_sha256"] = candidate_tool.sha256_json(
+            {key: value for key, value in current.items() if key != "route_contract_sha256"}
+        )
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "route contract semantics are invalid"):
+            candidate_tool.validate_route_contract(current)
 
     def test_route_bound_codex_command_uses_native_cli_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -773,6 +773,7 @@ class CodingAgentRouterTests(unittest.TestCase):
 
     def test_contrast_execution_contract_enforces_fable_paid_boundary(self) -> None:
         codex = router.contrast_route_execution_contract("codex-sol-high")
+        self.assertEqual(codex["schema_version"], 2)
         self.assertEqual(codex["harness"], "codex")
         self.assertEqual(codex["argv_prefix"], ["codex", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"'])
         self.assertFalse(codex["paid_only"])

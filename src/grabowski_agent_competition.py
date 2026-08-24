@@ -272,8 +272,15 @@ def _validate_route_contract(value: Any) -> dict[str, Any]:
         raise AgentCompetitionError("route contract shape is invalid")
     observed = value["route_contract_sha256"]
     unsigned = {key: item for key, item in value.items() if key != "route_contract_sha256"}
+    legacy_codexr = (
+        value["schema_version"] == 1
+        and value["harness"] == "codex"
+        and isinstance(value["argv_prefix"], list)
+        and bool(value["argv_prefix"])
+        and value["argv_prefix"][0] == "codexr"
+    )
     if (
-        value["schema_version"] != 1
+        value["schema_version"] not in (1, 2)
         or not isinstance(observed, str)
         or SHA256_RE.fullmatch(observed) is None
         or observed != _sha256_json(unsigned)
@@ -289,7 +296,10 @@ def _validate_route_contract(value: Any) -> dict[str, Any]:
         or not isinstance(value["argv_prefix"], list)
         or not value["argv_prefix"]
         or any(not isinstance(item, str) or not item for item in value["argv_prefix"])
-        or value["argv_prefix"][0] != value["harness_binary"]
+        or (
+            value["argv_prefix"][0] != value["harness_binary"]
+            and not legacy_codexr
+        )
         or not isinstance(value["quota_pools"], list)
         or not value["quota_pools"]
         or any(not isinstance(item, str) or not item for item in value["quota_pools"])
@@ -298,7 +308,7 @@ def _validate_route_contract(value: Any) -> dict[str, Any]:
         or value["automatic_patch_apply"] is not False
     ):
         raise AgentCompetitionError("route contract semantics are invalid")
-    if value["harness"] == "codex":
+    if value["schema_version"] == 2 and value["harness"] == "codex":
         prefix = value["argv_prefix"]
         try:
             model_index = prefix.index("--model")
