@@ -721,6 +721,168 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             effectiveness.record_review_classification(parameters)
 
 
+    def test_review_records_uses_effectiveness_index_beyond_legacy_scan_bound(self) -> None:
+        evaluation = "a" * 64
+        decision_ref = _ref("1")
+        outcome_ref = _ref("2")
+        indexed = [
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "1",
+                task_id="task-large-audit-review",
+                final_decision="allow",
+                reposkop_cohort="prospective_control",
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "2",
+                task_id="task-large-audit-review",
+                terminal_state="completed",
+            ),
+        ]
+        source = {
+            "chain_content_sha256": "c" * 64,
+            "chain_materialization_sha256": "d" * 64,
+            "total_records": effectiveness.MAX_REVIEW_SCAN_RECORDS + 1,
+            "index_complete": True,
+            "since_truncated": False,
+            "incremental_scanned_records": 0,
+        }
+
+        with patch.object(
+            effectiveness,
+            "_durable_effectiveness_records",
+            return_value=(indexed, source),
+        ), patch.object(
+            effectiveness.audit_query,
+            "capture_verified_audit_snapshot",
+            side_effect=AssertionError("full audit fallback must not run"),
+        ):
+            records, review_source = effectiveness._review_records(
+                evaluation=evaluation,
+                evidence_refs={decision_ref, outcome_ref},
+            )
+
+        self.assertEqual(
+            {record["_audit_ref"] for record in records},
+            {decision_ref, outcome_ref},
+        )
+        self.assertEqual(
+            review_source["lookup_mode"],
+            "verified_incremental_effectiveness_index",
+        )
+        self.assertFalse(review_source["scan_truncated"])
+        self.assertGreater(
+            review_source["total_records"], effectiveness.MAX_REVIEW_SCAN_RECORDS
+        )
+
+    def test_review_records_uses_retained_scoped_index_after_global_retention(self) -> None:
+        evaluation = "b" * 64
+        decision_ref = _ref("d")
+        outcome_ref = _ref("e")
+        indexed = [
+            _event(
+                "reposkop-evaluation-requested", evaluation, "1",
+                task_id="task-retained",
+            ),
+            _event(
+                "reposkop-evaluation-completed", evaluation, "2",
+                task_id="task-retained", requested_audit_ref=_ref("1"),
+            ),
+            _event(
+                "reposkop-decision-applied", evaluation, "d",
+                task_id="task-retained", final_decision="allow",
+                completed_audit_ref=_ref("2"),
+            ),
+            _event(
+                "reposkop-task-outcome-observed", evaluation, "e",
+                task_id="task-retained", terminal_state="completed",
+            ),
+        ]
+        source = {
+            "chain_content_sha256": "c" * 64,
+            "chain_materialization_sha256": "d" * 64,
+            "total_records": effectiveness.MAX_REVIEW_SCAN_RECORDS + 100,
+            "index_complete": True,
+            "since_truncated": True,
+            "retention_truncated": True,
+            "incremental_scanned_records": 0,
+        }
+        with patch.object(
+            effectiveness, "_durable_effectiveness_records",
+            return_value=(indexed, source),
+        ), patch.object(
+            effectiveness.audit_query, "capture_verified_audit_snapshot",
+            side_effect=AssertionError("scoped retained evaluation must not fall back"),
+        ):
+            records, review_source = effectiveness._review_records(
+                evaluation=evaluation, evidence_refs={decision_ref, outcome_ref}
+            )
+        self.assertEqual(len(records), 4)
+        self.assertTrue(review_source["scope_complete"])
+        self.assertTrue(review_source["retention_truncated"])
+        self.assertFalse(review_source["scan_truncated"])
+
+    def test_review_records_cold_index_uses_bounded_reverse_scope_on_large_audit(self) -> None:
+        evaluation = "c" * 64
+        decision_ref = _ref("d")
+        outcome_ref = _ref("e")
+        raw_records = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": evaluation, "task_id": "task-cold",
+                "record_sha256": "1" * 64,
+            },
+            {
+                "operation": "reposkop-evaluation-completed",
+                "evaluation_id": evaluation, "task_id": "task-cold",
+                "requested_audit_ref": _ref("1"), "record_sha256": "2" * 64,
+            },
+            {
+                "operation": "reposkop-decision-applied",
+                "evaluation_id": evaluation, "task_id": "task-cold",
+                "final_decision": "allow", "completed_audit_ref": _ref("2"),
+                "record_sha256": "d" * 64,
+            },
+            {
+                "operation": "reposkop-task-outcome-observed",
+                "evaluation_id": evaluation, "task_id": "task-cold",
+                "terminal_state": "completed", "record_sha256": "e" * 64,
+            },
+        ]
+        payload = b"".join(
+            (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+            for record in raw_records
+        )
+        segment = types.SimpleNamespace(records=len(raw_records))
+        snapshot = types.SimpleNamespace(
+            segments=(segment,),
+            total_records=effectiveness.MAX_REVIEW_SCAN_RECORDS + 1,
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with patch.object(
+            effectiveness, "_durable_effectiveness_records",
+            return_value=([], {"index_complete": False}),
+        ), patch.object(
+            effectiveness.audit_query, "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ), patch.object(
+            effectiveness.audit_query, "_load_snapshot_segment", return_value=payload,
+        ):
+            records, review_source = effectiveness._review_records(
+                evaluation=evaluation, evidence_refs={decision_ref, outcome_ref}
+            )
+        self.assertEqual(
+            review_source["lookup_mode"], "verified_bounded_reverse_review_scope"
+        )
+        self.assertEqual(review_source["scanned_records"], 4)
+        self.assertTrue(review_source["scope_complete"])
+        self.assertFalse(review_source["scan_truncated"])
+        self.assertEqual(len(records), 4)
+
     def test_projection_separates_verified_blocked_missing_and_legacy(self) -> None:
         verified = "a" * 64
         blocked = "b" * 64
