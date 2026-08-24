@@ -641,14 +641,13 @@ class TaskTests(unittest.TestCase):
         self.assertIn("GRABOWSKI_TASK_OUTPUT_TRUNCATED stderr", stderr)
 
     def test_capture_wrapper_treats_direct_rg_no_match_as_success(self) -> None:
-        haystack = self.root / "haystack.txt"
-        haystack.write_text("present\n", encoding="utf-8")
+        fake_rg = self.root / "rg"
+        fake_rg.write_text("#!/usr/bin/python3\nraise SystemExit(1)\n", encoding="utf-8")
+        fake_rg.chmod(0o755)
         record = {
             "task_id": "9" * 24,
             "attempt": 1,
-            "argv_json": json.dumps(
-                ["rg", "--fixed-strings", "definitely-absent", str(haystack)]
-            ),
+            "argv_json": json.dumps([str(fake_rg)]),
         }
         completed = subprocess.run(
             tasks._task_output_capture_argv(record),
@@ -661,6 +660,23 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(completed.stdout, "")
         self.assertEqual(completed.stderr, "")
+
+    def test_capture_wrapper_does_not_mask_missing_rg_executable(self) -> None:
+        missing_rg = self.root / "missing" / "rg"
+        record = {
+            "task_id": "a" * 24,
+            "attempt": 1,
+            "argv_json": json.dumps([str(missing_rg)]),
+        }
+        completed = subprocess.run(
+            tasks._task_output_capture_argv(record),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
 
     def test_capture_wrapper_refuses_existing_output_directory_before_child(self) -> None:
         side_effect = self.root / "child-started"
