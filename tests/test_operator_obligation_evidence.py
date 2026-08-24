@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -176,6 +179,230 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual("unsupported", result["acceptance"][0]["classification"])
         self.assertFalse(result["fully_verified"])
 
+    def test_free_form_reference_never_self_attests(self) -> None:
+        status = self._status(
+            stored_evidence=[
+                self._stored_evidence(
+                    source="github",
+                    reference="PR #1 looked green when I checked it",
+                )
+            ]
+        )
+        observations = evidence.collect_trusted_observations(status)
+
+        self.assertEqual({}, observations)
+        result = evidence.assess_status(status, observations=observations)
+        self.assertEqual("unverified", result["acceptance"][0]["classification"])
+
+    def test_github_adapter_binds_exact_merged_pr_and_check_count(self) -> None:
+        parsed = {
+            "repo": "heimgewebe/grabowski",
+            "pr": 919,
+            "head": "1" * 40,
+            "base": "2" * 40,
+            "merge": "3" * 40,
+            "passed": 2,
+            "total": 2,
+        }
+        reference = (
+            "github-pr:heimgewebe/grabowski#919@"
+            + parsed["head"]
+            + ":base="
+            + parsed["base"]
+            + ":merge="
+            + parsed["merge"]
+            + ":checks=2/2-success"
+        )
+        digest = evidence._sha256(evidence._github_observation_material(parsed))
+        payload = {
+            "state": "MERGED",
+            "isDraft": False,
+            "baseRefOid": parsed["base"],
+            "headRefOid": parsed["head"],
+            "mergeCommit": {"oid": parsed["merge"]},
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {"__typename": "StatusContext", "state": "SUCCESS"},
+            ],
+        }
+        stored = self._stored_evidence(
+            source="github", reference=reference, sha256=digest
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            observation = evidence._github_observation(stored)
+
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual("verified", observation["status"])
+        self.assertEqual(digest, observation["sha256"])
+
+        payload["headRefOid"] = "4" * 40
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            mismatch = evidence._github_observation(stored)
+        assert mismatch is not None
+        self.assertEqual("mismatch", mismatch["status"])
+
+    def test_git_adapter_hashes_exact_commit_payload(self) -> None:
+        commit_payload = b"tree " + b"a" * 40 + b"\n\nmessage\n"
+        digest = hashlib.sha256(commit_payload).hexdigest()
+        stored = self._stored_evidence(
+            source="git",
+            reference="git-commit:heimgewebe/grabowski@" + "b" * 40,
+            sha256=digest,
+        )
+        with patch.object(evidence, "_local_git_repo", return_value=Path("/tmp/repo")), patch.object(
+            evidence, "_run_command", return_value=(0, commit_payload, b"")
+        ):
+            observation = evidence._git_observation(stored)
+
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual("verified", observation["status"])
+        self.assertEqual(digest, observation["sha256"])
+
+    def test_receipt_adapter_hashes_only_bound_private_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"GRABOWSKI_EVIDENCE_RECEIPT_ROOT": tmp}
+        ):
+            root = Path(tmp)
+            path = root / "grip-receipts" / "sample.json"
+            path.parent.mkdir(mode=0o700)
+            payload = b'{"status":"passed"}\n'
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            digest = hashlib.sha256(payload).hexdigest()
+            stored = self._stored_evidence(
+                source="receipt",
+                reference="grabowski-receipt:grip-receipts/sample.json",
+                sha256=digest,
+            )
+            observation = evidence._receipt_observation(stored)
+
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual("verified", observation["status"])
+        self.assertEqual(digest, observation["sha256"])
+
+    def test_runtime_adapter_binds_exact_active_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"GRABOWSKI_EVIDENCE_DEPLOYMENT_MANIFEST": str(Path(tmp) / "manifest.json")},
+        ):
+            runtime_input = "7" * 64
+            repo_head = "8" * 40
+            release_id = "release-verified-1234567890"
+            manifest = Path(tmp) / "manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "completion_status": "complete",
+                        "repo_head": repo_head,
+                        "release_id": release_id,
+                        "runtime_input_sha256": runtime_input,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest.chmod(0o600)
+            stored = self._stored_evidence(
+                source="runtime",
+                reference=(
+                    f"grabowski-runtime-manifest:repo_head={repo_head};"
+                    f"release_id={release_id};runtime_input_sha256={runtime_input}"
+                ),
+                sha256=runtime_input,
+            )
+            observation = evidence._runtime_observation(stored)
+
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual("verified", observation["status"])
+        self.assertEqual(runtime_input, observation["sha256"])
+
+    def test_test_adapter_binds_terminal_task_receipt_and_exact_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_EVIDENCE_TASK_DATABASE": str(Path(tmp) / "tasks.sqlite3"),
+                "GRABOWSKI_EVIDENCE_TASK_OUTPUT_ROOT": str(Path(tmp) / "task-output"),
+            },
+        ):
+            task_id = "a" * 24
+            lifecycle_receipt = "9" * 64
+            connection = sqlite3.connect(Path(tmp) / "tasks.sqlite3")
+            try:
+                connection.execute(
+                    "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, attempt INTEGER, state TEXT, lifecycle_receipt_sha256 TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?)",
+                    (task_id, 1, "completed", lifecycle_receipt),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            output = (
+                Path(tmp)
+                / "task-output"
+                / f".grabowski-task-output-{task_id}-a1"
+            )
+            output.mkdir(parents=True, mode=0o700)
+            (output / "stdout.log").write_text(
+                "..................................................... [100%]\n"
+                "53 passed, 19 subtests passed in 0.20s\n",
+                encoding="utf-8",
+            )
+            (output / "stdout.log").chmod(0o600)
+            stored = self._stored_evidence(
+                source="test",
+                reference=f"grabowski-task:{task_id}:53-passed+19-subtests",
+                sha256=lifecycle_receipt,
+            )
+            observation = evidence._test_observation(stored)
+
+            self.assertIsNotNone(observation)
+            assert observation is not None
+            self.assertEqual("verified", observation["status"])
+            self.assertEqual(lifecycle_receipt, observation["sha256"])
+
+            stored["reference"] = f"grabowski-task:{task_id}:54-passed+19-subtests"
+            mismatch = evidence._test_observation(stored)
+            assert mismatch is not None
+            self.assertEqual("mismatch", mismatch["status"])
+
+    def test_matching_adapter_observation_flows_through_public_assessment(self) -> None:
+        stored = self._stored_evidence(
+            source="receipt",
+            reference="grabowski-receipt:sample.json",
+            sha256="a" * 64,
+        )
+        status = self._status(stored_evidence=[stored])
+        trusted = self._observation(
+            source="receipt",
+            reference="grabowski-receipt:sample.json",
+        )
+        with patch.object(
+            evidence,
+            "collect_trusted_observations",
+            return_value={"runtime": trusted},
+        ), patch.object(obligations, "status_obligation", return_value=status):
+            result = evidence.assess_obligation("goo-shadow-evidence-test-0001")
+
+        self.assertTrue(result["fully_verified"])
+        self.assertEqual("verified", result["acceptance"][0]["classification"])
+
     def test_sample_selection_is_schema_stratified_and_input_order_independent(self) -> None:
         legacy = [
             {
@@ -277,8 +504,19 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         )
         self.assertEqual("verifiability_gap_observed", first["shadow_signal"])
         self.assertEqual(
+            ["github", "git", "receipt", "runtime", "test"],
+            first["trusted_observation_adapter_sources"],
+        )
+        self.assertEqual({}, first["trusted_observation_counts"])
+        self.assertEqual(
             {"runtime": 30}, first["missing_adapter_source_counts"]
         )
+        self.assertFalse(first["rollout_eligible"])
+        self.assertEqual(
+            "stop_verifiability_threshold_not_met", first["rollout_decision"]
+        )
+        self.assertFalse(first["verified_completion_enforcement_enabled"])
+        self.assertTrue(first["rollout_threshold"]["enforcement_change_separate"])
         self.assertEqual(first["sample_sha256"], second["sample_sha256"])
         self.assertEqual(before, after)
 

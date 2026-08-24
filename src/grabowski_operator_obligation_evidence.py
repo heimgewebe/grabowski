@@ -3,6 +3,12 @@ from __future__ import annotations
 from collections import Counter
 import hashlib
 import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+import subprocess
 from typing import Any, Mapping
 
 import grabowski_operator_obligation as obligations
@@ -23,6 +29,44 @@ CLASSIFICATIONS = (
 OBSERVATION_STATUSES = frozenset({"verified", "stale", "mismatch", "unsupported"})
 MIN_ROLLOUT_SAMPLE = 30
 MAX_SAMPLE = 30
+TRUSTED_OBSERVATION_ADAPTER_SOURCES = (
+    "github",
+    "git",
+    "receipt",
+    "runtime",
+    "test",
+)
+ROLLOUT_THRESHOLD_KIND = "grabowski.operator_obligation_evidence_rollout_threshold"
+MAX_ADAPTER_FILE_BYTES = 4 * 1024 * 1024
+MAX_ADAPTER_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
+ADAPTER_COMMAND_TIMEOUT_SECONDS = 15
+GITHUB_PR_REFERENCE_RE = re.compile(
+    r"^github-pr:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"#(?P<pr>[1-9][0-9]{0,9})@(?P<head>[0-9a-f]{40})"
+    r":base=(?P<base>[0-9a-f]{40})"
+    r":merge=(?P<merge>[0-9a-f]{40})"
+    r":checks=(?P<passed>[0-9]{1,3})/(?P<total>[0-9]{1,3})-success$"
+)
+GIT_COMMIT_REFERENCE_RE = re.compile(
+    r"^git-commit:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"@(?P<commit>[0-9a-f]{40})$"
+)
+RUNTIME_REFERENCE_RE = re.compile(
+    r"^grabowski-runtime-manifest:repo_head=(?P<repo_head>[0-9a-f]{40});"
+    r"release_id=(?P<release_id>[A-Za-z0-9_.-]{16,240});"
+    r"runtime_input_sha256=(?P<runtime_input_sha256>[0-9a-f]{64})$"
+)
+TEST_TASK_REFERENCE_RE = re.compile(
+    r"^grabowski-task:(?P<task_id>[0-9a-f]{24}):"
+    r"(?P<passed>[0-9]{1,6})-passed\+(?P<subtests>[0-9]{1,6})-subtests$"
+)
+TEST_SUMMARY_RE = re.compile(
+    rb"(?m)(?P<passed>[0-9]{1,6}) passed"
+    rb"(?:, (?P<subtests>[0-9]{1,6}) subtests passed)?(?: in [^\n]+)?$"
+)
+GITHUB_REMOTE_RE = re.compile(
+    r"github\.com(?::|/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$"
+)
 
 
 class EvidenceAssessmentError(ValueError):
@@ -45,6 +89,433 @@ def _text(value: Any, label: str) -> str:
 
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and obligations.SHA256_RE.fullmatch(value) is not None
+
+
+def _trusted_observation(
+    evidence: Mapping[str, Any], *, status: str, sha256: str | None = None
+) -> dict[str, Any]:
+    digest = sha256 if _is_sha256(sha256) else evidence.get("sha256")
+    if not _is_sha256(digest):
+        digest = "0" * 64
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": OBSERVATION_KIND,
+        "acceptance_id": _text(evidence.get("acceptance_id"), "acceptance_id"),
+        "source": _text(evidence.get("source"), "source"),
+        "reference": _text(evidence.get("reference"), "reference"),
+        "sha256": digest,
+        "status": status,
+    }
+
+
+def _read_regular_bytes(path: Path, *, maximum: int) -> bytes:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise EvidenceAssessmentError("adapter evidence path is unavailable") from exc
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as exc:
+        raise EvidenceAssessmentError("adapter evidence path cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise EvidenceAssessmentError("adapter evidence path must be a regular file")
+        if before.st_uid != os.geteuid() or (stat.S_IMODE(before.st_mode) & 0o022):
+            raise EvidenceAssessmentError("adapter evidence path permissions are unsafe")
+        if before.st_size < 0 or before.st_size > maximum:
+            raise EvidenceAssessmentError("adapter evidence path exceeds the size bound")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    if len(data) > maximum:
+        raise EvidenceAssessmentError("adapter evidence path exceeds the size bound")
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        raise EvidenceAssessmentError("adapter evidence path changed while being read")
+    return data
+
+
+def _run_command(
+    argv: list[str], *, cwd: Path | None = None
+) -> tuple[int, bytes, bytes]:
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "GH_PROMPT_DISABLED": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+            "PAGER": "cat",
+        }
+    )
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd) if cwd is not None else None,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=ADAPTER_COMMAND_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EvidenceAssessmentError("trusted source adapter command failed") from exc
+    if (
+        len(completed.stdout) > MAX_ADAPTER_COMMAND_OUTPUT_BYTES
+        or len(completed.stderr) > MAX_ADAPTER_COMMAND_OUTPUT_BYTES
+    ):
+        raise EvidenceAssessmentError("trusted source adapter command output exceeded the bound")
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def _github_reference(reference: str) -> dict[str, Any] | None:
+    match = GITHUB_PR_REFERENCE_RE.fullmatch(reference)
+    if match is None:
+        return None
+    parsed: dict[str, Any] = {
+        "repo": match.group("repo"),
+        "pr": int(match.group("pr")),
+        "head": match.group("head"),
+        "base": match.group("base"),
+        "merge": match.group("merge"),
+        "passed": int(match.group("passed")),
+        "total": int(match.group("total")),
+    }
+    if parsed["total"] < 1 or parsed["total"] > 100 or parsed["passed"] != parsed["total"]:
+        return None
+    return parsed
+
+
+def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "grabowski.operator_obligation_evidence.github_pr_v1",
+        "repo": parsed["repo"],
+        "pr": parsed["pr"],
+        "head": parsed["head"],
+        "base": parsed["base"],
+        "merge": parsed["merge"],
+        "checks_passed": parsed["passed"],
+        "checks_total": parsed["total"],
+    }
+
+
+def _github_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    reference = _text(evidence.get("reference"), "reference")
+    parsed = _github_reference(reference)
+    if parsed is None:
+        return None
+    try:
+        returncode, stdout, _stderr = _run_command(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(parsed["pr"]),
+                "--repo",
+                str(parsed["repo"]),
+                "--json",
+                "state,isDraft,baseRefOid,headRefOid,mergeCommit,statusCheckRollup",
+            ]
+        )
+    except EvidenceAssessmentError:
+        return _trusted_observation(evidence, status="stale")
+    if returncode != 0:
+        return _trusted_observation(evidence, status="stale")
+    try:
+        payload = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _trusted_observation(evidence, status="mismatch")
+    if not isinstance(payload, Mapping):
+        return _trusted_observation(evidence, status="mismatch")
+    merge = payload.get("mergeCommit")
+    checks = payload.get("statusCheckRollup")
+    merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
+    if not isinstance(checks, list):
+        return _trusted_observation(evidence, status="mismatch")
+    successful = 0
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return _trusted_observation(evidence, status="mismatch")
+        typename = check.get("__typename")
+        if typename == "CheckRun":
+            ok = check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
+        elif typename == "StatusContext":
+            ok = check.get("state") == "SUCCESS"
+        else:
+            ok = False
+        successful += int(ok)
+    identity_matches = (
+        payload.get("state") == "MERGED"
+        and payload.get("isDraft") is False
+        and payload.get("headRefOid") == parsed["head"]
+        and payload.get("baseRefOid") == parsed["base"]
+        and merge_oid == parsed["merge"]
+        and len(checks) == parsed["total"]
+        and successful == parsed["passed"]
+    )
+    if not identity_matches:
+        return _trusted_observation(evidence, status="mismatch")
+    return _trusted_observation(
+        evidence,
+        status="verified",
+        sha256=_sha256(_github_observation_material(parsed)),
+    )
+
+
+def _remote_repo_slug(value: str) -> str | None:
+    match = GITHUB_REMOTE_RE.search(value.strip())
+    return match.group("repo") if match is not None else None
+
+
+def _local_git_repo(repo_slug: str) -> Path | None:
+    repo_name = repo_slug.rsplit("/", 1)[-1]
+    candidate = Path.home() / "repos" / repo_name
+    if not candidate.is_dir():
+        return None
+    try:
+        returncode, stdout, _stderr = _run_command(
+            ["git", "-c", "core.hooksPath=/dev/null", "remote", "get-url", "origin"],
+            cwd=candidate,
+        )
+    except EvidenceAssessmentError:
+        return None
+    if returncode != 0:
+        return None
+    try:
+        remote = stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    observed_slug = _remote_repo_slug(remote)
+    if observed_slug is None or observed_slug.casefold() != repo_slug.casefold():
+        return None
+    return candidate
+
+
+def _git_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    reference = _text(evidence.get("reference"), "reference")
+    match = GIT_COMMIT_REFERENCE_RE.fullmatch(reference)
+    if match is None:
+        return None
+    repo = _local_git_repo(match.group("repo"))
+    if repo is None:
+        return _trusted_observation(evidence, status="stale")
+    commit = match.group("commit")
+    try:
+        returncode, stdout, _stderr = _run_command(
+            ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "commit", commit],
+            cwd=repo,
+        )
+    except EvidenceAssessmentError:
+        return _trusted_observation(evidence, status="stale")
+    if returncode != 0:
+        return _trusted_observation(evidence, status="stale")
+    return _trusted_observation(
+        evidence, status="verified", sha256=hashlib.sha256(stdout).hexdigest()
+    )
+
+
+def _receipt_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_EVIDENCE_RECEIPT_ROOT")
+    return Path(configured).expanduser() if configured else Path.home() / ".local/state/grabowski"
+
+
+def _receipt_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    reference = _text(evidence.get("reference"), "reference")
+    prefix = "grabowski-receipt:"
+    if not reference.startswith(prefix):
+        return None
+    relative = reference[len(prefix) :]
+    if (
+        not relative
+        or len(relative) > 1024
+        or relative.startswith("/")
+        or re.fullmatch(r"[A-Za-z0-9_.@/+:-]+", relative) is None
+        or any(part in {"", ".", ".."} for part in Path(relative).parts)
+    ):
+        return None
+    root = _receipt_root().resolve()
+    path = (root / relative).resolve(strict=False)
+    if path != root and root not in path.parents:
+        return None
+    try:
+        data = _read_regular_bytes(path, maximum=MAX_ADAPTER_FILE_BYTES)
+    except EvidenceAssessmentError:
+        return _trusted_observation(evidence, status="stale")
+    return _trusted_observation(
+        evidence, status="verified", sha256=hashlib.sha256(data).hexdigest()
+    )
+
+
+def _deployment_manifest_path() -> Path:
+    configured = os.environ.get("GRABOWSKI_EVIDENCE_DEPLOYMENT_MANIFEST")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local/share/grabowski-mcp/deployment-manifest.json"
+
+
+def _runtime_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    reference = _text(evidence.get("reference"), "reference")
+    match = RUNTIME_REFERENCE_RE.fullmatch(reference)
+    if match is None:
+        return None
+    try:
+        data = _read_regular_bytes(
+            _deployment_manifest_path(), maximum=MAX_ADAPTER_FILE_BYTES
+        )
+        payload = json.loads(data)
+    except (EvidenceAssessmentError, UnicodeDecodeError, json.JSONDecodeError):
+        return _trusted_observation(evidence, status="stale")
+    if not isinstance(payload, Mapping):
+        return _trusted_observation(evidence, status="mismatch")
+    runtime_input_sha256 = payload.get("runtime_input_sha256")
+    matches = (
+        payload.get("completion_status") == "complete"
+        and payload.get("repo_head") == match.group("repo_head")
+        and payload.get("release_id") == match.group("release_id")
+        and runtime_input_sha256 == match.group("runtime_input_sha256")
+        and _is_sha256(runtime_input_sha256)
+    )
+    if not matches:
+        return _trusted_observation(evidence, status="mismatch")
+    return _trusted_observation(
+        evidence, status="verified", sha256=str(runtime_input_sha256)
+    )
+
+
+def _task_database_path() -> Path:
+    configured = os.environ.get("GRABOWSKI_EVIDENCE_TASK_DATABASE")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local/state/grabowski/tasks.sqlite3"
+
+
+def _task_output_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_EVIDENCE_TASK_OUTPUT_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local/state/grabowski/task-output"
+
+
+def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+    reference = _text(evidence.get("reference"), "reference")
+    match = TEST_TASK_REFERENCE_RE.fullmatch(reference)
+    if match is None:
+        return None
+    database = _task_database_path().resolve(strict=False)
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = connection.execute(
+                "SELECT attempt, state, lifecycle_receipt_sha256 FROM tasks WHERE task_id = ?",
+                (match.group("task_id"),),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return _trusted_observation(evidence, status="stale")
+    if row is None:
+        return _trusted_observation(evidence, status="stale")
+    attempt, state, lifecycle_receipt_sha256 = row
+    if (
+        not isinstance(attempt, int)
+        or attempt < 1
+        or state != "completed"
+        or not _is_sha256(lifecycle_receipt_sha256)
+    ):
+        return _trusted_observation(evidence, status="mismatch")
+    output_dir = _task_output_root() / (
+        f".grabowski-task-output-{match.group('task_id')}-a{attempt}"
+    )
+    streams: list[bytes] = []
+    for name in ("stdout.log", "stderr.log"):
+        try:
+            streams.append(
+                _read_regular_bytes(output_dir / name, maximum=MAX_ADAPTER_FILE_BYTES)
+            )
+        except EvidenceAssessmentError:
+            continue
+    if not streams:
+        return _trusted_observation(evidence, status="stale")
+    summaries = {
+        (
+            int(item.group("passed")),
+            int(item.group("subtests") or b"0"),
+        )
+        for stream in streams
+        for item in TEST_SUMMARY_RE.finditer(stream)
+    }
+    expected = (int(match.group("passed")), int(match.group("subtests")))
+    if expected not in summaries:
+        return _trusted_observation(evidence, status="mismatch")
+    return _trusted_observation(
+        evidence, status="verified", sha256=str(lifecycle_receipt_sha256)
+    )
+
+
+_SOURCE_ADAPTERS = {
+    "github": _github_observation,
+    "git": _git_observation,
+    "receipt": _receipt_observation,
+    "runtime": _runtime_observation,
+    "test": _test_observation,
+}
+
+
+def collect_trusted_observations(
+    status: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Collect only server-owned source observations from strict references.
+
+    Stored close evidence chooses neither adapter output nor adapter status.  A
+    free-form or unknown reference simply receives no trusted observation and
+    therefore remains unverified.
+    """
+
+    evidence_items = status.get("evidence")
+    if not isinstance(evidence_items, list):
+        return {}
+    observations: dict[str, dict[str, Any]] = {}
+    for item in evidence_items:
+        if not isinstance(item, Mapping):
+            continue
+        source = item.get("source")
+        acceptance_id = item.get("acceptance_id")
+        if not isinstance(source, str) or not isinstance(acceptance_id, str):
+            continue
+        adapter = _SOURCE_ADAPTERS.get(source)
+        if adapter is None:
+            continue
+        try:
+            observation = adapter(item)
+        except (EvidenceAssessmentError, OSError, ValueError, sqlite3.Error):
+            observation = _trusted_observation(item, status="stale")
+        if observation is not None:
+            observations[acceptance_id] = observation
+    return observations
 
 
 def _observation_for(
@@ -340,7 +811,8 @@ def assess_status(
 
 def assess_obligation(obligation_id: str) -> dict[str, Any]:
     status = obligations.status_obligation(obligation_id)
-    return assess_status(status)
+    observations = collect_trusted_observations(status)
+    return assess_status(status, observations=observations)
 
 
 def _completed_population() -> tuple[list[dict[str, Any]], list[dict[str, str]], bool]:
@@ -457,9 +929,11 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     population, integrity_errors, scan_truncated = _completed_population()
     selected = _select_sample_population(population, limit)
     obligation_ids = [str(item["obligation_id"]) for item in selected]
+    statuses = [obligations.status_obligation(obligation_id) for obligation_id in obligation_ids]
+    observation_maps = [collect_trusted_observations(status) for status in statuses]
     assessments = [
-        assess_status(obligations.status_obligation(obligation_id))
-        for obligation_id in obligation_ids
+        assess_status(status, observations=observations)
+        for status, observations in zip(statuses, observation_maps, strict=True)
     ]
 
     acceptance_total = sum(item["acceptance_count"] for item in assessments)
@@ -468,6 +942,14 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     source_counts: Counter[str] = Counter()
     missing_adapter_source_counts: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
+    adapter_observation_counts: Counter[str] = Counter()
+    adapter_status_counts: Counter[str] = Counter()
+    for observations in observation_maps:
+        for observation in observations.values():
+            adapter_observation_counts[str(observation["source"])] += 1
+            adapter_status_counts[
+                f"{observation['source']}:{observation['status']}"
+            ] += 1
     for assessment in assessments:
         seen_classes: set[str] = set()
         for item in assessment["acceptance"]:
@@ -499,6 +981,34 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         signal = "fully_verifiable_sample"
     else:
         signal = "verifiability_gap_observed"
+
+    rollout_threshold = {
+        "schema_version": 1,
+        "kind": ROLLOUT_THRESHOLD_KIND,
+        "minimum_sample": MIN_ROLLOUT_SAMPLE,
+        "requires_population_integrity": True,
+        "requires_all_acceptance_verified": True,
+        "requires_all_obligations_fully_verified": True,
+        "requires_zero_false_confidence_risk": True,
+        "enforcement_change_separate": True,
+    }
+    rollout_eligible = (
+        not integrity_errors
+        and not scan_truncated
+        and len(assessments) >= MIN_ROLLOUT_SAMPLE
+        and acceptance_total > 0
+        and acceptance_verified == acceptance_total
+        and fully_verified == len(assessments)
+        and false_confidence_risk == 0
+    )
+    if integrity_errors or scan_truncated:
+        rollout_decision = "stop_population_integrity"
+    elif len(assessments) < MIN_ROLLOUT_SAMPLE:
+        rollout_decision = "stop_sample_too_small"
+    elif rollout_eligible:
+        rollout_decision = "eligible_for_separate_enforcement_change"
+    else:
+        rollout_decision = "stop_verifiability_threshold_not_met"
 
     population_schema_counts = Counter(
         str(item.get("close_schema_version")) for item in population
@@ -557,7 +1067,15 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
             sorted(missing_adapter_source_counts.items())
         ),
         "reason_counts": dict(sorted(reason_counts.items())),
-        "trusted_observation_adapter_sources": [],
+        "trusted_observation_adapter_sources": list(
+            TRUSTED_OBSERVATION_ADAPTER_SOURCES
+        ),
+        "trusted_observation_counts": dict(sorted(adapter_observation_counts.items())),
+        "trusted_observation_status_counts": dict(sorted(adapter_status_counts.items())),
+        "rollout_threshold": rollout_threshold,
+        "rollout_eligible": rollout_eligible,
+        "rollout_decision": rollout_decision,
+        "verified_completion_enforcement_enabled": False,
         "shadow_signal": signal,
         "records": [
             {
@@ -581,6 +1099,8 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
             "sample proportions estimate population prevalence",
             "causality",
             "permission to enforce verified completion",
+            "verified completion enforcement in this change",
+            "future source truth after the adapter observation",
             "permission to rewrite legacy obligation records",
             "mutation authority",
         ],
