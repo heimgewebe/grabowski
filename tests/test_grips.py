@@ -1019,6 +1019,7 @@ class GripFoundationTests(unittest.TestCase):
                 "saga-run",
                 "saga-settle",
                 "operator-obligation-close",
+                "operator-obligation-evidence-assess",
                 "operator-obligation-list",
                 "operator-obligation-open",
                 "operator-obligation-resolve",
@@ -2355,6 +2356,62 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(intent_sha, binding["intent_record_sha256"])
         self.assertEqual(completion_sha, binding["completion_record_sha256"])
         self.assertEqual(receipt["receipt_sha256"], binding["receipt_sha256"])
+
+    def test_operator_obligation_evidence_assess_is_read_only_and_rejects_caller_observations(self) -> None:
+        assessment = {
+            "assessment_sha256": "a" * 64,
+            "fully_verified": False,
+            "false_confidence_risk": True,
+        }
+        with patch.object(
+            grips.grabowski_operator_obligation_evidence,
+            "assess_obligation",
+            return_value=assessment,
+        ) as assess:
+            result = grips.grip_run(
+                "operator-obligation-evidence-assess",
+                {
+                    "mode": "exact",
+                    "obligation_id": "goo-shadow-grip-test-0001",
+                },
+            )
+            rejected = grips.grip_run(
+                "operator-obligation-evidence-assess",
+                {
+                    "mode": "exact",
+                    "obligation_id": "goo-shadow-grip-test-0001",
+                    "observations": {},
+                },
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("read_only", result["receipt"]["grip"]["effect"])
+        self.assertFalse(result["output"]["fully_verified"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["read_only_shadow"])
+        self.assertEqual("pass", checks["no_completion_authority"])
+        self.assertEqual("blocked", rejected["receipt"]["status"])
+        assess.assert_called_once_with("goo-shadow-grip-test-0001")
+
+    def test_operator_obligation_evidence_sample_grip_is_bounded_to_thirty(self) -> None:
+        sample = {
+            "sample_sha256": "b" * 64,
+            "sample_size": 30,
+            "shadow_signal": "verifiability_gap_observed",
+        }
+        with patch.object(
+            grips.grabowski_operator_obligation_evidence,
+            "sample_completed",
+            return_value=sample,
+        ) as sample_completed:
+            result = grips.grip_run(
+                "operator-obligation-evidence-assess",
+                {"mode": "sample", "limit": 30},
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual(30, result["output"]["sample_size"])
+        sample_completed.assert_called_once_with(30)
 
     def test_operator_obligation_close_revalidates_systemic_convergence_live(self) -> None:
         obligation_id = "goo-grip-systemic-live-0001"

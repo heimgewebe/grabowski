@@ -634,6 +634,14 @@ def _openhands_subscription_auth_status(
     return status
 
 
+def _opencode_free_model_verified(models: list[str]) -> bool:
+    return any(
+        model.startswith("opencode/")
+        and (model.endswith("-free") or model.endswith(":free"))
+        for model in models
+    )
+
+
 def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     harnesses = _binary_versions(catalog)
     providers: dict[str, Any] = {}
@@ -682,7 +690,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     providers["opencode"] = {
         "available": harnesses.get("opencode", {}).get("available") is True,
         "models": opencode_models,
-        "free_model_verified": "opencode/deepseek-v4-flash-free" in opencode_models,
+        "free_model_verified": _opencode_free_model_verified(opencode_models),
     }
     openhands_auth = _openhands_subscription_auth_status()
     providers["openhands"] = {
