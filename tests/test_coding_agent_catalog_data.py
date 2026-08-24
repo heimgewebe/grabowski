@@ -53,7 +53,7 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 catalog, validation = router._load_catalog()
         self.assertEqual(validation["catalog_source"], "deployment_catalog")
-        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v8")
+        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v9")
         self.assertNotIn("legacy", catalog)
 
     def test_catalog_path_without_override_gate_is_ignored(self) -> None:
@@ -66,7 +66,7 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 catalog, validation = router._load_catalog()
         self.assertEqual(validation["catalog_source"], "deployment_catalog")
-        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v8")
+        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v9")
 
     def test_environment_override_remains_explicit_and_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -117,24 +117,57 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         self.assertEqual(routes["openhands-always-approve"]["harness"], "openhands")
         self.assertIn("--always-approve", routes["openhands-always-approve"]["argv_prefix"])
 
-    def test_ox_alpha_openrouter_preview_is_declared_conservatively(self) -> None:
+    def test_ox_alpha_openrouter_preview_has_broad_but_scoped_authority(self) -> None:
         catalog, _ = router._load_catalog()
         routes = {item["id"]: item for item in catalog["routes"]}
-        route = routes["opencode-openrouter-ox-alpha-free-preview"]
-        self.assertEqual(route["harness"], "opencode")
-        self.assertEqual(route["model"], "ox-alpha")
-        self.assertIn("openrouter/stealth/ox-alpha", route["argv_prefix"])
-        self.assertTrue(route["contrast_only"])
-        self.assertTrue(route["enabled"])
-        self.assertEqual(route["quota_pools"], ["openrouter-ox-alpha-preview"])
+        writer = routes["opencode-openrouter-ox-alpha-free-preview"]
+        reviewer = routes["opencode-openrouter-ox-alpha-review-preview"]
+
+        self.assertEqual(writer["harness"], "opencode")
+        self.assertEqual(writer["model"], "ox-alpha")
+        self.assertIn("openrouter/stealth/ox-alpha", writer["argv_prefix"])
+        self.assertFalse(writer["contrast_only"])
+        self.assertTrue(writer["experimental_quality_floor_bypass"])
+        self.assertTrue(writer["enabled"])
+        self.assertEqual(writer["quota_pools"], ["openrouter-ox-alpha-preview"])
+        self.assertEqual(
+            set(writer["task_classes"]),
+            {
+                "mechanical", "triage", "docs", "tests", "bounded-patch",
+                "frontend", "refactor", "complex-patch", "deep-debug",
+                "architecture", "long-agent", "migration", "isolated-pr",
+            },
+        )
+        self.assertNotIn("local-private", writer["task_classes"])
+
+        self.assertTrue(reviewer["review_only"])
+        self.assertTrue(reviewer["critical_eligible"])
+        self.assertTrue(reviewer["primary_review_authority"])
+        self.assertTrue(reviewer["experimental_quality_floor_bypass"])
+        self.assertEqual(
+            catalog["policy"]["direct_work_policy"]["primary_review_route_exceptions"],
+            ["opencode-openrouter-ox-alpha-review-preview"],
+        )
+        self.assertIn("--agent", reviewer["argv_prefix"])
+        self.assertIn("plan", reviewer["argv_prefix"])
+        self.assertNotIn("--auto", reviewer["argv_prefix"])
+        self.assertEqual(
+            set(reviewer["task_classes"]),
+            {"independent-review", "critical-review", "security-review"},
+        )
+
         model = catalog["models"]["ox-alpha"]
         self.assertEqual(model["provider_family"], "stealth")
+        self.assertEqual(model["quality_prior_class"], "C")
+        self.assertLessEqual(model["quality"]["reliability"], 5)
         pool = catalog["quota_pools"]["openrouter-ox-alpha-preview"]
         self.assertEqual(pool["marginal_cost_usd"], 0)
         self.assertEqual(pool["max_concurrency"], 1)
         self.assertFalse(pool["payg_fallback_allowed"])
-        self.assertEqual(pool["unknown_execution"], "advisory-only")
-        # The openrouter-paid hard block and PAYG/credits prohibition remain untouched.
+        self.assertEqual(
+            pool["unknown_execution"],
+            "allowed-while-fresh-zero-cost-preview",
+        )
         self.assertEqual(
             catalog["quota_pools"]["openrouter-paid"]["max_concurrency"], 0
         )

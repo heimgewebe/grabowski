@@ -292,6 +292,9 @@ def _route_capabilities_from_partitions(
         and review_only
         and not contrast_only
     )
+    primary_review_authority = (
+        review_capable and route.get("primary_review_authority") is True
+    )
     if direct_capable:
         route_role = "controller"
         authority_role = "controller"
@@ -321,6 +324,7 @@ def _route_capabilities_from_partitions(
         "writer_capable": direct_capable or scoped_writer_capable,
         "contrast_capable": contrast_capable,
         "review_capable": review_capable,
+        "primary_review_authority": primary_review_authority,
         "writer_capabilities": list(route.get("task_classes", [])) if direct_capable or scoped_writer_capable else [],
         "contrast_capabilities": contrast_capabilities if contrast_capable else [],
         "review_capabilities": review_capabilities if review_capable else [],
@@ -408,7 +412,13 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             raise CodingAgentRouterError(
                 f"{identifier}: writer_only is retired; use contrast_only or review_only"
             )
-        for role_flag in ("contrast_only", "review_only", "paid_only"):
+        for role_flag in (
+            "contrast_only",
+            "review_only",
+            "paid_only",
+            "experimental_quality_floor_bypass",
+            "primary_review_authority",
+        ):
             if role_flag in route and not isinstance(route[role_flag], bool):
                 raise CodingAgentRouterError(
                     f"{identifier}: {role_flag} must be a boolean"
@@ -642,6 +652,44 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
         raise CodingAgentRouterError(
             "catalog direct_work_policy review authority is invalid"
         )
+    primary_review_route_exceptions = direct_policy.get("primary_review_route_exceptions", [])
+    if (
+        not isinstance(primary_review_route_exceptions, list)
+        or any(not isinstance(item, str) or not item for item in primary_review_route_exceptions)
+        or len(primary_review_route_exceptions) != len(set(primary_review_route_exceptions))
+    ):
+        raise CodingAgentRouterError(
+            "catalog direct_work_policy primary_review_route_exceptions is invalid"
+        )
+    primary_review_exception_set = set(primary_review_route_exceptions)
+    flagged_primary_review_routes = {
+        route_id
+        for route_id, route in routes.items()
+        if route.get("primary_review_authority") is True
+    }
+    if primary_review_exception_set != flagged_primary_review_routes:
+        raise CodingAgentRouterError(
+            "catalog primary review authority flags must exactly match primary_review_route_exceptions"
+        )
+    for route_id in primary_review_exception_set:
+        route = routes[route_id]
+        task_classes = route.get("task_classes", [])
+        if (
+            route.get("review_only") is not True
+            or route.get("contrast_only") is True
+            or not task_classes
+            or any(
+                catalog["task_classes"][task_class].get("independent_review") is not True
+                for task_class in task_classes
+            )
+        ):
+            raise CodingAgentRouterError(
+                f"{route_id}: primary review authority requires a review-only route"
+            )
+        if route.get("critical_eligible") is not True:
+            raise CodingAgentRouterError(
+                f"{route_id}: primary review authority requires critical_eligible=true"
+            )
     required_operator_ownership = {
         "state-inspection",
         "planning",
@@ -1200,7 +1248,8 @@ def _score_route(
     model = catalog["models"][route["model"]]
     quality = model["quality"]
     primary_dimension = task["primary"]
-    if quality[primary_dimension] < int(task["minimum"]):
+    quality_floor_failed = quality[primary_dimension] < int(task["minimum"])
+    if quality_floor_failed and route.get("experimental_quality_floor_bypass") is not True:
         return (
             None,
             0.0,
@@ -1208,6 +1257,10 @@ def _score_route(
             reasons,
             [f"quality floor failed for {primary_dimension}"],
             False,
+        )
+    if quality_floor_failed:
+        reasons.append(
+            f"quality floor bypassed for {primary_dimension} by explicit experimental route policy; quality prior unchanged"
         )
     critical_eligible = (
         route.get("critical_eligible") is True or route.get("tier") == "critical"
@@ -2049,16 +2102,56 @@ def canonical_execution_route(
                     }
                 )
                 if ranked:
-                    reviewers.append(ranked[0])
-                    review_fallbacks = ranked[1:6]
+                    selected_reviewer = ranked[0]
+                    if direct_review_task:
+                        primary_review_exceptions = set(
+                            catalog["policy"]["direct_work_policy"].get(
+                                "primary_review_route_exceptions", []
+                            )
+                        )
+                        primary_candidates = [
+                            candidate
+                            for candidate in ranked
+                            if candidate.get("primary_review_authority") is True
+                            and candidate.get("route") in primary_review_exceptions
+                            and candidate.get("execution_eligible_if_separately_authorized") is True
+                        ]
+                        if primary_candidates:
+                            selected_reviewer = primary_candidates[0]
+                    reviewers.append(selected_reviewer)
+                    review_fallbacks = [
+                        candidate
+                        for candidate in ranked
+                        if candidate.get("route") != selected_reviewer.get("route")
+                    ][:5]
                     review_status = "recommended"
                 else:
                     review_status = "no-independent-review-route"
         elif state_error_type is not None:
             excluded["reviewer:state"] = [state_error_type]
 
-    primary_role = "controller-reviewer" if direct_review_task else "controller-integrator"
-    if direct_review_task:
+    selected_reviewer = reviewers[0] if reviewers else None
+    external_primary_review = bool(
+        direct_review_task
+        and isinstance(selected_reviewer, dict)
+        and selected_reviewer.get("primary_review_authority") is True
+        and selected_reviewer.get("route")
+        in set(
+            catalog["policy"]["direct_work_policy"].get(
+                "primary_review_route_exceptions", []
+            )
+        )
+    )
+    primary_role = (
+        "external-primary-reviewer"
+        if external_primary_review
+        else "controller-reviewer"
+        if direct_review_task
+        else "controller-integrator"
+    )
+    if external_primary_review:
+        reason = "catalogued external primary reviewer owns the substantive review verdict; controller retains process authority"
+    elif direct_review_task:
         reason = "controller review is canonical; external review is supplementary"
     elif task_value in controller_owned:
         reason = "controller-owned task class"
@@ -2076,6 +2169,8 @@ def canonical_execution_route(
     )
     if executor == "scoped_writer":
         executor_reason = "eligible lane-scoped writer selected; controller remains integrator"
+    elif external_primary_review:
+        executor_reason = "controller orchestrates the read-only primary external review; mutable integration authority is unchanged"
     elif direct_review_task:
         executor_reason = "review task is controller-owned; external review remains advisory"
     elif task_value in controller_owned:
@@ -2115,7 +2210,13 @@ def canonical_execution_route(
         "controller_integration_required": True,
         "delegated_scoped_writers_allowed": True,
         "external_primary_writer_forbidden": False,
-        "external_primary_reviewer_forbidden": True,
+        "external_primary_reviewer_forbidden": not external_primary_review,
+        "review_authority": "external-primary" if external_primary_review else "controller-primary",
+        "primary_reviewer_route": (
+            selected_reviewer.get("route")
+            if external_primary_review and isinstance(selected_reviewer, dict)
+            else controller_id if direct_review_task else None
+        ),
         "capacity_fallback_to_external_writer": True,
         "operator_owns": catalog["policy"]["direct_work_policy"]["operator_owns"],
         "scoped_writer_allowed": scoped_writer_allowed,
@@ -2130,8 +2231,11 @@ def canonical_execution_route(
         "review_state_error_type": review_state_error_type,
         "review_gap": max(0, (1 if external_review_requested else 0) - len(reviewers)),
         "review_quorum": {
-            "direct_operator": 1,
-            "external_advisory_target": 1 if external_review_requested else 0,
+            "direct_operator": 0 if external_primary_review else 1,
+            "external_authoritative_target": 1 if external_primary_review else 0,
+            "external_advisory_target": (
+                0 if external_primary_review else 1 if external_review_requested else 0
+            ),
         },
         "contrast_programming": {
             "allowed": not direct_review_task,

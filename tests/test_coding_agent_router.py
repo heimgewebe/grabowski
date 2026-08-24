@@ -97,6 +97,13 @@ class CodingAgentRouterTests(unittest.TestCase):
                         "logged_in": True,
                         "models": sorted(set(grok_models)),
                     },
+                    "opencode": {
+                        "free_model_verified": True,
+                        "models": [
+                            "opencode/deepseek-v4-flash-free",
+                            "openrouter/stealth/ox-alpha",
+                        ],
+                    },
                     "jules": {"authenticated": True},
                     "cline": {"config": {"free_entitlement_verified": False}},
                     "ollama": {
@@ -820,11 +827,18 @@ class CodingAgentRouterTests(unittest.TestCase):
             "security-review", duration_minutes=120, risk_flags=["security-sensitive"]
         )
         self.assertEqual(security["decision"], "controller")
-        self.assertEqual(security["primary_role"], "controller-reviewer")
+        self.assertEqual(security["primary_role"], "external-primary-reviewer")
         self.assertTrue(security["direct_review_required"])
         self.assertEqual(security["executor"], "controller")
         self.assertEqual(security["verification_policy"], "independent_review")
+        self.assertFalse(security["external_primary_reviewer_forbidden"])
+        self.assertEqual(security["review_authority"], "external-primary")
+        self.assertEqual(
+            security["primary_reviewer_route"],
+            "opencode-openrouter-ox-alpha-review-preview",
+        )
         self.assertTrue(security["reviewers"][0]["review_capable"])
+        self.assertTrue(security["reviewers"][0]["primary_review_authority"])
         self.assertFalse(security["authoritative_implementation_remains_direct"])
         self.assertFalse(security["scoped_writer_allowed"])
 
@@ -909,14 +923,16 @@ class CodingAgentRouterTests(unittest.TestCase):
         self._write_state()
         fallback_review = self._route("independent-review")
         self.assertEqual(fallback_review["decision"], "controller")
-        self.assertEqual(fallback_review["primary_role"], "controller-reviewer")
+        self.assertEqual(fallback_review["primary_role"], "external-primary-reviewer")
         self.assertTrue(fallback_review["reviewers"])
-        self.assertNotEqual(
-            fallback_review["reviewers"][0]["provider_family"], "anthropic"
-        )
+        self.assertEqual(fallback_review["reviewers"][0]["provider_family"], "stealth")
         self.assertEqual(fallback_review["review_gap"], 0)
 
-        for pool_id in ("grok-com", "antigravity-account"):
+        for pool_id in (
+            "grok-com",
+            "antigravity-account",
+            "openrouter-ox-alpha-preview",
+        ):
             self.state["pools"][pool_id] = {
                 "status": "exhausted",
                 "reset_at": "2099-01-01T00:00:00Z",
@@ -1089,13 +1105,21 @@ class CodingAgentRouterTests(unittest.TestCase):
         for task_class in ("critical-review", "security-review"):
             review = self._route(task_class)
             self.assertEqual(review["decision"], "controller")
-            self.assertEqual(review["primary_role"], "controller-reviewer")
+            self.assertEqual(review["primary_role"], "external-primary-reviewer")
             self.assertTrue(review["direct_review_required"])
             self.assertEqual(review["review_gap"], 0)
-            self.assertEqual(review["review_quorum"]["direct_operator"], 1)
-            self.assertEqual(review["review_quorum"]["external_advisory_target"], 1)
+            self.assertEqual(review["review_quorum"]["direct_operator"], 0)
+            self.assertEqual(review["review_quorum"]["external_authoritative_target"], 1)
+            self.assertEqual(review["review_quorum"]["external_advisory_target"], 0)
+            self.assertFalse(review["external_primary_reviewer_forbidden"])
+            self.assertEqual(review["review_authority"], "external-primary")
+            self.assertEqual(
+                review["primary_reviewer_route"],
+                "opencode-openrouter-ox-alpha-review-preview",
+            )
             self.assertTrue(review["reviewers"][0]["review_capable"])
-            self.assertNotEqual(review["reviewers"][0]["provider_family"], "openai")
+            self.assertTrue(review["reviewers"][0]["primary_review_authority"])
+            self.assertEqual(review["reviewers"][0]["provider_family"], "stealth")
 
     def test_external_reviewers_are_bound_to_selected_scoped_writer(self) -> None:
         for harness, state in self.state["catalog"]["harnesses"].items():
@@ -1437,6 +1461,9 @@ class CodingAgentRouterTests(unittest.TestCase):
             .isoformat()
             .replace("+00:00", "Z"),
         }
+        # Keep the assertion scoped to Spark: the newly executable Ox writer
+        # is an independent valid fallback and would otherwise satisfy docs.
+        self.state["catalog"]["harnesses"]["opencode"]["available"] = False
         self._write_state()
 
         result = self._route(
@@ -1456,35 +1483,45 @@ class CodingAgentRouterTests(unittest.TestCase):
             result["excluded"]["scoped-writer:codex-spark-low"][0],
         )
 
-    def test_ox_alpha_openrouter_preview_route_is_conservative_and_contrast_only(
-        self,
-    ) -> None:
+    def test_ox_alpha_openrouter_preview_routes_are_broad_but_scoped(self) -> None:
         validation = router._validate_catalog(self.catalog)
         self.assertTrue(validation["valid"])
         model = self.catalog["models"]["ox-alpha"]
         pool = self.catalog["quota_pools"]["openrouter-ox-alpha-preview"]
-        route = next(
-            item
-            for item in self.catalog["routes"]
-            if item["id"] == "opencode-openrouter-ox-alpha-free-preview"
-        )
-        self.assertEqual(route["harness"], "opencode")
-        self.assertEqual(route["model"], "ox-alpha")
-        self.assertIn("openrouter/stealth/ox-alpha", route["argv_prefix"])
-        self.assertTrue(route["contrast_only"])
-        self.assertTrue(route["enabled"])
-        self.assertFalse(route.get("review_only", False))
-        self.assertEqual(route["quality_class"], "C")
+        routes = {item["id"]: item for item in self.catalog["routes"]}
+        writer = routes["opencode-openrouter-ox-alpha-free-preview"]
+        reviewer = routes["opencode-openrouter-ox-alpha-review-preview"]
+
+        writer_capabilities = router._route_capabilities(writer, self.catalog)
+        self.assertEqual(writer_capabilities["route_role"], "scoped-writer")
+        self.assertTrue(writer_capabilities["scoped_writer_capable"])
+        self.assertFalse(writer["contrast_only"])
+        self.assertTrue(writer["experimental_quality_floor_bypass"])
         self.assertEqual(
-            route["quota_pools"], ["openrouter-ox-alpha-preview"]
+            set(writer["task_classes"]),
+            {
+                "mechanical", "triage", "docs", "tests", "bounded-patch",
+                "frontend", "refactor", "complex-patch", "deep-debug",
+                "architecture", "long-agent", "migration", "isolated-pr",
+            },
         )
+        self.assertNotIn("local-private", writer["task_classes"])
+
+        reviewer_capabilities = router._route_capabilities(reviewer, self.catalog)
+        self.assertEqual(reviewer_capabilities["route_role"], "reviewer")
+        self.assertTrue(reviewer_capabilities["review_capable"])
+        self.assertTrue(reviewer["review_only"])
+        self.assertTrue(reviewer["critical_eligible"])
+        self.assertTrue(reviewer["primary_review_authority"])
+        self.assertTrue(reviewer["experimental_quality_floor_bypass"])
+        self.assertIn("--agent", reviewer["argv_prefix"])
+        self.assertIn("plan", reviewer["argv_prefix"])
+        self.assertNotIn("--auto", reviewer["argv_prefix"])
         self.assertEqual(
-            set(route["task_classes"]),
-            {"mechanical", "docs", "tests", "bounded-patch", "triage"},
+            set(reviewer["task_classes"]),
+            {"independent-review", "critical-review", "security-review"},
         )
-        # The route must not silently reuse the opencode-free pool: OpenRouter
-        # free-preview pricing is a distinct, separately revalidated cost surface.
-        self.assertNotIn("opencode-free", route["quota_pools"])
+
         self.assertEqual(model["provider_family"], "stealth")
         self.assertEqual(model["quality_prior_class"], "C")
         self.assertLessEqual(model["quality"]["reliability"], 5)
@@ -1492,8 +1529,64 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertEqual(pool["marginal_cost_usd"], 0)
         self.assertEqual(pool["max_concurrency"], 1)
         self.assertFalse(pool["payg_fallback_allowed"])
-        self.assertEqual(pool["unknown_execution"], "advisory-only")
-        self.assertIn("revalidated", pool["note"])
+        self.assertEqual(
+            pool["unknown_execution"],
+            "allowed-while-fresh-zero-cost-preview",
+        )
+        self.assertIn("revalidated", pool["note"] or "")
+
+    def test_ox_alpha_explicit_experimental_policy_bypasses_quality_floor_without_regrading(self) -> None:
+        routes = {item["id"]: item for item in self.catalog["routes"]}
+        state = self._fresh_state()
+        state["catalog"]["providers"]["opencode"] = {
+            "free_model_verified": True,
+            "models": [
+                "opencode/deepseek-v4-flash-free",
+                "openrouter/stealth/ox-alpha",
+            ],
+        }
+
+        writer = routes["opencode-openrouter-ox-alpha-free-preview"]
+        score, _, _, reasons, exclusion, execution = router._score_route(
+            writer,
+            "architecture",
+            self.catalog,
+            state,
+            changed_files=20,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=[],
+            latency_priority=False,
+            reviewer=False,
+            previous_group=None,
+            previous_provider=None,
+        )
+        self.assertIsNotNone(score)
+        self.assertEqual(exclusion, [])
+        self.assertTrue(execution)
+        self.assertTrue(any("quality floor bypassed" in reason for reason in reasons))
+
+        reviewer = routes["opencode-openrouter-ox-alpha-review-preview"]
+        score, _, _, reasons, exclusion, execution = router._score_route(
+            reviewer,
+            "security-review",
+            self.catalog,
+            state,
+            changed_files=20,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["security-sensitive"],
+            latency_priority=False,
+            reviewer=True,
+            previous_group="openai-controller",
+            previous_provider="openai",
+        )
+        self.assertIsNotNone(score)
+        self.assertEqual(exclusion, [])
+        self.assertTrue(execution)
+        self.assertTrue(any("quality floor bypassed" in reason for reason in reasons))
+        self.assertEqual(self.catalog["models"]["ox-alpha"]["quality"]["review"], 3)
+
 
     def test_ox_alpha_route_fails_closed_without_local_openrouter_evidence(
         self,
@@ -1504,6 +1597,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             if item["id"] == "opencode-openrouter-ox-alpha-free-preview"
         )
         state = self._fresh_state()
+        state["catalog"]["providers"].pop("opencode", None)
         available, reason = router._route_available(route, self.catalog, state)
         self.assertFalse(available)
         self.assertEqual(reason, "OpenCode free model entitlement is unverified")

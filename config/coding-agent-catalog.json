@@ -1,5 +1,5 @@
 {
-  "catalog_version": "lane-scoped-writer-v8",
+  "catalog_version": "lane-scoped-writer-v9",
   "harnesses": {
     "antigravity": {
       "aliases": [
@@ -631,7 +631,7 @@
     },
     "ox-alpha": {
       "availability": "live-verified-free-via-openrouter",
-      "evidence": "openrouter-stealth-ox-alpha-zero-price-live-listing-2026-08-24; openrouter-free-tier-key-http-200-2026-08-24; opencode-exact-model-resolution-and-zero-cost-live-smoke-2026-08-24",
+      "evidence": "openrouter-stealth-ox-alpha-zero-price-live-listing-2026-08-24; openrouter-free-tier-key-http-200-2026-08-24; opencode-exact-model-resolution-and-zero-cost-live-smoke-2026-08-24; opencode-plan-agent-zero-cost-live-smoke-2026-08-24",
       "family": "stealth-ox-alpha",
       "name": "Ox Alpha (OpenRouter free preview)",
       "provider_family": "stealth",
@@ -729,7 +729,10 @@
       "delegated_scoped_writers_allowed": true,
       "single_mutating_writer_scope": "overlapping-resource-lane",
       "controller_integration_required": true,
-      "operator_ownership_semantics": "controller-accountability-not-exclusive-execution"
+      "operator_ownership_semantics": "controller-accountability-not-exclusive-execution",
+      "primary_review_route_exceptions": [
+        "opencode-openrouter-ox-alpha-review-preview"
+      ]
     },
     "effort_levels": {
       "high": 2,
@@ -759,7 +762,7 @@
       "benchmark_prior_not_local_truth": true,
       "escalation_route": "codex-sol-xhigh",
       "opus_role": "Upper-frontier Anthropic reviewer plus escalation-only scoped writer for architecture, deep-debug, migration and difficult complex-patch work through the shared Claude Pro baseline; Sonnet remains the routine Claude writer, Codex Sol remains the canonical top escalation, and Opus writer results require independent review.",
-      "principle": "The controller owns authoritative integration and closeout. Explicitly lane-bound scoped writers may implement and publish PRs; reviewer and observer results remain advisory.",
+      "principle": "The controller owns integration, merge, deployment and closeout. Explicitly lane-bound scoped writers may implement and publish PRs. Reviewers are advisory by default; explicitly catalogued primary-review exceptions may own the substantive review verdict while controller process authority remains unchanged.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
         "codex-sol-high"
@@ -1173,11 +1176,11 @@
       "freshness_seconds": 86400,
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "note": "Stealth Ox Alpha (stealth/ox-alpha) via OpenRouter is a temporary $0 input / $0 output preview from an anonymous provider identity; prompts and completions are retained by the provider. Free-preview pricing, local OpenCode OpenRouter authentication, exact model resolution, and a zero-cost synthetic live smoke were verified on 2026-08-24 and must be revalidated within the freshness window before execution. PAYG or credits fallback is forbidden.",
+      "note": "Stealth Ox Alpha (stealth/ox-alpha) via OpenRouter is a temporary $0 input / $0 output preview from an anonymous provider identity; prompts and completions are retained by the provider. Free-preview pricing, local OpenCode OpenRouter authentication, exact model resolution, and a zero-cost synthetic live smoke were verified on 2026-08-24 and must be revalidated within the freshness window before execution. A separate OpenCode plan-agent zero-cost live smoke also succeeded on 2026-08-24. Opaque provider quota does not by itself force advisory-only use while the $0 freshness proof is current; PAYG or credits fallback is forbidden.",
       "payg_fallback_allowed": false,
       "quota_mode": "provider-free-preview-model",
       "reserve_floor": 0.1,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "allowed-while-fresh-zero-cost-preview"
     },
     "openhands-account": {
       "cost_mode": "signed-in-account",
@@ -2477,7 +2480,7 @@
       ],
       "base_quality_rank": 30,
       "burn_weight": 0.3,
-      "contrast_only": true,
+      "contrast_only": false,
       "delegation_overhead_minutes": 3,
       "enabled": true,
       "harness": "opencode",
@@ -2493,12 +2496,59 @@
       ],
       "task_classes": [
         "mechanical",
+        "triage",
         "docs",
         "tests",
         "bounded-patch",
-        "triage"
+        "frontend",
+        "refactor",
+        "complex-patch",
+        "deep-debug",
+        "architecture",
+        "long-agent",
+        "migration",
+        "isolated-pr"
       ],
-      "tier": "balanced"
+      "tier": "balanced",
+      "experimental_quality_floor_bypass": true
+    },
+    {
+      "argv_prefix": [
+        "opencode",
+        "run",
+        "--pure",
+        "--agent",
+        "plan",
+        "--format",
+        "json",
+        "--model",
+        "openrouter/stealth/ox-alpha"
+      ],
+      "base_quality_rank": 30,
+      "burn_weight": 0.3,
+      "critical_eligible": true,
+      "delegation_overhead_minutes": 3,
+      "enabled": true,
+      "experimental_quality_floor_bypass": true,
+      "harness": "opencode",
+      "harness_quality": 7,
+      "id": "opencode-openrouter-ox-alpha-review-preview",
+      "independence_group": "stealth-ox-alpha-openrouter",
+      "min_duration_minutes": 5,
+      "model": "ox-alpha",
+      "priority": 40,
+      "quality_class": "C",
+      "quota_pools": [
+        "openrouter-ox-alpha-preview"
+      ],
+      "review_only": true,
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
+      ],
+      "tier": "critical",
+      "primary_review_authority": true
     },
     {
       "argv_prefix": [
