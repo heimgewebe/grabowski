@@ -92,6 +92,7 @@ class CheckoutTerminalSourcesTests(unittest.TestCase):
         self.assertEqual(evidence["started_at_unix"], 100)
         self.assertEqual(evidence["closed_at_unix"], 200)
         self.assertEqual(evidence["lane_receipt_sha256"], "d" * 64)
+        self.assertEqual(evidence["terminal_head_sha"], "b" * 40)
         self.assertEqual(
             evidence["terminal_closeout_audit_record_sha256"],
             "f" * 64,

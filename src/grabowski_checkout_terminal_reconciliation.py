@@ -56,6 +56,20 @@ def _record(checkout_key: str) -> dict[str, Any] | None:
     return {**result, "receipt": receipt, "source_evidence": source_evidence}
 
 
+def _reconciliation_mode(receipt: dict[str, Any]) -> str | None:
+    mode = receipt.get("reconciliation_mode")
+    if mode in {"missing_external", "present_retained"}:
+        return str(mode)
+    binding_after = receipt.get("binding_after")
+    if (
+        mode is None
+        and isinstance(binding_after, dict)
+        and binding_after.get("phase") == "externally_terminal_missing"
+    ):
+        return "missing_external"
+    return None
+
+
 def _snapshot(checkout_key: str) -> dict[str, Any]:
     connection = checkouts._readonly_connection(checkouts.CHECKOUT_DB)
     if connection is None:
@@ -372,19 +386,33 @@ def _preview_state(
     existing = _record(key)
     snapshot = _snapshot(key)
     binding = snapshot["binding"]
+    superseded_receipt_sha256: str | None = None
     if existing is not None:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "checkout_terminal_reconciliation_preview",
-            "status": "already_applied",
-            "checkout_key": key,
-            "safe_to_apply": False,
-            "existing_receipt": existing["receipt"],
-            "does_not_establish": [
-                "archive_or_cleanup_authority",
-                "branch_or_ref_deletion_authority",
-            ],
-        }
+        existing_mode = _reconciliation_mode(existing["receipt"])
+        _path, checkout_exists, path_blockers = _lexical_checkout_path_observation(
+            binding["checkout_path"]
+        )
+        may_follow_present_with_missing = (
+            existing_mode == "present_retained"
+            and binding["phase"] == "completed_retained"
+            and checkout_exists is False
+            and not path_blockers
+        )
+        if may_follow_present_with_missing:
+            superseded_receipt_sha256 = existing["receipt_sha256"]
+        else:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "checkout_terminal_reconciliation_preview",
+                "status": "already_applied",
+                "checkout_key": key,
+                "safe_to_apply": False,
+                "existing_receipt": existing["receipt"],
+                "does_not_establish": [
+                    "archive_or_cleanup_authority",
+                    "branch_or_ref_deletion_authority",
+                ],
+            }
     if binding["phase"] not in _ALLOWED_SOURCE_PHASES:
         raise RuntimeError("only active or completed-retained bindings may be reconciled")
     source_evidence = sources.source_terminal_evidence(binding)
@@ -399,6 +427,16 @@ def _preview_state(
         source = binding.get("source")
         if not isinstance(source, dict) or source.get("kind") != "work_lane":
             blockers.append("present-checkout-source-not-work-lane")
+        else:
+            terminal_head = source_evidence.get("terminal_head_sha")
+            if terminal_head is not None:
+                if (
+                    not isinstance(terminal_head, str)
+                    or checkouts.GIT_OBJECT_RE.fullmatch(terminal_head) is None
+                ):
+                    blockers.append("work-lane-terminal-head-invalid")
+                elif checkout.get("branch_head") != terminal_head:
+                    blockers.append("present-checkout-head-after-terminal-closeout")
     if coordination["blocking"]:
         blockers.append("active-coordination")
     stable = {
@@ -415,6 +453,7 @@ def _preview_state(
         "coordination": coordination,
         "blockers": sorted(set(blockers)),
         "safe_to_apply": not blockers,
+        "supersedes_reconciliation_receipt_sha256": superseded_receipt_sha256,
         "does_not_establish": [
             "archive_or_cleanup_authority",
             "branch_or_ref_deletion_authority",
@@ -454,6 +493,8 @@ def _replay(
     if existing["owner_id"] != owner_id:
         raise PermissionError("terminal reconciliation belongs to another owner")
     if existing["preview_sha256"] != expected_preview_sha256:
+        if _reconciliation_mode(existing["receipt"]) == "present_retained":
+            return None
         raise RuntimeError("terminal reconciliation replay preview digest drift")
     return {
         "schema_version": SCHEMA_VERSION,
@@ -529,15 +570,42 @@ def apply(
         applied_at = checkouts._now()
         with checkouts._operation_lock(), checkouts._database() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
-                "SELECT 1 FROM terminal_reconciliations WHERE checkout_key=?",
+            prior_row = connection.execute(
+                "SELECT owner_id, preview_sha256, receipt_json, receipt_sha256 "
+                "FROM terminal_reconciliations WHERE checkout_key=?",
                 (key,),
-            ).fetchone() is not None:
-                connection.rollback()
-                replay = _replay(key, owner, preview_sha256)
-                if replay is None:
-                    raise RuntimeError("terminal reconciliation replay disappeared")
-                return replay
+            ).fetchone()
+            superseded_receipt: dict[str, Any] | None = None
+            superseded_receipt_sha256: str | None = None
+            if prior_row is not None:
+                if prior_row["owner_id"] != owner:
+                    raise PermissionError("terminal reconciliation belongs to another owner")
+                if prior_row["preview_sha256"] == preview_sha256:
+                    connection.rollback()
+                    replay = _replay(key, owner, preview_sha256)
+                    if replay is None:
+                        raise RuntimeError("terminal reconciliation replay disappeared")
+                    return replay
+                try:
+                    prior_receipt = json.loads(prior_row["receipt_json"])
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "terminal reconciliation predecessor receipt is invalid"
+                    ) from exc
+                expected_predecessor = planned.get(
+                    "supersedes_reconciliation_receipt_sha256"
+                )
+                if (
+                    not isinstance(prior_receipt, dict)
+                    or _reconciliation_mode(prior_receipt) != "present_retained"
+                    or expected_predecessor != prior_row["receipt_sha256"]
+                    or prior_receipt.get("receipt_sha256") != prior_row["receipt_sha256"]
+                ):
+                    raise RuntimeError(
+                        "terminal reconciliation predecessor changed or is not supersedable"
+                    )
+                superseded_receipt = prior_receipt
+                superseded_receipt_sha256 = prior_row["receipt_sha256"]
             binding_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
                 (key,),
@@ -681,31 +749,57 @@ def apply(
                     "permission_to_delete_binding_or_retention_rows",
                 ],
             }
+            if superseded_receipt is not None:
+                receipt_core["supersedes_reconciliation_receipt_sha256"] = (
+                    superseded_receipt_sha256
+                )
+                receipt_core["supersedes_reconciliation_receipt"] = superseded_receipt
             receipt = {**receipt_core, "receipt_sha256": checkouts._sha256_json(receipt_core)}
-            connection.execute(
-                """
-                INSERT INTO terminal_reconciliations(
-                    checkout_key, owner_id, binding_before_sha256,
-                    retention_sha256, source_evidence_json,
-                    source_evidence_sha256, preview_sha256,
-                    preview_created_at_unix, applied_at_unix,
-                    receipt_json, receipt_sha256
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    key,
-                    owner,
-                    planned["binding_sha256"],
-                    planned["retention_sha256"],
-                    checkouts._canonical_json(planned["source_evidence"]),
-                    planned["source_evidence"]["evidence_sha256"],
-                    preview_sha256,
-                    preview_created_at_unix,
-                    applied_at,
-                    checkouts._canonical_json(receipt),
-                    receipt["receipt_sha256"],
-                ),
+            row_values = (
+                owner,
+                planned["binding_sha256"],
+                planned["retention_sha256"],
+                checkouts._canonical_json(planned["source_evidence"]),
+                planned["source_evidence"]["evidence_sha256"],
+                preview_sha256,
+                preview_created_at_unix,
+                applied_at,
+                checkouts._canonical_json(receipt),
+                receipt["receipt_sha256"],
             )
+            if superseded_receipt is None:
+                connection.execute(
+                    """
+                    INSERT INTO terminal_reconciliations(
+                        checkout_key, owner_id, binding_before_sha256,
+                        retention_sha256, source_evidence_json,
+                        source_evidence_sha256, preview_sha256,
+                        preview_created_at_unix, applied_at_unix,
+                        receipt_json, receipt_sha256
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, *row_values),
+                )
+            else:
+                replaced = connection.execute(
+                    """
+                    UPDATE terminal_reconciliations
+                    SET owner_id=?, binding_before_sha256=?, retention_sha256=?,
+                        source_evidence_json=?, source_evidence_sha256=?,
+                        preview_sha256=?, preview_created_at_unix=?, applied_at_unix=?,
+                        receipt_json=?, receipt_sha256=?
+                    WHERE checkout_key=? AND receipt_sha256=?
+                    """,
+                    (
+                        *row_values,
+                        key,
+                        superseded_receipt_sha256,
+                    ),
+                )
+                if replaced.rowcount != 1:
+                    raise RuntimeError(
+                        "terminal reconciliation predecessor CAS replacement failed"
+                    )
             connection.commit()
         readback = _record(key)
         if (

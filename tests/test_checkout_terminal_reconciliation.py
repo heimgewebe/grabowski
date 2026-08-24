@@ -277,6 +277,34 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         after_capacity = checkouts.active_capacity_projection(self.repo)
         self.assertEqual(0, after_capacity["used"])
 
+    def test_present_current_work_lane_rejects_head_after_terminal_closeout(self) -> None:
+        binding = self._present_binding()
+        (self.checkout / "post-closeout.txt").write_text("later\n", encoding="utf-8")
+        self._git("add", "post-closeout.txt", cwd=self.checkout)
+        self._git("commit", "-m", "post closeout work", cwd=self.checkout)
+        evidence = self._terminal_source_evidence(binding)
+        evidence["terminal_head_sha"] = self.head
+        evidence["evidence_sha256"] = checkouts._sha256_json(
+            {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        )
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts,
+                "_remote_secured_observation",
+                return_value={
+                    "remote_secured": True,
+                    "remote_secured_refs": ["refs/remotes/origin/topic"],
+                    "error": None,
+                },
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn(
+            "present-checkout-head-after-terminal-closeout", preview["blockers"]
+        )
+
     def test_present_terminal_checkout_rejects_non_work_lane_source(self) -> None:
         binding = self._present_binding(
             source_kind="bureau_task",
@@ -327,6 +355,44 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             receipt["branch_head_rebind"],
         )
         self.assertTrue(self.checkout.is_dir())
+
+    def test_present_reconciliation_can_later_supersede_to_missing(self) -> None:
+        binding = self._present_binding()
+        remote = {
+            "remote_secured": True,
+            "remote_secured_refs": ["refs/remotes/origin/topic"],
+            "error": None,
+        }
+        with patch.object(
+            checkouts, "_remote_secured_observation", return_value=remote
+        ):
+            first_preview = self._preview(binding)
+            first = self._apply(binding, first_preview)
+        first_receipt = first["receipt"]
+        first_sha = first_receipt["receipt_sha256"]
+        self._git("worktree", "remove", str(self.checkout))
+        second_preview = self._preview(binding)
+        self.assertTrue(second_preview["safe_to_apply"])
+        self.assertEqual(
+            first_sha,
+            second_preview["supersedes_reconciliation_receipt_sha256"],
+        )
+        second = self._apply(binding, second_preview)
+        second_receipt = second["receipt"]
+        self.assertEqual("missing_external", second_receipt["reconciliation_mode"])
+        self.assertEqual(
+            first_sha, second_receipt["supersedes_reconciliation_receipt_sha256"]
+        )
+        self.assertEqual(
+            first_receipt, second_receipt["supersedes_reconciliation_receipt"]
+        )
+        after = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("externally_terminal_missing", after["phase"])
+        replay = self._apply(binding, second_preview)
+        self.assertEqual("already_applied", replay["status"])
+        self.assertEqual(second_receipt["receipt_sha256"], replay["receipt"]["receipt_sha256"])
 
     def test_present_terminal_checkout_blocks_dirty_or_unsecured_head(self) -> None:
         binding = self._present_binding()
