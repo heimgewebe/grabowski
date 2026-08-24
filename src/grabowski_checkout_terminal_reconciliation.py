@@ -387,6 +387,7 @@ def _preview_state(
     snapshot = _snapshot(key)
     binding = snapshot["binding"]
     superseded_receipt_sha256: str | None = None
+    superseded_receipt: dict[str, Any] | None = None
     if existing is not None:
         existing_mode = _reconciliation_mode(existing["receipt"])
         _path, checkout_exists, path_blockers = _lexical_checkout_path_observation(
@@ -400,6 +401,7 @@ def _preview_state(
         )
         if may_follow_present_with_missing:
             superseded_receipt_sha256 = existing["receipt_sha256"]
+            superseded_receipt = existing["receipt"]
         else:
             return {
                 "schema_version": SCHEMA_VERSION,
@@ -459,6 +461,7 @@ def _preview_state(
         "blockers": sorted(set(blockers)),
         "safe_to_apply": not blockers,
         "supersedes_reconciliation_receipt_sha256": superseded_receipt_sha256,
+        "supersedes_reconciliation_receipt": superseded_receipt,
         "does_not_establish": [
             "archive_or_cleanup_authority",
             "branch_or_ref_deletion_authority",

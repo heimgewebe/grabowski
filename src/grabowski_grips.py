@@ -5139,21 +5139,27 @@ def _run_checkout_binding_terminal_apply(
             )
         except (ValueError, PermissionError, RuntimeError, OSError):
             readback = None
-        existing_receipt = (
-            readback.get("existing_receipt")
-            if isinstance(readback, dict)
-            and readback.get("status") == "already_applied"
-            and readback.get("checkout_key") == checkout_key
-            else None
+        readback_receipts: list[dict[str, Any]] = []
+        if isinstance(readback, dict) and readback.get("checkout_key") == checkout_key:
+            if readback.get("status") == "already_applied" and isinstance(
+                readback.get("existing_receipt"), dict
+            ):
+                readback_receipts.append(readback["existing_receipt"])
+            predecessor = readback.get("supersedes_reconciliation_receipt")
+            if isinstance(predecessor, dict):
+                readback_receipts.append(predecessor)
+        existing_receipt = next(
+            (
+                candidate
+                for candidate in readback_receipts
+                if candidate.get("checkout_key") == checkout_key
+                and candidate.get("owner_id") == owner_id
+                and candidate.get("preview_sha256") == expected_preview_sha256
+                and candidate.get("preview_created_at_unix") == preview_created_at_unix
+            ),
+            None,
         )
-        recovered = (
-            isinstance(existing_receipt, dict)
-            and existing_receipt.get("checkout_key") == checkout_key
-            and existing_receipt.get("owner_id") == owner_id
-            and existing_receipt.get("preview_sha256") == expected_preview_sha256
-            and existing_receipt.get("preview_created_at_unix")
-            == preview_created_at_unix
-        )
+        recovered = existing_receipt is not None
         if recovered:
             output = {
                 "schema_version": 1,

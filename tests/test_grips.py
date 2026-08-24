@@ -1474,6 +1474,57 @@ class GripFoundationTests(unittest.TestCase):
         self.assertTrue(result["output"]["readback_recovered"])
         terminal_preview.assert_called_once_with(checkout_key)
 
+    def test_checkout_binding_terminal_apply_recovers_present_receipt_from_missing_followup_preview(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {"phase": "active"},
+            "binding_after": {"phase": "completed_retained"},
+            "effects": ["lifecycle_phase_transition", "active_capacity_release"],
+            "receipt_sha256": "e" * 64,
+        }
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            side_effect=RuntimeError("audit append failed after commit"),
+        ), patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_preview",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_preview",
+                "status": "ready",
+                "checkout_key": checkout_key,
+                "safe_to_apply": True,
+                "supersedes_reconciliation_receipt_sha256": "e" * 64,
+                "supersedes_reconciliation_receipt": terminal_receipt,
+            },
+        ) as terminal_preview:
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("already_applied", result["output"]["status"])
+        self.assertTrue(result["output"]["readback_recovered"])
+        self.assertEqual(
+            "completed_retained", result["output"]["capacity_effect"]["to_phase"]
+        )
+        terminal_preview.assert_called_once_with(checkout_key)
+
     def test_checkout_binding_terminal_apply_preserves_unknown_runtime_error(self) -> None:
         checkout_key = "a" * 64
         parameters = {

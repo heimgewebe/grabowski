@@ -426,6 +426,9 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             first_sha,
             second_preview["supersedes_reconciliation_receipt_sha256"],
         )
+        self.assertEqual(
+            first_receipt, second_preview["supersedes_reconciliation_receipt"]
+        )
         second = self._apply(binding, second_preview)
         second_receipt = second["receipt"]
         self.assertEqual("missing_external", second_receipt["reconciliation_mode"])
