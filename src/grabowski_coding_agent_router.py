@@ -1867,7 +1867,7 @@ def _advisory_route_execution_contract(
             else "acceptEdits"
         )
     contract = {
-        "schema_version": 1,
+        "schema_version": 2,
         "catalog_sha256": validation["catalog_sha256"],
         "route_id": route_id,
         "harness": route["harness"],
