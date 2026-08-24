@@ -503,6 +503,93 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual(result["status"], "recorded")
         self.assertEqual(request_path.stem, result["adapter_request_sha256"])
 
+    def test_candidate_close_preserves_exact_request_and_binds_candidate_readback(self) -> None:
+        request = {
+            "schema_version": 1,
+            "operation": "close",
+            "idempotency_key": "close:candidate-alpha",
+            "candidate_id": "candidate-alpha",
+            "expected_event_id": 42,
+            "outcome": "completed",
+            "evidence": [
+                {
+                    "source": "github",
+                    "reference": "heimgewebe/weltgewebe#1786@merge",
+                    "sha256": "a" * 64,
+                },
+                {
+                    "source": "test",
+                    "reference": "web-unit:583-pass",
+                    "sha256": "b" * 64,
+                },
+            ],
+            "note": "Merged and verified.",
+        }
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "kind": "bureau_candidate_close_result",
+                "status": "closed",
+                "effect_started": True,
+                "ambiguity": False,
+            },
+        ) as invoke:
+            first = intake.grabowski_bureau_candidate_record(request)
+            second = intake.grabowski_bureau_candidate_record(request)
+
+        first_path = Path(invoke.call_args_list[0].args[0][-1])
+        second_path = Path(invoke.call_args_list[1].args[0][-1])
+        self.assertEqual(json.loads(first_path.read_text()), request)
+        self.assertEqual(first_path, second_path)
+        self.assertEqual(first["adapter_request_sha256"], second["adapter_request_sha256"])
+        self.assertEqual(
+            invoke.call_args_list[0].kwargs["required_readback"],
+            ["candidate_by_candidate_id"],
+        )
+        self.assertEqual(first["status"], "closed")
+
+    def test_candidate_close_exposes_exact_ambiguous_candidate_readback_selector(self) -> None:
+        request = {
+            "schema_version": 1,
+            "operation": "close",
+            "idempotency_key": "close:candidate-alpha",
+            "candidate_id": " candidate-alpha ",
+            "expected_event_id": 42,
+            "outcome": "completed",
+            "evidence": [
+                {
+                    "source": "receipt",
+                    "reference": "merge-receipt",
+                    "sha256": "c" * 64,
+                }
+            ],
+        }
+        failure = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_intake_adapter_failure",
+            "code": "bureau-runtime-timeout",
+            "effect_started": True,
+            "retryable": False,
+            "ambiguity": True,
+            "required_readback": ["candidate_by_candidate_id"],
+            "details": {},
+        }
+        with mock.patch.object(intake, "_invoke_bureau", return_value=failure):
+            result = intake.grabowski_bureau_candidate_record(request)
+
+        self.assertEqual(
+            result["readback_selector"],
+            {"kind": "candidate_id", "candidate_id": "candidate-alpha"},
+        )
+
+    def test_candidate_close_does_not_apply_record_only_repo_normalization(self) -> None:
+        repository = self._git_repository(
+            "close-repo", origin="git@github.com:heimgewebe/grabowski.git"
+        )
+        request = {"operation": "close", "repo": str(repository)}
+        self.assertEqual(intake._normalize_candidate_request(request), request)
+
     def test_candidate_record_normalizes_exact_heimgewebe_repo_path_before_hashing(self) -> None:
         repository = self._git_repository(
             "grabowski", origin="git@github.com:heimgewebe/grabowski.git"
