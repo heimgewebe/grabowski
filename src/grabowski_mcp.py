@@ -11233,6 +11233,32 @@ def _grip_run_core(
     dispatch_parameters.pop("session_escalation", None)
     captain_actor_identity: dict[str, Any] | None = None
     captain_intent_audit: dict[str, Any] | None = None
+    if name == "agent-execution-happy-path":
+        if ctx is None:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                "server runtime actor identity is unavailable",
+            )
+        session_profile = decision.get("session_profile")
+        actor_profile = (
+            session_profile.get("profile")
+            if isinstance(session_profile, dict)
+            else _session_profile_contract()["profile"]
+        )
+        try:
+            dispatch_parameters["_server_runtime_actor_identity"] = (
+                grabowski_merge_guard.issue_server_runtime_actor_identity(
+                    ctx.session,
+                    profile=str(actor_profile),
+                )
+            )
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                f"server runtime actor identity failed: {type(exc).__name__}",
+            )
     if name == "captain-run":
         if ctx is None:
             return grabowski_grips._blocked_surface_receipt(
