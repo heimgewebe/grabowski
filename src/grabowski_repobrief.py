@@ -217,6 +217,126 @@ def _freshness_status(snapshot_commit: object, current_head: object) -> str:
     return "fresh" if snapshot_commit == current_head else "stale"
 
 
+def _determine_candidates(
+    publication_root: Path,
+    repo_segment: str,
+    repo: Path,
+    runner: CommandRunner,
+    orientation: dict[str, Any],
+) -> tuple[list[tuple[str, Path, str]] | None, dict[str, Any] | None]:
+    canonical_root, legacy_root = _publication_roots(publication_root)
+    refs = ref_candidates(repo, runner, orientation)
+    canonical_resolution = _canonical_manifest_resolution(
+        canonical_root, repo_segment, refs
+    )
+    try:
+        canonical_paths = repoground_catalog.selected_manifest_paths(
+            canonical_resolution
+        )
+    except repoground_catalog.CatalogError as exc:
+        return None, unavailable(
+            "catalog_resolution_invalid",
+            repository=repo_segment,
+            publication_root=str(canonical_root),
+            freshness_status="publication_unavailable",
+            reason=str(exc),
+        )
+    candidates: list[tuple[str, Path, str]] = [
+        (ref, manifest_path, "canonical_publication")
+        for ref, manifest_path in canonical_paths
+    ]
+    canonical_identities = (canonical_resolution.get("aliases") or {}).get(
+        repo_segment, []
+    )
+    if not candidates and canonical_identities:
+        return None, unavailable(
+            "canonical_publication_unavailable",
+            repository=repo_segment,
+            publication_root=str(canonical_root),
+            freshness_status="publication_unavailable",
+            reason=canonical_resolution.get("reason"),
+            rejected_candidates=canonical_resolution.get("rejected", []),
+            ambiguous_candidates=canonical_resolution.get("ambiguous_candidates", []),
+        )
+    if not candidates:
+        candidates.extend(
+            (
+                ref,
+                _legacy_manifest_path(legacy_root, repo_segment, ref),
+                "legacy_repobrief_fallback",
+            )
+            for ref in refs
+        )
+    return candidates, None
+
+
+def _process_manifest_candidate(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    repo_segment: str,
+    ref: str,
+    authority: str,
+    publication_root: Path,
+    orientation: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        agent_reading_pack = sidecar_path(manifest, manifest_path, "agent_reading_pack")
+        canonical_md = sidecar_path(manifest, manifest_path, "canonical_md")
+        bundle = manifest.get("bundleManifest")
+        bundle_path = None
+        if isinstance(bundle, dict) and isinstance(bundle.get("path"), str):
+            bundle_path = str(
+                _resolve_bounded(
+                    manifest_path.parent.resolve(),
+                    bundle["path"],
+                    kind="bundleManifest",
+                )
+            )
+        elif authority == "canonical_publication":
+            bundle_path = str(manifest_path)
+    except ValueError as exc:
+        return unavailable(
+            "invalid_manifest_path",
+            repository=repo_segment,
+            ref=ref,
+            manifest_path=str(manifest_path),
+            publication_authority=authority,
+            reason=str(exc),
+        )
+    provenance = manifest.get("snapshot_provenance")
+    if not isinstance(provenance, dict):
+        provenance = manifest.get("snapshotProvenance")
+    repositories = []
+    if isinstance(provenance, dict) and isinstance(
+        provenance.get("repositories"), list
+    ):
+        repositories = [
+            item for item in provenance["repositories"] if isinstance(item, dict)
+        ]
+    snapshot_commit = repositories[0].get("git_commit") if repositories else None
+    freshness = _freshness_status(snapshot_commit, orientation.get("head"))
+    does_not_establish = manifest.get("does_not_establish")
+    if does_not_establish is None:
+        does_not_establish = manifest.get("doesNotEstablish")
+    return {
+        "available": True,
+        "status": "available",
+        "repository": repo_segment,
+        "ref": ref,
+        "publication_root": str(publication_root),
+        "publication_authority": authority,
+        "manifest_path": str(manifest_path),
+        "bundle_manifest_path": bundle_path,
+        "generated_at": manifest.get("created_at") or manifest.get("generatedAt"),
+        "snapshot_commit": snapshot_commit,
+        "current_head_matches_snapshot": freshness == "fresh",
+        "freshness_status": freshness,
+        "agent_reading_pack_path": agent_reading_pack,
+        "canonical_md_path": canonical_md,
+        "does_not_establish": does_not_establish,
+    }
+
+
 def context(
     repo: Path,
     runner: CommandRunner,
@@ -261,122 +381,38 @@ def context(
             freshness_status="publication_unavailable",
         )
 
-    canonical_root, legacy_root = _publication_roots(publication_root)
-    refs = ref_candidates(repo, runner, orientation)
-    canonical_resolution = _canonical_manifest_resolution(
-        canonical_root, repo_segment, refs
+    candidates, error = _determine_candidates(
+        publication_root, repo_segment, repo, runner, orientation
     )
-    try:
-        canonical_paths = repoground_catalog.selected_manifest_paths(
-            canonical_resolution
-        )
-    except repoground_catalog.CatalogError as exc:
-        return unavailable(
-            "catalog_resolution_invalid",
-            repository=repo_segment,
-            publication_root=str(canonical_root),
-            freshness_status="publication_unavailable",
-            reason=str(exc),
-        )
-    candidates: list[tuple[str, Path, str]] = [
-        (ref, manifest_path, "canonical_publication")
-        for ref, manifest_path in canonical_paths
-    ]
-    canonical_identities = (canonical_resolution.get("aliases") or {}).get(
-        repo_segment, []
-    )
-    if not candidates and canonical_identities:
-        return unavailable(
-            "canonical_publication_unavailable",
-            repository=repo_segment,
-            publication_root=str(canonical_root),
-            freshness_status="publication_unavailable",
-            reason=canonical_resolution.get("reason"),
-            rejected_candidates=canonical_resolution.get("rejected", []),
-            ambiguous_candidates=canonical_resolution.get("ambiguous_candidates", []),
-        )
-    if not candidates:
-        candidates.extend(
-            (
-                ref,
-                _legacy_manifest_path(legacy_root, repo_segment, ref),
-                "legacy_repobrief_fallback",
-            )
-            for ref in refs
-        )
+    if error is not None:
+        return error
+    assert candidates is not None
 
     searched: list[str] = []
     for ref, manifest_path, authority in candidates:
         searched.append(str(manifest_path))
-        manifest, error = read_manifest(manifest_path)
-        if error is not None:
-            if error["status"] == "missing":
+        manifest, read_error = read_manifest(manifest_path)
+        if read_error is not None:
+            if read_error["status"] == "missing":
                 continue
             return {
-                **error,
+                **read_error,
                 "repository": repo_segment,
                 "ref": ref,
                 "publication_authority": authority,
             }
         assert manifest is not None
-        try:
-            agent_reading_pack = sidecar_path(
-                manifest, manifest_path, "agent_reading_pack"
-            )
-            canonical_md = sidecar_path(manifest, manifest_path, "canonical_md")
-            bundle = manifest.get("bundleManifest")
-            bundle_path = None
-            if isinstance(bundle, dict) and isinstance(bundle.get("path"), str):
-                bundle_path = str(
-                    _resolve_bounded(
-                        manifest_path.parent.resolve(),
-                        bundle["path"],
-                        kind="bundleManifest",
-                    )
-                )
-            elif authority == "canonical_publication":
-                bundle_path = str(manifest_path)
-        except ValueError as exc:
-            return unavailable(
-                "invalid_manifest_path",
-                repository=repo_segment,
-                ref=ref,
-                manifest_path=str(manifest_path),
-                publication_authority=authority,
-                reason=str(exc),
-            )
-        provenance = manifest.get("snapshot_provenance")
-        if not isinstance(provenance, dict):
-            provenance = manifest.get("snapshotProvenance")
-        repositories = []
-        if isinstance(provenance, dict) and isinstance(
-            provenance.get("repositories"), list
-        ):
-            repositories = [
-                item for item in provenance["repositories"] if isinstance(item, dict)
-            ]
-        snapshot_commit = repositories[0].get("git_commit") if repositories else None
-        freshness = _freshness_status(snapshot_commit, orientation.get("head"))
-        does_not_establish = manifest.get("does_not_establish")
-        if does_not_establish is None:
-            does_not_establish = manifest.get("doesNotEstablish")
-        return {
-            "available": True,
-            "status": "available",
-            "repository": repo_segment,
-            "ref": ref,
-            "publication_root": str(publication_root),
-            "publication_authority": authority,
-            "manifest_path": str(manifest_path),
-            "bundle_manifest_path": bundle_path,
-            "generated_at": manifest.get("created_at") or manifest.get("generatedAt"),
-            "snapshot_commit": snapshot_commit,
-            "current_head_matches_snapshot": freshness == "fresh",
-            "freshness_status": freshness,
-            "agent_reading_pack_path": agent_reading_pack,
-            "canonical_md_path": canonical_md,
-            "does_not_establish": does_not_establish,
-        }
+
+        return _process_manifest_candidate(
+            manifest,
+            manifest_path,
+            repo_segment,
+            ref,
+            authority,
+            publication_root,
+            orientation,
+        )
+
     return unavailable(
         "missing",
         repository=repo_segment,
