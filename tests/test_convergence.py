@@ -144,6 +144,39 @@ class ConvergenceTests(unittest.TestCase):
         digest = hashlib.sha256(request.read_bytes()).hexdigest()
         return temporary, repo, executable, request, digest
 
+
+    def test_evaluator_invalid_json_fails_closed(self):
+        temporary, repo, executable, request, digest = self._fixture()
+        self.addCleanup(temporary.cleanup)
+        head = "a" * 40
+        class InvalidJsonRunner(FakeRunner):
+            def __call__(self, cwd: Path, argv: list[str]) -> dict[str, object]:
+                if len(argv) == 3 and argv[1] == "evaluate":
+                    return {
+                        "returncode": 0,
+                        "stdout": "not valid json\n",
+                        "stderr": "",
+                    }
+                return super().__call__(cwd, argv)
+        runner = InvalidJsonRunner(head=head)
+        with patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CONVERGENCE_PROTOCOL_REPO": str(repo),
+                "GRABOWSKI_CONVERGENCE_EXECUTABLE": str(executable),
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(convergence.ConvergenceExecutionError, "invalid JSON"):
+                convergence.assess(
+                    {
+                        "request_path": str(request),
+                        "expected_request_sha256": digest,
+                        "expected_protocol_head": head,
+                    },
+                    runner,
+                )
+
     def test_terminal_assessment_allows_closure(self):
         temporary, repo, executable, request, digest = self._fixture()
         self.addCleanup(temporary.cleanup)
