@@ -171,7 +171,10 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         pool = catalog["quota_pools"]["openrouter-ox-alpha-preview"]
         self.assertEqual(pool["marginal_cost_usd"], 0)
         self.assertEqual(pool["max_concurrency"], 1)
+        self.assertEqual(pool["freshness_seconds"], 7200)
+        self.assertFalse(pool["credits_allowed"])
         self.assertFalse(pool["payg_fallback_allowed"])
+        self.assertIn("unrelated metadata refreshes do not renew", pool["note"])
         self.assertEqual(
             pool["unknown_execution"],
             "allowed-while-fresh-zero-cost-preview",

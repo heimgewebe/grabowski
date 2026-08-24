@@ -1171,10 +1171,10 @@
         "openrouter-payg-api",
         "purchased-ai-credits"
       ],
-      "freshness_seconds": 86400,
+      "freshness_seconds": 7200,
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "note": "Stealth Ox Alpha (stealth/ox-alpha) via OpenRouter is a temporary $0 input / $0 output preview from an anonymous provider identity; prompts and completions are retained by the provider. Free-preview pricing, local OpenCode OpenRouter authentication, exact model resolution, and a zero-cost synthetic live smoke were verified on 2026-08-24 and must be revalidated within the freshness window before execution. A separate OpenCode plan-agent zero-cost live smoke also succeeded on 2026-08-24. Opaque provider quota does not by itself force advisory-only use while the $0 freshness proof is current; PAYG or credits fallback is forbidden.",
+      "note": "Stealth Ox Alpha (stealth/ox-alpha) via OpenRouter is a temporary $0 input / $0 output preview from an anonymous provider identity; prompts and completions are retained by the provider. The exact model must remain locally resolvable and the public OpenRouter model catalog must report zero for every advertised pricing field. That pool-specific price proof expires after two hours; unrelated metadata refreshes do not renew it. A zero-cost synthetic live smoke and a separate OpenCode plan-agent zero-cost live smoke also succeeded on 2026-08-24. Opaque provider quota does not by itself force advisory-only use while the $0 proof is current; PAYG or credits fallback is forbidden.",
       "payg_fallback_allowed": false,
       "quota_mode": "provider-free-preview-model",
       "reserve_floor": 0.1,

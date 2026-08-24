@@ -104,6 +104,13 @@ class CodingAgentRouterTests(unittest.TestCase):
                             "openrouter/stealth/ox-alpha",
                         ],
                     },
+                    "openrouter": {
+                        "available": True,
+                        "model_id": "stealth/ox-alpha",
+                        "price_source": "public-models-api",
+                        "zero_price_verified": True,
+                        "pricing_status": "zero",
+                    },
                     "jules": {"authenticated": True},
                     "cline": {"config": {"free_entitlement_verified": False}},
                     "ollama": {
@@ -115,10 +122,18 @@ class CodingAgentRouterTests(unittest.TestCase):
                         ]
                     },
                 },
+                "verified_quota_pools": [
+                    "grok-com",
+                    "jules-account",
+                    "opencode-free",
+                    "openrouter-ox-alpha-preview",
+                ],
             },
             "pools": {
                 "grok-com": {"verified_at": timestamp},
                 "jules-account": {"verified_at": timestamp},
+                "opencode-free": {"verified_at": timestamp},
+                "openrouter-ox-alpha-preview": {"verified_at": timestamp},
             },
             "routes": {},
             "history": {
@@ -1541,7 +1556,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             pool["unknown_execution"],
             "allowed-while-fresh-zero-cost-preview",
         )
-        self.assertIn("revalidated", pool["note"] or "")
+        self.assertIn("pool-specific price proof", pool["note"] or "")
 
     def test_ox_alpha_explicit_experimental_policy_bypasses_quality_floor_without_regrading(self) -> None:
         routes = {item["id"]: item for item in self.catalog["routes"]}
@@ -1689,7 +1704,9 @@ class CodingAgentRouterTests(unittest.TestCase):
         self,
     ) -> None:
         state = self._fresh_state()
-        state["catalog"]["observed_at"] = "2000-01-01T00:00:00Z"
+        state["pools"]["openrouter-ox-alpha-preview"]["verified_at"] = (
+            "2000-01-01T00:00:00Z"
+        )
         allowed, reasons, _, execution = router._pool_gate(
             "openrouter-ox-alpha-preview",
             self.catalog,
@@ -1699,6 +1716,33 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertFalse(execution)
         self.assertIn("stale or future-dated", reasons[0])
+
+    def test_openrouter_generic_catalog_refresh_cannot_renew_price_proof(self) -> None:
+        state = self._fresh_state()
+        state["pools"]["openrouter-ox-alpha-preview"].pop("verified_at")
+        state["catalog"]["observed_at"] = datetime.now(timezone.utc).isoformat()
+        allowed, reasons, _, execution = router._pool_gate(
+            "openrouter-ox-alpha-preview",
+            self.catalog,
+            state,
+            critical=False,
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("stale or future-dated", reasons[0])
+
+    def test_openrouter_ox_alpha_requires_current_zero_price_probe(self) -> None:
+        state = self._fresh_state()
+        state["catalog"]["providers"]["openrouter"]["zero_price_verified"] = False
+        allowed, reasons, _, execution = router._pool_gate(
+            "openrouter-ox-alpha-preview",
+            self.catalog,
+            state,
+            critical=False,
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("zero-cost evidence is missing", reasons[0])
 
     def test_controller_owned_work_has_no_scoped_writer(self) -> None:
         result = self._route("deployment")
