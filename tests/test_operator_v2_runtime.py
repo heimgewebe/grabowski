@@ -665,6 +665,76 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     result["output"]["error"],
                 )
 
+    def test_agent_execution_frontdoor_receives_server_runtime_actor_identity(self) -> None:
+        class Session:
+            pass
+
+        class RequestContext:
+            session = Session()
+
+        decision = {
+            "allowed": True,
+            "session_profile": {"profile": "trusted-owner"},
+        }
+        with (
+            patch.object(
+                grabowski_mcp.grabowski_grips,
+                "grip_required_capability",
+                return_value="terminal_execute",
+            ),
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp,
+                "_session_grip_policy_decision",
+                return_value=decision,
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_grips,
+                "grip_run",
+                return_value={"ok": True},
+            ) as run,
+        ):
+            result = grabowski_mcp.grip_run(
+                "agent-execution-happy-path",
+                {"base": "main", "title": "session actor"},
+                allow_mutation=True,
+                ctx=RequestContext(),
+            )
+
+        self.assertEqual({"ok": True}, result)
+        dispatched = run.call_args.args[1]
+        identity = dispatched["_server_runtime_actor_identity"]
+        verified = grabowski_mcp.grabowski_merge_guard.verify_server_runtime_actor_identity(
+            identity
+        )
+        self.assertTrue(verified["owner_id"].startswith("runtime-actor:"))
+
+        with (
+            patch.object(
+                grabowski_mcp.grabowski_grips,
+                "grip_required_capability",
+                return_value="terminal_execute",
+            ),
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp,
+                "_session_grip_policy_decision",
+                return_value=decision,
+            ),
+            patch.object(grabowski_mcp.grabowski_grips, "grip_run") as blocked_run,
+        ):
+            blocked = grabowski_mcp.grip_run(
+                "agent-execution-happy-path",
+                {"base": "main", "title": "session actor"},
+                allow_mutation=True,
+                ctx=None,
+            )
+        self.assertEqual("blocked", blocked["receipt"]["status"])
+        self.assertIn(
+            "server runtime actor identity is unavailable", blocked["output"]["error"]
+        )
+        blocked_run.assert_not_called()
+
     def test_high_risk_grip_requires_explicit_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

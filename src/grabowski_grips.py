@@ -6121,9 +6121,7 @@ _AGENT_EXECUTION_SOURCE_FIELDS = frozenset(
     }
 )
 _AGENT_EXECUTION_CONTINUATION_ENV = "GRABOWSKI_AEF_CONTINUATION"
-# Persisted lane identity predates model-neutral controller roles. Keep this stable
-# for replay/recovery compatibility; authority is still carried by controller_role.
-_AGENT_EXECUTION_CONTROLLER_ACTOR = "controller:chatgpt"
+_AGENT_EXECUTION_SERVER_ACTOR_FIELD = "_server_runtime_actor_identity"
 
 
 def _agent_execution_frontdoor_modules() -> tuple[Any, Any, Any, Any]:
@@ -6139,6 +6137,24 @@ def _agent_execution_job_operator() -> Any:
     import grabowski_operator_core as operator
 
     return operator
+
+
+def _agent_execution_controller_actor(parameters: dict[str, Any]) -> str:
+    identity = parameters.get(_AGENT_EXECUTION_SERVER_ACTOR_FIELD)
+    if identity is None:
+        raise GripPreflightError(
+            "mutable agent execution requires a server runtime actor identity"
+        )
+    try:
+        actor = grabowski_merge_guard.verify_server_runtime_actor_identity(identity)
+    except (TypeError, ValueError) as exc:
+        raise GripPreflightError(
+            "server runtime actor identity failed verification"
+        ) from exc
+    owner_id = actor.get("owner_id")
+    if not isinstance(owner_id, str) or not owner_id.startswith("runtime-actor:"):
+        raise GripPreflightError("server runtime actor identity has no concrete owner")
+    return owner_id
 
 
 def _agent_execution_text_parameter(
@@ -6479,6 +6495,7 @@ def _agent_execution_source_request(
             "receipt_status": "passed",
             "stop": True,
         }
+    controller_actor = _agent_execution_controller_actor(parameters)
     if route.get("executor") == "controller":
         if route.get("direct_work_required") is not True:
             raise GripPreflightError(
@@ -6487,7 +6504,7 @@ def _agent_execution_source_request(
         lane_parameters = {
             "source_kind": source_kind,
             "source_id": source_id,
-            "controller_actor": _AGENT_EXECUTION_CONTROLLER_ACTOR,
+            "controller_actor": controller_actor,
             "controller_role": "controller",
             "repo": str(repo),
             "base_head": source_revision,
@@ -6614,7 +6631,7 @@ def _agent_execution_source_request(
     lane_parameters = {
         "source_kind": source_kind,
         "source_id": source_id,
-        "controller_actor": _AGENT_EXECUTION_CONTROLLER_ACTOR,
+        "controller_actor": controller_actor,
         "controller_role": "controller",
         "scoped_writer_actor": f"scoped-writer:{route['writer_route']}",
         "repo": str(repo),
@@ -7169,6 +7186,7 @@ def _run_agent_execution_happy_path(
         "title",
         "body",
         *_AGENT_EXECUTION_SOURCE_FIELDS,
+        _AGENT_EXECUTION_SERVER_ACTOR_FIELD,
     }
     unknown = sorted(set(parameters) - allowed)
     if unknown:
