@@ -161,7 +161,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(stored["pools"], {})
         self.assertEqual(stored["catalog"], fake_probe)
         self.assertEqual(stored["catalog_sha256"], validation["catalog_sha256"])
-        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v8")
+        self.assertEqual(catalog["catalog_version"], "lane-scoped-writer-v9")
 
         status, readback = self._main(["status"])
         self.assertEqual(status, 0)
@@ -377,6 +377,17 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         digest_input = dict(probe)
         digest = digest_input.pop("catalog_probe_sha256")
         self.assertEqual(digest, cli._probe_digest(digest_input))
+
+    def test_opencode_free_entitlement_accepts_current_builtin_free_models_only(self) -> None:
+        self.assertTrue(cli._opencode_free_model_verified(["opencode/hy3-free"]))
+        self.assertTrue(cli._opencode_free_model_verified(["opencode/future:free"]))
+        self.assertFalse(
+            cli._opencode_free_model_verified(["openrouter/stealth/ox-alpha"])
+        )
+        self.assertFalse(
+            cli._opencode_free_model_verified(["openrouter/example/model:free"])
+        )
+        self.assertFalse(cli._opencode_free_model_verified(["opencode/paid-model"]))
 
     def test_state_write_lock_is_private_and_wraps_mutation(self) -> None:
         lock = self.state.parent / ".coding-agent-router-state.lock"
