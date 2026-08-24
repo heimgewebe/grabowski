@@ -2431,12 +2431,13 @@ def _local_workspace_path(raw: str | None, *, cwd: str) -> str:
     if not candidate.is_absolute():
         candidate = Path(cwd) / candidate
     resolved = Path(operator._resolve_cwd(str(candidate)))
-    for current in (resolved, *resolved.parents):
-        marker = current / ".git"
-        if marker.is_symlink():
-            continue
-        if marker.is_file() or marker.is_dir():
-            return str(current)
+    # Only Git may promote a nested workspace to an ancestor repository root.
+    # Marker-only ascent can capture unrelated or stale temporary .git state.
+    git_root = _local_git_root(str(resolved))
+    if git_root is not None:
+        marker = git_root / ".git"
+        if not marker.is_symlink() and (marker.is_file() or marker.is_dir()):
+            return str(git_root)
     return str(resolved)
 
 
