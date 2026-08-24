@@ -1801,6 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
                 "router": str(arguments.router),
                 "router_sha256": router_sha256,
                 "router_sha256_pin": str(arguments.router_sha256_file),
+                "catalog_sha256": after["catalog_sha256"],
                 "state": str(arguments.state),
                 "state_sha256_before": bytes_sha256(before_bytes),
                 "state_sha256_after_preclear": bytes_sha256(before_probe_bytes),

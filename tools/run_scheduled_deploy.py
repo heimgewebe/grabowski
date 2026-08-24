@@ -483,11 +483,58 @@ def reconcile_coding_agent_sidecars(
         applied.get("wrapper_sha256") != wrapper_sha256
         or applied.get("scheduler_sha256") != scheduler_sha256
         or applied.get("runtime_catalog_sha256") != runtime_catalog_sha256
+        or applied.get("scheduler_target") != checked.get("scheduler_target")
     ):
         raise RuntimeError("sidecar apply and check identities differ")
 
+    runtime_python_raw = applied.get("runtime_python")
+    scheduler_target_raw = checked.get("scheduler_target")
+    if not isinstance(runtime_python_raw, str) or not isinstance(scheduler_target_raw, str):
+        raise RuntimeError("sidecar scheduler execution identity is missing")
+    runtime_python = Path(runtime_python_raw)
+    scheduler_target = Path(scheduler_target_raw)
+    if (
+        not runtime_python.is_absolute()
+        or not os.access(runtime_python, os.X_OK)
+        or not scheduler_target.is_absolute()
+    ):
+        raise RuntimeError("sidecar scheduler execution identity is unsafe")
+
+    probe_receipt = _json_command(
+        [
+            str(runtime_python),
+            str(scheduler_target),
+            "--timeout-seconds",
+            "120",
+        ],
+        cwd=repo,
+        timeout=180,
+    )
+    status_readback = probe_receipt.get("status_readback")
+    probe_catalog_sha256 = _sidecar_digest(
+        probe_receipt.get("catalog_sha256"), label="probe catalog"
+    )
+    router_state_sha256 = _sidecar_digest(
+        probe_receipt.get("state_sha256_after"), label="router state"
+    )
+    if (
+        probe_receipt.get("kind") != "coding-agent-probe-scheduler-receipt"
+        or probe_receipt.get("status") != "ok"
+        or probe_receipt.get("router_sha256") != wrapper_sha256
+        or probe_catalog_sha256 != runtime_catalog_sha256
+        or probe_receipt.get("invocation_policy") != "metadata-only"
+        or probe_receipt.get("model_invocations") != 0
+        or isinstance(probe_receipt.get("model_invocations"), bool)
+        or probe_receipt.get("paid_api_requests_authorized") != 0
+        or isinstance(probe_receipt.get("paid_api_requests_authorized"), bool)
+        or not isinstance(status_readback, dict)
+        or status_readback.get("catalog_fresh") is not True
+        or status_readback.get("automatic_execution_authorized") is not False
+    ):
+        raise RuntimeError("sidecar router-state convergence receipt is invalid")
+
     material = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": SIDECAR_RECONCILIATION_KIND,
         "status": "installed",
         "repo_head": live.get("repo_head"),
@@ -495,6 +542,11 @@ def reconcile_coding_agent_sidecars(
         "wrapper_sha256": wrapper_sha256,
         "scheduler_sha256": scheduler_sha256,
         "runtime_catalog_sha256": runtime_catalog_sha256,
+        "router_state_status": "converged",
+        "router_state_sha256": router_state_sha256,
+        "probe_receipt_sha256": canonical_json_sha256(probe_receipt),
+        "probe_model_invocations": 0,
+        "probe_paid_api_requests_authorized": 0,
         "apply_receipt_sha256": canonical_json_sha256(applied),
         "check_receipt_sha256": canonical_json_sha256(checked),
         "automatic_execution_authorized": True,

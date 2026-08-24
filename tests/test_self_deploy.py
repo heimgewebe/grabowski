@@ -159,6 +159,8 @@ def _sidecar_apply_receipt() -> dict[str, object]:
         "runtime_catalog_sha256": "c" * 64,
         "wrapper_sha256": "a" * 64,
         "scheduler_sha256": "b" * 64,
+        "scheduler_target": "/tmp/coding_agent_probe_scheduler.py",
+        "runtime_python": sys.executable,
         "automatic_execution_authorized": True,
         "rollback_performed": False,
         "readback": {
@@ -176,14 +178,34 @@ def _sidecar_check_receipt() -> dict[str, object]:
         "runtime_catalog_sha256": "c" * 64,
         "wrapper_sha256": "a" * 64,
         "scheduler_sha256": "b" * 64,
+        "scheduler_target": "/tmp/coding_agent_probe_scheduler.py",
         **_sidecar_controller_contract(),
         "catalog_sha256": "c" * 64,
     }
 
 
+def _sidecar_probe_receipt(**overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "kind": "coding-agent-probe-scheduler-receipt",
+        "status": "ok",
+        "router_sha256": "a" * 64,
+        "catalog_sha256": "c" * 64,
+        "state_sha256_after": "d" * 64,
+        "status_readback": {
+            "catalog_fresh": True,
+            "automatic_execution_authorized": False,
+        },
+        "invocation_policy": "metadata-only",
+        "model_invocations": 0,
+        "paid_api_requests_authorized": 0,
+    }
+    value.update(overrides)
+    return value
+
+
 def _sidecar_reconciliation(expected: str = "f" * 40) -> dict[str, object]:
     material = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": RUNNER.SIDECAR_RECONCILIATION_KIND,
         "status": "installed",
         "repo_head": expected,
@@ -191,6 +213,13 @@ def _sidecar_reconciliation(expected: str = "f" * 40) -> dict[str, object]:
         "wrapper_sha256": "a" * 64,
         "scheduler_sha256": "b" * 64,
         "runtime_catalog_sha256": "c" * 64,
+        "router_state_status": "converged",
+        "router_state_sha256": "d" * 64,
+        "probe_receipt_sha256": RUNNER.canonical_json_sha256(
+            _sidecar_probe_receipt()
+        ),
+        "probe_model_invocations": 0,
+        "probe_paid_api_requests_authorized": 0,
         "apply_receipt_sha256": RUNNER.canonical_json_sha256(
             _sidecar_apply_receipt()
         ),
@@ -2287,15 +2316,52 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             with patch.object(
                 RUNNER,
                 "_json_command",
-                side_effect=[_sidecar_apply_receipt(), _sidecar_check_receipt()],
+                side_effect=[
+                    _sidecar_apply_receipt(),
+                    _sidecar_check_receipt(),
+                    _sidecar_probe_receipt(),
+                ],
             ) as command:
                 result = RUNNER.reconcile_coding_agent_sidecars(repo, live)
         self.assertEqual(result, _sidecar_reconciliation())
-        self.assertEqual(command.call_count, 2)
+        self.assertEqual(command.call_count, 3)
         self.assertEqual(command.call_args_list[0].args[0][-1], "--apply")
         self.assertEqual(command.call_args_list[1].args[0][-1], "--check")
-        self.assertEqual(command.call_args_list[0].kwargs["cwd"], repo)
-        self.assertEqual(command.call_args_list[1].kwargs["cwd"], repo)
+        self.assertEqual(
+            command.call_args_list[2].args[0][-2:], ["--timeout-seconds", "120"]
+        )
+        self.assertEqual(command.call_args_list[2].kwargs["timeout"], 180)
+        for call in command.call_args_list:
+            self.assertEqual(call.kwargs["cwd"], repo)
+
+    def test_sidecar_reconciliation_requires_zero_cost_catalog_bound_probe(self) -> None:
+        regressions = {
+            "scheduler skipped": {"status": "skipped-lock-busy"},
+            "catalog drift": {"catalog_sha256": "e" * 64},
+            "model invocation": {"model_invocations": 1},
+            "paid authorization": {"paid_api_requests_authorized": 1},
+            "boolean model counter": {"model_invocations": False},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            installer = repo / RUNNER.SIDECAR_INSTALLER_RELATIVE_PATH
+            installer.parent.mkdir(parents=True)
+            installer.write_text("pass\n", encoding="utf-8")
+            for label, override in regressions.items():
+                with self.subTest(label=label), patch.object(
+                    RUNNER,
+                    "_json_command",
+                    side_effect=[
+                        _sidecar_apply_receipt(),
+                        _sidecar_check_receipt(),
+                        _sidecar_probe_receipt(**override),
+                    ],
+                ):
+                    with self.assertRaises(RuntimeError):
+                        RUNNER.reconcile_coding_agent_sidecars(
+                            repo,
+                            {"release_id": "r", "repo_head": "f" * 40},
+                        )
 
     def test_sidecar_reconciliation_rejects_apply_check_digest_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -827,6 +827,7 @@ for line in sys.stdin:
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(self.initial["history"], after["history"])
         self.assertEqual("ok", receipt["status"])
+        self.assertEqual(after["catalog_sha256"], receipt["catalog_sha256"])
         self.assertTrue(receipt["status_readback"]["catalog_fresh"])
         self.assertFalse(receipt["status_readback"]["automatic_execution_authorized"])
         self.assertEqual(0, receipt["model_invocations"])
