@@ -979,10 +979,21 @@ def bounded_output_read_size(buffered_bytes: int) -> int:
     return min(IO_CHUNK_BYTES, remaining_capacity + 1)
 
 
+def bounded_step_timeout(
+    per_command_seconds: int, overall_deadline: float | None
+) -> float:
+    if overall_deadline is None:
+        return float(per_command_seconds)
+    remaining = overall_deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProbeSchedulerError("probe scheduler overall deadline exceeded")
+    return min(float(per_command_seconds), remaining)
+
+
 def collect_bounded_process_output(
     process: subprocess.Popen[bytes],
     *,
-    timeout_seconds: int,
+    timeout_seconds: float,
     command_name: str,
 ) -> tuple[bytes, bytes]:
     if process.stdout is None or process.stderr is None:
@@ -1160,7 +1171,7 @@ def collect_codex_app_server_observations(
     codex_binary: Path,
     *,
     environment: dict[str, str],
-    timeout_seconds: int,
+    timeout_seconds: float,
     state_directory: Path,
     source_codex_home: Path,
 ) -> dict[str, dict[str, Any]]:
@@ -1283,7 +1294,7 @@ def run_json_command(
     argv: list[str],
     *,
     environment: dict[str, str],
-    timeout_seconds: int,
+    timeout_seconds: float,
     pass_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     process: subprocess.Popen[bytes] | None = None
@@ -1610,6 +1621,7 @@ def parser() -> argparse.ArgumentParser:
         "--codex-sessions-root", type=Path, default=DEFAULT_CODEX_SESSIONS_ROOT
     )
     result.add_argument("--timeout-seconds", type=int, default=120)
+    result.add_argument("--overall-timeout-seconds", type=int, default=None)
     return result
 
 
@@ -1618,6 +1630,17 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.timeout_seconds < 1 or arguments.timeout_seconds > 300:
         print("timeout-seconds must be between 1 and 300", file=sys.stderr)
         return 2
+    if (
+        arguments.overall_timeout_seconds is not None
+        and not 1 <= arguments.overall_timeout_seconds <= 1800
+    ):
+        print("overall-timeout-seconds must be between 1 and 1800", file=sys.stderr)
+        return 2
+    overall_deadline = (
+        time.monotonic() + arguments.overall_timeout_seconds
+        if arguments.overall_timeout_seconds is not None
+        else None
+    )
     try:
         expected_router_sha256 = read_expected_router_sha256(
             arguments.router_sha256_file
@@ -1656,7 +1679,9 @@ def main(argv: list[str] | None = None) -> int:
                     preclear_result = run_json_command(
                         preclear_plan["argv"],
                         environment=environment,
-                        timeout_seconds=arguments.timeout_seconds,
+                        timeout_seconds=bounded_step_timeout(
+                            arguments.timeout_seconds, overall_deadline
+                        ),
                         pass_fds=(router_descriptor,),
                     )
                     before_probe, before_probe_bytes = read_json(arguments.state)
@@ -1670,7 +1695,9 @@ def main(argv: list[str] | None = None) -> int:
             probe = run_json_command(
                 [router_invocation, "probe"],
                 environment=environment,
-                timeout_seconds=arguments.timeout_seconds,
+                timeout_seconds=bounded_step_timeout(
+                    arguments.timeout_seconds, overall_deadline
+                ),
                 pass_fds=(router_descriptor,),
             )
             validate_probe(probe)
@@ -1693,7 +1720,9 @@ def main(argv: list[str] | None = None) -> int:
                     direct_observations = collect_codex_app_server_observations(
                         Path(codex_binary),
                         environment=environment,
-                        timeout_seconds=min(arguments.timeout_seconds, 30),
+                        timeout_seconds=bounded_step_timeout(
+                            min(arguments.timeout_seconds, 30), overall_deadline
+                        ),
                         state_directory=arguments.state.parent,
                         source_codex_home=Path.home() / ".codex",
                     )
@@ -1744,7 +1773,9 @@ def main(argv: list[str] | None = None) -> int:
                 quota_result = run_json_command(
                     quota_plan["argv"],
                     environment=environment,
-                    timeout_seconds=arguments.timeout_seconds,
+                    timeout_seconds=bounded_step_timeout(
+                        arguments.timeout_seconds, overall_deadline
+                    ),
                     pass_fds=(router_descriptor,),
                 )
                 next_state, next_bytes = read_json(arguments.state)
@@ -1760,7 +1791,9 @@ def main(argv: list[str] | None = None) -> int:
             status_value = run_json_command(
                 [router_invocation, "status"],
                 environment=environment,
-                timeout_seconds=arguments.timeout_seconds,
+                timeout_seconds=bounded_step_timeout(
+                    arguments.timeout_seconds, overall_deadline
+                ),
                 pass_fds=(router_descriptor,),
             )
             validate_status(status_value)
@@ -1800,6 +1833,7 @@ def main(argv: list[str] | None = None) -> int:
                 "router": str(arguments.router),
                 "router_sha256": router_sha256,
                 "router_sha256_pin": str(arguments.router_sha256_file),
+                "catalog_sha256": after["catalog_sha256"],
                 "state": str(arguments.state),
                 "state_sha256_before": bytes_sha256(before_bytes),
                 "state_sha256_after_preclear": bytes_sha256(before_probe_bytes),

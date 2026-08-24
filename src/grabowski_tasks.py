@@ -1984,14 +1984,28 @@ def _explicit_managed_cargo_target_dir(command: list[str]) -> str | None:
     return str(path)
 
 
-def _local_git_root(cwd: str) -> Path | None:
+def _git_repository_discovery_environment() -> dict[str, str]:
+    environment = operator._safe_environment()
+    return {
+        key: value
+        for key, value in environment.items()
+        if not key.upper().startswith("GIT_")
+    }
+
+
+def _local_git_root(
+    cwd: str,
+    *,
+    environment: dict[str, str] | None = None,
+) -> Path | None:
     result = operator._run(
         ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
         cwd=operator.HOME,
         timeout_seconds=5,
         max_output_bytes=4096,
+        environment=environment,
     )
-    if result.get("returncode") != 0:
+    if result.get("returncode") != 0 or result.get("timed_out") is True:
         return None
     value = str(result.get("stdout", "")).strip()
     if not value or not value.startswith("/") or "\x00" in value:
@@ -2424,6 +2438,19 @@ def _argument_value(argv: list[str], *names: str) -> str | None:
     return None
 
 
+def _git_marker_conclusively_invalid(marker: Path) -> bool:
+    try:
+        if marker.is_symlink():
+            return False
+        if marker.is_file():
+            return marker.stat().st_size == 0
+        if marker.is_dir():
+            return next(marker.iterdir(), None) is None
+    except OSError:
+        return False
+    return False
+
+
 def _local_workspace_path(raw: str | None, *, cwd: str) -> str:
     candidate = Path(cwd) if raw in {None, ""} else Path(raw).expanduser()
     if not candidate.is_absolute():
@@ -2431,10 +2458,25 @@ def _local_workspace_path(raw: str | None, *, cwd: str) -> str:
     resolved = Path(operator._resolve_cwd(str(candidate)))
     for current in (resolved, *resolved.parents):
         marker = current / ".git"
-        if marker.is_symlink():
+        if marker.is_symlink() or not (marker.is_file() or marker.is_dir()):
             continue
-        if marker.is_file() or marker.is_dir():
-            return str(current)
+        if current == resolved:
+            # A direct marker is itself enough to keep the workspace fail-closed,
+            # even when the repository metadata is currently damaged.
+            return str(resolved)
+        if _git_marker_conclusively_invalid(marker):
+            # Empty marker stubs cannot describe a Git repository and may be
+            # unrelated temporary state.  Continue looking for a real ancestor.
+            continue
+        git_root = _local_git_root(
+            str(current),
+            environment=_git_repository_discovery_environment(),
+        )
+        if git_root is None or git_root != current:
+            raise RuntimeError(
+                f"unable to validate ancestor Git workspace root: {current}"
+            )
+        return str(current)
     return str(resolved)
 
 
@@ -3038,11 +3080,13 @@ def _task_resource_keys(
 
 
 def _workspace_scope_identity(workspace: str) -> tuple[str, str]:
+    environment = _git_repository_discovery_environment()
     head_result = operator._run(
         ["git", "-C", workspace, "rev-parse", "HEAD"],
         cwd=operator.HOME,
         timeout_seconds=5,
         max_output_bytes=4096,
+        environment=environment,
     )
     raw_head = head_result.get("stdout", "").strip().lower()
     if head_result.get("returncode") == 0 and re.fullmatch(
@@ -3056,6 +3100,7 @@ def _workspace_scope_identity(workspace: str) -> tuple[str, str]:
         cwd=operator.HOME,
         timeout_seconds=5,
         max_output_bytes=4096,
+        environment=environment,
     )
     raw_branch = branch_result.get("stdout", "").strip()
     if branch_result.get("returncode") == 0 and re.fullmatch(
