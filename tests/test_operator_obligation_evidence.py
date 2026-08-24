@@ -376,6 +376,49 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual("verified", observation["status"])
         self.assertEqual(runtime_input, observation["sha256"])
 
+    def test_pytest_summary_accepts_non_failing_extra_outcomes(self) -> None:
+        self.assertEqual(
+            {(53, 0)},
+            evidence._pytest_summary_counts(
+                b"53 passed, 2 skipped, 1 warning in 0.20s\n"
+            ),
+        )
+        self.assertEqual(
+            {(53, 19)},
+            evidence._pytest_summary_counts(
+                b"53 passed, 19 subtests passed, 2 skipped, 1 xfailed in 0.20s\n"
+            ),
+        )
+        self.assertEqual(set(), evidence._pytest_summary_counts(b"52 passed, 1 failed in 0.20s\n"))
+
+    def test_legacy_collection_skips_all_adapter_io(self) -> None:
+        status = {
+            "close_schema_version": obligations.LEGACY_CLOSE_SCHEMA_VERSION,
+            "evidence": [self._stored_evidence(source="github")],
+        }
+        adapter = unittest.mock.Mock()
+        with patch.dict(evidence._SOURCE_ADAPTERS, {"github": adapter}):
+            self.assertEqual({}, evidence.collect_trusted_observations(status))
+        adapter.assert_not_called()
+
+    def test_collection_stops_at_shared_deadline(self) -> None:
+        status = {
+            "close_schema_version": obligations.CLOSE_SCHEMA_VERSION,
+            "evidence": [
+                self._stored_evidence(acceptance_id="one", source="github"),
+                self._stored_evidence(acceptance_id="two", source="github"),
+            ],
+        }
+        adapter = unittest.mock.Mock(return_value=None)
+        with patch.dict(evidence._SOURCE_ADAPTERS, {"github": adapter}), patch.object(
+            evidence.time, "monotonic", side_effect=[0.0, 11.0]
+        ):
+            observations = evidence.collect_trusted_observations(
+                status, deadline_monotonic=10.0
+            )
+        self.assertEqual({}, observations)
+        self.assertEqual(1, adapter.call_count)
+
     def test_test_adapter_binds_terminal_task_receipt_and_exact_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
@@ -623,6 +666,22 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         )
         self.assertFalse(first["verified_completion_enforcement_enabled"])
         self.assertTrue(first["rollout_threshold"]["enforcement_change_separate"])
+        self.assertEqual(
+            "source_observation_identity_only",
+            first["rollout_threshold"]["verification_scope"],
+        )
+        self.assertFalse(
+            first["rollout_threshold"]["semantic_acceptance_relevance_established"]
+        )
+        self.assertEqual(
+            evidence.MAX_ADAPTER_COLLECTION_SECONDS,
+            first["rollout_threshold"]["adapter_collection_budget_seconds"],
+        )
+        self.assertIn(
+            "semantic relevance of a verified source artifact to an acceptance condition",
+            first["does_not_establish"],
+        )
+        self.assertIn("completion correctness", first["does_not_establish"])
         self.assertEqual(first["sample_sha256"], second["sample_sha256"])
         self.assertEqual(before, after)
 

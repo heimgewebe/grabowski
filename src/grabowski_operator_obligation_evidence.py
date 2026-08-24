@@ -9,6 +9,7 @@ import re
 import sqlite3
 import stat
 import subprocess
+import time
 from typing import Any, Mapping
 
 import grabowski_operator_obligation as obligations
@@ -40,6 +41,7 @@ ROLLOUT_THRESHOLD_KIND = "grabowski.operator_obligation_evidence_rollout_thresho
 MAX_ADAPTER_FILE_BYTES = 4 * 1024 * 1024
 MAX_ADAPTER_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
 ADAPTER_COMMAND_TIMEOUT_SECONDS = 15
+MAX_ADAPTER_COLLECTION_SECONDS = 12.0
 GITHUB_PR_REFERENCE_RE = re.compile(
     r"^github-pr:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
     r"#(?P<pr>[1-9][0-9]{0,9})@(?P<head>[0-9a-f]{40})"
@@ -61,8 +63,12 @@ TEST_TASK_REFERENCE_RE = re.compile(
     r"(?P<passed>[0-9]{1,6})-passed\+(?P<subtests>[0-9]{1,6})-subtests$"
 )
 TEST_SUMMARY_RE = re.compile(
-    rb"(?m)(?P<passed>[0-9]{1,6}) passed"
-    rb"(?:, (?P<subtests>[0-9]{1,6}) subtests passed)?(?: in [^\n]+)?$"
+    rb"(?m)^(?P<passed>[0-9]{1,6}) passed"
+    rb"(?P<extras>(?:, [0-9]{1,6} (?:subtests passed|skipped|xfailed|xpassed|deselected|warnings?|reruns?))*)"
+    rb"(?: in [^\n]+)?$"
+)
+TEST_SUMMARY_EXTRA_RE = re.compile(
+    rb", (?P<count>[0-9]{1,6}) (?P<label>subtests passed|skipped|xfailed|xpassed|deselected|warnings?|reruns?)"
 )
 UNITTEST_SUMMARY_RE = re.compile(
     rb"(?m)^Ran (?P<passed>[0-9]{1,6}) tests in [^\n]+\n\nOK(?:\n|$)"
@@ -165,7 +171,10 @@ def _read_regular_bytes(path: Path, *, maximum: int) -> bytes:
 
 
 def _run_command(
-    argv: list[str], *, cwd: Path | None = None
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    deadline_monotonic: float | None = None,
 ) -> tuple[int, bytes, bytes]:
     environment = dict(os.environ)
     environment.update(
@@ -177,6 +186,12 @@ def _run_command(
             "PAGER": "cat",
         }
     )
+    timeout_seconds = float(ADAPTER_COMMAND_TIMEOUT_SECONDS)
+    if deadline_monotonic is not None:
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise EvidenceAssessmentError("trusted source adapter budget exhausted")
+        timeout_seconds = min(timeout_seconds, max(0.05, remaining))
     try:
         completed = subprocess.run(
             argv,
@@ -185,7 +200,7 @@ def _run_command(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=ADAPTER_COMMAND_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -230,7 +245,9 @@ def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _github_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+def _github_observation(
+    evidence: Mapping[str, Any], *, deadline_monotonic: float | None = None
+) -> dict[str, Any] | None:
     reference = _text(evidence.get("reference"), "reference")
     parsed = _github_reference(reference)
     if parsed is None:
@@ -246,7 +263,8 @@ def _github_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
                 str(parsed["repo"]),
                 "--json",
                 "state,isDraft,baseRefOid,headRefOid,mergeCommit,statusCheckRollup",
-            ]
+            ],
+            deadline_monotonic=deadline_monotonic,
         )
     except EvidenceAssessmentError:
         return _trusted_observation(evidence, status="stale")
@@ -298,7 +316,9 @@ def _remote_repo_slug(value: str) -> str | None:
     return match.group("repo") if match is not None else None
 
 
-def _local_git_repo(repo_slug: str) -> Path | None:
+def _local_git_repo(
+    repo_slug: str, *, deadline_monotonic: float | None = None
+) -> Path | None:
     repo_name = repo_slug.rsplit("/", 1)[-1]
     candidate = Path.home() / "repos" / repo_name
     if not candidate.is_dir():
@@ -307,6 +327,7 @@ def _local_git_repo(repo_slug: str) -> Path | None:
         returncode, stdout, _stderr = _run_command(
             ["git", "-c", "core.hooksPath=/dev/null", "remote", "get-url", "origin"],
             cwd=candidate,
+            deadline_monotonic=deadline_monotonic,
         )
     except EvidenceAssessmentError:
         return None
@@ -322,12 +343,16 @@ def _local_git_repo(repo_slug: str) -> Path | None:
     return candidate
 
 
-def _git_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+def _git_observation(
+    evidence: Mapping[str, Any], *, deadline_monotonic: float | None = None
+) -> dict[str, Any] | None:
     reference = _text(evidence.get("reference"), "reference")
     match = GIT_COMMIT_REFERENCE_RE.fullmatch(reference)
     if match is None:
         return None
-    repo = _local_git_repo(match.group("repo"))
+    repo = _local_git_repo(
+        match.group("repo"), deadline_monotonic=deadline_monotonic
+    )
     if repo is None:
         return _trusted_observation(evidence, status="stale")
     commit = match.group("commit")
@@ -335,6 +360,7 @@ def _git_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         returncode, stdout, _stderr = _run_command(
             ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "commit", commit],
             cwd=repo,
+            deadline_monotonic=deadline_monotonic,
         )
     except EvidenceAssessmentError:
         return _trusted_observation(evidence, status="stale")
@@ -350,7 +376,10 @@ def _receipt_root() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".local/state/grabowski"
 
 
-def _receipt_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+def _receipt_observation(
+    evidence: Mapping[str, Any], *, deadline_monotonic: float | None = None
+) -> dict[str, Any] | None:
+    del deadline_monotonic
     reference = _text(evidence.get("reference"), "reference")
     prefix = "grabowski-receipt:"
     if not reference.startswith(prefix):
@@ -395,7 +424,10 @@ def _deployment_manifest_path() -> Path:
     return Path.home() / ".local/share/grabowski-mcp/deployment-manifest.json"
 
 
-def _runtime_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+def _runtime_observation(
+    evidence: Mapping[str, Any], *, deadline_monotonic: float | None = None
+) -> dict[str, Any] | None:
+    del deadline_monotonic
     reference = _text(evidence.get("reference"), "reference")
     match = RUNTIME_REFERENCE_RE.fullmatch(reference)
     if match is None:
@@ -436,6 +468,18 @@ def _task_output_root() -> Path:
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".local/state/grabowski/task-output"
+
+
+def _pytest_summary_counts(stream: bytes) -> set[tuple[int, int]]:
+    summaries: set[tuple[int, int]] = set()
+    for item in TEST_SUMMARY_RE.finditer(stream):
+        subtests = 0
+        extras = item.group("extras") or b""
+        for extra in TEST_SUMMARY_EXTRA_RE.finditer(extras):
+            if extra.group("label") == b"subtests passed":
+                subtests = int(extra.group("count"))
+        summaries.add((int(item.group("passed")), subtests))
+    return summaries
 
 
 def _recognized_test_argv(argv_json: Any) -> bool:
@@ -498,7 +542,10 @@ def _test_observation_digest(
     )
 
 
-def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
+def _test_observation(
+    evidence: Mapping[str, Any], *, deadline_monotonic: float | None = None
+) -> dict[str, Any] | None:
+    del deadline_monotonic
     reference = _text(evidence.get("reference"), "reference")
     match = TEST_TASK_REFERENCE_RE.fullmatch(reference)
     if match is None:
@@ -533,11 +580,9 @@ def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         output_sha256s.append(hashlib.sha256(data).hexdigest())
     if not streams:
         return _trusted_observation(evidence, status="stale")
-    summaries = {
-        (int(item.group("passed")), int(item.group("subtests") or b"0"))
-        for stream in streams
-        for item in TEST_SUMMARY_RE.finditer(stream)
-    }
+    summaries: set[tuple[int, int]] = set()
+    for stream in streams:
+        summaries.update(_pytest_summary_counts(stream))
     summaries.update(
         (int(item.group("passed")), 0)
         for stream in streams
@@ -576,6 +621,8 @@ _SOURCE_ADAPTERS = {
 
 def collect_trusted_observations(
     status: Mapping[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Collect only server-owned source observations from strict references.
 
@@ -584,11 +631,17 @@ def collect_trusted_observations(
     therefore remains unverified.
     """
 
+    if status.get("close_schema_version") == obligations.LEGACY_CLOSE_SCHEMA_VERSION:
+        return {}
     evidence_items = status.get("evidence")
     if not isinstance(evidence_items, list):
         return {}
+    if deadline_monotonic is None:
+        deadline_monotonic = time.monotonic() + MAX_ADAPTER_COLLECTION_SECONDS
     observations: dict[str, dict[str, Any]] = {}
     for item in evidence_items:
+        if time.monotonic() >= deadline_monotonic:
+            break
         if not isinstance(item, Mapping):
             continue
         source = item.get("source")
@@ -599,7 +652,9 @@ def collect_trusted_observations(
         if adapter is None:
             continue
         try:
-            observation = adapter(item)
+            observation = adapter(
+                item, deadline_monotonic=deadline_monotonic
+            )
         except (EvidenceAssessmentError, OSError, ValueError, sqlite3.Error):
             observation = _trusted_observation(item, status="stale")
         if observation is not None:
@@ -897,6 +952,8 @@ def assess_status(
             "merge readiness",
             "deployment correctness",
             "runtime correctness",
+            "semantic relevance of a verified source artifact to an acceptance condition",
+            "completion correctness",
             "mutation authority",
         ],
     }
@@ -1025,7 +1082,11 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     selected = _select_sample_population(population, limit)
     obligation_ids = [str(item["obligation_id"]) for item in selected]
     statuses = [obligations.status_obligation(obligation_id) for obligation_id in obligation_ids]
-    observation_maps = [collect_trusted_observations(status) for status in statuses]
+    adapter_deadline = time.monotonic() + MAX_ADAPTER_COLLECTION_SECONDS
+    observation_maps = [
+        collect_trusted_observations(status, deadline_monotonic=adapter_deadline)
+        for status in statuses
+    ]
     assessments = [
         assess_status(status, observations=observations)
         for status, observations in zip(statuses, observation_maps, strict=True)
@@ -1085,6 +1146,9 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         "requires_all_acceptance_verified": True,
         "requires_all_obligations_fully_verified": True,
         "requires_zero_false_confidence_risk": True,
+        "verification_scope": "source_observation_identity_only",
+        "semantic_acceptance_relevance_established": False,
+        "adapter_collection_budget_seconds": MAX_ADAPTER_COLLECTION_SECONDS,
         "enforcement_change_separate": True,
     }
     rollout_eligible = (
@@ -1101,7 +1165,9 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     elif len(assessments) < MIN_ROLLOUT_SAMPLE:
         rollout_decision = "stop_sample_too_small"
     elif rollout_eligible:
-        rollout_decision = "eligible_for_separate_enforcement_change"
+        rollout_decision = (
+            "source_verifiability_threshold_met_separate_enforcement_review_required"
+        )
     else:
         rollout_decision = "stop_verifiability_threshold_not_met"
 
@@ -1196,6 +1262,8 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
             "permission to enforce verified completion",
             "verified completion enforcement in this change",
             "future source truth after the adapter observation",
+            "semantic relevance of a verified source artifact to an acceptance condition",
+            "completion correctness",
             "permission to rewrite legacy obligation records",
             "mutation authority",
         ],
