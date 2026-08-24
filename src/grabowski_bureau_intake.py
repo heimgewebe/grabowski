@@ -662,8 +662,18 @@ def _canonical_bureau_repo_resource(value: Any) -> str | None:
     return _bureau_repo_resource_from_origin(origins[0])
 
 
+def _candidate_request_operation(request: dict[str, Any]) -> str:
+    operation = request.get("operation")
+    return "close" if operation == "close" else "record"
+
+
 def _normalize_candidate_request(request: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(request)
+    if _candidate_request_operation(normalized) == "close":
+        # Close requests are identity/evidence bound and intentionally carry no
+        # repository selector. Preserve their bytes semantically so Bureau owns
+        # the complete close-contract validation.
+        return normalized
     resource = _canonical_bureau_repo_resource(normalized.get("repo"))
     if resource is not None:
         normalized["repo"] = resource
@@ -1166,6 +1176,7 @@ def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
     request = _normalize_candidate_request(request)
+    operation = _candidate_request_operation(request)
     raw = _canonical_json(request)
     request_id = _sha256(raw)
     request_path = _private_root() / "requests" / f"{request_id}.json"
@@ -1179,25 +1190,44 @@ def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]
             str(request_path),
         ],
         mutation=True,
-        required_readback=["candidate_by_idempotency_key"],
+        required_readback=(
+            ["candidate_by_candidate_id"]
+            if operation == "close"
+            else ["candidate_by_idempotency_key"]
+        ),
     )
     idempotency_key = request.get("idempotency_key")
+    candidate_id = request.get("candidate_id")
     required_readback = payload.get("required_readback")
-    if (
-        payload.get("ambiguity") is True
-        and isinstance(required_readback, list)
-        and "candidate_by_idempotency_key" in required_readback
-        and isinstance(idempotency_key, str)
-        and idempotency_key.strip()
-        and "\x00" not in idempotency_key
-    ):
-        payload = {
-            **payload,
-            "readback_selector": {
-                "kind": "idempotency_key",
-                "idempotency_key": idempotency_key.strip(),
-            },
-        }
+    if payload.get("ambiguity") is True and isinstance(required_readback, list):
+        if (
+            operation == "close"
+            and "candidate_by_candidate_id" in required_readback
+            and isinstance(candidate_id, str)
+            and candidate_id.strip()
+            and "\x00" not in candidate_id
+        ):
+            payload = {
+                **payload,
+                "readback_selector": {
+                    "kind": "candidate_id",
+                    "candidate_id": candidate_id.strip(),
+                },
+            }
+        elif (
+            operation != "close"
+            and "candidate_by_idempotency_key" in required_readback
+            and isinstance(idempotency_key, str)
+            and idempotency_key.strip()
+            and "\x00" not in idempotency_key
+        ):
+            payload = {
+                **payload,
+                "readback_selector": {
+                    "kind": "idempotency_key",
+                    "idempotency_key": idempotency_key.strip(),
+                },
+            }
     _audit("bureau-candidate-record", payload, request_sha256=request_id)
     return {**payload, "adapter_request_sha256": request_id}
 

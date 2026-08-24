@@ -61,6 +61,7 @@ PROBE_VERIFIABLE_QUOTA_POOLS = (
     "grok-com",
     "jules-account",
     "opencode-free",
+    "openrouter-ox-alpha-preview",
     "openhands-account",
 )
 SENSITIVE_PROBE_FIELD_TOKENS = (
