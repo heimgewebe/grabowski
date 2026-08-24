@@ -233,7 +233,7 @@ def validate_route_contract(value: Any) -> dict[str, Any]:
         or not isinstance(value["argv_prefix"], list)
         or not value["argv_prefix"]
         or any(not isinstance(item, str) or not item for item in value["argv_prefix"])
-        or value["argv_prefix"][0] not in {value["harness_binary"], "codexr"}
+        or value["argv_prefix"][0] != value["harness_binary"]
         or not isinstance(value["quota_pools"], list)
         or not value["quota_pools"]
         or type(value["paid_only"]) is not bool
@@ -241,6 +241,19 @@ def validate_route_contract(value: Any) -> dict[str, Any]:
         or value["automatic_patch_apply"] is not False
     ):
         raise CandidateError("route contract semantics are invalid")
+    if value["harness"] == "codex":
+        prefix = value["argv_prefix"]
+        try:
+            model_index = prefix.index("--model")
+        except ValueError as err:
+            raise CandidateError("Codex route contract must bind --model explicitly") from err
+        effort_setting = f'model_reasoning_effort="{value["effort"]}"'
+        if (
+            model_index + 1 >= len(prefix)
+            or prefix[model_index + 1] != value["model"]
+            or effort_setting not in prefix
+        ):
+            raise CandidateError("Codex route contract must bind model and effort explicitly")
     if value["model"] == "claude-fable-5":
         prefix = value["argv_prefix"]
         if value["paid_only"] is not True:
@@ -1029,8 +1042,8 @@ def provider_command(
         )
         if packet["provider"] == "codex":
             prefix = list(route["argv_prefix"])
-            if len(prefix) != 2 or prefix[0] != "codexr":
-                raise CandidateError("Codex route must use one codexr task profile")
+            if not prefix or prefix[0] != "codex":
+                raise CandidateError("Codex route must use the native codex CLI")
             output_schema_path = prompt_path.parent.parent / "output-schema.json"
             return (
                 prefix
@@ -1536,11 +1549,7 @@ def main(argv: list[str] | None = None) -> int:
             packet=packet,
             environment=environment,
         )
-        version_command = (
-            [executable, packet["route_contract"]["argv_prefix"][1], "--print-route"]
-            if packet["schema_version"] == 3 and packet["provider"] == "codex"
-            else [executable, "--version"]
-        )
+        version_command = [executable, "--version"]
         version_returncode, version_stdout, version_stderr, _ = run_bounded_process(
             version_command,
             executable=executable,

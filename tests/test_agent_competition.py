@@ -234,7 +234,7 @@ class AgentCompetitionTests(unittest.TestCase):
                 "harness_binary": "codex",
                 "model": "gpt-5.6-sol",
                 "effort": "high",
-                "argv_prefix": ["codexr", "architecture"],
+                "argv_prefix": ["codex", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"'],
                 "permission_mode": None,
                 "quota_pools": ["openai-agentic"],
                 "paid_only": False,
@@ -457,8 +457,7 @@ class AgentCompetitionTests(unittest.TestCase):
         }
         if manifest["schema_version"] == 3 and manifest["provider"] == "codex":
             command = [
-                "codexr",
-                manifest["route_contract"]["argv_prefix"][1],
+                *manifest["route_contract"]["argv_prefix"],
                 "exec",
                 "--sandbox",
                 "read-only",

@@ -104,7 +104,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "antigravity"
                 else ["grok", "--model", "grok-4.6"]
                 if provider == "grok"
-                else ["codexr", "architecture"]
+                else ["codex", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"']
             )
             quota_pools = (
                 ["claude-pro"]
@@ -186,7 +186,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         }
 
 
-    def test_route_bound_codex_command_uses_subscription_wrapper_read_only(self) -> None:
+    def test_route_bound_codex_command_uses_native_cli_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             root.chmod(0o700)
@@ -206,7 +206,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 max_budget_usd=0,
                 prompt_path=prompt,
             )
-        self.assertEqual(command[:3], ["codexr", "architecture", "exec"])
+        self.assertEqual(command[:6], ["codex", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"', "exec"])
         self.assertIn("read-only", command)
         self.assertIn("--ephemeral", command)
         self.assertIn("--output-schema", command)
