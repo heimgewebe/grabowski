@@ -64,6 +64,9 @@ TEST_SUMMARY_RE = re.compile(
     rb"(?m)(?P<passed>[0-9]{1,6}) passed"
     rb"(?:, (?P<subtests>[0-9]{1,6}) subtests passed)?(?: in [^\n]+)?$"
 )
+UNITTEST_SUMMARY_RE = re.compile(
+    rb"(?m)^Ran (?P<passed>[0-9]{1,6}) tests in [^\n]+\n\nOK(?:\n|$)"
+)
 GITHUB_REMOTE_RE = re.compile(
     r"github\.com(?::|/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$"
 )
@@ -343,6 +346,28 @@ def _receipt_root() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".local/state/grabowski"
 
 
+def _receipt_payload_succeeded(relative: str, payload: Mapping[str, Any]) -> bool | None:
+    if relative.startswith("grip-receipts/"):
+        return (
+            payload.get("schema_version") == 1
+            and isinstance(payload.get("kind"), str)
+            and str(payload.get("kind")).startswith("grabowski.")
+            and payload.get("state") == "complete"
+            and payload.get("error") in {None, ""}
+            and _is_sha256(payload.get("receipt_sha256"))
+        )
+    if relative.startswith("jobs/") and relative.endswith("/finalization.json"):
+        return (
+            payload.get("schema_version") == 1
+            and payload.get("kind") == "grabowski_job_finalization"
+            and payload.get("completion_status") == "complete"
+            and payload.get("final_status") == "succeeded"
+            and _is_sha256(payload.get("payload_sha256"))
+            and _is_sha256(payload.get("contract_sha256"))
+        )
+    return None
+
+
 def _receipt_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     reference = _text(evidence.get("reference"), "reference")
     prefix = "grabowski-receipt:"
@@ -363,8 +388,16 @@ def _receipt_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     try:
         data = _read_regular_bytes(path, maximum=MAX_ADAPTER_FILE_BYTES)
-    except EvidenceAssessmentError:
+        payload = json.loads(data)
+    except (EvidenceAssessmentError, UnicodeDecodeError, json.JSONDecodeError):
         return _trusted_observation(evidence, status="stale")
+    if not isinstance(payload, Mapping):
+        return _trusted_observation(evidence, status="unsupported")
+    succeeded = _receipt_payload_succeeded(relative, payload)
+    if succeeded is None:
+        return _trusted_observation(evidence, status="unsupported")
+    if not succeeded:
+        return _trusted_observation(evidence, status="mismatch")
     return _trusted_observation(
         evidence, status="verified", sha256=hashlib.sha256(data).hexdigest()
     )
@@ -420,6 +453,35 @@ def _task_output_root() -> Path:
     return Path.home() / ".local/state/grabowski/task-output"
 
 
+def _recognized_test_argv(argv_json: Any) -> bool:
+    if not isinstance(argv_json, str):
+        return False
+    try:
+        argv = json.loads(argv_json)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
+        return False
+    command = Path(argv[0]).name
+    rest = argv[1:]
+    if command == "env":
+        while rest and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", rest[0]):
+            rest = rest[1:]
+        if not rest:
+            return False
+        command = Path(rest[0]).name
+        rest = rest[1:]
+    if command in {"pytest", "py.test"}:
+        return True
+    if command.startswith("python") and len(rest) >= 2 and rest[0] == "-m" and rest[1] in {"pytest", "unittest"}:
+        return True
+    if command == "cargo" and rest and rest[0] == "test":
+        return True
+    if command in {"npm", "pnpm", "yarn"} and rest and (rest[0] == "test" or rest[0].startswith("test:")):
+        return True
+    return command in {"make", "just"} and bool(rest) and rest[0] in {"test", "tests", "check", "validate"}
+
+
 def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     reference = _text(evidence.get("reference"), "reference")
     match = TEST_TASK_REFERENCE_RE.fullmatch(reference)
@@ -430,7 +492,7 @@ def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2.0)
         try:
             row = connection.execute(
-                "SELECT attempt, state, lifecycle_receipt_sha256 FROM tasks WHERE task_id = ?",
+                "SELECT attempt, state, lifecycle_receipt_sha256, argv_json FROM tasks WHERE task_id = ?",
                 (match.group("task_id"),),
             ).fetchone()
         finally:
@@ -439,12 +501,13 @@ def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         return _trusted_observation(evidence, status="stale")
     if row is None:
         return _trusted_observation(evidence, status="stale")
-    attempt, state, lifecycle_receipt_sha256 = row
+    attempt, state, lifecycle_receipt_sha256, argv_json = row
     if (
         not isinstance(attempt, int)
         or attempt < 1
         or state != "completed"
         or not _is_sha256(lifecycle_receipt_sha256)
+        or not _recognized_test_argv(argv_json)
     ):
         return _trusted_observation(evidence, status="mismatch")
     output_dir = _task_output_root() / (
@@ -468,6 +531,11 @@ def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         for stream in streams
         for item in TEST_SUMMARY_RE.finditer(stream)
     }
+    summaries.update(
+        (int(item.group("passed")), 0)
+        for stream in streams
+        for item in UNITTEST_SUMMARY_RE.finditer(stream)
+    )
     expected = (int(match.group("passed")), int(match.group("subtests")))
     if expected not in summaries:
         return _trusted_observation(evidence, status="mismatch")
@@ -623,6 +691,12 @@ def assess_evidence_item(
             **base,
             "classification": "legacy_unverifiable" if legacy else "unverified",
             "reason": "missing_or_invalid_evidence_digest",
+        }
+    if legacy:
+        return {
+            **base,
+            "classification": "legacy_unverifiable",
+            "reason": "legacy_close_not_reverified",
         }
     if source == "user":
         return {

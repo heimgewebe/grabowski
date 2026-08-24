@@ -169,6 +169,16 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertFalse(result["fully_verified"])
         self.assertTrue(result["false_confidence_risk"])
 
+    def test_legacy_close_stays_unverifiable_even_with_matching_observation(self) -> None:
+        result = evidence.assess_status(
+            self._status(close_schema_version=obligations.LEGACY_CLOSE_SCHEMA_VERSION),
+            observations={"runtime": self._observation()},
+        )
+
+        self.assertEqual("legacy_unverifiable", result["acceptance"][0]["classification"])
+        self.assertEqual("legacy_close_not_reverified", result["acceptance"][0]["reason"])
+        self.assertFalse(result["fully_verified"])
+
     def test_human_assertion_is_unsupported_for_machine_verification(self) -> None:
         result = evidence.assess_status(
             self._status(
@@ -279,7 +289,16 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             root = Path(tmp)
             path = root / "grip-receipts" / "sample.json"
             path.parent.mkdir(mode=0o700)
-            payload = b'{"status":"passed"}\n'
+            payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "grabowski.test_receipt",
+                    "state": "complete",
+                    "error": "",
+                    "receipt_sha256": "1" * 64,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
             path.write_bytes(payload)
             path.chmod(0o600)
             digest = hashlib.sha256(payload).hexdigest()
@@ -294,6 +313,26 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         assert observation is not None
         self.assertEqual("verified", observation["status"])
         self.assertEqual(digest, observation["sha256"])
+
+    def test_receipt_adapter_rejects_private_but_unrecognized_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"GRABOWSKI_EVIDENCE_RECEIPT_ROOT": tmp}
+        ):
+            path = Path(tmp) / "grip-receipts" / "fake.json"
+            path.parent.mkdir(mode=0o700)
+            payload = b'{"status":"passed"}'
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            stored = self._stored_evidence(
+                source="receipt",
+                reference="grabowski-receipt:grip-receipts/fake.json",
+                sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            observation = evidence._receipt_observation(stored)
+
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual("mismatch", observation["status"])
 
     def test_runtime_adapter_binds_exact_active_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -344,11 +383,11 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             connection = sqlite3.connect(Path(tmp) / "tasks.sqlite3")
             try:
                 connection.execute(
-                    "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, attempt INTEGER, state TEXT, lifecycle_receipt_sha256 TEXT)"
+                    "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, attempt INTEGER, state TEXT, lifecycle_receipt_sha256 TEXT, argv_json TEXT)"
                 )
                 connection.execute(
-                    "INSERT INTO tasks VALUES (?, ?, ?, ?)",
-                    (task_id, 1, "completed", lifecycle_receipt),
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                    (task_id, 1, "completed", lifecycle_receipt, json.dumps(["env", "PYTHONDONTWRITEBYTECODE=1", "pytest", "-q"])),
                 )
                 connection.commit()
             finally:
@@ -381,6 +420,45 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             mismatch = evidence._test_observation(stored)
             assert mismatch is not None
             self.assertEqual("mismatch", mismatch["status"])
+
+    def test_test_adapter_rejects_non_test_task_even_if_output_looks_green(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_EVIDENCE_TASK_DATABASE": str(Path(tmp) / "tasks.sqlite3"),
+                "GRABOWSKI_EVIDENCE_TASK_OUTPUT_ROOT": str(Path(tmp) / "task-output"),
+            },
+        ):
+            task_id = "b" * 24
+            lifecycle_receipt = "8" * 64
+            connection = sqlite3.connect(Path(tmp) / "tasks.sqlite3")
+            try:
+                connection.execute(
+                    "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, attempt INTEGER, state TEXT, lifecycle_receipt_sha256 TEXT, argv_json TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                    (task_id, 1, "completed", lifecycle_receipt, json.dumps(["printf", "53 passed, 19 subtests passed"])),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            output = Path(tmp) / "task-output" / f".grabowski-task-output-{task_id}-a1"
+            output.mkdir(parents=True, mode=0o700)
+            (output / "stdout.log").write_text(
+                "53 passed, 19 subtests passed in 0.20s\n", encoding="utf-8"
+            )
+            (output / "stdout.log").chmod(0o600)
+            stored = self._stored_evidence(
+                source="test",
+                reference=f"grabowski-task:{task_id}:53-passed+19-subtests",
+                sha256=lifecycle_receipt,
+            )
+            observation = evidence._test_observation(stored)
+
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual("mismatch", observation["status"])
 
     def test_matching_adapter_observation_flows_through_public_assessment(self) -> None:
         stored = self._stored_evidence(
