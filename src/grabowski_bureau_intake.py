@@ -1171,7 +1171,7 @@ def _proposal_directory(proposal_id: str) -> Path:
 
 @mcp.tool(name="grabowski_bureau_candidate_record", annotations=MUTATING)
 def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]:
-    """Record or close one Bureau candidate through the canonical typed intake contract."""
+    """Record one source-bound Bureau candidate through the canonical typed intake contract."""
     operator._require_operator_mutation("terminal_execute")
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
