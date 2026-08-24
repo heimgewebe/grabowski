@@ -595,6 +595,18 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         )
         self.assertFalse(first["verified_completion_enforcement_enabled"])
         self.assertTrue(first["rollout_threshold"]["enforcement_change_separate"])
+        self.assertEqual(
+            "source_observation_identity_only",
+            first["rollout_threshold"]["verification_scope"],
+        )
+        self.assertFalse(
+            first["rollout_threshold"]["semantic_acceptance_relevance_established"]
+        )
+        self.assertIn(
+            "semantic relevance of a verified source artifact to an acceptance condition",
+            first["does_not_establish"],
+        )
+        self.assertIn("completion correctness", first["does_not_establish"])
         self.assertEqual(first["sample_sha256"], second["sample_sha256"])
         self.assertEqual(before, after)
 

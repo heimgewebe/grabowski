@@ -876,6 +876,8 @@ def assess_status(
             "merge readiness",
             "deployment correctness",
             "runtime correctness",
+            "semantic relevance of a verified source artifact to the acceptance condition",
+            "completion correctness",
             "mutation authority",
         ],
     }
@@ -1064,6 +1066,8 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         "requires_all_acceptance_verified": True,
         "requires_all_obligations_fully_verified": True,
         "requires_zero_false_confidence_risk": True,
+        "verification_scope": "source_observation_identity_only",
+        "semantic_acceptance_relevance_established": False,
         "enforcement_change_separate": True,
     }
     rollout_eligible = (
@@ -1080,7 +1084,9 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     elif len(assessments) < MIN_ROLLOUT_SAMPLE:
         rollout_decision = "stop_sample_too_small"
     elif rollout_eligible:
-        rollout_decision = "eligible_for_separate_enforcement_change"
+        rollout_decision = (
+            "source_verifiability_threshold_met_separate_enforcement_review_required"
+        )
     else:
         rollout_decision = "stop_verifiability_threshold_not_met"
 
@@ -1175,6 +1181,8 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
             "permission to enforce verified completion",
             "verified completion enforcement in this change",
             "future source truth after the adapter observation",
+            "semantic relevance of a verified source artifact to an acceptance condition",
+            "completion correctness",
             "permission to rewrite legacy obligation records",
             "mutation authority",
         ],
