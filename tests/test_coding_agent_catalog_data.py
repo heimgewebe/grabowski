@@ -148,13 +148,13 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
 
         self.assertTrue(reviewer["review_only"])
         self.assertTrue(reviewer["critical_eligible"])
-        self.assertTrue(reviewer["primary_review_authority"])
+        self.assertFalse(reviewer.get("primary_review_authority", False))
         self.assertTrue(reviewer["experimental_quality_floor_bypass"])
         self.assertEqual(set(reviewer["forbidden_risk_flags"]), expected_private_flags)
         self.assertEqual(set(reviewer["required_any_risk_flags"]), expected_safe_flags)
         self.assertEqual(
             catalog["policy"]["direct_work_policy"]["primary_review_route_exceptions"],
-            ["opencode-openrouter-ox-alpha-review-preview"],
+            [],
         )
         self.assertIn("--agent", reviewer["argv_prefix"])
         self.assertIn("plan", reviewer["argv_prefix"])
@@ -171,7 +171,10 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         pool = catalog["quota_pools"]["openrouter-ox-alpha-preview"]
         self.assertEqual(pool["marginal_cost_usd"], 0)
         self.assertEqual(pool["max_concurrency"], 1)
+        self.assertEqual(pool["freshness_seconds"], 7200)
+        self.assertFalse(pool["credits_allowed"])
         self.assertFalse(pool["payg_fallback_allowed"])
+        self.assertIn("unrelated metadata refreshes do not renew", pool["note"])
         self.assertEqual(
             pool["unknown_execution"],
             "allowed-while-fresh-zero-cost-preview",
