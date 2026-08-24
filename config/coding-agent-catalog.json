@@ -730,7 +730,9 @@
       "single_mutating_writer_scope": "overlapping-resource-lane",
       "controller_integration_required": true,
       "operator_ownership_semantics": "controller-accountability-not-exclusive-execution",
-      "primary_review_route_exceptions": []
+      "primary_review_route_exceptions": [
+        "opencode-openrouter-ox-alpha-review-preview"
+      ]
     },
     "effort_levels": {
       "high": 2,
@@ -760,7 +762,7 @@
       "benchmark_prior_not_local_truth": true,
       "escalation_route": "codex-sol-xhigh",
       "opus_role": "Upper-frontier Anthropic reviewer plus escalation-only scoped writer for architecture, deep-debug, migration and difficult complex-patch work through the shared Claude Pro baseline; Sonnet remains the routine Claude writer, Codex Sol remains the canonical top escalation, and Opus writer results require independent review.",
-      "principle": "The controller owns integration, merge, deployment, closeout and the final review verdict. Explicitly lane-bound scoped writers may implement and publish PRs. External reviewers may cover all catalogued review classes, including critical and security review, but remain advisory until controller verification.",
+      "principle": "The controller owns integration, merge, deployment and closeout. Explicitly lane-bound scoped writers may implement and publish PRs. Reviewers are advisory by default; explicitly catalogued primary-review exceptions may own the substantive review verdict while controller process authority remains unchanged.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
         "codex-sol-high"
@@ -1171,10 +1173,10 @@
         "openrouter-payg-api",
         "purchased-ai-credits"
       ],
-      "freshness_seconds": 7200,
+      "freshness_seconds": 86400,
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "note": "Stealth Ox Alpha (stealth/ox-alpha) via OpenRouter is a temporary $0 input / $0 output preview from an anonymous provider identity; prompts and completions are retained by the provider. The exact model must remain locally resolvable and the public OpenRouter model catalog must report zero for every advertised pricing field. That pool-specific price proof expires after two hours; unrelated metadata refreshes do not renew it. A zero-cost synthetic live smoke and a separate OpenCode plan-agent zero-cost live smoke also succeeded on 2026-08-24. Opaque provider quota does not by itself force advisory-only use while the $0 proof is current; PAYG or credits fallback is forbidden.",
+      "note": "Stealth Ox Alpha (stealth/ox-alpha) via OpenRouter is a temporary $0 input / $0 output preview from an anonymous provider identity; prompts and completions are retained by the provider. Free-preview pricing, local OpenCode OpenRouter authentication, exact model resolution, and a zero-cost synthetic live smoke were verified on 2026-08-24 and must be revalidated within the freshness window before execution. A separate OpenCode plan-agent zero-cost live smoke also succeeded on 2026-08-24. Opaque provider quota does not by itself force advisory-only use while the $0 freshness proof is current; PAYG or credits fallback is forbidden.",
       "payg_fallback_allowed": false,
       "quota_mode": "provider-free-preview-model",
       "reserve_floor": 0.1,
@@ -1275,11 +1277,8 @@
     },
     {
       "argv_prefix": [
-        "codex",
-        "--model",
-        "gpt-5.6-luna",
-        "-c",
-        "model_reasoning_effort=\"low\""
+        "codexr",
+        "mechanical"
       ],
       "base_quality_rank": 62,
       "burn_weight": 0.4,
@@ -1308,11 +1307,8 @@
     },
     {
       "argv_prefix": [
-        "codex",
-        "--model",
-        "gpt-5.6-luna",
-        "-c",
-        "model_reasoning_effort=\"high\""
+        "codexr",
+        "fast-high"
       ],
       "base_quality_rank": 75,
       "burn_weight": 0.8,
@@ -1352,11 +1348,8 @@
     },
     {
       "argv_prefix": [
-        "codex",
-        "--model",
-        "gpt-5.6-terra",
-        "-c",
-        "model_reasoning_effort=\"medium\""
+        "codexr",
+        "bounded-patch"
       ],
       "base_quality_rank": 76,
       "burn_weight": 1.0,
@@ -1399,11 +1392,8 @@
     },
     {
       "argv_prefix": [
-        "codex",
-        "--model",
-        "gpt-5.6-terra",
-        "-c",
-        "model_reasoning_effort=\"high\""
+        "codexr",
+        "bounded-patch-high"
       ],
       "base_quality_rank": 86,
       "burn_weight": 1.4,
@@ -1445,11 +1435,8 @@
     },
     {
       "argv_prefix": [
-        "codex",
-        "--model",
-        "gpt-5.6-sol",
-        "-c",
-        "model_reasoning_effort=\"high\""
+        "codexr",
+        "architecture"
       ],
       "base_quality_rank": 100,
       "burn_weight": 2.0,
@@ -1493,11 +1480,8 @@
     },
     {
       "argv_prefix": [
-        "codex",
-        "--model",
-        "gpt-5.6-sol",
-        "-c",
-        "model_reasoning_effort=\"medium\""
+        "codexr",
+        "complex-medium"
       ],
       "base_quality_rank": 88,
       "burn_weight": 1.25,
@@ -1535,11 +1519,8 @@
     },
     {
       "argv_prefix": [
-        "codex",
-        "--model",
-        "gpt-5.6-sol",
-        "-c",
-        "model_reasoning_effort=\"xhigh\""
+        "codexr",
+        "security"
       ],
       "base_quality_rank": 100,
       "burn_weight": 3.2,
@@ -2579,6 +2560,7 @@
         "security-review"
       ],
       "tier": "critical",
+      "primary_review_authority": true,
       "forbidden_risk_flags": [
         "user_data",
         "secrets",

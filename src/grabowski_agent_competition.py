@@ -272,15 +272,8 @@ def _validate_route_contract(value: Any) -> dict[str, Any]:
         raise AgentCompetitionError("route contract shape is invalid")
     observed = value["route_contract_sha256"]
     unsigned = {key: item for key, item in value.items() if key != "route_contract_sha256"}
-    legacy_codexr = (
-        value["schema_version"] == 1
-        and value["harness"] == "codex"
-        and isinstance(value["argv_prefix"], list)
-        and bool(value["argv_prefix"])
-        and value["argv_prefix"][0] == "codexr"
-    )
     if (
-        value["schema_version"] not in (1, 2)
+        value["schema_version"] != 1
         or not isinstance(observed, str)
         or SHA256_RE.fullmatch(observed) is None
         or observed != _sha256_json(unsigned)
@@ -296,10 +289,7 @@ def _validate_route_contract(value: Any) -> dict[str, Any]:
         or not isinstance(value["argv_prefix"], list)
         or not value["argv_prefix"]
         or any(not isinstance(item, str) or not item for item in value["argv_prefix"])
-        or (
-            value["argv_prefix"][0] != value["harness_binary"]
-            and not legacy_codexr
-        )
+        or value["argv_prefix"][0] not in {value["harness_binary"], "codexr"}
         or not isinstance(value["quota_pools"], list)
         or not value["quota_pools"]
         or any(not isinstance(item, str) or not item for item in value["quota_pools"])
@@ -308,19 +298,6 @@ def _validate_route_contract(value: Any) -> dict[str, Any]:
         or value["automatic_patch_apply"] is not False
     ):
         raise AgentCompetitionError("route contract semantics are invalid")
-    if value["schema_version"] == 2 and value["harness"] == "codex":
-        prefix = value["argv_prefix"]
-        try:
-            model_index = prefix.index("--model")
-        except ValueError as err:
-            raise AgentCompetitionError("Codex route contract must bind --model explicitly") from err
-        effort_setting = f'model_reasoning_effort="{value["effort"]}"'
-        if (
-            model_index + 1 >= len(prefix)
-            or prefix[model_index + 1] != value["model"]
-            or effort_setting not in prefix
-        ):
-            raise AgentCompetitionError("Codex route contract must bind model and effort explicitly")
     if value["model"] == "claude-fable-5":
         prefix = value["argv_prefix"]
         if value["paid_only"] is not True:
@@ -1496,14 +1473,12 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
         if command[0] != route_contract["argv_prefix"][0]:
             raise AgentCompetitionError("candidate receipt command does not match route executable")
         if receipt["provider"] == "codex":
-            prefix = route_contract["argv_prefix"]
             sandbox_indexes = [
                 index for index, item in enumerate(command) if item == "--sandbox"
             ]
             if (
-                command[: len(prefix)] != prefix
-                or len(command) <= len(prefix)
-                or command[len(prefix)] != "exec"
+                command[:3]
+                != ["codexr", route_contract["argv_prefix"][1], "exec"]
                 or len(sandbox_indexes) != 1
                 or sandbox_indexes[0] + 1 >= len(command)
                 or command[sandbox_indexes[0] + 1] != "read-only"
@@ -1579,19 +1554,12 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
                 )
         elif receipt["provider"] == "opencode":
             prefix = route_contract["argv_prefix"]
-            agent_index = prefix.index("--agent") if "--agent" in prefix else -1
-            plan_agent_mode = (
-                agent_index >= 0
-                and agent_index + 1 < len(prefix)
-                and prefix[agent_index + 1] == "plan"
-            )
-            execution_mode_ok = ("--auto" in prefix) != plan_agent_mode
             if (
                 command[: len(prefix)] != prefix
                 or len(command) != len(prefix) + 1
                 or command[1] != "run"
                 or "--pure" not in command
-                or not execution_mode_ok
+                or "--auto" not in command
                 or "--format" not in command
                 or command[command.index("--format") + 1] != "json"
                 or not isinstance(command[-1], str)
@@ -2049,7 +2017,7 @@ def grabowski_agent_execution_route(
             provider
             for provider in ROUTABLE_EXTERNAL_PROVIDERS
             if (
-                (provider == "codex" and shutil.which("codex"))
+                (provider == "codex" and (shutil.which("codex") or shutil.which("codexr")))
                 or (provider == "antigravity" and shutil.which("agy"))
                 or (provider not in {"codex", "antigravity"} and shutil.which(provider))
             )
