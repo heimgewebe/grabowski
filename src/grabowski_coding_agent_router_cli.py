@@ -5,9 +5,11 @@ import base64
 import binascii
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
 import hmac
+import http.client
 import json
 import math
 import os
@@ -21,12 +23,18 @@ import sys
 import tempfile
 import time
 from typing import Any
+import urllib.error
+import urllib.request
 
 import grabowski_coding_agent_router as router
 
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 MAX_GROK_AUTH_BYTES = 128 * 1024
 COMMAND_TIMEOUT_SECONDS = 20
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+OPENROUTER_OX_ALPHA_MODEL = "stealth/ox-alpha"
+OPENROUTER_OX_ALPHA_OPENCODE_MODEL = "openrouter/stealth/ox-alpha"
+MAX_OPENROUTER_MODELS_BYTES = 8 * 1024 * 1024
 PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v3"
 PROBE_DIGEST_FIELDS = (
     "schema_version",
@@ -42,6 +50,7 @@ PROBE_VERIFIABLE_QUOTA_POOLS = (
     "grok-com",
     "jules-account",
     "opencode-free",
+    "openrouter-ox-alpha-preview",
     "openhands-account",
 )
 SENSITIVE_PROBE_FIELD_TOKENS = (
@@ -642,6 +651,69 @@ def _opencode_free_model_verified(models: list[str]) -> bool:
     )
 
 
+def _openrouter_ox_alpha_price_status() -> dict[str, Any]:
+    base = {
+        "available": False,
+        "model_id": None,
+        "price_source": "public-models-api",
+        "zero_price_verified": False,
+        "pricing_status": "unavailable",
+    }
+    request = urllib.request.Request(
+        OPENROUTER_MODELS_URL,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "grabowski-coding-agent-probe/1",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=COMMAND_TIMEOUT_SECONDS) as response:
+            payload = response.read(MAX_OPENROUTER_MODELS_BYTES + 1)
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
+        return base
+    if len(payload) > MAX_OPENROUTER_MODELS_BYTES:
+        return {**base, "pricing_status": "response-too-large"}
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {**base, "pricing_status": "invalid-response"}
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("data"), list):
+        return {**base, "pricing_status": "invalid-response"}
+    matches = [
+        item
+        for item in decoded["data"]
+        if isinstance(item, dict) and item.get("id") == OPENROUTER_OX_ALPHA_MODEL
+    ]
+    if len(matches) != 1:
+        return {**base, "available": True, "pricing_status": "model-not-unique"}
+    pricing = matches[0].get("pricing")
+    if not isinstance(pricing, dict) or not {"prompt", "completion"}.issubset(pricing):
+        return {
+            **base,
+            "available": True,
+            "model_id": OPENROUTER_OX_ALPHA_MODEL,
+            "pricing_status": "pricing-incomplete",
+        }
+
+    def zero_price(value: Any) -> bool:
+        if isinstance(value, bool) or value is None:
+            return False
+        try:
+            return Decimal(str(value)) == Decimal("0")
+        except (InvalidOperation, ValueError):
+            return False
+
+    verified = bool(pricing) and all(zero_price(value) for value in pricing.values())
+    return {
+        **base,
+        "available": True,
+        "model_id": OPENROUTER_OX_ALPHA_MODEL,
+        "zero_price_verified": verified,
+        "pricing_status": "zero" if verified else "nonzero-or-unknown",
+    }
+
+
 def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     harnesses = _binary_versions(catalog)
     providers: dict[str, Any] = {}
@@ -692,6 +764,17 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         "models": opencode_models,
         "free_model_verified": _opencode_free_model_verified(opencode_models),
     }
+    providers["openrouter"] = (
+        _openrouter_ox_alpha_price_status()
+        if OPENROUTER_OX_ALPHA_OPENCODE_MODEL in opencode_models
+        else {
+            "available": False,
+            "model_id": None,
+            "price_source": "public-models-api",
+            "zero_price_verified": False,
+            "pricing_status": "local-model-unavailable",
+        }
+    )
     openhands_auth = _openhands_subscription_auth_status()
     providers["openhands"] = {
         "available": harnesses.get("openhands", {}).get("available") is True,
@@ -790,6 +873,12 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         verified_quota_pools.append("jules-account")
     if providers["opencode"].get("free_model_verified") is True:
         verified_quota_pools.append("opencode-free")
+    if (
+        OPENROUTER_OX_ALPHA_OPENCODE_MODEL in providers["opencode"].get("models", [])
+        and providers["openrouter"].get("model_id") == OPENROUTER_OX_ALPHA_MODEL
+        and providers["openrouter"].get("zero_price_verified") is True
+    ):
+        verified_quota_pools.append("openrouter-ox-alpha-preview")
     if providers["openhands"].get("authenticated") is True:
         verified_quota_pools.append("openhands-account")
     body = {

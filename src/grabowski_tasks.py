@@ -290,6 +290,8 @@ if returncode < 0:
     signum = -returncode
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
+if returncode == 1 and command and os.path.basename(command[0]) == "rg":
+    returncode = 0
 raise SystemExit(returncode)
 """.strip()
 TASK_OUTPUT_REMOTE_READ_CODE = r"""

@@ -967,6 +967,28 @@ for line in sys.stdin:
         ):
             SCHEDULER.validate_state_after_probe(before, tampered, probe)
 
+    def test_probe_validation_accepts_ox_preview_verified_pool(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {
+                "openrouter": {
+                    "available": True,
+                    "model_id": "stealth/ox-alpha",
+                    "price_source": "public-models-api",
+                    "zero_price_verified": True,
+                    "pricing_status": "zero",
+                }
+            },
+            "verified_quota_pools": ["openrouter-ox-alpha-preview"],
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
+        SCHEDULER.validate_probe(probe)
+
     def test_probe_validation_accepts_all_canonical_verified_pools(self) -> None:
         probe = {
             "schema_version": 2,
