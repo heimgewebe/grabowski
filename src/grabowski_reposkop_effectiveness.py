@@ -1687,6 +1687,56 @@ def _raw_records(
     }
 
 
+def _review_scope_complete(
+    records: list[dict[str, Any]],
+    *,
+    evaluation: str,
+    requested_audit_refs: set[str],
+) -> bool:
+    available_refs = {
+        str(record["_audit_ref"])
+        for record in records
+        if isinstance(record.get("_audit_ref"), str)
+    }
+    if not requested_audit_refs <= available_refs:
+        return False
+    evaluation_records = [
+        record
+        for record in records
+        if record.get("evaluation_id") == evaluation
+        or record.get("transaction_id") == evaluation
+    ]
+    decisions = [
+        record
+        for record in evaluation_records
+        if record.get("operation") == "reposkop-decision-applied"
+        and record.get("_audit_ref") in requested_audit_refs
+    ]
+    for decision in decisions:
+        if decision.get("reposkop_cohort") == "prospective_control":
+            return True
+        requested_ref = decision.get("requested_audit_ref")
+        if not isinstance(requested_ref, str):
+            completed_ref = decision.get("completed_audit_ref")
+            completed = next(
+                (
+                    record
+                    for record in evaluation_records
+                    if record.get("operation") == "reposkop-evaluation-completed"
+                    and record.get("_audit_ref") == completed_ref
+                ),
+                None,
+            )
+            requested_ref = (completed or {}).get("requested_audit_ref")
+        if isinstance(requested_ref, str) and any(
+            record.get("operation") == "reposkop-evaluation-requested"
+            and record.get("_audit_ref") == requested_ref
+            for record in evaluation_records
+        ):
+            return True
+    return False
+
+
 def _review_records(
     *,
     evaluation: str,
@@ -1703,64 +1753,61 @@ def _review_records(
             since_unix=0,
             requested_scan_limit=MAX_SCAN_LIMIT,
         )
+        requested_audit_refs = {
+            reference
+            for reference in evidence_refs
+            if reference.startswith("audit-record-sha256:")
+        }
+        selected = [
+            record
+            for record in indexed_records
+            if (
+                record.get("_audit_ref") in evidence_refs
+                or record.get("evaluation_id") == evaluation
+                or record.get("transaction_id") == evaluation
+            )
+        ]
         if (
             indexed_source.get("index_complete") is True
-            and indexed_source.get("since_truncated") is not True
+            and _review_scope_complete(
+                selected,
+                evaluation=evaluation,
+                requested_audit_refs=requested_audit_refs,
+            )
         ):
-            indexed_refs = {
-                str(record["_audit_ref"])
-                for record in indexed_records
-                if isinstance(record.get("_audit_ref"), str)
+            return selected, {
+                "chain_content_sha256": indexed_source.get("chain_content_sha256"),
+                "chain_materialization_sha256": indexed_source.get(
+                    "chain_materialization_sha256"
+                ),
+                "total_records": indexed_source.get("total_records"),
+                "scanned_records": indexed_source.get(
+                    "incremental_scanned_records", 0
+                ),
+                "retained_records": len(selected),
+                "scan_limit": MAX_SCAN_LIMIT,
+                "scan_truncated": False,
+                "lookup_mode": "verified_incremental_effectiveness_index",
+                "index_complete": True,
+                "scope_complete": True,
+                "retention_truncated": indexed_source.get(
+                    "retention_truncated", False
+                ),
             }
-            requested_audit_refs = {
-                reference
-                for reference in evidence_refs
-                if reference.startswith("audit-record-sha256:")
-            }
-            if requested_audit_refs <= indexed_refs:
-                selected = [
-                    record
-                    for record in indexed_records
-                    if (
-                        record.get("_audit_ref") in evidence_refs
-                        or record.get("evaluation_id") == evaluation
-                        or record.get("transaction_id") == evaluation
-                    )
-                ]
-                return selected, {
-                    "chain_content_sha256": indexed_source.get("chain_content_sha256"),
-                    "chain_materialization_sha256": indexed_source.get(
-                        "chain_materialization_sha256"
-                    ),
-                    "total_records": indexed_source.get("total_records"),
-                    "scanned_records": indexed_source.get(
-                        "incremental_scanned_records", 0
-                    ),
-                    "retained_records": len(selected),
-                    "scan_limit": MAX_SCAN_LIMIT,
-                    "scan_truncated": False,
-                    "lookup_mode": "verified_incremental_effectiveness_index",
-                    "index_complete": True,
-                }
 
-    # Compatibility fallback for corroborating audit references outside the
-    # Reposkop effectiveness operation set. It deliberately retains the old
-    # bounded full-chain contract and therefore fails closed when such external
-    # evidence cannot be verified within the configured review window.
+    # Fallback to a bounded newest-to-oldest scan. Completeness is scoped to
+    # this evaluation: once its first bound event and every requested audit
+    # reference have been seen, older global history cannot contain a later
+    # review for the same evaluation.
     snapshot = audit_query.capture_verified_audit_snapshot()
-    if snapshot.total_records > scan_limit:
-        return [], {
-            "chain_content_sha256": snapshot.chain_content_sha256,
-            "chain_materialization_sha256": snapshot.chain_materialization_sha256,
-            "total_records": snapshot.total_records,
-            "scanned_records": 0,
-            "retained_records": 0,
-            "scan_limit": scan_limit,
-            "scan_truncated": True,
-            "lookup_mode": "bounded_verified_audit_fallback",
-        }
+    requested_audit_refs = {
+        reference
+        for reference in evidence_refs
+        if reference.startswith("audit-record-sha256:")
+    }
     selected: list[dict[str, Any]] = []
     scanned = 0
+    scope_complete = False
     for segment in reversed(snapshot.segments):
         data = audit_query._load_snapshot_segment(segment)
         lines = data.splitlines()
@@ -1769,6 +1816,8 @@ def _review_records(
                 "verified audit segment changed during Reposkop review scan"
             )
         for raw_line in reversed(lines):
+            if scanned >= scan_limit:
+                break
             scanned += 1
             parsed = json.loads(raw_line.decode("utf-8"))
             if not isinstance(parsed, dict):
@@ -1783,6 +1832,16 @@ def _review_records(
                 or parsed.get("transaction_id") == evaluation
             ):
                 selected.append({**parsed, "_audit_ref": audit_ref})
+            scope_complete = _review_scope_complete(
+                selected,
+                evaluation=evaluation,
+                requested_audit_refs=requested_audit_refs,
+            )
+            if scope_complete:
+                break
+        if scope_complete or scanned >= scan_limit:
+            break
+    exhaustive = scanned >= snapshot.total_records
     return selected, {
         "chain_content_sha256": snapshot.chain_content_sha256,
         "chain_materialization_sha256": snapshot.chain_materialization_sha256,
@@ -1790,8 +1849,9 @@ def _review_records(
         "scanned_records": scanned,
         "retained_records": len(selected),
         "scan_limit": scan_limit,
-        "scan_truncated": False,
-        "lookup_mode": "bounded_verified_audit_fallback",
+        "scan_truncated": not (scope_complete or exhaustive),
+        "lookup_mode": "verified_bounded_reverse_review_scope",
+        "scope_complete": scope_complete,
     }
 
 
