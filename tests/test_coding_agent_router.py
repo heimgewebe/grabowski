@@ -824,7 +824,9 @@ class CodingAgentRouterTests(unittest.TestCase):
                 )
 
         security = self._route(
-            "security-review", duration_minutes=120, risk_flags=["security-sensitive"]
+            "security-review",
+            duration_minutes=120,
+            risk_flags=["security-sensitive", "public-context"],
         )
         self.assertEqual(security["decision"], "controller")
         self.assertEqual(security["primary_role"], "external-primary-reviewer")
@@ -921,7 +923,9 @@ class CodingAgentRouterTests(unittest.TestCase):
             "reset_at": "2099-01-01T00:00:00Z",
         }
         self._write_state()
-        fallback_review = self._route("independent-review")
+        fallback_review = self._route(
+            "independent-review", risk_flags=["public-context"]
+        )
         self.assertEqual(fallback_review["decision"], "controller")
         self.assertEqual(fallback_review["primary_role"], "external-primary-reviewer")
         self.assertTrue(fallback_review["reviewers"])
@@ -1103,7 +1107,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                 "openai",
             )
         for task_class in ("critical-review", "security-review"):
-            review = self._route(task_class)
+            review = self._route(task_class, risk_flags=["public-context"])
             self.assertEqual(review["decision"], "controller")
             self.assertEqual(review["primary_role"], "external-primary-reviewer")
             self.assertTrue(review["direct_review_required"])
@@ -1510,6 +1514,8 @@ class CodingAgentRouterTests(unittest.TestCase):
             "user_data", "secrets", "private-context", "customer-data", "credential",
         }
         self.assertEqual(set(writer["forbidden_risk_flags"]), expected_private_flags)
+        expected_safe_flags = {"public-context", "synthetic-context", "non-sensitive-context"}
+        self.assertEqual(set(writer["required_any_risk_flags"]), expected_safe_flags)
 
         reviewer_capabilities = router._route_capabilities(reviewer, self.catalog)
         self.assertEqual(reviewer_capabilities["route_role"], "reviewer")
@@ -1519,6 +1525,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(reviewer["primary_review_authority"])
         self.assertTrue(reviewer["experimental_quality_floor_bypass"])
         self.assertEqual(set(reviewer["forbidden_risk_flags"]), expected_private_flags)
+        self.assertEqual(set(reviewer["required_any_risk_flags"]), expected_safe_flags)
         self.assertIn("--agent", reviewer["argv_prefix"])
         self.assertIn("plan", reviewer["argv_prefix"])
         self.assertNotIn("--auto", reviewer["argv_prefix"])
@@ -1560,7 +1567,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             changed_files=20,
             duration_minutes=180,
             novelty="high",
-            risk_flags=[],
+            risk_flags=["synthetic-context"],
             latency_priority=False,
             reviewer=False,
             previous_group=None,
@@ -1580,7 +1587,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             changed_files=20,
             duration_minutes=180,
             novelty="high",
-            risk_flags=[],
+            risk_flags=["public-context"],
             latency_priority=False,
             reviewer=True,
             previous_group="openai-controller",
@@ -1600,7 +1607,31 @@ class CodingAgentRouterTests(unittest.TestCase):
             changed_files=20,
             duration_minutes=180,
             novelty="high",
-            risk_flags=["private-context"],
+            risk_flags=["security-sensitive"],
+            latency_priority=False,
+            reviewer=True,
+            previous_group="openai-controller",
+            previous_provider="openai",
+        )
+        self.assertIsNone(score)
+        self.assertFalse(execution)
+        self.assertEqual(
+            exclusion,
+            [
+                "route requires explicit safe-context risk flag: "
+                "non-sensitive-context, public-context, synthetic-context"
+            ],
+        )
+
+        score, _, _, _, exclusion, execution = router._score_route(
+            reviewer,
+            "security-review",
+            self.catalog,
+            state,
+            changed_files=20,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["public-context", "private-context"],
             latency_priority=False,
             reviewer=True,
             previous_group="openai-controller",
@@ -1621,7 +1652,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             changed_files=20,
             duration_minutes=180,
             novelty="high",
-            risk_flags=["user_data"],
+            risk_flags=["synthetic-context", "user_data"],
             latency_priority=False,
             reviewer=False,
             previous_group=None,

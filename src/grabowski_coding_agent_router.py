@@ -420,6 +420,19 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             raise CodingAgentRouterError(
                 f"{identifier}: forbidden_risk_flags must be a unique list of valid risk flags"
             )
+        required_any_risk_flags = route.get("required_any_risk_flags", [])
+        if (
+            not isinstance(required_any_risk_flags, list)
+            or len(required_any_risk_flags) > 20
+            or len(required_any_risk_flags) != len(set(required_any_risk_flags))
+            or any(
+                not isinstance(flag, str) or not flag or len(flag) > 64
+                for flag in required_any_risk_flags
+            )
+        ):
+            raise CodingAgentRouterError(
+                f"{identifier}: required_any_risk_flags must be a unique list of valid risk flags"
+            )
         permission_mode = _route_permission_mode(route)
         if "writer_only" in route:
             raise CodingAgentRouterError(
@@ -1269,6 +1282,19 @@ def _score_route(
             [
                 "route forbids sensitive risk flags: "
                 + ", ".join(blocked_risk_flags)
+            ],
+            False,
+        )
+    required_any_risk_flags = set(route.get("required_any_risk_flags", []))
+    if required_any_risk_flags and not required_any_risk_flags.intersection(risk_flags):
+        return (
+            None,
+            0.0,
+            0.0,
+            reasons,
+            [
+                "route requires explicit safe-context risk flag: "
+                + ", ".join(sorted(required_any_risk_flags))
             ],
             False,
         )

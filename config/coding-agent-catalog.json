@@ -2517,6 +2517,11 @@
         "private-context",
         "customer-data",
         "credential"
+      ],
+      "required_any_risk_flags": [
+        "public-context",
+        "synthetic-context",
+        "non-sensitive-context"
       ]
     },
     {
@@ -2562,6 +2567,11 @@
         "private-context",
         "customer-data",
         "credential"
+      ],
+      "required_any_risk_flags": [
+        "public-context",
+        "synthetic-context",
+        "non-sensitive-context"
       ]
     },
     {
