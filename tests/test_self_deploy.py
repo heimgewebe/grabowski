@@ -2328,9 +2328,15 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.assertEqual(command.call_args_list[0].args[0][-1], "--apply")
         self.assertEqual(command.call_args_list[1].args[0][-1], "--check")
         self.assertEqual(
-            command.call_args_list[2].args[0][-2:], ["--timeout-seconds", "120"]
+            command.call_args_list[2].args[0][-4:],
+            [
+                "--timeout-seconds",
+                "120",
+                "--overall-timeout-seconds",
+                "300",
+            ],
         )
-        self.assertEqual(command.call_args_list[2].kwargs["timeout"], 180)
+        self.assertEqual(command.call_args_list[2].kwargs["timeout"], 330)
         for call in command.call_args_list:
             self.assertEqual(call.kwargs["cwd"], repo)
 

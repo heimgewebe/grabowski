@@ -506,9 +506,11 @@ def reconcile_coding_agent_sidecars(
             str(scheduler_target),
             "--timeout-seconds",
             "120",
+            "--overall-timeout-seconds",
+            "300",
         ],
         cwd=repo,
-        timeout=180,
+        timeout=330,
     )
     status_readback = probe_receipt.get("status_readback")
     probe_catalog_sha256 = _sidecar_digest(
