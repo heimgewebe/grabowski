@@ -1554,12 +1554,19 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
                 )
         elif receipt["provider"] == "opencode":
             prefix = route_contract["argv_prefix"]
+            agent_index = prefix.index("--agent") if "--agent" in prefix else -1
+            plan_agent_mode = (
+                agent_index >= 0
+                and agent_index + 1 < len(prefix)
+                and prefix[agent_index + 1] == "plan"
+            )
+            execution_mode_ok = ("--auto" in prefix) != plan_agent_mode
             if (
                 command[: len(prefix)] != prefix
                 or len(command) != len(prefix) + 1
                 or command[1] != "run"
                 or "--pure" not in command
-                or "--auto" not in command
+                or not execution_mode_ok
                 or "--format" not in command
                 or command[command.index("--format") + 1] != "json"
                 or not isinstance(command[-1], str)
