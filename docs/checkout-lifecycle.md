@@ -18,16 +18,29 @@ trennt Inventar, Archivierung und Cleanup.
 - `grabowski_checkout_cleanup`: erzeugt zuerst einen persistierten Dry-Run-Plan
   und führt erst danach, mit Plan-ID und Plan-Hash, `git worktree remove` ohne
   Force-Option aus.
-- `grabowski_checkout_binding_terminal_preview`: prüft read-only, ob ein bereits
-  verschwundener managed Checkout durch unveränderliche Quellterminalität, exakte
-  Binding-Identität und fehlende Koordination als Evidenzzustand abschließbar ist.
+- `grabowski_checkout_binding_terminal_preview`: prüft read-only zwei eng
+  begrenzte Terminal-Reconciliation-Modi. Ein bereits verschwundener managed
+  Checkout kann durch unveränderliche Quellterminalität, exakte Binding-Identität
+  und fehlende Koordination als `externally_terminal_missing` vorbereitet werden.
+  Zusätzlich kann ein noch vorhandener `active`-Checkout ausschließlich für eine
+  terminal belegte Work Lane als `completed_retained` vorbereitet werden, wenn er
+  sauber, unkoordiniert, remote recoverbar und `lease_release_ready=true` ist. Bei
+  aktuellen Work-Lane-Receipts muss der Checkout-Head außerdem exakt dem
+  `terminal_head_sha` des Closeouts entsprechen; Legacy-Receipts ohne dieses Feld
+  bleiben auf den strengeren historischen Recovery-Nachweis beschränkt.
 - `grabowski_checkout_binding_terminal_apply`: übernimmt ausschließlich einen
-  frischen, zeitgebundenen Preview-Digest per Compare-and-Swap in
-  `externally_terminal_missing`. Ist der erhaltene Branch-Head ein nachweislicher
-  Descendant des gebundenen Heads, darf derselbe CAS zusätzlich ausschließlich
-  `expected_head` in Binding und Retention auf diesen Descendant rebind-en.
-  Divergenz oder nicht beobachtbare Ancestry bleiben blockierend. Der Aufruf
-  archiviert oder löscht nichts und verändert weder Branch noch Ref.
+  frischen, zeitgebundenen Preview-Digest per Compare-and-Swap. Missing-Mode geht
+  nach `externally_terminal_missing`; Present-Work-Lane-Mode geht nur von `active`
+  nach `completed_retained` und gibt damit den Active-Creation-Slot frei, ohne den
+  Checkout oder seine Retention zu entfernen. Ein später verschwundener
+  `completed_retained`-Checkout darf in einem neuen Preview nach
+  `externally_terminal_missing` konvergieren; der vorherige Receipt bleibt dabei
+  hashgebunden als Vorgänger erhalten. Ist ein zulässiger Branch-Head ein
+  nachweislicher Descendant des gebundenen Heads, darf derselbe CAS zusätzlich
+  ausschließlich `expected_head` in Binding und Retention rebind-en. Divergenz,
+  fehlende Release-Readiness, ein Head nach aktuellem Work-Lane-Closeout oder nicht
+  beobachtbare Recovery-Evidenz bleiben blockierend. Der Aufruf archiviert oder
+  löscht nichts und verändert weder Branch noch Ref.
 - Die Grips `checkout-owner-handoff-preview` und `checkout-owner-handoff-apply`
   sind ein enger Reconciliation-Pfad für genau `binding-retention-owner-mismatch`:
   nur sauberer, unkoordinierter Checkout; nur `completed_retained`; kein

@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2ae85246fc566463d3cd9af1659ebec1471e85b69d2a162d58dac7c2d95862fa",
+  "capability_source_sha256": "29c0079f26612c4ebaec98b38af7303a9e54f4c599b543aedd2d38023b2604e9",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "c26c726ab979110678865eacc4bcef45f5842e8e8804e97739e717eae616dab4",
   "integrity": {
@@ -813,10 +813,10 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview an evidence-only terminal transition for one missing managed checkout.",
+      "description": "Preview an evidence-only terminal transition for one missing or safely retained managed checkout.",
       "effects": [],
       "id": "grabowski_checkout_binding_terminal_preview",
-      "purpose": "Preview one exact source- and identity-bound external terminal transition for an already missing managed checkout.",
+      "purpose": "Preview one exact evidence-bound terminal reconciliation for either an absent managed checkout or a clean present terminal Work Lane retained without consuming active checkout capacity.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -832,7 +832,7 @@
         "state-change"
       ],
       "id": "grabowski_checkout_binding_terminal_apply",
-      "purpose": "Apply one fresh compare-and-swap transition to externally_terminal_missing while preserving retention, branch, refs, archive state and filesystem contents.",
+      "purpose": "Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing, or clean present terminal Work Lanes from active to completed_retained while preserving the checkout, retention and cleanup authority boundaries.",
       "read_only": false,
       "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
       "risk_class": "medium",
