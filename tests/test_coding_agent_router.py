@@ -752,10 +752,30 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(antigravity["routes"][0]["route"].startswith("antigravity-"))
         self.assertFalse(antigravity["routes"][0]["paid_only"])
 
+    def test_gpt56_codex_routes_bind_native_cli_model_and_effort(self) -> None:
+        routes = [
+            route
+            for route in self.catalog["routes"]
+            if route.get("harness") == "codex"
+            and str(route.get("model", "")).startswith("gpt-5.6-")
+        ]
+        self.assertGreaterEqual(len(routes), 7)
+        for route in routes:
+            with self.subTest(route=route["id"]):
+                prefix = route["argv_prefix"]
+                self.assertEqual(prefix[0], "codex")
+                self.assertIn("--model", prefix)
+                self.assertEqual(prefix[prefix.index("--model") + 1], route["model"])
+                self.assertIn(
+                    f'model_reasoning_effort="{route["effort"]}"',
+                    prefix,
+                )
+
     def test_contrast_execution_contract_enforces_fable_paid_boundary(self) -> None:
         codex = router.contrast_route_execution_contract("codex-sol-high")
+        self.assertEqual(codex["schema_version"], 2)
         self.assertEqual(codex["harness"], "codex")
-        self.assertEqual(codex["argv_prefix"], ["codexr", "architecture"])
+        self.assertEqual(codex["argv_prefix"], ["codex", "--model", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"'])
         self.assertFalse(codex["paid_only"])
         antigravity = router.contrast_route_execution_contract("antigravity-gemini-flash-medium")
         self.assertEqual(antigravity["harness"], "antigravity")
