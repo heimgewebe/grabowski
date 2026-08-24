@@ -1291,6 +1291,48 @@ class BureauFailureIdentityProjectionTests(unittest.TestCase):
         )
         self.assertNotIn("/", json.dumps(pattern["top_identity_groups"], sort_keys=True))
 
+    def test_exact_identity_projects_bounded_failure_reason_classes(self) -> None:
+        now = 1_800_000_000
+        reasons = [
+            "candidate payload missing claims",
+            "candidate payload missing claims",
+            "candidate task identity mismatch",
+            "candidate resources invalid",
+            "candidate acceptance invalid",
+            "candidate source digest invalid",
+            "candidate evidence invalid",
+            None,
+        ]
+        records = [
+            self._record(
+                now=now,
+                seconds_ago=(index + 1) * 60,
+                source_commit="a" * 40,
+            )
+            for index in range(len(reasons))
+        ]
+        for record, reason in zip(records, reasons, strict=True):
+            if reason is not None:
+                record["bureau_failure_reason"] = reason
+
+        result = self._project(records, now)
+        summary_group = result["windows"][0]["bureau_failure_identity"][
+            "top_exact_identity_groups"
+        ][0]
+        pattern_group = result["candidate_patterns"][0]["top_identity_groups"][0]
+
+        for group in (summary_group, pattern_group):
+            self.assertEqual(group["failure_reason_class_count"], 6)
+            self.assertEqual(group["failure_reason_attributed_count"], 7)
+            self.assertEqual(group["failure_reason_unknown_count"], 1)
+            self.assertEqual(group["failure_reason_coverage"], 0.875)
+            self.assertEqual(len(group["top_failure_reason_classes"]), 5)
+            self.assertEqual(
+                group["top_failure_reason_classes"][0],
+                {"reason": "candidate payload missing claims", "count": 2},
+            )
+            self.assertNotIn("failure_reason_counts", group)
+
     def test_same_runtime_with_distinct_result_schema_families_stays_two_groups(self) -> None:
         now = 1_800_000_000
         records = [
