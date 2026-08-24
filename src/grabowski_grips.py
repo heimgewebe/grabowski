@@ -186,7 +186,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
     "checkout-binding-terminal-preview": GripSpec(
         name="checkout-binding-terminal-preview",
         version="1.0",
-        summary="Preview one evidence-bound terminal transition for a missing managed checkout.",
+        summary="Preview one evidence-bound terminal transition for a missing or safely retained managed checkout.",
         effect=READ_ONLY,
         required_parameters=("checkout_key",),
         acceptance_ids=(
@@ -201,7 +201,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
     "checkout-binding-terminal-apply": GripSpec(
         name="checkout-binding-terminal-apply",
         version="1.0",
-        summary="CAS-apply one evidence-bound terminal transition for a missing managed checkout.",
+        summary="CAS-apply one evidence-bound terminal transition for a missing or safely retained managed checkout.",
         effect=MUTATING,
         required_parameters=(
             "checkout_key",
@@ -972,8 +972,8 @@ GRIP_SURFACE_TARGETS = {
     "work-acquire": "one controller-owned work lane and exact isolated worktree",
     "worktree-ensure": "one exact repository worktree",
     "worktree-hygiene-reconcile": "terminal repository worktree lifecycle",
-    "checkout-binding-terminal-preview": "one missing managed checkout lifecycle binding",
-    "checkout-binding-terminal-apply": "one preview-bound missing checkout lifecycle transition",
+    "checkout-binding-terminal-preview": "one missing or safely retained managed checkout lifecycle binding",
+    "checkout-binding-terminal-apply": "one preview-bound terminal checkout lifecycle transition",
     "checkout-binding-identity-rebind-preview": "one existing managed checkout with proven branch-name identity drift",
     "checkout-binding-identity-rebind-apply": "one snapshot-bound lifecycle and retention expected-identity update",
     "checkout-owner-handoff-preview": "one clean managed checkout with lifecycle/retention owner drift",
@@ -5238,17 +5238,41 @@ def _run_checkout_binding_terminal_apply(
     if not _is_sha256_hex(source_evidence_sha256):
         raise GripActionError("checkout terminal apply lacks source evidence digest")
     effects = terminal_receipt.get("effects")
-    if effects not in (
-        ["lifecycle_phase_transition"],
-        ["lifecycle_phase_transition", "terminal_head_rebind"],
-    ):
-        raise GripActionError("checkout terminal apply exceeded bounded lifecycle effects")
     binding_before = terminal_receipt.get("binding_before")
     binding_after = terminal_receipt.get("binding_after")
     if not isinstance(binding_before, dict) or not isinstance(binding_after, dict):
         raise GripActionError("checkout terminal apply lacks lifecycle before/after state")
-    if binding_after.get("phase") != "externally_terminal_missing":
-        raise GripActionError("checkout terminal apply post-state is not externally terminal")
+    reconciliation_mode = terminal_receipt.get("reconciliation_mode")
+    if reconciliation_mode is None and binding_after.get("phase") == "externally_terminal_missing":
+        # Preserve schema-1 missing-checkout receipts written before the present
+        # reconciliation mode was added.
+        reconciliation_mode = "missing_external"
+    if reconciliation_mode == "missing_external":
+        allowed_effects = (
+            ["lifecycle_phase_transition"],
+            ["lifecycle_phase_transition", "terminal_head_rebind"],
+        )
+        if binding_after.get("phase") != "externally_terminal_missing":
+            raise GripActionError("missing checkout terminal apply post-state is invalid")
+        if terminal_receipt.get("checkout_preserved") not in (None, False):
+            raise GripActionError("missing checkout terminal apply preservation claim is invalid")
+    elif reconciliation_mode == "present_retained":
+        allowed_effects = (
+            ["lifecycle_phase_transition", "active_capacity_release"],
+            [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+                "terminal_head_rebind",
+            ],
+        )
+        if binding_after.get("phase") != "completed_retained":
+            raise GripActionError("present checkout terminal apply post-state is invalid")
+        if terminal_receipt.get("checkout_preserved") is not True:
+            raise GripActionError("present checkout terminal apply must preserve checkout")
+    else:
+        raise GripActionError("checkout terminal apply reconciliation mode is invalid")
+    if effects not in allowed_effects:
+        raise GripActionError("checkout terminal apply exceeded bounded lifecycle effects")
     if "terminal_head_rebind" in effects:
         rebind = terminal_receipt.get("branch_head_rebind")
         retention_before = terminal_receipt.get("retention_before")
@@ -5271,7 +5295,8 @@ def _run_checkout_binding_terminal_apply(
         raise GripActionError("checkout terminal apply lacks durable receipt digest")
     active_binding_released = (
         binding_before.get("phase") == "active"
-        and binding_after.get("phase") == "externally_terminal_missing"
+        and binding_after.get("phase")
+        in {"externally_terminal_missing", "completed_retained"}
     )
     _check(receipt, "checkout-key-bound", "pass", checkout_key)
     _check(

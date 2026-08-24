@@ -1385,6 +1385,50 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["lifecycle-only-effect"]["status"])
         self.assertEqual("pass", checks["active-capacity-transition"]["status"])
 
+    def test_checkout_binding_terminal_apply_accepts_present_retained_receipt(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "binding_before": {"phase": "active"},
+            "binding_after": {"phase": "completed_retained"},
+            "effects": [
+                "lifecycle_phase_transition",
+                "active_capacity_release",
+            ],
+            "receipt_sha256": "e" * 64,
+        }
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "applied",
+                "receipt": terminal_receipt,
+            },
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("completed_retained", result["output"]["capacity_effect"]["to_phase"])
+        self.assertTrue(result["output"]["capacity_effect"]["active_binding_released"])
+
     def test_checkout_binding_terminal_apply_recovers_applied_runtime_error_by_readback(self) -> None:
         checkout_key = "a" * 64
         expected_preview = "c" * 64

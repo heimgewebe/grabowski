@@ -1662,7 +1662,8 @@ def _github_pull_ref_secured_observation(
             if isinstance(item, dict)
             and item.get("state") == "MERGED"
             and item.get("headRefName") == branch
-            and item.get("headRefOid") == head
+            and isinstance(item.get("headRefOid"), str)
+            and GIT_OBJECT_RE.fullmatch(str(item["headRefOid"])) is not None
             and isinstance(item.get("number"), int)
             and not isinstance(item.get("number"), bool)
             and int(item["number"]) > 0
@@ -1708,10 +1709,51 @@ def _github_pull_ref_secured_observation(
             )[:256]
             continue
         remote_head = str(verified.get("stdout") or "").strip()
+        if remote_head != item.get("headRefOid"):
+            last_error = "GitHub pull head ref differs from merged PR metadata"
+            continue
         if remote_head == head:
             return {
                 "remote_secured": True,
                 "remote_secured_refs": [f"github:{github_repo}:{remote_ref}"],
+                "remote_secured_relation": "exact_merged_pull_head",
+                "remote_secured_head": remote_head,
+                "error": None,
+            }
+        compared = github_read(
+            [
+                "api",
+                "--hostname",
+                "github.com",
+                f"repos/{github_repo}/compare/{head}...{remote_head}",
+                "--jq",
+                "{status:.status,merge_base_sha:.merge_base_commit.sha}",
+            ]
+        )
+        if compared is None or compared.get("timed_out") is True:
+            last_error = "GitHub pull head ancestry query timed out"
+            break
+        if compared.get("returncode") != 0 or compared.get("stdout_truncated"):
+            last_error = str(
+                compared.get("stderr")
+                or compared.get("stdout")
+                or "GitHub pull head ancestry query failed"
+            )[:256]
+            continue
+        try:
+            ancestry = json.loads(str(compared.get("stdout") or ""))
+        except json.JSONDecodeError:
+            ancestry = None
+        if (
+            isinstance(ancestry, dict)
+            and ancestry.get("status") == "ahead"
+            and ancestry.get("merge_base_sha") == head
+        ):
+            return {
+                "remote_secured": True,
+                "remote_secured_refs": [f"github:{github_repo}:{remote_ref}"],
+                "remote_secured_relation": "ancestor_of_merged_pull_head",
+                "remote_secured_head": remote_head,
                 "error": None,
             }
     return {
@@ -2745,7 +2787,7 @@ def _verify_recovery_refs(repo: Path, recovery_refs: list[dict[str, str]]) -> li
 
 @mcp.tool(name="grabowski_checkout_binding_terminal_preview", annotations=READ_ONLY)
 def grabowski_checkout_binding_terminal_preview(checkout_key: str) -> dict[str, Any]:
-    """Preview an evidence-only terminal transition for one missing managed checkout."""
+    """Preview an evidence-only terminal transition for one missing or safely retained managed checkout."""
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
     from grabowski_checkout_terminal_reconciliation import preview

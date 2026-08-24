@@ -192,6 +192,7 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     )
     blockers.extend(branch_blockers)
     return {
+        "mode": "missing",
         "repository": str(top_level),
         "repo_common_dir": str(common_dir),
         "checkout_path": str(bound_checkout_path),
@@ -205,6 +206,104 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         "expected_branch": binding["expected_branch"],
         "blockers": sorted(set(blockers)),
     }
+
+
+def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
+    repo = checkouts._resolve_repo(binding["repo_path"])
+    common_dir = checkouts._git_common_dir(repo)
+    top_level, observed_common, records = checkouts._worktree_records(repo)
+    bound_checkout_path, checkout_exists, path_blockers = (
+        _lexical_checkout_path_observation(binding["checkout_path"])
+    )
+    blockers: list[str] = list(path_blockers)
+    try:
+        checkout_path = checkouts._safe_path(
+            bound_checkout_path, must_exist=checkout_exists
+        )
+    except (OSError, ValueError):
+        checkout_path = bound_checkout_path
+        blockers.append("checkout-path-unobservable")
+    if not checkout_exists:
+        blockers.append("checkout-path-missing")
+    if str(top_level) != binding["repo_path"]:
+        blockers.append("repository-path-drift")
+    if common_dir != observed_common or str(common_dir) != binding["repo_common_dir"]:
+        blockers.append("repository-common-dir-drift")
+    matches = [
+        record
+        for record in records
+        if Path(record["path"]).resolve(strict=False) == checkout_path.resolve(strict=False)
+    ]
+    if len(matches) != 1:
+        blockers.append(
+            "checkout-record-missing" if not matches else "checkout-record-ambiguous"
+        )
+    record = matches[0] if len(matches) == 1 else None
+    branch_ref = f"refs/heads/{binding['expected_branch']}"
+    branch_head: str | None = None
+    relation = "unobservable"
+    status: dict[str, Any] | None = None
+    remote_security: dict[str, Any] | None = None
+    if record is not None:
+        if record.get("prunable"):
+            blockers.append("checkout-record-prunable")
+        if record.get("branch") != binding["expected_branch"]:
+            blockers.append("checkout-record-branch-drift")
+        current_head = record.get("head")
+        if not isinstance(current_head, str) or checkouts.GIT_OBJECT_RE.fullmatch(current_head) is None:
+            blockers.append("checkout-record-head-unobservable")
+        else:
+            branch_head = current_head
+            relation, relation_blockers = _branch_head_relation(
+                repo, binding["expected_head"], current_head
+            )
+            blockers.extend(relation_blockers)
+        branch_read = checkouts._git_read(
+            repo,
+            ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
+            check=False,
+        )
+        ref_head = branch_read.stdout.strip() if branch_read.returncode == 0 else None
+        if ref_head is None:
+            blockers.append("branch-ref-missing")
+        elif branch_head is not None and ref_head != branch_head:
+            blockers.append("branch-ref-head-drift")
+        status = checkouts._worktree_status(record)
+        if status.get("dirty") is True:
+            blockers.append("checkout-dirty")
+        elif status.get("dirty") is not False:
+            blockers.append("checkout-status-unobservable")
+        remote_security = checkouts._remote_secured_observation(
+            record, verify_github_pull_ref=True
+        )
+        if remote_security.get("remote_secured") is not True:
+            blockers.append("checkout-head-not-remote-secured")
+    return {
+        "mode": "present",
+        "repository": str(top_level),
+        "repo_common_dir": str(common_dir),
+        "checkout_path": str(bound_checkout_path),
+        "checkout_exists": checkout_exists,
+        "worktree_record_present": record is not None,
+        "worktree_record": record,
+        "branch_ref": branch_ref,
+        "branch_head": branch_head,
+        "branch_head_relation": relation,
+        "expected_head": binding["expected_head"],
+        "expected_branch": binding["expected_branch"],
+        "status": status,
+        "remote_security": remote_security,
+        "blockers": sorted(set(blockers)),
+    }
+
+
+def _terminal_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
+    _path, checkout_exists, _blockers = _lexical_checkout_path_observation(
+        binding["checkout_path"]
+    )
+    if checkout_exists:
+        return _present_checkout_observation(binding)
+    return _missing_checkout_observation(binding)
 
 
 def _branch_task_records(checkout_path: Path, branch_key: str) -> list[dict[str, Any]]:
@@ -289,11 +388,17 @@ def _preview_state(
     if binding["phase"] not in _ALLOWED_SOURCE_PHASES:
         raise RuntimeError("only active or completed-retained bindings may be reconciled")
     source_evidence = sources.source_terminal_evidence(binding)
-    checkout = _missing_checkout_observation(binding)
+    checkout = _terminal_checkout_observation(binding)
     coordination = _coordination(binding, ignore_lease_owner=ignore_lease_owner)
     blockers = list(checkout["blockers"])
     if snapshot["archive_count"]:
         blockers.append("archive-record-present")
+    if checkout.get("mode") == "present":
+        if binding["phase"] != "active":
+            blockers.append("present-checkout-not-active")
+        source = binding.get("source")
+        if not isinstance(source, dict) or source.get("kind") != "work_lane":
+            blockers.append("present-checkout-source-not-work-lane")
     if coordination["blocking"]:
         blockers.append("active-coordination")
     stable = {
@@ -404,7 +509,7 @@ def apply(
     lease = checkouts.resources.acquire_resources(
         operation_owner,
         resource_keys,
-        purpose=f"terminal reconciliation for missing checkout {key}",
+        purpose=f"terminal reconciliation for checkout {key}",
         ttl_seconds=checkouts.OPERATION_LEASE_TTL_SECONDS,
         metadata={
             "checkout_key": key,
@@ -451,6 +556,14 @@ def apply(
             ):
                 raise RuntimeError("checkout lifecycle CAS preimage changed")
             checkout_observation = planned["checkout_observation"]
+            mode = checkout_observation.get("mode")
+            if mode not in {"missing", "present"}:
+                raise RuntimeError("terminal reconciliation checkout mode is invalid")
+            target_phase = (
+                "completed_retained"
+                if mode == "present"
+                else "externally_terminal_missing"
+            )
             relation = checkout_observation.get("branch_head_relation")
             rebind_head = (
                 checkout_observation.get("branch_head")
@@ -465,7 +578,7 @@ def apply(
             updated = connection.execute(
                 """
                 UPDATE lifecycle_bindings
-                SET phase='externally_terminal_missing',
+                SET phase=?,
                     expected_head=?,
                     terminal_at_unix=COALESCE(terminal_at_unix, ?),
                     archived_at_unix=NULL,
@@ -474,6 +587,7 @@ def apply(
                   AND expected_head=? AND updated_at_unix=?
                 """,
                 (
+                    target_phase,
                     rebind_head,
                     applied_at,
                     lifecycle_updated_at,
@@ -530,12 +644,18 @@ def apply(
                 else None
             )
             effects = ["lifecycle_phase_transition"]
+            if mode == "present":
+                effects.append("active_capacity_release")
             if branch_head_rebind is not None:
                 effects.append("terminal_head_rebind")
             receipt_core = {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "checkout_terminal_reconciliation_receipt",
                 "checkout_key": key,
+                "reconciliation_mode": (
+                    "present_retained" if mode == "present" else "missing_external"
+                ),
+                "checkout_preserved": mode == "present",
                 "owner_id": owner,
                 "binding_before": binding_before,
                 "binding_before_sha256": planned["binding_sha256"],
@@ -591,7 +711,7 @@ def apply(
         if (
             readback is None
             or readback["receipt_sha256"] != receipt["receipt_sha256"]
-            or readback["receipt"]["binding_after"]["phase"] != "externally_terminal_missing"
+            or readback["receipt"]["binding_after"]["phase"] != target_phase
         ):
             raise RuntimeError("terminal reconciliation post-state readback failed")
         audit = {

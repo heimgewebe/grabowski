@@ -813,7 +813,7 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview an evidence-only terminal transition for one missing managed checkout.",
+      "description": "Preview an evidence-only terminal transition for one missing or safely retained managed checkout.",
       "effects": [],
       "id": "grabowski_checkout_binding_terminal_preview",
       "purpose": "Preview one exact source- and identity-bound external terminal transition for an already missing managed checkout.",

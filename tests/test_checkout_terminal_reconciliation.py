@@ -155,6 +155,19 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             str(binding["checkout_key"])
         ]
 
+    def _present_binding(
+        self,
+        *,
+        source_kind: str = "work_lane",
+        source_id: str = "a" * 32,
+    ) -> dict[str, object]:
+        binding = self._missing_binding(
+            source_kind=source_kind,
+            source_id=source_id,
+        )
+        self._git("worktree", "add", str(self.checkout), "topic")
+        return binding
+
     def _advance_topic_branch(self) -> str:
         self._git("worktree", "add", str(self.checkout), "topic")
         (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")
@@ -230,6 +243,111 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             result["receipt"]["does_not_establish"],
         )
         self.assertEqual(2, len(result["lease_release"]["released"]))
+
+    def test_present_clean_terminal_checkout_releases_active_capacity_but_preserves_checkout(self) -> None:
+        binding = self._present_binding()
+        before_capacity = checkouts.active_capacity_projection(self.repo)
+        self.assertEqual(1, before_capacity["used"])
+        remote = {
+            "remote_secured": True,
+            "remote_secured_refs": ["refs/remotes/origin/topic"],
+            "error": None,
+        }
+        with patch.object(
+            checkouts, "_remote_secured_observation", return_value=remote
+        ):
+            preview = self._preview(binding)
+            self.assertTrue(preview["safe_to_apply"])
+            self.assertEqual("present", preview["checkout_observation"]["mode"])
+            result = self._apply(binding, preview)
+        self.assertEqual("applied", result["status"])
+        receipt = result["receipt"]
+        self.assertEqual("present_retained", receipt["reconciliation_mode"])
+        self.assertTrue(receipt["checkout_preserved"])
+        self.assertIn("active_capacity_release", receipt["effects"])
+        after = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        retained = checkouts._retention_records([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("completed_retained", after["phase"])
+        self.assertEqual("owner-a", retained["owner_id"])
+        self.assertTrue(self.checkout.is_dir())
+        after_capacity = checkouts.active_capacity_projection(self.repo)
+        self.assertEqual(0, after_capacity["used"])
+
+    def test_present_terminal_checkout_rejects_non_work_lane_source(self) -> None:
+        binding = self._present_binding(
+            source_kind="bureau_task",
+            source_id="GRABOWSKI-OPERATOR-SURFACE-V1-T065",
+        )
+        with patch.object(
+            checkouts,
+            "_remote_secured_observation",
+            return_value={
+                "remote_secured": True,
+                "remote_secured_refs": ["refs/remotes/origin/topic"],
+                "error": None,
+            },
+        ):
+            preview = self._preview(binding)
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("present-checkout-source-not-work-lane", preview["blockers"])
+
+    def test_present_terminal_checkout_rebinds_descendant_head_in_lifecycle_and_retention(self) -> None:
+        binding = self._present_binding()
+        (self.checkout / "later.txt").write_text("later\n", encoding="utf-8")
+        self._git("add", "later.txt", cwd=self.checkout)
+        self._git("commit", "-m", "later topic work", cwd=self.checkout)
+        new_head = self._git("rev-parse", "HEAD", cwd=self.checkout).stdout.strip()
+        with patch.object(
+            checkouts,
+            "_remote_secured_observation",
+            return_value={
+                "remote_secured": True,
+                "remote_secured_refs": ["refs/remotes/origin/topic"],
+                "error": None,
+            },
+        ):
+            preview = self._preview(binding)
+            self.assertEqual(
+                "descendant", preview["checkout_observation"]["branch_head_relation"]
+            )
+            result = self._apply(binding, preview)
+        receipt = result["receipt"]
+        self.assertEqual(new_head, receipt["binding_after"]["expected_head"])
+        self.assertEqual(new_head, receipt["retention_after"]["expected_head"])
+        self.assertEqual(
+            {
+                "relation": "descendant",
+                "from_head": self.head,
+                "to_head": new_head,
+            },
+            receipt["branch_head_rebind"],
+        )
+        self.assertTrue(self.checkout.is_dir())
+
+    def test_present_terminal_checkout_blocks_dirty_or_unsecured_head(self) -> None:
+        binding = self._present_binding()
+        (self.checkout / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        with patch.object(
+            checkouts,
+            "_remote_secured_observation",
+            return_value={
+                "remote_secured": False,
+                "remote_secured_refs": [],
+                "error": None,
+            },
+        ):
+            preview = self._preview(binding)
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("checkout-dirty", preview["blockers"])
+        self.assertIn("checkout-head-not-remote-secured", preview["blockers"])
+        current = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", current["phase"])
 
     def test_preview_digest_binds_timestamp_and_expiry(self) -> None:
         binding = self._missing_binding()
