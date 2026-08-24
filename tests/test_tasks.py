@@ -469,45 +469,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(capture[-2:], ["/bin/echo", command_argument])
         self.assertEqual(result["task"]["runtime_seconds"], 60)
         self.assertIn("--property=RuntimeMaxSec=60s", launch)
-        self.assertNotIn("--property=SuccessExitStatus=1", launch)
         return result
-
-    def test_systemd_success_result_accepts_configured_nonzero_status(self) -> None:
-        self.assertEqual(
-            "completed",
-            tasks._classify_observation(
-                {"returncode": 0},
-                {
-                    "ActiveState": "inactive",
-                    "LoadState": "loaded",
-                    "Result": "success",
-                    "ExecMainCode": "1",
-                    "ExecMainStatus": "1",
-                },
-            ),
-        )
-
-    def test_direct_rg_no_match_is_declared_successful_to_systemd(self) -> None:
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks,
-                "_require_recovery_gate",
-                return_value={"checked_at_unix": 123},
-            ),
-        ):
-            tasks.grabowski_task_start(
-                "local",
-                ["rg", "definitely-no-match", "."],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                resume_policy="never",
-            )
-
-        launch = dispatch.call_args.args[1]
-        self.assertIn("--property=SuccessExitStatus=1", launch)
 
     def test_persistent_task_and_job_defaults_are_six_hours(self) -> None:
         self.assertEqual(tasks.operator.DEFAULT_JOB_RUNTIME, 21_600)
@@ -677,6 +639,28 @@ class TaskTests(unittest.TestCase):
         self.assertIn("err-0000", stderr)
         self.assertIn("err-0999", stderr)
         self.assertIn("GRABOWSKI_TASK_OUTPUT_TRUNCATED stderr", stderr)
+
+    def test_capture_wrapper_treats_direct_rg_no_match_as_success(self) -> None:
+        haystack = self.root / "haystack.txt"
+        haystack.write_text("present\n", encoding="utf-8")
+        record = {
+            "task_id": "9" * 24,
+            "attempt": 1,
+            "argv_json": json.dumps(
+                ["rg", "--fixed-strings", "definitely-absent", str(haystack)]
+            ),
+        }
+        completed = subprocess.run(
+            tasks._task_output_capture_argv(record),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
 
     def test_capture_wrapper_refuses_existing_output_directory_before_child(self) -> None:
         side_effect = self.root / "child-started"
