@@ -484,6 +484,73 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             "work-lane-head-after-terminal-closeout", second_preview["blockers"]
         )
 
+    def test_missing_followup_uses_current_owner_after_completed_retained_handoff(self) -> None:
+        binding = self._present_binding()
+        remote = {
+            "remote_secured": True,
+            "remote_secured_refs": ["refs/remotes/origin/topic"],
+            "error": None,
+        }
+        with patch.object(
+            checkouts, "_remote_secured_observation", return_value=remote
+        ):
+            first_preview = self._preview(binding)
+            first = self._apply(binding, first_preview)
+        first_receipt = first["receipt"]
+        checkout_key = str(binding["checkout_key"])
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET owner_id='owner-b' WHERE checkout_key=?",
+                (checkout_key,),
+            )
+            connection.commit()
+        handoff_preview = checkouts.checkout_owner_handoff_preview(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic",
+        )
+        handoff = checkouts.checkout_owner_handoff_apply(
+            str(self.repo), str(self.checkout), "owner-a", "owner-b", "owner-b",
+            self.head, "topic", handoff_preview["snapshot_sha256"],
+            handoff_preview["observed_at_unix"], handoff_preview["confirmation"],
+        )
+        self.assertEqual("owner-b", handoff["after"]["lifecycle"]["owner_id"])
+        self._git("worktree", "remove", str(self.checkout))
+        second_preview = self._preview(binding)
+        self.assertTrue(second_preview["safe_to_apply"])
+        with patch.object(
+            sources,
+            "source_terminal_evidence",
+            side_effect=self._terminal_source_evidence,
+        ):
+            second = reconciliation.apply(
+                checkout_key,
+                "owner-b",
+                str(second_preview["preview_sha256"]),
+                int(second_preview["preview_created_at_unix"]),
+                reconciliation.CONFIRMATION,
+            )
+        self.assertEqual("applied", second["status"])
+        receipt = second["receipt"]
+        self.assertEqual("owner-b", receipt["owner_id"])
+        self.assertEqual(
+            "owner-a", receipt["supersedes_reconciliation_receipt"]["owner_id"]
+        )
+        self.assertEqual(
+            first_receipt["receipt_sha256"],
+            receipt["supersedes_reconciliation_receipt_sha256"],
+        )
+        after = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("owner-b", after["owner_id"])
+        self.assertEqual("externally_terminal_missing", after["phase"])
+        with self.assertRaises(PermissionError):
+            reconciliation.apply(
+                checkout_key,
+                "owner-a",
+                str(second_preview["preview_sha256"]),
+                int(second_preview["preview_created_at_unix"]),
+                reconciliation.CONFIRMATION,
+            )
+
     def test_present_terminal_checkout_blocks_dirty_or_unsecured_head(self) -> None:
         binding = self._present_binding()
         (self.checkout / "dirty.txt").write_text("dirty\n", encoding="utf-8")

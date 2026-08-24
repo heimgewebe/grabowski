@@ -498,10 +498,16 @@ def _replay(
     existing = _record(checkout_key)
     if existing is None:
         return None
+    existing_mode = _reconciliation_mode(existing["receipt"])
     if existing["owner_id"] != owner_id:
+        if existing_mode == "present_retained":
+            # A completed-retained owner handoff changes lifecycle/retention
+            # authority without rewriting the historical reconciliation receipt.
+            # Let the fresh binding-owner check decide a later missing follow-up.
+            return None
         raise PermissionError("terminal reconciliation belongs to another owner")
     if existing["preview_sha256"] != expected_preview_sha256:
-        if _reconciliation_mode(existing["receipt"]) == "present_retained":
+        if existing_mode == "present_retained":
             return None
         raise RuntimeError("terminal reconciliation replay preview digest drift")
     return {
@@ -586,9 +592,12 @@ def apply(
             superseded_receipt: dict[str, Any] | None = None
             superseded_receipt_sha256: str | None = None
             if prior_row is not None:
-                if prior_row["owner_id"] != owner:
-                    raise PermissionError("terminal reconciliation belongs to another owner")
+                same_owner = prior_row["owner_id"] == owner
                 if prior_row["preview_sha256"] == preview_sha256:
+                    if not same_owner:
+                        raise PermissionError(
+                            "terminal reconciliation replay belongs to another owner"
+                        )
                     connection.rollback()
                     replay = _replay(key, owner, preview_sha256)
                     if replay is None:
@@ -603,14 +612,26 @@ def apply(
                 expected_predecessor = planned.get(
                     "supersedes_reconciliation_receipt_sha256"
                 )
-                if (
-                    not isinstance(prior_receipt, dict)
-                    or _reconciliation_mode(prior_receipt) != "present_retained"
-                    or expected_predecessor != prior_row["receipt_sha256"]
-                    or prior_receipt.get("receipt_sha256") != prior_row["receipt_sha256"]
-                ):
+                predecessor_is_present = (
+                    isinstance(prior_receipt, dict)
+                    and _reconciliation_mode(prior_receipt) == "present_retained"
+                    and expected_predecessor == prior_row["receipt_sha256"]
+                    and prior_receipt.get("receipt_sha256")
+                    == prior_row["receipt_sha256"]
+                )
+                handoff_supersession = (
+                    predecessor_is_present
+                    and not same_owner
+                    and planned["binding"]["owner_id"] == owner
+                    and planned["binding"]["phase"] == "completed_retained"
+                )
+                if not predecessor_is_present:
                     raise RuntimeError(
                         "terminal reconciliation predecessor changed or is not supersedable"
+                    )
+                if not same_owner and not handoff_supersession:
+                    raise PermissionError(
+                        "terminal reconciliation predecessor belongs to another owner"
                     )
                 superseded_receipt = prior_receipt
                 superseded_receipt_sha256 = prior_row["receipt_sha256"]
