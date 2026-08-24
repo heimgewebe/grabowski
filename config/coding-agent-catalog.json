@@ -1275,8 +1275,11 @@
     },
     {
       "argv_prefix": [
-        "codexr",
-        "mechanical"
+        "codex",
+        "--model",
+        "gpt-5.6-luna",
+        "-c",
+        "model_reasoning_effort=\"low\""
       ],
       "base_quality_rank": 62,
       "burn_weight": 0.4,
@@ -1305,8 +1308,11 @@
     },
     {
       "argv_prefix": [
-        "codexr",
-        "fast-high"
+        "codex",
+        "--model",
+        "gpt-5.6-luna",
+        "-c",
+        "model_reasoning_effort=\"high\""
       ],
       "base_quality_rank": 75,
       "burn_weight": 0.8,
@@ -1346,8 +1352,11 @@
     },
     {
       "argv_prefix": [
-        "codexr",
-        "bounded-patch"
+        "codex",
+        "--model",
+        "gpt-5.6-terra",
+        "-c",
+        "model_reasoning_effort=\"medium\""
       ],
       "base_quality_rank": 76,
       "burn_weight": 1.0,
@@ -1390,8 +1399,11 @@
     },
     {
       "argv_prefix": [
-        "codexr",
-        "bounded-patch-high"
+        "codex",
+        "--model",
+        "gpt-5.6-terra",
+        "-c",
+        "model_reasoning_effort=\"high\""
       ],
       "base_quality_rank": 86,
       "burn_weight": 1.4,
@@ -1433,8 +1445,11 @@
     },
     {
       "argv_prefix": [
-        "codexr",
-        "architecture"
+        "codex",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        "model_reasoning_effort=\"high\""
       ],
       "base_quality_rank": 100,
       "burn_weight": 2.0,
@@ -1478,8 +1493,11 @@
     },
     {
       "argv_prefix": [
-        "codexr",
-        "complex-medium"
+        "codex",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        "model_reasoning_effort=\"medium\""
       ],
       "base_quality_rank": 88,
       "burn_weight": 1.25,
@@ -1517,8 +1535,11 @@
     },
     {
       "argv_prefix": [
-        "codexr",
-        "security"
+        "codex",
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        "model_reasoning_effort=\"xhigh\""
       ],
       "base_quality_rank": 100,
       "burn_weight": 3.2,

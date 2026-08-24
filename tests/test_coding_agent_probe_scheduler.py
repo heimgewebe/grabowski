@@ -827,6 +827,7 @@ for line in sys.stdin:
         receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
         self.assertEqual(self.initial["history"], after["history"])
         self.assertEqual("ok", receipt["status"])
+        self.assertEqual(after["catalog_sha256"], receipt["catalog_sha256"])
         self.assertTrue(receipt["status_readback"]["catalog_fresh"])
         self.assertFalse(receipt["status_readback"]["automatic_execution_authorized"])
         self.assertEqual(0, receipt["model_invocations"])
@@ -1195,6 +1196,23 @@ for line in sys.stdin:
                     environment=environment,
                     timeout_seconds=5,
                 )
+
+    def test_overall_deadline_clamps_each_router_step(self) -> None:
+        with mock.patch.object(SCHEDULER.time, "monotonic", return_value=100.0):
+            self.assertEqual(10.0, SCHEDULER.bounded_step_timeout(10, None))
+            self.assertEqual(3.0, SCHEDULER.bounded_step_timeout(10, 103.0))
+            self.assertEqual(10.0, SCHEDULER.bounded_step_timeout(10, 120.0))
+            with self.assertRaisesRegex(
+                SCHEDULER.ProbeSchedulerError,
+                "overall deadline exceeded",
+            ):
+                SCHEDULER.bounded_step_timeout(10, 100.0)
+
+    def test_invalid_overall_timeout_fails_before_router_access(self) -> None:
+        self.assertEqual(
+            2,
+            SCHEDULER.main(self.arguments() + ["--overall-timeout-seconds", "0"]),
+        )
 
     def test_command_timeout_terminates_the_child_process_group(self) -> None:
         started = time.monotonic()
