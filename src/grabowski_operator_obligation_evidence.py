@@ -67,6 +67,10 @@ TEST_SUMMARY_RE = re.compile(
 UNITTEST_SUMMARY_RE = re.compile(
     rb"(?m)^Ran (?P<passed>[0-9]{1,6}) tests in [^\n]+\n\nOK(?:\n|$)"
 )
+WORKTREE_ENSURE_RECEIPT_PATH_RE = re.compile(
+    r"^grip-receipts/worktree-ensure/(?P<key>[0-9a-f]{64})\.json$"
+)
+WORKTREE_ENSURE_SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
 GITHUB_REMOTE_RE = re.compile(
     r"github\.com(?::|/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$"
 )
@@ -346,45 +350,18 @@ def _receipt_root() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".local/state/grabowski"
 
 
-def _receipt_payload_succeeded(relative: str, payload: Mapping[str, Any]) -> bool | None:
-    if relative.startswith("grip-receipts/"):
-        return (
-            payload.get("schema_version") == 1
-            and isinstance(payload.get("kind"), str)
-            and str(payload.get("kind")).startswith("grabowski.")
-            and payload.get("state") == "complete"
-            and payload.get("error") in {None, ""}
-            and _is_sha256(payload.get("receipt_sha256"))
-        )
-    if relative.startswith("jobs/") and relative.endswith("/finalization.json"):
-        return (
-            payload.get("schema_version") == 1
-            and payload.get("kind") == "grabowski_job_finalization"
-            and payload.get("completion_status") == "complete"
-            and payload.get("final_status") == "succeeded"
-            and _is_sha256(payload.get("payload_sha256"))
-            and _is_sha256(payload.get("contract_sha256"))
-        )
-    return None
-
-
 def _receipt_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     reference = _text(evidence.get("reference"), "reference")
     prefix = "grabowski-receipt:"
     if not reference.startswith(prefix):
         return None
     relative = reference[len(prefix) :]
-    if (
-        not relative
-        or len(relative) > 1024
-        or relative.startswith("/")
-        or re.fullmatch(r"[A-Za-z0-9_.@/+:-]+", relative) is None
-        or any(part in {"", ".", ".."} for part in Path(relative).parts)
-    ):
+    match = WORKTREE_ENSURE_RECEIPT_PATH_RE.fullmatch(relative)
+    if match is None:
         return None
     root = _receipt_root().resolve()
     path = (root / relative).resolve(strict=False)
-    if path != root and root not in path.parents:
+    if root not in path.parents:
         return None
     try:
         data = _read_regular_bytes(path, maximum=MAX_ADAPTER_FILE_BYTES)
@@ -392,16 +369,24 @@ def _receipt_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     except (EvidenceAssessmentError, UnicodeDecodeError, json.JSONDecodeError):
         return _trusted_observation(evidence, status="stale")
     if not isinstance(payload, Mapping):
-        return _trusted_observation(evidence, status="unsupported")
-    succeeded = _receipt_payload_succeeded(relative, payload)
-    if succeeded is None:
-        return _trusted_observation(evidence, status="unsupported")
-    if not succeeded:
+        return _trusted_observation(evidence, status="mismatch")
+    error = payload.get("error")
+    result_state = payload.get("result_state")
+    successful = (
+        payload.get("schema_version") == 1
+        and payload.get("kind") == "grabowski.worktree_ensure_receipt"
+        and payload.get("state") == "complete"
+        and (error is None or error == "")
+        and isinstance(result_state, str)
+        and result_state in WORKTREE_ENSURE_SUCCESS_STATES
+        and payload.get("idempotency_key_sha256") == match.group("key")
+        and _is_sha256(payload.get("receipt_sha256"))
+    )
+    if not successful:
         return _trusted_observation(evidence, status="mismatch")
     return _trusted_observation(
         evidence, status="verified", sha256=hashlib.sha256(data).hexdigest()
     )
-
 
 def _deployment_manifest_path() -> Path:
     configured = os.environ.get("GRABOWSKI_EVIDENCE_DEPLOYMENT_MANIFEST")
@@ -460,26 +445,57 @@ def _recognized_test_argv(argv_json: Any) -> bool:
         argv = json.loads(argv_json)
     except json.JSONDecodeError:
         return False
-    if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
+    if not isinstance(argv, list) or not argv or any(
+        not isinstance(item, str) or not item for item in argv
+    ):
         return False
-    command = Path(argv[0]).name
+    executable = Path(argv[0]).name
     rest = argv[1:]
-    if command == "env":
-        while rest and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", rest[0]):
-            rest = rest[1:]
-        if not rest:
-            return False
-        command = Path(rest[0]).name
-        rest = rest[1:]
-    if command in {"pytest", "py.test"}:
+    if executable in {"pytest", "py.test"}:
         return True
-    if command.startswith("python") and len(rest) >= 2 and rest[0] == "-m" and rest[1] in {"pytest", "unittest"}:
-        return True
-    if command == "cargo" and rest and rest[0] == "test":
-        return True
-    if command in {"npm", "pnpm", "yarn"} and rest and (rest[0] == "test" or rest[0].startswith("test:")):
-        return True
-    return command in {"make", "just"} and bool(rest) and rest[0] in {"test", "tests", "check", "validate"}
+    return (
+        executable.startswith("python")
+        and len(rest) >= 2
+        and rest[0] == "-m"
+        and rest[1] in {"pytest", "unittest"}
+    )
+
+
+def _read_task_evidence_row(database: Path, task_id: str) -> tuple[Any, ...] | None:
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2.0)
+    try:
+        return connection.execute(
+            "SELECT attempt, state, lifecycle_receipt_sha256, argv_json "
+            "FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+
+def _test_observation_digest(
+    *,
+    task_id: str,
+    attempt: int,
+    lifecycle_receipt_sha256: str,
+    argv_json: str,
+    passed: int,
+    subtests: int,
+    output_sha256s: list[str],
+) -> str:
+    return _sha256(
+        {
+            "schema_version": 1,
+            "kind": "grabowski.operator_obligation_evidence.test_task_v1",
+            "task_id": task_id,
+            "attempt": attempt,
+            "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+            "argv_sha256": hashlib.sha256(argv_json.encode("utf-8")).hexdigest(),
+            "passed": passed,
+            "subtests": subtests,
+            "output_sha256s": sorted(output_sha256s),
+        }
+    )
 
 
 def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -489,19 +505,12 @@ def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     database = _task_database_path().resolve(strict=False)
     try:
-        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2.0)
-        try:
-            row = connection.execute(
-                "SELECT attempt, state, lifecycle_receipt_sha256, argv_json FROM tasks WHERE task_id = ?",
-                (match.group("task_id"),),
-            ).fetchone()
-        finally:
-            connection.close()
+        before = _read_task_evidence_row(database, match.group("task_id"))
     except sqlite3.Error:
         return _trusted_observation(evidence, status="stale")
-    if row is None:
+    if before is None:
         return _trusted_observation(evidence, status="stale")
-    attempt, state, lifecycle_receipt_sha256, argv_json = row
+    attempt, state, lifecycle_receipt_sha256, argv_json = before
     if (
         not isinstance(attempt, int)
         or attempt < 1
@@ -514,20 +523,18 @@ def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
         f".grabowski-task-output-{match.group('task_id')}-a{attempt}"
     )
     streams: list[bytes] = []
+    output_sha256s: list[str] = []
     for name in ("stdout.log", "stderr.log"):
         try:
-            streams.append(
-                _read_regular_bytes(output_dir / name, maximum=MAX_ADAPTER_FILE_BYTES)
-            )
+            data = _read_regular_bytes(output_dir / name, maximum=MAX_ADAPTER_FILE_BYTES)
         except EvidenceAssessmentError:
             continue
+        streams.append(data)
+        output_sha256s.append(hashlib.sha256(data).hexdigest())
     if not streams:
         return _trusted_observation(evidence, status="stale")
     summaries = {
-        (
-            int(item.group("passed")),
-            int(item.group("subtests") or b"0"),
-        )
+        (int(item.group("passed")), int(item.group("subtests") or b"0"))
         for stream in streams
         for item in TEST_SUMMARY_RE.finditer(stream)
     }
@@ -539,10 +546,24 @@ def _test_observation(evidence: Mapping[str, Any]) -> dict[str, Any] | None:
     expected = (int(match.group("passed")), int(match.group("subtests")))
     if expected not in summaries:
         return _trusted_observation(evidence, status="mismatch")
-    return _trusted_observation(
-        evidence, status="verified", sha256=str(lifecycle_receipt_sha256)
+    try:
+        after = _read_task_evidence_row(database, match.group("task_id"))
+    except sqlite3.Error:
+        return _trusted_observation(evidence, status="stale")
+    if after != before:
+        return _trusted_observation(evidence, status="stale")
+    observation_sha256 = _test_observation_digest(
+        task_id=match.group("task_id"),
+        attempt=attempt,
+        lifecycle_receipt_sha256=str(lifecycle_receipt_sha256),
+        argv_json=str(argv_json),
+        passed=expected[0],
+        subtests=expected[1],
+        output_sha256s=output_sha256s,
     )
-
+    return _trusted_observation(
+        evidence, status="verified", sha256=observation_sha256
+    )
 
 _SOURCE_ADAPTERS = {
     "github": _github_observation,
@@ -876,8 +897,6 @@ def assess_status(
             "merge readiness",
             "deployment correctness",
             "runtime correctness",
-            "semantic relevance of a verified source artifact to the acceptance condition",
-            "completion correctness",
             "mutation authority",
         ],
     }
@@ -1066,8 +1085,6 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         "requires_all_acceptance_verified": True,
         "requires_all_obligations_fully_verified": True,
         "requires_zero_false_confidence_risk": True,
-        "verification_scope": "source_observation_identity_only",
-        "semantic_acceptance_relevance_established": False,
         "enforcement_change_separate": True,
     }
     rollout_eligible = (
@@ -1084,9 +1101,7 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     elif len(assessments) < MIN_ROLLOUT_SAMPLE:
         rollout_decision = "stop_sample_too_small"
     elif rollout_eligible:
-        rollout_decision = (
-            "source_verifiability_threshold_met_separate_enforcement_review_required"
-        )
+        rollout_decision = "eligible_for_separate_enforcement_change"
     else:
         rollout_decision = "stop_verifiability_threshold_not_met"
 
@@ -1181,8 +1196,6 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
             "permission to enforce verified completion",
             "verified completion enforcement in this change",
             "future source truth after the adapter observation",
-            "semantic relevance of a verified source artifact to an acceptance condition",
-            "completion correctness",
             "permission to rewrite legacy obligation records",
             "mutation authority",
         ],
