@@ -252,6 +252,21 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
             "grabowski_inspect_user_service", self.runtime["expected_tools"]
         )
 
+    def test_terminal_reconciliation_budget_declares_both_terminal_modes(self) -> None:
+        apply_contract = self.contract["accepted_additions"][
+            "grabowski_checkout_binding_terminal_apply"
+        ]
+        preview_contract = self.contract["accepted_additions"][
+            "grabowski_checkout_binding_terminal_preview"
+        ]
+        apply_claim = apply_contract["exception_detail"]["claim"]
+        preview_claim = preview_contract["exception_detail"]["claim"]
+        self.assertIn("externally_terminal_missing", apply_claim)
+        self.assertIn("completed_retained", apply_claim)
+        self.assertIn("present terminal Work Lane", apply_claim)
+        self.assertIn("absent-checkout", preview_claim)
+        self.assertIn("present terminal Work Lane", preview_claim)
+
     def test_baseline_cannot_be_reinitialized(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
