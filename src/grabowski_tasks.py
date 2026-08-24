@@ -1156,8 +1156,7 @@ def _classify_observation(result: dict[str, Any], properties: dict[str, str]) ->
     load = properties.get("LoadState")
     unit_result = properties.get("Result")
     exec_code = properties.get("ExecMainCode")
-    exec_status = properties.get("ExecMainStatus")
-    if unit_result == "success" and exec_status in {None, "", "0"}:
+    if unit_result == "success":
         return "completed" if active not in {"active", "activating", "reloading"} else "running"
     if active in {"active", "activating", "reloading"}:
         return "running"
@@ -5217,6 +5216,13 @@ def _task_output_cleanup_run(
     }
 
 
+def _task_success_exit_statuses(record: dict[str, Any]) -> tuple[int, ...]:
+    command = json.loads(record["argv_json"])
+    if command and os.path.basename(command[0]) == "rg":
+        return (1,)
+    return ()
+
+
 def _launch_argv(
     record: dict[str, Any], *, include_managed_runtime: bool
 ) -> list[str]:
@@ -5248,6 +5254,12 @@ def _launch_argv(
         f"--property=CPUWeight={record['cpu_weight']}",
         f"--property=IOWeight={record['io_weight']}",
     ]
+    success_exit_statuses = _task_success_exit_statuses(record)
+    if success_exit_statuses:
+        argv.append(
+            "--property=SuccessExitStatus="
+            + " ".join(str(code) for code in success_exit_statuses)
+        )
     if record["memory_max_bytes"] is not None:
         argv.append(f"--property=MemoryMax={record['memory_max_bytes']}")
     if include_managed_runtime:
