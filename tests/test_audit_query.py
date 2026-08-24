@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import importlib.util
 import json
+from pathlib import Path
 import sys
 import types
 import unittest
-from contextlib import nullcontext
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
