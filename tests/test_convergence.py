@@ -149,16 +149,16 @@ class ConvergenceTests(unittest.TestCase):
         temporary, repo, executable, request, digest = self._fixture()
         self.addCleanup(temporary.cleanup)
         head = "a" * 40
-        class InvalidJsonRunner(FakeRunner):
-            def __call__(self, cwd: Path, argv: list[str]) -> dict[str, object]:
-                if len(argv) == 3 and argv[1] == "evaluate":
-                    return {
-                        "returncode": 0,
-                        "stdout": "not valid json\n",
-                        "stderr": "",
-                    }
-                return super().__call__(cwd, argv)
-        runner = InvalidJsonRunner(head=head)
+        runner = FakeRunner(head=head)
+
+        def invalid_json_evaluator(
+            _cwd: Path, _argv: list[str]
+        ) -> dict[str, object]:
+            return {
+                "returncode": 0,
+                "stdout": "not valid json\n",
+                "stderr": "",
+            }
         with patch.dict(
             os.environ,
             {
@@ -175,6 +175,7 @@ class ConvergenceTests(unittest.TestCase):
                         "expected_protocol_head": head,
                     },
                     runner,
+                    invalid_json_evaluator,
                 )
 
     def test_terminal_assessment_allows_closure(self):
