@@ -5144,7 +5144,13 @@ def _run_checkout_binding_terminal_apply(
             if readback.get("status") == "already_applied" and isinstance(
                 readback.get("existing_receipt"), dict
             ):
-                readback_receipts.append(readback["existing_receipt"])
+                existing = readback["existing_receipt"]
+                readback_receipts.append(existing)
+                nested_predecessor = existing.get(
+                    "supersedes_reconciliation_receipt"
+                )
+                if isinstance(nested_predecessor, dict):
+                    readback_receipts.append(nested_predecessor)
             predecessor = readback.get("supersedes_reconciliation_receipt")
             if isinstance(predecessor, dict):
                 readback_receipts.append(predecessor)
