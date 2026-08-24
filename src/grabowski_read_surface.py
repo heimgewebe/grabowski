@@ -614,6 +614,45 @@ def _audit_bureau_failure_identity(
     return completeness, safe
 
 
+_AUDIT_BUREAU_FAILURE_REASON_EXACT_CLASSES = {
+    "candidate request contains unknown fields": "candidate request contains unknown fields",
+    "candidate request schema_version must be 1": "candidate request schema unsupported",
+    "live register repo must be a repo.* resource": "live register repo resource invalid",
+    "candidate task cannot change across supersession": "candidate task supersession mismatch",
+    "candidate repo cannot change across supersession": "candidate repo supersession mismatch",
+    "idempotency_key already identifies different candidate input": "idempotency conflict",
+    "idempotency_key contains unsupported characters": "idempotency key invalid",
+    "source_sha256 must be a lowercase SHA-256 digest": "source digest invalid",
+    "candidate assessment found an exact duplicate": "candidate exact duplicate",
+    "TaskSpec revision candidate must explicitly bind the exact existing task_id": "task revision identity mismatch",
+    "nonterminal task proposals must use exact Bureau resources or an explicit reviewed repository-wide exception": "bureau task scope too broad",
+}
+
+
+def _audit_bureau_failure_reason_class(reason: Any, code: Any) -> str | None:
+    if not isinstance(reason, str) or not reason:
+        return None
+    exact = _AUDIT_BUREAU_FAILURE_REASON_EXACT_CLASSES.get(reason)
+    if exact is not None:
+        return exact
+    if reason.startswith("unknown live register task "):
+        return "live register task unknown"
+    if (
+        reason.startswith("publishing task ")
+        and reason.endswith(" is not in the authoritative StateStore")
+    ):
+        return "publishing task unknown"
+    if reason.startswith("unknown initiative "):
+        return "initiative unknown"
+    if reason.startswith(
+        "task JSON does not have an executable typed acceptance contract:"
+    ):
+        return "task acceptance contract invalid"
+    if isinstance(code, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", code):
+        return f"bureau code: {code}"
+    return "bureau failure other"
+
+
 def _audit_bureau_identity_public_group(
     group: dict[str, Any],
     *,
@@ -797,10 +836,14 @@ def _audit_window_projection(
                 code_key = _audit_label(record.get("bureau_code"), fallback="unknown")
                 code_counts = group["failure_code_counts"]
                 code_counts[code_key] = int(code_counts.get(code_key, 0)) + 1
-                failure_reason = record.get("bureau_failure_reason")
-                if isinstance(failure_reason, str) and failure_reason:
+                failure_reason_class = _audit_bureau_failure_reason_class(
+                    record.get("bureau_failure_reason"), record.get("bureau_code")
+                )
+                if failure_reason_class is not None:
                     reason_counts = group["failure_reason_counts"]
-                    reason_counts[failure_reason] = int(reason_counts.get(failure_reason, 0)) + 1
+                    reason_counts[failure_reason_class] = (
+                        int(reason_counts.get(failure_reason_class, 0)) + 1
+                    )
                 else:
                     group["failure_reason_unknown_count"] += 1
                 if retryable is True:
