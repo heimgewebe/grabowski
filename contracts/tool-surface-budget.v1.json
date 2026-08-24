@@ -484,12 +484,12 @@
         "tests:test_checkout_terminal_reconciliation.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only the exact transition from active or completed-retained to externally_terminal_missing for one already absent managed checkout.",
-        "evidence": "Fresh timestamp-bound preview, exact owner, source and checkout identity, source-terminal revalidation, path and branch leases, immediate conflict reread, SQLite compare-and-swap, immutable receipt, audit append and post-state readback."
+        "claim": "The tool owns only two exact evidence-bound transitions: active or completed-retained to externally_terminal_missing for an absent managed checkout, or active to completed_retained for a clean present terminal Work Lane while preserving the checkout and retention.",
+        "evidence": "Fresh timestamp-bound preview, exact owner/source/checkout identity, source-terminal revalidation, present Work Lane terminal-head binding when available, clean and remote-recoverable present state or proven absence, path and branch leases, immediate conflict reread, SQLite compare-and-swap, chained receipts for later missing reconciliation, audit append and post-state readback."
       },
       "justification_kind": "distinct_authority_boundary",
       "operation_alternative_considered": "Archive and cleanup tools were rejected because they create recovery or removal authority; generic state or terminal tools cannot bind source-specific terminal receipts, checkout identity, leases and lifecycle CAS as one fail-closed transition.",
-      "rationale": "External terminal reconciliation is a distinct evidence-only mutation boundary. It changes lifecycle phase and terminal time while explicitly preserving binding, retention, branch, refs, archive state and filesystem contents.",
+      "rationale": "External terminal reconciliation is a distinct evidence-only mutation boundary. It either records an absent checkout as externally terminal or releases active capacity for a retained terminal Work Lane by moving it to completed_retained; both modes preserve retention, refs and cleanup authority boundaries, and the present mode preserves the checkout itself.",
       "tool_contract": {
         "tool": "grabowski_checkout_binding_terminal_apply",
         "category": "checkout-lifecycle",
@@ -512,8 +512,8 @@
         "tests:test_checkout_terminal_reconciliation.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only the read-only, time-bounded evidence shape required before one missing-checkout terminal reconciliation.",
-        "evidence": "Exact checkout, repository, common-dir, path, owner, branch, head, source identity, source-terminal receipt, archive absence and live lease/task/process blockers are hash-bound with explicit nonclaims."
+        "claim": "The tool owns only the read-only, time-bounded evidence shape required before one absent-checkout terminal reconciliation or one clean present terminal Work Lane retention transition.",
+        "evidence": "Exact checkout, repository, common-dir, path, owner, branch, head, source identity, source-terminal receipt, Work Lane terminal head when available, clean/remote recovery evidence for present mode, archive absence and live lease/task/process blockers are hash-bound with explicit nonclaims."
       },
       "justification_kind": "material_call_shape",
       "operation_alternative_considered": "Extending generic checkout inventory or binding reconciliation was rejected because neither call shape binds a fresh source-terminal receipt and exact apply preimage with an expiry contract.",

@@ -56,6 +56,20 @@ def _record(checkout_key: str) -> dict[str, Any] | None:
     return {**result, "receipt": receipt, "source_evidence": source_evidence}
 
 
+def _reconciliation_mode(receipt: dict[str, Any]) -> str | None:
+    mode = receipt.get("reconciliation_mode")
+    if mode in {"missing_external", "present_retained"}:
+        return str(mode)
+    binding_after = receipt.get("binding_after")
+    if (
+        mode is None
+        and isinstance(binding_after, dict)
+        and binding_after.get("phase") == "externally_terminal_missing"
+    ):
+        return "missing_external"
+    return None
+
+
 def _snapshot(checkout_key: str) -> dict[str, Any]:
     connection = checkouts._readonly_connection(checkouts.CHECKOUT_DB)
     if connection is None:
@@ -192,6 +206,7 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     )
     blockers.extend(branch_blockers)
     return {
+        "mode": "missing",
         "repository": str(top_level),
         "repo_common_dir": str(common_dir),
         "checkout_path": str(bound_checkout_path),
@@ -205,6 +220,104 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
         "expected_branch": binding["expected_branch"],
         "blockers": sorted(set(blockers)),
     }
+
+
+def _present_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
+    repo = checkouts._resolve_repo(binding["repo_path"])
+    common_dir = checkouts._git_common_dir(repo)
+    top_level, observed_common, records = checkouts._worktree_records(repo)
+    bound_checkout_path, checkout_exists, path_blockers = (
+        _lexical_checkout_path_observation(binding["checkout_path"])
+    )
+    blockers: list[str] = list(path_blockers)
+    try:
+        checkout_path = checkouts._safe_path(
+            bound_checkout_path, must_exist=checkout_exists
+        )
+    except (OSError, ValueError):
+        checkout_path = bound_checkout_path
+        blockers.append("checkout-path-unobservable")
+    if not checkout_exists:
+        blockers.append("checkout-path-missing")
+    if str(top_level) != binding["repo_path"]:
+        blockers.append("repository-path-drift")
+    if common_dir != observed_common or str(common_dir) != binding["repo_common_dir"]:
+        blockers.append("repository-common-dir-drift")
+    matches = [
+        record
+        for record in records
+        if Path(record["path"]).resolve(strict=False) == checkout_path.resolve(strict=False)
+    ]
+    if len(matches) != 1:
+        blockers.append(
+            "checkout-record-missing" if not matches else "checkout-record-ambiguous"
+        )
+    record = matches[0] if len(matches) == 1 else None
+    branch_ref = f"refs/heads/{binding['expected_branch']}"
+    branch_head: str | None = None
+    relation = "unobservable"
+    status: dict[str, Any] | None = None
+    remote_security: dict[str, Any] | None = None
+    if record is not None:
+        if record.get("prunable"):
+            blockers.append("checkout-record-prunable")
+        if record.get("branch") != binding["expected_branch"]:
+            blockers.append("checkout-record-branch-drift")
+        current_head = record.get("head")
+        if not isinstance(current_head, str) or checkouts.GIT_OBJECT_RE.fullmatch(current_head) is None:
+            blockers.append("checkout-record-head-unobservable")
+        else:
+            branch_head = current_head
+            relation, relation_blockers = _branch_head_relation(
+                repo, binding["expected_head"], current_head
+            )
+            blockers.extend(relation_blockers)
+        branch_read = checkouts._git_read(
+            repo,
+            ["rev-parse", "--verify", f"{branch_ref}^{{commit}}"],
+            check=False,
+        )
+        ref_head = branch_read.stdout.strip() if branch_read.returncode == 0 else None
+        if ref_head is None:
+            blockers.append("branch-ref-missing")
+        elif branch_head is not None and ref_head != branch_head:
+            blockers.append("branch-ref-head-drift")
+        status = checkouts._worktree_status(record)
+        if status.get("dirty") is True:
+            blockers.append("checkout-dirty")
+        elif status.get("dirty") is not False:
+            blockers.append("checkout-status-unobservable")
+        remote_security = checkouts._remote_secured_observation(
+            record, verify_github_pull_ref=True
+        )
+        if remote_security.get("remote_secured") is not True:
+            blockers.append("checkout-head-not-remote-secured")
+    return {
+        "mode": "present",
+        "repository": str(top_level),
+        "repo_common_dir": str(common_dir),
+        "checkout_path": str(bound_checkout_path),
+        "checkout_exists": checkout_exists,
+        "worktree_record_present": record is not None,
+        "worktree_record": record,
+        "branch_ref": branch_ref,
+        "branch_head": branch_head,
+        "branch_head_relation": relation,
+        "expected_head": binding["expected_head"],
+        "expected_branch": binding["expected_branch"],
+        "status": status,
+        "remote_security": remote_security,
+        "blockers": sorted(set(blockers)),
+    }
+
+
+def _terminal_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
+    _path, checkout_exists, _blockers = _lexical_checkout_path_observation(
+        binding["checkout_path"]
+    )
+    if checkout_exists:
+        return _present_checkout_observation(binding)
+    return _missing_checkout_observation(binding)
 
 
 def _branch_task_records(checkout_path: Path, branch_key: str) -> list[dict[str, Any]]:
@@ -273,27 +386,64 @@ def _preview_state(
     existing = _record(key)
     snapshot = _snapshot(key)
     binding = snapshot["binding"]
+    superseded_receipt_sha256: str | None = None
+    superseded_receipt: dict[str, Any] | None = None
     if existing is not None:
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "checkout_terminal_reconciliation_preview",
-            "status": "already_applied",
-            "checkout_key": key,
-            "safe_to_apply": False,
-            "existing_receipt": existing["receipt"],
-            "does_not_establish": [
-                "archive_or_cleanup_authority",
-                "branch_or_ref_deletion_authority",
-            ],
-        }
+        existing_mode = _reconciliation_mode(existing["receipt"])
+        _path, checkout_exists, path_blockers = _lexical_checkout_path_observation(
+            binding["checkout_path"]
+        )
+        may_follow_present_with_missing = (
+            existing_mode == "present_retained"
+            and binding["phase"] == "completed_retained"
+            and checkout_exists is False
+            and not path_blockers
+        )
+        if may_follow_present_with_missing:
+            superseded_receipt_sha256 = existing["receipt_sha256"]
+            superseded_receipt = existing["receipt"]
+        else:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "checkout_terminal_reconciliation_preview",
+                "status": "already_applied",
+                "checkout_key": key,
+                "safe_to_apply": False,
+                "existing_receipt": existing["receipt"],
+                "does_not_establish": [
+                    "archive_or_cleanup_authority",
+                    "branch_or_ref_deletion_authority",
+                ],
+            }
     if binding["phase"] not in _ALLOWED_SOURCE_PHASES:
         raise RuntimeError("only active or completed-retained bindings may be reconciled")
     source_evidence = sources.source_terminal_evidence(binding)
-    checkout = _missing_checkout_observation(binding)
+    checkout = _terminal_checkout_observation(binding)
     coordination = _coordination(binding, ignore_lease_owner=ignore_lease_owner)
     blockers = list(checkout["blockers"])
     if snapshot["archive_count"]:
         blockers.append("archive-record-present")
+    source = binding.get("source")
+    source_is_work_lane = (
+        isinstance(source, dict) and source.get("kind") == "work_lane"
+    )
+    if checkout.get("mode") == "present":
+        if binding["phase"] != "active":
+            blockers.append("present-checkout-not-active")
+        if not source_is_work_lane:
+            blockers.append("present-checkout-source-not-work-lane")
+        elif source_evidence.get("lease_release_ready") is not True:
+            blockers.append("work-lane-lease-release-not-ready")
+    if source_is_work_lane:
+        terminal_head = source_evidence.get("terminal_head_sha")
+        if terminal_head is not None:
+            if (
+                not isinstance(terminal_head, str)
+                or checkouts.GIT_OBJECT_RE.fullmatch(terminal_head) is None
+            ):
+                blockers.append("work-lane-terminal-head-invalid")
+            elif checkout.get("branch_head") != terminal_head:
+                blockers.append("work-lane-head-after-terminal-closeout")
     if coordination["blocking"]:
         blockers.append("active-coordination")
     stable = {
@@ -310,6 +460,8 @@ def _preview_state(
         "coordination": coordination,
         "blockers": sorted(set(blockers)),
         "safe_to_apply": not blockers,
+        "supersedes_reconciliation_receipt_sha256": superseded_receipt_sha256,
+        "supersedes_reconciliation_receipt": superseded_receipt,
         "does_not_establish": [
             "archive_or_cleanup_authority",
             "branch_or_ref_deletion_authority",
@@ -346,9 +498,17 @@ def _replay(
     existing = _record(checkout_key)
     if existing is None:
         return None
+    existing_mode = _reconciliation_mode(existing["receipt"])
     if existing["owner_id"] != owner_id:
+        if existing_mode == "present_retained":
+            # A completed-retained owner handoff changes lifecycle/retention
+            # authority without rewriting the historical reconciliation receipt.
+            # Let the fresh binding-owner check decide a later missing follow-up.
+            return None
         raise PermissionError("terminal reconciliation belongs to another owner")
     if existing["preview_sha256"] != expected_preview_sha256:
+        if existing_mode == "present_retained":
+            return None
         raise RuntimeError("terminal reconciliation replay preview digest drift")
     return {
         "schema_version": SCHEMA_VERSION,
@@ -404,7 +564,7 @@ def apply(
     lease = checkouts.resources.acquire_resources(
         operation_owner,
         resource_keys,
-        purpose=f"terminal reconciliation for missing checkout {key}",
+        purpose=f"terminal reconciliation for checkout {key}",
         ttl_seconds=checkouts.OPERATION_LEASE_TTL_SECONDS,
         metadata={
             "checkout_key": key,
@@ -424,15 +584,57 @@ def apply(
         applied_at = checkouts._now()
         with checkouts._operation_lock(), checkouts._database() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
-                "SELECT 1 FROM terminal_reconciliations WHERE checkout_key=?",
+            prior_row = connection.execute(
+                "SELECT owner_id, preview_sha256, receipt_json, receipt_sha256 "
+                "FROM terminal_reconciliations WHERE checkout_key=?",
                 (key,),
-            ).fetchone() is not None:
-                connection.rollback()
-                replay = _replay(key, owner, preview_sha256)
-                if replay is None:
-                    raise RuntimeError("terminal reconciliation replay disappeared")
-                return replay
+            ).fetchone()
+            superseded_receipt: dict[str, Any] | None = None
+            superseded_receipt_sha256: str | None = None
+            if prior_row is not None:
+                same_owner = prior_row["owner_id"] == owner
+                if prior_row["preview_sha256"] == preview_sha256:
+                    if not same_owner:
+                        raise PermissionError(
+                            "terminal reconciliation replay belongs to another owner"
+                        )
+                    connection.rollback()
+                    replay = _replay(key, owner, preview_sha256)
+                    if replay is None:
+                        raise RuntimeError("terminal reconciliation replay disappeared")
+                    return replay
+                try:
+                    prior_receipt = json.loads(prior_row["receipt_json"])
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "terminal reconciliation predecessor receipt is invalid"
+                    ) from exc
+                expected_predecessor = planned.get(
+                    "supersedes_reconciliation_receipt_sha256"
+                )
+                predecessor_is_present = (
+                    isinstance(prior_receipt, dict)
+                    and _reconciliation_mode(prior_receipt) == "present_retained"
+                    and expected_predecessor == prior_row["receipt_sha256"]
+                    and prior_receipt.get("receipt_sha256")
+                    == prior_row["receipt_sha256"]
+                )
+                handoff_supersession = (
+                    predecessor_is_present
+                    and not same_owner
+                    and planned["binding"]["owner_id"] == owner
+                    and planned["binding"]["phase"] == "completed_retained"
+                )
+                if not predecessor_is_present:
+                    raise RuntimeError(
+                        "terminal reconciliation predecessor changed or is not supersedable"
+                    )
+                if not same_owner and not handoff_supersession:
+                    raise PermissionError(
+                        "terminal reconciliation predecessor belongs to another owner"
+                    )
+                superseded_receipt = prior_receipt
+                superseded_receipt_sha256 = prior_row["receipt_sha256"]
             binding_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
                 (key,),
@@ -451,6 +653,14 @@ def apply(
             ):
                 raise RuntimeError("checkout lifecycle CAS preimage changed")
             checkout_observation = planned["checkout_observation"]
+            mode = checkout_observation.get("mode")
+            if mode not in {"missing", "present"}:
+                raise RuntimeError("terminal reconciliation checkout mode is invalid")
+            target_phase = (
+                "completed_retained"
+                if mode == "present"
+                else "externally_terminal_missing"
+            )
             relation = checkout_observation.get("branch_head_relation")
             rebind_head = (
                 checkout_observation.get("branch_head")
@@ -465,7 +675,7 @@ def apply(
             updated = connection.execute(
                 """
                 UPDATE lifecycle_bindings
-                SET phase='externally_terminal_missing',
+                SET phase=?,
                     expected_head=?,
                     terminal_at_unix=COALESCE(terminal_at_unix, ?),
                     archived_at_unix=NULL,
@@ -474,6 +684,7 @@ def apply(
                   AND expected_head=? AND updated_at_unix=?
                 """,
                 (
+                    target_phase,
                     rebind_head,
                     applied_at,
                     lifecycle_updated_at,
@@ -530,12 +741,18 @@ def apply(
                 else None
             )
             effects = ["lifecycle_phase_transition"]
+            if mode == "present":
+                effects.append("active_capacity_release")
             if branch_head_rebind is not None:
                 effects.append("terminal_head_rebind")
             receipt_core = {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "checkout_terminal_reconciliation_receipt",
                 "checkout_key": key,
+                "reconciliation_mode": (
+                    "present_retained" if mode == "present" else "missing_external"
+                ),
+                "checkout_preserved": mode == "present",
                 "owner_id": owner,
                 "binding_before": binding_before,
                 "binding_before_sha256": planned["binding_sha256"],
@@ -561,37 +778,63 @@ def apply(
                     "permission_to_delete_binding_or_retention_rows",
                 ],
             }
+            if superseded_receipt is not None:
+                receipt_core["supersedes_reconciliation_receipt_sha256"] = (
+                    superseded_receipt_sha256
+                )
+                receipt_core["supersedes_reconciliation_receipt"] = superseded_receipt
             receipt = {**receipt_core, "receipt_sha256": checkouts._sha256_json(receipt_core)}
-            connection.execute(
-                """
-                INSERT INTO terminal_reconciliations(
-                    checkout_key, owner_id, binding_before_sha256,
-                    retention_sha256, source_evidence_json,
-                    source_evidence_sha256, preview_sha256,
-                    preview_created_at_unix, applied_at_unix,
-                    receipt_json, receipt_sha256
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    key,
-                    owner,
-                    planned["binding_sha256"],
-                    planned["retention_sha256"],
-                    checkouts._canonical_json(planned["source_evidence"]),
-                    planned["source_evidence"]["evidence_sha256"],
-                    preview_sha256,
-                    preview_created_at_unix,
-                    applied_at,
-                    checkouts._canonical_json(receipt),
-                    receipt["receipt_sha256"],
-                ),
+            row_values = (
+                owner,
+                planned["binding_sha256"],
+                planned["retention_sha256"],
+                checkouts._canonical_json(planned["source_evidence"]),
+                planned["source_evidence"]["evidence_sha256"],
+                preview_sha256,
+                preview_created_at_unix,
+                applied_at,
+                checkouts._canonical_json(receipt),
+                receipt["receipt_sha256"],
             )
+            if superseded_receipt is None:
+                connection.execute(
+                    """
+                    INSERT INTO terminal_reconciliations(
+                        checkout_key, owner_id, binding_before_sha256,
+                        retention_sha256, source_evidence_json,
+                        source_evidence_sha256, preview_sha256,
+                        preview_created_at_unix, applied_at_unix,
+                        receipt_json, receipt_sha256
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, *row_values),
+                )
+            else:
+                replaced = connection.execute(
+                    """
+                    UPDATE terminal_reconciliations
+                    SET owner_id=?, binding_before_sha256=?, retention_sha256=?,
+                        source_evidence_json=?, source_evidence_sha256=?,
+                        preview_sha256=?, preview_created_at_unix=?, applied_at_unix=?,
+                        receipt_json=?, receipt_sha256=?
+                    WHERE checkout_key=? AND receipt_sha256=?
+                    """,
+                    (
+                        *row_values,
+                        key,
+                        superseded_receipt_sha256,
+                    ),
+                )
+                if replaced.rowcount != 1:
+                    raise RuntimeError(
+                        "terminal reconciliation predecessor CAS replacement failed"
+                    )
             connection.commit()
         readback = _record(key)
         if (
             readback is None
             or readback["receipt_sha256"] != receipt["receipt_sha256"]
-            or readback["receipt"]["binding_after"]["phase"] != "externally_terminal_missing"
+            or readback["receipt"]["binding_after"]["phase"] != target_phase
         ):
             raise RuntimeError("terminal reconciliation post-state readback failed")
         audit = {
