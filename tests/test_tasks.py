@@ -3907,6 +3907,60 @@ class TaskTests(unittest.TestCase):
             self.assertIsNone(tasks.resources.inspect_resource(f"repo:{ambient}"))
             self.assertIsNotNone(tasks.resources.inspect_resource(f"repo:{scratch}"))
 
+    def test_git_workspace_discovery_ignores_repository_selection_environment(self) -> None:
+        repository = self.root / "selected-repository"
+        unrelated = self.root / "unrelated-repository"
+        for path, branch in ((repository, "expected"), (unrelated, "wrong")):
+            subprocess.run(
+                ["git", "init", "-q", str(path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", str(path), "symbolic-ref", "HEAD", f"refs/heads/{branch}"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        nested = repository / "src" / "feature"
+        nested.mkdir(parents=True)
+
+        with patch.dict(
+            os.environ,
+            {
+                "GIT_DIR": str(unrelated / ".git"),
+                "GIT_WORK_TREE": str(unrelated),
+                "GIT_CEILING_DIRECTORIES": str(repository),
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                tasks._local_workspace_path(None, cwd=str(nested)),
+                str(repository),
+            )
+            self.assertEqual(
+                tasks._workspace_scope_identity(str(repository)),
+                ("0" * 40, "expected"),
+            )
+
+    def test_nested_git_workspace_discovery_failure_fails_closed(self) -> None:
+        repository = self.root / "discovery-failure-repository"
+        subprocess.run(
+            ["git", "init", "-q", str(repository)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        nested = repository / "src" / "feature"
+        nested.mkdir(parents=True)
+
+        with patch.object(tasks, "_local_git_root", return_value=None):
+            with self.assertRaisesRegex(
+                RuntimeError, "unable to validate ancestor Git workspace root"
+            ):
+                tasks._local_workspace_path(None, cwd=str(nested))
+
     def test_unversioned_repository_write_remains_reposkop_required(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with tempfile.TemporaryDirectory(dir=self.root.parent) as scratch_name:
