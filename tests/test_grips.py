@@ -5446,6 +5446,11 @@ class GripFoundationTests(unittest.TestCase):
                 "base": "main",
                 "title": "AEF source one-shot",
                 "source_kind": "direct-user",
+                "_server_runtime_actor_identity": (
+                    grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
+                        object(), profile="operator"
+                    )
+                ),
                 "source_id": "source-1",
                 "repo": str(repo),
                 "source_revision": head,
@@ -5481,7 +5486,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("workspace_ready", result["output"]["frontdoor"]["state"])
         self.assertEqual(lane_id, result["output"]["frontdoor"]["lane_id"])
         self.assertEqual(1, len(acquired))
-        self.assertEqual("controller:chatgpt", acquired[0]["controller_actor"])
+        self.assertRegex(str(acquired[0]["controller_actor"]), r"^runtime-actor:[0-9a-f]{64}$")
         self.assertEqual(
             "claude-sonnet-5-high",
             acquired[0]["execution_plan"]["route_binding"]["writer_route"],
@@ -5537,6 +5542,11 @@ class GripFoundationTests(unittest.TestCase):
                 "base": "main",
                 "title": "Controller boundary",
                 "source_kind": "direct-user",
+                "_server_runtime_actor_identity": (
+                    grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
+                        object(), profile="operator"
+                    )
+                ),
                 "source_id": "controller-source",
                 "repo": str(repo),
                 "source_revision": head,
@@ -5564,7 +5574,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(lane_id, result["output"]["lane_id"])
         self.assertEqual(lane_receipt, result["output"]["lane_receipt_sha256"])
         self.assertEqual(1, len(acquired))
-        self.assertEqual("controller:chatgpt", acquired[0]["controller_actor"])
+        self.assertRegex(str(acquired[0]["controller_actor"]), r"^runtime-actor:[0-9a-f]{64}$")
         self.assertEqual("direct", acquired[0]["execution_plan"]["topology"])
         work_acquire.operator._require_operator_mutation.assert_called_once()
         work_acquire.operator._require_operator_capability.assert_called_once_with("git_cli")
@@ -5591,6 +5601,11 @@ class GripFoundationTests(unittest.TestCase):
                 "base": "main",
                 "title": "Controller review boundary",
                 "source_kind": "direct-user",
+                "_server_runtime_actor_identity": (
+                    grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
+                        object(), profile="operator"
+                    )
+                ),
                 "source_id": "controller-review-source",
                 "repo": str(repo),
                 "source_revision": head,
