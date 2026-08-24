@@ -2510,7 +2510,14 @@
         "isolated-pr"
       ],
       "tier": "balanced",
-      "experimental_quality_floor_bypass": true
+      "experimental_quality_floor_bypass": true,
+      "forbidden_risk_flags": [
+        "user_data",
+        "secrets",
+        "private-context",
+        "customer-data",
+        "credential"
+      ]
     },
     {
       "argv_prefix": [
@@ -2548,7 +2555,14 @@
         "security-review"
       ],
       "tier": "critical",
-      "primary_review_authority": true
+      "primary_review_authority": true,
+      "forbidden_risk_flags": [
+        "user_data",
+        "secrets",
+        "private-context",
+        "customer-data",
+        "credential"
+      ]
     },
     {
       "argv_prefix": [

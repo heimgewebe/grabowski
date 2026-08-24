@@ -1506,6 +1506,10 @@ class CodingAgentRouterTests(unittest.TestCase):
             },
         )
         self.assertNotIn("local-private", writer["task_classes"])
+        expected_private_flags = {
+            "user_data", "secrets", "private-context", "customer-data", "credential",
+        }
+        self.assertEqual(set(writer["forbidden_risk_flags"]), expected_private_flags)
 
         reviewer_capabilities = router._route_capabilities(reviewer, self.catalog)
         self.assertEqual(reviewer_capabilities["route_role"], "reviewer")
@@ -1514,6 +1518,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(reviewer["critical_eligible"])
         self.assertTrue(reviewer["primary_review_authority"])
         self.assertTrue(reviewer["experimental_quality_floor_bypass"])
+        self.assertEqual(set(reviewer["forbidden_risk_flags"]), expected_private_flags)
         self.assertIn("--agent", reviewer["argv_prefix"])
         self.assertIn("plan", reviewer["argv_prefix"])
         self.assertNotIn("--auto", reviewer["argv_prefix"])
@@ -1575,7 +1580,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             changed_files=20,
             duration_minutes=180,
             novelty="high",
-            risk_flags=["security-sensitive"],
+            risk_flags=[],
             latency_priority=False,
             reviewer=True,
             previous_group="openai-controller",
@@ -1586,6 +1591,45 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(execution)
         self.assertTrue(any("quality floor bypassed" in reason for reason in reasons))
         self.assertEqual(self.catalog["models"]["ox-alpha"]["quality"]["review"], 3)
+
+        score, _, _, _, exclusion, execution = router._score_route(
+            reviewer,
+            "security-review",
+            self.catalog,
+            state,
+            changed_files=20,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["private-context"],
+            latency_priority=False,
+            reviewer=True,
+            previous_group="openai-controller",
+            previous_provider="openai",
+        )
+        self.assertIsNone(score)
+        self.assertFalse(execution)
+        self.assertEqual(
+            exclusion,
+            ["route forbids sensitive risk flags: private-context"],
+        )
+
+        score, _, _, _, exclusion, execution = router._score_route(
+            writer,
+            "architecture",
+            self.catalog,
+            state,
+            changed_files=20,
+            duration_minutes=180,
+            novelty="high",
+            risk_flags=["user_data"],
+            latency_priority=False,
+            reviewer=False,
+            previous_group=None,
+            previous_provider=None,
+        )
+        self.assertIsNone(score)
+        self.assertFalse(execution)
+        self.assertEqual(exclusion, ["route forbids sensitive risk flags: user_data"])
 
 
     def test_ox_alpha_route_fails_closed_without_local_openrouter_evidence(

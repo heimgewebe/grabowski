@@ -139,11 +139,16 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
             },
         )
         self.assertNotIn("local-private", writer["task_classes"])
+        expected_private_flags = {
+            "user_data", "secrets", "private-context", "customer-data", "credential",
+        }
+        self.assertEqual(set(writer["forbidden_risk_flags"]), expected_private_flags)
 
         self.assertTrue(reviewer["review_only"])
         self.assertTrue(reviewer["critical_eligible"])
         self.assertTrue(reviewer["primary_review_authority"])
         self.assertTrue(reviewer["experimental_quality_floor_bypass"])
+        self.assertEqual(set(reviewer["forbidden_risk_flags"]), expected_private_flags)
         self.assertEqual(
             catalog["policy"]["direct_work_policy"]["primary_review_route_exceptions"],
             ["opencode-openrouter-ox-alpha-review-preview"],
