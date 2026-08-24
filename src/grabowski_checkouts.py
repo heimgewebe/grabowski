@@ -1677,15 +1677,15 @@ def _github_pull_ref_secured_observation(
             "remote_secured_refs": [],
             "error": None,
         }
-    if len(matches) > 4:
-        return {
-            "remote_secured": False,
-            "remote_secured_refs": [],
-            "error": "too many exact merged pull requests for bounded ref verification",
-        }
+    # Branch names can be reused across many merged PRs. Preserve the bounded
+    # verification budget while guaranteeing that exact head matches are tried
+    # before ancestry-only candidates.
+    exact_matches = [item for item in matches if item.get("headRefOid") == head]
+    ancestor_candidates = [item for item in matches if item.get("headRefOid") != head]
+    candidates = [*exact_matches, *ancestor_candidates][:4]
 
     last_error: str | None = None
-    for item in matches:
+    for item in candidates:
         number = int(item["number"])
         remote_ref = f"refs/pull/{number}/head"
         verified = github_read(

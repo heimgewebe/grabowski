@@ -193,6 +193,8 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             "source_id": source["id"],
             "terminal_state": "verified",
         }
+        if source["kind"] == "work_lane":
+            core["lease_release_ready"] = True
         return {**core, "evidence_sha256": checkouts._sha256_json(core)}
 
     def _preview(self, binding: dict[str, object]) -> dict[str, object]:
@@ -326,8 +328,31 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             preview = reconciliation.preview(str(binding["checkout_key"]))
         self.assertFalse(preview["safe_to_apply"])
         self.assertIn(
-            "present-checkout-head-after-terminal-closeout", preview["blockers"]
+            "work-lane-head-after-terminal-closeout", preview["blockers"]
         )
+
+    def test_present_work_lane_requires_release_readiness(self) -> None:
+        binding = self._present_binding()
+        evidence = self._terminal_source_evidence(binding)
+        evidence["lease_release_ready"] = False
+        evidence["evidence_sha256"] = checkouts._sha256_json(
+            {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        )
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts,
+                "_remote_secured_observation",
+                return_value={
+                    "remote_secured": True,
+                    "remote_secured_refs": ["refs/remotes/origin/topic"],
+                    "error": None,
+                },
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("work-lane-lease-release-not-ready", preview["blockers"])
 
     def test_present_terminal_checkout_rejects_non_work_lane_source(self) -> None:
         binding = self._present_binding(
@@ -417,6 +442,44 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         replay = self._apply(binding, second_preview)
         self.assertEqual("already_applied", replay["status"])
         self.assertEqual(second_receipt["receipt_sha256"], replay["receipt"]["receipt_sha256"])
+
+    def test_missing_followup_rechecks_work_lane_terminal_head(self) -> None:
+        binding = self._present_binding()
+        evidence = self._terminal_source_evidence(binding)
+        evidence["terminal_head_sha"] = self.head
+        evidence["evidence_sha256"] = checkouts._sha256_json(
+            {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        )
+        remote = {
+            "remote_secured": True,
+            "remote_secured_refs": ["refs/remotes/origin/topic"],
+            "error": None,
+        }
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(checkouts, "_remote_secured_observation", return_value=remote),
+        ):
+            first_preview = reconciliation.preview(str(binding["checkout_key"]))
+            self.assertTrue(first_preview["safe_to_apply"])
+            reconciliation.apply(
+                str(binding["checkout_key"]),
+                "owner-a",
+                str(first_preview["preview_sha256"]),
+                int(first_preview["preview_created_at_unix"]),
+                reconciliation.CONFIRMATION,
+            )
+        self._git("worktree", "remove", str(self.checkout))
+        tree = self._git("rev-parse", f"{self.head}^{{tree}}").stdout.strip()
+        advanced = self._git(
+            "commit-tree", tree, "-p", self.head, "-m", "post-closeout branch advance"
+        ).stdout.strip()
+        self._git("update-ref", "refs/heads/topic", advanced)
+        with patch.object(sources, "source_terminal_evidence", return_value=evidence):
+            second_preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertFalse(second_preview["safe_to_apply"])
+        self.assertIn(
+            "work-lane-head-after-terminal-closeout", second_preview["blockers"]
+        )
 
     def test_present_terminal_checkout_blocks_dirty_or_unsecured_head(self) -> None:
         binding = self._present_binding()

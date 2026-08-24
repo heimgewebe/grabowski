@@ -1319,6 +1319,56 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertTrue(dry_run["plan"]["safe_to_apply"])
         self.assertEqual(len(calls), 2)
 
+    def test_remote_security_prioritizes_exact_head_among_many_reused_branch_prs(self) -> None:
+        self._git(
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:heimgewebe/reposkop.git",
+        )
+        _top, _common, records = checkouts._worktree_records(self.repo)
+        record = next(item for item in records if item["path"] == str(self.checkout))
+        calls: list[list[str]] = []
+        payload = [
+            {
+                "number": number,
+                "state": "MERGED",
+                "headRefName": "topic",
+                "headRefOid": self.head if number == 101 else f"{number % 16:x}" * 40,
+            }
+            for number in (106, 105, 104, 103, 102, 101)
+        ]
+
+        def github_run(argv, **_kwargs):
+            calls.append(list(argv))
+            if argv[:3] == ["gh", "pr", "list"]:
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": json.dumps(payload),
+                    "stderr": "",
+                    "stdout_truncated": False,
+                }
+            if argv[:2] == ["gh", "api"]:
+                self.assertIn("/git/ref/pull/101/head", argv[4])
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": self.head + "\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                }
+            raise AssertionError(f"unexpected GitHub command: {argv!r}")
+
+        with patch.object(checkouts.operator, "_run", side_effect=github_run):
+            observed = checkouts._remote_secured_observation(
+                record, verify_github_pull_ref=True
+            )
+
+        self.assertTrue(observed["remote_secured"])
+        self.assertEqual("exact_merged_pull_head", observed["remote_secured_relation"])
+        self.assertEqual(2, len(calls))
+
     def test_remote_security_accepts_ancestor_of_exact_merged_github_pull_head(self) -> None:
         self._git(
             "remote",

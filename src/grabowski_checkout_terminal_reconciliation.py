@@ -421,22 +421,27 @@ def _preview_state(
     blockers = list(checkout["blockers"])
     if snapshot["archive_count"]:
         blockers.append("archive-record-present")
+    source = binding.get("source")
+    source_is_work_lane = (
+        isinstance(source, dict) and source.get("kind") == "work_lane"
+    )
     if checkout.get("mode") == "present":
         if binding["phase"] != "active":
             blockers.append("present-checkout-not-active")
-        source = binding.get("source")
-        if not isinstance(source, dict) or source.get("kind") != "work_lane":
+        if not source_is_work_lane:
             blockers.append("present-checkout-source-not-work-lane")
-        else:
-            terminal_head = source_evidence.get("terminal_head_sha")
-            if terminal_head is not None:
-                if (
-                    not isinstance(terminal_head, str)
-                    or checkouts.GIT_OBJECT_RE.fullmatch(terminal_head) is None
-                ):
-                    blockers.append("work-lane-terminal-head-invalid")
-                elif checkout.get("branch_head") != terminal_head:
-                    blockers.append("present-checkout-head-after-terminal-closeout")
+        elif source_evidence.get("lease_release_ready") is not True:
+            blockers.append("work-lane-lease-release-not-ready")
+    if source_is_work_lane:
+        terminal_head = source_evidence.get("terminal_head_sha")
+        if terminal_head is not None:
+            if (
+                not isinstance(terminal_head, str)
+                or checkouts.GIT_OBJECT_RE.fullmatch(terminal_head) is None
+            ):
+                blockers.append("work-lane-terminal-head-invalid")
+            elif checkout.get("branch_head") != terminal_head:
+                blockers.append("work-lane-head-after-terminal-closeout")
     if coordination["blocking"]:
         blockers.append("active-coordination")
     stable = {

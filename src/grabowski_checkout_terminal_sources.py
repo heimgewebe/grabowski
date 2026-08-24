@@ -305,6 +305,7 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
             "lane_receipt_sha256": record.get("receipt_sha256"),
             "assessment_sha256": assessment_sha256,
             "terminal_head_sha": assessment.get("terminal_head_sha"),
+            "lease_release_ready": assessment.get("lease_release_ready"),
             "terminal_closeout_audit_record_sha256": audit_record_sha256,
         }
     )
