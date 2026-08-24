@@ -9,7 +9,6 @@ import sys
 import types
 import unittest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -215,6 +214,32 @@ class AuditQueryTests(unittest.TestCase):
             module.base.required_capabilities,
             ["audit_read", "audit_read", "audit_read"],
         )
+
+    def test_grabowski_audit_analyze_delegates_to_analyze_audit(self) -> None:
+        module = self._load_module(self._components())
+
+        # Override the analyze_audit function to verify delegation
+        called = False
+        args = None
+        kwargs = None
+
+        def fake_analyze_audit(*a, **kw):
+            nonlocal called, args, kwargs
+            called = True
+            args = a
+            kwargs = kw
+            return {"status": "success"}
+
+        module.analyze_audit = fake_analyze_audit
+
+        filters = {"test": "filter"}
+        result = module.grabowski_audit_analyze(filters, top=15)
+
+        self.assertTrue(called)
+        self.assertEqual(args, (filters,))
+        self.assertEqual(kwargs, {"top": 15})
+        self.assertEqual(result, {"status": "success"})
+        self.assertIn("audit_read", module.base.required_capabilities)
 
     def test_snapshot_uses_verification_cache_without_dropping_archived_records(self) -> None:
         module = self._load_module(self._components())
