@@ -3,11 +3,24 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from tests.test_tasks import LOCAL_HOST, TaskTests, _launcher, _missing_unit_observation
+from tests import test_tasks as _task_tests
 import grabowski_tasks as tasks
 
 
-class ReposkopEffectivenessTaskIntegrationTests(TaskTests):
+LOCAL_HOST = _task_tests.LOCAL_HOST
+_launcher = _task_tests._launcher
+_missing_unit_observation = _task_tests._missing_unit_observation
+
+
+# Keep this class independent of TaskTests. Pytest collects inherited unittest
+# methods even though the load_tests hook below narrows unittest discovery.
+class ReposkopEffectivenessTaskIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _task_tests.TaskTests.setUp(self)
+
+    def tearDown(self) -> None:
+        _task_tests.TaskTests.tearDown(self)
+
     def test_required_writer_orders_evaluation_before_task_start(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         operations: list[str] = []
