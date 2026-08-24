@@ -3350,6 +3350,14 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
     retry_successor_record_count = 0
     convergence_excluded_task_ids: set[str] = set()
     decision_excluded_task_ids: set[str] = set()
+    current_attention_count: int | None = None
+    excluded_attention_count: int | None = None
+    current_attention_count_scope = (
+        "not_applicable"
+        if view == "history"
+        else "unavailable_due_to_unverified_projection"
+    )
+    current_attention_exact = False
     page_records: list[dict[str, Any]] = []
     has_more = False
     next_cursor = None
@@ -3444,6 +3452,17 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                         decision_excluded_task_ids = set(
                             projection["decision_excluded_task_ids"]
                         )
+                        if snapshot_status == "locked":
+                            current_attention_count = int(
+                                projection["current_attention_count"]
+                            )
+                            excluded_attention_count = int(
+                                projection["excluded_attention_count"]
+                            )
+                            current_attention_count_scope = str(
+                                projection["scope"]
+                            )
+                            current_attention_exact = True
             scan_created_at = cursor_created_at
             scan_task_id = cursor_task_id
             visible: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -3578,6 +3597,10 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
         "classification_counts_scope": "returned_page",
         "total_attention": raw_total_attention,
         "total_attention_scope": "raw_task_state_projection_before_decisions",
+        "current_attention_count": current_attention_count,
+        "current_attention_count_scope": current_attention_count_scope,
+        "current_attention_exact": current_attention_exact,
+        "excluded_attention_count": excluded_attention_count,
         "current_attention_excluded_classifications": sorted(
             CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
         ),
@@ -3618,6 +3641,10 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
             "completion_of_future_attempts",
             "systemd_or_fleet_post_state",
             "task_or_outcome_receipt_mutation",
-            "exact_global_current_attention_count",
+            *(
+                []
+                if current_attention_exact
+                else ["exact_global_current_attention_count"]
+            ),
         ],
     }
