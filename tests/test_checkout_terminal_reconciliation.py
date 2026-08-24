@@ -277,6 +277,30 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         after_capacity = checkouts.active_capacity_projection(self.repo)
         self.assertEqual(0, after_capacity["used"])
 
+    def test_present_current_work_lane_accepts_exact_terminal_head(self) -> None:
+        binding = self._present_binding()
+        evidence = self._terminal_source_evidence(binding)
+        evidence["terminal_head_sha"] = self.head
+        evidence["evidence_sha256"] = checkouts._sha256_json(
+            {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        )
+        with (
+            patch.object(sources, "source_terminal_evidence", return_value=evidence),
+            patch.object(
+                checkouts,
+                "_remote_secured_observation",
+                return_value={
+                    "remote_secured": True,
+                    "remote_secured_refs": ["refs/remotes/origin/topic"],
+                    "error": None,
+                },
+            ),
+        ):
+            preview = reconciliation.preview(str(binding["checkout_key"]))
+        self.assertTrue(preview["safe_to_apply"])
+        self.assertEqual([], preview["blockers"])
+        self.assertEqual(self.head, preview["source_evidence"]["terminal_head_sha"])
+
     def test_present_current_work_lane_rejects_head_after_terminal_closeout(self) -> None:
         binding = self._present_binding()
         (self.checkout / "post-closeout.txt").write_text("later\n", encoding="utf-8")
