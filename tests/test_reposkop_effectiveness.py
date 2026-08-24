@@ -721,6 +721,62 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             effectiveness.record_review_classification(parameters)
 
 
+    def test_review_records_uses_effectiveness_index_beyond_legacy_scan_bound(self) -> None:
+        evaluation = "a" * 64
+        decision_ref = _ref("1")
+        outcome_ref = _ref("2")
+        indexed = [
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "1",
+                task_id="task-large-audit-review",
+                final_decision="allow",
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "2",
+                task_id="task-large-audit-review",
+                terminal_state="completed",
+            ),
+        ]
+        source = {
+            "chain_content_sha256": "c" * 64,
+            "chain_materialization_sha256": "d" * 64,
+            "total_records": effectiveness.MAX_REVIEW_SCAN_RECORDS + 1,
+            "index_complete": True,
+            "since_truncated": False,
+            "incremental_scanned_records": 0,
+        }
+
+        with patch.object(
+            effectiveness,
+            "_durable_effectiveness_records",
+            return_value=(indexed, source),
+        ), patch.object(
+            effectiveness.audit_query,
+            "capture_verified_audit_snapshot",
+            side_effect=AssertionError("full audit fallback must not run"),
+        ):
+            records, review_source = effectiveness._review_records(
+                evaluation=evaluation,
+                evidence_refs={decision_ref, outcome_ref},
+            )
+
+        self.assertEqual(
+            {record["_audit_ref"] for record in records},
+            {decision_ref, outcome_ref},
+        )
+        self.assertEqual(
+            review_source["lookup_mode"],
+            "verified_incremental_effectiveness_index",
+        )
+        self.assertFalse(review_source["scan_truncated"])
+        self.assertGreater(
+            review_source["total_records"], effectiveness.MAX_REVIEW_SCAN_RECORDS
+        )
+
     def test_projection_separates_verified_blocked_missing_and_legacy(self) -> None:
         verified = "a" * 64
         blocked = "b" * 64

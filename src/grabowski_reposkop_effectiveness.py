@@ -1693,6 +1693,60 @@ def _review_records(
     evidence_refs: set[str],
     scan_limit: int = MAX_REVIEW_SCAN_RECORDS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    # Reposkop review evidence is itself part of the effectiveness domain. Prefer
+    # the durable verified-audit index for the production/default lookup so
+    # semantic review does not stop working merely because the global audit
+    # chain grew beyond the legacy full-scan cap. An explicit smaller scan
+    # limit retains the bounded fallback contract.
+    if scan_limit == MAX_REVIEW_SCAN_RECORDS:
+        indexed_records, indexed_source = _durable_effectiveness_records(
+            since_unix=0,
+            requested_scan_limit=MAX_SCAN_LIMIT,
+        )
+        if (
+            indexed_source.get("index_complete") is True
+            and indexed_source.get("since_truncated") is not True
+        ):
+            indexed_refs = {
+                str(record["_audit_ref"])
+                for record in indexed_records
+                if isinstance(record.get("_audit_ref"), str)
+            }
+            requested_audit_refs = {
+                reference
+                for reference in evidence_refs
+                if reference.startswith("audit-record-sha256:")
+            }
+            if requested_audit_refs <= indexed_refs:
+                selected = [
+                    record
+                    for record in indexed_records
+                    if (
+                        record.get("_audit_ref") in evidence_refs
+                        or record.get("evaluation_id") == evaluation
+                        or record.get("transaction_id") == evaluation
+                    )
+                ]
+                return selected, {
+                    "chain_content_sha256": indexed_source.get("chain_content_sha256"),
+                    "chain_materialization_sha256": indexed_source.get(
+                        "chain_materialization_sha256"
+                    ),
+                    "total_records": indexed_source.get("total_records"),
+                    "scanned_records": indexed_source.get(
+                        "incremental_scanned_records", 0
+                    ),
+                    "retained_records": len(selected),
+                    "scan_limit": MAX_SCAN_LIMIT,
+                    "scan_truncated": False,
+                    "lookup_mode": "verified_incremental_effectiveness_index",
+                    "index_complete": True,
+                }
+
+    # Compatibility fallback for corroborating audit references outside the
+    # Reposkop effectiveness operation set. It deliberately retains the old
+    # bounded full-chain contract and therefore fails closed when such external
+    # evidence cannot be verified within the configured review window.
     snapshot = audit_query.capture_verified_audit_snapshot()
     if snapshot.total_records > scan_limit:
         return [], {
@@ -1703,6 +1757,7 @@ def _review_records(
             "retained_records": 0,
             "scan_limit": scan_limit,
             "scan_truncated": True,
+            "lookup_mode": "bounded_verified_audit_fallback",
         }
     selected: list[dict[str, Any]] = []
     scanned = 0
@@ -1736,6 +1791,7 @@ def _review_records(
         "retained_records": len(selected),
         "scan_limit": scan_limit,
         "scan_truncated": False,
+        "lookup_mode": "bounded_verified_audit_fallback",
     }
 
 
