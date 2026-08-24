@@ -1057,7 +1057,12 @@ def _route_available(
             return False, "Antigravity model is absent"
     if harness == "opencode":
         opencode = providers.get("opencode", {})
-        if opencode.get("free_model_verified") is not True:
+        quota_pools = route.get("quota_pools", [])
+        if (
+            isinstance(quota_pools, list)
+            and "opencode-free" in quota_pools
+            and opencode.get("free_model_verified") is not True
+        ):
             return False, "OpenCode free model entitlement is unverified"
         if model_arg not in opencode.get("models", []):
             return False, "OpenCode model is absent"

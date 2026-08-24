@@ -148,13 +148,13 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
 
         self.assertTrue(reviewer["review_only"])
         self.assertTrue(reviewer["critical_eligible"])
-        self.assertTrue(reviewer["primary_review_authority"])
+        self.assertFalse(reviewer.get("primary_review_authority", False))
         self.assertTrue(reviewer["experimental_quality_floor_bypass"])
         self.assertEqual(set(reviewer["forbidden_risk_flags"]), expected_private_flags)
         self.assertEqual(set(reviewer["required_any_risk_flags"]), expected_safe_flags)
         self.assertEqual(
             catalog["policy"]["direct_work_policy"]["primary_review_route_exceptions"],
-            ["opencode-openrouter-ox-alpha-review-preview"],
+            [],
         )
         self.assertIn("--agent", reviewer["argv_prefix"])
         self.assertIn("plan", reviewer["argv_prefix"])

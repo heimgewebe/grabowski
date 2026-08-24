@@ -730,9 +730,7 @@
       "single_mutating_writer_scope": "overlapping-resource-lane",
       "controller_integration_required": true,
       "operator_ownership_semantics": "controller-accountability-not-exclusive-execution",
-      "primary_review_route_exceptions": [
-        "opencode-openrouter-ox-alpha-review-preview"
-      ]
+      "primary_review_route_exceptions": []
     },
     "effort_levels": {
       "high": 2,
@@ -762,7 +760,7 @@
       "benchmark_prior_not_local_truth": true,
       "escalation_route": "codex-sol-xhigh",
       "opus_role": "Upper-frontier Anthropic reviewer plus escalation-only scoped writer for architecture, deep-debug, migration and difficult complex-patch work through the shared Claude Pro baseline; Sonnet remains the routine Claude writer, Codex Sol remains the canonical top escalation, and Opus writer results require independent review.",
-      "principle": "The controller owns integration, merge, deployment and closeout. Explicitly lane-bound scoped writers may implement and publish PRs. Reviewers are advisory by default; explicitly catalogued primary-review exceptions may own the substantive review verdict while controller process authority remains unchanged.",
+      "principle": "The controller owns integration, merge, deployment, closeout and the final review verdict. Explicitly lane-bound scoped writers may implement and publish PRs. External reviewers may cover all catalogued review classes, including critical and security review, but remain advisory until controller verification.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
         "codex-sol-high"
@@ -2560,7 +2558,6 @@
         "security-review"
       ],
       "tier": "critical",
-      "primary_review_authority": true,
       "forbidden_risk_flags": [
         "user_data",
         "secrets",
