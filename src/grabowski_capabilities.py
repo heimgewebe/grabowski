@@ -355,14 +355,14 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_checkout_binding_terminal_preview": {
         "category": "checkout-lifecycle",
-        "purpose": "Preview one exact source- and identity-bound external terminal transition for an already missing managed checkout.",
+        "purpose": "Preview one exact evidence-bound terminal reconciliation for either an absent managed checkout or a clean present terminal Work Lane retained without consuming active checkout capacity.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_terminal_apply": {
         "category": "checkout-lifecycle",
-        "purpose": "Apply one fresh compare-and-swap transition to externally_terminal_missing while preserving retention, branch, refs, archive state and filesystem contents.",
+        "purpose": "Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing, or clean present terminal Work Lanes from active to completed_retained while preserving the checkout, retention and cleanup authority boundaries.",
         "risk_class": "medium",
         "effects": ["audit-append", "receipt-create", "resource-lease", "state-change"],
         "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
