@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
 import hmac
+import http.client
 import json
 import math
 import os
@@ -669,7 +670,7 @@ def _openrouter_ox_alpha_price_status() -> dict[str, Any]:
     try:
         with urllib.request.urlopen(request, timeout=COMMAND_TIMEOUT_SECONDS) as response:
             payload = response.read(MAX_OPENROUTER_MODELS_BYTES + 1)
-    except (OSError, ValueError, urllib.error.URLError):
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
         return base
     if len(payload) > MAX_OPENROUTER_MODELS_BYTES:
         return {**base, "pricing_status": "response-too-large"}

@@ -378,6 +378,16 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         digest = digest_input.pop("catalog_probe_sha256")
         self.assertEqual(digest, cli._probe_digest(digest_input))
 
+    def test_openrouter_ox_alpha_public_price_probe_fails_closed_on_incomplete_read(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = cli.http.client.IncompleteRead(b"{\"data\":")
+        with mock.patch.object(cli.urllib.request, "urlopen", return_value=response):
+            result = cli._openrouter_ox_alpha_price_status()
+        self.assertFalse(result["available"])
+        self.assertFalse(result["zero_price_verified"])
+        self.assertEqual(result["pricing_status"], "unavailable")
+
     def test_openrouter_ox_alpha_public_price_probe_requires_every_price_zero(self) -> None:
         zero_payload = {
             "data": [
