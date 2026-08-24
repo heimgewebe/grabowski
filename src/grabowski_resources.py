@@ -2498,10 +2498,14 @@ def _reconcile_verified_path_leases(
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders})", list(keys)
+            ).fetchall()
+            existing_by_key = {row["resource_key"]: row for row in rows}
+
             for key in keys:
-                row = connection.execute(
-                    "SELECT * FROM leases WHERE resource_key=?", (key,)
-                ).fetchone()
+                row = existing_by_key.get(key)
                 if row is None:
                     retained.append({"resource_key": key, "reason": "already_absent"})
                     continue
@@ -4989,10 +4993,14 @@ def acquire_resources(
                 now=now,
             )
             existing: dict[str, sqlite3.Row] = {}
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders})", list(keys)
+            ).fetchall()
+            existing_by_key = {row["resource_key"]: row for row in rows}
+
             for key in keys:
-                row = connection.execute(
-                    "SELECT * FROM leases WHERE resource_key=?", (key,)
-                ).fetchone()
+                row = existing_by_key.get(key)
                 if row is not None:
                     existing[key] = row
                     expected_reentry = expired_reentry_expectations.get(key)
@@ -5203,10 +5211,15 @@ def rebind_same_owner_resources(
         try:
             observed_rows: dict[str, sqlite3.Row] = {}
             observed_metadata_by_key: dict[str, dict[str, Any]] = {}
+
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders})", list(keys)
+            ).fetchall()
+            existing_by_key = {row["resource_key"]: row for row in rows}
+
             for key in keys:
-                row = connection.execute(
-                    "SELECT * FROM leases WHERE resource_key=?", (key,)
-                ).fetchone()
+                row = existing_by_key.get(key)
                 if row is None:
                     raise RuntimeError(f"Resource lease disappeared before rebind: {key}")
                 if row["owner_id"] != owner:
@@ -5328,11 +5341,14 @@ def renew_resources(
                 now=now,
                 bureau_contract=bureau_contract,
             )
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders})", list(keys)
+            ).fetchall()
+            existing_by_key = {row["resource_key"]: row for row in rows}
+
             for key in keys:
-                row = connection.execute(
-                    "SELECT * FROM leases WHERE resource_key=?",
-                    (key,),
-                ).fetchone()
+                row = existing_by_key.get(key)
                 if row is None:
                     raise ResourceLeaseMissing(f"Unknown resource lease: {key}")
                 if row["owner_id"] != owner:
@@ -5406,10 +5422,14 @@ def release_resources(
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders})", list(keys)
+            ).fetchall()
+            existing_by_key = {row["resource_key"]: row for row in rows}
+
             for key in keys:
-                row = connection.execute(
-                    "SELECT * FROM leases WHERE resource_key=?", (key,)
-                ).fetchone()
+                row = existing_by_key.get(key)
                 if row is None:
                     if expected_by_key is not None:
                         raise RuntimeError(
