@@ -292,6 +292,25 @@ class AgentCompetitionTests(unittest.TestCase):
                 "authority": "advisory_only",
                 "automatic_patch_apply": False,
             }
+        elif route_id == "opencode-openrouter-ox-alpha-review-preview":
+            contract = {
+                "schema_version": 1,
+                "catalog_sha256": "a" * 64,
+                "route_id": route_id,
+                "harness": "opencode",
+                "harness_binary": "opencode",
+                "model": "ox-alpha",
+                "effort": None,
+                "argv_prefix": [
+                    "opencode", "run", "--pure", "--agent", "plan", "--format", "json",
+                    "--model", "openrouter/stealth/ox-alpha",
+                ],
+                "permission_mode": None,
+                "quota_pools": ["openrouter-ox-alpha-preview"],
+                "paid_only": False,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
         elif route_id == "openhands-always-approve":
             contract = {
                 "schema_version": 1,
@@ -1640,6 +1659,11 @@ class AgentCompetitionTests(unittest.TestCase):
     def test_route_bound_opencode_receipt_preserves_route_and_zero_budget_binding(self) -> None:
         self._assert_zero_budget_route_receipt(
             provider="opencode", route_id="opencode-deepseek-v4-flash-free"
+        )
+
+    def test_route_bound_opencode_plan_reviewer_receipt_preserves_route_and_zero_budget_binding(self) -> None:
+        self._assert_zero_budget_route_receipt(
+            provider="opencode", route_id="opencode-openrouter-ox-alpha-review-preview"
         )
 
     def test_route_bound_openhands_receipt_preserves_always_approve_binding(self) -> None:
