@@ -3778,17 +3778,26 @@ def _read_audit_chain_unlocked(
     *,
     use_segment_cache: bool = True,
     retain_verified_segment_data: bool = True,
-    start_path: Path | None = None,
     initial_expected: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
-    if (start_path is None) != (initial_expected is None):
-        raise ValueError("audit-chain-deferred-start-binding-incomplete")
     components: list[tuple[Path, bytes, dict[str, Any]]] = []
-    seen: set[Path] = set()
-    current = start_path if start_path is not None else path
     expected = dict(initial_expected) if initial_expected is not None else None
+    if expected is None:
+        current = path
+        seen: set[Path] = set()
+        component_limit = MAX_AUDIT_SEGMENTS + 1
+    else:
+        bound_path = expected.get("path")
+        if not isinstance(bound_path, Path):
+            raise ValueError("audit-chain-deferred-start-path-invalid")
+        current = bound_path
+        # The active head was already verified by the caller. Preserve the old
+        # active+MAX_AUDIT_SEGMENTS chain budget and include that head in cycle
+        # detection even though this deferred walk begins at its predecessor.
+        seen = {path.resolve(strict=False)}
+        component_limit = MAX_AUDIT_SEGMENTS
     compatibility_evidence = False
-    for _ in range(MAX_AUDIT_SEGMENTS + 1):
+    for _ in range(component_limit):
         resolved = current.resolve(strict=False)
         if resolved in seen:
             raise ValueError("audit-segment-cycle")

@@ -96,7 +96,6 @@ class AuditQueryTests(unittest.TestCase):
                 path,
                 use_segment_cache=False,
                 retain_verified_segment_data=True,
-                start_path=None,
                 initial_expected=None,
             ):
                 raise read_error
@@ -137,7 +136,6 @@ class AuditQueryTests(unittest.TestCase):
                 path,
                 use_segment_cache=False,
                 retain_verified_segment_data=True,
-                start_path=None,
                 initial_expected=None,
             ):
                 fake_base.read_chain_lock_states.append(fake_base.lock_held)
@@ -147,7 +145,11 @@ class AuditQueryTests(unittest.TestCase):
                         "retain_verified_segment_data": retain_verified_segment_data,
                     }
                 )
-                selected = original_components[1:] if start_path is not None else original_components
+                selected = (
+                    original_components[1:]
+                    if initial_expected is not None
+                    else original_components
+                )
                 returned = []
                 for index, (segment_path, data, status) in enumerate(selected):
                     returned_data = data

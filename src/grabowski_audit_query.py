@@ -365,7 +365,6 @@ def capture_verified_audit_snapshot(path: Path | None = None) -> VerifiedAuditSn
             active_path,
             use_segment_cache=True,
             retain_verified_segment_data=False,
-            start_path=predecessor["path"],
             initial_expected=predecessor,
         )
         components.extend(archived_components)
