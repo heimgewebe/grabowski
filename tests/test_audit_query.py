@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -64,7 +64,20 @@ class AuditQueryTests(unittest.TestCase):
         fake_operator = types.ModuleType("grabowski_operator_core")
         fake_operator.mcp = FakeMCP()
         fake_operator.READ_ONLY = {}
-        fake_base._audit_coordination_lock = lambda path, exclusive=False: nullcontext()
+        fake_base.lock_held = False
+        fake_base.head_lock_states = []
+        fake_base.read_chain_lock_states = []
+
+        @contextmanager
+        def audit_coordination_lock(path, exclusive=False):
+            self.assertFalse(fake_base.lock_held)
+            fake_base.lock_held = True
+            try:
+                yield
+            finally:
+                fake_base.lock_held = False
+
+        fake_base._audit_coordination_lock = audit_coordination_lock
         fake_base.read_chain_calls = []
 
         original_components = list(components or [])
@@ -76,32 +89,76 @@ class AuditQueryTests(unittest.TestCase):
             lazy_files.update(lazy_overrides)
 
         if read_error is not None:
+            def fail_head(path):
+                raise read_error
+
             def fail_read(
                 path,
                 use_segment_cache=False,
                 retain_verified_segment_data=True,
+                initial_expected=None,
             ):
                 raise read_error
+
+            fake_base._read_audit_head_unlocked = fail_head
             fake_base._read_audit_chain_unlocked = fail_read
         else:
+            def read_head(path):
+                fake_base.head_lock_states.append(fake_base.lock_held)
+                if original_components:
+                    segment_path, data, status = original_components[0]
+                    head = (segment_path, data, dict(status))
+                else:
+                    data = b""
+                    head = (
+                        Path(path),
+                        data,
+                        {
+                            "valid": True,
+                            "exists": False,
+                            "records": 0,
+                            "legacy_records": 0,
+                            "v2_records": 0,
+                            "last_record_sha256": None,
+                            "active_bytes": 0,
+                            "segment_sha256": hashlib.sha256(data).hexdigest(),
+                            "error": None,
+                        },
+                    )
+                predecessor = (
+                    {"path": original_components[1][0]}
+                    if len(original_components) > 1
+                    else None
+                )
+                return head, predecessor
+
             def read_chain(
                 path,
                 use_segment_cache=False,
                 retain_verified_segment_data=True,
+                initial_expected=None,
             ):
+                fake_base.read_chain_lock_states.append(fake_base.lock_held)
                 fake_base.read_chain_calls.append(
                     {
                         "use_segment_cache": use_segment_cache,
                         "retain_verified_segment_data": retain_verified_segment_data,
                     }
                 )
+                selected = (
+                    original_components[1:]
+                    if initial_expected is not None
+                    else original_components
+                )
                 returned = []
-                for index, (segment_path, data, status) in enumerate(original_components):
+                for index, (segment_path, data, status) in enumerate(selected):
                     returned_data = data
-                    if index > 0 and not retain_verified_segment_data:
+                    if not retain_verified_segment_data:
                         returned_data = b""
                     returned.append((segment_path, returned_data, dict(status)))
                 return returned, False
+
+            fake_base._read_audit_head_unlocked = read_head
             fake_base._read_audit_chain_unlocked = read_chain
 
         def read_audit_file_bytes(path):
@@ -248,6 +305,8 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(module.base.read_chain_calls, [
             {"use_segment_cache": True, "retain_verified_segment_data": False}
         ])
+        self.assertEqual(module.base.head_lock_states, [True])
+        self.assertEqual(module.base.read_chain_lock_states, [False])
         self.assertEqual(projection["source"]["total_records"], 4)
         self.assertEqual(projection["items"][0]["record"]["operation"], "resource-acquire")
         self.assertEqual(projection["items"][-1]["record"]["task_id"], "task-2")
