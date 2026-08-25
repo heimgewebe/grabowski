@@ -58,6 +58,27 @@ def _artifact(
     return contract.mixed_artifact_from_runtime_tools(runtime_tools)
 
 
+def _complete_artifact() -> dict[str, object]:
+    schemas = _sentinel_schemas()
+    tools = [
+        {
+            "name": name,
+            "inputSchema": schemas.get(
+                name,
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+            ),
+        }
+        for name in NAMES
+    ]
+    complete_schemas = {item["name"]: item["inputSchema"] for item in tools}
+    return {
+        "schema_version": contract.OBSERVED_ARTIFACT_SCHEMA_VERSION,
+        "tools": tools,
+        "complete_schema_count": len(tools),
+        "complete_schema_sha256": contract.complete_schema_fingerprint(complete_schemas),
+    }
+
+
 class ConnectorContractTests(unittest.TestCase):
     def test_mixed_artifact_has_complete_names_and_exact_sentinel_coverage(self) -> None:
         names, schemas, metadata = contract.parse_observed_artifact(_artifact())
@@ -73,6 +94,34 @@ class ConnectorContractTests(unittest.TestCase):
         self.assertLessEqual(
             metadata["artifact_bytes"], contract.MAX_OBSERVED_ARTIFACT_BYTES
         )
+
+    def test_complete_observation_is_recomputed_before_compaction(self) -> None:
+        complete = _complete_artifact()
+        compact = contract.compact_complete_observed_artifact(complete)
+        names, schemas, metadata = contract.parse_observed_artifact(compact)
+
+        self.assertEqual(names, NAMES)
+        self.assertEqual(set(schemas), contract.REQUIRED_SCHEMA_SENTINELS)
+        self.assertEqual(metadata["complete_schema_count"], len(NAMES))
+        self.assertEqual(
+            metadata["complete_schema_sha256"], complete["complete_schema_sha256"]
+        )
+
+    def test_complete_observation_rejects_compact_claim_only_artifact(self) -> None:
+        with self.assertRaisesRegex(
+            contract.ConnectorContractError,
+            "must contain exactly name and inputSchema",
+        ):
+            contract.compact_complete_observed_artifact(_artifact())
+
+    def test_complete_observation_rejects_hash_not_derived_from_supplied_schemas(self) -> None:
+        complete = _complete_artifact()
+        complete["complete_schema_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            contract.ConnectorContractError,
+            "does not match the supplied schemas",
+        ):
+            contract.compact_complete_observed_artifact(complete)
 
     def test_positive_probe_matches_all_contract_axes(self) -> None:
         names, schemas, _ = contract.parse_observed_artifact(_artifact())
