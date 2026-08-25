@@ -2651,6 +2651,29 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(0, listed["attention_projection"]["excluded_attention_count"])
         self.assertIsNone(listed["attention_projection"]["decision_candidate_count"])
 
+    def test_current_reconciliation_treats_absent_decision_store_as_exact(self) -> None:
+        actionable = self._failed_task()
+        self.assertFalse(self.decisions.exists())
+
+        page = attention.reconcile_attention({"limit": 20})
+
+        self.assertFalse(self.decisions.exists())
+        self.assertEqual(1, page["current_attention_count"])
+        self.assertEqual(0, page["excluded_attention_count"])
+        self.assertTrue(page["current_attention_exact"])
+        self.assertEqual(
+            "current_task_projection_after_valid_attention_decisions",
+            page["current_attention_count_scope"],
+        )
+        self.assertEqual(
+            [actionable["task_id"]],
+            [item["task_id"] for item in page["records"]],
+        )
+        self.assertNotIn(
+            "exact_global_current_attention_count",
+            page["does_not_establish"],
+        )
+
     def test_attention_cursor_is_invalidated_by_new_closeout_decision(self) -> None:
         first = self._failed_task()
         second = self._failed_task()

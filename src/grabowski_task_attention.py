@@ -3452,7 +3452,7 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                         decision_excluded_task_ids = set(
                             projection["decision_excluded_task_ids"]
                         )
-                        if snapshot_status == "locked":
+                        if snapshot_status in {"locked", "absent"}:
                             current_attention_count = int(
                                 projection["current_attention_count"]
                             )
