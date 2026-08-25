@@ -5321,6 +5321,14 @@ def capture_platform_connector_snapshot(
     requested_contract_sha256: str | None = None,
     observed_at_unix: int | None = None,
 ) -> dict[str, Any]:
+    if publication_request_id is not None:
+        try:
+            observed_tools = connector_contract.compact_complete_observed_artifact(
+                observed_tools,
+                label="request-bound platform connector catalog artifact",
+            )
+        except connector_contract.ConnectorContractError as exc:
+            raise ClientSnapshotError(str(exc)) from exc
     document, runtime_names = _build_platform_connector_snapshot_with_runtime_names(
         observed_tools=observed_tools,
         runtime_root=runtime_root,
