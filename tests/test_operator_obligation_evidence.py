@@ -798,7 +798,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 started_at="2026-08-25T14:30:01Z",
                 conclusion="FAILURE",
                 workflow_run_id=32859870973,
-                event="pull_request_target",
+                event="pull_request_review",
                 run_number=5691,
             ),
             self._github_v2_workflow_check(
@@ -917,6 +917,43 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 workflow_id=7002,
                 workflow_name="shared display name",
                 workflow_run_id=8002,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+
+    def test_prepare_github_keeps_same_workflow_job_from_distinct_events(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=251,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_run_id=8101,
+                event="pull_request",
+                run_number=101,
+            ),
+            self._github_v2_workflow_check(
+                database_id=252,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=8102,
+                event="workflow_dispatch",
+                run_number=102,
             ),
         ]
         payload = self._github_v2_payload(

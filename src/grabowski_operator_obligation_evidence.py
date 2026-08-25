@@ -425,7 +425,7 @@ def _github_v2_check(
             workflow_name = workflow.get("name")
             if workflow_id is None or not isinstance(workflow_name, str) or not workflow_name:
                 return None
-            logical_identity = ("workflow-check", str(workflow_id), name)
+            logical_identity = ("workflow-check", str(workflow_id), workflow_event, name)
             same_run_identity = (
                 "workflow-run-check",
                 str(workflow_run_id),
