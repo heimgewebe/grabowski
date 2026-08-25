@@ -680,6 +680,59 @@ class HistoricalActivationContractTests(unittest.TestCase):
             midcutover.validate_cutover_receipt(receipt)
 
 
+class SnapshotInspectorDependencyTests(unittest.TestCase):
+    def test_snapshot_inspector_is_injected_and_unknown_state_fails_closed(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def inspect(**parameters):
+            calls.append(parameters)
+            return {
+                "state": "unexpected-state",
+                "publication_transition_sha256": "a" * 64,
+            }
+
+        observed = midcutover.observe_client_snapshot_binding(
+            cutover_id=CUTOVER_ID,
+            cutover_generation=GENERATION,
+            blue_release_id=BLUE_RELEASE,
+            blue_repo_head=HEAD_BLUE,
+            green_release_id=GREEN_RELEASE,
+            target_head=HEAD_GREEN,
+            source_evidence_time=1,
+            publication_request_id="gpp-test",
+            registered_tool_count=1,
+            registered_names_sha256="b" * 64,
+            agent_instructions_sha256="c" * 64,
+            green_readiness={},
+            snapshot_inspector=inspect,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(observed["state"], midcutover.SNAPSHOT_BINDING_UNREADABLE)
+        self.assertEqual(observed["transition_sha256"], "a" * 64)
+
+    def test_missing_snapshot_inspector_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            midcutover.MidCutoverEvidenceError,
+            "canonical client snapshot inspector is unavailable",
+        ):
+            midcutover.observe_client_snapshot_binding(
+                cutover_id=CUTOVER_ID,
+                cutover_generation=GENERATION,
+                blue_release_id=BLUE_RELEASE,
+                blue_repo_head=HEAD_BLUE,
+                green_release_id=GREEN_RELEASE,
+                target_head=HEAD_GREEN,
+                source_evidence_time=1,
+                publication_request_id="gpp-test",
+                registered_tool_count=1,
+                registered_names_sha256="b" * 64,
+                agent_instructions_sha256="c" * 64,
+                green_readiness={},
+                snapshot_inspector=None,
+            )
+
+
 class SelectorEvidenceReaderTests(unittest.TestCase):
     def test_tampered_selector_is_unreadable_rather_than_misread(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
