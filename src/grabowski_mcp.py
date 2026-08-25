@@ -3755,18 +3755,49 @@ def _validate_segment_manifest(
     raise ValueError("audit-segment-manifest-kind-invalid")
 
 
+def _read_audit_head_unlocked(
+    path: Path,
+) -> tuple[tuple[Path, bytes, dict[str, Any]], dict[str, Any] | None]:
+    """Verify the mutable audit head and return its predecessor binding.
+
+    Callers that need a stable snapshot can hold the coordination lock only for
+    this active segment, then verify immutable predecessors after releasing it.
+    """
+    data, status = _read_audit_file(path)
+    if not status["valid"]:
+        raise ValueError(str(status["error"]))
+    observed_sha = hashlib.sha256(data).hexdigest()
+    component_status = dict(status)
+    component_status["segment_sha256"] = observed_sha
+    predecessor = _audit_predecessor_binding(path, _first_audit_record(data))
+    return (path, data, component_status), predecessor
+
+
 def _read_audit_chain_unlocked(
     path: Path,
     *,
     use_segment_cache: bool = True,
     retain_verified_segment_data: bool = True,
+    initial_expected: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
     components: list[tuple[Path, bytes, dict[str, Any]]] = []
-    seen: set[Path] = set()
-    current = path
-    expected: dict[str, Any] | None = None
+    expected = dict(initial_expected) if initial_expected is not None else None
+    if expected is None:
+        current = path
+        seen: set[Path] = set()
+        component_limit = MAX_AUDIT_SEGMENTS + 1
+    else:
+        bound_path = expected.get("path")
+        if not isinstance(bound_path, Path):
+            raise ValueError("audit-chain-deferred-start-path-invalid")
+        current = bound_path
+        # The active head was already verified by the caller. Preserve the old
+        # active+MAX_AUDIT_SEGMENTS chain budget and include that head in cycle
+        # detection even though this deferred walk begins at its predecessor.
+        seen = {path.resolve(strict=False)}
+        component_limit = MAX_AUDIT_SEGMENTS
     compatibility_evidence = False
-    for _ in range(MAX_AUDIT_SEGMENTS + 1):
+    for _ in range(component_limit):
         resolved = current.resolve(strict=False)
         if resolved in seen:
             raise ValueError("audit-segment-cycle")
