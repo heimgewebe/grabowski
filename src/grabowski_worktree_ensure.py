@@ -793,6 +793,8 @@ def _checkout_capacity_saturation_evidence(
         if not isinstance(projection, dict):
             return None
         configured_limit = projection.get("configured_limit")
+        effective_capacity = projection.get("effective_capacity")
+        limiting_reason = projection.get("limiting_reason")
         used = projection.get("used")
         free = projection.get("free")
         semantics = projection.get("capacity_semantics")
@@ -804,6 +806,11 @@ def _checkout_capacity_saturation_evidence(
         or not isinstance(configured_limit, int)
         or isinstance(configured_limit, bool)
         or configured_limit < 1
+        or not isinstance(effective_capacity, int)
+        or isinstance(effective_capacity, bool)
+        or effective_capacity != configured_limit
+        or not isinstance(limiting_reason, str)
+        or not limiting_reason
         or not isinstance(used, int)
         or isinstance(used, bool)
         or used < configured_limit
@@ -818,9 +825,11 @@ def _checkout_capacity_saturation_evidence(
         "schema_version": 1,
         "available": True,
         "configured_limit": configured_limit,
+        "effective_capacity": effective_capacity,
         "used": used,
         "free": 0,
         "saturated": True,
+        "limiting_reason": limiting_reason,
         "capacity_semantics": semantics,
         "does_not_establish": [
             "checkout_terminality",

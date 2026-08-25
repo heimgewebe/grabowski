@@ -245,6 +245,33 @@ class CheckoutLifecycleTests(unittest.TestCase):
             connection.commit()
         return binding
 
+    def test_active_checkout_limit_configuration_is_bounded(self) -> None:
+        self.assertEqual(
+            checkouts._configured_active_checkout_limit({}),
+            checkouts.DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO,
+        )
+        self.assertEqual(
+            checkouts._configured_active_checkout_limit(
+                {checkouts.ACTIVE_CHECKOUT_LIMIT_ENV: "20"}
+            ),
+            20,
+        )
+        self.assertEqual(
+            checkouts._configured_active_checkout_limit(
+                {
+                    checkouts.ACTIVE_CHECKOUT_LIMIT_ENV: str(
+                        checkouts.MAX_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO
+                    )
+                }
+            ),
+            checkouts.MAX_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO,
+        )
+        for raw in ("", "0", "1", "8", "257", " 16", "16 ", "+16", "16.0"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                checkouts._configured_active_checkout_limit(
+                    {checkouts.ACTIVE_CHECKOUT_LIMIT_ENV: raw}
+                )
+
     def test_parent_directory_is_not_a_checkout_process_scope(self) -> None:
         parent = self.root
         self.assertFalse(

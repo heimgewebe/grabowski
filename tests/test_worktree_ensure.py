@@ -301,6 +301,48 @@ class WorktreeEnsureTests(unittest.TestCase):
             str(parameters["branch"]),
         )
 
+    def test_default_active_limit_admits_thirteen_disjoint_worktrees(self) -> None:
+        self.assertEqual(
+            checkouts._configured_active_checkout_limit({}),
+            checkouts.DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO,
+        )
+        self.assertEqual(checkouts.DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO, 16)
+
+        def allow_admission(**_kwargs: object) -> dict[str, object]:
+            return {"decision": "allow", "blocker_codes": []}
+
+        receipts = []
+        with patch.object(
+            checkouts,
+            "MAX_ACTIVE_CHECKOUTS_PER_REPO",
+            checkouts.DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO,
+        ):
+            for index in range(13):
+                parameters = self._parameters(
+                    key=f"parallel-{index:02d}",
+                    branch=f"feat/parallel-{index:02d}",
+                    target=self.worktree_root / f"parallel-{index:02d}",
+                )
+                receipts.append(
+                    self._ensure(parameters, assess_admission=allow_admission)
+                )
+            capacity = checkouts.active_capacity_projection(self.repo)
+
+        self.assertEqual(
+            [receipt["result_state"] for receipt in receipts],
+            ["CREATED"] * 13,
+        )
+        self.assertEqual(capacity["configured_limit"], 16)
+        self.assertEqual(capacity["effective_capacity"], 16)
+        self.assertEqual(capacity["used"], 13)
+        self.assertEqual(capacity["free"], 3)
+        self.assertFalse(capacity["saturated"])
+        self.assertIsNone(capacity["limiting_reason"])
+        self.assertEqual(
+            len({Path(str(receipt["post_state"]["target_path"])) for receipt in receipts}),
+            13,
+        )
+
     def test_active_limit_blocks_new_growth_without_deleting_existing_checkout(self) -> None:
         first = self._parameters(
             key="limit-first",
@@ -329,9 +371,11 @@ class WorktreeEnsureTests(unittest.TestCase):
                 "schema_version": 1,
                 "available": True,
                 "configured_limit": 1,
+                "effective_capacity": 1,
                 "used": 1,
                 "free": 0,
                 "saturated": True,
+                "limiting_reason": checkouts.ACTIVE_CHECKOUT_LIMITING_REASON,
                 "capacity_semantics": "unexpired_active_retention",
                 "does_not_establish": [
                     "checkout_terminality",
@@ -615,7 +659,10 @@ class WorktreeEnsureTests(unittest.TestCase):
             {"kind": "bureau_task", "id": "STORAGE-LIFECYCLE-V1-T003"},
         )
         self.assertEqual(lifecycle["artifact_class"], "operator_worktree")
-        self.assertEqual(lifecycle["limit"]["maximum"], 8)
+        self.assertEqual(
+            lifecycle["limit"]["maximum"],
+            checkouts.DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO,
+        )
         self.assertEqual(lifecycle["expected_head"], self.head)
         self.assertEqual(lifecycle["expected_branch"], "feat/worktree-case")
         self.assertEqual(lifecycle["terminal_decision"], "retain")
