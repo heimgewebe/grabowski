@@ -629,6 +629,48 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             snapshot._read_publication_current()["state"], "outcome_unknown"
         )
 
+    def test_capture_cli_accepts_complete_artifact_file_above_argv_limit(self) -> None:
+        runtime_artifact = self.artifact()
+        names = connector_contract.parse_observed_artifact(runtime_artifact)[0]
+        prepared = self.prepare_request(runtime_artifact)
+        complete = self.complete_artifact()
+        alpha = next(item for item in complete["tools"] if item["name"] == "alpha")
+        alpha["inputSchema"]["description"] = "x" * 140_000
+        complete["complete_schema_sha256"] = connector_contract.complete_schema_fingerprint(
+            {item["name"]: item["inputSchema"] for item in complete["tools"]}
+        )
+        artifact_path = self.root / "complete-platform-artifact.json"
+        artifact_path.write_text(json.dumps(complete), encoding="utf-8")
+        self.assertGreater(artifact_path.stat().st_size, 131_072)
+        self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        result = snapshot.main(
+            [
+                "capture-platform",
+                "--runtime-root",
+                str(self.runtime_root(names)),
+                "--source-reference",
+                "chatgpt:connector:file-transport",
+                "--observation-scope",
+                "connector_catalog",
+                "--observation-id",
+                "connector-file-transport",
+                "--publication-request-id",
+                prepared["request_id"],
+                "--requested-contract-sha256",
+                prepared["contract"]["tool_contract_sha256"],
+                "--observed-tools-file",
+                str(artifact_path),
+            ]
+        )
+
+        self.assertEqual(result, 0)
+        persisted = json.loads(self.platform_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            persisted["observed_tools"]["complete_schema_sha256"],
+            complete["complete_schema_sha256"],
+        )
+
     def test_request_bound_capture_rejects_compact_schema_hash_claim(self) -> None:
         artifact = self.artifact()
         names = connector_contract.parse_observed_artifact(artifact)[0]

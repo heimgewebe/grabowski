@@ -251,6 +251,59 @@ def _state_lock() -> Iterator[None]:
             os.close(descriptor)
 
 
+def _read_bounded_json_object(
+    path: Path, *, max_bytes: int, label: str
+) -> dict[str, Any]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ClientSnapshotError(f"{label} is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ClientSnapshotError(f"{label} must be a single-link regular file")
+        if before.st_size > max_bytes:
+            raise ClientSnapshotError(f"{label} exceeds size limit")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > max_bytes:
+            raise ClientSnapshotError(f"{label} exceeds size limit")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ClientSnapshotError(f"{label} changed while reading")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ClientSnapshotError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ClientSnapshotError(f"{label} must be a JSON object")
+    return value
+
+
 def _read_private_json(path: Path) -> dict[str, Any]:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -5410,7 +5463,9 @@ def _auto_refresh_parser() -> argparse.ArgumentParser:
     capture.add_argument("--observation-id", required=True)
     capture.add_argument("--publication-request-id")
     capture.add_argument("--requested-contract-sha256")
-    capture.add_argument("--observed-tools-json", required=True)
+    observed_tools_input = capture.add_mutually_exclusive_group(required=True)
+    observed_tools_input.add_argument("--observed-tools-json")
+    observed_tools_input.add_argument("--observed-tools-file", type=Path)
     reconcile = subparsers.add_parser(
         "reconcile-platform-publication",
         help="Reconcile user-owned publication state from one trusted platform snapshot.",
@@ -5462,16 +5517,23 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout_seconds,
             )
         elif args.command == "capture-platform":
-            try:
-                observed_tools = json.loads(args.observed_tools_json)
-            except json.JSONDecodeError as exc:
-                raise ClientSnapshotError(
-                    "platform connector catalog artifact is not valid JSON"
-                ) from exc
-            if not isinstance(observed_tools, dict):
-                raise ClientSnapshotError(
-                    "platform connector catalog artifact must be a JSON object"
+            if args.observed_tools_file is not None:
+                observed_tools = _read_bounded_json_object(
+                    args.observed_tools_file,
+                    max_bytes=connector_contract.MAX_COMPLETE_OBSERVED_ARTIFACT_BYTES,
+                    label="platform connector catalog artifact file",
                 )
+            else:
+                try:
+                    observed_tools = json.loads(args.observed_tools_json)
+                except json.JSONDecodeError as exc:
+                    raise ClientSnapshotError(
+                        "platform connector catalog artifact is not valid JSON"
+                    ) from exc
+                if not isinstance(observed_tools, dict):
+                    raise ClientSnapshotError(
+                        "platform connector catalog artifact must be a JSON object"
+                    )
             result = capture_platform_connector_snapshot(
                 observed_tools=observed_tools,
                 runtime_root=args.runtime_root,
