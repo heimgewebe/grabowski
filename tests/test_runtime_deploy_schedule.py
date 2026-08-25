@@ -1684,6 +1684,7 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             returncode=0,
             stdout=(
                 "PYTHONUNBUFFERED=1 "
+                "GRABOWSKI_MAX_ACTIVE_CHECKOUTS_PER_REPO=24 "
                 "GRABOWSKI_SERVER_RECOVERY_HOST=heimberry "
                 "GRABOWSKI_SERVER_RECOVERY_TARGET=heimberry:rest-server/probe "
                 "UNRELATED_SECRET=do-not-copy"
@@ -1694,6 +1695,7 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
         self.assertEqual(
             environment,
             {
+                "GRABOWSKI_MAX_ACTIVE_CHECKOUTS_PER_REPO": "24",
                 "GRABOWSKI_SERVER_RECOVERY_HOST": "heimberry",
                 "GRABOWSKI_SERVER_RECOVERY_TARGET": "heimberry:rest-server/probe",
             },

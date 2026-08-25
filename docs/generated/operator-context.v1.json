@@ -3597,7 +3597,7 @@
       "src/grabowski_checkout_identity.py": "377ca0a5396df74023cff263a7ae16da94d1c31a887772c3abb877961f4e5fd5",
       "src/grabowski_checkout_terminal_reconciliation.py": "fbe3f0a0778c006a76ab5d44734c6d06988fd0a0cda2e931b39a5e0a0f4a41b2",
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
-      "src/grabowski_checkouts.py": "977dd84858f5da009d10efe2fc5568084393be78aeb8cefbe063e91cedc7b2f9",
+      "src/grabowski_checkouts.py": "e519cc9f2b4ff0b67e6e73d748c89499fe028876b3fcb9c1df989eda9c8a5145",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
