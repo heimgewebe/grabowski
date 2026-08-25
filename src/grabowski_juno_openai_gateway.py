@@ -351,7 +351,7 @@ def select_advisory_contract() -> dict[str, Any]:
     return contract
 
 
-def build_codex_argv(contract: dict[str, Any], prompt: str, output_path: Path) -> list[str]:
+def build_codex_argv(contract: dict[str, Any], output_path: Path) -> list[str]:
     argv = list(contract["argv_prefix"])
     argv.extend(
         [
@@ -372,7 +372,7 @@ def build_codex_argv(contract: dict[str, Any], prompt: str, output_path: Path) -
             "never",
             "--output-last-message",
             str(output_path),
-            prompt,
+            "-",
         ]
     )
     return argv
@@ -399,13 +399,13 @@ def run_advisory(
     with tempfile.TemporaryDirectory(prefix="grabowski-juno-openai-") as directory:
         root = Path(directory)
         output_path = root / "answer.txt"
-        argv = build_codex_argv(contract, prompt, output_path)
+        argv = build_codex_argv(contract, output_path)
         try:
             completed = runner(
                 argv,
                 cwd=root,
                 env=_scrubbed_environment(),
-                stdin=subprocess.DEVNULL,
+                input=prompt,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

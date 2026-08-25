@@ -48,6 +48,7 @@ The Codex subprocess runs:
 - with user config and repository rules ignored;
 - with shell, unified exec, hooks, apps, browser/computer use, plugins, multi-agent, image/view tools, tool suggestions, remote plugins, and dependency-install tooling disabled;
 - with common provider API-key environment variables removed;
+- with the conversation prompt supplied over stdin rather than process argv, so chat content is not exposed through the Codex command line;
 - with only the final response file used as the user-visible model answer.
 
 The gateway prompt also tells the advisory model not to use tools or external/local resources. The command-line and systemd boundaries, rather than that prompt, are the primary controls.

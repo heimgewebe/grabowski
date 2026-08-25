@@ -185,7 +185,7 @@ def test_route_selection_fails_closed_when_no_route(monkeypatch: pytest.MonkeyPa
 
 
 def test_codex_command_is_toolless_read_only_ephemeral(tmp_path: Path) -> None:
-    argv = gateway.build_codex_argv(_contract(), "prompt", tmp_path / "answer")
+    argv = gateway.build_codex_argv(_contract(), tmp_path / "answer")
     assert argv[:3] == ["codex", "--model", "gpt-test"]
     assert "--sandbox" in argv
     assert argv[argv.index("--sandbox") + 1] == "read-only"
@@ -193,6 +193,8 @@ def test_codex_command_is_toolless_read_only_ephemeral(tmp_path: Path) -> None:
     assert "--skip-git-repo-check" in argv
     assert "--ignore-user-config" in argv
     assert "--ignore-rules" in argv
+    assert argv[-1] == "-"
+    assert "prompt" not in argv
     assert "workspace-write" not in argv
     assert "--dangerously-bypass-approvals-and-sandbox" not in argv
     disabled = {
@@ -222,6 +224,7 @@ def test_run_advisory_reads_only_final_output(
     def runner(argv, **kwargs):
         observed["argv"] = argv
         observed["cwd"] = kwargs["cwd"]
+        observed["input"] = kwargs["input"]
         output = Path(argv[argv.index("--output-last-message") + 1])
         output.write_text("answer\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, stdout="event noise", stderr="")
@@ -232,6 +235,8 @@ def test_run_advisory_reads_only_final_output(
     )
     assert text == "answer"
     assert evidence["route_id"] == "codex-spark-low"
+    assert observed["argv"][-1] == "-"
+    assert "hello" in observed["input"]
     assert Path(observed["cwd"]).name.startswith("grabowski-juno-openai-")
 
 
