@@ -778,8 +778,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "operator-obligation-evidence-assess": GripSpec(
         name="operator-obligation-evidence-assess",
-        version="1.0",
-        summary="Shadow-assess operator-obligation acceptance evidence without changing closeout truth.",
+        version="1.1",
+        summary="Shadow-assess or prepare source-bound operator-obligation evidence without changing closeout truth.",
         effect=READ_ONLY,
         required_parameters=("mode",),
         acceptance_ids=("read-only-shadow", "bounded-assessment", "no-completion-authority"),
@@ -12940,8 +12940,18 @@ def _run_operator_obligation_evidence_assess(
             output = grabowski_operator_obligation_evidence.sample_completed(
                 parameters.get("limit", grabowski_operator_obligation_evidence.MIN_ROLLOUT_SAMPLE)
             )
+        elif mode == "prepare":
+            if set(parameters) != {"mode", "acceptance_id", "source", "selectors"}:
+                raise GripPreflightError(
+                    "prepare evidence assessment requires exactly mode, acceptance_id, source, and selectors"
+                )
+            output = grabowski_operator_obligation_evidence.prepare_evidence(
+                parameters["acceptance_id"],
+                parameters["source"],
+                parameters["selectors"],
+            )
         else:
-            raise GripPreflightError("mode must be exact or sample")
+            raise GripPreflightError("mode must be exact, sample, or prepare")
     except grabowski_operator_obligation_evidence.EvidenceAssessmentError as exc:
         raise GripPreflightError(str(exc)) from exc
     except grabowski_operator_obligation.OperatorObligationInputError as exc:
@@ -12957,9 +12967,13 @@ def _run_operator_obligation_evidence_assess(
     except grabowski_operator_obligation.OperatorObligationError as exc:
         raise GripActionError(str(exc)) from exc
     _check(receipt, "read_only_shadow", "pass", f"mode={mode}")
-    digest = output.get("assessment_sha256") or output.get("sample_sha256")
+    digest = (
+        output.get("assessment_sha256")
+        or output.get("sample_sha256")
+        or output.get("preparation_sha256")
+    )
     if not _is_sha256_hex(digest):
-        raise GripActionError("evidence shadow assessment lacks a canonical SHA-256 digest")
+        raise GripActionError("evidence assessment lacks a canonical SHA-256 digest")
     _check(receipt, "bounded_assessment", "pass", digest)
     _check(
         receipt,

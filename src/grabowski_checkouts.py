@@ -14,7 +14,7 @@ import subprocess
 import time
 import urllib.parse
 import uuid
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import grabowski_mcp as base
 import grabowski_resources as resources
@@ -58,7 +58,11 @@ MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
 CHECKOUT_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
 CLEANUP_PLAN_SCHEMA_VERSION = 2
 CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = ("archive_age_seconds",)
-MAX_ACTIVE_CHECKOUTS_PER_REPO = 8
+ACTIVE_CHECKOUT_LIMIT_ENV = "GRABOWSKI_MAX_ACTIVE_CHECKOUTS_PER_REPO"
+DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO = 16
+MIN_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO = 16
+MAX_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO = 256
+ACTIVE_CHECKOUT_LIMITING_REASON = "configured-per-repository-active-checkout-cap"
 MAX_COMPLETED_RETAINED_CHECKOUTS_PER_REPO = 4
 LIFECYCLE_PHASES = frozenset(
     {"active", "completed_retained", "archived", "externally_terminal_missing"}
@@ -80,6 +84,39 @@ MIN_GIT_READ_TIMEOUT_SECONDS = 0.1
 MAX_GIT_READ_TIMEOUT_SECONDS = 30.0
 MAX_INVENTORY_PROBE_ERRORS = 32
 MAX_ACTIVE_CAPACITY_PATH_OBSERVATIONS = 64
+
+
+def _configured_active_checkout_limit(
+    environment: Mapping[str, str] | None = None,
+) -> int:
+    source = os.environ if environment is None else environment
+    raw = source.get(ACTIVE_CHECKOUT_LIMIT_ENV)
+    if raw is None:
+        return DEFAULT_MAX_ACTIVE_CHECKOUTS_PER_REPO
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or raw != raw.strip()
+        or re.fullmatch(r"[0-9]+", raw) is None
+    ):
+        raise ValueError(
+            f"{ACTIVE_CHECKOUT_LIMIT_ENV} must be a canonical positive integer"
+        )
+    value = int(raw)
+    if not (
+        MIN_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO
+        <= value
+        <= MAX_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO
+    ):
+        raise ValueError(
+            f"{ACTIVE_CHECKOUT_LIMIT_ENV} must be between "
+            f"{MIN_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO} and "
+            f"{MAX_CONFIGURABLE_ACTIVE_CHECKOUTS_PER_REPO}"
+        )
+    return value
+
+
+MAX_ACTIVE_CHECKOUTS_PER_REPO = _configured_active_checkout_limit()
 
 
 def _git_timeout_seconds(value: int | float) -> float:
@@ -694,9 +731,13 @@ def _active_capacity_projection_from_connection(
     return {
         "available": True,
         "configured_limit": limit,
+        "effective_capacity": limit,
         "used": used,
         "free": max(0, limit - used),
         "saturated": used >= limit,
+        "limiting_reason": (
+            ACTIVE_CHECKOUT_LIMITING_REASON if used >= limit else None
+        ),
         "raw_active_rows": len(rows),
         "unexpired_active_rows": unexpired,
         "expired_active_rows": len(expired_rows),
@@ -716,9 +757,11 @@ def _unavailable_active_capacity_projection() -> dict[str, Any]:
     return {
         "available": False,
         "configured_limit": _phase_limit("active"),
+        "effective_capacity": _phase_limit("active"),
         "used": None,
         "free": None,
         "saturated": None,
+        "limiting_reason": None,
         "raw_active_rows": None,
         "unexpired_active_rows": None,
         "expired_active_rows": None,

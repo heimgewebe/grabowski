@@ -2551,6 +2551,54 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("blocked", rejected["receipt"]["status"])
         assess.assert_called_once_with("goo-shadow-grip-test-0001")
 
+
+    def test_operator_obligation_evidence_prepare_grip_is_read_only_and_rejects_caller_observations(self) -> None:
+        preparation = {
+            "preparation_sha256": "c" * 64,
+            "status": "prepared",
+            "evidence": {
+                "acceptance_id": "merge",
+                "status": "passed",
+                "source": "github",
+                "reference": "github-pr:heimgewebe/grabowski#943@" + "1" * 40
+                + ":base=" + "2" * 40
+                + ":merge=" + "3" * 40
+                + ":checks=2/2-success",
+                "sha256": "d" * 64,
+            },
+        }
+        selectors = {"repo": "heimgewebe/grabowski", "pr": 943}
+        with patch.object(
+            grips.grabowski_operator_obligation_evidence,
+            "prepare_evidence",
+            return_value=preparation,
+        ) as prepare:
+            result = grips.grip_run(
+                "operator-obligation-evidence-assess",
+                {
+                    "mode": "prepare",
+                    "acceptance_id": "merge",
+                    "source": "github",
+                    "selectors": selectors,
+                },
+            )
+            rejected = grips.grip_run(
+                "operator-obligation-evidence-assess",
+                {
+                    "mode": "prepare",
+                    "acceptance_id": "merge",
+                    "source": "github",
+                    "selectors": selectors,
+                    "observations": {"merge": {"sha256": "e" * 64}},
+                },
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("read_only", result["receipt"]["grip"]["effect"])
+        self.assertEqual("prepared", result["output"]["status"])
+        self.assertEqual("blocked", rejected["receipt"]["status"])
+        prepare.assert_called_once_with("merge", "github", selectors)
+
     def test_operator_obligation_evidence_sample_grip_is_bounded_to_thirty(self) -> None:
         sample = {
             "sample_sha256": "b" * 64,
