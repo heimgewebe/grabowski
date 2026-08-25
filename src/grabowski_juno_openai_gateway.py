@@ -49,16 +49,6 @@ _ALLOWED_REQUEST_FIELDS = {
     "seed",
     "user",
 }
-_PROVIDER_SECRET_ENV = frozenset(
-    {
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "XAI_API_KEY",
-        "GOOGLE_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENROUTER_API_KEY",
-    }
-)
 _DISABLED_CODEX_FEATURES = (
     "shell_tool",
     "unified_exec",
@@ -75,6 +65,17 @@ _DISABLED_CODEX_FEATURES = (
     "tool_suggest",
     "remote_plugin",
     "skill_mcp_dependency_install",
+    "auth_elicitation",
+    "code_mode_host",
+    "in_app_browser",
+    "in_app_chat",
+    "in_app_dictation",
+    "in_app_updates",
+    "plugin_sharing",
+    "shell_snapshot",
+    "skill_search",
+    "tool_call_mcp_elicitation",
+    "workspace_dependencies",
 )
 _REQUEST_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
 
@@ -379,11 +380,23 @@ def build_codex_argv(contract: dict[str, Any], output_path: Path) -> list[str]:
 
 
 def _scrubbed_environment() -> dict[str, str]:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in _PROVIDER_SECRET_ENV
+    allowed = {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
     }
+    environment = {key: value for key, value in os.environ.items() if key in allowed}
+    environment.setdefault("HOME", str(Path.home()))
+    environment.setdefault(
+        "PATH",
+        str(Path.home() / ".local" / "bin") + ":/usr/local/bin:/usr/bin:/bin",
+    )
     environment["NO_COLOR"] = "1"
     return environment
 

@@ -46,8 +46,8 @@ The Codex subprocess runs:
 - with `--ephemeral`;
 - with repository checks skipped because no repository is supplied;
 - with user config and repository rules ignored;
-- with shell, unified exec, hooks, apps, browser/computer use, plugins, multi-agent, image/view tools, tool suggestions, remote plugins, and dependency-install tooling disabled;
-- with common provider API-key environment variables removed;
+- with shell/unified exec, hooks, apps, browser/computer and in-app surfaces, plugins, multi-agent, image/view tools, skill/tool discovery, elicitation, workspace dependency handling, remote plugins, and dependency-install tooling disabled;
+- with a strict inherited-environment allowlist limited to runtime basics such as HOME, PATH, locale, TLS certificate paths, TMPDIR, and XDG_RUNTIME_DIR; arbitrary inherited credentials and private environment values are not forwarded;
 - with the conversation prompt supplied over stdin rather than process argv, so chat content is not exposed through the Codex command line;
 - with only the final response file used as the user-visible model answer.
 
@@ -63,7 +63,7 @@ The gateway Bearer token lives at:
 
 The installer creates it once with owner-only permissions and never prints its contents. The gateway rejects a symlink, non-regular file, wrong owner, extra hard link, broad permissions, or invalid token size/content. Logs must never contain the token, request body, or response body.
 
-Provider API keys are neither accepted by the gateway nor deliberately forwarded to the Codex subprocess.
+Provider API keys are neither accepted by the gateway nor inherited by the Codex subprocess. The subprocess environment is allowlisted rather than secret-name blacklisted, so unrelated credential variables are excluded by default.
 
 ## Installation
 

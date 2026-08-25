@@ -202,17 +202,35 @@ def test_codex_command_is_toolless_read_only_ephemeral(tmp_path: Path) -> None:
         for index, item in enumerate(argv[:-1])
         if item == "--disable"
     }
-    assert {"shell_tool", "unified_exec", "hooks", "apps", "plugins"} <= disabled
+    assert {
+        "shell_tool",
+        "unified_exec",
+        "hooks",
+        "apps",
+        "plugins",
+        "in_app_browser",
+        "shell_snapshot",
+        "skill_search",
+        "tool_call_mcp_elicitation",
+        "workspace_dependencies",
+    } <= disabled
 
 
-def test_provider_secret_environment_is_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_backend_environment_uses_minimal_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret2")
-    monkeypatch.setenv("PATH", "/test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret3")
+    monkeypatch.setenv("UNRELATED_PRIVATE_VALUE", "secret4")
+    monkeypatch.setenv("HOME", "/test-home")
+    monkeypatch.setenv("PATH", "/test-bin")
     environment = gateway._scrubbed_environment()
     assert "OPENAI_API_KEY" not in environment
     assert "OPENROUTER_API_KEY" not in environment
-    assert environment["PATH"] == "/test"
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert "UNRELATED_PRIVATE_VALUE" not in environment
+    assert environment["HOME"] == "/test-home"
+    assert environment["PATH"] == "/test-bin"
+    assert environment["NO_COLOR"] == "1"
 
 
 def test_run_advisory_reads_only_final_output(
