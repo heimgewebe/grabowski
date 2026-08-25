@@ -370,7 +370,12 @@ def select_advisory_contract() -> dict[str, Any]:
     return contract
 
 
-def build_codex_argv(contract: dict[str, Any], output_path: Path) -> list[str]:
+def build_codex_argv(
+    contract: dict[str, Any],
+    output_path: Path,
+    *,
+    supported_features: set[str],
+) -> list[str]:
     argv = list(contract["argv_prefix"])
     argv.extend(
         [
@@ -384,7 +389,8 @@ def build_codex_argv(contract: dict[str, Any], output_path: Path) -> list[str]:
         ]
     )
     for feature in _DISABLED_CODEX_FEATURES:
-        argv.extend(["--disable", feature])
+        if feature in supported_features:
+            argv.extend(["--disable", feature])
     argv.extend(
         [
             "--color",
@@ -419,6 +425,51 @@ def _scrubbed_environment() -> dict[str, str]:
     return environment
 
 
+def _supported_codex_features(
+    binary: str,
+    *,
+    runner: Any = subprocess.run,
+) -> set[str]:
+    try:
+        completed = runner(
+            [binary, "features", "list"],
+            env=_scrubbed_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _error(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            "backend_feature_probe_failed",
+            f"cannot inspect advisory backend features: {type(exc).__name__}",
+        ) from exc
+    if completed.returncode != 0:
+        raise _error(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            "backend_feature_probe_failed",
+            "advisory backend feature inspection failed",
+        )
+    features: set[str] = set()
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[1] == "removed":
+            continue
+        name = fields[0]
+        if name.replace("_", "").isalnum():
+            features.add(name)
+    if not features:
+        raise _error(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            "backend_feature_probe_failed",
+            "advisory backend returned no usable feature catalog",
+        )
+    return features
+
+
 def run_advisory(
     messages: list[dict[str, str]],
     *,
@@ -427,10 +478,13 @@ def run_advisory(
 ) -> tuple[str, dict[str, Any]]:
     contract = select_advisory_contract()
     prompt = _conversation_prompt(messages)
+    supported_features = _supported_codex_features(contract["argv_prefix"][0])
     with tempfile.TemporaryDirectory(prefix="grabowski-juno-openai-") as directory:
         root = Path(directory)
         output_path = root / "answer.txt"
-        argv = build_codex_argv(contract, output_path)
+        argv = build_codex_argv(
+            contract, output_path, supported_features=supported_features
+        )
         try:
             completed = runner(
                 argv,

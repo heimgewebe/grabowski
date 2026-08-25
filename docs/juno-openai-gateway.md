@@ -46,7 +46,8 @@ The Codex subprocess runs:
 - with `--ephemeral`;
 - with repository checks skipped because no repository is supplied;
 - with user config and repository rules ignored;
-- with shell/unified exec, hooks, apps, browser/computer and in-app surfaces, plugins, multi-agent, image/view tools, skill/tool discovery, elicitation, workspace dependency handling, remote plugins, and dependency-install tooling disabled;
+- after a bounded local `codex features list` inspection, with each configured risky feature disabled only when that exact feature name is advertised by the installed Codex CLI; removed or absent names are omitted rather than passed as invalid `--disable` flags, and a failed/empty feature inspection fails closed before model execution;
+- with shell/unified exec, hooks, apps, browser/computer and in-app surfaces, plugins, multi-agent, image/view tools, skill/tool discovery, elicitation, workspace dependency handling, remote plugins, and dependency-install tooling disabled when those surfaces exist in the installed CLI;
 - with a strict inherited-environment allowlist limited to runtime basics such as HOME, PATH, locale, TLS certificate paths, TMPDIR, and XDG_RUNTIME_DIR; arbitrary inherited credentials and private environment values are not forwarded;
 - with the conversation prompt supplied over stdin rather than process argv, so chat content is not exposed through the Codex command line;
 - with only the final response file used as the user-visible model answer.

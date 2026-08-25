@@ -209,7 +209,11 @@ def test_route_selection_fails_closed_when_no_route(
 
 
 def test_codex_command_is_toolless_read_only_ephemeral(tmp_path: Path) -> None:
-    argv = gateway.build_codex_argv(_contract(), tmp_path / "answer")
+    argv = gateway.build_codex_argv(
+        _contract(),
+        tmp_path / "answer",
+        supported_features=set(gateway._DISABLED_CODEX_FEATURES),
+    )
     assert argv[:3] == ["codex", "--model", "gpt-test"]
     assert "--sandbox" in argv
     assert argv[argv.index("--sandbox") + 1] == "read-only"
@@ -240,6 +244,49 @@ def test_codex_command_is_toolless_read_only_ephemeral(tmp_path: Path) -> None:
     } <= disabled
 
 
+def test_codex_command_omits_unadvertised_feature_flags(tmp_path: Path) -> None:
+    argv = gateway.build_codex_argv(
+        _contract(),
+        tmp_path / "answer",
+        supported_features={"shell_tool", "hooks"},
+    )
+    disabled = [
+        argv[index + 1]
+        for index, item in enumerate(argv[:-1])
+        if item == "--disable"
+    ]
+    assert disabled == ["shell_tool", "hooks"]
+    assert "in_app_chat" not in argv
+    assert "skill_search" not in argv
+
+
+def test_supported_codex_features_ignores_removed_entries() -> None:
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                "shell_tool stable true\n"
+                "view_image stable true\n"
+                "old_tool removed false\n"
+                "code_mode under development false\n"
+            ),
+            stderr="",
+        )
+
+    features = gateway._supported_codex_features("codex", runner=runner)
+    assert features == {"shell_tool", "view_image", "code_mode"}
+
+
+def test_supported_codex_features_fails_closed_on_probe_error() -> None:
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="unknown command")
+
+    with pytest.raises(gateway.GatewayError) as exc:
+        gateway._supported_codex_features("codex", runner=runner)
+    assert exc.value.code == "backend_feature_probe_failed"
+
+
 def test_backend_environment_uses_minimal_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret2")
@@ -261,6 +308,11 @@ def test_run_advisory_reads_only_final_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(gateway, "select_advisory_contract", _contract)
+    monkeypatch.setattr(
+        gateway,
+        "_supported_codex_features",
+        lambda _binary: set(gateway._DISABLED_CODEX_FEATURES),
+    )
     observed = {}
 
     def runner(argv, **kwargs):
