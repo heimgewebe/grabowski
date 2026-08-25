@@ -121,6 +121,44 @@ def _prepare_registry_root(
     return str(resolved)
 
 
+class BureauCandidateRecordOptionalFields(TypedDict, total=False):
+    repo: Any
+    source_locator: Any
+    source_sha256: Any
+    observed_at: Any
+    task_id: Any
+    candidate_id: Any
+    supersedes_event_id: Any
+    note: Any
+    catalog_validation: Any
+
+
+class BureauCandidateRecordRequest(BureauCandidateRecordOptionalFields):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    schema_version: Any
+    idempotency_key: Any
+    title: Any
+    source_kind: Any
+    desired_outcome: Any
+
+
+class BureauCandidateCloseOptionalFields(TypedDict, total=False):
+    note: Any
+
+
+class BureauCandidateCloseRequest(BureauCandidateCloseOptionalFields):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    schema_version: Any
+    operation: Literal["close"]
+    idempotency_key: Any
+    candidate_id: Any
+    expected_event_id: Any
+    outcome: Any
+    evidence: Any
+
+
 class BureauCandidateIdSelector(TypedDict):
     __pydantic_config__ = {"extra": "forbid", "strict": True}
 
@@ -1170,7 +1208,9 @@ def _proposal_directory(proposal_id: str) -> Path:
 
 
 @mcp.tool(name="grabowski_bureau_candidate_record", annotations=MUTATING)
-def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]:
+def grabowski_bureau_candidate_record(
+    request: BureauCandidateRecordRequest | BureauCandidateCloseRequest,
+) -> dict[str, Any]:
     """Record one source-bound Bureau candidate through the canonical typed intake contract."""
     operator._require_operator_mutation("terminal_execute")
     if not isinstance(request, dict):

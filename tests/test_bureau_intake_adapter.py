@@ -989,6 +989,90 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
+    def test_candidate_record_registered_schema_matches_bureau_contract_boundary(self) -> None:
+        if not hasattr(intake.mcp, "list_tools"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        tool = next(
+            item
+            for item in asyncio.run(intake.mcp.list_tools())
+            if item.name == "grabowski_bureau_candidate_record"
+        )
+        schema = tool.inputSchema
+        request_schema = schema["properties"]["request"]
+        references = {
+            variant["$ref"]
+            for variant in request_schema["anyOf"]
+            if "$ref" in variant
+        }
+        self.assertEqual(
+            {
+                "#/$defs/BureauCandidateRecordRequest",
+                "#/$defs/BureauCandidateCloseRequest",
+            },
+            references,
+        )
+
+        record = schema["$defs"]["BureauCandidateRecordRequest"]
+        self.assertIs(record["additionalProperties"], False)
+        self.assertEqual(
+            {
+                "schema_version",
+                "idempotency_key",
+                "title",
+                "source_kind",
+                "desired_outcome",
+                "repo",
+                "source_locator",
+                "source_sha256",
+                "observed_at",
+                "task_id",
+                "candidate_id",
+                "supersedes_event_id",
+                "note",
+                "catalog_validation",
+            },
+            set(record["properties"]),
+        )
+        self.assertEqual(
+            {
+                "schema_version",
+                "idempotency_key",
+                "title",
+                "source_kind",
+                "desired_outcome",
+            },
+            set(record["required"]),
+        )
+
+        close = schema["$defs"]["BureauCandidateCloseRequest"]
+        self.assertIs(close["additionalProperties"], False)
+        self.assertEqual(
+            {
+                "schema_version",
+                "operation",
+                "idempotency_key",
+                "candidate_id",
+                "expected_event_id",
+                "outcome",
+                "evidence",
+                "note",
+            },
+            set(close["properties"]),
+        )
+        self.assertEqual(
+            {
+                "schema_version",
+                "operation",
+                "idempotency_key",
+                "candidate_id",
+                "expected_event_id",
+                "outcome",
+                "evidence",
+            },
+            set(close["required"]),
+        )
+        self.assertEqual("close", close["properties"]["operation"]["const"])
+
     def test_candidate_assess_registered_schema_is_additive_and_cache_safe(self) -> None:
         if not hasattr(intake.mcp, "list_tools"):
             self.skipTest("real FastMCP unavailable in dependency-free validation")
