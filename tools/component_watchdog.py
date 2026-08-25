@@ -112,6 +112,7 @@ class WatchdogState:
     recovery_episode_restart_attempted: bool = False
     recovery_episode_started_at_unix: int = 0
     recovery_phase: str = "idle"
+    recovery_episode_reason: str = ""
     readiness_dependency_unavailable_boot_id: str | None = None
     readiness_dependency_unavailable_pid: int | None = None
     readiness_dependency_unavailable_start_ticks: int | None = None
@@ -1354,6 +1355,7 @@ def load_state(path: Path) -> WatchdogState:
         "recovery_episode_restart_attempted",
         "recovery_episode_started_at_unix",
         "recovery_phase",
+        "recovery_episode_reason",
         "readiness_dependency_unavailable_boot_id",
         "readiness_dependency_unavailable_pid",
         "readiness_dependency_unavailable_start_ticks",
@@ -1373,6 +1375,7 @@ def load_state(path: Path) -> WatchdogState:
         "recovery_episode_started_at_unix", 0
     )
     recovery_phase = raw.get("recovery_phase", "idle")
+    recovery_episode_reason = raw.get("recovery_episode_reason", "")
     dependency_boot_id = raw.get("readiness_dependency_unavailable_boot_id")
     dependency_pid = raw.get("readiness_dependency_unavailable_pid")
     dependency_start_ticks = raw.get(
@@ -1419,6 +1422,8 @@ def load_state(path: Path) -> WatchdogState:
         or type(recovery_episode_started_at_unix) is not int
         or recovery_episode_started_at_unix < 0
         or recovery_phase not in TUNNEL_RECOVERY_PHASES
+        or not isinstance(recovery_episode_reason, str)
+        or len(recovery_episode_reason) > 512
         or not dependency_identity_valid
     ):
         raise WatchdogError("invalid-state-shape")
@@ -1434,6 +1439,7 @@ def load_state(path: Path) -> WatchdogState:
         recovery_episode_restart_attempted=recovery_episode_restart_attempted,
         recovery_episode_started_at_unix=recovery_episode_started_at_unix,
         recovery_phase=recovery_phase,
+        recovery_episode_reason=recovery_episode_reason,
         readiness_dependency_unavailable_boot_id=dependency_boot_id,
         readiness_dependency_unavailable_pid=dependency_pid,
         readiness_dependency_unavailable_start_ticks=dependency_start_ticks,
@@ -1460,6 +1466,7 @@ def save_state(path: Path, state: WatchdogState) -> None:
                     state.recovery_episode_started_at_unix
                 ),
                 "recovery_phase": state.recovery_phase,
+                "recovery_episode_reason": state.recovery_episode_reason,
                 "readiness_dependency_unavailable_boot_id": (
                     state.readiness_dependency_unavailable_boot_id
                 ),
@@ -1532,6 +1539,7 @@ def reset_after_healthy(
         recovery_episode_restart_attempted=False,
         recovery_episode_started_at_unix=0,
         recovery_phase="idle",
+        recovery_episode_reason="",
     )
 
 
@@ -1559,6 +1567,7 @@ def decide(
         ),
         recovery_episode_started_at_unix=state.recovery_episode_started_at_unix,
         recovery_phase=state.recovery_phase,
+        recovery_episode_reason=state.recovery_episode_reason,
         readiness_dependency_unavailable_boot_id=(
             state.readiness_dependency_unavailable_boot_id
         ),
@@ -1590,6 +1599,7 @@ def decide(
         ),
         recovery_episode_started_at_unix=state.recovery_episode_started_at_unix,
         recovery_phase=state.recovery_phase,
+        recovery_episode_reason=state.recovery_episode_reason,
         readiness_dependency_unavailable_boot_id=(
             state.readiness_dependency_unavailable_boot_id
         ),
@@ -2124,15 +2134,30 @@ def _recovery_reason(probe: ProbeResult) -> str:
     return ",".join(probe.reasons)[:512]
 
 
+def _connector_convergence_reason(result: dict[str, object] | None) -> str:
+    if result is None:
+        return "connector-convergence"
+    reason = result.get("reason")
+    if isinstance(reason, str) and reason:
+        return f"connector-convergence:{reason}"[:512]
+    return "connector-convergence"
+
+
 def _tunnel_recovery_state(
     state: WatchdogState,
     *,
     now: int,
     phase: str,
     restart_attempted: bool | None = None,
+    reason: str | None = None,
 ) -> WatchdogState:
     if phase not in TUNNEL_RECOVERY_PHASES or phase == "idle":
         raise WatchdogError("invalid-tunnel-recovery-phase")
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 512):
+        raise WatchdogError("invalid-tunnel-recovery-reason")
+    episode_reason = state.recovery_episode_reason
+    if not episode_reason and reason:
+        episode_reason = reason
     return replace(
         state,
         recovery_episode_restart_attempted=(
@@ -2144,6 +2169,7 @@ def _tunnel_recovery_state(
             state.recovery_episode_started_at_unix or now
         ),
         recovery_phase=phase,
+        recovery_episode_reason=episode_reason,
     )
 
 
@@ -2396,11 +2422,13 @@ def run_watchdog(args: argparse.Namespace) -> int:
                         replace(state, consecutive_failures=0),
                         now=now,
                         phase="connector-convergence",
+                        reason=_connector_convergence_reason(snapshot_result),
                     )
                     save_state(state_path, state)
                     emit(
                         "grabowski.component_watchdog.recovering",
                         **common,
+                        recovery_reason=(state.recovery_episode_reason or "unknown"),
                         recovery_phase=state.recovery_phase,
                         recovery_episode_started_at_unix=(
                             state.recovery_episode_started_at_unix
@@ -2416,17 +2444,39 @@ def run_watchdog(args: argparse.Namespace) -> int:
                         restart_generation=state.restart_generation,
                     )
                     return 1
-                state = reset_after_healthy(
+                episode_state = state
+                recovered_state = reset_after_healthy(
                     state,
                     now=int(time.time()),
                     restart_window=args.restart_window,
                 )
-                save_state(state_path, state)
+                save_state(state_path, recovered_state)
+                if args.component == "tunnel" and episode_state.recovery_phase != "idle":
+                    emit(
+                        "grabowski.component_watchdog.recovered",
+                        **common,
+                        initiator="watchdog",
+                        recovery_reason=(
+                            episode_state.recovery_episode_reason or "unknown"
+                        ),
+                        recovery_phase=episode_state.recovery_phase,
+                        recovery_episode_started_at_unix=(
+                            episode_state.recovery_episode_started_at_unix
+                        ),
+                        restart_attempted=(
+                            episode_state.recovery_episode_restart_attempted
+                        ),
+                        post_recovery_phase=recovered_state.recovery_phase,
+                        recovery_result="connector-converged",
+                        restart_generation=recovered_state.restart_generation,
+                        **runtime_deployment_identity(args.runtime_root),
+                    )
+                    return 0
                 emit(
                     "grabowski.component_watchdog.healthy",
                     **common,
-                    recovery_phase=state.recovery_phase,
-                    restart_generation=state.restart_generation,
+                    recovery_phase=recovered_state.recovery_phase,
+                    restart_generation=recovered_state.restart_generation,
                 )
                 return 0
             if probe.status == "startup-grace":
@@ -2457,6 +2507,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     ),
                     now=decision_now,
                     phase="degraded",
+                    reason=_recovery_reason(probe),
                 )
                 save_state(state_path, next_state)
                 emit(
@@ -2464,7 +2515,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     **common,
                     reason="recovery-episode-restart-already-attempted",
                     initiator="watchdog",
-                    recovery_reason=_recovery_reason(probe),
+                    recovery_reason=(next_state.recovery_episode_reason or "unknown"),
                     recovery_phase=next_state.recovery_phase,
                     recovery_episode_started_at_unix=(
                         next_state.recovery_episode_started_at_unix
@@ -2490,6 +2541,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     now=decision_now,
                     phase="restarting" if action == "restart" else "degraded",
                     restart_attempted=True if action == "restart" else None,
+                    reason=_recovery_reason(probe),
                 )
             save_state(state_path, next_state)
             if action == "observe":
@@ -2710,7 +2762,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 **common,
                 initiator="watchdog",
                 previous_state="degraded",
-                recovery_reason=_recovery_reason(probe),
+                recovery_reason=(next_state.recovery_episode_reason or "unknown"),
                 recovery_phase=next_state.recovery_phase,
                 recovery_episode_started_at_unix=(
                     next_state.recovery_episode_started_at_unix
@@ -2737,20 +2789,20 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     "grabowski.component_watchdog.restart_failed",
                     **common,
                     initiator="watchdog",
-                    recovery_reason=_recovery_reason(probe),
+                    recovery_reason=(failed_state.recovery_episode_reason or "unknown"),
                     recovery_phase=failed_state.recovery_phase,
                     recovery_episode_started_at_unix=(
                         failed_state.recovery_episode_started_at_unix
                     ),
                     restart_started_at_unix=decision_now,
-                    restart_completed_at_unix=int(time.time()),
+                    restart_request_failed_at_unix=int(time.time()),
                     restart_result="service-action-failed",
                     failure=str(exc),
                     restart_generation=failed_state.restart_generation,
                     **runtime_identity,
                 )
                 return 4
-            restart_completed_at_unix = int(time.time())
+            restart_request_accepted_at_unix = int(time.time())
             deadline = time.monotonic() + args.recovery_timeout
             final_probe = probe
             while time.monotonic() < deadline:
@@ -2774,6 +2826,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 if final_probe.status == "healthy" and _is_new_process_instance(
                     probe, final_probe
                 ):
+                    restart_completed_at_unix = int(time.time())
                     snapshot_result = _emit_connector_snapshot_refresh(
                         args, final_probe
                     )
@@ -2792,15 +2845,18 @@ def run_watchdog(args: argparse.Namespace) -> int:
                             status=final_probe.status,
                             pid=final_probe.pid,
                             initiator="watchdog",
-                            recovery_reason=_recovery_reason(probe),
+                            recovery_reason=(
+                                pending_state.recovery_episode_reason or "unknown"
+                            ),
                             recovery_phase=pending_state.recovery_phase,
                             recovery_episode_started_at_unix=(
                                 pending_state.recovery_episode_started_at_unix
                             ),
                             restart_started_at_unix=decision_now,
-                            restart_completed_at_unix=(
-                                restart_completed_at_unix
+                            restart_request_accepted_at_unix=(
+                                restart_request_accepted_at_unix
                             ),
+                            restart_completed_at_unix=restart_completed_at_unix,
                             restart_result="service-action-succeeded",
                             convergence_reason=(
                                 snapshot_result.get("reason")
@@ -2823,13 +2879,16 @@ def run_watchdog(args: argparse.Namespace) -> int:
                         service=args.service,
                         pid=final_probe.pid,
                         initiator="watchdog",
-                        recovery_reason=_recovery_reason(probe),
+                        recovery_reason=(next_state.recovery_episode_reason or "unknown"),
                         recovery_phase=next_state.recovery_phase,
                         recovery_episode_started_at_unix=(
                             next_state.recovery_episode_started_at_unix
                         ),
                         post_recovery_phase=recovered_state.recovery_phase,
                         restart_started_at_unix=decision_now,
+                        restart_request_accepted_at_unix=(
+                            restart_request_accepted_at_unix
+                        ),
                         restart_completed_at_unix=restart_completed_at_unix,
                         restart_result="service-action-succeeded",
                         recovery_result="connector-converged",
@@ -2854,13 +2913,13 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 status=final_probe.status,
                 reasons=list(final_probe.reasons),
                 initiator="watchdog",
-                recovery_reason=_recovery_reason(probe),
+                recovery_reason=(failed_state.recovery_episode_reason or "unknown"),
                 recovery_phase=failed_state.recovery_phase,
                 recovery_episode_started_at_unix=(
                     failed_state.recovery_episode_started_at_unix
                 ),
                 restart_started_at_unix=decision_now,
-                restart_completed_at_unix=restart_completed_at_unix,
+                restart_request_accepted_at_unix=restart_request_accepted_at_unix,
                 restart_result="service-action-succeeded",
                 recovery_result="upstream-still-unhealthy",
                 backoff_level=failed_state.backoff_level,

@@ -2805,6 +2805,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             state = watchdog.load_state(state_path)
             self.assertTrue(state.recovery_episode_restart_attempted)
             self.assertEqual("degraded", state.recovery_phase)
+            self.assertEqual("control-plane-poll-stale", state.recovery_episode_reason)
             self.assertEqual(1, state.restart_generation)
             restarting = next(
                 call
@@ -2883,6 +2884,10 @@ class WatchdogPolicyTests(unittest.TestCase):
                 "grabowski.component_watchdog.recovering",
                 recovering_emit.call_args.args[0],
             )
+            self.assertEqual(
+                "control-plane-poll-stale",
+                recovering_emit.call_args.kwargs["recovery_reason"],
+            )
 
             with (
                 patch.object(watchdog, "probe_component", return_value=healthy),
@@ -2911,9 +2916,26 @@ class WatchdogPolicyTests(unittest.TestCase):
             self.assertFalse(state.recovery_episode_restart_attempted)
             self.assertEqual(0, state.recovery_episode_started_at_unix)
             self.assertEqual("idle", state.recovery_phase)
+            self.assertEqual("", state.recovery_episode_reason)
             self.assertEqual(
-                "grabowski.component_watchdog.healthy",
+                "grabowski.component_watchdog.recovered",
                 healthy_emit.call_args.args[0],
+            )
+            self.assertEqual(
+                "control-plane-poll-stale",
+                healthy_emit.call_args.kwargs["recovery_reason"],
+            )
+            self.assertEqual(
+                "connector-convergence",
+                healthy_emit.call_args.kwargs["recovery_phase"],
+            )
+            self.assertEqual(
+                1000, healthy_emit.call_args.kwargs["recovery_episode_started_at_unix"]
+            )
+            self.assertTrue(healthy_emit.call_args.kwargs["restart_attempted"])
+            self.assertEqual("idle", healthy_emit.call_args.kwargs["post_recovery_phase"])
+            self.assertEqual(
+                "connector-converged", healthy_emit.call_args.kwargs["recovery_result"]
             )
 
     def test_tunnel_recovered_event_preserves_pre_reset_episode_metadata(self) -> None:
@@ -2987,14 +3009,18 @@ class WatchdogPolicyTests(unittest.TestCase):
                 for call in emit.call_args_list
                 if call.args[0] == "grabowski.component_watchdog.recovered"
             )
+            self.assertEqual("control-plane-poll-stale", recovered.kwargs["recovery_reason"])
             self.assertEqual("restarting", recovered.kwargs["recovery_phase"])
             self.assertEqual(
                 3000, recovered.kwargs["recovery_episode_started_at_unix"]
             )
+            self.assertEqual(3000, recovered.kwargs["restart_request_accepted_at_unix"])
+            self.assertEqual(3000, recovered.kwargs["restart_completed_at_unix"])
             self.assertEqual("idle", recovered.kwargs["post_recovery_phase"])
             state = watchdog.load_state(Path(tmp) / "tunnel-watchdog-state.json")
             self.assertEqual("idle", state.recovery_phase)
             self.assertEqual(0, state.recovery_episode_started_at_unix)
+            self.assertEqual("", state.recovery_episode_reason)
             self.assertFalse(state.recovery_episode_restart_attempted)
 
     def test_tunnel_restart_failure_does_not_loop_within_episode(self) -> None:
