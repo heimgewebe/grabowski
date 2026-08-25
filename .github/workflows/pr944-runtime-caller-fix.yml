@@ -1,0 +1,88 @@
+name: PR 944 runtime caller fix
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.pull_request.number == 944 && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Apply bounded runtime wiring fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "a06fca44716c7f9490f2c552d146f39ffc23568e"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/deploy_runtime_dual.py")
+          source = path.read_text(encoding="utf-8")
+
+          def replace_in_region(start_marker: str, end_marker: str, old: str, new: str) -> None:
+              global source
+              start = source.index(start_marker)
+              end = source.index(end_marker, start)
+              region = source[start:end]
+              if region.count(old) != 1:
+                  raise SystemExit(
+                      f"expected exactly one preimage in {start_marker.strip()!r}, got {region.count(old)}"
+                  )
+              source = source[:start] + region.replace(old, new, 1) + source[end:]
+
+          inspector = "client_snapshot.inspect_cutover_snapshot_binding"
+
+          replace_in_region(
+              "    def rebind_snapshot(self) -> dict[str, Any]:\n",
+              "    def adopted_snapshot_rebind(self) -> dict[str, Any] | None:\n",
+              "            green_readiness=self.green_readiness,\n        )",
+              "            green_readiness=self.green_readiness,\n"
+              f"            snapshot_inspector={inspector},\n"
+              "        )",
+          )
+          replace_in_region(
+              "    def cold_snapshot_observation(self) -> dict[str, Any]:\n",
+              "    def promote_canonical(self) -> dict[str, Any]:\n",
+              "            green_readiness=readiness,\n        )",
+              "            green_readiness=readiness,\n"
+              f"            snapshot_inspector={inspector},\n"
+              "        )",
+          )
+          replace_in_region(
+              "def classify_midcutover_resume(\n",
+              "def observe_green_operator_unit(unit: str) -> dict[str, Any]:\n",
+              "        green_unit_observer=observe_green_operator_unit,\n    )",
+              "        green_unit_observer=observe_green_operator_unit,\n"
+              f"        snapshot_inspector={inspector},\n"
+              "    )",
+          )
+
+          path.write_text(source, encoding="utf-8")
+
+          test_path = Path("tests/test_midcutover_snapshot_runtime_wiring.py")
+          test_path.write_text(
+              '''from __future__ import annotations\n\nimport ast\nfrom pathlib import Path\nimport unittest\n\n\nSOURCE_PATH = Path(__file__).resolve().parents[1] / "tools/deploy_runtime_dual.py"\n\n\ndef _tree() -> ast.Module:\n    return ast.parse(SOURCE_PATH.read_text(encoding="utf-8"), filename=str(SOURCE_PATH))\n\n\ndef _function(tree: ast.AST, name: str) -> ast.FunctionDef:\n    for node in ast.walk(tree):\n        if isinstance(node, ast.FunctionDef) and node.name == name:\n            return node\n    raise AssertionError(f"function {name!r} not found")\n\n\ndef _method(tree: ast.AST, class_name: str, method_name: str) -> ast.FunctionDef:\n    for node in ast.walk(tree):\n        if isinstance(node, ast.ClassDef) and node.name == class_name:\n            for item in node.body:\n                if isinstance(item, ast.FunctionDef) and item.name == method_name:\n                    return item\n    raise AssertionError(f"method {class_name}.{method_name} not found")\n\n\ndef _matching_calls(node: ast.AST, attribute: str) -> list[ast.Call]:\n    return [\n        item\n        for item in ast.walk(node)\n        if isinstance(item, ast.Call)\n        and isinstance(item.func, ast.Attribute)\n        and item.func.attr == attribute\n    ]\n\n\ndef _assert_inspector(test: unittest.TestCase, call: ast.Call) -> None:\n    keywords = {item.arg: item.value for item in call.keywords if item.arg is not None}\n    test.assertIn("snapshot_inspector", keywords)\n    value = keywords["snapshot_inspector"]\n    test.assertIsInstance(value, ast.Attribute)\n    test.assertEqual(value.attr, "inspect_cutover_snapshot_binding")\n    test.assertIsInstance(value.value, ast.Name)\n    test.assertEqual(value.value.id, "client_snapshot")\n\n\nclass MidCutoverSnapshotRuntimeWiringTests(unittest.TestCase):\n    def test_rebind_readback_injects_canonical_inspector(self) -> None:\n        method = _method(_tree(), "MidCutoverResumeRuntime", "rebind_snapshot")\n        calls = _matching_calls(method, "observe_client_snapshot_binding")\n        self.assertEqual(len(calls), 1)\n        _assert_inspector(self, calls[0])\n\n    def test_cold_observation_injects_canonical_inspector(self) -> None:\n        method = _method(_tree(), "MidCutoverResumeRuntime", "cold_snapshot_observation")\n        calls = _matching_calls(method, "observe_client_snapshot_binding")\n        self.assertEqual(len(calls), 1)\n        _assert_inspector(self, calls[0])\n\n    def test_classifier_injects_canonical_inspector(self) -> None:\n        function = _function(_tree(), "classify_midcutover_resume")\n        calls = _matching_calls(function, "classify_from_durable_state")\n        self.assertEqual(len(calls), 1)\n        _assert_inspector(self, calls[0])\n\n\nif __name__ == "__main__":\n    unittest.main()\n''',
+              encoding="utf-8",
+          )
+          PY
+
+          python3 -m py_compile tools/deploy_runtime_dual.py tests/test_midcutover_snapshot_runtime_wiring.py
+          python3 tests/test_midcutover_snapshot_runtime_wiring.py
+          git diff --check
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr944-runtime-caller-fix.yml
+          git add tools/deploy_runtime_dual.py tests/test_midcutover_snapshot_runtime_wiring.py
+          git diff --cached --check
+          git commit -m "fix: inject midcutover snapshot inspector in runtime"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
