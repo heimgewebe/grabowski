@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -340,6 +341,101 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         )
         self.assertIsNone(evidence._receipt_observation(stored))
 
+    def test_receipt_adapter_refuses_non_durable_generic_grip_receipt(self) -> None:
+        stored = self._stored_evidence(
+            source="receipt",
+            reference=(
+                "grip:operator-obligation-evidence-assess:sample:"
+                + "1" * 64
+                + ":receipt:"
+                + "2" * 64
+            ),
+        )
+        self.assertIsNone(evidence._receipt_observation(stored))
+
+    def test_bureau_adapter_binds_idempotency_selected_candidate(self) -> None:
+        candidate_id = "candidate-" + "6" * 24
+        event_id = 11086
+        idempotency_key = "operator-obligation:trusted-adapters:postdeploy-sample-gap-20260824"
+        fingerprint = "7" * 64
+        stored = self._stored_evidence(
+            source="bureau",
+            reference=(
+                f"bureau-candidate:{candidate_id}:event={event_id}:"
+                f"idempotency={idempotency_key}"
+            ),
+            sha256=fingerprint,
+        )
+        invoke = unittest.mock.Mock(
+            return_value={
+                "status": "assessed",
+                "candidate_id": candidate_id,
+                "event_id": event_id,
+                "content_fingerprint": fingerprint,
+            }
+        )
+        module = types.ModuleType("grabowski_bureau_intake")
+        module._invoke_bureau = invoke
+        with patch.dict(sys.modules, {"grabowski_bureau_intake": module}):
+            observation = evidence._bureau_observation(
+                stored, deadline_monotonic=evidence.time.monotonic() + 5.0
+            )
+        assert observation is not None
+        self.assertEqual("verified", observation["status"])
+        self.assertEqual(fingerprint, observation["sha256"])
+        arguments = invoke.call_args.args[0]
+        self.assertEqual("operator-candidate-assess", arguments[2])
+        self.assertEqual(idempotency_key, arguments[-1])
+        self.assertLessEqual(invoke.call_args.kwargs["timeout_seconds"], 5)
+
+        invoke.return_value = {
+            "status": "assessed",
+            "candidate_id": candidate_id,
+            "event_id": event_id + 1,
+            "content_fingerprint": fingerprint,
+        }
+        with patch.dict(sys.modules, {"grabowski_bureau_intake": module}):
+            mismatch = evidence._bureau_observation(stored)
+        assert mismatch is not None
+        self.assertEqual("mismatch", mismatch["status"])
+
+    def test_bureau_adapter_treats_runtime_failure_as_stale(self) -> None:
+        stored = self._stored_evidence(
+            source="bureau",
+            reference=(
+                "bureau-candidate:candidate-" + "8" * 24
+                + ":event=42:idempotency=operator-obligation:test"
+            ),
+        )
+        module = types.ModuleType("grabowski_bureau_intake")
+        module._invoke_bureau = unittest.mock.Mock(
+            return_value={"kind": "grabowski_bureau_intake_adapter_failure"}
+        )
+        with patch.dict(sys.modules, {"grabowski_bureau_intake": module}):
+            observation = evidence._bureau_observation(stored)
+        assert observation is not None
+        self.assertEqual("stale", observation["status"])
+
+    def test_bureau_adapter_does_not_start_when_shared_deadline_is_under_one_second(self) -> None:
+        stored = self._stored_evidence(
+            source="bureau",
+            reference=(
+                "bureau-candidate:candidate-" + "9" * 24
+                + ":event=43:idempotency=operator-obligation:deadline-test"
+            ),
+        )
+        module = types.ModuleType("grabowski_bureau_intake")
+        module._invoke_bureau = unittest.mock.Mock()
+        with patch.dict(sys.modules, {"grabowski_bureau_intake": module}), patch.object(
+            evidence.time, "monotonic", return_value=100.25
+        ):
+            observation = evidence._bureau_observation(
+                stored, deadline_monotonic=101.0
+            )
+        assert observation is not None
+        self.assertEqual("stale", observation["status"])
+        module._invoke_bureau.assert_not_called()
+
     def test_runtime_adapter_binds_exact_active_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
@@ -375,6 +471,47 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         assert observation is not None
         self.assertEqual("verified", observation["status"])
         self.assertEqual(runtime_input, observation["sha256"])
+
+    def test_runtime_adapter_verifies_immutable_historical_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"GRABOWSKI_EVIDENCE_RELEASES_ROOT": tmp},
+        ):
+            runtime_input = "9" * 64
+            repo_head = "a" * 40
+            release_id = "historical-release-1234567890"
+            release = Path(tmp) / release_id
+            release.mkdir(mode=0o700)
+            manifest = release / "deployment-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "completion_status": "complete",
+                        "repo_head": repo_head,
+                        "release_id": release_id,
+                        "runtime_input_sha256": runtime_input,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest.chmod(0o600)
+            stored = self._stored_evidence(
+                source="runtime",
+                reference=(
+                    f"grabowski-runtime-manifest:repo_head={repo_head};"
+                    f"release_id={release_id};runtime_input_sha256={runtime_input}"
+                ),
+                sha256=runtime_input,
+            )
+            observation = evidence._runtime_observation(stored)
+            assert observation is not None
+            self.assertEqual("verified", observation["status"])
+            self.assertEqual(runtime_input, observation["sha256"])
+
+            manifest.unlink()
+            stale = evidence._runtime_observation(stored)
+            assert stale is not None
+            self.assertEqual("stale", stale["status"])
 
     def test_pytest_summary_accepts_non_failing_extra_outcomes(self) -> None:
         self.assertEqual(
@@ -653,7 +790,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         )
         self.assertEqual("verifiability_gap_observed", first["shadow_signal"])
         self.assertEqual(
-            ["github", "git", "receipt", "runtime", "test"],
+            ["bureau", "github", "git", "receipt", "runtime", "test"],
             first["trusted_observation_adapter_sources"],
         )
         self.assertEqual({}, first["trusted_observation_counts"])
