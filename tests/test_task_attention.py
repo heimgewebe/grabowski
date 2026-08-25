@@ -2651,6 +2651,29 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(0, listed["attention_projection"]["excluded_attention_count"])
         self.assertIsNone(listed["attention_projection"]["decision_candidate_count"])
 
+    def test_current_reconciliation_treats_absent_decision_store_as_exact(self) -> None:
+        actionable = self._failed_task()
+        self.assertFalse(self.decisions.exists())
+
+        page = attention.reconcile_attention({"limit": 20})
+
+        self.assertFalse(self.decisions.exists())
+        self.assertEqual(1, page["current_attention_count"])
+        self.assertEqual(0, page["excluded_attention_count"])
+        self.assertTrue(page["current_attention_exact"])
+        self.assertEqual(
+            "current_task_projection_after_valid_attention_decisions",
+            page["current_attention_count_scope"],
+        )
+        self.assertEqual(
+            [actionable["task_id"]],
+            [item["task_id"] for item in page["records"]],
+        )
+        self.assertNotIn(
+            "exact_global_current_attention_count",
+            page["does_not_establish"],
+        )
+
     def test_attention_cursor_is_invalidated_by_new_closeout_decision(self) -> None:
         first = self._failed_task()
         second = self._failed_task()
@@ -2682,6 +2705,36 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertGreaterEqual(page["pagination"]["scanned_raw"], 3)
         self.assertEqual(1, page["filtered_classification_counts"]["decision_closed"])
         self.assertEqual(1, page["filtered_classification_counts"]["decision_superseded"])
+
+    def test_current_reconciliation_reports_exact_current_attention_count(self) -> None:
+        closed = self._failed_task()
+        attention.record_decision(self._parameters(closed, decision="closed"))
+        superseded = self._failed_task()
+        attention.record_decision(self._parameters(superseded, decision="superseded"))
+        actionable = self._failed_task()
+
+        page = attention.reconcile_attention({"limit": 20})
+
+        self.assertEqual(3, page["total_attention"])
+        self.assertEqual(
+            "raw_task_state_projection_before_decisions",
+            page["total_attention_scope"],
+        )
+        self.assertEqual(1, page["current_attention_count"])
+        self.assertEqual(2, page["excluded_attention_count"])
+        self.assertTrue(page["current_attention_exact"])
+        self.assertEqual(
+            "current_task_projection_after_valid_attention_decisions",
+            page["current_attention_count_scope"],
+        )
+        self.assertEqual(
+            [actionable["task_id"]],
+            [item["task_id"] for item in page["records"]],
+        )
+        self.assertNotIn(
+            "exact_global_current_attention_count",
+            page["does_not_establish"],
+        )
 
     def test_reconciliation_rejects_unknown_view(self) -> None:
         with self.assertRaisesRegex(attention.TaskAttentionInputError, "view must be current or history"):
@@ -2784,6 +2837,17 @@ class TaskAttentionTests(unittest.TestCase):
             reconciled = attention.reconcile_attention({"limit": 20})
         self.assertEqual("degraded", reconciled["attention_convergence_status"])
         self.assertEqual(message, reconciled["attention_convergence_error"])
+        self.assertIsNone(reconciled["current_attention_count"])
+        self.assertIsNone(reconciled["excluded_attention_count"])
+        self.assertFalse(reconciled["current_attention_exact"])
+        self.assertEqual(
+            "unavailable_due_to_unverified_projection",
+            reconciled["current_attention_count_scope"],
+        )
+        self.assertIn(
+            "exact_global_current_attention_count",
+            reconciled["does_not_establish"],
+        )
 
         with patch.object(
             tasks,
