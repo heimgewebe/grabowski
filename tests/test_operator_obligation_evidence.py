@@ -668,6 +668,389 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             assert observed is not None
             self.assertEqual("verified", observed["status"])
 
+
+    def test_prepare_github_matches_trusted_adapter_and_rejects_caller_hash(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        payload = {
+            "state": "MERGED",
+            "isDraft": False,
+            "baseRefOid": base,
+            "headRefOid": head,
+            "mergeCommit": {"oid": merge},
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {"__typename": "StatusContext", "state": "SUCCESS"},
+            ],
+        }
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 943}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            observed = evidence._github_observation(item)
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertEqual(
+            f"github-pr:{repo}#943@{head}:base={base}:merge={merge}:checks=2/2-success",
+            item["reference"],
+        )
+        assert observed is not None
+        self.assertEqual("verified", observed["status"])
+        self.assertEqual(item["sha256"], observed["sha256"])
+        self.assertEqual(
+            "verified",
+            evidence.assess_evidence_item(item, observation=observed)["classification"],
+        )
+        with self.assertRaisesRegex(
+            evidence.EvidenceAssessmentError, "requires exactly repo and pr"
+        ):
+            evidence.prepare_evidence(
+                "merge",
+                "github",
+                {"repo": repo, "pr": 943, "sha256": "f" * 64},
+            )
+        with self.assertRaisesRegex(
+            evidence.EvidenceAssessmentError, "generic receipt strings remain intentionally untrusted"
+        ):
+            evidence.prepare_evidence(
+                "receipt",
+                "receipt",
+                {"reference": "grip:any:receipt:" + "a" * 64},
+            )
+
+    def test_prepare_runtime_matches_trusted_adapter_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"GRABOWSKI_EVIDENCE_RELEASES_ROOT": tmp},
+        ):
+            runtime_input = "7" * 64
+            repo_head = "8" * 40
+            release_id = "release-v3-prepare-1234567890"
+            release = Path(tmp) / release_id
+            release.mkdir(mode=0o700)
+            manifest = release / "deployment-manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "completion_status": "complete",
+                        "repo_head": repo_head,
+                        "release_id": release_id,
+                        "runtime_input_sha256": runtime_input,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest.chmod(0o600)
+            prepared = evidence.prepare_evidence(
+                "runtime", "runtime", {"release_id": release_id}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            observed = evidence._runtime_observation(item)
+            assert observed is not None
+            self.assertEqual("verified", observed["status"])
+            self.assertEqual(runtime_input, item["sha256"])
+            self.assertEqual(item["sha256"], observed["sha256"])
+
+            manifest.unlink()
+            stale = evidence.prepare_evidence(
+                "runtime", "runtime", {"release_id": release_id}
+            )
+            self.assertEqual("stale", stale["status"])
+            self.assertIsNone(stale["evidence"])
+
+    def test_prepare_test_task_matches_trusted_adapter_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_EVIDENCE_TASK_DATABASE": str(Path(tmp) / "tasks.sqlite3"),
+                "GRABOWSKI_EVIDENCE_TASK_OUTPUT_ROOT": str(Path(tmp) / "task-output"),
+            },
+        ):
+            task_id = "b" * 24
+            lifecycle_receipt = "9" * 64
+            database = Path(tmp) / "tasks.sqlite3"
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, attempt INTEGER, state TEXT, lifecycle_receipt_sha256 TEXT, argv_json TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                    (
+                        task_id,
+                        1,
+                        "completed",
+                        lifecycle_receipt,
+                        json.dumps(["pytest", "-q"]),
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            output = (
+                Path(tmp)
+                / "task-output"
+                / f".grabowski-task-output-{task_id}-a1"
+            )
+            output.mkdir(parents=True, mode=0o700)
+            (output / "stdout.log").write_text(
+                "53 passed, 19 subtests passed in 0.20s\n",
+                encoding="utf-8",
+            )
+            (output / "stdout.log").chmod(0o600)
+
+            prepared = evidence.prepare_evidence(
+                "tests", "test", {"task_id": task_id}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            observed = evidence._test_observation(item)
+
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "UPDATE tasks SET argv_json = ? WHERE task_id = ?",
+                    (
+                        json.dumps(["python3", "-m", "unittest", "tests.test_empty"]),
+                        task_id,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            (output / "stdout.log").write_text(
+                "Ran 0 tests in 0.000s\n\nOK\n", encoding="utf-8"
+            )
+            (output / "stdout.log").chmod(0o600)
+            zero_test = evidence.prepare_evidence(
+                "tests-zero", "test", {"task_id": task_id}
+            )
+
+        assert observed is not None
+        self.assertEqual("verified", observed["status"])
+        self.assertEqual(
+            f"grabowski-task:{task_id}:53-passed+19-subtests",
+            item["reference"],
+        )
+        self.assertEqual(item["sha256"], observed["sha256"])
+        self.assertNotEqual(lifecycle_receipt, item["sha256"])
+        self.assertEqual("mismatch", zero_test["status"])
+        self.assertEqual("test_summary_no_successful_tests", zero_test["reason"])
+        self.assertIsNone(zero_test["evidence"])
+
+    def test_root_cause_audit_distinguishes_producer_gap_mismatch_and_human_boundary(self) -> None:
+        current = self._status(
+            acceptance_ids=["github", "receipt", "human"],
+            stored_evidence=[
+                self._stored_evidence(
+                    acceptance_id="github",
+                    source="github",
+                    reference="PR 943 merged successfully",
+                    sha256="a" * 64,
+                ),
+                self._stored_evidence(
+                    acceptance_id="receipt",
+                    source="receipt",
+                    reference="grip:operator-obligation-evidence-assess:sample:"
+                    + "1" * 64
+                    + ":receipt:"
+                    + "2" * 64,
+                    sha256="b" * 64,
+                ),
+                self._stored_evidence(
+                    acceptance_id="human",
+                    source="user",
+                    reference="human acceptance",
+                    sha256="c" * 64,
+                ),
+            ],
+        )
+        result = evidence.assess_status(current)
+        by_id = {item["acceptance_id"]: item for item in result["acceptance"]}
+        self.assertEqual(
+            "evidence_at_source_reference_unbound", by_id["github"]["root_cause"]
+        )
+        self.assertEqual(
+            "evidence_at_source_not_persisted", by_id["receipt"]["root_cause"]
+        )
+        self.assertEqual("non_machine_verifiable", by_id["human"]["root_cause"])
+
+        mismatch_status = self._status(
+            acceptance_ids=["runtime"],
+            stored_evidence=[
+                self._stored_evidence(
+                    source="runtime",
+                    reference="runtime:revision-a",
+                    sha256="d" * 64,
+                )
+            ],
+        )
+        mismatch = evidence.assess_status(
+            mismatch_status,
+            observations={
+                "runtime": self._observation(
+                    reference="runtime:revision-b", sha256="d" * 64
+                )
+            },
+        )
+        self.assertEqual("identity_mismatch", mismatch["acceptance"][0]["root_cause"])
+        self.assertEqual(
+            "trusted_observation_mismatch",
+            evidence._root_cause_for_assessment(
+                {
+                    "classification": "mismatch",
+                    "reason": "trusted_observation_digest_mismatch",
+                }
+            ),
+        )
+        self.assertEqual(
+            "stored_evidence_status_mismatch",
+            evidence._root_cause_for_assessment(
+                {"classification": "mismatch", "reason": "stored_evidence_not_passed"}
+            ),
+        )
+        gap = evidence._gap_audit([result, mismatch])
+        causes = {item["root_cause"] for item in gap}
+        self.assertTrue(
+            {
+                "evidence_at_source_reference_unbound",
+                "evidence_at_source_not_persisted",
+                "non_machine_verifiable",
+                "identity_mismatch",
+            }.issubset(causes)
+        )
+        receipt_policy = evidence._gap_policy(
+            "receipt", "evidence_at_source_reference_unbound", "Captain merge receipt"
+        )
+        self.assertFalse(receipt_policy["independent_primary_source_present"])
+        self.assertEqual(
+            "replace_free_form_receipt_with_primary_source_or_concrete_durable_receipt",
+            receipt_policy["recommended_action"],
+        )
+
+    def test_prepare_git_and_bureau_reuse_existing_adapter_contracts(self) -> None:
+        commit = "b" * 40
+        commit_payload = b"tree " + b"a" * 40 + b"\n\nmessage\n"
+        with patch.object(
+            evidence, "_local_git_repo", return_value=Path("/tmp/repo")
+        ), patch.object(
+            evidence, "_run_command", return_value=(0, commit_payload, b"")
+        ):
+            prepared_git = evidence.prepare_evidence(
+                "git", "git", {"repo": "heimgewebe/grabowski", "commit": commit}
+            )
+            git_item = prepared_git["evidence"]
+            assert git_item is not None
+            git_observation = evidence._git_observation(git_item)
+        assert git_observation is not None
+        self.assertEqual("verified", git_observation["status"])
+        self.assertEqual(git_item["sha256"], git_observation["sha256"])
+
+        candidate_id = "candidate-" + "6" * 24
+        event_id = 11086
+        idempotency_key = "operator-obligation:v3:producer"
+        fingerprint = "7" * 64
+        invoke = unittest.mock.Mock(
+            return_value={
+                "status": "assessed",
+                "candidate_id": candidate_id,
+                "event_id": event_id,
+                "content_fingerprint": fingerprint,
+            }
+        )
+        module = types.ModuleType("grabowski_bureau_intake")
+        module._invoke_bureau = invoke
+        with patch.dict(sys.modules, {"grabowski_bureau_intake": module}):
+            prepared_bureau = evidence.prepare_evidence(
+                "bureau",
+                "bureau",
+                {"idempotency_key": idempotency_key},
+            )
+            bureau_item = prepared_bureau["evidence"]
+            assert bureau_item is not None
+            bureau_observation = evidence._bureau_observation(bureau_item)
+        assert bureau_observation is not None
+        self.assertEqual("verified", bureau_observation["status"])
+        self.assertEqual(fingerprint, bureau_item["sha256"])
+        self.assertEqual(bureau_item["sha256"], bureau_observation["sha256"])
+
+    def test_cohort_summary_keeps_legacy_and_modern_populations_separate(self) -> None:
+        population = [
+            {
+                "obligation_id": "legacy",
+                "close_schema_version": obligations.LEGACY_CLOSE_SCHEMA_VERSION,
+            },
+            {
+                "obligation_id": "modern",
+                "close_schema_version": obligations.CLOSE_SCHEMA_VERSION,
+            },
+        ]
+        selected = list(population)
+        assessments = [
+            {
+                "obligation_id": "legacy",
+                "legacy_close": True,
+                "acceptance_count": 1,
+                "acceptance": [
+                    {
+                        "classification": "legacy_unverifiable",
+                        "root_cause": "historical_truth_unavailable",
+                        "source": "git",
+                    }
+                ],
+                "fully_verified": False,
+                "false_confidence_risk": True,
+            },
+            {
+                "obligation_id": "modern",
+                "legacy_close": False,
+                "acceptance_count": 1,
+                "acceptance": [
+                    {
+                        "classification": "unverified",
+                        "root_cause": "evidence_at_source_reference_unbound",
+                        "source": "github",
+                    }
+                ],
+                "fully_verified": False,
+                "false_confidence_risk": True,
+            },
+        ]
+
+        legacy = evidence._cohort_summary(
+            population, selected, assessments, legacy=True, integrity_ok=True
+        )
+        modern = evidence._cohort_summary(
+            population, selected, assessments, legacy=False, integrity_ok=True
+        )
+
+        self.assertEqual(1, legacy["population_total"])
+        self.assertEqual(1, modern["population_total"])
+        self.assertTrue(legacy["fully_represented"])
+        self.assertTrue(modern["fully_represented"])
+        self.assertEqual(
+            1, legacy["acceptance_classification_counts"]["legacy_unverifiable"]
+        )
+        self.assertEqual(1, modern["acceptance_classification_counts"]["unverified"])
+        self.assertEqual(
+            {"historical_truth_unavailable": 1}, legacy["root_cause_counts"]
+        )
+        self.assertEqual(
+            {"evidence_at_source_reference_unbound": 1}, modern["root_cause_counts"]
+        )
     def test_matching_adapter_observation_flows_through_public_assessment(self) -> None:
         stored = self._stored_evidence(
             source="receipt",
