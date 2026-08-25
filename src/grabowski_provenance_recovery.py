@@ -59,6 +59,7 @@ except ImportError:  # pragma: no cover - exercised only without the mcp package
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+import grabowski_client_snapshot as client_snapshot
 import grabowski_mcp as base
 import grabowski_midcutover_resume as midcutover
 import grabowski_operator_core as operator
@@ -601,7 +602,10 @@ def _recovery_lane(expected_head: str) -> dict[str, Any]:
     cannot see *why* a lane is closed will reach for a wider tool.
     """
     try:
-        return midcutover.classify_from_durable_state(expected_head=expected_head)
+        return midcutover.classify_from_durable_state(
+            expected_head=expected_head,
+            snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
+        )
     except Exception as exc:  # noqa: BLE001 - a broken classifier is fail-closed
         return {
             "schema_version": midcutover.SCHEMA_VERSION,
