@@ -6,11 +6,22 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import threading
+from types import SimpleNamespace
+import unittest
 import urllib.error
 import urllib.request
 
-import pytest
+try:
+    import pytest
+except ModuleNotFoundError:  # unittest discovery environment intentionally omits pytest
+    class _PytestFallback:
+        @staticmethod
+        def fixture(function):
+            return function
+
+    pytest = _PytestFallback()  # type: ignore[assignment]
 
 import grabowski_juno_openai_gateway as gateway
 
@@ -116,11 +127,18 @@ def test_request_validation_enforces_message_limit() -> None:
     assert exc.value.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
 
 
-def test_route_selection_is_codex_nonpaid_and_revalidated(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        gateway.coding_agent_router,
-        "select_contrast_routes",
-        lambda *args, **kwargs: {
+def test_route_selection_is_codex_nonpaid_and_revalidated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = {}
+
+    def contract(route_id, *, paid_execution_authorized):
+        seen["route_id"] = route_id
+        seen["paid"] = paid_execution_authorized
+        return _contract()
+
+    router = SimpleNamespace(
+        select_contrast_routes=lambda *args, **kwargs: {
             "status": "recommended",
             "routes": [
                 {
@@ -131,27 +149,18 @@ def test_route_selection_is_codex_nonpaid_and_revalidated(monkeypatch: pytest.Mo
                 }
             ],
         },
-     )
-    seen = {}
-
-    def contract(route_id, *, paid_execution_authorized):
-        seen["route_id"] = route_id
-        seen["paid"] = paid_execution_authorized
-        return _contract()
-
-    monkeypatch.setattr(
-        gateway.coding_agent_router,
-        "advisory_route_execution_contract",
-        contract,
+        advisory_route_execution_contract=contract,
     )
+    monkeypatch.setattr(gateway, "_router_module", lambda: router)
     result = gateway.select_advisory_contract()
     assert result["route_id"] == "codex-spark-low"
     assert seen == {"route_id": "codex-spark-low", "paid": False}
 
 
-@pytest.mark.parametrize(
-    "route",
-    [
+def test_route_selection_rejects_paid_openrouter_or_wrong_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routes = (
         {
             "route": "paid",
             "harness": "codex",
@@ -170,27 +179,30 @@ def test_route_selection_is_codex_nonpaid_and_revalidated(monkeypatch: pytest.Mo
             "provider_family": "anthropic",
             "paid_only": False,
         },
-    ],
-)
-def test_route_selection_rejects_paid_openrouter_or_wrong_harness(
-    monkeypatch: pytest.MonkeyPatch, route: dict[str, object]
-) -> None:
-    monkeypatch.setattr(
-        gateway.coding_agent_router,
-        "select_contrast_routes",
-        lambda *args, **kwargs: {"status": "recommended", "routes": [route]},
     )
-    with pytest.raises(gateway.GatewayError) as exc:
-        gateway.select_advisory_contract()
-    assert exc.value.code == "unsafe_route"
+    for route in routes:
+        router = SimpleNamespace(
+            select_contrast_routes=lambda *args, _route=route, **kwargs: {
+                "status": "recommended",
+                "routes": [_route],
+            }
+        )
+        monkeypatch.setattr(gateway, "_router_module", lambda _router=router: _router)
+        with pytest.raises(gateway.GatewayError) as exc:
+            gateway.select_advisory_contract()
+        assert exc.value.code == "unsafe_route"
 
 
-def test_route_selection_fails_closed_when_no_route(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        gateway.coding_agent_router,
-        "select_contrast_routes",
-        lambda *args, **kwargs: {"status": "no-route", "routes": []},
-     )
+def test_route_selection_fails_closed_when_no_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = SimpleNamespace(
+        select_contrast_routes=lambda *args, **kwargs: {
+            "status": "no-route",
+            "routes": [],
+        }
+    )
+    monkeypatch.setattr(gateway, "_router_module", lambda: router)
     with pytest.raises(gateway.GatewayError) as exc:
         gateway.select_advisory_contract()
     assert exc.value.status == HTTPStatus.SERVICE_UNAVAILABLE
@@ -497,3 +509,22 @@ def test_installer_rolls_back_artifacts_and_service_state_after_smoke_failure(
     assert ("restart", installer.SERVICE_NAME) in calls
     assert ("probe", "stop", installer.SERVICE_NAME) in calls
     assert ("probe", "disable", installer.SERVICE_NAME) in calls
+
+
+class JunoOpenAIGatewayUnittestSmoke(unittest.TestCase):
+    def test_wrong_model_fails_closed(self) -> None:
+        with self.assertRaises(gateway.GatewayError) as caught:
+            gateway.validate_chat_request({**_request_payload(), "model": "other"})
+        self.assertEqual(caught.exception.code, "model_not_found")
+
+    def test_only_ipv4_loopback_is_accepted(self) -> None:
+        for host in ("::1", "localhost", "0.0.0.0"):
+            with self.subTest(host=host), self.assertRaises(SystemExit):
+                gateway.main(["--host", host])
+
+    def test_private_token_loader_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "token"
+            path.write_text("x" * 48, encoding="ascii")
+            path.chmod(0o600)
+            self.assertEqual(gateway.load_bearer_token(path), "x" * 48)

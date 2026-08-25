@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import importlib
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 import uuid
 
-import grabowski_coding_agent_router as coding_agent_router
+_coding_agent_router: Any | None = None
 
 MODEL_ID = "grabowski-juno"
 DEFAULT_HOST = "127.0.0.1"
@@ -268,9 +269,24 @@ def _conversation_prompt(messages: list[dict[str, str]]) -> str:
     )
 
 
+def _router_module() -> Any:
+    global _coding_agent_router
+    if _coding_agent_router is None:
+        try:
+            _coding_agent_router = importlib.import_module("grabowski_coding_agent_router")
+        except Exception as exc:
+            raise _error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "router_unavailable",
+                f"coding-agent router unavailable: {type(exc).__name__}",
+            ) from exc
+    return _coding_agent_router
+
+
 def select_advisory_contract() -> dict[str, Any]:
     try:
-        selection = coding_agent_router.select_contrast_routes(
+        router = _router_module()
+        selection = router.select_contrast_routes(
             "triage",
             changed_files=0,
             duration_minutes=3,
@@ -281,6 +297,8 @@ def select_advisory_contract() -> dict[str, Any]:
             allow_paid=False,
             allowed_harnesses={"codex"},
         )
+    except GatewayError:
+        raise
     except Exception as exc:
         raise _error(
             HTTPStatus.SERVICE_UNAVAILABLE,
@@ -315,7 +333,7 @@ def select_advisory_contract() -> dict[str, Any]:
             "router returned an invalid route id",
         )
     try:
-        contract = coding_agent_router.advisory_route_execution_contract(
+        contract = router.advisory_route_execution_contract(
             route_id, paid_execution_authorized=False
         )
     except Exception as exc:
