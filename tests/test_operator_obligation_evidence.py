@@ -683,10 +683,26 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             "statusCheckRollup": [
                 {
                     "__typename": "CheckRun",
+                    "name": "review settled",
+                    "workflowName": "review",
+                    "startedAt": "2026-08-25T14:30:01Z",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "review settled",
+                    "workflowName": "review",
+                    "startedAt": "2026-08-25T14:31:33Z",
                     "status": "COMPLETED",
                     "conclusion": "SUCCESS",
                 },
-                {"__typename": "StatusContext", "state": "SUCCESS"},
+                {
+                    "__typename": "StatusContext",
+                    "context": "required status",
+                    "startedAt": "2026-08-25T14:31:40Z",
+                    "state": "SUCCESS",
+                },
             ],
         }
         with patch.object(
@@ -703,7 +719,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
 
         self.assertEqual("prepared", prepared["status"])
         self.assertEqual(
-            f"github-pr:{repo}#943@{head}:base={base}:merge={merge}:checks=2/2-success",
+            f"github-pr-v2:{repo}#943@{head}:base={base}:merge={merge}:checks=2/2-effective-success",
             item["reference"],
         )
         assert observed is not None
@@ -729,6 +745,45 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 "receipt",
                 {"reference": "grip:any:receipt:" + "a" * 64},
             )
+
+    def test_prepare_github_latest_effective_failure_fails_closed(self) -> None:
+        payload = {
+            "state": "MERGED",
+            "isDraft": False,
+            "baseRefOid": "2" * 40,
+            "headRefOid": "1" * 40,
+            "mergeCommit": {"oid": "3" * 40},
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "validate",
+                    "workflowName": "validate",
+                    "startedAt": "2026-08-25T14:30:01Z",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                },
+                {
+                    "__typename": "CheckRun",
+                    "name": "validate",
+                    "workflowName": "validate",
+                    "startedAt": "2026-08-25T14:31:01Z",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                },
+            ],
+        }
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 948}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
 
     def test_prepare_runtime_matches_trusted_adapter_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(

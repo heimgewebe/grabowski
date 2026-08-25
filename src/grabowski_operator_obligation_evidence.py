@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -56,6 +57,13 @@ GITHUB_PR_REFERENCE_RE = re.compile(
     r":base=(?P<base>[0-9a-f]{40})"
     r":merge=(?P<merge>[0-9a-f]{40})"
     r":checks=(?P<passed>[0-9]{1,3})/(?P<total>[0-9]{1,3})-success$"
+)
+GITHUB_PR_V2_REFERENCE_RE = re.compile(
+    r"^github-pr-v2:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"#(?P<pr>[1-9][0-9]{0,9})@(?P<head>[0-9a-f]{40})"
+    r":base=(?P<base>[0-9a-f]{40})"
+    r":merge=(?P<merge>[0-9a-f]{40})"
+    r":checks=(?P<passed>[0-9]{1,3})/(?P<total>[0-9]{1,3})-effective-success$"
 )
 GIT_COMMIT_REFERENCE_RE = re.compile(
     r"^git-commit:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
@@ -228,6 +236,10 @@ def _run_command(
 
 def _github_reference(reference: str) -> dict[str, Any] | None:
     match = GITHUB_PR_REFERENCE_RE.fullmatch(reference)
+    version = 1
+    if match is None:
+        match = GITHUB_PR_V2_REFERENCE_RE.fullmatch(reference)
+        version = 2
     if match is None:
         return None
     parsed: dict[str, Any] = {
@@ -238,13 +250,14 @@ def _github_reference(reference: str) -> dict[str, Any] | None:
         "merge": match.group("merge"),
         "passed": int(match.group("passed")),
         "total": int(match.group("total")),
+        "version": version,
     }
     if parsed["total"] < 1 or parsed["total"] > 100 or parsed["passed"] != parsed["total"]:
         return None
     return parsed
 
 def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    material = {
         "schema_version": 1,
         "kind": "grabowski.operator_obligation_evidence.github_pr_v1",
         "repo": parsed["repo"],
@@ -255,6 +268,71 @@ def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
         "checks_passed": parsed["passed"],
         "checks_total": parsed["total"],
     }
+    if parsed.get("version", 1) == 2:
+        material.update(
+            {
+                "schema_version": 2,
+                "kind": "grabowski.operator_obligation_evidence.github_pr_v2",
+                "check_semantics": "latest_per_logical_identity_v1",
+            }
+        )
+    return material
+
+
+def _github_check_identity(
+    check: Mapping[str, Any],
+) -> tuple[tuple[str, ...], datetime] | None:
+    typename = check.get("__typename")
+    started_at = check.get("startedAt")
+    if not isinstance(started_at, str) or not started_at.endswith("Z"):
+        return None
+    try:
+        started = datetime.fromisoformat(started_at.removesuffix("Z") + "+00:00")
+    except ValueError:
+        return None
+    if started.tzinfo != timezone.utc:
+        return None
+    if typename == "CheckRun":
+        name = check.get("name")
+        workflow_name = check.get("workflowName")
+        if not isinstance(name, str) or not name or not isinstance(workflow_name, str):
+            return None
+        return ("CheckRun", workflow_name, name), started
+    if typename == "StatusContext":
+        context = check.get("context")
+        if not isinstance(context, str) or not context:
+            return None
+        return ("StatusContext", context), started
+    return None
+
+
+def _effective_github_checks(
+    checks: list[Any],
+) -> list[Mapping[str, Any]] | None:
+    effective: dict[tuple[str, ...], tuple[datetime, Mapping[str, Any]]] = {}
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return None
+        identity = _github_check_identity(check)
+        if identity is None:
+            return None
+        key, started = identity
+        previous = effective.get(key)
+        if previous is None or started > previous[0]:
+            effective[key] = (started, check)
+            continue
+        if started == previous[0] and dict(check) != dict(previous[1]):
+            return None
+    return [effective[key][1] for key in sorted(effective)]
+
+
+def _github_check_success(check: Mapping[str, Any]) -> bool:
+    typename = check.get("__typename")
+    if typename == "CheckRun":
+        return check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
+    if typename == "StatusContext":
+        return check.get("state") == "SUCCESS"
+    return False
 
 
 def _github_observation(
@@ -293,25 +371,24 @@ def _github_observation(
     merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
     if not isinstance(checks, list):
         return _trusted_observation(evidence, status="mismatch")
+    if parsed.get("version", 1) == 2:
+        observed_checks = _effective_github_checks(checks)
+        if observed_checks is None:
+            return _trusted_observation(evidence, status="mismatch")
+    else:
+        observed_checks = checks
     successful = 0
-    for check in checks:
+    for check in observed_checks:
         if not isinstance(check, Mapping):
             return _trusted_observation(evidence, status="mismatch")
-        typename = check.get("__typename")
-        if typename == "CheckRun":
-            ok = check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
-        elif typename == "StatusContext":
-            ok = check.get("state") == "SUCCESS"
-        else:
-            ok = False
-        successful += int(ok)
+        successful += int(_github_check_success(check))
     identity_matches = (
         payload.get("state") == "MERGED"
         and payload.get("isDraft") is False
         and payload.get("headRefOid") == parsed["head"]
         and payload.get("baseRefOid") == parsed["base"]
         and merge_oid == parsed["merge"]
-        and len(checks) == parsed["total"]
+        and len(observed_checks) == parsed["total"]
         and successful == parsed["passed"]
     )
     if not identity_matches:
@@ -803,24 +880,16 @@ def _prepare_github(
             status="mismatch",
             reason="github_pr_not_terminal_success",
         )
-    successful = 0
-    for check in checks:
-        if not isinstance(check, Mapping):
-            return _preparation_result(
-                acceptance_id=acceptance_id,
-                source="github",
-                status="mismatch",
-                reason="github_check_shape_invalid",
-            )
-        typename = check.get("__typename")
-        if typename == "CheckRun":
-            ok = check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
-        elif typename == "StatusContext":
-            ok = check.get("state") == "SUCCESS"
-        else:
-            ok = False
-        successful += int(ok)
-    if successful != len(checks):
+    effective_checks = _effective_github_checks(checks)
+    if effective_checks is None:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="github",
+            status="mismatch",
+            reason="github_check_shape_invalid",
+        )
+    successful = sum(int(_github_check_success(check)) for check in effective_checks)
+    if successful != len(effective_checks):
         return _preparation_result(
             acceptance_id=acceptance_id,
             source="github",
@@ -834,11 +903,12 @@ def _prepare_github(
         "base": base,
         "merge": merge_oid,
         "passed": successful,
-        "total": len(checks),
+        "total": len(effective_checks),
+        "version": 2,
     }
     reference = (
-        f"github-pr:{repo}#{pr}@{head}:base={base}:merge={merge_oid}:"
-        f"checks={successful}/{len(checks)}-success"
+        f"github-pr-v2:{repo}#{pr}@{head}:base={base}:merge={merge_oid}:"
+        f"checks={successful}/{len(effective_checks)}-effective-success"
     )
     return _prepared(
         acceptance_id,
