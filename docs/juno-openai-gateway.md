@@ -12,7 +12,7 @@ The gateway is intentionally advisory-only. It does not expose repository mutati
 
 ## API contract
 
-The service listens on `127.0.0.1:18195` by default and exposes:
+The service accepts only the IPv4 loopback bind `127.0.0.1` and listens on port `18195` by default. It exposes:
 
 - `GET /healthz` — minimal unauthenticated liveness response; no secret or route detail.
 - `GET /v1/models` — Bearer-authenticated; exposes exactly `grabowski-juno`.
@@ -73,12 +73,13 @@ After the gateway code has been merged and the exact merge revision deployed int
 
 The installer:
 
-1. creates or validates the private token;
-2. atomically copies the reviewed gateway source to `~/.local/libexec/grabowski/grabowski_juno_openai_gateway.py` and records its SHA-256;
-3. installs the user systemd unit;
-4. reloads user systemd;
-5. enables and starts the service;
-6. checks `/healthz` and the authenticated `/v1/models` endpoint locally.
+1. snapshots any previously installed gateway/unit and the current service state;
+2. creates or validates the private token;
+3. atomically copies the reviewed gateway source to `~/.local/libexec/grabowski/grabowski_juno_openai_gateway.py` and records its SHA-256;
+4. installs the user systemd unit and reloads user systemd;
+5. enables the unit and explicitly restarts the service, so an upgrade cannot leave the old in-memory process serving the smoke test;
+6. checks `/healthz`, the authenticated `/v1/models`, and one bounded authenticated `/v1/chat/completions` request through the real routed Codex backend;
+7. on any installation, systemd, or smoke failure, restores the prior gateway/unit and prior active/enabled service state before surfacing the error.
 
 The service imports the current deployed Grabowski routing modules through the release symlink at `~/.local/share/grabowski-mcp/inputs/src`, while the gateway executable itself remains the exact hash copied by the installer. A later gateway code change therefore requires rerunning the installer after the new revision is merged; an unrelated Grabowski runtime refresh does not silently replace the gateway executable.
 

@@ -717,8 +717,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.host not in {"127.0.0.1", "::1", "localhost"}:
-        raise SystemExit("gateway refuses non-loopback bind addresses")
+    if args.host != "127.0.0.1":
+        raise SystemExit("gateway accepts only the IPv4 loopback address 127.0.0.1")
     if not 1024 <= args.port <= 65535:
         raise SystemExit("port must be between 1024 and 65535")
     if not 10 <= args.backend_timeout_seconds <= 300:

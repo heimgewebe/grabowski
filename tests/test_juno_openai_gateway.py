@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from http import HTTPStatus
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,17 @@ import urllib.request
 import pytest
 
 import grabowski_juno_openai_gateway as gateway
+
+
+_INSTALLER_PATH = (
+    Path(__file__).resolve().parents[1] / "tools" / "install_juno_openai_gateway.py"
+)
+_INSTALLER_SPEC = importlib.util.spec_from_file_location(
+    "install_juno_openai_gateway_tested", _INSTALLER_PATH
+)
+assert _INSTALLER_SPEC is not None and _INSTALLER_SPEC.loader is not None
+installer = importlib.util.module_from_spec(_INSTALLER_SPEC)
+_INSTALLER_SPEC.loader.exec_module(installer)
 
 
 def _contract() -> dict[str, object]:
@@ -349,3 +361,139 @@ def test_healthz_does_not_require_secret(live_server: str) -> None:
         "status": "ok",
         "service": "grabowski-juno-openai-gateway",
     }
+
+
+def test_main_rejects_ipv6_and_hostname_loopback() -> None:
+    for host in ("::1", "localhost"):
+        with pytest.raises(SystemExit, match=r"127\.0\.0\.1"):
+            gateway.main(["--host", host])
+
+
+def test_installer_completion_smoke_posts_authenticated_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": installer.INSTALL_SMOKE_REPLY
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        observed["request"] = request
+        observed["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(installer.urllib.request, "urlopen", fake_urlopen)
+    token = "t" * 48
+    installer._completion_smoke(token, timeout_seconds=7)
+    request = observed["request"]
+    assert isinstance(request, urllib.request.Request)
+    assert request.full_url.endswith("/v1/chat/completions")
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer " + token
+    payload = json.loads(request.data)
+    assert payload["model"] == installer.MODEL_ID
+    assert installer.INSTALL_SMOKE_REPLY in payload["messages"][0]["content"]
+    assert observed["timeout"] == 7
+
+
+def _configure_installer_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, Path, Path, Path, Path]:
+    source = tmp_path / "source.py"
+    template = tmp_path / "service.example"
+    gateway_path = tmp_path / "installed" / "gateway.py"
+    unit_path = tmp_path / "systemd" / installer.SERVICE_NAME
+    token_path = tmp_path / "state" / "token"
+    source.write_text("print('new gateway')\n", encoding="utf-8")
+    template.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
+    monkeypatch.setattr(installer, "GATEWAY_SOURCE_PATH", source)
+    monkeypatch.setattr(installer, "TEMPLATE_PATH", template)
+    monkeypatch.setattr(installer, "GATEWAY_EXEC_PATH", gateway_path)
+    monkeypatch.setattr(installer, "UNIT_PATH", unit_path)
+    monkeypatch.setattr(installer, "TOKEN_PATH", token_path)
+    return source, template, gateway_path, unit_path, token_path
+
+
+def test_installer_restarts_after_replacing_active_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _configure_installer_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        installer, "_service_state", lambda: {"active": False, "enabled": False}
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def systemctl(*arguments: str):
+        calls.append(arguments)
+        stdout = "active\n" if arguments == ("is-active", installer.SERVICE_NAME) else ""
+        return subprocess.CompletedProcess(arguments, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(installer, "_systemctl", systemctl)
+    monkeypatch.setattr(installer, "_wait_for_smoke", lambda _path: None)
+    assert installer.main([]) == 0
+    capsys.readouterr()
+    assert ("enable", installer.SERVICE_NAME) in calls
+    assert ("restart", installer.SERVICE_NAME) in calls
+    assert calls.index(("restart", installer.SERVICE_NAME)) > calls.index(
+        ("enable", installer.SERVICE_NAME)
+    )
+
+
+def test_installer_rolls_back_artifacts_and_service_state_after_smoke_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _source, _template, gateway_path, unit_path, _token_path = (
+        _configure_installer_paths(monkeypatch, tmp_path)
+    )
+    gateway_path.parent.mkdir(parents=True)
+    unit_path.parent.mkdir(parents=True)
+    gateway_path.write_text("old gateway\n", encoding="utf-8")
+    gateway_path.chmod(0o700)
+    unit_path.write_text("old unit\n", encoding="utf-8")
+    unit_path.chmod(0o644)
+    monkeypatch.setattr(
+        installer, "_service_state", lambda: {"active": True, "enabled": True}
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def systemctl(*arguments: str):
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, stdout="active\n", stderr="")
+
+    def systemctl_probe(*arguments: str):
+        calls.append(("probe", *arguments))
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(installer, "_systemctl", systemctl)
+    monkeypatch.setattr(installer, "_systemctl_probe", systemctl_probe)
+
+    def fail_smoke(_path: Path) -> None:
+        raise RuntimeError("synthetic smoke failure")
+
+    monkeypatch.setattr(installer, "_wait_for_smoke", fail_smoke)
+    with pytest.raises(RuntimeError, match="synthetic smoke failure"):
+        installer.main([])
+    assert gateway_path.read_text(encoding="utf-8") == "old gateway\n"
+    assert unit_path.read_text(encoding="utf-8") == "old unit\n"
+    assert ("restart", installer.SERVICE_NAME) in calls
+    assert ("probe", "stop", installer.SERVICE_NAME) in calls
+    assert ("probe", "disable", installer.SERVICE_NAME) in calls
