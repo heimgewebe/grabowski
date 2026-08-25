@@ -489,10 +489,25 @@ def _github_v2_check(
     return None
 
 
+def _github_v2_effective_order(
+    observed_at: datetime, material: Mapping[str, Any]
+) -> tuple[int, int, int, datetime] | None:
+    workflow_id = material.get("workflow_database_id")
+    if workflow_id is not None:
+        run_number = _positive_int(material.get("workflow_run_number"))
+        run_attempt = _positive_int(material.get("workflow_run_attempt"))
+        if run_number is None or run_attempt is None:
+            return None
+        return (1, run_number, run_attempt, datetime.min.replace(tzinfo=timezone.utc))
+    return (0, 0, 0, observed_at)
+
+
 def _effective_github_v2_checks(
     checks: list[Any],
 ) -> list[dict[str, Any]] | None:
-    effective: dict[tuple[str, ...], tuple[datetime, dict[str, Any]]] = {}
+    effective: dict[
+        tuple[str, ...], tuple[tuple[int, int, int, datetime], dict[str, Any]]
+    ] = {}
     same_run_seen: dict[tuple[str, ...], int] = {}
     for check in checks:
         if not isinstance(check, Mapping):
@@ -505,15 +520,18 @@ def _effective_github_v2_checks(
             database_id = material["database_id"]
             previous_id = same_run_seen.get(same_run_identity)
             if previous_id is not None and previous_id != database_id:
-                # Two distinct jobs with the same display name in one workflow run
-                # are ambiguous; never treat one as a rerun of the other.
+                # Two distinct jobs with the same display name in one workflow
+                # attempt are ambiguous; never treat one as a rerun of the other.
                 return None
             same_run_seen[same_run_identity] = database_id
+        order = _github_v2_effective_order(observed_at, material)
+        if order is None:
+            return None
         previous = effective.get(logical_identity)
-        if previous is None or observed_at > previous[0]:
-            effective[logical_identity] = (observed_at, material)
+        if previous is None or order > previous[0]:
+            effective[logical_identity] = (order, material)
             continue
-        if observed_at == previous[0] and material != previous[1]:
+        if order == previous[0] and material != previous[1]:
             return None
     return [effective[key][1] for key in sorted(effective)]
 
