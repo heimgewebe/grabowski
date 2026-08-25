@@ -1116,6 +1116,13 @@ def _prepare_test(
             reason="authoritative_source_changed_or_unavailable",
         )
     passed, subtests = next(iter(summaries))
+    if passed + subtests < 1:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="mismatch",
+            reason="test_summary_no_successful_tests",
+        )
     digest = _test_observation_digest(
         task_id=task_id,
         attempt=attempt,

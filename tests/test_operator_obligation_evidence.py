@@ -819,6 +819,26 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             assert item is not None
             observed = evidence._test_observation(item)
 
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "UPDATE tasks SET argv_json = ? WHERE task_id = ?",
+                    (
+                        json.dumps(["python3", "-m", "unittest", "tests.test_empty"]),
+                        task_id,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            (output / "stdout.log").write_text(
+                "Ran 0 tests in 0.000s\n\nOK\n", encoding="utf-8"
+            )
+            (output / "stdout.log").chmod(0o600)
+            zero_test = evidence.prepare_evidence(
+                "tests-zero", "test", {"task_id": task_id}
+            )
+
         assert observed is not None
         self.assertEqual("verified", observed["status"])
         self.assertEqual(
@@ -827,6 +847,9 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(item["sha256"], observed["sha256"])
         self.assertNotEqual(lifecycle_receipt, item["sha256"])
+        self.assertEqual("mismatch", zero_test["status"])
+        self.assertEqual("test_summary_no_successful_tests", zero_test["reason"])
+        self.assertIsNone(zero_test["evidence"])
 
     def test_root_cause_audit_distinguishes_producer_gap_mismatch_and_human_boundary(self) -> None:
         current = self._status(
