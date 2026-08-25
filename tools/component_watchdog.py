@@ -39,6 +39,7 @@ DEFAULT_METRICS_URL = "http://127.0.0.1:18080/metrics"
 DEFAULT_CONTROL_PLANE_POLL_MAX_AGE = 90.0
 TUNNEL_METRICS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 CONTROL_PLANE_POLL_METRIC = "commands_poll_last_successful_timestamp_seconds"
+TUNNEL_RECOVERY_PHASES = frozenset({"idle", "degraded", "restarting", "connector-convergence"})
 PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
@@ -108,6 +109,9 @@ class WatchdogState:
     backoff_level: int = 0
     next_restart_not_before: int = 0
     restart_generation: int = 0
+    recovery_episode_restart_attempted: bool = False
+    recovery_episode_started_at_unix: int = 0
+    recovery_phase: str = "idle"
     readiness_dependency_unavailable_boot_id: str | None = None
     readiness_dependency_unavailable_pid: int | None = None
     readiness_dependency_unavailable_start_ticks: int | None = None
@@ -1347,6 +1351,9 @@ def load_state(path: Path) -> WatchdogState:
         "backoff_level",
         "next_restart_not_before",
         "restart_generation",
+        "recovery_episode_restart_attempted",
+        "recovery_episode_started_at_unix",
+        "recovery_phase",
         "readiness_dependency_unavailable_boot_id",
         "readiness_dependency_unavailable_pid",
         "readiness_dependency_unavailable_start_ticks",
@@ -1359,6 +1366,13 @@ def load_state(path: Path) -> WatchdogState:
     backoff_level = raw.get("backoff_level", 0)
     next_restart_not_before = raw.get("next_restart_not_before", 0)
     restart_generation = raw.get("restart_generation", 0)
+    recovery_episode_restart_attempted = raw.get(
+        "recovery_episode_restart_attempted", False
+    )
+    recovery_episode_started_at_unix = raw.get(
+        "recovery_episode_started_at_unix", 0
+    )
+    recovery_phase = raw.get("recovery_phase", "idle")
     dependency_boot_id = raw.get("readiness_dependency_unavailable_boot_id")
     dependency_pid = raw.get("readiness_dependency_unavailable_pid")
     dependency_start_ticks = raw.get(
@@ -1401,6 +1415,10 @@ def load_state(path: Path) -> WatchdogState:
         or next_restart_not_before < 0
         or type(restart_generation) is not int
         or restart_generation < 0
+        or type(recovery_episode_restart_attempted) is not bool
+        or type(recovery_episode_started_at_unix) is not int
+        or recovery_episode_started_at_unix < 0
+        or recovery_phase not in TUNNEL_RECOVERY_PHASES
         or not dependency_identity_valid
     ):
         raise WatchdogError("invalid-state-shape")
@@ -1413,6 +1431,9 @@ def load_state(path: Path) -> WatchdogState:
         backoff_level=backoff_level,
         next_restart_not_before=next_restart_not_before,
         restart_generation=restart_generation,
+        recovery_episode_restart_attempted=recovery_episode_restart_attempted,
+        recovery_episode_started_at_unix=recovery_episode_started_at_unix,
+        recovery_phase=recovery_phase,
         readiness_dependency_unavailable_boot_id=dependency_boot_id,
         readiness_dependency_unavailable_pid=dependency_pid,
         readiness_dependency_unavailable_start_ticks=dependency_start_ticks,
@@ -1432,6 +1453,13 @@ def save_state(path: Path, state: WatchdogState) -> None:
                 "backoff_level": state.backoff_level,
                 "next_restart_not_before": state.next_restart_not_before,
                 "restart_generation": state.restart_generation,
+                "recovery_episode_restart_attempted": (
+                    state.recovery_episode_restart_attempted
+                ),
+                "recovery_episode_started_at_unix": (
+                    state.recovery_episode_started_at_unix
+                ),
+                "recovery_phase": state.recovery_phase,
                 "readiness_dependency_unavailable_boot_id": (
                     state.readiness_dependency_unavailable_boot_id
                 ),
@@ -1501,6 +1529,9 @@ def reset_after_healthy(
         backoff_level=0,
         next_restart_not_before=0,
         restart_generation=state.restart_generation,
+        recovery_episode_restart_attempted=False,
+        recovery_episode_started_at_unix=0,
+        recovery_phase="idle",
     )
 
 
@@ -1523,6 +1554,11 @@ def decide(
         backoff_level=state.backoff_level,
         next_restart_not_before=state.next_restart_not_before,
         restart_generation=state.restart_generation,
+        recovery_episode_restart_attempted=(
+            state.recovery_episode_restart_attempted
+        ),
+        recovery_episode_started_at_unix=state.recovery_episode_started_at_unix,
+        recovery_phase=state.recovery_phase,
         readiness_dependency_unavailable_boot_id=(
             state.readiness_dependency_unavailable_boot_id
         ),
@@ -1549,6 +1585,11 @@ def decide(
         backoff_level=level,
         next_restart_not_before=now + delay,
         restart_generation=state.restart_generation + 1,
+        recovery_episode_restart_attempted=(
+            state.recovery_episode_restart_attempted
+        ),
+        recovery_episode_started_at_unix=state.recovery_episode_started_at_unix,
+        recovery_phase=state.recovery_phase,
         readiness_dependency_unavailable_boot_id=(
             state.readiness_dependency_unavailable_boot_id
         ),
@@ -1940,7 +1981,7 @@ def refresh_connector_snapshot_from_runtime(
     connector_start_ticks: int,
     timeout_seconds: float = CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
-    """Refresh snapshot evidence without making snapshot failure a tunnel restart signal."""
+    """Refresh snapshot evidence without raising or directly triggering a restart."""
     try:
         root = runtime_root.expanduser().resolve(strict=True)
     except OSError:
@@ -2020,29 +2061,89 @@ def refresh_connector_snapshot_from_runtime(
     return allowed
 
 
+def runtime_deployment_identity(runtime_root: Path) -> dict[str, str]:
+    try:
+        root = runtime_root.expanduser().resolve(strict=True)
+        manifest = root / "deployment-manifest.json"
+        if not manifest.is_file() or manifest.stat().st_size > 65536:
+            return {}
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, str] = {}
+    release_id = payload.get("release_id")
+    repo_head = payload.get("repo_head")
+    if isinstance(release_id, str) and 0 < len(release_id) <= 256:
+        result["release_id"] = release_id
+    if (
+        isinstance(repo_head, str)
+        and len(repo_head) == 40
+        and all(char in "0123456789abcdef" for char in repo_head)
+    ):
+        result["repo_head"] = repo_head
+    return result
+
+
 def _emit_connector_snapshot_refresh(
     args: argparse.Namespace,
     probe: ProbeResult,
-) -> None:
-    if (
-        args.component != "tunnel"
-        or args.check_only
-        or probe.pid is None
-        or probe.start_ticks is None
-    ):
-        return
-    result = refresh_connector_snapshot_from_runtime(
-        runtime_root=args.runtime_root,
-        host=args.host,
-        port=args.port,
-        connector_pid=probe.pid,
-        connector_start_ticks=probe.start_ticks,
-    )
+) -> dict[str, object] | None:
+    if args.component != "tunnel" or args.check_only:
+        return None
+    if probe.pid is None or probe.start_ticks is None:
+        result: dict[str, object] = {
+            "state": "error",
+            "reason": "connector-process-identity-unavailable",
+        }
+    else:
+        result = refresh_connector_snapshot_from_runtime(
+            runtime_root=args.runtime_root,
+            host=args.host,
+            port=args.port,
+            connector_pid=probe.pid,
+            connector_start_ticks=probe.start_ticks,
+        )
     emit(
         "grabowski.connector_snapshot.refresh",
         component=args.component,
         service=args.service,
         **result,
+    )
+    return result
+
+
+def _connector_snapshot_converged(result: dict[str, object] | None) -> bool:
+    return result is None or result.get("state") in {"not_due", "renewed"}
+
+
+def _recovery_reason(probe: ProbeResult) -> str:
+    if not probe.reasons:
+        return "unknown"
+    return ",".join(probe.reasons)[:512]
+
+
+def _tunnel_recovery_state(
+    state: WatchdogState,
+    *,
+    now: int,
+    phase: str,
+    restart_attempted: bool | None = None,
+) -> WatchdogState:
+    if phase not in TUNNEL_RECOVERY_PHASES or phase == "idle":
+        raise WatchdogError("invalid-tunnel-recovery-phase")
+    return replace(
+        state,
+        recovery_episode_restart_attempted=(
+            state.recovery_episode_restart_attempted
+            if restart_attempted is None
+            else restart_attempted
+        ),
+        recovery_episode_started_at_unix=(
+            state.recovery_episode_started_at_unix or now
+        ),
+        recovery_phase=phase,
     )
 
 
@@ -2288,7 +2389,33 @@ def run_watchdog(args: argparse.Namespace) -> int:
             }
 
             if probe.status == "healthy":
-                _emit_connector_snapshot_refresh(args, probe)
+                snapshot_result = _emit_connector_snapshot_refresh(args, probe)
+                if not _connector_snapshot_converged(snapshot_result):
+                    now = int(time.time())
+                    state = _tunnel_recovery_state(
+                        replace(state, consecutive_failures=0),
+                        now=now,
+                        phase="connector-convergence",
+                    )
+                    save_state(state_path, state)
+                    emit(
+                        "grabowski.component_watchdog.recovering",
+                        **common,
+                        recovery_phase=state.recovery_phase,
+                        recovery_episode_started_at_unix=(
+                            state.recovery_episode_started_at_unix
+                        ),
+                        restart_attempted=(
+                            state.recovery_episode_restart_attempted
+                        ),
+                        convergence_reason=(
+                            snapshot_result.get("reason")
+                            if snapshot_result is not None
+                            else "unknown"
+                        ),
+                        restart_generation=state.restart_generation,
+                    )
+                    return 1
                 state = reset_after_healthy(
                     state,
                     now=int(time.time()),
@@ -2298,6 +2425,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 emit(
                     "grabowski.component_watchdog.healthy",
                     **common,
+                    recovery_phase=state.recovery_phase,
                     restart_generation=state.restart_generation,
                 )
                 return 0
@@ -2318,6 +2446,35 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 return 1
 
             decision_now = int(time.time())
+            if (
+                args.component == "tunnel"
+                and state.recovery_episode_restart_attempted
+            ):
+                next_state = _tunnel_recovery_state(
+                    replace(
+                        state,
+                        consecutive_failures=state.consecutive_failures + 1,
+                    ),
+                    now=decision_now,
+                    phase="degraded",
+                )
+                save_state(state_path, next_state)
+                emit(
+                    "grabowski.component_watchdog.restart_deferred",
+                    **common,
+                    reason="recovery-episode-restart-already-attempted",
+                    initiator="watchdog",
+                    recovery_reason=_recovery_reason(probe),
+                    recovery_phase=next_state.recovery_phase,
+                    recovery_episode_started_at_unix=(
+                        next_state.recovery_episode_started_at_unix
+                    ),
+                    consecutive_failures=next_state.consecutive_failures,
+                    restart_generation=next_state.restart_generation,
+                    **runtime_deployment_identity(args.runtime_root),
+                )
+                return 1
+
             action, next_state = decide(
                 state,
                 now=decision_now,
@@ -2327,6 +2484,13 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 backoff_base=args.backoff_base,
                 backoff_max=args.backoff_max,
             )
+            if args.component == "tunnel":
+                next_state = _tunnel_recovery_state(
+                    next_state,
+                    now=decision_now,
+                    phase="restarting" if action == "restart" else "degraded",
+                    restart_attempted=True if action == "restart" else None,
+                )
             save_state(state_path, next_state)
             if action == "observe":
                 emit(
@@ -2540,16 +2704,53 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 )
                 return 4
 
+            runtime_identity = runtime_deployment_identity(args.runtime_root)
             emit(
                 "grabowski.component_watchdog.restarting",
                 **common,
+                initiator="watchdog",
+                previous_state="degraded",
+                recovery_reason=_recovery_reason(probe),
+                recovery_phase=next_state.recovery_phase,
+                recovery_episode_started_at_unix=(
+                    next_state.recovery_episode_started_at_unix
+                ),
+                restart_started_at_unix=decision_now,
                 stack_dump_requested=stack_dump_requested,
                 stack_dump_receipt=stack_dump_receipt,
                 backoff_level=next_state.backoff_level,
                 next_restart_not_before=next_state.next_restart_not_before,
                 restart_generation=next_state.restart_generation,
+                **runtime_identity,
             )
-            restart_service(args.service)
+            try:
+                restart_service(args.service)
+            except WatchdogError as exc:
+                failed_state = _tunnel_recovery_state(
+                    replace(next_state, consecutive_failures=1),
+                    now=decision_now,
+                    phase="degraded",
+                    restart_attempted=True,
+                )
+                save_state(state_path, failed_state)
+                emit(
+                    "grabowski.component_watchdog.restart_failed",
+                    **common,
+                    initiator="watchdog",
+                    recovery_reason=_recovery_reason(probe),
+                    recovery_phase=failed_state.recovery_phase,
+                    recovery_episode_started_at_unix=(
+                        failed_state.recovery_episode_started_at_unix
+                    ),
+                    restart_started_at_unix=decision_now,
+                    restart_completed_at_unix=int(time.time()),
+                    restart_result="service-action-failed",
+                    failure=str(exc),
+                    restart_generation=failed_state.restart_generation,
+                    **runtime_identity,
+                )
+                return 4
+            restart_completed_at_unix = int(time.time())
             deadline = time.monotonic() + args.recovery_timeout
             final_probe = probe
             while time.monotonic() < deadline:
@@ -2573,7 +2774,43 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 if final_probe.status == "healthy" and _is_new_process_instance(
                     probe, final_probe
                 ):
-                    _emit_connector_snapshot_refresh(args, final_probe)
+                    snapshot_result = _emit_connector_snapshot_refresh(
+                        args, final_probe
+                    )
+                    if not _connector_snapshot_converged(snapshot_result):
+                        pending_state = _tunnel_recovery_state(
+                            replace(next_state, consecutive_failures=0),
+                            now=int(time.time()),
+                            phase="connector-convergence",
+                            restart_attempted=True,
+                        )
+                        save_state(state_path, pending_state)
+                        emit(
+                            "grabowski.component_watchdog.recovering",
+                            component=args.component,
+                            service=args.service,
+                            status=final_probe.status,
+                            pid=final_probe.pid,
+                            initiator="watchdog",
+                            recovery_reason=_recovery_reason(probe),
+                            recovery_phase=pending_state.recovery_phase,
+                            recovery_episode_started_at_unix=(
+                                pending_state.recovery_episode_started_at_unix
+                            ),
+                            restart_started_at_unix=decision_now,
+                            restart_completed_at_unix=(
+                                restart_completed_at_unix
+                            ),
+                            restart_result="service-action-succeeded",
+                            convergence_reason=(
+                                snapshot_result.get("reason")
+                                if snapshot_result is not None
+                                else "unknown"
+                            ),
+                            restart_generation=pending_state.restart_generation,
+                            **runtime_identity,
+                        )
+                        return 1
                     recovered_state = reset_after_healthy(
                         next_state,
                         now=int(time.time()),
@@ -2585,23 +2822,47 @@ def run_watchdog(args: argparse.Namespace) -> int:
                         component=args.component,
                         service=args.service,
                         pid=final_probe.pid,
+                        initiator="watchdog",
+                        recovery_reason=_recovery_reason(probe),
+                        recovery_phase=recovered_state.recovery_phase,
+                        restart_started_at_unix=decision_now,
+                        restart_completed_at_unix=restart_completed_at_unix,
+                        restart_result="service-action-succeeded",
+                        recovery_result="connector-converged",
                         backoff_level=recovered_state.backoff_level,
                         next_restart_not_before=recovered_state.next_restart_not_before,
                         restart_generation=recovered_state.restart_generation,
+                        **runtime_identity,
                     )
                     return 0
 
-            next_state.consecutive_failures = 1
-            save_state(state_path, next_state)
+            failed_state = _tunnel_recovery_state(
+                replace(next_state, consecutive_failures=1),
+                now=decision_now,
+                phase="degraded",
+                restart_attempted=True,
+            )
+            save_state(state_path, failed_state)
             emit(
                 "grabowski.component_watchdog.restart_unhealthy",
                 component=args.component,
                 service=args.service,
                 status=final_probe.status,
                 reasons=list(final_probe.reasons),
-                backoff_level=next_state.backoff_level,
-                next_restart_not_before=next_state.next_restart_not_before,
-                restart_generation=next_state.restart_generation,
+                initiator="watchdog",
+                recovery_reason=_recovery_reason(probe),
+                recovery_phase=failed_state.recovery_phase,
+                recovery_episode_started_at_unix=(
+                    failed_state.recovery_episode_started_at_unix
+                ),
+                restart_started_at_unix=decision_now,
+                restart_completed_at_unix=restart_completed_at_unix,
+                restart_result="service-action-succeeded",
+                recovery_result="upstream-still-unhealthy",
+                backoff_level=failed_state.backoff_level,
+                next_restart_not_before=failed_state.next_restart_not_before,
+                restart_generation=failed_state.restart_generation,
+                **runtime_identity,
             )
             return 4
 

@@ -1544,6 +1544,42 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
                 self.assertEqual(watchdog.run_watchdog(check_args), 0)
                 refresh.assert_not_called()
 
+    def test_healthy_tunnel_is_recovering_until_connector_snapshot_converges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", tmp]
+                )
+            )
+            probe = watchdog.ProbeResult(
+                "healthy", pid=123, age_seconds=30.0, start_ticks=456
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "refresh_connector_snapshot_from_runtime",
+                    return_value={"state": "error", "reason": "discover-failed"},
+                ),
+                patch.object(watchdog, "restart_service") as restart,
+                patch.object(watchdog, "emit") as emit,
+            ):
+                self.assertEqual(1, watchdog.run_watchdog(args))
+
+            restart.assert_not_called()
+            state = watchdog.load_state(Path(tmp) / "tunnel-watchdog-state.json")
+            self.assertEqual("connector-convergence", state.recovery_phase)
+            self.assertFalse(state.recovery_episode_restart_attempted)
+            self.assertGreater(state.recovery_episode_started_at_unix, 0)
+            self.assertEqual(
+                "grabowski.component_watchdog.recovering",
+                emit.call_args.args[0],
+            )
+            self.assertEqual(
+                "discover-failed", emit.call_args.kwargs["convergence_reason"]
+            )
+
+
 
 class WatchdogAdmissionRecoveryTests(unittest.TestCase):
     def _manifest_root(self, root: Path) -> Path:
@@ -2692,6 +2728,261 @@ class WatchdogPolicyTests(unittest.TestCase):
             self.assertEqual(0, state.next_restart_not_before)
             self.assertEqual(1, state.restart_generation)
             self.assertEqual([1000], state.restart_timestamps)
+
+    def test_tunnel_stale_poll_golden_recovery_is_single_restart_and_convergence_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "tunnel-watchdog-state.json"
+            watchdog.save_state(
+                state_path, watchdog.WatchdogState(consecutive_failures=2)
+            )
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "tunnel",
+                        "--state-dir",
+                        tmp,
+                        "--failure-threshold",
+                        "3",
+                        "--startup-grace",
+                        "0",
+                        "--recovery-timeout",
+                        "1",
+                    ]
+                )
+            )
+            stale = watchdog.ProbeResult(
+                "unhealthy",
+                ("control-plane-poll-stale",),
+                pid=123,
+                age_seconds=300.0,
+                start_ticks=10,
+            )
+            healthy = watchdog.ProbeResult(
+                "healthy", pid=456, age_seconds=1.0, start_ticks=20
+            )
+
+            def passthrough(probe, state, **_kwargs):
+                return probe, state
+
+            with (
+                patch.object(watchdog, "probe_component", return_value=stale),
+                patch.object(
+                    watchdog,
+                    "classify_tunnel_readiness_dependency",
+                    side_effect=passthrough,
+                ),
+                patch.object(watchdog, "restart_service") as restart,
+                patch.object(
+                    watchdog,
+                    "runtime_deployment_identity",
+                    return_value={
+                        "release_id": "test-release",
+                        "repo_head": "a" * 40,
+                    },
+                ),
+                patch.object(watchdog, "emit") as emit,
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(1000.0),
+                ),
+                patch.object(
+                    watchdog.time,
+                    "monotonic",
+                    side_effect=iter([0.0, 2.0]),
+                ),
+            ):
+                self.assertEqual(4, watchdog.run_watchdog(args))
+
+            restart.assert_called_once_with("tunnel-client-grabowski.service")
+            state = watchdog.load_state(state_path)
+            self.assertTrue(state.recovery_episode_restart_attempted)
+            self.assertEqual("degraded", state.recovery_phase)
+            self.assertEqual(1, state.restart_generation)
+            restarting = next(
+                call
+                for call in emit.call_args_list
+                if call.args[0] == "grabowski.component_watchdog.restarting"
+            )
+            self.assertEqual("watchdog", restarting.kwargs["initiator"])
+            self.assertEqual(
+                "control-plane-poll-stale", restarting.kwargs["recovery_reason"]
+            )
+            self.assertEqual("restarting", restarting.kwargs["recovery_phase"])
+            self.assertEqual("a" * 40, restarting.kwargs["repo_head"])
+
+            with (
+                patch.object(watchdog, "probe_component", return_value=stale),
+                patch.object(
+                    watchdog,
+                    "classify_tunnel_readiness_dependency",
+                    side_effect=passthrough,
+                ),
+                patch.object(watchdog, "restart_service") as second_restart,
+                patch.object(
+                    watchdog,
+                    "runtime_deployment_identity",
+                    return_value={
+                        "release_id": "test-release",
+                        "repo_head": "a" * 40,
+                    },
+                ),
+                patch.object(watchdog, "emit") as second_emit,
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(1100.0),
+                ),
+            ):
+                self.assertEqual(1, watchdog.run_watchdog(args))
+
+            second_restart.assert_not_called()
+            self.assertEqual(
+                "grabowski.component_watchdog.restart_deferred",
+                second_emit.call_args.args[0],
+            )
+            self.assertEqual(
+                "recovery-episode-restart-already-attempted",
+                second_emit.call_args.kwargs["reason"],
+            )
+
+            with (
+                patch.object(watchdog, "probe_component", return_value=healthy),
+                patch.object(
+                    watchdog,
+                    "classify_tunnel_readiness_dependency",
+                    side_effect=passthrough,
+                ),
+                patch.object(
+                    watchdog,
+                    "refresh_connector_snapshot_from_runtime",
+                    return_value={"state": "error", "reason": "discover-failed"},
+                ),
+                patch.object(watchdog, "restart_service") as recovering_restart,
+                patch.object(watchdog, "emit") as recovering_emit,
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(1200.0),
+                ),
+            ):
+                self.assertEqual(1, watchdog.run_watchdog(args))
+
+            recovering_restart.assert_not_called()
+            state = watchdog.load_state(state_path)
+            self.assertTrue(state.recovery_episode_restart_attempted)
+            self.assertEqual("connector-convergence", state.recovery_phase)
+            self.assertEqual(
+                "grabowski.component_watchdog.recovering",
+                recovering_emit.call_args.args[0],
+            )
+
+            with (
+                patch.object(watchdog, "probe_component", return_value=healthy),
+                patch.object(
+                    watchdog,
+                    "classify_tunnel_readiness_dependency",
+                    side_effect=passthrough,
+                ),
+                patch.object(
+                    watchdog,
+                    "refresh_connector_snapshot_from_runtime",
+                    return_value={"state": "not_due"},
+                ),
+                patch.object(watchdog, "restart_service") as healthy_restart,
+                patch.object(watchdog, "emit") as healthy_emit,
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(1300.0),
+                ),
+            ):
+                self.assertEqual(0, watchdog.run_watchdog(args))
+
+            healthy_restart.assert_not_called()
+            state = watchdog.load_state(state_path)
+            self.assertFalse(state.recovery_episode_restart_attempted)
+            self.assertEqual(0, state.recovery_episode_started_at_unix)
+            self.assertEqual("idle", state.recovery_phase)
+            self.assertEqual(
+                "grabowski.component_watchdog.healthy",
+                healthy_emit.call_args.args[0],
+            )
+
+    def test_tunnel_restart_failure_does_not_loop_within_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "tunnel-watchdog-state.json"
+            watchdog.save_state(
+                state_path, watchdog.WatchdogState(consecutive_failures=2)
+            )
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "tunnel",
+                        "--state-dir",
+                        tmp,
+                        "--failure-threshold",
+                        "3",
+                        "--startup-grace",
+                        "0",
+                    ]
+                )
+            )
+            stale = watchdog.ProbeResult(
+                "unhealthy", ("control-plane-poll-stale",), pid=123, start_ticks=10
+            )
+
+            def passthrough(probe, state, **_kwargs):
+                return probe, state
+
+            with (
+                patch.object(watchdog, "probe_component", return_value=stale),
+                patch.object(
+                    watchdog,
+                    "classify_tunnel_readiness_dependency",
+                    side_effect=passthrough,
+                ),
+                patch.object(
+                    watchdog,
+                    "restart_service",
+                    side_effect=watchdog.WatchdogError("service-restart-failed: test"),
+                ) as restart,
+                patch.object(watchdog, "runtime_deployment_identity", return_value={}),
+                patch.object(watchdog, "emit"),
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(2000.0),
+                ),
+            ):
+                self.assertEqual(4, watchdog.run_watchdog(args))
+
+            self.assertEqual(1, restart.call_count)
+            state = watchdog.load_state(state_path)
+            self.assertTrue(state.recovery_episode_restart_attempted)
+            self.assertEqual("degraded", state.recovery_phase)
+
+            with (
+                patch.object(watchdog, "probe_component", return_value=stale),
+                patch.object(
+                    watchdog,
+                    "classify_tunnel_readiness_dependency",
+                    side_effect=passthrough,
+                ),
+                patch.object(watchdog, "restart_service") as retry,
+                patch.object(watchdog, "runtime_deployment_identity", return_value={}),
+                patch.object(watchdog, "emit"),
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(2100.0),
+                ),
+            ):
+                self.assertEqual(1, watchdog.run_watchdog(args))
+            retry.assert_not_called()
+
 
 
 if __name__ == "__main__":
