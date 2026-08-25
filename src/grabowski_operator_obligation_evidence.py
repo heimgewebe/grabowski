@@ -18,6 +18,13 @@ SCHEMA_VERSION = 1
 KIND = "grabowski.operator_obligation_evidence_assessment"
 SAMPLE_KIND = "grabowski.operator_obligation_evidence_sample"
 OBSERVATION_KIND = "grabowski.operator_obligation_evidence_observation"
+PREPARATION_KIND = "grabowski.operator_obligation_evidence_preparation"
+PREPARABLE_SOURCES = ("bureau", "github", "git", "runtime", "test")
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+GITHUB_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+TASK_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{16,240}$")
+BUREAU_IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9._:@/+-]{1,512}$")
 CLASSIFICATIONS = (
     "verified",
     "unverified",
@@ -235,7 +242,6 @@ def _github_reference(reference: str) -> dict[str, Any] | None:
     if parsed["total"] < 1 or parsed["total"] > 100 or parsed["passed"] != parsed["total"]:
         return None
     return parsed
-
 
 def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
     return {
@@ -577,7 +583,6 @@ def _read_task_evidence_row(database: Path, task_id: str) -> tuple[Any, ...] | N
     finally:
         connection.close()
 
-
 def _test_observation_digest(
     *,
     task_id: str,
@@ -671,6 +676,498 @@ def _test_observation(
         evidence, status="verified", sha256=observation_sha256
     )
 
+
+def _preparation_result(
+    *,
+    acceptance_id: str,
+    source: str,
+    status: str,
+    reason: str,
+    evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": PREPARATION_KIND,
+        "acceptance_id": acceptance_id,
+        "source": source,
+        "status": status,
+        "reason": reason,
+        "evidence": dict(evidence) if evidence is not None else None,
+        "verified_completion_enforcement_enabled": False,
+        "does_not_establish": [
+            "operator obligation completion",
+            "semantic relevance of the source artifact to the acceptance condition",
+            "future source truth after preparation",
+            "trust in caller-authored observations or digests",
+            "trust in generic non-persisted grip receipt strings",
+            "permission to enforce verified completion",
+            "mutation authority",
+        ],
+    }
+    result["preparation_sha256"] = _sha256(result)
+    return result
+
+
+def _prepared(
+    acceptance_id: str, source: str, reference: str, sha256: str
+) -> dict[str, Any]:
+    evidence_item = {
+        "acceptance_id": acceptance_id,
+        "status": "passed",
+        "source": source,
+        "reference": reference,
+        "sha256": sha256,
+    }
+    return _preparation_result(
+        acceptance_id=acceptance_id,
+        source=source,
+        status="prepared",
+        reason="authoritative_source_bound",
+        evidence=evidence_item,
+    )
+
+
+def _prepare_github(
+    acceptance_id: str,
+    selectors: Mapping[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    if set(selectors) != {"repo", "pr"}:
+        raise EvidenceAssessmentError("github preparation requires exactly repo and pr")
+    repo = _text(selectors.get("repo"), "repo")
+    pr = selectors.get("pr")
+    if GITHUB_REPO_SLUG_RE.fullmatch(repo) is None:
+        raise EvidenceAssessmentError("repo must be an exact GitHub owner/repository slug")
+    if isinstance(pr, bool) or not isinstance(pr, int) or not 1 <= pr <= 9_999_999_999:
+        raise EvidenceAssessmentError("pr must be a positive integer")
+    try:
+        returncode, stdout, _stderr = _run_command(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(pr),
+                "--repo",
+                repo,
+                "--json",
+                "state,isDraft,baseRefOid,headRefOid,mergeCommit,statusCheckRollup",
+            ],
+            deadline_monotonic=deadline_monotonic,
+        )
+    except EvidenceAssessmentError:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="github",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    if returncode != 0:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="github",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    try:
+        payload = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, Mapping):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="github",
+            status="mismatch",
+            reason="authoritative_source_malformed",
+        )
+    merge = payload.get("mergeCommit")
+    merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
+    head = payload.get("headRefOid")
+    base = payload.get("baseRefOid")
+    checks = payload.get("statusCheckRollup")
+    if (
+        payload.get("state") != "MERGED"
+        or payload.get("isDraft") is not False
+        or not isinstance(head, str)
+        or SHA40_RE.fullmatch(head) is None
+        or not isinstance(base, str)
+        or SHA40_RE.fullmatch(base) is None
+        or not isinstance(merge_oid, str)
+        or SHA40_RE.fullmatch(merge_oid) is None
+        or not isinstance(checks, list)
+        or not 1 <= len(checks) <= 100
+    ):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="github",
+            status="mismatch",
+            reason="github_pr_not_terminal_success",
+        )
+    successful = 0
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return _preparation_result(
+                acceptance_id=acceptance_id,
+                source="github",
+                status="mismatch",
+                reason="github_check_shape_invalid",
+            )
+        typename = check.get("__typename")
+        if typename == "CheckRun":
+            ok = check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
+        elif typename == "StatusContext":
+            ok = check.get("state") == "SUCCESS"
+        else:
+            ok = False
+        successful += int(ok)
+    if successful != len(checks):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="github",
+            status="mismatch",
+            reason="github_checks_not_all_successful",
+        )
+    parsed = {
+        "repo": repo,
+        "pr": pr,
+        "head": head,
+        "base": base,
+        "merge": merge_oid,
+        "passed": successful,
+        "total": len(checks),
+    }
+    reference = (
+        f"github-pr:{repo}#{pr}@{head}:base={base}:merge={merge_oid}:"
+        f"checks={successful}/{len(checks)}-success"
+    )
+    return _prepared(
+        acceptance_id,
+        "github",
+        reference,
+        _sha256(_github_observation_material(parsed)),
+    )
+
+
+def _prepare_git(
+    acceptance_id: str,
+    selectors: Mapping[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    if set(selectors) != {"repo", "commit"}:
+        raise EvidenceAssessmentError("git preparation requires exactly repo and commit")
+    repo_slug = _text(selectors.get("repo"), "repo")
+    commit = _text(selectors.get("commit"), "commit")
+    if GITHUB_REPO_SLUG_RE.fullmatch(repo_slug) is None:
+        raise EvidenceAssessmentError("repo must be an exact GitHub owner/repository slug")
+    if SHA40_RE.fullmatch(commit) is None:
+        raise EvidenceAssessmentError("commit must be an exact lowercase 40-character SHA")
+    repo = _local_git_repo(repo_slug, deadline_monotonic=deadline_monotonic)
+    if repo is None:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="git",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    try:
+        returncode, stdout, _stderr = _run_command(
+            ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "commit", commit],
+            cwd=repo,
+            deadline_monotonic=deadline_monotonic,
+        )
+    except EvidenceAssessmentError:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="git",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    if returncode != 0:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="git",
+            status="stale",
+            reason="git_commit_unavailable",
+        )
+    return _prepared(
+        acceptance_id,
+        "git",
+        f"git-commit:{repo_slug}@{commit}",
+        hashlib.sha256(stdout).hexdigest(),
+    )
+
+
+def _prepare_bureau(
+    acceptance_id: str,
+    selectors: Mapping[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    if set(selectors) != {"idempotency_key"}:
+        raise EvidenceAssessmentError(
+            "bureau preparation requires exactly idempotency_key"
+        )
+    idempotency_key = _text(selectors.get("idempotency_key"), "idempotency_key")
+    if BUREAU_IDEMPOTENCY_RE.fullmatch(idempotency_key) is None:
+        raise EvidenceAssessmentError("idempotency_key has unsupported characters")
+    remaining = ADAPTER_COMMAND_TIMEOUT_SECONDS
+    if deadline_monotonic is not None:
+        remaining = min(remaining, max(0.0, deadline_monotonic - time.monotonic()))
+    if remaining < 1:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="bureau",
+            status="stale",
+            reason="authoritative_source_deadline_exhausted",
+        )
+    try:
+        import grabowski_bureau_intake as bureau_intake
+
+        payload = bureau_intake._invoke_bureau(
+            [
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+                "--idempotency-key",
+                idempotency_key,
+            ],
+            timeout_seconds=max(1, int(remaining)),
+        )
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="bureau",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("kind") == "grabowski_bureau_intake_adapter_failure"
+    ):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="bureau",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    candidate_id = payload.get("candidate_id")
+    event_id = payload.get("event_id")
+    fingerprint = payload.get("content_fingerprint")
+    if (
+        payload.get("status") != "assessed"
+        or not isinstance(candidate_id, str)
+        or re.fullmatch(r"candidate-[0-9a-f]{24}", candidate_id) is None
+        or isinstance(event_id, bool)
+        or not isinstance(event_id, int)
+        or event_id < 1
+        or not _is_sha256(fingerprint)
+    ):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="bureau",
+            status="mismatch",
+            reason="bureau_candidate_identity_invalid",
+        )
+    reference = (
+        f"bureau-candidate:{candidate_id}:event={event_id}:"
+        f"idempotency={idempotency_key}"
+    )
+    return _prepared(acceptance_id, "bureau", reference, str(fingerprint))
+
+
+def _prepare_runtime(
+    acceptance_id: str,
+    selectors: Mapping[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    del deadline_monotonic
+    if set(selectors) != {"release_id"}:
+        raise EvidenceAssessmentError("runtime preparation requires exactly release_id")
+    release_id = _text(selectors.get("release_id"), "release_id")
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise EvidenceAssessmentError("release_id has invalid format")
+    try:
+        data = _read_regular_bytes(
+            _deployment_manifest_path(release_id),
+            maximum=MAX_ADAPTER_FILE_BYTES,
+        )
+        payload = json.loads(data)
+    except (EvidenceAssessmentError, UnicodeDecodeError, json.JSONDecodeError):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="runtime",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    if not isinstance(payload, Mapping):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="runtime",
+            status="mismatch",
+            reason="runtime_manifest_malformed",
+        )
+    repo_head = payload.get("repo_head")
+    runtime_input = payload.get("runtime_input_sha256")
+    if (
+        payload.get("completion_status") != "complete"
+        or payload.get("release_id") != release_id
+        or not isinstance(repo_head, str)
+        or SHA40_RE.fullmatch(repo_head) is None
+        or not _is_sha256(runtime_input)
+    ):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="runtime",
+            status="mismatch",
+            reason="runtime_manifest_identity_invalid",
+        )
+    reference = (
+        f"grabowski-runtime-manifest:repo_head={repo_head};"
+        f"release_id={release_id};runtime_input_sha256={runtime_input}"
+    )
+    return _prepared(acceptance_id, "runtime", reference, str(runtime_input))
+
+
+def _prepare_test(
+    acceptance_id: str,
+    selectors: Mapping[str, Any],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any]:
+    del deadline_monotonic
+    if set(selectors) != {"task_id"}:
+        raise EvidenceAssessmentError("test preparation requires exactly task_id")
+    task_id = _text(selectors.get("task_id"), "task_id")
+    if TASK_ID_RE.fullmatch(task_id) is None:
+        raise EvidenceAssessmentError("task_id must be an exact 24-character hex id")
+    database = _task_database_path().resolve(strict=False)
+    try:
+        before = _read_task_evidence_row(database, task_id)
+    except sqlite3.Error:
+        before = None
+    if before is None:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="stale",
+            reason="authoritative_source_unavailable",
+        )
+    attempt, state, lifecycle_receipt_sha256, argv_json = before
+    if (
+        not isinstance(attempt, int)
+        or attempt < 1
+        or state != "completed"
+        or not _is_sha256(lifecycle_receipt_sha256)
+        or not _recognized_test_argv(argv_json)
+    ):
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="mismatch",
+            reason="test_task_not_terminal_test_execution",
+        )
+    output_dir = _task_output_root() / f".grabowski-task-output-{task_id}-a{attempt}"
+    streams: list[bytes] = []
+    output_sha256s: list[str] = []
+    for name in ("stdout.log", "stderr.log"):
+        try:
+            data = _read_regular_bytes(output_dir / name, maximum=MAX_ADAPTER_FILE_BYTES)
+        except EvidenceAssessmentError:
+            continue
+        streams.append(data)
+        output_sha256s.append(hashlib.sha256(data).hexdigest())
+    if not streams:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="stale",
+            reason="test_output_unavailable",
+        )
+    summaries: set[tuple[int, int]] = set()
+    for stream in streams:
+        summaries.update(_pytest_summary_counts(stream))
+        summaries.update(
+            (int(item.group("passed")), 0)
+            for item in UNITTEST_SUMMARY_RE.finditer(stream)
+        )
+    if len(summaries) != 1:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="mismatch",
+            reason="test_summary_not_unique_success",
+        )
+    try:
+        after = _read_task_evidence_row(database, task_id)
+    except sqlite3.Error:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="stale",
+            reason="authoritative_source_changed_or_unavailable",
+        )
+    if after != before:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="stale",
+            reason="authoritative_source_changed_or_unavailable",
+        )
+    passed, subtests = next(iter(summaries))
+    if passed + subtests < 1:
+        return _preparation_result(
+            acceptance_id=acceptance_id,
+            source="test",
+            status="mismatch",
+            reason="test_summary_no_successful_tests",
+        )
+    digest = _test_observation_digest(
+        task_id=task_id,
+        attempt=attempt,
+        lifecycle_receipt_sha256=str(lifecycle_receipt_sha256),
+        argv_json=str(argv_json),
+        passed=passed,
+        subtests=subtests,
+        output_sha256s=output_sha256s,
+    )
+    reference = f"grabowski-task:{task_id}:{passed}-passed+{subtests}-subtests"
+    return _prepared(acceptance_id, "test", reference, digest)
+
+
+_PREPARERS = {
+    "bureau": _prepare_bureau,
+    "github": _prepare_github,
+    "git": _prepare_git,
+    "runtime": _prepare_runtime,
+    "test": _prepare_test,
+}
+
+
+def prepare_evidence(
+    acceptance_id: str,
+    source: str,
+    selectors: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prepare close evidence only from a fresh independent authoritative read."""
+
+    acceptance = _text(acceptance_id, "acceptance_id")
+    source_name = _text(source, "source")
+    if source_name not in PREPARABLE_SOURCES:
+        raise EvidenceAssessmentError(
+            "source is not preparable; generic receipt strings remain intentionally untrusted"
+        )
+    if not isinstance(selectors, Mapping):
+        raise EvidenceAssessmentError("selectors must be an object")
+    deadline = time.monotonic() + MAX_ADAPTER_COLLECTION_SECONDS
+    return _PREPARERS[source_name](
+        acceptance,
+        selectors,
+        deadline_monotonic=deadline,
+    )
+
+
 _SOURCE_ADAPTERS = {
     "bureau": _bureau_observation,
     "github": _github_observation,
@@ -722,6 +1219,50 @@ def collect_trusted_observations(
         if observation is not None:
             observations[acceptance_id] = observation
     return observations
+
+
+
+def _root_cause_for_assessment(item: Mapping[str, Any]) -> str:
+    classification = str(item.get("classification"))
+    reason = str(item.get("reason"))
+    source = item.get("source")
+    reference = item.get("reference")
+    if classification == "verified":
+        return "verified"
+    if classification == "legacy_unverifiable":
+        return "historical_truth_unavailable"
+    if classification == "mismatch":
+        if reason in {"observation_acceptance_mismatch", "observation_identity_mismatch"}:
+            return "identity_mismatch"
+        if reason == "stored_evidence_not_passed":
+            return "stored_evidence_status_mismatch"
+        return "trusted_observation_mismatch"
+    if classification == "stale":
+        return "source_temporarily_unavailable"
+    if classification == "missing":
+        return "evidence_at_source_missing"
+    if classification == "unsupported":
+        if source == "user" or reason == "human_assertion_is_not_machine_verification":
+            return "non_machine_verifiable"
+        return "trusted_adapter_gap"
+    if classification == "unverified":
+        if reason == "missing_or_invalid_evidence_digest":
+            return "evidence_at_source_digest_unbound"
+        if source == "receipt" and isinstance(reference, str) and reference.startswith("grip:"):
+            return "evidence_at_source_not_persisted"
+        if isinstance(source, str) and source in _SOURCE_ADAPTERS:
+            return "evidence_at_source_reference_unbound"
+        return "trusted_adapter_gap"
+    return "non_machine_verifiable"
+
+
+def _attach_root_causes(items: list[dict[str, Any]]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for item in items:
+        root_cause = _root_cause_for_assessment(item)
+        item["root_cause"] = root_cause
+        counts[root_cause] += 1
+    return counts
 
 
 def _observation_for(
@@ -968,6 +1509,7 @@ def assess_status(
             )
         )
 
+    root_cause_counts = _attach_root_causes(assessed)
     counts = Counter(item["classification"] for item in assessed)
     fully_verified = (
         state == "completed"
@@ -1002,6 +1544,7 @@ def assess_status(
         "classifications": {
             name: int(counts.get(name, 0)) for name in CLASSIFICATIONS
         },
+        "root_cause_counts": dict(sorted(root_cause_counts.items())),
         "acceptance": assessed,
         "fully_verified": fully_verified,
         "declared_hash_bound_completion": declared_hash_bound,
@@ -1136,6 +1679,201 @@ def _select_sample_population(
     return selected[:limit]
 
 
+
+def _cohort_summary(
+    population: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    assessments: list[dict[str, Any]],
+    *,
+    legacy: bool,
+    integrity_ok: bool,
+) -> dict[str, Any]:
+    def is_legacy_record(item: Mapping[str, Any]) -> bool:
+        return item.get("close_schema_version") == obligations.LEGACY_CLOSE_SCHEMA_VERSION
+
+    population_items = [item for item in population if is_legacy_record(item) is legacy]
+    selected_ids = {
+        str(item["obligation_id"])
+        for item in selected
+        if is_legacy_record(item) is legacy
+    }
+    cohort_assessments = [
+        item
+        for item in assessments
+        if bool(item.get("legacy_close")) is legacy
+    ]
+    classification_counts: Counter[str] = Counter()
+    root_cause_counts: Counter[str] = Counter()
+    source_counts: Counter[str] = Counter()
+    for assessment in cohort_assessments:
+        for item in assessment["acceptance"]:
+            classification_counts[str(item["classification"])] += 1
+            root_cause_counts[str(item["root_cause"])] += 1
+            source = item.get("source")
+            if isinstance(source, str):
+                source_counts[source] += 1
+    return {
+        "population_total": len(population_items),
+        "selected_total": len(cohort_assessments),
+        "fully_represented": (
+            integrity_ok
+            and len(population_items) == len(selected_ids)
+            and {str(item["obligation_id"]) for item in population_items} == selected_ids
+        ),
+        "schema_versions": sorted(
+            {
+                item.get("close_schema_version")
+                for item in population_items
+                if isinstance(item.get("close_schema_version"), int)
+            }
+        ),
+        "acceptance_total": sum(
+            int(item["acceptance_count"]) for item in cohort_assessments
+        ),
+        "acceptance_classification_counts": {
+            name: int(classification_counts.get(name, 0))
+            for name in CLASSIFICATIONS
+        },
+        "root_cause_counts": dict(sorted(root_cause_counts.items())),
+        "source_counts": dict(sorted(source_counts.items())),
+        "obligations_fully_verified": sum(
+            1 for item in cohort_assessments if item["fully_verified"]
+        ),
+        "obligations_with_false_confidence_risk": sum(
+            1 for item in cohort_assessments if item["false_confidence_risk"]
+        ),
+    }
+
+
+def _gap_policy(source: str | None, root_cause: str, reference: str | None) -> dict[str, Any]:
+    durable_receipt = (
+        source == "receipt"
+        and isinstance(reference, str)
+        and reference.startswith("grabowski-receipt:grip-receipts/worktree-ensure/")
+    )
+    independent = source in PREPARABLE_SOURCES or durable_receipt
+    adapter_available = isinstance(source, str) and source in _SOURCE_ADAPTERS
+    producer_hardening = root_cause.startswith("evidence_at_source_") or root_cause in {
+        "identity_mismatch",
+        "stored_evidence_status_mismatch",
+        "trusted_observation_mismatch",
+    }
+    if root_cause in {
+        "identity_mismatch",
+        "stored_evidence_status_mismatch",
+        "trusted_observation_mismatch",
+    }:
+        action = "investigate_producer_evidence_binding; do_not_relax_adapter"
+        benefit = "eliminates false source claims without increasing trust permissiveness"
+        risk = "historical mismatch may be irreparable"
+    elif root_cause == "historical_truth_unavailable":
+        action = "retain_legacy_unverifiable"
+        benefit = "preserves truthful legacy boundary"
+        risk = "legacy verification ratio remains low"
+    elif root_cause == "non_machine_verifiable":
+        action = "retain_explicit_non_machine_boundary"
+        benefit = "avoids automating qualitative acceptance"
+        risk = "requires a separate human-policy decision before enforcement"
+    elif root_cause == "trusted_adapter_gap":
+        action = "add_adapter_only_if_independent_authoritative_source_exists"
+        benefit = "could verify existing exact identities without producer changes"
+        risk = "new adapter expands trust surface"
+    elif root_cause == "evidence_at_source_not_persisted":
+        action = "keep_generic_grip_receipt_untrusted; add_concrete_durable_receipt_only_if_recurrent"
+        benefit = "avoids inventing evidence after the fact"
+        risk = "generic historical grip evidence remains unverified"
+    elif root_cause in {
+        "evidence_at_source_reference_unbound",
+        "evidence_at_source_digest_unbound",
+        "evidence_at_source_missing",
+    }:
+        if source in PREPARABLE_SOURCES:
+            action = "use_authoritative_evidence_preparation_at_producer"
+            benefit = "future evidence carries canonical identity and independently recomputable digest"
+            risk = "producer must choose the semantically correct acceptance/source pairing"
+        elif source == "receipt":
+            action = "replace_free_form_receipt_with_primary_source_or_concrete_durable_receipt"
+            benefit = "avoids granting trust to non-persisted or prose-only receipt claims"
+            risk = "historical free-form receipt claims remain unverified"
+        else:
+            action = "bind_evidence_to_independent_authoritative_source_at_producer"
+            benefit = "future evidence can become independently observable without widening trust"
+            risk = "no current preparer exists for the selected evidence source"
+    elif root_cause == "source_temporarily_unavailable":
+        action = "retry_read_only_source_observation_later"
+        benefit = "distinguishes transient availability from identity mismatch"
+        risk = "verification remains unavailable while source is stale"
+    else:
+        action = "inspect_case"
+        benefit = "keeps classification conservative"
+        risk = "unknown gap remains"
+    return {
+        "independent_primary_source_present": independent,
+        "adapter_available": adapter_available,
+        "producer_hardening_necessary": producer_hardening,
+        "expected_benefit": benefit,
+        "risk": risk,
+        "recommended_action": action,
+    }
+
+
+def _gap_audit(assessments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[Any, str | None, str, str], dict[str, Any]] = {}
+    for assessment in assessments:
+        schema = assessment.get("close_schema_version")
+        obligation_id = str(assessment["obligation_id"])
+        for item in assessment["acceptance"]:
+            classification = str(item["classification"])
+            if classification == "verified":
+                continue
+            source = item.get("source") if isinstance(item.get("source"), str) else None
+            root_cause = str(item["root_cause"])
+            key = (schema, source, root_cause, classification)
+            entry = groups.setdefault(
+                key,
+                {
+                    "completion_schema": schema,
+                    "source": source,
+                    "classification": classification,
+                    "root_cause": root_cause,
+                    "count": 0,
+                    "examples": [],
+                },
+            )
+            entry["count"] += 1
+            if len(entry["examples"]) < 3:
+                entry["examples"].append(
+                    {
+                        "obligation_id": obligation_id,
+                        "acceptance_id": item.get("acceptance_id"),
+                        "reference": item.get("reference"),
+                    }
+                )
+    result: list[dict[str, Any]] = []
+    for key in sorted(
+        groups,
+        key=lambda item: (
+            str(item[0]),
+            item[1] or "",
+            item[2],
+            item[3],
+        ),
+    ):
+        entry = groups[key]
+        first_reference = (
+            entry["examples"][0].get("reference") if entry["examples"] else None
+        )
+        entry.update(
+            _gap_policy(
+                entry["source"],
+                entry["root_cause"],
+                first_reference if isinstance(first_reference, str) else None,
+            )
+        )
+        result.append(entry)
+    return result
+
+
 def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > MAX_SAMPLE:
         raise EvidenceAssessmentError(f"limit must be an integer from 1 to {MAX_SAMPLE}")
@@ -1160,6 +1898,7 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
     source_counts: Counter[str] = Counter()
     missing_adapter_source_counts: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
+    root_cause_counts: Counter[str] = Counter()
     adapter_observation_counts: Counter[str] = Counter()
     adapter_status_counts: Counter[str] = Counter()
     for observations in observation_maps:
@@ -1183,6 +1922,7 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
                 ):
                     missing_adapter_source_counts[source] += 1
             reason_counts[item["reason"]] += 1
+            root_cause_counts[str(item["root_cause"])] += 1
         for classification in seen_classes:
             obligation_classification_counts[classification] += 1
 
@@ -1260,6 +2000,14 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
         "obligations_fully_verified": fully_verified,
         "obligations_with_false_confidence_risk": false_confidence_risk,
     }
+    integrity_ok = not integrity_errors and not scan_truncated
+    legacy_cohort = _cohort_summary(
+        population, selected, assessments, legacy=True, integrity_ok=integrity_ok
+    )
+    modern_cohort = _cohort_summary(
+        population, selected, assessments, legacy=False, integrity_ok=integrity_ok
+    )
+    gap_audit = _gap_audit(assessments)
     result = {
         "schema_version": SCHEMA_VERSION,
         "kind": SAMPLE_KIND,
@@ -1290,6 +2038,10 @@ def sample_completed(limit: int = MIN_ROLLOUT_SAMPLE) -> dict[str, Any]:
             sorted(missing_adapter_source_counts.items())
         ),
         "reason_counts": dict(sorted(reason_counts.items())),
+        "root_cause_counts": dict(sorted(root_cause_counts.items())),
+        "legacy_cohort": legacy_cohort,
+        "modern_cohort": modern_cohort,
+        "gap_audit": gap_audit,
         "trusted_observation_adapter_sources": list(
             TRUSTED_OBSERVATION_ADAPTER_SOURCES
         ),
