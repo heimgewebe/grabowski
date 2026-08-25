@@ -19,6 +19,9 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONPATH=%h/.local/share/grabowski-mcp/inputs/src
 NoNewPrivileges=yes
+# The per-user manager needs a private user namespace before mount/device
+# sandboxing and capability reductions become available without host privilege.
+PrivateUsers=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict

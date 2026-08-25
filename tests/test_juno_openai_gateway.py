@@ -437,6 +437,7 @@ def test_user_service_hardening_avoids_user_manager_capability_drop() -> None:
     unit = installer.TEMPLATE_PATH.read_text(encoding="utf-8")
     assert "CapabilityBoundingSet=" not in unit
     assert "NoNewPrivileges=yes" in unit
+    assert "PrivateUsers=yes" in unit
     assert "ProtectSystem=strict" in unit
     assert "ProtectHome=tmpfs" in unit
 
