@@ -1,0 +1,45 @@
+[Unit]
+Description=Grabowski controlled OpenAI-compatible gateway for Juno
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/libexec/grabowski/grabowski_juno_openai_gateway.py --host 127.0.0.1 --port 18195 --token-file %h/.local/state/grabowski/juno-openai-gateway/token
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=20
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/.local/share/grabowski-mcp/inputs/src
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/share/grabowski-mcp
+BindReadOnlyPaths=%h/.local/bin
+BindReadOnlyPaths=%h/.local/libexec/grabowski/grabowski_juno_openai_gateway.py
+BindReadOnlyPaths=%h/.local/state/grabowski/coding-agent-router
+BindReadOnlyPaths=%h/.local/state/grabowski/juno-openai-gateway
+BindPaths=%h/.codex
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+LimitCORE=0
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
