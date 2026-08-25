@@ -2068,7 +2068,7 @@ def runtime_deployment_identity(runtime_root: Path) -> dict[str, str]:
         if not manifest.is_file() or manifest.stat().st_size > 65536:
             return {}
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     if not isinstance(payload, dict):
         return {}
@@ -2824,7 +2824,11 @@ def run_watchdog(args: argparse.Namespace) -> int:
                         pid=final_probe.pid,
                         initiator="watchdog",
                         recovery_reason=_recovery_reason(probe),
-                        recovery_phase=recovered_state.recovery_phase,
+                        recovery_phase=next_state.recovery_phase,
+                        recovery_episode_started_at_unix=(
+                            next_state.recovery_episode_started_at_unix
+                        ),
+                        post_recovery_phase=recovered_state.recovery_phase,
                         restart_started_at_unix=decision_now,
                         restart_completed_at_unix=restart_completed_at_unix,
                         restart_result="service-action-succeeded",

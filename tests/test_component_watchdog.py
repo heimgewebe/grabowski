@@ -1499,6 +1499,12 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
             self.assertIn("20.0", command)
             self.assertEqual(runner.call_args.kwargs["timeout"], 22.0)
 
+    def test_runtime_deployment_identity_ignores_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp)
+            (runtime / "deployment-manifest.json").write_bytes(b"\xff\xfe")
+            self.assertEqual({}, watchdog.runtime_deployment_identity(runtime))
+
     def test_refresh_failure_is_reported_without_raising(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = self._runtime(Path(tmp))
@@ -2909,6 +2915,87 @@ class WatchdogPolicyTests(unittest.TestCase):
                 "grabowski.component_watchdog.healthy",
                 healthy_emit.call_args.args[0],
             )
+
+    def test_tunnel_recovered_event_preserves_pre_reset_episode_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "tunnel",
+                        "--state-dir",
+                        tmp,
+                        "--failure-threshold",
+                        "1",
+                        "--startup-grace",
+                        "0",
+                        "--recovery-timeout",
+                        "5",
+                    ]
+                )
+            )
+            stale = watchdog.ProbeResult(
+                "unhealthy",
+                ("control-plane-poll-stale",),
+                pid=123,
+                age_seconds=300.0,
+                start_ticks=10,
+            )
+            healthy = watchdog.ProbeResult(
+                "healthy", pid=456, age_seconds=1.0, start_ticks=20
+            )
+
+            def passthrough(probe, state, **_kwargs):
+                return probe, state
+
+            with (
+                patch.object(
+                    watchdog, "probe_component", side_effect=[stale, healthy]
+                ),
+                patch.object(
+                    watchdog,
+                    "classify_tunnel_readiness_dependency",
+                    side_effect=passthrough,
+                ),
+                patch.object(watchdog, "restart_service") as restart,
+                patch.object(
+                    watchdog,
+                    "refresh_connector_snapshot_from_runtime",
+                    return_value={"state": "renewed"},
+                ),
+                patch.object(
+                    watchdog, "runtime_deployment_identity", return_value={}
+                ),
+                patch.object(watchdog, "emit") as emit,
+                patch.object(watchdog.time, "sleep"),
+                patch.object(
+                    watchdog.time,
+                    "time",
+                    side_effect=itertools.repeat(3000.0),
+                ),
+                patch.object(
+                    watchdog.time,
+                    "monotonic",
+                    side_effect=iter([0.0, 1.0]),
+                ),
+            ):
+                self.assertEqual(0, watchdog.run_watchdog(args))
+
+            restart.assert_called_once_with("tunnel-client-grabowski.service")
+            recovered = next(
+                call
+                for call in emit.call_args_list
+                if call.args[0] == "grabowski.component_watchdog.recovered"
+            )
+            self.assertEqual("restarting", recovered.kwargs["recovery_phase"])
+            self.assertEqual(
+                3000, recovered.kwargs["recovery_episode_started_at_unix"]
+            )
+            self.assertEqual("idle", recovered.kwargs["post_recovery_phase"])
+            state = watchdog.load_state(Path(tmp) / "tunnel-watchdog-state.json")
+            self.assertEqual("idle", state.recovery_phase)
+            self.assertEqual(0, state.recovery_episode_started_at_unix)
+            self.assertFalse(state.recovery_episode_restart_attempted)
 
     def test_tunnel_restart_failure_does_not_loop_within_episode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
