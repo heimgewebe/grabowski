@@ -995,6 +995,43 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual("mismatch", prepared["status"])
         self.assertEqual("github_check_shape_invalid", prepared["reason"])
 
+    def test_prepare_github_accepts_manual_rerun_as_new_attempt(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=451,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_run_id=9001,
+                run_attempt=1,
+            ),
+            self._github_v2_workflow_check(
+                database_id=452,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=9001,
+                run_attempt=2,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith("checks=1/1-effective-success")
+        )
+
     def test_prepare_github_fails_closed_on_truncated_check_rollup(self) -> None:
         payload = self._github_v2_payload(
             head="1" * 40,

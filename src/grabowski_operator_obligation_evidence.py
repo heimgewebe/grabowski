@@ -429,6 +429,7 @@ def _github_v2_check(
             same_run_identity = (
                 "workflow-run-check",
                 str(workflow_run_id),
+                str(workflow_run_attempt),
                 name,
             )
         else:
