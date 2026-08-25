@@ -8,6 +8,7 @@ from typing import Any
 LEGACY_OBSERVED_ARTIFACT_SCHEMA_VERSION = 1
 OBSERVED_ARTIFACT_SCHEMA_VERSION = 2
 MAX_OBSERVED_ARTIFACT_BYTES = 32 * 1024
+MAX_COMPLETE_OBSERVED_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_OBSERVED_TOOLS = 1_000
 REQUIRED_SCHEMA_PROPERTIES = {
     "grabowski_bureau_candidate_assess": {
@@ -348,6 +349,94 @@ def mixed_artifact_from_runtime_tools(
     }
     parse_observed_artifact(artifact, label="runtime artifact")
     return artifact
+
+
+def compact_complete_observed_artifact(
+    value: Any,
+    *,
+    label: str = "complete observed artifact",
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ConnectorContractError(f"{label} must be an object")
+    if value.get("schema_version") != OBSERVED_ARTIFACT_SCHEMA_VERSION:
+        raise ConnectorContractError(
+            f"{label} must use schema_version {OBSERVED_ARTIFACT_SCHEMA_VERSION}"
+        )
+    expected_keys = {
+        "schema_version",
+        "tools",
+        "complete_schema_count",
+        "complete_schema_sha256",
+    }
+    if set(value) != expected_keys:
+        raise ConnectorContractError(
+            f"{label} fields do not match schema_version {OBSERVED_ARTIFACT_SCHEMA_VERSION}"
+        )
+    encoded = canonical_bytes(value)
+    if len(encoded) > MAX_COMPLETE_OBSERVED_ARTIFACT_BYTES:
+        raise ConnectorContractError(f"{label} exceeds the 2-MiB size limit")
+    tools = value.get("tools")
+    if not isinstance(tools, list) or not tools or len(tools) > MAX_OBSERVED_TOOLS:
+        raise ConnectorContractError(
+            f"{label} must contain 1..{MAX_OBSERVED_TOOLS} tools"
+        )
+    schemas: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(tools):
+        if not isinstance(item, dict) or set(item) != {"name", "inputSchema"}:
+            raise ConnectorContractError(
+                f"{label} tools[{index}] must contain exactly name and inputSchema"
+            )
+        name = item.get("name")
+        schema = item.get("inputSchema")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name.encode("utf-8")) > 512
+        ):
+            raise ConnectorContractError(
+                f"{label} tools[{index}] has an invalid name"
+            )
+        if not isinstance(schema, dict):
+            raise ConnectorContractError(
+                f"{label} schema for {name!r} must be an object"
+            )
+        if name in schemas:
+            raise ConnectorContractError(f"duplicate {label} tool: {name}")
+        schemas[name] = schema
+
+    declared_count = value.get("complete_schema_count")
+    if (
+        isinstance(declared_count, bool)
+        or not isinstance(declared_count, int)
+        or declared_count != len(schemas)
+    ):
+        raise ConnectorContractError(
+            f"{label} complete_schema_count must equal the observed schema count"
+        )
+    declared_sha256 = _require_sha256(
+        value.get("complete_schema_sha256"),
+        label=f"{label} complete_schema_sha256",
+    )
+    observed_sha256 = complete_schema_fingerprint(schemas)
+    if declared_sha256 != observed_sha256:
+        raise ConnectorContractError(
+            f"{label} complete_schema_sha256 does not match the supplied schemas"
+        )
+
+    entries: list[Any] = []
+    for name, schema in sorted(schemas.items()):
+        if name in REQUIRED_SCHEMA_SENTINELS:
+            entries.append({"name": name, "inputSchema": schema})
+        else:
+            entries.append(name)
+    compact = {
+        "schema_version": OBSERVED_ARTIFACT_SCHEMA_VERSION,
+        "tools": entries,
+        "complete_schema_count": len(schemas),
+        "complete_schema_sha256": observed_sha256,
+    }
+    parse_observed_artifact(compact, label=f"{label} compact form")
+    return compact
 
 
 def _require_sha256(value: Any, *, label: str) -> str:

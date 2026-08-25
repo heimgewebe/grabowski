@@ -31,6 +31,7 @@ OBSERVATION_STATUSES = frozenset({"verified", "stale", "mismatch", "unsupported"
 MIN_ROLLOUT_SAMPLE = 30
 MAX_SAMPLE = 30
 TRUSTED_OBSERVATION_ADAPTER_SOURCES = (
+    "bureau",
     "github",
     "git",
     "receipt",
@@ -57,6 +58,11 @@ RUNTIME_REFERENCE_RE = re.compile(
     r"^grabowski-runtime-manifest:repo_head=(?P<repo_head>[0-9a-f]{40});"
     r"release_id=(?P<release_id>[A-Za-z0-9_.-]{16,240});"
     r"runtime_input_sha256=(?P<runtime_input_sha256>[0-9a-f]{64})$"
+)
+BUREAU_CANDIDATE_REFERENCE_RE = re.compile(
+    r"^bureau-candidate:(?P<candidate_id>candidate-[0-9a-f]{24})"
+    r":event=(?P<event_id>[1-9][0-9]{0,18})"
+    r":idempotency=(?P<idempotency_key>[A-Za-z0-9._:@/+-]{1,512})$"
 )
 TEST_TASK_REFERENCE_RE = re.compile(
     r"^grabowski-task:(?P<task_id>[0-9a-f]{24}):"
@@ -417,11 +423,65 @@ def _receipt_observation(
         evidence, status="verified", sha256=hashlib.sha256(data).hexdigest()
     )
 
-def _deployment_manifest_path() -> Path:
+def _bureau_observation(
+    evidence: Mapping[str, Any], *, deadline_monotonic: float | None = None
+) -> dict[str, Any] | None:
+    reference = _text(evidence.get("reference"), "reference")
+    match = BUREAU_CANDIDATE_REFERENCE_RE.fullmatch(reference)
+    if match is None:
+        return None
+    remaining = ADAPTER_COMMAND_TIMEOUT_SECONDS
+    if deadline_monotonic is not None:
+        remaining = min(remaining, max(0.0, deadline_monotonic - time.monotonic()))
+    if remaining < 1:
+        return _trusted_observation(evidence, status="stale")
+    try:
+        import grabowski_bureau_intake as bureau_intake
+
+        payload = bureau_intake._invoke_bureau(
+            [
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+                "--idempotency-key",
+                match.group("idempotency_key"),
+            ],
+            timeout_seconds=max(1, int(remaining)),
+        )
+    except (ImportError, OSError, RuntimeError, ValueError):
+        return _trusted_observation(evidence, status="stale")
+    if not isinstance(payload, Mapping):
+        return _trusted_observation(evidence, status="mismatch")
+    if payload.get("kind") == "grabowski_bureau_intake_adapter_failure":
+        return _trusted_observation(evidence, status="stale")
+    fingerprint = payload.get("content_fingerprint")
+    matches = (
+        payload.get("status") == "assessed"
+        and payload.get("candidate_id") == match.group("candidate_id")
+        and payload.get("event_id") == int(match.group("event_id"))
+        and _is_sha256(fingerprint)
+    )
+    if not matches:
+        return _trusted_observation(evidence, status="mismatch")
+    return _trusted_observation(
+        evidence, status="verified", sha256=str(fingerprint)
+    )
+
+
+def _deployment_manifest_path(release_id: str) -> Path:
     configured = os.environ.get("GRABOWSKI_EVIDENCE_DEPLOYMENT_MANIFEST")
     if configured:
         return Path(configured).expanduser()
-    return Path.home() / ".local/share/grabowski-mcp/deployment-manifest.json"
+    root_value = os.environ.get("GRABOWSKI_EVIDENCE_RELEASES_ROOT")
+    root = (
+        Path(root_value).expanduser()
+        if root_value
+        else Path.home() / ".local/share/grabowski-mcp-releases"
+    ).resolve(strict=False)
+    path = (root / release_id / "deployment-manifest.json").resolve(strict=False)
+    if root not in path.parents:
+        raise EvidenceAssessmentError("runtime release manifest escapes the release root")
+    return path
 
 
 def _runtime_observation(
@@ -434,7 +494,8 @@ def _runtime_observation(
         return None
     try:
         data = _read_regular_bytes(
-            _deployment_manifest_path(), maximum=MAX_ADAPTER_FILE_BYTES
+            _deployment_manifest_path(match.group("release_id")),
+            maximum=MAX_ADAPTER_FILE_BYTES,
         )
         payload = json.loads(data)
     except (EvidenceAssessmentError, UnicodeDecodeError, json.JSONDecodeError):
@@ -611,6 +672,7 @@ def _test_observation(
     )
 
 _SOURCE_ADAPTERS = {
+    "bureau": _bureau_observation,
     "github": _github_observation,
     "git": _git_observation,
     "receipt": _receipt_observation,

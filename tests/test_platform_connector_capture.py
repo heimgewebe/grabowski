@@ -112,6 +112,20 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             self.runtime_tool_objects()
         )
 
+    def complete_artifact(
+        self, tools: list[dict[str, object]] | None = None
+    ) -> dict[str, object]:
+        tools = self.runtime_tool_objects() if tools is None else tools
+        schemas = {item["name"]: item["inputSchema"] for item in tools}
+        return {
+            "schema_version": connector_contract.OBSERVED_ARTIFACT_SCHEMA_VERSION,
+            "tools": tools,
+            "complete_schema_count": len(tools),
+            "complete_schema_sha256": connector_contract.complete_schema_fingerprint(
+                schemas
+            ),
+        }
+
     def runtime_root(self, names: list[str]) -> Path:
         root = self.root / "runtime"
         root.mkdir(exist_ok=True)
@@ -534,7 +548,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
 
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector:before-reboot",
             observation_scope="connector_catalog",
@@ -615,6 +629,94 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
             snapshot._read_publication_current()["state"], "outcome_unknown"
         )
 
+    def test_capture_cli_accepts_complete_artifact_file_above_argv_limit(self) -> None:
+        runtime_artifact = self.artifact()
+        names = connector_contract.parse_observed_artifact(runtime_artifact)[0]
+        prepared = self.prepare_request(runtime_artifact)
+        complete = self.complete_artifact()
+        alpha = next(item for item in complete["tools"] if item["name"] == "alpha")
+        alpha["inputSchema"]["description"] = "x" * 140_000
+        complete["complete_schema_sha256"] = connector_contract.complete_schema_fingerprint(
+            {item["name"]: item["inputSchema"] for item in complete["tools"]}
+        )
+        artifact_path = self.root / "complete-platform-artifact.json"
+        artifact_path.write_text(json.dumps(complete), encoding="utf-8")
+        self.assertGreater(artifact_path.stat().st_size, 131_072)
+        self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        result = snapshot.main(
+            [
+                "capture-platform",
+                "--runtime-root",
+                str(self.runtime_root(names)),
+                "--source-reference",
+                "chatgpt:connector:file-transport",
+                "--observation-scope",
+                "connector_catalog",
+                "--observation-id",
+                "connector-file-transport",
+                "--publication-request-id",
+                prepared["request_id"],
+                "--requested-contract-sha256",
+                prepared["contract"]["tool_contract_sha256"],
+                "--observed-tools-file",
+                str(artifact_path),
+            ]
+        )
+
+        self.assertEqual(result, 0)
+        persisted = json.loads(self.platform_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            persisted["observed_tools"]["complete_schema_sha256"],
+            complete["complete_schema_sha256"],
+        )
+
+    def test_request_bound_capture_rejects_compact_schema_hash_claim(self) -> None:
+        artifact = self.artifact()
+        names = connector_contract.parse_observed_artifact(artifact)[0]
+        prepared = self.prepare_request(artifact)
+        self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "must contain exactly name and inputSchema",
+        ):
+            snapshot.capture_platform_connector_snapshot(
+                observed_tools=artifact,
+                runtime_root=self.runtime_root(names),
+                source_reference="chatgpt:connector:compact-claim",
+                observation_scope="connector_catalog",
+                observation_id="connector-compact-claim",
+                publication_request_id=prepared["request_id"],
+                requested_contract_sha256=prepared["contract"]["tool_contract_sha256"],
+                observed_at_unix=1_100,
+            )
+        self.assertFalse(self.platform_path.exists())
+
+    def test_request_bound_capture_rejects_hash_not_derived_from_platform_schemas(self) -> None:
+        artifact = self.artifact()
+        names = connector_contract.parse_observed_artifact(artifact)[0]
+        prepared = self.prepare_request(artifact)
+        complete = self.complete_artifact()
+        complete["complete_schema_sha256"] = "0" * 64
+        self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "does not match the supplied schemas",
+        ):
+            snapshot.capture_platform_connector_snapshot(
+                observed_tools=complete,
+                runtime_root=self.runtime_root(names),
+                source_reference="chatgpt:connector:forged-hash",
+                observation_scope="connector_catalog",
+                observation_id="connector-forged-hash",
+                publication_request_id=prepared["request_id"],
+                requested_contract_sha256=prepared["contract"]["tool_contract_sha256"],
+                observed_at_unix=1_100,
+            )
+        self.assertFalse(self.platform_path.exists())
+
     def test_root_capture_does_not_mutate_user_publication_state(self) -> None:
         artifact = self.artifact()
         names = connector_contract.parse_observed_artifact(artifact)[0]
@@ -626,7 +728,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         result = snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector-catalog:session",
             observation_scope="chat_session_catalog",
@@ -647,7 +749,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:session:old-chat",
             observation_scope="chat_session_catalog",
@@ -675,7 +777,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector:stale",
             observation_scope="connector_catalog",
@@ -710,7 +812,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         )
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector:refreshed",
             observation_scope="connector_catalog",
@@ -741,7 +843,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector:wrong-request",
             observation_scope="connector_catalog",
@@ -839,7 +941,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         )
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector:receipt-crash",
             observation_scope="connector_catalog",
@@ -954,12 +1056,9 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         platform_tools = json.loads(json.dumps(self.runtime_tool_objects()))
         alpha = next(item for item in platform_tools if item["name"] == "alpha")
         alpha["inputSchema"]["properties"]["value"]["minLength"] = 1
-        platform_artifact = connector_contract.mixed_artifact_from_runtime_tools(
-            platform_tools
-        )
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=platform_artifact,
+            observed_tools=self.complete_artifact(platform_tools),
             runtime_root=self.runtime_root(runtime_names),
             source_reference="chatgpt:connector:schema-drift",
             observation_scope="connector_catalog",
@@ -1021,7 +1120,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector:converged",
             observation_scope="new_chat_catalog",
@@ -1072,7 +1171,7 @@ class PlatformConnectorCaptureTests(unittest.TestCase):
         snapshot.activate_platform_publication_request(request_id=request_id, now_unix=1_005)
         self.platform_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot.capture_platform_connector_snapshot(
-            observed_tools=artifact,
+            observed_tools=self.complete_artifact(),
             runtime_root=self.runtime_root(names),
             source_reference="chatgpt:connector:receipt-test",
             observation_scope="connector_catalog",
