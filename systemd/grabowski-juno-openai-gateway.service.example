@@ -37,7 +37,9 @@ RestrictSUIDSGID=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-CapabilityBoundingSet=
+# User services already start without root capabilities. Setting an empty
+# CapabilityBoundingSet here requires a capability operation the user manager
+# cannot perform and fails before ExecStart with status=218/CAPABILITIES.
 LimitCORE=0
 SystemCallArchitectures=native
 
