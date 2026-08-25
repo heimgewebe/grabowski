@@ -175,6 +175,60 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     workers * records_per_worker,
                 )
 
+    def test_deferred_predecessor_verification_matches_full_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "deferred-chain-test",
+                            "index": index,
+                            "payload": "d" * 120,
+                        }
+                    )
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    head, predecessor = grabowski_mcp._read_audit_head_unlocked(audit)
+                self.assertIsNotNone(predecessor)
+                assert predecessor is not None
+
+                deferred, deferred_compatibility = grabowski_mcp._read_audit_chain_unlocked(
+                    audit,
+                    use_segment_cache=True,
+                    retain_verified_segment_data=False,
+                    start_path=predecessor["path"],
+                    initial_expected=predecessor,
+                )
+                self.assertTrue(deferred)
+
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    full, full_compatibility = grabowski_mcp._read_audit_chain_unlocked(audit)
+
+                combined = [head, *deferred]
+                self.assertEqual(
+                    [item[0] for item in combined],
+                    [item[0] for item in full],
+                )
+                self.assertEqual(
+                    [item[2]["segment_sha256"] for item in combined],
+                    [item[2]["segment_sha256"] for item in full],
+                )
+                self.assertEqual(deferred_compatibility, full_compatibility)
+
+                wrong_binding = dict(predecessor)
+                wrong_binding["sha256"] = (
+                    "0" * 64 if predecessor.get("sha256") != "0" * 64 else "1" * 64
+                )
+                with self.assertRaisesRegex(ValueError, "audit-segment-sha256-mismatch"):
+                    grabowski_mcp._read_audit_chain_unlocked(
+                        audit,
+                        start_path=predecessor["path"],
+                        initial_expected=wrong_binding,
+                    )
+
     def test_metadata_only_chain_read_retains_verified_segment_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"

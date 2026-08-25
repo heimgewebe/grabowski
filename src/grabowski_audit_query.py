@@ -349,22 +349,31 @@ def capture_verified_audit_snapshot(path: Path | None = None) -> VerifiedAuditSn
     """Capture a verified immutable audit view while minimizing shared-lock hold time.
 
     The active segment bytes are retained because they may change after the lock is
-    released. Historical segments are represented by verified hashes and are loaded
-    lazily outside the coordination lock. A cold verification cache may still require
-    one full historical verification pass; subsequent captures can reuse the existing
-    immutable-segment verification cache without losing historical record access.
+    released. Only that mutable head is verified while the shared coordination lock is
+    held. Its predecessor binding is then used to verify immutable historical segments
+    outside the lock, preserving the same hash/manifest fail-closed chain contract
+    without making a cold historical verification block audit writers.
     """
     active_path = path if path is not None else base.AUDIT_LOG
     with base._audit_coordination_lock(active_path, exclusive=False):
-        components, compatibility = base._read_audit_chain_unlocked(
+        active_component, predecessor = base._read_audit_head_unlocked(active_path)
+
+    components = [active_component]
+    compatibility = False
+    if predecessor is not None:
+        archived_components, compatibility = base._read_audit_chain_unlocked(
             active_path,
             use_segment_cache=True,
             retain_verified_segment_data=False,
+            start_path=predecessor["path"],
+            initial_expected=predecessor,
         )
-        captured_components = [
-            (segment_path, data, dict(status), index == 0)
-            for index, (segment_path, data, status) in enumerate(components)
-        ]
+        components.extend(archived_components)
+
+    captured_components = [
+        (segment_path, data, dict(status), index == 0)
+        for index, (segment_path, data, status) in enumerate(components)
+    ]
 
     ordered = list(reversed(captured_components))
     segments: list[AuditSegmentSnapshot] = []

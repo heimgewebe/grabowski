@@ -3755,16 +3755,38 @@ def _validate_segment_manifest(
     raise ValueError("audit-segment-manifest-kind-invalid")
 
 
+def _read_audit_head_unlocked(
+    path: Path,
+) -> tuple[tuple[Path, bytes, dict[str, Any]], dict[str, Any] | None]:
+    """Verify the mutable audit head and return its predecessor binding.
+
+    Callers that need a stable snapshot can hold the coordination lock only for
+    this active segment, then verify immutable predecessors after releasing it.
+    """
+    data, status = _read_audit_file(path)
+    if not status["valid"]:
+        raise ValueError(str(status["error"]))
+    observed_sha = hashlib.sha256(data).hexdigest()
+    component_status = dict(status)
+    component_status["segment_sha256"] = observed_sha
+    predecessor = _audit_predecessor_binding(path, _first_audit_record(data))
+    return (path, data, component_status), predecessor
+
+
 def _read_audit_chain_unlocked(
     path: Path,
     *,
     use_segment_cache: bool = True,
     retain_verified_segment_data: bool = True,
+    start_path: Path | None = None,
+    initial_expected: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
+    if (start_path is None) != (initial_expected is None):
+        raise ValueError("audit-chain-deferred-start-binding-incomplete")
     components: list[tuple[Path, bytes, dict[str, Any]]] = []
     seen: set[Path] = set()
-    current = path
-    expected: dict[str, Any] | None = None
+    current = start_path if start_path is not None else path
+    expected = dict(initial_expected) if initial_expected is not None else None
     compatibility_evidence = False
     for _ in range(MAX_AUDIT_SEGMENTS + 1):
         resolved = current.resolve(strict=False)
