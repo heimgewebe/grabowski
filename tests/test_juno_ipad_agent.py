@@ -58,6 +58,19 @@ class StateRootSelectionTests(unittest.TestCase):
             self.assertTrue(persistent)
             self.assertEqual(failures, ["script_sibling:PermissionError:1"])
 
+    def test_probe_rejects_writable_root_without_hard_link_support(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate"
+            with patch.object(
+                agent.os,
+                "link",
+                side_effect=OSError(95, "operation not supported"),
+            ):
+                with self.assertRaises(OSError) as raised:
+                    agent.probe_writable_directory(candidate)
+            self.assertEqual(raised.exception.errno, 95)
+            self.assertEqual(list(candidate.iterdir()), [])
+
     def test_explicit_state_root_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             explicit = Path(directory) / "explicit"

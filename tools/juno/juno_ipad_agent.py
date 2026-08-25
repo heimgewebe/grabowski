@@ -163,14 +163,14 @@ def read_json(path: Path) -> Any:
 def probe_writable_directory(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     probe = path / f".grabowski-write-probe-{os.getpid()}-{threading.get_ident()}"
-    fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(fd, "wb", closefd=False) as handle:
-            handle.write(b"ok")
-            handle.flush()
-            os.fsync(handle.fileno())
+        # Job completion relies on create-once hard-link publication. Probe the
+        # exact primitive here so writable-but-incompatible document-provider
+        # roots are rejected before they can strand jobs in "running".
+        atomic_publish_create_bytes(probe, b"ok")
+        if probe.read_bytes() != b"ok":
+            raise OSError("state-root publication probe readback mismatch")
     finally:
-        os.close(fd)
         with contextlib.suppress(FileNotFoundError):
             probe.unlink()
     return path.resolve()
