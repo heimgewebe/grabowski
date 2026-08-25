@@ -7675,6 +7675,7 @@ class MidCutoverResumeRuntime:
                 "agent_instructions_sha256"
             ],
             green_readiness=self.green_readiness,
+            snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
         )
         if (
             readback.get("state") != midcutover.SNAPSHOT_BINDING_DONE
@@ -7787,6 +7788,7 @@ class MidCutoverResumeRuntime:
                 self.resume_binding["agent_instructions_sha256"]
             ),
             green_readiness=readiness,
+            snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
         )
 
     def promote_canonical(self) -> dict[str, Any]:
@@ -8087,6 +8089,7 @@ def classify_midcutover_resume(
         runtime_path=target_runtime,
         pointer_releases_root=core.releases_root_for(target_runtime),
         green_unit_observer=observe_green_operator_unit,
+        snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
     )
 
 

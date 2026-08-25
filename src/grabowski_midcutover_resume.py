@@ -55,7 +55,6 @@ import stat
 import subprocess
 from typing import Any, Iterable, Sequence
 
-import grabowski_client_snapshot as client_snapshot
 
 
 SCHEMA_VERSION = 1
@@ -119,10 +118,20 @@ def observe_client_snapshot_binding(
     registered_names_sha256: str,
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
+    snapshot_inspector: Any,
     path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
 ) -> dict[str, Any]:
-    """Project canonical snapshot inspection into the recovery vocabulary."""
-    observed = client_snapshot.inspect_cutover_snapshot_binding(
+    """Project canonical snapshot inspection into the recovery vocabulary.
+
+    The snapshot authority is injected by the recovery composition root.  This
+    module owns recovery classification, not the client-snapshot parser, and
+    therefore must not import the latter back into the recovery layer.
+    """
+    if not callable(snapshot_inspector):
+        raise MidCutoverEvidenceError(
+            "canonical client snapshot inspector is unavailable"
+        )
+    observed = snapshot_inspector(
         cutover_id=cutover_id,
         cutover_generation=cutover_generation,
         source_release_id=blue_release_id,
@@ -137,15 +146,21 @@ def observe_client_snapshot_binding(
         green_readiness=green_readiness,
         path=path,
     )
+    if not isinstance(observed, dict):
+        raise MidCutoverEvidenceError(
+            "canonical client snapshot inspector returned invalid evidence"
+        )
     state = observed.get("state")
+    if state not in {
+        SNAPSHOT_BINDING_PENDING,
+        SNAPSHOT_BINDING_DONE,
+        SNAPSHOT_BINDING_FOREIGN,
+        SNAPSHOT_BINDING_UNREADABLE,
+    }:
+        state = SNAPSHOT_BINDING_UNREADABLE
     return {
         **observed,
-        "state": {
-            client_snapshot.SNAPSHOT_BINDING_PREDECESSOR: SNAPSHOT_BINDING_PENDING,
-            client_snapshot.SNAPSHOT_BINDING_REBOUND: SNAPSHOT_BINDING_DONE,
-            client_snapshot.SNAPSHOT_BINDING_FOREIGN: SNAPSHOT_BINDING_FOREIGN,
-            client_snapshot.SNAPSHOT_BINDING_UNREADABLE: SNAPSHOT_BINDING_UNREADABLE,
-        }.get(state, SNAPSHOT_BINDING_UNREADABLE),
+        "state": state,
         "transition_sha256": observed.get("publication_transition_sha256"),
     }
 
@@ -764,6 +779,7 @@ def collect_classification_inputs(
     pointer_releases_root: Path | None = None,
     client_snapshot_path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
     green_unit_observer: Any = None,
+    snapshot_inspector: Any = None,
 ) -> dict[str, Any]:
     """Gather every durable input the lane verdict is derived from."""
     if pointer_releases_root is None:
@@ -826,6 +842,7 @@ def collect_classification_inputs(
                     cutover.get("agent_instructions_sha256") or ""
                 ),
                 green_readiness=readiness,
+                snapshot_inspector=snapshot_inspector,
                 path=client_snapshot_path,
             )
         except (MidCutoverEvidenceError, KeyError, TypeError, ValueError) as exc:
@@ -864,6 +881,7 @@ def classify_from_durable_state(
     pointer_releases_root: Path | None = None,
     client_snapshot_path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
     green_unit_observer: Any = None,
+    snapshot_inspector: Any = None,
 ) -> dict[str, Any]:
     inputs = collect_classification_inputs(
         selector_path=selector_path,
@@ -873,6 +891,7 @@ def classify_from_durable_state(
         pointer_releases_root=pointer_releases_root,
         client_snapshot_path=client_snapshot_path,
         green_unit_observer=green_unit_observer,
+        snapshot_inspector=snapshot_inspector,
     )
     return classify_recovery_lane(expected_head=expected_head, **inputs)
 
