@@ -72,7 +72,9 @@ query($owner:String!,$name:String!,$number:Int!){
       state
       isDraft
       baseRefOid
+      baseRefName
       headRefOid
+      headRefName
       mergeCommit{oid}
       commits(last:1){
         nodes{
@@ -544,6 +546,147 @@ def _github_v2_check_success(check: Mapping[str, Any]) -> bool:
     return False
 
 
+def _github_actions_run_pr_binding(
+    repo: str,
+    run_id: int,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any] | None:
+    returncode, stdout, _stderr = _run_command(
+        ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
+        deadline_monotonic=deadline_monotonic,
+    )
+    if returncode != 0:
+        raise EvidenceAssessmentError("github Actions run source unavailable")
+    try:
+        payload = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or _positive_int(payload.get("id")) != run_id:
+        return None
+    repository = payload.get("repository")
+    event = payload.get("event")
+    head_sha = payload.get("head_sha")
+    head_branch = payload.get("head_branch")
+    pulls = payload.get("pull_requests")
+    if (
+        not isinstance(repository, Mapping)
+        or repository.get("full_name") != repo
+        or not isinstance(event, str)
+        or not event
+        or not isinstance(head_sha, str)
+        or SHA40_RE.fullmatch(head_sha) is None
+        or not isinstance(head_branch, str)
+        or not head_branch
+        or not isinstance(pulls, list)
+    ):
+        return None
+    normalized_pulls: list[dict[str, Any]] = []
+    for item in pulls:
+        if not isinstance(item, Mapping):
+            return None
+        number = _positive_int(item.get("number"))
+        head = item.get("head")
+        base = item.get("base")
+        if number is None or not isinstance(head, Mapping) or not isinstance(base, Mapping):
+            return None
+        head_ref = head.get("ref")
+        bound_head_sha = head.get("sha")
+        base_ref = base.get("ref")
+        bound_base_sha = base.get("sha")
+        if (
+            not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(bound_head_sha, str)
+            or SHA40_RE.fullmatch(bound_head_sha) is None
+            or not isinstance(base_ref, str)
+            or not base_ref
+            or not isinstance(bound_base_sha, str)
+            or SHA40_RE.fullmatch(bound_base_sha) is None
+        ):
+            return None
+        normalized_pulls.append(
+            {
+                "number": number,
+                "head_ref": head_ref,
+                "head_sha": bound_head_sha,
+                "base_ref": base_ref,
+                "base_sha": bound_base_sha,
+            }
+        )
+    normalized_pulls.sort(
+        key=lambda item: (
+            item["number"],
+            item["head_ref"],
+            item["head_sha"],
+            item["base_ref"],
+            item["base_sha"],
+        )
+    )
+    return {
+        "run_id": run_id,
+        "event": event,
+        "head_sha": head_sha,
+        "head_branch": head_branch,
+        "pull_requests": normalized_pulls,
+    }
+
+
+def _github_v2_rerun_pr_bindings_valid(
+    repo: str,
+    pr: int,
+    *,
+    head_ref: str,
+    head_sha: str,
+    base_ref: str,
+    base_sha: str,
+    checks: list[Any],
+    deadline_monotonic: float | None = None,
+) -> bool:
+    groups: dict[tuple[str, ...], dict[int, str]] = {}
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return False
+        normalized = _github_v2_check(check)
+        if normalized is None:
+            return False
+        logical_identity, _observed_at, _same_run_identity, material = normalized
+        run_id = material.get("workflow_run_database_id")
+        event = material.get("workflow_event")
+        if (
+            run_id is not None
+            and isinstance(run_id, int)
+            and isinstance(event, str)
+            and event.startswith("pull_request")
+        ):
+            groups.setdefault(logical_identity, {})[run_id] = event
+    expected_pull = {
+        "number": pr,
+        "head_ref": head_ref,
+        "head_sha": head_sha,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+    }
+    cache: dict[int, dict[str, Any] | None] = {}
+    for runs in groups.values():
+        if len(runs) <= 1:
+            continue
+        for run_id, event in runs.items():
+            if run_id not in cache:
+                cache[run_id] = _github_actions_run_pr_binding(
+                    repo, run_id, deadline_monotonic=deadline_monotonic
+                )
+            binding = cache[run_id]
+            if (
+                binding is None
+                or binding.get("event") != event
+                or binding.get("head_sha") not in {head_sha, base_sha}
+                or binding.get("pull_requests") != [expected_pull]
+            ):
+                return False
+    return True
+
+
 def _github_v2_snapshot(
     repo: str,
     pr: int,
@@ -605,10 +748,34 @@ def _github_v2_snapshot(
     ):
         return None
     head = pull_request.get("headRefOid")
+    head_ref = pull_request.get("headRefName")
+    base = pull_request.get("baseRefOid")
+    base_ref = pull_request.get("baseRefName")
     commit_oid = commit.get("oid")
     merge = pull_request.get("mergeCommit")
     merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
-    if commit_oid != head:
+    if (
+        commit_oid != head
+        or not isinstance(head, str)
+        or SHA40_RE.fullmatch(head) is None
+        or not isinstance(head_ref, str)
+        or not head_ref
+        or not isinstance(base, str)
+        or SHA40_RE.fullmatch(base) is None
+        or not isinstance(base_ref, str)
+        or not base_ref
+    ):
+        return None
+    if not _github_v2_rerun_pr_bindings_valid(
+        repo,
+        pr,
+        head_ref=head_ref,
+        head_sha=head,
+        base_ref=base_ref,
+        base_sha=base,
+        checks=check_nodes,
+        deadline_monotonic=deadline_monotonic,
+    ):
         return None
     effective_checks = _effective_github_v2_checks(check_nodes)
     if effective_checks is None:
@@ -616,7 +783,7 @@ def _github_v2_snapshot(
     return {
         "state": pull_request.get("state"),
         "isDraft": pull_request.get("isDraft"),
-        "baseRefOid": pull_request.get("baseRefOid"),
+        "baseRefOid": base,
         "headRefOid": head,
         "merge_oid": merge_oid,
         "effective_checks": effective_checks,

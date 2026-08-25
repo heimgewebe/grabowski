@@ -166,6 +166,8 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         merge: str,
         checks: list[dict[str, object]],
         has_next_page: bool = False,
+        head_ref: str = "feature/test",
+        base_ref: str = "main",
     ) -> dict[str, object]:
         return {
             "data": {
@@ -174,7 +176,9 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                         "state": "MERGED",
                         "isDraft": False,
                         "baseRefOid": base,
+                        "baseRefName": base_ref,
                         "headRefOid": head,
+                        "headRefName": head_ref,
                         "mergeCommit": {"oid": merge},
                         "commits": {
                             "nodes": [
@@ -198,6 +202,67 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 }
             }
         }
+
+    @staticmethod
+    def _github_v2_command_side_effect(
+        payload: dict[str, object],
+        *,
+        pr: int,
+        run_pr_overrides: dict[int, int] | None = None,
+    ):
+        repository = payload["data"]["repository"]
+        pull_request = repository["pullRequest"]
+        head = pull_request["headRefOid"]
+        head_ref = pull_request["headRefName"]
+        base = pull_request["baseRefOid"]
+        base_ref = pull_request["baseRefName"]
+        checks = pull_request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]
+        workflow_events: dict[int, str] = {}
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            suite = check.get("checkSuite")
+            workflow_run = suite.get("workflowRun") if isinstance(suite, dict) else None
+            if not isinstance(workflow_run, dict):
+                continue
+            run_id = workflow_run.get("databaseId")
+            event = workflow_run.get("event")
+            if isinstance(run_id, int) and not isinstance(run_id, bool) and isinstance(event, str):
+                workflow_events[run_id] = event
+        encoded_graphql = json.dumps(payload).encode("utf-8")
+        overrides = run_pr_overrides or {}
+
+        def run(argv, **_kwargs):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return 0, encoded_graphql, b""
+            if len(argv) >= 3 and argv[:2] == ["gh", "api"] and "/actions/runs/" in argv[2]:
+                endpoint = argv[2]
+                run_id = int(endpoint.rsplit("/", 1)[-1])
+                event = workflow_events.get(run_id)
+                if event is None:
+                    return 1, b"", b"unknown workflow run"
+                parts = endpoint.split("/")
+                repo_slug = "/".join(parts[1:3])
+                bound_pr = overrides.get(run_id, pr)
+                bound_head_ref = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
+                run_payload = {
+                    "id": run_id,
+                    "event": event,
+                    "head_sha": head,
+                    "head_branch": bound_head_ref,
+                    "repository": {"full_name": repo_slug},
+                    "pull_requests": [
+                        {
+                            "number": bound_pr,
+                            "head": {"ref": bound_head_ref, "sha": head},
+                            "base": {"ref": base_ref, "sha": base},
+                        }
+                    ],
+                }
+                return 0, json.dumps(run_payload).encode("utf-8"), b""
+            return 1, b"", b"unexpected command"
+
+        return run
 
     def test_fake_hash_is_not_verified(self) -> None:
         result = evidence.assess_status(self._status())
@@ -817,7 +882,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         with patch.object(
             evidence,
             "_run_command",
-            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
         ) as run_command:
             prepared = evidence.prepare_evidence(
                 "merge", "github", {"repo": repo, "pr": 943}
@@ -831,10 +896,16 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             f"github-pr-v2:{repo}#943@{head}:base={base}:merge={merge}:checks=2/2-effective-success",
             item["reference"],
         )
-        self.assertEqual(2, run_command.call_count)
-        for call in run_command.call_args_list:
-            self.assertEqual("api", call.args[0][1])
-            self.assertEqual("graphql", call.args[0][2])
+        graphql_calls = [
+            call for call in run_command.call_args_list
+            if call.args[0][:3] == ["gh", "api", "graphql"]
+        ]
+        actions_calls = [
+            call for call in run_command.call_args_list
+            if len(call.args[0]) >= 3 and "/actions/runs/" in call.args[0][2]
+        ]
+        self.assertEqual(2, len(graphql_calls))
+        self.assertEqual(4, len(actions_calls))
         assert observed is not None
         self.assertEqual("verified", observed["status"])
         self.assertEqual(item["sha256"], observed["sha256"])
@@ -889,7 +960,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         with patch.object(
             evidence,
             "_run_command",
-            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+            side_effect=self._github_v2_command_side_effect(payload, pr=948),
         ):
             prepared = evidence.prepare_evidence(
                 "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 948}
@@ -970,6 +1041,46 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
 
         self.assertEqual("mismatch", prepared["status"])
         self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+
+    def test_prepare_github_fails_closed_when_rerun_originates_from_other_pr(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=271,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_run_id=8201,
+                event="pull_request",
+                run_number=101,
+            ),
+            self._github_v2_workflow_check(
+                database_id=272,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=8202,
+                event="pull_request",
+                run_number=102,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload, pr=949, run_pr_overrides={8202: 950}
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
 
     def test_prepare_github_keeps_external_same_name_checks_distinct(self) -> None:
         checks = [
@@ -1095,7 +1206,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         with patch.object(
             evidence,
             "_run_command",
-            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
         ):
             prepared = evidence.prepare_evidence(
                 "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
