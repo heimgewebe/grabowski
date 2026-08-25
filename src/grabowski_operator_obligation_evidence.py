@@ -65,6 +65,60 @@ GITHUB_PR_V2_REFERENCE_RE = re.compile(
     r":merge=(?P<merge>[0-9a-f]{40})"
     r":checks=(?P<passed>[0-9]{1,3})/(?P<total>[0-9]{1,3})-effective-success$"
 )
+GITHUB_V2_QUERY = r"""
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      state
+      isDraft
+      baseRefOid
+      headRefOid
+      mergeCommit{oid}
+      commits(last:1){
+        nodes{
+          commit{
+            oid
+            statusCheckRollup{
+              contexts(first:100){
+                totalCount
+                pageInfo{hasNextPage}
+                nodes{
+                  __typename
+                  ... on CheckRun{
+                    databaseId
+                    name
+                    startedAt
+                    status
+                    conclusion
+                    checkSuite{
+                      databaseId
+                      app{id slug}
+                      workflowRun{
+                        databaseId
+                        event
+                        runNumber
+                        runAttempt
+                        workflow{databaseId name}
+                      }
+                    }
+                  }
+                  ... on StatusContext{
+                    id
+                    context
+                    createdAt
+                    state
+                    creator{login}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 GIT_COMMIT_REFERENCE_RE = re.compile(
     r"^git-commit:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
     r"@(?P<commit>[0-9a-f]{40})$"
@@ -257,9 +311,24 @@ def _github_reference(reference: str) -> dict[str, Any] | None:
     return parsed
 
 def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
-    material = {
-        "schema_version": 1,
-        "kind": "grabowski.operator_obligation_evidence.github_pr_v1",
+    if parsed.get("version", 1) != 2:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski.operator_obligation_evidence.github_pr_v1",
+            "repo": parsed["repo"],
+            "pr": parsed["pr"],
+            "head": parsed["head"],
+            "base": parsed["base"],
+            "merge": parsed["merge"],
+            "checks_passed": parsed["passed"],
+            "checks_total": parsed["total"],
+        }
+    effective_checks = parsed.get("effective_checks")
+    if not isinstance(effective_checks, list) or not effective_checks:
+        raise EvidenceAssessmentError("github v2 observation material lacks effective checks")
+    return {
+        "schema_version": 2,
+        "kind": "grabowski.operator_obligation_evidence.github_pr_v2",
         "repo": parsed["repo"],
         "pr": parsed["pr"],
         "head": parsed["head"],
@@ -267,63 +336,272 @@ def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
         "merge": parsed["merge"],
         "checks_passed": parsed["passed"],
         "checks_total": parsed["total"],
+        "check_semantics": "stable_workflow_identity_latest_run_v1",
+        "effective_checks": effective_checks,
     }
-    if parsed.get("version", 1) == 2:
-        material.update(
-            {
-                "schema_version": 2,
-                "kind": "grabowski.operator_obligation_evidence.github_pr_v2",
-                "check_semantics": "latest_per_logical_identity_v1",
-            }
-        )
-    return material
 
 
-def _github_check_identity(
-    check: Mapping[str, Any],
-) -> tuple[tuple[str, ...], datetime] | None:
-    typename = check.get("__typename")
-    started_at = check.get("startedAt")
-    if not isinstance(started_at, str) or not started_at.endswith("Z"):
+def _github_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.endswith("Z"):
         return None
     try:
-        started = datetime.fromisoformat(started_at.removesuffix("Z") + "+00:00")
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
     except ValueError:
         return None
-    if started.tzinfo != timezone.utc:
+    if parsed.tzinfo != timezone.utc:
         return None
+    return parsed
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _github_v2_check(
+    check: Mapping[str, Any],
+) -> tuple[tuple[str, ...], datetime, tuple[str, ...] | None, dict[str, Any]] | None:
+    typename = check.get("__typename")
     if typename == "CheckRun":
+        database_id = _positive_int(check.get("databaseId"))
         name = check.get("name")
-        workflow_name = check.get("workflowName")
-        if not isinstance(name, str) or not name or not isinstance(workflow_name, str):
+        started_at = check.get("startedAt")
+        started = _github_utc(started_at)
+        status = check.get("status")
+        conclusion = check.get("conclusion")
+        suite = check.get("checkSuite")
+        if (
+            database_id is None
+            or not isinstance(name, str)
+            or not name
+            or started is None
+            or not isinstance(status, str)
+            or not status
+            or not isinstance(conclusion, str)
+            or not conclusion
+            or not isinstance(suite, Mapping)
+        ):
             return None
-        return ("CheckRun", workflow_name, name), started
+        suite_id = _positive_int(suite.get("databaseId"))
+        app = suite.get("app")
+        if suite_id is None or not isinstance(app, Mapping):
+            return None
+        app_id = app.get("id")
+        app_slug = app.get("slug")
+        if (
+            not isinstance(app_id, str)
+            or not app_id
+            or not isinstance(app_slug, str)
+            or not app_slug
+        ):
+            return None
+        workflow_run = suite.get("workflowRun")
+        workflow_run_id: int | None = None
+        workflow_event: str | None = None
+        workflow_run_number: int | None = None
+        workflow_run_attempt: int | None = None
+        workflow_id: int | None = None
+        workflow_name: str | None = None
+        same_run_identity: tuple[str, ...] | None = None
+        if workflow_run is not None:
+            if not isinstance(workflow_run, Mapping):
+                return None
+            workflow_run_id = _positive_int(workflow_run.get("databaseId"))
+            workflow_event = workflow_run.get("event")
+            workflow_run_number = _positive_int(workflow_run.get("runNumber"))
+            workflow_run_attempt = _positive_int(workflow_run.get("runAttempt"))
+            workflow = workflow_run.get("workflow")
+            if (
+                workflow_run_id is None
+                or not isinstance(workflow_event, str)
+                or not workflow_event
+                or workflow_run_number is None
+                or workflow_run_attempt is None
+                or not isinstance(workflow, Mapping)
+            ):
+                return None
+            workflow_id = _positive_int(workflow.get("databaseId"))
+            workflow_name = workflow.get("name")
+            if workflow_id is None or not isinstance(workflow_name, str) or not workflow_name:
+                return None
+            logical_identity = ("workflow-check", str(workflow_id), name)
+            same_run_identity = (
+                "workflow-run-check",
+                str(workflow_run_id),
+                name,
+            )
+        else:
+            # Non-workflow checks have no stable logical rerun identity available
+            # here. Keep each immutable CheckRun distinct rather than guessing.
+            logical_identity = ("check-run", str(database_id))
+        material = {
+            "type": "CheckRun",
+            "logical_identity": list(logical_identity),
+            "database_id": database_id,
+            "name": name,
+            "started_at": started_at,
+            "status": status,
+            "conclusion": conclusion,
+            "check_suite_database_id": suite_id,
+            "app_id": app_id,
+            "app_slug": app_slug,
+            "workflow_run_database_id": workflow_run_id,
+            "workflow_event": workflow_event,
+            "workflow_run_number": workflow_run_number,
+            "workflow_run_attempt": workflow_run_attempt,
+            "workflow_database_id": workflow_id,
+            "workflow_name": workflow_name,
+        }
+        return logical_identity, started, same_run_identity, material
     if typename == "StatusContext":
+        node_id = check.get("id")
         context = check.get("context")
-        if not isinstance(context, str) or not context:
+        created_at = check.get("createdAt")
+        created = _github_utc(created_at)
+        state = check.get("state")
+        creator = check.get("creator")
+        login = creator.get("login") if isinstance(creator, Mapping) else None
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or not isinstance(context, str)
+            or not context
+            or created is None
+            or not isinstance(state, str)
+            or not state
+            or not isinstance(login, str)
+            or not login
+        ):
             return None
-        return ("StatusContext", context), started
+        logical_identity = ("status-context", node_id)
+        material = {
+            "type": "StatusContext",
+            "logical_identity": list(logical_identity),
+            "id": node_id,
+            "context": context,
+            "created_at": created_at,
+            "state": state,
+            "creator_login": login,
+        }
+        return logical_identity, created, None, material
     return None
 
 
-def _effective_github_checks(
+def _effective_github_v2_checks(
     checks: list[Any],
-) -> list[Mapping[str, Any]] | None:
-    effective: dict[tuple[str, ...], tuple[datetime, Mapping[str, Any]]] = {}
+) -> list[dict[str, Any]] | None:
+    effective: dict[tuple[str, ...], tuple[datetime, dict[str, Any]]] = {}
+    same_run_seen: dict[tuple[str, ...], int] = {}
     for check in checks:
         if not isinstance(check, Mapping):
             return None
-        identity = _github_check_identity(check)
-        if identity is None:
+        normalized = _github_v2_check(check)
+        if normalized is None:
             return None
-        key, started = identity
-        previous = effective.get(key)
-        if previous is None or started > previous[0]:
-            effective[key] = (started, check)
+        logical_identity, observed_at, same_run_identity, material = normalized
+        if same_run_identity is not None:
+            database_id = material["database_id"]
+            previous_id = same_run_seen.get(same_run_identity)
+            if previous_id is not None and previous_id != database_id:
+                # Two distinct jobs with the same display name in one workflow run
+                # are ambiguous; never treat one as a rerun of the other.
+                return None
+            same_run_seen[same_run_identity] = database_id
+        previous = effective.get(logical_identity)
+        if previous is None or observed_at > previous[0]:
+            effective[logical_identity] = (observed_at, material)
             continue
-        if started == previous[0] and dict(check) != dict(previous[1]):
+        if observed_at == previous[0] and material != previous[1]:
             return None
     return [effective[key][1] for key in sorted(effective)]
+
+
+def _github_v2_check_success(check: Mapping[str, Any]) -> bool:
+    if check.get("type") == "CheckRun":
+        return check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
+    if check.get("type") == "StatusContext":
+        return check.get("state") == "SUCCESS"
+    return False
+
+
+def _github_v2_snapshot(
+    repo: str,
+    pr: int,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any] | None:
+    owner, name = repo.split("/", 1)
+    returncode, stdout, _stderr = _run_command(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={GITHUB_V2_QUERY}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={pr}",
+        ],
+        deadline_monotonic=deadline_monotonic,
+    )
+    if returncode != 0:
+        raise EvidenceAssessmentError("github GraphQL source unavailable")
+    try:
+        payload = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or payload.get("errors"):
+        return None
+    data = payload.get("data")
+    repository = data.get("repository") if isinstance(data, Mapping) else None
+    pull_request = (
+        repository.get("pullRequest") if isinstance(repository, Mapping) else None
+    )
+    if not isinstance(pull_request, Mapping):
+        return None
+    commits = pull_request.get("commits")
+    nodes = commits.get("nodes") if isinstance(commits, Mapping) else None
+    if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], Mapping):
+        return None
+    commit = nodes[0].get("commit")
+    if not isinstance(commit, Mapping):
+        return None
+    rollup = commit.get("statusCheckRollup")
+    contexts = rollup.get("contexts") if isinstance(rollup, Mapping) else None
+    check_nodes = contexts.get("nodes") if isinstance(contexts, Mapping) else None
+    page_info = contexts.get("pageInfo") if isinstance(contexts, Mapping) else None
+    total_count = contexts.get("totalCount") if isinstance(contexts, Mapping) else None
+    if (
+        not isinstance(check_nodes, list)
+        or not 1 <= len(check_nodes) <= 100
+        or not isinstance(page_info, Mapping)
+        or page_info.get("hasNextPage") is not False
+        or isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count != len(check_nodes)
+    ):
+        return None
+    head = pull_request.get("headRefOid")
+    commit_oid = commit.get("oid")
+    merge = pull_request.get("mergeCommit")
+    merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
+    if commit_oid != head:
+        return None
+    effective_checks = _effective_github_v2_checks(check_nodes)
+    if effective_checks is None:
+        return None
+    return {
+        "state": pull_request.get("state"),
+        "isDraft": pull_request.get("isDraft"),
+        "baseRefOid": pull_request.get("baseRefOid"),
+        "headRefOid": head,
+        "merge_oid": merge_oid,
+        "effective_checks": effective_checks,
+    }
 
 
 def _github_check_success(check: Mapping[str, Any]) -> bool:
@@ -342,6 +620,38 @@ def _github_observation(
     parsed = _github_reference(reference)
     if parsed is None:
         return None
+    if parsed.get("version", 1) == 2:
+        try:
+            snapshot = _github_v2_snapshot(
+                str(parsed["repo"]),
+                int(parsed["pr"]),
+                deadline_monotonic=deadline_monotonic,
+            )
+        except EvidenceAssessmentError:
+            return _trusted_observation(evidence, status="stale")
+        if snapshot is None:
+            return _trusted_observation(evidence, status="mismatch")
+        effective_checks = snapshot["effective_checks"]
+        successful = sum(
+            int(_github_v2_check_success(check)) for check in effective_checks
+        )
+        identity_matches = (
+            snapshot.get("state") == "MERGED"
+            and snapshot.get("isDraft") is False
+            and snapshot.get("headRefOid") == parsed["head"]
+            and snapshot.get("baseRefOid") == parsed["base"]
+            and snapshot.get("merge_oid") == parsed["merge"]
+            and len(effective_checks) == parsed["total"]
+            and successful == parsed["passed"]
+        )
+        if not identity_matches:
+            return _trusted_observation(evidence, status="mismatch")
+        material = {**parsed, "effective_checks": effective_checks}
+        return _trusted_observation(
+            evidence,
+            status="verified",
+            sha256=_sha256(_github_observation_material(material)),
+        )
     try:
         returncode, stdout, _stderr = _run_command(
             [
@@ -371,14 +681,8 @@ def _github_observation(
     merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
     if not isinstance(checks, list):
         return _trusted_observation(evidence, status="mismatch")
-    if parsed.get("version", 1) == 2:
-        observed_checks = _effective_github_checks(checks)
-        if observed_checks is None:
-            return _trusted_observation(evidence, status="mismatch")
-    else:
-        observed_checks = checks
     successful = 0
-    for check in observed_checks:
+    for check in checks:
         if not isinstance(check, Mapping):
             return _trusted_observation(evidence, status="mismatch")
         successful += int(_github_check_success(check))
@@ -388,7 +692,7 @@ def _github_observation(
         and payload.get("headRefOid") == parsed["head"]
         and payload.get("baseRefOid") == parsed["base"]
         and merge_oid == parsed["merge"]
-        and len(observed_checks) == parsed["total"]
+        and len(checks) == parsed["total"]
         and successful == parsed["passed"]
     )
     if not identity_matches:
@@ -819,18 +1123,8 @@ def _prepare_github(
     if isinstance(pr, bool) or not isinstance(pr, int) or not 1 <= pr <= 9_999_999_999:
         raise EvidenceAssessmentError("pr must be a positive integer")
     try:
-        returncode, stdout, _stderr = _run_command(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                repo,
-                "--json",
-                "state,isDraft,baseRefOid,headRefOid,mergeCommit,statusCheckRollup",
-            ],
-            deadline_monotonic=deadline_monotonic,
+        snapshot = _github_v2_snapshot(
+            repo, pr, deadline_monotonic=deadline_monotonic
         )
     except EvidenceAssessmentError:
         return _preparation_result(
@@ -839,40 +1133,28 @@ def _prepare_github(
             status="stale",
             reason="authoritative_source_unavailable",
         )
-    if returncode != 0:
-        return _preparation_result(
-            acceptance_id=acceptance_id,
-            source="github",
-            status="stale",
-            reason="authoritative_source_unavailable",
-        )
-    try:
-        payload = json.loads(stdout)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        payload = None
-    if not isinstance(payload, Mapping):
+    if snapshot is None:
         return _preparation_result(
             acceptance_id=acceptance_id,
             source="github",
             status="mismatch",
-            reason="authoritative_source_malformed",
+            reason="github_check_shape_invalid",
         )
-    merge = payload.get("mergeCommit")
-    merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
-    head = payload.get("headRefOid")
-    base = payload.get("baseRefOid")
-    checks = payload.get("statusCheckRollup")
+    head = snapshot.get("headRefOid")
+    base = snapshot.get("baseRefOid")
+    merge_oid = snapshot.get("merge_oid")
+    effective_checks = snapshot.get("effective_checks")
     if (
-        payload.get("state") != "MERGED"
-        or payload.get("isDraft") is not False
+        snapshot.get("state") != "MERGED"
+        or snapshot.get("isDraft") is not False
         or not isinstance(head, str)
         or SHA40_RE.fullmatch(head) is None
         or not isinstance(base, str)
         or SHA40_RE.fullmatch(base) is None
         or not isinstance(merge_oid, str)
         or SHA40_RE.fullmatch(merge_oid) is None
-        or not isinstance(checks, list)
-        or not 1 <= len(checks) <= 100
+        or not isinstance(effective_checks, list)
+        or not effective_checks
     ):
         return _preparation_result(
             acceptance_id=acceptance_id,
@@ -880,15 +1162,9 @@ def _prepare_github(
             status="mismatch",
             reason="github_pr_not_terminal_success",
         )
-    effective_checks = _effective_github_checks(checks)
-    if effective_checks is None:
-        return _preparation_result(
-            acceptance_id=acceptance_id,
-            source="github",
-            status="mismatch",
-            reason="github_check_shape_invalid",
-        )
-    successful = sum(int(_github_check_success(check)) for check in effective_checks)
+    successful = sum(
+        int(_github_v2_check_success(check)) for check in effective_checks
+    )
     if successful != len(effective_checks):
         return _preparation_result(
             acceptance_id=acceptance_id,
@@ -905,6 +1181,7 @@ def _prepare_github(
         "passed": successful,
         "total": len(effective_checks),
         "version": 2,
+        "effective_checks": effective_checks,
     }
     reference = (
         f"github-pr-v2:{repo}#{pr}@{head}:base={base}:merge={merge_oid}:"
