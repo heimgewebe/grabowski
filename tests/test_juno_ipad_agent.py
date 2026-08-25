@@ -273,6 +273,40 @@ class AgentStateTests(unittest.TestCase):
                 "<unrepresentable BadRepr: RuntimeError>",
             )
 
+    def test_result_is_not_visible_until_complete_create_once_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = agent.AgentState(Path(directory), start_worker=False)
+            job_id = "job-result-publish-0001"
+            state.submit_job(
+                {
+                    "schema_version": 1,
+                    "job_id": job_id,
+                    "code": "GRABOWSKI_RESULT = {'value': 7}",
+                    "timeout_seconds": 5,
+                    "metadata": {},
+                }
+            )
+            result_path = state._job_dir(job_id) / "result.json"
+            real_link = agent.os.link
+            observed_states: list[str] = []
+
+            def inspect_before_publish(source, destination, *, follow_symlinks=True):
+                self.assertEqual(Path(destination), result_path)
+                self.assertFalse(result_path.exists())
+                observed_states.append(state.get_job(job_id)["state"])
+                return real_link(
+                    source,
+                    destination,
+                    follow_symlinks=follow_symlinks,
+                )
+
+            with patch.object(agent.os, "link", side_effect=inspect_before_publish):
+                result = state.run_job_now(job_id)
+
+            self.assertEqual(observed_states, ["running"])
+            self.assertEqual(result["state"], "succeeded")
+            self.assertEqual(state.get_job(job_id), result)
+
     def test_duplicate_job_id_is_create_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = agent.AgentState(Path(directory), start_worker=False)
