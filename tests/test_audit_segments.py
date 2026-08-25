@@ -1,15 +1,51 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import importlib.util
 import hashlib
 import json
 import multiprocessing
 import os
 from pathlib import Path
+import sys
+import types
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from test_operator_v2_runtime import grabowski_mcp
+
+
+def _load_audit_query():
+    fake_operator = types.ModuleType("grabowski_operator_core")
+
+    class FakeMCP:
+        def tool(self, *args, **kwargs):
+            return lambda function: function
+
+    fake_operator.mcp = FakeMCP()
+    fake_operator.READ_ONLY = {}
+    module_name = "grabowski_audit_query_segments_test"
+    spec = importlib.util.spec_from_file_location(
+        module_name, Path(__file__).resolve().parents[1] / "src" / "grabowski_audit_query.py"
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load grabowski_audit_query")
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(
+        sys.modules,
+        {
+            "grabowski_mcp": grabowski_mcp,
+            "grabowski_operator_core": fake_operator,
+            module_name: module,
+        },
+        clear=False,
+    ):
+        spec.loader.exec_module(module)
+    return module
+
+
+grabowski_audit_query = _load_audit_query()
 
 
 def _concurrent_segment_writer(start_event, worker: int, count: int) -> None:
@@ -173,6 +209,190 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertEqual(
                     len({(item["worker"], item["index"]) for item in observed}),
                     workers * records_per_worker,
+                )
+
+    def test_deferred_predecessor_verification_matches_full_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "deferred-chain-test",
+                            "index": index,
+                            "payload": "d" * 120,
+                        }
+                    )
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    head, predecessor = grabowski_mcp._read_audit_head_unlocked(audit)
+                self.assertIsNotNone(predecessor)
+                assert predecessor is not None
+
+                deferred, deferred_compatibility = grabowski_mcp._read_audit_chain_unlocked(
+                    audit,
+                    use_segment_cache=True,
+                    retain_verified_segment_data=False,
+                    initial_expected=predecessor,
+                )
+                self.assertTrue(deferred)
+
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    full, full_compatibility = grabowski_mcp._read_audit_chain_unlocked(audit)
+
+                combined = [head, *deferred]
+                self.assertEqual(
+                    [item[0] for item in combined],
+                    [item[0] for item in full],
+                )
+                self.assertEqual(
+                    [item[2]["segment_sha256"] for item in combined],
+                    [item[2]["segment_sha256"] for item in full],
+                )
+                self.assertEqual(deferred_compatibility, full_compatibility)
+
+                wrong_binding = dict(predecessor)
+                wrong_binding["sha256"] = (
+                    "0" * 64 if predecessor.get("sha256") != "0" * 64 else "1" * 64
+                )
+                with self.assertRaisesRegex(ValueError, "audit-segment-sha256-mismatch"):
+                    grabowski_mcp._read_audit_chain_unlocked(
+                        audit,
+                        initial_expected=wrong_binding,
+                    )
+
+    def test_deferred_chain_preserves_full_chain_segment_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(40):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "deferred-limit-test",
+                            "index": index,
+                            "payload": "l" * 160,
+                        }
+                    )
+                status = grabowski_mcp._verify_audit_log(audit)
+                self.assertGreaterEqual(status["archived_segment_count"], 2)
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    _head, predecessor = grabowski_mcp._read_audit_head_unlocked(audit)
+                self.assertIsNotNone(predecessor)
+                assert predecessor is not None
+                with patch.object(grabowski_mcp, "MAX_AUDIT_SEGMENTS", 1):
+                    with self.assertRaisesRegex(ValueError, "audit-segment-limit-exceeded"):
+                        grabowski_mcp._read_audit_chain_unlocked(audit)
+                    with self.assertRaisesRegex(ValueError, "audit-segment-limit-exceeded"):
+                        grabowski_mcp._read_audit_chain_unlocked(
+                            audit,
+                            initial_expected=predecessor,
+                        )
+
+    def test_capture_verified_snapshot_matches_real_full_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(30):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "snapshot-real-chain-test",
+                            "index": index,
+                            "payload": "r" * 120,
+                        }
+                    )
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                snapshot = grabowski_audit_query.capture_verified_audit_snapshot(audit)
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    full, compatibility = grabowski_mcp._read_audit_chain_unlocked(
+                        audit,
+                        use_segment_cache=False,
+                    )
+                chronological = list(reversed(full))
+                self.assertEqual(
+                    [segment.path for segment in snapshot.segments],
+                    [item[0] for item in chronological],
+                )
+                self.assertEqual(
+                    [segment.segment_sha256 for segment in snapshot.segments],
+                    [item[2]["segment_sha256"] for item in chronological],
+                )
+                self.assertEqual(
+                    snapshot.total_records,
+                    sum(item[2]["records"] for item in full),
+                )
+                self.assertEqual(snapshot.archived_segment_count, len(full) - 1)
+                self.assertEqual(snapshot.legacy_rotation_compatibility, compatibility)
+                self.assertTrue(snapshot.segments[-1].active)
+                self.assertIsNotNone(snapshot.segments[-1].captured_data)
+
+    def test_capture_snapshot_excludes_rotation_after_head_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {
+                            "operation": "snapshot-race-before",
+                            "index": index,
+                            "payload": "b" * 120,
+                        }
+                    )
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    before_components, before_compatibility = (
+                        grabowski_mcp._read_audit_chain_unlocked(
+                            audit,
+                            use_segment_cache=False,
+                        )
+                    )
+                before_paths = [item[0] for item in reversed(before_components)]
+                before_hashes = [
+                    item[2]["segment_sha256"]
+                    for item in reversed(before_components)
+                ]
+                before_total = sum(item[2]["records"] for item in before_components)
+                real_lock = grabowski_mcp._audit_coordination_lock
+                race_armed = True
+
+                @contextmanager
+                def lock_then_race(path, *, exclusive):
+                    nonlocal race_armed
+                    with real_lock(path, exclusive=exclusive):
+                        yield
+                    if race_armed and not exclusive:
+                        race_armed = False
+                        for index in range(30):
+                            grabowski_mcp._append_audit(
+                                {
+                                    "operation": "snapshot-race-after",
+                                    "index": index,
+                                    "payload": "a" * 180,
+                                }
+                            )
+
+                with patch.object(
+                    grabowski_mcp,
+                    "_audit_coordination_lock",
+                    lock_then_race,
+                ):
+                    snapshot = grabowski_audit_query.capture_verified_audit_snapshot(audit)
+
+                after = grabowski_mcp._verify_audit_log(audit)
+                self.assertFalse(race_armed)
+                self.assertGreater(after["total_records"], before_total)
+                self.assertEqual(snapshot.total_records, before_total)
+                self.assertEqual(snapshot.legacy_rotation_compatibility, before_compatibility)
+                self.assertEqual([segment.path for segment in snapshot.segments], before_paths)
+                self.assertEqual(
+                    [segment.segment_sha256 for segment in snapshot.segments],
+                    before_hashes,
                 )
 
     def test_metadata_only_chain_read_retains_verified_segment_identity(self) -> None:
@@ -344,6 +564,9 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                 self.assertTrue(status["valid"], status)
                 self.assertTrue(status["legacy_rotation_compatibility"])
                 self.assertEqual(status["archived_segment_count"], 1)
+                snapshot = grabowski_audit_query.capture_verified_audit_snapshot(audit)
+                self.assertTrue(snapshot.legacy_rotation_compatibility)
+                self.assertEqual(snapshot.archived_segment_count, 1)
 
 
 if __name__ == "__main__":
