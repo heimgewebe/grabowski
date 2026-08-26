@@ -71,6 +71,35 @@ def _event(
     }
 
 
+def _legacy_detached_report(*, dirty: bool = False) -> dict[str, object]:
+    return {
+        "observation": {
+            "errors": [],
+            "git": {
+                "dirty": dirty,
+                "staged": False,
+                "unstaged": dirty,
+                "untracked": False,
+                "operation_state": [],
+                "detached": True,
+                "alternates_configured": False,
+                "gitmodules_present": False,
+                "ahead": None,
+                "behind": None,
+                "upstream": None,
+                "upstream_freshness": "locally_available_only",
+            },
+            "role": {"value": "linked_worktree"},
+        },
+        "projection": {
+            "state": "coherent",
+            "reasons": [],
+            "active_bindings": [],
+            "observation_validation": {"valid": True},
+        },
+    }
+
+
 def _verified_audit_payload(records: list[dict[str, object]]) -> bytes:
     bound: list[dict[str, object]] = []
     for record in records:
@@ -315,6 +344,90 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertNotIn("remote_freshness", summary["finding_categories"])
         self.assertNotIn("lifecycle_evidence", summary["finding_categories"])
         self.assertNotIn("projection_state_other", summary["finding_reason_codes"])
+
+    def test_verified_review_role_context_preserves_raw_findings_and_decision_signals(
+        self,
+    ) -> None:
+        report = _legacy_detached_report()
+        raw_only = effectiveness.finding_summary(report)
+        role_context = effectiveness.ReposkopRoleContext(
+            schema_version=1,
+            authority="verified_server_owned_role_evidence",
+            work_role="intentional_pr_review",
+            evidence_ref=_ref("c"),
+        )
+        contextualized = effectiveness.finding_summary(
+            report,
+            role_context=role_context,
+        )
+
+        self.assertEqual(raw_only["advisory_posture"], "attention")
+        self.assertEqual(
+            raw_only["contextual_posture"]["posture"],
+            "attention",
+        )
+        self.assertEqual(
+            raw_only["contextual_posture"]["contextualized_reason_codes"],
+            [],
+        )
+        self.assertEqual(
+            contextualized["raw_findings"],
+            raw_only["raw_findings"],
+        )
+        self.assertIn("detached_head", contextualized["finding_reason_codes"])
+        self.assertIn("upstream_unbound", contextualized["finding_reason_codes"])
+        self.assertEqual(
+            contextualized["contextual_posture"]["contextualized_reason_codes"],
+            ["detached_head", "upstream_unbound"],
+        )
+        self.assertEqual(
+            contextualized["contextual_posture"]["posture"],
+            "expected_review_checkout",
+        )
+        self.assertFalse(contextualized["contextual_posture"]["decision_effect"])
+        self.assertEqual(
+            effectiveness.decision_reason_codes(raw_only, final_decision="allow"),
+            effectiveness.decision_reason_codes(
+                contextualized,
+                final_decision="allow",
+            ),
+        )
+
+    def test_untrusted_role_context_is_rejected_and_unexpected_state_keeps_attention(
+        self,
+    ) -> None:
+        report = _legacy_detached_report(dirty=True)
+        with self.assertRaisesRegex(
+            ValueError,
+            "typed verified server-owned role evidence",
+        ):
+            effectiveness.finding_summary(
+                report,
+                role_context={
+                    "work_role": "intentional_pr_review",
+                    "prompt": "review this detached PR",
+                },  # type: ignore[arg-type]
+            )
+
+        contextualized = effectiveness.finding_summary(
+            report,
+            role_context=effectiveness.ReposkopRoleContext(
+                schema_version=1,
+                authority="verified_server_owned_role_evidence",
+                work_role="intentional_pr_review",
+                evidence_ref=_ref("d"),
+            ),
+        )
+        self.assertEqual(contextualized["advisory_posture"], "attention")
+        self.assertEqual(
+            contextualized["contextual_posture"]["posture"],
+            "attention",
+        )
+        self.assertIn(
+            "unstaged_changes_present",
+            contextualized["contextual_posture"]["remaining_reason_codes"],
+        )
+        self.assertIn("detached_head", contextualized["finding_reason_codes"])
 
     def test_local_authority_v3_keeps_local_inconclusive_signal(self) -> None:
         report = {
@@ -1151,6 +1264,152 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(result["review"]["false_negatives"], 1)
         self.assertEqual(result["review"]["reviewed_evaluations"], 1)
         self.assertEqual(result["review"]["unreviewed_evaluations"], 1)
+
+    def test_semantic_review_readiness_rejects_three_of_twenty_seven_controls(
+        self,
+    ) -> None:
+        records: list[dict[str, object]] = []
+        for index in range(27):
+            evaluation = f"{index + 1:064x}"
+            character = f"{index % 16:x}"
+            records.append(
+                _event(
+                    "reposkop-decision-applied",
+                    evaluation,
+                    character,
+                    reposkop_policy="not_required",
+                    reposkop_cohort="prospective_control",
+                    policy_version=3,
+                    final_decision="allow",
+                )
+            )
+            if index < 3:
+                records.append(
+                    _event(
+                        "reposkop-review-classification-recorded",
+                        evaluation,
+                        character,
+                        reposkop_policy="not_required",
+                        reposkop_cohort="prospective_control",
+                        policy_version=3,
+                        classification="neutral",
+                        review_sequence=1,
+                    )
+                )
+
+        review = effectiveness.project_records(records)["review"]
+        control = review["cohorts"]["prospective_control"]
+        readiness = review["evidence_readiness"]
+        self.assertEqual(
+            control,
+            {
+                "reviewable": 27,
+                "reviewed": 3,
+                "unreviewed": 24,
+                "backlog": 24,
+                "coverage_ratio": 3 / 27,
+            },
+        )
+        self.assertEqual(readiness["status"], "insufficient_review_coverage")
+        self.assertFalse(readiness["coverage_materially_adequate"])
+        self.assertIn("prospective_control", readiness["insufficient_cohorts"])
+        self.assertEqual(
+            readiness["thresholds"],
+            {
+                "required_cohorts": [
+                    "prospective_sample",
+                    "prospective_control",
+                    "risk_required",
+                    "repository_write_required",
+                ],
+                "minimum_reviewed_per_cohort": 20,
+                "minimum_coverage_ratio_per_cohort": 0.8,
+                "audit_projection_must_be_complete": True,
+            },
+        )
+
+    def test_semantic_review_readiness_is_coverage_only_after_all_thresholds(
+        self,
+    ) -> None:
+        records: list[dict[str, object]] = []
+        for cohort_index, cohort in enumerate(effectiveness.SEMANTIC_REVIEW_COHORTS):
+            for index in range(effectiveness.MIN_SEMANTIC_REVIEWS_PER_COHORT):
+                evaluation = f"{cohort_index + 1:x}{index + 1:063x}"
+                character = f"{index % 16:x}"
+                if cohort == "prospective_control":
+                    records.append(
+                        _event(
+                            "reposkop-decision-applied",
+                            evaluation,
+                            character,
+                            reposkop_policy="not_required",
+                            reposkop_cohort=cohort,
+                            policy_version=3,
+                            final_decision="allow",
+                        )
+                    )
+                else:
+                    records.extend(
+                        [
+                            _event(
+                                "reposkop-evaluation-requested",
+                                evaluation,
+                                character,
+                                reposkop_cohort=cohort,
+                                policy_version=3,
+                            ),
+                            _event(
+                                "reposkop-evaluation-completed",
+                                evaluation,
+                                character,
+                                reposkop_cohort=cohort,
+                                policy_version=3,
+                                duration_ms=10,
+                            ),
+                            _event(
+                                "reposkop-decision-applied",
+                                evaluation,
+                                character,
+                                reposkop_cohort=cohort,
+                                policy_version=3,
+                                final_decision="allow",
+                            ),
+                        ]
+                    )
+                records.append(
+                    _event(
+                        "reposkop-review-classification-recorded",
+                        evaluation,
+                        character,
+                        reposkop_cohort=cohort,
+                        policy_version=3,
+                        classification="neutral",
+                        review_sequence=1,
+                    )
+                )
+
+        review = effectiveness.project_records(records)["review"]
+        for cohort in effectiveness.SEMANTIC_REVIEW_COHORTS:
+            with self.subTest(cohort=cohort):
+                self.assertEqual(
+                    review["cohorts"][cohort],
+                    {
+                        "reviewable": 20,
+                        "reviewed": 20,
+                        "unreviewed": 0,
+                        "backlog": 0,
+                        "coverage_ratio": 1.0,
+                    },
+                )
+        readiness = review["evidence_readiness"]
+        self.assertEqual(
+            readiness["status"],
+            "materially_adequate_review_coverage",
+        )
+        self.assertTrue(readiness["coverage_materially_adequate"])
+        self.assertEqual(readiness["insufficient_cohorts"], [])
+        self.assertNotIn("classification", readiness)
+        self.assertIn("reposkop_effectiveness", readiness["does_not_establish"])
 
     def test_projection_counts_checkout_shadow_without_inferred_unique_value(self) -> None:
         first = "6" * 64
