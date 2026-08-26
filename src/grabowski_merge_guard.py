@@ -1644,6 +1644,19 @@ def _github_json_call(
         "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
     }
     if info["returncode"] != 0:
+        stderr = info["stderr"].strip()
+        no_required_checks = (
+            label == "required_pr_checks"
+            and info["returncode"] == 1
+            and not info["stdout"].strip()
+            and stderr.startswith("no required checks reported on the '")
+            and stderr.endswith("' branch")
+        )
+        if no_required_checks:
+            value: Any = []
+            evidence["nonzero_empty_result"] = "no_required_checks_reported"
+            evidence["value_sha256"] = _sha256_json(value)
+            return value, evidence, []
         evidence["github_plan_limit"] = _github_rules_plan_limit_error(info["stderr"])
         return None, evidence, [f"{label}_query_failed"]
     try:
