@@ -252,6 +252,7 @@ GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS = frozenset(
         "cherry-pick",
         "commit",
         "merge",
+        "mv",
         "read-tree",
         "rebase",
         "reset",
@@ -4126,12 +4127,19 @@ def _git_branch_preimage(repo: Path, *, require_attached: bool = True) -> dict[s
     if require_attached and branch is None:
         raise PermissionError("Local branch mutation requires an attached Git branch")
 
-    head_probe = _git_probe_bytes(repo, ["rev-parse", "--verify", "HEAD"])
-    if head_probe.returncode != 0:
+    head_probe = _git_probe_bytes(repo, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    head: str | None
+    head_state: str
+    if head_probe.returncode == 0:
+        head = head_probe.stdout.decode("ascii", errors="strict").strip()
+        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None:
+            raise RuntimeError("Git HEAD observation is not an object id")
+        head_state = "present"
+    elif head_probe.returncode == 1 and branch is not None:
+        head = None
+        head_state = "unborn"
+    else:
         raise RuntimeError("Git HEAD observation failed")
-    head = head_probe.stdout.decode("ascii", errors="strict").strip()
-    if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None:
-        raise RuntimeError("Git HEAD observation is not an object id")
 
     index_probe = _git_probe_bytes(repo, ["ls-files", "--stage", "-z"])
     if index_probe.returncode != 0:
@@ -4153,6 +4161,7 @@ def _git_branch_preimage(repo: Path, *, require_attached: bool = True) -> dict[s
         "repository": str(repo),
         "branch": branch,
         "head": head,
+        "head_state": head_state,
         "index_sha256": index_sha256,
         "operation_refs": operation_refs,
     }
@@ -4160,6 +4169,153 @@ def _git_branch_preimage(repo: Path, *, require_attached: bool = True) -> dict[s
         **material,
         "preimage_sha256": hashlib.sha256(_canonical_json_bytes(material)).hexdigest(),
     }
+
+
+def _reject_cross_branch_mutation_target(
+    subcommand: str, command_arguments: list[str], bound_branch: str
+) -> None:
+    """Keep one branch-attempt lease scoped to the branch it actually protects."""
+    bound_ref = f"refs/heads/{bound_branch}"
+
+    if subcommand == "update-ref":
+        if "--stdin" in command_arguments:
+            raise PermissionError(
+                "git update-ref --stdin is blocked because its target refs are not argv-bound"
+            )
+        positionals: list[str] = []
+        skip_value = False
+        for item in command_arguments:
+            if skip_value:
+                skip_value = False
+                continue
+            if item == "-m":
+                skip_value = True
+                continue
+            if item.startswith("-"):
+                continue
+            positionals.append(item)
+        if not positionals or positionals[0] not in {"HEAD", bound_ref}:
+            raise PermissionError(
+                "git update-ref mutation must target HEAD or branch_attempt.branch"
+            )
+        return
+
+    if subcommand == "symbolic-ref":
+        positionals: list[str] = []
+        skip_value = False
+        for item in command_arguments:
+            if skip_value:
+                skip_value = False
+                continue
+            if item == "-m":
+                skip_value = True
+                continue
+            if item.startswith("-"):
+                continue
+            positionals.append(item)
+        if not positionals or positionals[0] != "HEAD":
+            raise PermissionError(
+                "git symbolic-ref mutation is limited to HEAD for a branch attempt"
+            )
+        if len(positionals) > 1 and positionals[1] != bound_ref:
+            raise PermissionError(
+                "git symbolic-ref may attach HEAD only to branch_attempt.branch"
+            )
+        return
+
+    if subcommand in {"checkout", "switch"}:
+        branch_options = {
+            "-b",
+            "-B",
+            "--orphan",
+            "-c",
+            "-C",
+            "--create",
+            "--force-create",
+        }
+        named_branch: str | None = None
+        positional_only = False
+        index = 0
+        while index < len(command_arguments):
+            item = command_arguments[index]
+            if item == "--":
+                positional_only = True
+                index += 1
+                continue
+            if not positional_only and item in branch_options:
+                if index + 1 >= len(command_arguments):
+                    raise ValueError(f"git {subcommand} {item} requires a branch")
+                named_branch = command_arguments[index + 1]
+                index += 2
+                continue
+            if not positional_only and item.startswith("-"):
+                index += 1
+                continue
+            if not positional_only and named_branch is None:
+                named_branch = item
+            index += 1
+        if named_branch is not None and named_branch not in {bound_branch, "HEAD"}:
+            raise PermissionError(
+                f"git {subcommand} may not switch to a branch outside branch_attempt.branch"
+            )
+        return
+
+    if subcommand != "branch":
+        return
+
+    takes_value = {
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--sort",
+        "--format",
+        "--set-upstream-to",
+        "-u",
+    }
+    positionals: list[str] = []
+    skip_value = False
+    positional_only = False
+    for item in command_arguments:
+        if skip_value:
+            skip_value = False
+            continue
+        if item == "--":
+            positional_only = True
+            continue
+        if not positional_only and item in takes_value:
+            skip_value = True
+            continue
+        if not positional_only and any(
+            item.startswith(prefix)
+            for prefix in (
+                "--contains=",
+                "--no-contains=",
+                "--merged=",
+                "--no-merged=",
+                "--points-at=",
+                "--sort=",
+                "--format=",
+                "--set-upstream-to=",
+            )
+        ):
+            continue
+        if not positional_only and item.startswith("-"):
+            continue
+        positionals.append(item)
+
+    rename_or_copy = any(
+        item in {"-m", "-M", "--move", "-c", "-C", "--copy"}
+        for item in command_arguments
+    )
+    targets = positionals if rename_or_copy else positionals[:1]
+    for target in targets:
+        if target != bound_branch:
+            raise PermissionError(
+                "git branch mutation may not target a branch outside branch_attempt.branch"
+            )
+
 
 
 def _normalize_git_branch_attempt(value: Any) -> dict[str, Any]:
@@ -4267,8 +4423,8 @@ def _branch_attempt_reconcile_result(
 @mcp.tool(name="grabowski_git_branch_preimage", annotations=READ_ONLY)
 def grabowski_git_branch_preimage(repo: str) -> dict[str, Any]:
     """Read one exact local branch/index preimage for a later CAS-bound mutation."""
-    path = Path(repo).expanduser().resolve(strict=True)
     _require_operator_capability("git_cli")
+    path = base._resolve_existing(repo, "read")
     if not path.is_dir():
         raise ValueError(f"Repository path is not a directory: {path}")
     return {
@@ -5026,6 +5182,9 @@ def grabowski_git(
                 "to owner, operation, attempt and an exact observed Git preimage."
             )
         normalized_attempt = _normalize_git_branch_attempt(branch_attempt)
+        _reject_cross_branch_mutation_target(
+            subcommand, _command_arguments, normalized_attempt["branch"]
+        )
         observed_before = _git_branch_preimage(path)
         if normalized_attempt["branch"] != observed_before["branch"]:
             return _branch_attempt_reconcile_result(

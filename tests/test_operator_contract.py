@@ -128,6 +128,9 @@ def _load_operator_module():
 
     fake_base._load_policy = load_policy
     fake_base._active_profile = active_profile
+    fake_base._resolve_existing = (
+        lambda raw_path, kind: Path(raw_path).expanduser().resolve(strict=True)
+    )
     # The capability catalog has exactly one definition, and the double must be
     # bound to it rather than restate it: a stand-in that drifts from the real
     # catalog would let a capability regression pass unnoticed here.
@@ -2511,6 +2514,81 @@ class OperatorContractTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
                     operator.grabowski_git(str(repo), ["commit", "-m", "unsafe"])
+
+    def test_grabowski_git_branch_preimage_enforces_read_policy(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(
+            operator.base,
+            "_resolve_existing",
+            side_effect=PermissionError("outside configured read roots"),
+        ) as resolve:
+            with self.assertRaisesRegex(PermissionError, "outside configured read roots"):
+                operator.grabowski_git_branch_preimage("/tmp/private-repo")
+        resolve.assert_called_once_with("/tmp/private-repo", "read")
+
+    def test_grabowski_git_mv_requires_branch_attempt(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_guard_git", return_value=None),
+            ):
+                with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
+                    operator.grabowski_git(str(repo), ["mv", "old", "new"])
+
+    def test_grabowski_git_branch_attempt_blocks_other_branch_targets(self) -> None:
+        operator = _load_operator_module()
+        attempt = {
+            "schema_version": 1,
+            "owner_id": "operator:same-owner",
+            "operation_id": "operation-a",
+            "attempt_id": "attempt-1",
+            "branch": "feature",
+            "expected_preimage_sha256": "a" * 64,
+        }
+        for arguments in (
+            ["update-ref", "refs/heads/other", "b" * 40],
+            ["update-ref", "--stdin"],
+            ["branch", "-f", "other", "HEAD"],
+            ["symbolic-ref", "HEAD", "refs/heads/other"],
+            ["checkout", "other"],
+            ["switch", "other"],
+            ["switch", "-c", "other"],
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(PermissionError, "branch|target refs"):
+                    operator._reject_cross_branch_mutation_target(
+                        arguments[0], arguments[1:], attempt["branch"]
+                    )
+
+    def test_grabowski_git_branch_attempt_allows_bound_target_with_foreign_startpoint(self) -> None:
+        operator = _load_operator_module()
+        operator._reject_cross_branch_mutation_target(
+            "branch", ["-f", "feature", "refs/heads/base"], "feature"
+        )
+        operator._reject_cross_branch_mutation_target(
+            "update-ref", ["refs/heads/feature", "b" * 40], "feature"
+        )
+        operator._reject_cross_branch_mutation_target(
+            "symbolic-ref", ["HEAD", "refs/heads/feature"], "feature"
+        )
+        operator._reject_cross_branch_mutation_target(
+            "checkout", ["HEAD", "--", "README.md"], "feature"
+        )
+
+    def test_git_branch_preimage_represents_unborn_head(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            preimage = operator._git_branch_preimage(repo)
+        self.assertEqual("feature", preimage["branch"])
+        self.assertIsNone(preimage["head"])
+        self.assertEqual("unborn", preimage["head_state"])
+        self.assertRegex(preimage["preimage_sha256"], r"^[0-9a-f]{64}$")
 
     def test_grabowski_git_same_owner_competing_attempt_blocks_before_second_effect(self) -> None:
         operator = _load_operator_module()
