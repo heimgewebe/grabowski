@@ -821,7 +821,20 @@ def _canonical_worktree_repo_path(
     repo: Path, *, expected_common_dir: Path
 ) -> Path:
     """Return Git's primary worktree path for one exact repository common-dir."""
-    _, observed_common_dir, records = _worktree_records(repo)
+    resolved_repo = _safe_path(repo, must_exist=True)
+    # For the standard primary-worktree layout, the common-dir itself already
+    # identifies the canonical worktree.  Bind that structural shortcut with an
+    # independent Git common-dir readback; never use the caller path as fallback.
+    if (
+        expected_common_dir.name == ".git"
+        and resolved_repo == expected_common_dir.parent
+    ):
+        if _git_common_dir(resolved_repo) != expected_common_dir:
+            raise RuntimeError(
+                "Primary repository path does not match the expected Git common-dir"
+            )
+        return resolved_repo
+    _, observed_common_dir, records = _worktree_records(resolved_repo)
     if observed_common_dir != expected_common_dir:
         raise RuntimeError(
             "Repository common-dir does not match the checkout lifecycle binding"
