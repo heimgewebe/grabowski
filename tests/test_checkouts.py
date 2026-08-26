@@ -1229,6 +1229,46 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertTrue(manifest["rollback"]["branch_preserved"])
         self.assertEqual(manifest["cleanup"]["tool"], "grabowski_checkout_cleanup")
 
+    def test_retain_called_from_linked_checkout_uses_canonical_repo_identity(self) -> None:
+        retained_until = int(time.time()) + 3600
+        result = checkouts.grabowski_checkout_retain(
+            str(self.checkout),
+            str(self.checkout),
+            "owner-a",
+            "retain via linked caller",
+            retained_until,
+            self.head,
+            "topic",
+        )
+        self.assertEqual(str(self.repo.resolve()), result["retention"]["repo_path"])
+        self.assertEqual(str(self.repo.resolve()), result["audit"]["repo"])
+
+    def test_archive_and_cleanup_called_from_linked_checkout_use_canonical_repo_identity(self) -> None:
+        retained_until = int(time.time()) + 3600
+        archived = checkouts.grabowski_checkout_archive(
+            str(self.checkout),
+            str(self.checkout),
+            "owner-a",
+            "archive via linked caller",
+            retained_until,
+            self.head,
+            "topic",
+        )
+        archive = archived["archive"]
+        self.assertEqual(str(self.repo.resolve()), archive["repo_path"])
+        self.assertEqual(str(self.repo.resolve()), archived["manifest"]["repo"])
+        self.assertEqual(str(self.repo.resolve()), archived["audit"]["repo"])
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.checkout),
+            str(self.checkout),
+            "owner-a",
+            dry_run=True,
+            archive_id=str(archive["archive_id"]),
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self.assertEqual(str(self.repo.resolve()), dry_run["plan"]["repo"])
+
     def test_inventory_marks_retained_clean_checkout(self) -> None:
         retained_until = int(time.time()) + 3600
         checkouts.grabowski_checkout_retain(
@@ -2042,6 +2082,15 @@ class CheckoutLifecycleTests(unittest.TestCase):
         git_file.symlink_to(target)
         with self.assertRaisesRegex(PermissionError, "Symlinked"):
             self._archive()
+
+    def test_worktree_for_path_called_from_linked_checkout_returns_canonical_repo_identity(self) -> None:
+        canonical_repo, common_dir, record = checkouts._worktree_for_path(
+            self.checkout, self.checkout
+        )
+        self.assertEqual(self.repo.resolve(), canonical_repo)
+        self.assertEqual(self._common_dir(), common_dir)
+        self.assertEqual(str(self.repo.resolve()), record["repo_path"])
+        self.assertTrue(record["is_linked"])
 
     def test_inventory_called_from_linked_checkout_uses_canonical_repo_identity(self) -> None:
         _top_level, _common_dir, records = checkouts._worktree_records(self.checkout)

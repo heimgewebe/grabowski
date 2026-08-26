@@ -2753,11 +2753,12 @@ def checkout_inventory(
 
 
 def _worktree_for_path(repo_path: Path, checkout_path: Path) -> tuple[Path, Path, dict[str, Any]]:
-    top_level, common_dir, records = _worktree_records(repo_path)
+    _top_level, common_dir, records = _worktree_records(repo_path)
     target = checkout_path.resolve(strict=True)
     for record in records:
         if Path(record["path"]).resolve(strict=False) == target:
-            return top_level, common_dir, record
+            canonical_repo = _safe_path(str(record["repo_path"]), must_exist=True)
+            return canonical_repo, common_dir, record
     raise ValueError(f"Path is not a linked Git worktree for this repository: {target}")
 
 
