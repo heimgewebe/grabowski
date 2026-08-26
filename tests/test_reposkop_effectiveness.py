@@ -413,7 +413,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
 
         self.assertEqual(
             contextualized["contextual_posture"]["posture"],
-            "attention",
+            "informational",
         )
         self.assertEqual(
             contextualized["contextual_posture"]["contextualized_reason_codes"],
@@ -424,6 +424,51 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             contextualized["contextual_posture"]["remaining_reason_codes"],
         )
         self.assertFalse(contextualized["contextual_posture"]["decision_effect"])
+
+    def test_invalid_role_context_fields_are_rejected(self) -> None:
+        report = _legacy_detached_report()
+        invalid_contexts = [
+            (
+                effectiveness.ReposkopRoleContext(
+                    schema_version=2,
+                    authority="verified_server_owned_role_evidence",
+                    work_role="intentional_pr_review",
+                    evidence_ref=_ref("1"),
+                ),
+                "schema_version must be 1",
+            ),
+            (
+                effectiveness.ReposkopRoleContext(
+                    schema_version=1,
+                    authority="caller_asserted",  # type: ignore[arg-type]
+                    work_role="intentional_pr_review",
+                    evidence_ref=_ref("2"),
+                ),
+                "authority is unsupported",
+            ),
+            (
+                effectiveness.ReposkopRoleContext(
+                    schema_version=1,
+                    authority="verified_server_owned_role_evidence",
+                    work_role="writer",  # type: ignore[arg-type]
+                    evidence_ref=_ref("3"),
+                ),
+                "work_role is unsupported",
+            ),
+            (
+                effectiveness.ReposkopRoleContext(
+                    schema_version=1,
+                    authority="verified_server_owned_role_evidence",
+                    work_role="intentional_pr_review",
+                    evidence_ref="sha256:" + "4" * 64,
+                ),
+                "evidence_ref must bind one audit record",
+            ),
+        ]
+        for role_context, message in invalid_contexts:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    effectiveness.finding_summary(report, role_context=role_context)
 
     def test_untrusted_role_context_is_rejected_and_unexpected_state_keeps_attention(
         self,
@@ -1357,6 +1402,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
                 "minimum_reviewed_per_cohort": 20,
                 "minimum_coverage_ratio_per_cohort": 0.8,
                 "audit_projection_must_be_complete": True,
+                "requested_window_must_not_be_truncated": True,
             },
         )
 
@@ -1442,6 +1488,21 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(readiness["insufficient_cohorts"], [])
         self.assertNotIn("classification", readiness)
         self.assertIn("reposkop_effectiveness", readiness["does_not_establish"])
+
+        catchup_readiness = effectiveness.project_records(
+            records,
+            source={"index_complete": False, "since_truncated": False},
+        )["review"]["evidence_readiness"]
+        self.assertEqual(catchup_readiness["status"], "incomplete_audit_catchup")
+        self.assertFalse(catchup_readiness["coverage_materially_adequate"])
+
+        truncated_readiness = effectiveness.project_records(
+            records,
+            source={"index_complete": True, "since_truncated": True},
+        )["review"]["evidence_readiness"]
+        self.assertEqual(truncated_readiness["status"], "incomplete_audit_window")
+        self.assertFalse(truncated_readiness["coverage_materially_adequate"])
+        self.assertTrue(truncated_readiness["source_window_truncated"])
 
     def test_projection_counts_checkout_shadow_without_inferred_unique_value(self) -> None:
         first = "6" * 64

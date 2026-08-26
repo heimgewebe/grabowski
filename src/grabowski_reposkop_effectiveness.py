@@ -420,9 +420,9 @@ def _contextual_posture(
         posture = "attention"
     elif remaining_reasons:
         # A verified review role may explain only the exact detached/unbound
-        # checkout signals. Any other signal stays visible as unresolved
-        # context instead of being relabelled as an expected review checkout.
-        posture = raw_posture
+        # checkout warnings. Remaining information stays visible without
+        # inheriting attention from the contextualized warning.
+        posture = "informational"
     elif contextualized:
         posture = "expected_review_checkout"
     else:
@@ -2344,6 +2344,8 @@ def project_records(
     relevant = REPOSKOP_EFFECTIVENESS_OPERATIONS
     source_material = source or {}
     evaluation_complete = source_material.get("index_complete") is not False
+    requested_window_truncated = source_material.get("since_truncated") is True
+    audit_projection_complete = evaluation_complete and not requested_window_truncated
     requested: dict[str, dict[str, Any]] = {}
     completed: dict[str, dict[str, Any]] = {}
     decisions: dict[str, dict[str, Any]] = {}
@@ -2539,17 +2541,20 @@ def project_records(
         if not all(cohort_readiness[cohort].values())
     ]
     semantic_review_coverage_adequate = (
-        evaluation_complete and not insufficient_review_cohorts
+        audit_projection_complete and not insufficient_review_cohorts
     )
     semantic_evidence_readiness = {
         "status": (
             "incomplete_audit_catchup"
             if not evaluation_complete
+            else "incomplete_audit_window"
+            if requested_window_truncated
             else "materially_adequate_review_coverage"
             if semantic_review_coverage_adequate
             else "insufficient_review_coverage"
         ),
         "coverage_materially_adequate": semantic_review_coverage_adequate,
+        "source_window_truncated": requested_window_truncated,
         "thresholds": {
             "required_cohorts": list(SEMANTIC_REVIEW_COHORTS),
             "minimum_reviewed_per_cohort": MIN_SEMANTIC_REVIEWS_PER_COHORT,
@@ -2557,6 +2562,7 @@ def project_records(
                 MIN_SEMANTIC_REVIEW_COVERAGE_RATIO
             ),
             "audit_projection_must_be_complete": True,
+            "requested_window_must_not_be_truncated": True,
         },
         "cohort_checks": cohort_readiness,
         "insufficient_cohorts": insufficient_review_cohorts,
