@@ -22,6 +22,9 @@ NoNewPrivileges=yes
 # The per-user manager needs a private user namespace before mount/device
 # sandboxing and capability reductions become available without host privilege.
 PrivateUsers=yes
+# Inside that private user namespace, drop the namespace-local capability set
+# completely; the process retains no capabilities on the host or in the sandbox.
+CapabilityBoundingSet=
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
@@ -40,9 +43,6 @@ RestrictSUIDSGID=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-# User services already start without root capabilities. Setting an empty
-# CapabilityBoundingSet here requires a capability operation the user manager
-# cannot perform and fails before ExecStart with status=218/CAPABILITIES.
 LimitCORE=0
 SystemCallArchitectures=native
 
