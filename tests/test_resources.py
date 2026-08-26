@@ -4446,6 +4446,62 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(current["metadata_json"], original["metadata_json"])
         self.assertEqual(current["metadata_sha256"], original["metadata_sha256"])
 
+    def test_branch_attempt_same_owner_cas_distinguishes_attempts_and_preserves_continuation(self) -> None:
+        (self.root / ".git").mkdir()
+        owner = "operator:same-owner"
+        branch = "feat/same-owner-cas"
+
+        first = resources.acquire_branch_mutation_attempt(
+            owner,
+            str(self.root),
+            branch,
+            operation_id="operation-a",
+            attempt_id="attempt-1",
+            ttl_seconds=120,
+        )
+        continued = resources.acquire_branch_mutation_attempt(
+            owner,
+            str(self.root),
+            branch,
+            operation_id="operation-a",
+            attempt_id="attempt-1",
+            ttl_seconds=120,
+        )
+        self.assertTrue(continued["preserved"])
+        self.assertEqual(
+            first["attempt_binding_sha256"], continued["attempt_binding_sha256"]
+        )
+        self.assertEqual(
+            first["lease"]["metadata_sha256"],
+            continued["lease"]["metadata_sha256"],
+        )
+
+        with self.assertRaises(resources.SameOwnerBranchAttemptConflict) as blocked:
+            resources.acquire_branch_mutation_attempt(
+                owner,
+                str(self.root),
+                branch,
+                operation_id="operation-b",
+                attempt_id="attempt-2",
+                ttl_seconds=120,
+            )
+        self.assertEqual(first["resource_key"], blocked.exception.resource_key)
+        self.assertNotEqual(
+            blocked.exception.existing_binding_sha256,
+            blocked.exception.requested_binding_sha256,
+        )
+
+        disjoint = resources.acquire_branch_mutation_attempt(
+            owner,
+            str(self.root),
+            "feat/disjoint",
+            operation_id="operation-b",
+            attempt_id="attempt-2",
+            ttl_seconds=120,
+        )
+        self.assertNotEqual(first["resource_key"], disjoint["resource_key"])
+        self.assertEqual(owner, disjoint["lease"]["owner_id"])
+
     def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:
         (self.root / ".git").mkdir()
         key = f"repo:{self.root}"

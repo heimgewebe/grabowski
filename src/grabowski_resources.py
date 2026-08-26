@@ -56,6 +56,9 @@ SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
 COMPONENT_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,255}\Z")
 OPERATION_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,255}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+BRANCH_MUTATION_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
+BRANCH_MUTATION_ATTEMPT_SCHEMA_VERSION = 1
+BRANCH_MUTATION_ATTEMPT_METADATA_KEY = "branch_mutation_attempt"
 TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -157,6 +160,26 @@ class ResourceConflict(RuntimeError):
         self.resource_key = resource_key
         self.owner_id = owner_id
         self.expires_at_unix = expires_at_unix
+
+
+class SameOwnerBranchAttemptConflict(RuntimeError):
+    """A live branch lease belongs to the owner but to a different attempt."""
+
+    def __init__(
+        self,
+        resource_key: str,
+        owner_id: str,
+        existing_binding_sha256: str,
+        requested_binding_sha256: str,
+    ) -> None:
+        super().__init__(
+            "Live same-owner branch lease belongs to a different operation/attempt; "
+            "read back and reconcile before retry"
+        )
+        self.resource_key = resource_key
+        self.owner_id = owner_id
+        self.existing_binding_sha256 = existing_binding_sha256
+        self.requested_binding_sha256 = requested_binding_sha256
 
 
 def _now() -> int:
@@ -1097,6 +1120,28 @@ def _lease_identity_metadata(
     if preserve_task_attempt:
         ignored.update({"attempt", "recovered_after_expiry"})
     return {key: value for key, value in metadata.items() if key not in ignored}
+
+
+def _branch_mutation_attempt_binding(
+    *, operation_id: str, attempt_id: str
+) -> dict[str, Any]:
+    for label, value in (("operation_id", operation_id), ("attempt_id", attempt_id)):
+        if (
+            not isinstance(value, str)
+            or BRANCH_MUTATION_ATTEMPT_ID_RE.fullmatch(value) is None
+        ):
+            raise ValueError(
+                f"{label} must match [A-Za-z0-9][A-Za-z0-9._:@/-]{{0,127}}"
+            )
+    material: dict[str, Any] = {
+        "schema_version": BRANCH_MUTATION_ATTEMPT_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+    }
+    material["binding_sha256"] = hashlib.sha256(
+        _canonical_json(material).encode("utf-8")
+    ).hexdigest()
+    return material
 
 
 def _expired_same_owner_reentry_snapshot(row: sqlite3.Row) -> dict[str, Any]:
@@ -5070,6 +5115,27 @@ def acquire_resources(
                         row["purpose"] != lease_purpose
                         or observed_identity_metadata != requested_identity_metadata
                     ):
+                        observed_attempt = observed_metadata.get(
+                            BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                        )
+                        requested_attempt = persisted_metadata.get(
+                            BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                        )
+                        if isinstance(observed_attempt, dict) and isinstance(
+                            requested_attempt, dict
+                        ):
+                            observed_binding = observed_attempt.get("binding_sha256")
+                            requested_binding = requested_attempt.get("binding_sha256")
+                            if (
+                                isinstance(observed_binding, str)
+                                and SHA256_RE.fullmatch(observed_binding) is not None
+                                and isinstance(requested_binding, str)
+                                and SHA256_RE.fullmatch(requested_binding) is not None
+                                and observed_binding != requested_binding
+                            ):
+                                raise SameOwnerBranchAttemptConflict(
+                                    key, owner, observed_binding, requested_binding
+                                )
                         raise RuntimeError(
                             "Live same-owner lease identity changed; release and "
                             f"reacquire: {key}"
@@ -5151,6 +5217,55 @@ def acquire_resources(
         "nonconflict_exception": nonconflict_exception,
         "merge_guard_nonconflicts": merge_guard_nonconflicts,
         "work_admission": admission_evidence,
+    }
+
+
+def acquire_branch_mutation_attempt(
+    owner_id: str,
+    repository: str,
+    branch: str,
+    *,
+    operation_id: str,
+    attempt_id: str,
+    ttl_seconds: int = 900,
+) -> dict[str, Any]:
+    """Serialize one logical owner's overlapping branch attempts without a repo lock.
+
+    The branch resource is the existing lease store's CAS point.  A continuation
+    may re-enter with the exact same operation/attempt binding.  A second attempt
+    by the same logical owner is intentionally *not* treated as harmless re-entry.
+    """
+    owner = _owner(owner_id)
+    repository_path = Path(repository).expanduser().resolve(strict=True)
+    if not repository_path.is_dir():
+        raise ValueError("repository must be a directory")
+    if not isinstance(branch, str) or not branch or len(branch.encode("utf-8")) > 512:
+        raise ValueError("branch must be non-empty bounded text")
+    branch_key = normalize_resource_key(f"repo:{repository_path}:branch:{branch}")
+    binding = _branch_mutation_attempt_binding(
+        operation_id=operation_id, attempt_id=attempt_id
+    )
+    result = acquire_resources(
+        owner,
+        [branch_key],
+        purpose="branch mutation attempt",
+        ttl_seconds=ttl_seconds,
+        metadata={BRANCH_MUTATION_ATTEMPT_METADATA_KEY: binding},
+    )
+    lease = result["leases"][0]
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_branch_mutation_attempt_lease",
+        "owner_id": owner,
+        "repository": str(repository_path),
+        "branch": branch,
+        "resource_key": branch_key,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "attempt_binding_sha256": binding["binding_sha256"],
+        "lease": lease,
+        "preserved": branch_key in result["preserved"],
+        "release_required_after_terminal_readback": True,
     }
 
 

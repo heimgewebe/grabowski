@@ -698,6 +698,7 @@ class OperatorContractTests(unittest.TestCase):
             "grabowski_job_logs",
             "grabowski_job_cancel",
             "grabowski_git",
+            "grabowski_git_branch_preimage",
             "grabowski_github",
             "grabowski_user_service",
             "grabowski_tmux_list",
@@ -2499,6 +2500,164 @@ class OperatorContractTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(PermissionError):
                     operator._guard_git(arguments, Path("/repo"))
+
+    def test_grabowski_git_local_mutation_requires_branch_attempt(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_guard_git", return_value=None),
+            ):
+                with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
+                    operator.grabowski_git(str(repo), ["commit", "-m", "unsafe"])
+
+    def test_grabowski_git_same_owner_competing_attempt_blocks_before_second_effect(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            resource_db = root / "resources.sqlite3"
+            operator.subprocess.run(["git", "init", "-q", "-b", "feature", str(repo)], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "config", "user.name", "Grabowski Test"], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"], check=True)
+            (repo / "README.md").write_text("baseline\n")
+            operator.subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baseline"], check=True)
+
+            preimage = operator._git_branch_preimage(repo)
+            first_attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:same-owner",
+                "operation_id": "operation-a",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+                "expected_preimage_sha256": preimage["preimage_sha256"],
+            }
+            second_attempt = {
+                **first_attempt,
+                "operation_id": "operation-b",
+                "attempt_id": "attempt-2",
+            }
+            entered_effect = threading.Event()
+            allow_effect = threading.Event()
+            original_run = operator._run
+            first_result: dict[str, object] = {}
+            first_error: list[BaseException] = []
+
+            def delayed_run(command, **kwargs):
+                if "commit" in command:
+                    entered_effect.set()
+                    if not allow_effect.wait(timeout=2):
+                        raise TimeoutError("test did not release first branch effect")
+                return original_run(command, **kwargs)
+
+            def execute_first() -> None:
+                try:
+                    first_result.update(
+                        operator.grabowski_git(
+                            str(repo),
+                            ["commit", "--allow-empty", "-m", "attempt one"],
+                            branch_attempt=first_attempt,
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced below
+                    first_error.append(exc)
+
+            with (
+                patch.object(resources, "RESOURCE_DB", resource_db),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+                patch.object(operator, "_run", side_effect=delayed_run),
+            ):
+                thread = threading.Thread(target=execute_first)
+                thread.start()
+                self.assertTrue(entered_effect.wait(timeout=2))
+                second_result = operator.grabowski_git(
+                    str(repo),
+                    ["commit", "--allow-empty", "-m", "attempt two"],
+                    branch_attempt=second_attempt,
+                )
+                allow_effect.set()
+                thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], first_error)
+            self.assertEqual(0, first_result["returncode"])
+            first_receipt = first_result["branch_mutation"]
+            self.assertEqual("completed", first_receipt["status"])
+            self.assertTrue(first_receipt["effect_attempted"])
+            self.assertEqual("operation-a", first_receipt["operation_id"])
+            self.assertEqual("attempt-1", first_receipt["attempt_id"])
+            self.assertEqual(preimage["preimage_sha256"], first_receipt["expected_preimage_sha256"])
+
+            second_receipt = second_result["branch_mutation"]
+            self.assertEqual("reconcile_required", second_receipt["status"])
+            self.assertEqual("same-owner-attempt-conflict", second_receipt["reason"])
+            self.assertFalse(second_receipt["effect_attempted"])
+            self.assertFalse(second_receipt["retry_allowed"])
+            self.assertEqual("operation-b", second_receipt["operation_id"])
+            self.assertEqual("attempt-2", second_receipt["attempt_id"])
+            self.assertEqual(
+                first_receipt["attempt_binding_sha256"],
+                second_receipt["existing_attempt_binding_sha256"],
+            )
+
+            commits = operator.subprocess.run(
+                ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+                stdout=operator.subprocess.PIPE,
+                check=True,
+                text=True,
+            )
+            self.assertEqual("2", commits.stdout.strip())
+
+    def test_grabowski_git_same_attempt_continuation_preserves_unchanged_preimage(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            resource_db = root / "resources.sqlite3"
+            operator.subprocess.run(["git", "init", "-q", "-b", "feature", str(repo)], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "config", "user.name", "Grabowski Test"], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"], check=True)
+            (repo / "README.md").write_text("baseline\n")
+            operator.subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            operator.subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "baseline"], check=True)
+            preimage = operator._git_branch_preimage(repo)
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:same-owner",
+                "operation_id": "operation-a",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+                "expected_preimage_sha256": preimage["preimage_sha256"],
+            }
+
+            with (
+                patch.object(resources, "RESOURCE_DB", resource_db),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="b" * 64),
+            ):
+                first = operator.grabowski_git(
+                    str(repo), ["update-index", "--refresh"], branch_attempt=attempt
+                )
+                second = operator.grabowski_git(
+                    str(repo), ["update-index", "--refresh"], branch_attempt=attempt
+                )
+
+            self.assertEqual("completed", first["branch_mutation"]["status"])
+            self.assertEqual("completed", second["branch_mutation"]["status"])
+            self.assertEqual(
+                first["branch_mutation"]["attempt_binding_sha256"],
+                second["branch_mutation"]["attempt_binding_sha256"],
+            )
+            self.assertEqual(
+                preimage["preimage_sha256"], second["branch_mutation"]["postimage_sha256"]
+            )
 
     def test_grabowski_git_uses_sanitized_git_environment(self) -> None:
         operator = _load_operator_module()
