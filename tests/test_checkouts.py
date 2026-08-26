@@ -240,6 +240,17 @@ class CheckoutLifecycleTests(unittest.TestCase):
             connection.commit()
         return binding
 
+    def _retention_repo_path_drift_managed_checkout(self) -> dict[str, object]:
+        binding = self._managed_binding(owner="owner-a")
+        self._publish_remote()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET repo_path=? WHERE checkout_key=?",
+                (str(self.checkout.resolve()), binding["checkout_key"]),
+            )
+            connection.commit()
+        return binding
+
     def _completed_owner_drift(self) -> dict[str, object]:
         binding = self._managed_binding(owner="owner-a")
         checkouts._mark_checkout_completed_retained(
@@ -2705,6 +2716,33 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertTrue(linked["lifecycle_decision"]["binding_consistent"])
         self.assertEqual([], linked["lifecycle_decision"]["binding_drift_reasons"])
+
+    def test_binding_identity_rebind_retention_only_audit_preserves_both_path_preimages(self) -> None:
+        binding = self._retention_repo_path_drift_managed_checkout()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        self.assertEqual("repo_path_canonicalization", preview["rebind_mode"])
+        self.assertEqual(
+            ["retention-repo-path-mismatch"], preview["allowed_drift_reasons"]
+        )
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            binding["checkout_key"],
+            "owner-a",
+            preview["snapshot_sha256"],
+            preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        audit = applied["audit"]
+        canonical = str(self.repo.resolve())
+        linked = str(self.checkout.resolve())
+        self.assertEqual(["retention_repo_path_update"], audit["effects"])
+        self.assertEqual(linked, audit["before_repo_path"])
+        self.assertEqual(canonical, audit["after_repo_path"])
+        self.assertEqual(canonical, audit["before_lifecycle_repo_path"])
+        self.assertEqual(canonical, audit["after_lifecycle_repo_path"])
+        self.assertEqual(linked, audit["before_retention_repo_path"])
+        self.assertEqual(canonical, audit["after_retention_repo_path"])
 
     def test_binding_identity_rebind_rejects_repo_path_plus_branch_drift(self) -> None:
         binding = self._repo_path_drift_managed_checkout()

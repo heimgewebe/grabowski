@@ -3401,8 +3401,16 @@ def _binding_identity_rebind_apply(
             "repo": str(canonical_repo),
             "repo_path": str(canonical_repo),
             "checkout_path": str(checkout),
-            "before_repo_path": lifecycle_before["repo_path"],
+            "before_repo_path": (
+                retention_before["repo_path"]
+                if effects == ["retention_repo_path_update"]
+                else lifecycle_before["repo_path"]
+            ),
             "after_repo_path": target_repo_path,
+            "before_lifecycle_repo_path": lifecycle_before["repo_path"],
+            "after_lifecycle_repo_path": lifecycle_after["repo_path"],
+            "before_retention_repo_path": retention_before["repo_path"],
+            "after_retention_repo_path": retention_after["repo_path"],
             "before_head": lifecycle_before["expected_head"],
             "before_branch": lifecycle_before["expected_branch"],
             "after_head": target_head,
