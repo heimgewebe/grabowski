@@ -1764,6 +1764,45 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(execution)
         self.assertIn("zero-cost evidence is missing", reasons[0])
 
+    def test_openrouter_ox_alpha_requires_exact_model_identity(self) -> None:
+        state = self._fresh_state()
+        state["catalog"]["providers"]["openrouter"]["model_id"] = "stealth/not-ox-alpha"
+        allowed, reasons, _, execution = router._pool_gate(
+            "openrouter-ox-alpha-preview",
+            self.catalog,
+            state,
+            critical=False,
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertIn("zero-cost evidence is missing", reasons[0])
+
+    def test_openrouter_ox_alpha_forbids_credits_fallback(self) -> None:
+        state = self._fresh_state()
+        self.catalog["quota_pools"]["openrouter-ox-alpha-preview"]["credits_allowed"] = True
+        allowed, reasons, _, execution = router._pool_gate(
+            "openrouter-ox-alpha-preview",
+            self.catalog,
+            state,
+            critical=False,
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertEqual(reasons, ["credits fallback is not forbidden"])
+
+    def test_openrouter_ox_alpha_forbids_payg_fallback(self) -> None:
+        state = self._fresh_state()
+        self.catalog["quota_pools"]["openrouter-ox-alpha-preview"]["payg_fallback_allowed"] = True
+        allowed, reasons, _, execution = router._pool_gate(
+            "openrouter-ox-alpha-preview",
+            self.catalog,
+            state,
+            critical=False,
+        )
+        self.assertFalse(allowed)
+        self.assertFalse(execution)
+        self.assertEqual(reasons, ["PAYG fallback is not forbidden"])
+
     def test_controller_owned_work_has_no_scoped_writer(self) -> None:
         result = self._route("deployment")
         self.assertEqual(result["decision"], "controller")
