@@ -58,6 +58,19 @@ class StateRootSelectionTests(unittest.TestCase):
             self.assertTrue(persistent)
             self.assertEqual(failures, ["script_sibling:PermissionError:1"])
 
+    def test_probe_rejects_writable_root_without_hard_link_support(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate"
+            with patch.object(
+                agent.os,
+                "link",
+                side_effect=OSError(95, "operation not supported"),
+            ):
+                with self.assertRaises(OSError) as raised:
+                    agent.probe_writable_directory(candidate)
+            self.assertEqual(raised.exception.errno, 95)
+            self.assertEqual(list(candidate.iterdir()), [])
+
     def test_explicit_state_root_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             explicit = Path(directory) / "explicit"
@@ -272,6 +285,40 @@ class AgentStateTests(unittest.TestCase):
                 result["result"],
                 "<unrepresentable BadRepr: RuntimeError>",
             )
+
+    def test_result_is_not_visible_until_complete_create_once_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = agent.AgentState(Path(directory), start_worker=False)
+            job_id = "job-result-publish-0001"
+            state.submit_job(
+                {
+                    "schema_version": 1,
+                    "job_id": job_id,
+                    "code": "GRABOWSKI_RESULT = {'value': 7}",
+                    "timeout_seconds": 5,
+                    "metadata": {},
+                }
+            )
+            result_path = state._job_dir(job_id) / "result.json"
+            real_link = agent.os.link
+            observed_states: list[str] = []
+
+            def inspect_before_publish(source, destination, *, follow_symlinks=True):
+                self.assertEqual(Path(destination), result_path)
+                self.assertFalse(result_path.exists())
+                observed_states.append(state.get_job(job_id)["state"])
+                return real_link(
+                    source,
+                    destination,
+                    follow_symlinks=follow_symlinks,
+                )
+
+            with patch.object(agent.os, "link", side_effect=inspect_before_publish):
+                result = state.run_job_now(job_id)
+
+            self.assertEqual(observed_states, ["running"])
+            self.assertEqual(result["state"], "succeeded")
+            self.assertEqual(state.get_job(job_id), result)
 
     def test_duplicate_job_id_is_create_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
