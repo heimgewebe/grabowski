@@ -433,6 +433,16 @@ def test_main_rejects_ipv6_and_hostname_loopback() -> None:
             gateway.main(["--host", host])
 
 
+def test_user_service_hardening_drops_private_namespace_capabilities() -> None:
+    unit = installer.TEMPLATE_PATH.read_text(encoding="utf-8")
+    assert "NoNewPrivileges=yes" in unit
+    assert "PrivateUsers=yes" in unit
+    assert "CapabilityBoundingSet=" in unit
+    assert unit.index("PrivateUsers=yes") < unit.index("CapabilityBoundingSet=")
+    assert "ProtectSystem=strict" in unit
+    assert "ProtectHome=tmpfs" in unit
+
+
 def test_installer_completion_smoke_posts_authenticated_chat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -19,6 +19,12 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONPATH=%h/.local/share/grabowski-mcp/inputs/src
 NoNewPrivileges=yes
+# The per-user manager needs a private user namespace before mount/device
+# sandboxing and capability reductions become available without host privilege.
+PrivateUsers=yes
+# Inside that private user namespace, drop the namespace-local capability set
+# completely; the process retains no capabilities on the host or in the sandbox.
+CapabilityBoundingSet=
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
@@ -37,7 +43,6 @@ RestrictSUIDSGID=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-CapabilityBoundingSet=
 LimitCORE=0
 SystemCallArchitectures=native
 
