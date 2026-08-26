@@ -504,11 +504,18 @@ def _grok_subscription_auth_status(
             os.close(descriptor)
 
 
+def _catalog_routes(catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    routes = catalog.get("routes")
+    if not isinstance(routes, list):
+        raise ValueError("coding-agent catalog routes are missing or invalid")
+    return routes
+
+
 def _configured_models(catalog: dict[str, Any], harness: str) -> list[str]:
     return sorted(
         {
             str(route["model"])
-            for route in catalog["routes"]
+            for route in _catalog_routes(catalog)
             if route.get("harness") == harness
         }
     )
@@ -521,7 +528,7 @@ def _configured_model_aliases(
     candidates: dict[str, set[str]] = {
         model: {model} for model in configured
     }
-    for route in catalog["routes"]:
+    for route in _catalog_routes(catalog):
         canonical = route.get("model")
         argv = route.get("argv_prefix")
         if (
@@ -557,15 +564,39 @@ def _grok_models_from_output(
     catalog: dict[str, Any], stdout: str
 ) -> list[str]:
     marker = "Available models:"
-    if marker not in stdout:
+    lines = stdout.splitlines()
+    marker_index = next(
+        (index for index, line in enumerate(lines) if marker in line),
+        None,
+    )
+    if marker_index is None:
         return []
-    available = stdout.split(marker, 1)[1]
-    discovered = []
-    for model in _configured_models(catalog, "grok"):
-        pattern = rf"(?<![A-Za-z0-9._/-]){re.escape(model)}(?![A-Za-z0-9._/-])"
-        if re.search(pattern, available):
-            discovered.append(model)
-    return discovered
+
+    configured = set(_configured_models(catalog, "grok"))
+    discovered: set[str] = set()
+    marker_tail = lines[marker_index].split(marker, 1)[1].strip()
+    if marker_tail:
+        for model in configured:
+            pattern = (
+                rf"(?<![A-Za-z0-9._/-]){re.escape(model)}"
+                rf"(?![A-Za-z0-9._/-])"
+            )
+            if re.search(pattern, marker_tail):
+                discovered.add(model)
+
+    for line in lines[marker_index + 1 :]:
+        stripped = line.strip()
+        if not stripped:
+            if discovered:
+                break
+            continue
+        match = re.match(r"^[*-]\s+([^\s,(]+)", stripped)
+        if match is None:
+            break
+        candidate = match.group(1)
+        if candidate in configured:
+            discovered.add(candidate)
+    return sorted(discovered)
 
 
 def _openhands_subscription_auth_status(

@@ -43,6 +43,12 @@ class PlainExternalReviewTests(unittest.TestCase):
         self.addCleanup(self._account_home.cleanup)
         account_home = Path(self._account_home.name)
         account_home.chmod(0o700)
+        self._account_home_path = account_home
+        opencode_data = account_home / ".local" / "share" / "opencode"
+        opencode_data.mkdir(parents=True, mode=0o700)
+        auth = opencode_data / "auth.json"
+        auth.write_text('{"openrouter":{"type":"api","key":"test-only"}}\n', encoding="utf-8")
+        auth.chmod(0o600)
         self._account_home_patch = mock.patch.dict(
             os.environ,
             {"HOME": str(account_home)},
@@ -361,7 +367,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                         "run",
                         "--pure",
                         "--agent",
-                        "plan",
+                        plain.OX_ALPHA_AGENT,
                         "--model",
                         plain.OX_ALPHA_MODEL,
                         "--file",
@@ -379,6 +385,17 @@ class PlainExternalReviewTests(unittest.TestCase):
                 self.assertEqual(list(isolated.iterdir()), [prompt_path])
                 environment = kwargs["environment"]
                 self.assertNotIn("OPENROUTER_API_KEY", environment)
+                runtime_root = Path(environment["HOME"]).parent
+                self.assertNotEqual(Path(environment["HOME"]), self._account_home_path)
+                self.assertEqual(Path(environment["XDG_CONFIG_HOME"]).parent, runtime_root)
+                self.assertEqual(Path(environment["XDG_DATA_HOME"]).parent, runtime_root)
+                self.assertEqual(Path(environment["XDG_CACHE_HOME"]).parent, runtime_root)
+                self.assertEqual(Path(environment["XDG_STATE_HOME"]).parent, runtime_root)
+                config = Path(environment["XDG_CONFIG_HOME"]) / "opencode" / "opencode.json"
+                auth = Path(environment["XDG_DATA_HOME"]) / "opencode" / "auth.json"
+                self.assertEqual(plain.sha256_bytes(config.read_bytes()), plain.OX_ALPHA_AGENT_CONFIG_SHA256)
+                self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(auth.stat().st_mode), 0o600)
                 return subprocess.CompletedProcess(
                     argv,
                     0,
@@ -419,11 +436,31 @@ class PlainExternalReviewTests(unittest.TestCase):
             )
             self.assertEqual(
                 evidence["review_input"]["paid_fallback_policy"],
-                "disabled_by_exact_model",
+                plain.OX_ALPHA_PAID_FALLBACK_POLICY,
             )
             self.assertEqual(
                 evidence["reviews"][0]["tool_policy"],
-                "opencode_pure_plan_agent",
+                plain.OX_ALPHA_TOOL_POLICY,
+            )
+            self.assertEqual(
+                evidence["review_input"]["runtime_isolation"],
+                plain.OX_ALPHA_RUNTIME_ISOLATION,
+            )
+            self.assertEqual(
+                evidence["review_input"]["agent_name"],
+                plain.OX_ALPHA_AGENT,
+            )
+            self.assertEqual(
+                evidence["review_input"]["agent_config_sha256"],
+                plain.OX_ALPHA_AGENT_CONFIG_SHA256,
+            )
+            self.assertEqual(
+                evidence["review_input"]["account_auth_copy_policy"],
+                plain.OX_ALPHA_AUTH_COPY_POLICY,
+            )
+            self.assertEqual(
+                evidence["review_input"]["provider_argv"][4],
+                plain.OX_ALPHA_AGENT,
             )
             self.assertFalse(evidence["review_input"]["prompt_argument_exposure"])
             self.assertTrue(evidence["review_input"]["ephemeral_prompt_file"])

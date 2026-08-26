@@ -4,8 +4,9 @@ Status: active, advisory only
 
 ## Purpose
 
-`tools/external_review_plain.py` asks an account-backed Gemini or Grok
-command-line client for one independent review without giving the model a
+`tools/external_review_plain.py` asks an account-backed Gemini, Grok, or
+explicitly safe-context Ox Alpha command-line client for one independent review
+without giving the model a
 repository checkout or an implementation role. It consumes the immutable
 external-review packet produced by `tools/pr_review_gate.py`, transmits the
 packet prompt plus the exact hash-bound diff, and writes schema-valid optional
@@ -20,6 +21,14 @@ This path is deliberately distinct from coding-agent review:
   constrains tools but does not prove that the provider exposed no tool surface;
 - Grok receives an empty tool set in plan mode and disables web search, memory,
   and subagents through explicit CLI flags;
+- Ox Alpha is accepted only with an explicit `public-context`,
+  `synthetic-context`, or `non-sensitive-context` attestation. It runs the exact
+  `openrouter/stealth/ox-alpha` model with `--pure` and a private generated
+  `grabowski-reviewer` agent whose OpenCode permission map denies `*`. The
+  process receives a fresh temporary `HOME` plus XDG config/data/cache/state
+  roots; only the owner-private OpenCode account `auth.json` is copied into that
+  runtime. The deny-all agent config and copied auth are mode `0600`, inode- and
+  hash-rechecked after the turn, and the runtime is discarded afterwards;
 - a fixed environment allowlist passes only account-client configuration,
   locale, network, certificate, and temporary-directory settings; API keys,
   Git context, DBus, display, runtime-directory, and SSH-agent variables never
@@ -136,6 +145,25 @@ The default executable name is `grok`, but it must resolve to the canonical
 owner-controlled native binary behind `~/.grok/bin/grok`. Wrappers elsewhere on
 `PATH`, including npm or Node trampolines, fail closed.
 
+## Ox Alpha
+
+```bash
+python3 tools/external_review_plain.py \
+  --manifest .review-packets/pr-123/manifest.json \
+  --output .review-audits/pr-123-ox-alpha-external.json \
+  --provider ox-alpha \
+  --context-attestation public-context
+```
+
+Ox Alpha has no fallback model. The adapter itself does not assert that the
+preview is currently listed or still zero-cost; callers must establish fresh
+model availability and zero-cost eligibility before invoking it. If that proof
+is absent, the review must not be started. Evidence records the exact provider
+argv, deny-all agent identity/config hash, isolated-runtime contract, the fixed
+private exact-copy/reverification policy for account auth, and the exact-model
+no-fallback policy. The central gate independently checks
+those fields and rejects `--auto`, a different agent/model, or policy drift.
+
 The adapter does not attest the signed-in account tier, remaining subscription
 quota, absence of provider-side overage, or the provider's resolved model
 identity. The evidence records the requested model label conservatively as
@@ -177,7 +205,9 @@ The evidence records:
 - packet prompt, transmitted prompt, and nonce;
 - exact diff hash and pull-request head;
 - transmitted prompt and raw response paths;
-- argv, stdout, stderr, raw-review, and canonical parsed-review hashes;
+- argv, stdout, stderr, raw-review, and canonical parsed-review hashes; for Ox
+  Alpha the exact provider argv is retained as evidence and independently
+  matched to its argv hash;
 - removed billable API-key and inherited Git-context variable names;
 - the exact passed environment-key names (never values), removed session-variable
   names, Null-stdin, process-group and output-limit policy, and workspace
