@@ -46,7 +46,15 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
     )
 
 VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
-PROVIDERS = {"gemini", "grok"}
+PROVIDERS = {"gemini", "grok", "ox-alpha"}
+OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
+OX_ALPHA_CONTEXT_ATTESTATIONS = frozenset(
+    {"public-context", "synthetic-context", "non-sensitive-context"}
+)
+OX_ALPHA_PROMPT_MESSAGE = (
+    "Review the complete prompt in the attached file and return only its "
+    "requested JSON object."
+)
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_PROMPT_BYTES = 500_000
 DEFAULT_MAX_REVIEW_BYTES = PLAIN_LLM_MAX_RAW_REVIEW_BYTES
@@ -476,6 +484,25 @@ def build_provider_argv(
         if model:
             argv.extend(["--model", model])
         return argv
+    if provider == "ox-alpha":
+        if prompt_path is None:
+            raise PlainReviewError("Ox Alpha plain review prompt file is missing")
+        if model != OX_ALPHA_MODEL:
+            raise PlainReviewError(
+                f"Ox Alpha plain review requires exact model {OX_ALPHA_MODEL}"
+            )
+        return [
+            executable,
+            "run",
+            "--pure",
+            "--agent",
+            "plan",
+            "--model",
+            OX_ALPHA_MODEL,
+            "--file",
+            str(prompt_path),
+            OX_ALPHA_PROMPT_MESSAGE,
+        ]
     raise PlainReviewError(f"unsupported plain review provider: {provider}")
 
 
@@ -1205,7 +1232,7 @@ def run_provider(
                 )
             provider_prompt_path: Path | None = None
             provider_prompt: str | None = prompt
-            if provider == "grok":
+            if provider in {"grok", "ox-alpha"}:
                 provider_prompt_path = isolated_root / "plain-review-prompt.txt"
                 write_text_create_only(
                     provider_prompt_path,
@@ -1855,6 +1882,7 @@ def build_evidence(
     resolved_executable: str,
     review: dict[str, Any],
     prompt_nonce: str,
+    context_attestation: str | None,
 ) -> dict[str, Any]:
     verdict = review["verdict"]
     finding_count = review["finding_count"]
@@ -1879,7 +1907,9 @@ def build_evidence(
             "head_sha": manifest["head_sha"],
             "diff_sha256": manifest["diff_sha256"],
             "transport": (
-                "prompt_file" if provider == "grok" else "argv"
+                "prompt_file"
+                if provider in {"grok", "ox-alpha"}
+                else "argv"
             ),
             "account_transport": "account_cli",
             "provider": provider,
@@ -1896,7 +1926,13 @@ def build_evidence(
             "prompt_sha256": prompt_sha256,
             "prompt_nonce": prompt_nonce,
             "prompt_argument_exposure": provider == "gemini",
-            "ephemeral_prompt_file": provider == "grok",
+            "ephemeral_prompt_file": provider in {"grok", "ox-alpha"},
+            "context_attestation": context_attestation,
+            "paid_fallback_policy": (
+                "disabled_by_exact_model"
+                if provider == "ox-alpha"
+                else "not_established_by_adapter"
+            ),
             "transmitted_prompt_bytes": prompt_bytes,
             "transmitted_prompt_path": str(
                 Path(os.path.abspath(prompt_path))
@@ -1945,7 +1981,11 @@ def build_evidence(
                 "tool_policy": (
                     "sandboxed_plan_mode"
                     if provider == "gemini"
-                    else "empty_tools_plan_mode"
+                    else (
+                        "empty_tools_plan_mode"
+                        if provider == "grok"
+                        else "opencode_pure_plan_agent"
+                    )
                 ),
                 "argv_sha256": canonical_sha256(argv),
                 "stdout_sha256": sha256_text(completed.stdout),
@@ -1978,9 +2018,26 @@ def run_from_manifest(
     timeout_seconds: int,
     max_prompt_bytes: int,
     max_review_bytes: int = DEFAULT_MAX_REVIEW_BYTES,
+    context_attestation: str | None = None,
 ) -> dict[str, Any]:
     if provider not in PROVIDERS:
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
+    if provider == "ox-alpha":
+        if context_attestation not in OX_ALPHA_CONTEXT_ATTESTATIONS:
+            raise PlainReviewError(
+                "Ox Alpha plain review requires an explicit safe context "
+                "attestation: public-context, synthetic-context, or "
+                "non-sensitive-context"
+            )
+        if model is not None and model != OX_ALPHA_MODEL:
+            raise PlainReviewError(
+                f"Ox Alpha plain review requires exact model {OX_ALPHA_MODEL}"
+            )
+        model = OX_ALPHA_MODEL
+    elif context_attestation is not None:
+        raise PlainReviewError(
+            "context attestation is only valid for the Ox Alpha provider"
+        )
     if (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, int)
@@ -2186,6 +2243,7 @@ def run_from_manifest(
         resolved_executable=resolved_executable,
         review=review,
         prompt_nonce=prompt_nonce,
+        context_attestation=context_attestation,
     )
     evidence_text = (
         json.dumps(
@@ -2259,6 +2317,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--executable")
     parser.add_argument("--model")
+    parser.add_argument("--context-attestation")
     parser.add_argument("--raw-review-output")
     parser.add_argument("--transmitted-prompt-output")
     parser.add_argument(
@@ -2277,9 +2336,11 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_REVIEW_BYTES,
     )
     args = parser.parse_args(argv)
-    executable = args.executable or (
-        "agy" if args.provider == "gemini" else "grok"
-    )
+    executable = args.executable or {
+        "gemini": "agy",
+        "grok": "grok",
+        "ox-alpha": "opencode",
+    }[args.provider]
     try:
         evidence = run_from_manifest(
             manifest_path=Path(args.manifest),
@@ -2300,6 +2361,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
             max_prompt_bytes=args.max_prompt_bytes,
             max_review_bytes=args.max_review_bytes,
+            context_attestation=args.context_attestation,
         )
     except (PlainReviewError, subprocess.TimeoutExpired) as exc:
         print(
