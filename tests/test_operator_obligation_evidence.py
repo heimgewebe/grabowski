@@ -996,7 +996,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         with patch.object(
             evidence,
             "_run_command",
-            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
         ):
             prepared = evidence.prepare_evidence(
                 "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
@@ -1033,7 +1033,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         with patch.object(
             evidence,
             "_run_command",
-            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
         ):
             prepared = evidence.prepare_evidence(
                 "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
@@ -1072,6 +1072,36 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             "_run_command",
             side_effect=self._github_v2_command_side_effect(
                 payload, pr=949, run_pr_overrides={8202: 950}
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_fails_closed_when_single_run_originates_from_other_pr(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=281,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=8301,
+                event="pull_request",
+                run_number=101,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload, pr=949, run_pr_overrides={8301: 950}
             ),
         ):
             prepared = evidence.prepare_evidence(
@@ -1169,7 +1199,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         with patch.object(
             evidence,
             "_run_command",
-            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
         ):
             prepared = evidence.prepare_evidence(
                 "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}

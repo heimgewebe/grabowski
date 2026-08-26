@@ -669,8 +669,6 @@ def _github_v2_rerun_pr_bindings_valid(
     }
     cache: dict[int, dict[str, Any] | None] = {}
     for runs in groups.values():
-        if len(runs) <= 1:
-            continue
         for run_id, event in runs.items():
             if run_id not in cache:
                 cache[run_id] = _github_actions_run_pr_binding(
