@@ -209,6 +209,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         *,
         pr: int,
         run_pr_overrides: dict[int, int] | None = None,
+        run_head_sha_overrides: dict[int, str] | None = None,
     ):
         repository = payload["data"]["repository"]
         pull_request = repository["pullRequest"]
@@ -230,36 +231,61 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             if isinstance(run_id, int) and not isinstance(run_id, bool) and isinstance(event, str):
                 workflow_events[run_id] = event
         encoded_graphql = json.dumps(payload).encode("utf-8")
-        overrides = run_pr_overrides or {}
+        pr_overrides = run_pr_overrides or {}
+        sha_overrides = run_head_sha_overrides or {}
 
         def run(argv, **_kwargs):
             if argv[:3] == ["gh", "api", "graphql"]:
                 return 0, encoded_graphql, b""
-            if len(argv) >= 3 and argv[:2] == ["gh", "api"] and "/actions/runs/" in argv[2]:
-                endpoint = argv[2]
-                run_id = int(endpoint.rsplit("/", 1)[-1])
-                event = workflow_events.get(run_id)
-                if event is None:
-                    return 1, b"", b"unknown workflow run"
-                parts = endpoint.split("/")
-                repo_slug = "/".join(parts[1:3])
-                bound_pr = overrides.get(run_id, pr)
-                bound_head_ref = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
-                run_payload = {
-                    "id": run_id,
-                    "event": event,
-                    "head_sha": head,
-                    "head_branch": bound_head_ref,
-                    "repository": {"full_name": repo_slug},
-                    "pull_requests": [
+            endpoint = next(
+                (
+                    part
+                    for part in argv
+                    if isinstance(part, str)
+                    and part.startswith("repos/")
+                    and part.endswith("/actions/runs")
+                ),
+                None,
+            )
+            if argv[:2] == ["gh", "api"] and endpoint is not None:
+                queried_head_sha = next(
+                    (
+                        part.split("=", 1)[1]
+                        for part in argv
+                        if isinstance(part, str) and part.startswith("head_sha=")
+                    ),
+                    None,
+                )
+                repo_slug = endpoint[len("repos/") : -len("/actions/runs")]
+                run_payloads: list[dict[str, object]] = []
+                for run_id, event in workflow_events.items():
+                    run_head_sha = sha_overrides.get(run_id, head)
+                    if queried_head_sha != run_head_sha:
+                        continue
+                    bound_pr = pr_overrides.get(run_id, pr)
+                    bound_head_ref = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
+                    run_payloads.append(
                         {
-                            "number": bound_pr,
-                            "head": {"ref": bound_head_ref, "sha": head},
-                            "base": {"ref": base_ref, "sha": base},
+                            "id": run_id,
+                            "event": event,
+                            "head_sha": run_head_sha,
+                            "head_branch": bound_head_ref,
+                            "repository": {"full_name": repo_slug},
+                            "pull_requests": [
+                                {
+                                    "number": bound_pr,
+                                    "head": {"ref": bound_head_ref, "sha": head},
+                                    "base": {"ref": base_ref, "sha": base},
+                                }
+                            ],
                         }
-                    ],
-                }
-                return 0, json.dumps(run_payload).encode("utf-8"), b""
+                    )
+                encoded_runs = b"\n".join(
+                    json.dumps(item).encode("utf-8") for item in run_payloads
+                )
+                if encoded_runs:
+                    encoded_runs += b"\n"
+                return 0, encoded_runs, b""
             return 1, b"", b"unexpected command"
 
         return run
@@ -901,11 +927,15 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             if call.args[0][:3] == ["gh", "api", "graphql"]
         ]
         actions_calls = [
-            call for call in run_command.call_args_list
-            if len(call.args[0]) >= 3 and "/actions/runs/" in call.args[0][2]
+            call
+            for call in run_command.call_args_list
+            if any(
+                isinstance(part, str) and part.endswith("/actions/runs")
+                for part in call.args[0]
+            )
         ]
         self.assertEqual(2, len(graphql_calls))
-        self.assertEqual(4, len(actions_calls))
+        self.assertEqual(2, len(actions_calls))
         assert observed is not None
         self.assertEqual("verified", observed["status"])
         self.assertEqual(item["sha256"], observed["sha256"])
@@ -1111,6 +1141,97 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual("mismatch", prepared["status"])
         self.assertEqual("github_check_shape_invalid", prepared["reason"])
         self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_batches_many_pr_run_provenance_reads(self) -> None:
+        head = "1" * 40
+        base = "2" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=10000 + index,
+                name=f"job-{index}",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=20000 + index,
+                workflow_run_id=30000 + index,
+                event="pull_request",
+                run_number=1,
+            )
+            for index in range(80)
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
+        ) as run_command:
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        actions_calls = [
+            call
+            for call in run_command.call_args_list
+            if any(
+                isinstance(part, str) and part.endswith("/actions/runs")
+                for part in call.args[0]
+            )
+        ]
+        self.assertEqual(1, len(actions_calls))
+        argv = actions_calls[0].args[0]
+        self.assertIn("--paginate", argv)
+        self.assertIn(f"head_sha={head}", argv)
+        self.assertIn("per_page=100", argv)
+        self.assertFalse(any("/actions/runs/" in part for part in argv))
+
+    def test_prepare_github_batches_base_sha_fallback_for_target_run(self) -> None:
+        head = "1" * 40
+        base = "2" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=951,
+                name="target-check",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=952,
+                workflow_run_id=953,
+                event="pull_request_target",
+                run_number=1,
+            )
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload, pr=949, run_head_sha_overrides={953: base}
+            ),
+        ) as run_command:
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        actions_calls = [
+            call
+            for call in run_command.call_args_list
+            if any(
+                isinstance(part, str) and part.endswith("/actions/runs")
+                for part in call.args[0]
+            )
+        ]
+        self.assertEqual(2, len(actions_calls))
+        queried = [
+            next(
+                part
+                for part in call.args[0]
+                if isinstance(part, str) and part.startswith("head_sha=")
+            )
+            for call in actions_calls
+        ]
+        self.assertEqual([f"head_sha={head}", f"head_sha={base}"], queried)
 
     def test_prepare_github_keeps_external_same_name_checks_distinct(self) -> None:
         checks = [

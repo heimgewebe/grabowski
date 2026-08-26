@@ -546,31 +546,18 @@ def _github_v2_check_success(check: Mapping[str, Any]) -> bool:
     return False
 
 
-def _github_actions_run_pr_binding(
-    repo: str,
-    run_id: int,
-    *,
-    deadline_monotonic: float | None = None,
+def _github_actions_run_pr_binding_from_payload(
+    repo: str, payload: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    returncode, stdout, _stderr = _run_command(
-        ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"],
-        deadline_monotonic=deadline_monotonic,
-    )
-    if returncode != 0:
-        raise EvidenceAssessmentError("github Actions run source unavailable")
-    try:
-        payload = json.loads(stdout)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, Mapping) or _positive_int(payload.get("id")) != run_id:
-        return None
+    run_id = _positive_int(payload.get("id"))
     repository = payload.get("repository")
     event = payload.get("event")
     head_sha = payload.get("head_sha")
     head_branch = payload.get("head_branch")
     pulls = payload.get("pull_requests")
     if (
-        not isinstance(repository, Mapping)
+        run_id is None
+        or not isinstance(repository, Mapping)
         or repository.get("full_name") != repo
         or not isinstance(event, str)
         or not event
@@ -632,6 +619,86 @@ def _github_actions_run_pr_binding(
     }
 
 
+def _github_actions_run_pr_bindings(
+    repo: str,
+    run_ids: set[int],
+    *,
+    candidate_head_shas: tuple[str, ...],
+    deadline_monotonic: float | None = None,
+) -> dict[int, dict[str, Any]] | None:
+    wanted = set(run_ids)
+    if any(_positive_int(run_id) != run_id for run_id in wanted):
+        return None
+    if not wanted:
+        return {}
+    head_shas: list[str] = []
+    for candidate in candidate_head_shas:
+        if not isinstance(candidate, str) or SHA40_RE.fullmatch(candidate) is None:
+            return None
+        if candidate not in head_shas:
+            head_shas.append(candidate)
+    if not head_shas:
+        return None
+    jq_filter = (
+        '.workflow_runs[]|{id,event,head_sha,head_branch,'
+        'repository:{full_name:.repository.full_name},'
+        'pull_requests:[.pull_requests[]|{number,'
+        'head:{ref:.head.ref,sha:.head.sha},'
+        'base:{ref:.base.ref,sha:.base.sha}}]}'
+    )
+    bindings: dict[int, dict[str, Any]] = {}
+    pending = set(wanted)
+    for candidate_head_sha in head_shas:
+        if not pending:
+            break
+        returncode, stdout, _stderr = _run_command(
+            [
+                "gh",
+                "api",
+                "-X",
+                "GET",
+                "--paginate",
+                f"repos/{repo}/actions/runs",
+                "-f",
+                f"head_sha={candidate_head_sha}",
+                "-f",
+                "per_page=100",
+                "--jq",
+                jq_filter,
+            ],
+            deadline_monotonic=deadline_monotonic,
+        )
+        if returncode != 0:
+            raise EvidenceAssessmentError("github Actions runs source unavailable")
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, Mapping):
+                return None
+            run_id = _positive_int(payload.get("id"))
+            if run_id is None:
+                return None
+            if run_id not in wanted:
+                continue
+            binding = _github_actions_run_pr_binding_from_payload(repo, payload)
+            if binding is None or binding.get("head_sha") != candidate_head_sha:
+                return None
+            previous = bindings.get(run_id)
+            if previous is not None:
+                if previous != binding:
+                    return None
+                continue
+            bindings[run_id] = binding
+            pending.discard(run_id)
+    if pending:
+        return None
+    return bindings
+
+
 def _github_v2_rerun_pr_bindings_valid(
     repo: str,
     pr: int,
@@ -667,21 +734,30 @@ def _github_v2_rerun_pr_bindings_valid(
         "base_ref": base_ref,
         "base_sha": base_sha,
     }
-    cache: dict[int, dict[str, Any] | None] = {}
+    run_events: dict[int, str] = {}
     for runs in groups.values():
         for run_id, event in runs.items():
-            if run_id not in cache:
-                cache[run_id] = _github_actions_run_pr_binding(
-                    repo, run_id, deadline_monotonic=deadline_monotonic
-                )
-            binding = cache[run_id]
-            if (
-                binding is None
-                or binding.get("event") != event
-                or binding.get("head_sha") not in {head_sha, base_sha}
-                or binding.get("pull_requests") != [expected_pull]
-            ):
+            previous_event = run_events.get(run_id)
+            if previous_event is not None and previous_event != event:
                 return False
+            run_events[run_id] = event
+    bindings = _github_actions_run_pr_bindings(
+        repo,
+        set(run_events),
+        candidate_head_shas=(head_sha, base_sha),
+        deadline_monotonic=deadline_monotonic,
+    )
+    if bindings is None:
+        return False
+    for run_id, event in run_events.items():
+        binding = bindings.get(run_id)
+        if (
+            binding is None
+            or binding.get("event") != event
+            or binding.get("head_sha") not in {head_sha, base_sha}
+            or binding.get("pull_requests") != [expected_pull]
+        ):
+            return False
     return True
 
 
