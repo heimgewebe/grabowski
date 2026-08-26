@@ -25,6 +25,9 @@ try:
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
+        PLAIN_LLM_OX_ALPHA_MODEL,
+        PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
@@ -38,6 +41,9 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
+        PLAIN_LLM_OX_ALPHA_MODEL,
+        PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
@@ -46,11 +52,9 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
     )
 
 VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
-PROVIDERS = {"gemini", "grok", "ox-alpha"}
-OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
-OX_ALPHA_CONTEXT_ATTESTATIONS = frozenset(
-    {"public-context", "synthetic-context", "non-sensitive-context"}
-)
+PROVIDERS = set(PLAIN_LLM_PROVIDERS)
+OX_ALPHA_MODEL = PLAIN_LLM_OX_ALPHA_MODEL
+OX_ALPHA_CONTEXT_ATTESTATIONS = PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS
 OX_ALPHA_PROMPT_MESSAGE = (
     "Review the complete prompt in the attached file and return only its "
     "requested JSON object."
