@@ -82,6 +82,214 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             "status": status,
         }
 
+    @staticmethod
+    def _github_v2_workflow_check(
+        *,
+        database_id: int,
+        name: str,
+        started_at: str,
+        conclusion: str = "SUCCESS",
+        workflow_id: int = 320669873,
+        workflow_name: str = "Codex review settlement",
+        workflow_run_id: int = 32860034363,
+        event: str = "pull_request_review",
+        run_number: int = 5693,
+        run_attempt: int = 1,
+    ) -> dict[str, object]:
+        return {
+            "__typename": "CheckRun",
+            "databaseId": database_id,
+            "name": name,
+            "startedAt": started_at,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "checkSuite": {
+                "databaseId": database_id + 100000,
+                "app": {"id": "MDM6QXBwMTUzNjg=", "slug": "github-actions"},
+                "workflowRun": {
+                    "databaseId": workflow_run_id,
+                    "event": event,
+                    "runNumber": run_number,
+                    "runAttempt": run_attempt,
+                    "workflow": {
+                        "databaseId": workflow_id,
+                        "name": workflow_name,
+                    },
+                },
+            },
+        }
+
+    @staticmethod
+    def _github_v2_external_check(
+        *,
+        database_id: int,
+        name: str,
+        started_at: str,
+        conclusion: str = "SUCCESS",
+    ) -> dict[str, object]:
+        return {
+            "__typename": "CheckRun",
+            "databaseId": database_id,
+            "name": name,
+            "startedAt": started_at,
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+            "checkSuite": {
+                "databaseId": database_id + 100000,
+                "app": {"id": "MDM6QXBwNTc3ODk=", "slug": "github-advanced-security"},
+                "workflowRun": None,
+            },
+        }
+
+    @staticmethod
+    def _github_v2_status_context(
+        *,
+        node_id: str = "SC_test",
+        context: str = "Codex review settled",
+        created_at: str = "2026-08-25T14:31:40Z",
+        state: str = "SUCCESS",
+    ) -> dict[str, object]:
+        return {
+            "__typename": "StatusContext",
+            "id": node_id,
+            "context": context,
+            "createdAt": created_at,
+            "state": state,
+            "creator": {"login": "github-actions"},
+        }
+
+    @staticmethod
+    def _github_v2_payload(
+        *,
+        head: str,
+        base: str,
+        merge: str,
+        checks: list[dict[str, object]],
+        has_next_page: bool = False,
+        head_ref: str = "feature/test",
+        base_ref: str = "main",
+    ) -> dict[str, object]:
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "baseRefOid": base,
+                        "baseRefName": base_ref,
+                        "headRefOid": head,
+                        "headRefName": head_ref,
+                        "mergeCommit": {"oid": merge},
+                        "commits": {
+                            "nodes": [
+                                {
+                                    "commit": {
+                                        "oid": head,
+                                        "statusCheckRollup": {
+                                            "contexts": {
+                                                "totalCount": len(checks),
+                                                "pageInfo": {
+                                                    "hasNextPage": has_next_page
+                                                },
+                                                "nodes": checks,
+                                            }
+                                        },
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        }
+
+    @staticmethod
+    def _github_v2_command_side_effect(
+        payload: dict[str, object],
+        *,
+        pr: int,
+        run_pr_overrides: dict[int, int] | None = None,
+        run_head_sha_overrides: dict[int, str] | None = None,
+    ):
+        repository = payload["data"]["repository"]
+        pull_request = repository["pullRequest"]
+        head = pull_request["headRefOid"]
+        head_ref = pull_request["headRefName"]
+        base = pull_request["baseRefOid"]
+        base_ref = pull_request["baseRefName"]
+        checks = pull_request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]
+        workflow_events: dict[int, str] = {}
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            suite = check.get("checkSuite")
+            workflow_run = suite.get("workflowRun") if isinstance(suite, dict) else None
+            if not isinstance(workflow_run, dict):
+                continue
+            run_id = workflow_run.get("databaseId")
+            event = workflow_run.get("event")
+            if isinstance(run_id, int) and not isinstance(run_id, bool) and isinstance(event, str):
+                workflow_events[run_id] = event
+        encoded_graphql = json.dumps(payload).encode("utf-8")
+        pr_overrides = run_pr_overrides or {}
+        sha_overrides = run_head_sha_overrides or {}
+
+        def run(argv, **_kwargs):
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return 0, encoded_graphql, b""
+            endpoint = next(
+                (
+                    part
+                    for part in argv
+                    if isinstance(part, str)
+                    and part.startswith("repos/")
+                    and part.endswith("/actions/runs")
+                ),
+                None,
+            )
+            if argv[:2] == ["gh", "api"] and endpoint is not None:
+                queried_head_sha = next(
+                    (
+                        part.split("=", 1)[1]
+                        for part in argv
+                        if isinstance(part, str) and part.startswith("head_sha=")
+                    ),
+                    None,
+                )
+                repo_slug = endpoint[len("repos/") : -len("/actions/runs")]
+                run_payloads: list[dict[str, object]] = []
+                for run_id, event in workflow_events.items():
+                    run_head_sha = sha_overrides.get(run_id, head)
+                    if queried_head_sha != run_head_sha:
+                        continue
+                    bound_pr = pr_overrides.get(run_id, pr)
+                    bound_head_ref = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
+                    run_payloads.append(
+                        {
+                            "id": run_id,
+                            "event": event,
+                            "head_sha": run_head_sha,
+                            "head_branch": bound_head_ref,
+                            "repository": {"full_name": repo_slug},
+                            "pull_requests": [
+                                {
+                                    "number": bound_pr,
+                                    "head": {"ref": bound_head_ref, "sha": head},
+                                    "base": {"ref": base_ref, "sha": base},
+                                }
+                            ],
+                        }
+                    )
+                encoded_runs = b"\n".join(
+                    json.dumps(item).encode("utf-8") for item in run_payloads
+                )
+                if encoded_runs:
+                    encoded_runs += b"\n"
+                return 0, encoded_runs, b""
+            return 1, b"", b"unexpected command"
+
+        return run
+
     def test_fake_hash_is_not_verified(self) -> None:
         result = evidence.assess_status(self._status())
 
@@ -674,26 +882,34 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         head = "1" * 40
         base = "2" * 40
         merge = "3" * 40
-        payload = {
-            "state": "MERGED",
-            "isDraft": False,
-            "baseRefOid": base,
-            "headRefOid": head,
-            "mergeCommit": {"oid": merge},
-            "statusCheckRollup": [
-                {
-                    "__typename": "CheckRun",
-                    "status": "COMPLETED",
-                    "conclusion": "SUCCESS",
-                },
-                {"__typename": "StatusContext", "state": "SUCCESS"},
-            ],
-        }
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=97840906739,
+                name="Codex review settled",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+                workflow_run_id=32859870973,
+                event="pull_request_review",
+                run_number=5691,
+            ),
+            self._github_v2_workflow_check(
+                database_id=97841452490,
+                name="Codex review settled",
+                started_at="2026-08-25T14:31:33Z",
+                workflow_run_id=32860034363,
+                event="pull_request_review",
+                run_number=5693,
+            ),
+            self._github_v2_status_context(),
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge=merge, checks=checks
+        )
         with patch.object(
             evidence,
             "_run_command",
-            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
-        ):
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
+        ) as run_command:
             prepared = evidence.prepare_evidence(
                 "merge", "github", {"repo": repo, "pr": 943}
             )
@@ -703,9 +919,23 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
 
         self.assertEqual("prepared", prepared["status"])
         self.assertEqual(
-            f"github-pr:{repo}#943@{head}:base={base}:merge={merge}:checks=2/2-success",
+            f"github-pr-v2:{repo}#943@{head}:base={base}:merge={merge}:checks=2/2-effective-success",
             item["reference"],
         )
+        graphql_calls = [
+            call for call in run_command.call_args_list
+            if call.args[0][:3] == ["gh", "api", "graphql"]
+        ]
+        actions_calls = [
+            call
+            for call in run_command.call_args_list
+            if any(
+                isinstance(part, str) and part.endswith("/actions/runs")
+                for part in call.args[0]
+            )
+        ]
+        self.assertEqual(2, len(graphql_calls))
+        self.assertEqual(2, len(actions_calls))
         assert observed is not None
         self.assertEqual("verified", observed["status"])
         self.assertEqual(item["sha256"], observed["sha256"])
@@ -729,6 +959,479 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 "receipt",
                 {"reference": "grip:any:receipt:" + "a" * 64},
             )
+
+    def test_prepare_github_latest_effective_failure_fails_closed(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=101,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                workflow_id=301891383,
+                workflow_name="validate",
+                workflow_run_id=1001,
+                event="pull_request",
+                run_number=1,
+            ),
+            self._github_v2_workflow_check(
+                database_id=102,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                conclusion="FAILURE",
+                workflow_id=301891383,
+                workflow_name="validate",
+                workflow_run_id=1002,
+                event="pull_request",
+                run_number=2,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=948),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 948}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_keeps_same_display_name_from_distinct_workflows(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=201,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_name="shared display name",
+                workflow_run_id=8001,
+            ),
+            self._github_v2_workflow_check(
+                database_id=202,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7002,
+                workflow_name="shared display name",
+                workflow_run_id=8002,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+
+    def test_prepare_github_keeps_same_workflow_job_from_distinct_events(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=251,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_run_id=8101,
+                event="pull_request",
+                run_number=101,
+            ),
+            self._github_v2_workflow_check(
+                database_id=252,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=8102,
+                event="workflow_dispatch",
+                run_number=102,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+
+    def test_prepare_github_fails_closed_when_rerun_originates_from_other_pr(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=271,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_run_id=8201,
+                event="pull_request",
+                run_number=101,
+            ),
+            self._github_v2_workflow_check(
+                database_id=272,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=8202,
+                event="pull_request",
+                run_number=102,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload, pr=949, run_pr_overrides={8202: 950}
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_fails_closed_when_single_run_originates_from_other_pr(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=281,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=8301,
+                event="pull_request",
+                run_number=101,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload, pr=949, run_pr_overrides={8301: 950}
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_batches_many_pr_run_provenance_reads(self) -> None:
+        head = "1" * 40
+        base = "2" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=10000 + index,
+                name=f"job-{index}",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=20000 + index,
+                workflow_run_id=30000 + index,
+                event="pull_request",
+                run_number=1,
+            )
+            for index in range(80)
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
+        ) as run_command:
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        actions_calls = [
+            call
+            for call in run_command.call_args_list
+            if any(
+                isinstance(part, str) and part.endswith("/actions/runs")
+                for part in call.args[0]
+            )
+        ]
+        self.assertEqual(1, len(actions_calls))
+        argv = actions_calls[0].args[0]
+        self.assertIn("--paginate", argv)
+        self.assertIn(f"head_sha={head}", argv)
+        self.assertIn("per_page=100", argv)
+        self.assertFalse(any("/actions/runs/" in part for part in argv))
+
+    def test_prepare_github_batches_base_sha_fallback_for_target_run(self) -> None:
+        head = "1" * 40
+        base = "2" * 40
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=951,
+                name="target-check",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=952,
+                workflow_run_id=953,
+                event="pull_request_target",
+                run_number=1,
+            )
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload, pr=949, run_head_sha_overrides={953: base}
+            ),
+        ) as run_command:
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        actions_calls = [
+            call
+            for call in run_command.call_args_list
+            if any(
+                isinstance(part, str) and part.endswith("/actions/runs")
+                for part in call.args[0]
+            )
+        ]
+        self.assertEqual(2, len(actions_calls))
+        queried = [
+            next(
+                part
+                for part in call.args[0]
+                if isinstance(part, str) and part.startswith("head_sha=")
+            )
+            for call in actions_calls
+        ]
+        self.assertEqual([f"head_sha={head}", f"head_sha={base}"], queried)
+
+    def test_prepare_github_keeps_external_same_name_checks_distinct(self) -> None:
+        checks = [
+            self._github_v2_external_check(
+                database_id=301,
+                name="CodeQL",
+                started_at="2026-08-25T14:30:01Z",
+                conclusion="FAILURE",
+            ),
+            self._github_v2_external_check(
+                database_id=302,
+                name="CodeQL",
+                started_at="2026-08-25T14:31:01Z",
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+
+    def test_prepare_github_fails_closed_on_duplicate_name_within_one_workflow_run(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=401,
+                name="duplicate",
+                started_at="2026-08-25T14:30:01Z",
+                workflow_id=7001,
+                workflow_run_id=9001,
+            ),
+            self._github_v2_workflow_check(
+                database_id=402,
+                name="duplicate",
+                started_at="2026-08-25T14:30:02Z",
+                workflow_id=7001,
+                workflow_run_id=9001,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+
+    def test_prepare_github_accepts_manual_rerun_as_new_attempt(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=451,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_run_id=9001,
+                run_attempt=1,
+            ),
+            self._github_v2_workflow_check(
+                database_id=452,
+                name="validate",
+                started_at="2026-08-25T14:30:01Z",
+                workflow_id=7001,
+                workflow_run_id=9001,
+                run_attempt=2,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith("checks=1/1-effective-success")
+        )
+
+    def test_prepare_github_orders_workflow_runs_by_run_number_not_start_time(self) -> None:
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=461,
+                name="validate",
+                started_at="2026-08-25T14:32:01Z",
+                workflow_id=7001,
+                workflow_run_id=9001,
+                run_number=101,
+            ),
+            self._github_v2_workflow_check(
+                database_id=462,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                conclusion="FAILURE",
+                workflow_id=7001,
+                workflow_run_id=9002,
+                run_number=102,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head="1" * 40, base="2" * 40, merge="3" * 40, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=949),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+
+    def test_prepare_github_fails_closed_on_truncated_check_rollup(self) -> None:
+        payload = self._github_v2_payload(
+            head="1" * 40,
+            base="2" * 40,
+            merge="3" * 40,
+            checks=[
+                self._github_v2_external_check(
+                    database_id=501,
+                    name="CodeQL",
+                    started_at="2026-08-25T14:30:01Z",
+                )
+            ],
+            has_next_page=True,
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            return_value=(0, json.dumps(payload).encode("utf-8"), b""),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 949}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+
+    def test_github_v2_digest_binds_selected_run_identity(self) -> None:
+        first = self._github_v2_workflow_check(
+            database_id=601,
+            name="validate",
+            started_at="2026-08-25T14:30:01Z",
+            workflow_id=7001,
+            workflow_run_id=9001,
+        )
+        second = self._github_v2_workflow_check(
+            database_id=602,
+            name="validate",
+            started_at="2026-08-25T14:30:01Z",
+            workflow_id=7001,
+            workflow_run_id=9002,
+        )
+        first_effective = evidence._effective_github_v2_checks([first])
+        second_effective = evidence._effective_github_v2_checks([second])
+        assert first_effective is not None and second_effective is not None
+        common = {
+            "repo": "heimgewebe/grabowski",
+            "pr": 949,
+            "head": "1" * 40,
+            "base": "2" * 40,
+            "merge": "3" * 40,
+            "passed": 1,
+            "total": 1,
+            "version": 2,
+        }
+        first_digest = evidence._sha256(
+            evidence._github_observation_material(
+                {**common, "effective_checks": first_effective}
+            )
+        )
+        second_digest = evidence._sha256(
+            evidence._github_observation_material(
+                {**common, "effective_checks": second_effective}
+            )
+        )
+
+        self.assertNotEqual(first_digest, second_digest)
 
     def test_prepare_runtime_matches_trusted_adapter_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(

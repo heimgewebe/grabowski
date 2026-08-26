@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -57,6 +58,69 @@ GITHUB_PR_REFERENCE_RE = re.compile(
     r":merge=(?P<merge>[0-9a-f]{40})"
     r":checks=(?P<passed>[0-9]{1,3})/(?P<total>[0-9]{1,3})-success$"
 )
+GITHUB_PR_V2_REFERENCE_RE = re.compile(
+    r"^github-pr-v2:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"#(?P<pr>[1-9][0-9]{0,9})@(?P<head>[0-9a-f]{40})"
+    r":base=(?P<base>[0-9a-f]{40})"
+    r":merge=(?P<merge>[0-9a-f]{40})"
+    r":checks=(?P<passed>[0-9]{1,3})/(?P<total>[0-9]{1,3})-effective-success$"
+)
+GITHUB_V2_QUERY = r"""
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      state
+      isDraft
+      baseRefOid
+      baseRefName
+      headRefOid
+      headRefName
+      mergeCommit{oid}
+      commits(last:1){
+        nodes{
+          commit{
+            oid
+            statusCheckRollup{
+              contexts(first:100){
+                totalCount
+                pageInfo{hasNextPage}
+                nodes{
+                  __typename
+                  ... on CheckRun{
+                    databaseId
+                    name
+                    startedAt
+                    status
+                    conclusion
+                    checkSuite{
+                      databaseId
+                      app{id slug}
+                      workflowRun{
+                        databaseId
+                        event
+                        runNumber
+                        runAttempt
+                        workflow{databaseId name}
+                      }
+                    }
+                  }
+                  ... on StatusContext{
+                    id
+                    context
+                    createdAt
+                    state
+                    creator{login}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 GIT_COMMIT_REFERENCE_RE = re.compile(
     r"^git-commit:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
     r"@(?P<commit>[0-9a-f]{40})$"
@@ -228,6 +292,10 @@ def _run_command(
 
 def _github_reference(reference: str) -> dict[str, Any] | None:
     match = GITHUB_PR_REFERENCE_RE.fullmatch(reference)
+    version = 1
+    if match is None:
+        match = GITHUB_PR_V2_REFERENCE_RE.fullmatch(reference)
+        version = 2
     if match is None:
         return None
     parsed: dict[str, Any] = {
@@ -238,15 +306,31 @@ def _github_reference(reference: str) -> dict[str, Any] | None:
         "merge": match.group("merge"),
         "passed": int(match.group("passed")),
         "total": int(match.group("total")),
+        "version": version,
     }
     if parsed["total"] < 1 or parsed["total"] > 100 or parsed["passed"] != parsed["total"]:
         return None
     return parsed
 
 def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
+    if parsed.get("version", 1) != 2:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski.operator_obligation_evidence.github_pr_v1",
+            "repo": parsed["repo"],
+            "pr": parsed["pr"],
+            "head": parsed["head"],
+            "base": parsed["base"],
+            "merge": parsed["merge"],
+            "checks_passed": parsed["passed"],
+            "checks_total": parsed["total"],
+        }
+    effective_checks = parsed.get("effective_checks")
+    if not isinstance(effective_checks, list) or not effective_checks:
+        raise EvidenceAssessmentError("github v2 observation material lacks effective checks")
     return {
-        "schema_version": 1,
-        "kind": "grabowski.operator_obligation_evidence.github_pr_v1",
+        "schema_version": 2,
+        "kind": "grabowski.operator_obligation_evidence.github_pr_v2",
         "repo": parsed["repo"],
         "pr": parsed["pr"],
         "head": parsed["head"],
@@ -254,7 +338,539 @@ def _github_observation_material(parsed: Mapping[str, Any]) -> dict[str, Any]:
         "merge": parsed["merge"],
         "checks_passed": parsed["passed"],
         "checks_total": parsed["total"],
+        "check_semantics": "stable_workflow_identity_latest_run_v1",
+        "effective_checks": effective_checks,
     }
+
+
+def _github_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError:
+        return None
+    if parsed.tzinfo != timezone.utc:
+        return None
+    return parsed
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _github_v2_check(
+    check: Mapping[str, Any],
+) -> tuple[tuple[str, ...], datetime, tuple[str, ...] | None, dict[str, Any]] | None:
+    typename = check.get("__typename")
+    if typename == "CheckRun":
+        database_id = _positive_int(check.get("databaseId"))
+        name = check.get("name")
+        started_at = check.get("startedAt")
+        started = _github_utc(started_at)
+        status = check.get("status")
+        conclusion = check.get("conclusion")
+        suite = check.get("checkSuite")
+        if (
+            database_id is None
+            or not isinstance(name, str)
+            or not name
+            or started is None
+            or not isinstance(status, str)
+            or not status
+            or not isinstance(conclusion, str)
+            or not conclusion
+            or not isinstance(suite, Mapping)
+        ):
+            return None
+        suite_id = _positive_int(suite.get("databaseId"))
+        app = suite.get("app")
+        if suite_id is None or not isinstance(app, Mapping):
+            return None
+        app_id = app.get("id")
+        app_slug = app.get("slug")
+        if (
+            not isinstance(app_id, str)
+            or not app_id
+            or not isinstance(app_slug, str)
+            or not app_slug
+        ):
+            return None
+        workflow_run = suite.get("workflowRun")
+        workflow_run_id: int | None = None
+        workflow_event: str | None = None
+        workflow_run_number: int | None = None
+        workflow_run_attempt: int | None = None
+        workflow_id: int | None = None
+        workflow_name: str | None = None
+        same_run_identity: tuple[str, ...] | None = None
+        if workflow_run is not None:
+            if not isinstance(workflow_run, Mapping):
+                return None
+            workflow_run_id = _positive_int(workflow_run.get("databaseId"))
+            workflow_event = workflow_run.get("event")
+            workflow_run_number = _positive_int(workflow_run.get("runNumber"))
+            workflow_run_attempt = _positive_int(workflow_run.get("runAttempt"))
+            workflow = workflow_run.get("workflow")
+            if (
+                workflow_run_id is None
+                or not isinstance(workflow_event, str)
+                or not workflow_event
+                or workflow_run_number is None
+                or workflow_run_attempt is None
+                or not isinstance(workflow, Mapping)
+            ):
+                return None
+            workflow_id = _positive_int(workflow.get("databaseId"))
+            workflow_name = workflow.get("name")
+            if workflow_id is None or not isinstance(workflow_name, str) or not workflow_name:
+                return None
+            logical_identity = ("workflow-check", str(workflow_id), workflow_event, name)
+            same_run_identity = (
+                "workflow-run-check",
+                str(workflow_run_id),
+                str(workflow_run_attempt),
+                name,
+            )
+        else:
+            # Non-workflow checks have no stable logical rerun identity available
+            # here. Keep each immutable CheckRun distinct rather than guessing.
+            logical_identity = ("check-run", str(database_id))
+        material = {
+            "type": "CheckRun",
+            "logical_identity": list(logical_identity),
+            "database_id": database_id,
+            "name": name,
+            "started_at": started_at,
+            "status": status,
+            "conclusion": conclusion,
+            "check_suite_database_id": suite_id,
+            "app_id": app_id,
+            "app_slug": app_slug,
+            "workflow_run_database_id": workflow_run_id,
+            "workflow_event": workflow_event,
+            "workflow_run_number": workflow_run_number,
+            "workflow_run_attempt": workflow_run_attempt,
+            "workflow_database_id": workflow_id,
+            "workflow_name": workflow_name,
+        }
+        return logical_identity, started, same_run_identity, material
+    if typename == "StatusContext":
+        node_id = check.get("id")
+        context = check.get("context")
+        created_at = check.get("createdAt")
+        created = _github_utc(created_at)
+        state = check.get("state")
+        creator = check.get("creator")
+        login = creator.get("login") if isinstance(creator, Mapping) else None
+        if (
+            not isinstance(node_id, str)
+            or not node_id
+            or not isinstance(context, str)
+            or not context
+            or created is None
+            or not isinstance(state, str)
+            or not state
+            or not isinstance(login, str)
+            or not login
+        ):
+            return None
+        logical_identity = ("status-context", node_id)
+        material = {
+            "type": "StatusContext",
+            "logical_identity": list(logical_identity),
+            "id": node_id,
+            "context": context,
+            "created_at": created_at,
+            "state": state,
+            "creator_login": login,
+        }
+        return logical_identity, created, None, material
+    return None
+
+
+def _github_v2_effective_order(
+    observed_at: datetime, material: Mapping[str, Any]
+) -> tuple[int, int, int, datetime] | None:
+    workflow_id = material.get("workflow_database_id")
+    if workflow_id is not None:
+        run_number = _positive_int(material.get("workflow_run_number"))
+        run_attempt = _positive_int(material.get("workflow_run_attempt"))
+        if run_number is None or run_attempt is None:
+            return None
+        return (1, run_number, run_attempt, datetime.min.replace(tzinfo=timezone.utc))
+    return (0, 0, 0, observed_at)
+
+
+def _effective_github_v2_checks(
+    checks: list[Any],
+) -> list[dict[str, Any]] | None:
+    effective: dict[
+        tuple[str, ...], tuple[tuple[int, int, int, datetime], dict[str, Any]]
+    ] = {}
+    same_run_seen: dict[tuple[str, ...], int] = {}
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return None
+        normalized = _github_v2_check(check)
+        if normalized is None:
+            return None
+        logical_identity, observed_at, same_run_identity, material = normalized
+        if same_run_identity is not None:
+            database_id = material["database_id"]
+            previous_id = same_run_seen.get(same_run_identity)
+            if previous_id is not None and previous_id != database_id:
+                # Two distinct jobs with the same display name in one workflow
+                # attempt are ambiguous; never treat one as a rerun of the other.
+                return None
+            same_run_seen[same_run_identity] = database_id
+        order = _github_v2_effective_order(observed_at, material)
+        if order is None:
+            return None
+        previous = effective.get(logical_identity)
+        if previous is None or order > previous[0]:
+            effective[logical_identity] = (order, material)
+            continue
+        if order == previous[0] and material != previous[1]:
+            return None
+    return [effective[key][1] for key in sorted(effective)]
+
+
+def _github_v2_check_success(check: Mapping[str, Any]) -> bool:
+    if check.get("type") == "CheckRun":
+        return check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
+    if check.get("type") == "StatusContext":
+        return check.get("state") == "SUCCESS"
+    return False
+
+
+def _github_actions_run_pr_binding_from_payload(
+    repo: str, payload: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    run_id = _positive_int(payload.get("id"))
+    repository = payload.get("repository")
+    event = payload.get("event")
+    head_sha = payload.get("head_sha")
+    head_branch = payload.get("head_branch")
+    pulls = payload.get("pull_requests")
+    if (
+        run_id is None
+        or not isinstance(repository, Mapping)
+        or repository.get("full_name") != repo
+        or not isinstance(event, str)
+        or not event
+        or not isinstance(head_sha, str)
+        or SHA40_RE.fullmatch(head_sha) is None
+        or not isinstance(head_branch, str)
+        or not head_branch
+        or not isinstance(pulls, list)
+    ):
+        return None
+    normalized_pulls: list[dict[str, Any]] = []
+    for item in pulls:
+        if not isinstance(item, Mapping):
+            return None
+        number = _positive_int(item.get("number"))
+        head = item.get("head")
+        base = item.get("base")
+        if number is None or not isinstance(head, Mapping) or not isinstance(base, Mapping):
+            return None
+        head_ref = head.get("ref")
+        bound_head_sha = head.get("sha")
+        base_ref = base.get("ref")
+        bound_base_sha = base.get("sha")
+        if (
+            not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(bound_head_sha, str)
+            or SHA40_RE.fullmatch(bound_head_sha) is None
+            or not isinstance(base_ref, str)
+            or not base_ref
+            or not isinstance(bound_base_sha, str)
+            or SHA40_RE.fullmatch(bound_base_sha) is None
+        ):
+            return None
+        normalized_pulls.append(
+            {
+                "number": number,
+                "head_ref": head_ref,
+                "head_sha": bound_head_sha,
+                "base_ref": base_ref,
+                "base_sha": bound_base_sha,
+            }
+        )
+    normalized_pulls.sort(
+        key=lambda item: (
+            item["number"],
+            item["head_ref"],
+            item["head_sha"],
+            item["base_ref"],
+            item["base_sha"],
+        )
+    )
+    return {
+        "run_id": run_id,
+        "event": event,
+        "head_sha": head_sha,
+        "head_branch": head_branch,
+        "pull_requests": normalized_pulls,
+    }
+
+
+def _github_actions_run_pr_bindings(
+    repo: str,
+    run_ids: set[int],
+    *,
+    candidate_head_shas: tuple[str, ...],
+    deadline_monotonic: float | None = None,
+) -> dict[int, dict[str, Any]] | None:
+    wanted = set(run_ids)
+    if any(_positive_int(run_id) != run_id for run_id in wanted):
+        return None
+    if not wanted:
+        return {}
+    head_shas: list[str] = []
+    for candidate in candidate_head_shas:
+        if not isinstance(candidate, str) or SHA40_RE.fullmatch(candidate) is None:
+            return None
+        if candidate not in head_shas:
+            head_shas.append(candidate)
+    if not head_shas:
+        return None
+    jq_filter = (
+        '.workflow_runs[]|{id,event,head_sha,head_branch,'
+        'repository:{full_name:.repository.full_name},'
+        'pull_requests:[.pull_requests[]|{number,'
+        'head:{ref:.head.ref,sha:.head.sha},'
+        'base:{ref:.base.ref,sha:.base.sha}}]}'
+    )
+    bindings: dict[int, dict[str, Any]] = {}
+    pending = set(wanted)
+    for candidate_head_sha in head_shas:
+        if not pending:
+            break
+        returncode, stdout, _stderr = _run_command(
+            [
+                "gh",
+                "api",
+                "-X",
+                "GET",
+                "--paginate",
+                f"repos/{repo}/actions/runs",
+                "-f",
+                f"head_sha={candidate_head_sha}",
+                "-f",
+                "per_page=100",
+                "--jq",
+                jq_filter,
+            ],
+            deadline_monotonic=deadline_monotonic,
+        )
+        if returncode != 0:
+            raise EvidenceAssessmentError("github Actions runs source unavailable")
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            if not isinstance(payload, Mapping):
+                return None
+            run_id = _positive_int(payload.get("id"))
+            if run_id is None:
+                return None
+            if run_id not in wanted:
+                continue
+            binding = _github_actions_run_pr_binding_from_payload(repo, payload)
+            if binding is None or binding.get("head_sha") != candidate_head_sha:
+                return None
+            previous = bindings.get(run_id)
+            if previous is not None:
+                if previous != binding:
+                    return None
+                continue
+            bindings[run_id] = binding
+            pending.discard(run_id)
+    if pending:
+        return None
+    return bindings
+
+
+def _github_v2_rerun_pr_bindings_valid(
+    repo: str,
+    pr: int,
+    *,
+    head_ref: str,
+    head_sha: str,
+    base_ref: str,
+    base_sha: str,
+    checks: list[Any],
+    deadline_monotonic: float | None = None,
+) -> bool:
+    groups: dict[tuple[str, ...], dict[int, str]] = {}
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return False
+        normalized = _github_v2_check(check)
+        if normalized is None:
+            return False
+        logical_identity, _observed_at, _same_run_identity, material = normalized
+        run_id = material.get("workflow_run_database_id")
+        event = material.get("workflow_event")
+        if (
+            run_id is not None
+            and isinstance(run_id, int)
+            and isinstance(event, str)
+            and event.startswith("pull_request")
+        ):
+            groups.setdefault(logical_identity, {})[run_id] = event
+    expected_pull = {
+        "number": pr,
+        "head_ref": head_ref,
+        "head_sha": head_sha,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+    }
+    run_events: dict[int, str] = {}
+    for runs in groups.values():
+        for run_id, event in runs.items():
+            previous_event = run_events.get(run_id)
+            if previous_event is not None and previous_event != event:
+                return False
+            run_events[run_id] = event
+    bindings = _github_actions_run_pr_bindings(
+        repo,
+        set(run_events),
+        candidate_head_shas=(head_sha, base_sha),
+        deadline_monotonic=deadline_monotonic,
+    )
+    if bindings is None:
+        return False
+    for run_id, event in run_events.items():
+        binding = bindings.get(run_id)
+        if (
+            binding is None
+            or binding.get("event") != event
+            or binding.get("head_sha") not in {head_sha, base_sha}
+            or binding.get("pull_requests") != [expected_pull]
+        ):
+            return False
+    return True
+
+
+def _github_v2_snapshot(
+    repo: str,
+    pr: int,
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[str, Any] | None:
+    owner, name = repo.split("/", 1)
+    returncode, stdout, _stderr = _run_command(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={GITHUB_V2_QUERY}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={pr}",
+        ],
+        deadline_monotonic=deadline_monotonic,
+    )
+    if returncode != 0:
+        raise EvidenceAssessmentError("github GraphQL source unavailable")
+    try:
+        payload = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or payload.get("errors"):
+        return None
+    data = payload.get("data")
+    repository = data.get("repository") if isinstance(data, Mapping) else None
+    pull_request = (
+        repository.get("pullRequest") if isinstance(repository, Mapping) else None
+    )
+    if not isinstance(pull_request, Mapping):
+        return None
+    commits = pull_request.get("commits")
+    nodes = commits.get("nodes") if isinstance(commits, Mapping) else None
+    if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], Mapping):
+        return None
+    commit = nodes[0].get("commit")
+    if not isinstance(commit, Mapping):
+        return None
+    rollup = commit.get("statusCheckRollup")
+    contexts = rollup.get("contexts") if isinstance(rollup, Mapping) else None
+    check_nodes = contexts.get("nodes") if isinstance(contexts, Mapping) else None
+    page_info = contexts.get("pageInfo") if isinstance(contexts, Mapping) else None
+    total_count = contexts.get("totalCount") if isinstance(contexts, Mapping) else None
+    if (
+        not isinstance(check_nodes, list)
+        or not 1 <= len(check_nodes) <= 100
+        or not isinstance(page_info, Mapping)
+        or page_info.get("hasNextPage") is not False
+        or isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count != len(check_nodes)
+    ):
+        return None
+    head = pull_request.get("headRefOid")
+    head_ref = pull_request.get("headRefName")
+    base = pull_request.get("baseRefOid")
+    base_ref = pull_request.get("baseRefName")
+    commit_oid = commit.get("oid")
+    merge = pull_request.get("mergeCommit")
+    merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
+    if (
+        commit_oid != head
+        or not isinstance(head, str)
+        or SHA40_RE.fullmatch(head) is None
+        or not isinstance(head_ref, str)
+        or not head_ref
+        or not isinstance(base, str)
+        or SHA40_RE.fullmatch(base) is None
+        or not isinstance(base_ref, str)
+        or not base_ref
+    ):
+        return None
+    if not _github_v2_rerun_pr_bindings_valid(
+        repo,
+        pr,
+        head_ref=head_ref,
+        head_sha=head,
+        base_ref=base_ref,
+        base_sha=base,
+        checks=check_nodes,
+        deadline_monotonic=deadline_monotonic,
+    ):
+        return None
+    effective_checks = _effective_github_v2_checks(check_nodes)
+    if effective_checks is None:
+        return None
+    return {
+        "state": pull_request.get("state"),
+        "isDraft": pull_request.get("isDraft"),
+        "baseRefOid": base,
+        "headRefOid": head,
+        "merge_oid": merge_oid,
+        "effective_checks": effective_checks,
+    }
+
+
+def _github_check_success(check: Mapping[str, Any]) -> bool:
+    typename = check.get("__typename")
+    if typename == "CheckRun":
+        return check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
+    if typename == "StatusContext":
+        return check.get("state") == "SUCCESS"
+    return False
 
 
 def _github_observation(
@@ -264,6 +880,38 @@ def _github_observation(
     parsed = _github_reference(reference)
     if parsed is None:
         return None
+    if parsed.get("version", 1) == 2:
+        try:
+            snapshot = _github_v2_snapshot(
+                str(parsed["repo"]),
+                int(parsed["pr"]),
+                deadline_monotonic=deadline_monotonic,
+            )
+        except EvidenceAssessmentError:
+            return _trusted_observation(evidence, status="stale")
+        if snapshot is None:
+            return _trusted_observation(evidence, status="mismatch")
+        effective_checks = snapshot["effective_checks"]
+        successful = sum(
+            int(_github_v2_check_success(check)) for check in effective_checks
+        )
+        identity_matches = (
+            snapshot.get("state") == "MERGED"
+            and snapshot.get("isDraft") is False
+            and snapshot.get("headRefOid") == parsed["head"]
+            and snapshot.get("baseRefOid") == parsed["base"]
+            and snapshot.get("merge_oid") == parsed["merge"]
+            and len(effective_checks) == parsed["total"]
+            and successful == parsed["passed"]
+        )
+        if not identity_matches:
+            return _trusted_observation(evidence, status="mismatch")
+        material = {**parsed, "effective_checks": effective_checks}
+        return _trusted_observation(
+            evidence,
+            status="verified",
+            sha256=_sha256(_github_observation_material(material)),
+        )
     try:
         returncode, stdout, _stderr = _run_command(
             [
@@ -297,14 +945,7 @@ def _github_observation(
     for check in checks:
         if not isinstance(check, Mapping):
             return _trusted_observation(evidence, status="mismatch")
-        typename = check.get("__typename")
-        if typename == "CheckRun":
-            ok = check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
-        elif typename == "StatusContext":
-            ok = check.get("state") == "SUCCESS"
-        else:
-            ok = False
-        successful += int(ok)
+        successful += int(_github_check_success(check))
     identity_matches = (
         payload.get("state") == "MERGED"
         and payload.get("isDraft") is False
@@ -742,18 +1383,8 @@ def _prepare_github(
     if isinstance(pr, bool) or not isinstance(pr, int) or not 1 <= pr <= 9_999_999_999:
         raise EvidenceAssessmentError("pr must be a positive integer")
     try:
-        returncode, stdout, _stderr = _run_command(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr),
-                "--repo",
-                repo,
-                "--json",
-                "state,isDraft,baseRefOid,headRefOid,mergeCommit,statusCheckRollup",
-            ],
-            deadline_monotonic=deadline_monotonic,
+        snapshot = _github_v2_snapshot(
+            repo, pr, deadline_monotonic=deadline_monotonic
         )
     except EvidenceAssessmentError:
         return _preparation_result(
@@ -762,40 +1393,28 @@ def _prepare_github(
             status="stale",
             reason="authoritative_source_unavailable",
         )
-    if returncode != 0:
-        return _preparation_result(
-            acceptance_id=acceptance_id,
-            source="github",
-            status="stale",
-            reason="authoritative_source_unavailable",
-        )
-    try:
-        payload = json.loads(stdout)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        payload = None
-    if not isinstance(payload, Mapping):
+    if snapshot is None:
         return _preparation_result(
             acceptance_id=acceptance_id,
             source="github",
             status="mismatch",
-            reason="authoritative_source_malformed",
+            reason="github_check_shape_invalid",
         )
-    merge = payload.get("mergeCommit")
-    merge_oid = merge.get("oid") if isinstance(merge, Mapping) else None
-    head = payload.get("headRefOid")
-    base = payload.get("baseRefOid")
-    checks = payload.get("statusCheckRollup")
+    head = snapshot.get("headRefOid")
+    base = snapshot.get("baseRefOid")
+    merge_oid = snapshot.get("merge_oid")
+    effective_checks = snapshot.get("effective_checks")
     if (
-        payload.get("state") != "MERGED"
-        or payload.get("isDraft") is not False
+        snapshot.get("state") != "MERGED"
+        or snapshot.get("isDraft") is not False
         or not isinstance(head, str)
         or SHA40_RE.fullmatch(head) is None
         or not isinstance(base, str)
         or SHA40_RE.fullmatch(base) is None
         or not isinstance(merge_oid, str)
         or SHA40_RE.fullmatch(merge_oid) is None
-        or not isinstance(checks, list)
-        or not 1 <= len(checks) <= 100
+        or not isinstance(effective_checks, list)
+        or not effective_checks
     ):
         return _preparation_result(
             acceptance_id=acceptance_id,
@@ -803,24 +1422,10 @@ def _prepare_github(
             status="mismatch",
             reason="github_pr_not_terminal_success",
         )
-    successful = 0
-    for check in checks:
-        if not isinstance(check, Mapping):
-            return _preparation_result(
-                acceptance_id=acceptance_id,
-                source="github",
-                status="mismatch",
-                reason="github_check_shape_invalid",
-            )
-        typename = check.get("__typename")
-        if typename == "CheckRun":
-            ok = check.get("status") == "COMPLETED" and check.get("conclusion") == "SUCCESS"
-        elif typename == "StatusContext":
-            ok = check.get("state") == "SUCCESS"
-        else:
-            ok = False
-        successful += int(ok)
-    if successful != len(checks):
+    successful = sum(
+        int(_github_v2_check_success(check)) for check in effective_checks
+    )
+    if successful != len(effective_checks):
         return _preparation_result(
             acceptance_id=acceptance_id,
             source="github",
@@ -834,11 +1439,13 @@ def _prepare_github(
         "base": base,
         "merge": merge_oid,
         "passed": successful,
-        "total": len(checks),
+        "total": len(effective_checks),
+        "version": 2,
+        "effective_checks": effective_checks,
     }
     reference = (
-        f"github-pr:{repo}#{pr}@{head}:base={base}:merge={merge_oid}:"
-        f"checks={successful}/{len(checks)}-success"
+        f"github-pr-v2:{repo}#{pr}@{head}:base={base}:merge={merge_oid}:"
+        f"checks={successful}/{len(effective_checks)}-effective-success"
     )
     return _prepared(
         acceptance_id,
