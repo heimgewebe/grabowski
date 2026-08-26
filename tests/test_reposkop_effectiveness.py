@@ -393,6 +393,38 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             ),
         )
 
+    def test_verified_review_role_context_does_not_hide_other_information(
+        self,
+    ) -> None:
+        report = _legacy_detached_report()
+        projection = report["projection"]
+        assert isinstance(projection, dict)
+        projection["state"] = "inconclusive"
+
+        contextualized = effectiveness.finding_summary(
+            report,
+            role_context=effectiveness.ReposkopRoleContext(
+                schema_version=1,
+                authority="verified_server_owned_role_evidence",
+                work_role="intentional_pr_review",
+                evidence_ref=_ref("e"),
+            ),
+        )
+
+        self.assertEqual(
+            contextualized["contextual_posture"]["posture"],
+            "attention",
+        )
+        self.assertEqual(
+            contextualized["contextual_posture"]["contextualized_reason_codes"],
+            ["detached_head", "upstream_unbound"],
+        )
+        self.assertIn(
+            "projection_state_inconclusive",
+            contextualized["contextual_posture"]["remaining_reason_codes"],
+        )
+        self.assertFalse(contextualized["contextual_posture"]["decision_effect"])
+
     def test_untrusted_role_context_is_rejected_and_unexpected_state_keeps_attention(
         self,
     ) -> None:

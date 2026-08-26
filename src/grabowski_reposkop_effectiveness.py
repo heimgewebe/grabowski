@@ -418,6 +418,11 @@ def _contextual_posture(
         or remaining_warning_count > 0
     ):
         posture = "attention"
+    elif remaining_reasons:
+        # A verified review role may explain only the exact detached/unbound
+        # checkout signals. Any other signal stays visible as unresolved
+        # context instead of being relabelled as an expected review checkout.
+        posture = raw_posture
     elif contextualized:
         posture = "expected_review_checkout"
     else:
