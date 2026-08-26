@@ -1463,11 +1463,17 @@ class WorkAcquireTests(unittest.TestCase):
         release.assert_not_called()
 
 
-    def terminal_assessment(self, lane_id: str, observed_at: int) -> dict[str, object]:
+    def terminal_assessment(
+        self,
+        lane_id: str,
+        observed_at: int,
+        *,
+        lease_active: bool = True,
+    ) -> dict[str, object]:
         return closeout.assess(closeout.LaneCloseoutObservation(
             lane_id=lane_id, repository=str(self.repo), workspace=str(self.target),
             branch="feat/authority-p0", base_revision=SHA, writer_state="completed",
-            task_active=False, process_active=False, lease_active=True, git_dirty=False,
+            task_active=False, process_active=False, lease_active=lease_active, git_dirty=False,
             head_sha=SHA, remote_head_sha=SHA, ahead_commits=0, behind_commits=0,
             no_change_proven=True,
         ), observed_at_unix=observed_at)
@@ -1684,7 +1690,384 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertIsNotNone(after)
         assert after is not None
         self.assertNotIn("terminal_closeout", after)
-        self.assertEqual(after["receipt_sha256"], receipt["receipt_sha256"])
+        self.assertIn("terminal_closeout_pending", after)
+        self.assertEqual(
+            after["terminal_closeout_pending"]["expected_receipt_sha256"],
+            receipt["receipt_sha256"],
+        )
+        self.assertNotEqual(after["receipt_sha256"], receipt["receipt_sha256"])
+
+        acquire = Mock()
+        ensure = Mock()
+        replay = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertTrue(replay["replayed"])
+        self.assertTrue(replay["closeout_pending"])
+        self.assertEqual(replay["decision"], "TERMINAL_CLOSEOUT_PENDING")
+        self.assertEqual(replay["next_action"], "retry_terminal_closeout")
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+
+    def test_candidate_adopted_defers_resource_release_until_publication_closeout(self) -> None:
+        params = self.parameters()
+        inputs, receipt = self.store_lane(params)
+        lane_id = str(inputs["lane_id"])
+        owner_id = str(inputs["lease_owner_id"])
+        assessment = closeout.assess(
+            closeout.LaneCloseoutObservation(
+                lane_id=lane_id,
+                repository=str(self.repo),
+                workspace=str(self.target),
+                branch="feat/authority-p0",
+                base_revision=SHA,
+                writer_state="completed",
+                task_active=False,
+                process_active=False,
+                lease_active=True,
+                git_dirty=False,
+                head_sha=SHA,
+                candidate_id="c" * 64,
+                adoption_receipt_sha256="d" * 64,
+                adoption_commit_sha=SHA,
+            ),
+            observed_at_unix=200,
+        )
+        self.assertEqual("candidate_adopted", assessment["closeout_state"])
+        self.assertTrue(assessment["lease_release_ready"])
+
+        with (
+            patch.object(work_acquire.resources, "list_resources") as listing,
+            patch.object(work_acquire.resources, "count_resources") as counting,
+            patch.object(work_acquire.resources, "grabowski_resource_release") as release,
+        ):
+            stored = work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+        self.assertIn("terminal_closeout", stored)
+        self.assertNotIn("resource_lease_closeout", stored)
+        listing.assert_not_called()
+        counting.assert_not_called()
+        release.assert_not_called()
+
+        late_key = "operation:publication-after-adoption"
+        late_lease = self.acquired(owner_id, [late_key])["leases"][0]
+        snapshot = work_acquire._lease_snapshot(late_lease, owner_id=owner_id)
+        with (
+            patch.object(
+                work_acquire.resources,
+                "list_resources",
+                side_effect=[[late_lease], []],
+            ),
+            patch.object(
+                work_acquire.resources,
+                "count_resources",
+                side_effect=[1, 0],
+            ),
+            patch.object(
+                work_acquire.resources,
+                "grabowski_resource_release",
+                return_value=self.released(owner_id, [snapshot]),
+            ) as release,
+        ):
+            converged = work_acquire.converge_terminal_resource_closeout(
+                lane_id, expected_closeout_states={"candidate_adopted"}
+            )
+        self.assertEqual("released", converged["state"])
+        self.assertEqual(0, converged["live_owner_lease_count"])
+        self.assertEqual([late_key], converged["released_resource_keys"])
+        release.assert_called_once_with(
+            owner_id, [late_key], force=False, expected_leases=[snapshot]
+        )
+
+    def test_terminal_resource_convergence_releases_all_current_owner_generations(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        owner_id = str(inputs["lease_owner_id"])
+        registered_keys = list(inputs["resource_keys"])
+        own_key = registered_keys[0]
+        late_key = "operation:terminal-late-deploy"
+        own_lease = self.acquired(owner_id, [own_key])["leases"][0]
+        late_lease = self.acquired(owner_id, [late_key])["leases"][0]
+        own_snapshot = work_acquire._lease_snapshot(own_lease, owner_id=owner_id)
+        late_snapshot = work_acquire._lease_snapshot(late_lease, owner_id=owner_id)
+        expected_snapshots = sorted(
+            [own_snapshot, late_snapshot], key=lambda item: item["resource_key"]
+        )
+        release = Mock(
+            return_value=self.released(owner_id, expected_snapshots)
+        )
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+
+        with (
+            patch.object(
+                work_acquire.resources,
+                "list_resources",
+                side_effect=[[own_lease, late_lease], []],
+            ) as listing,
+            patch.object(
+                work_acquire.resources,
+                "count_resources",
+                side_effect=[2, 0],
+            ) as counting,
+            patch.object(work_acquire.resources, "grabowski_resource_release", release),
+        ):
+            result = work_acquire._converge_terminal_resource_leases(
+                record,
+                assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "released")
+        self.assertEqual(
+            result["released_resource_keys"],
+            [snapshot["resource_key"] for snapshot in expected_snapshots],
+        )
+        self.assertEqual(
+            result["registered_resource_key_count"], len(registered_keys)
+        )
+        self.assertEqual(result["live_owner_lease_count"], 0)
+        self.assertEqual(listing.call_count, 2)
+        self.assertEqual(counting.call_count, 2)
+        for call in listing.call_args_list:
+            self.assertEqual(call.kwargs["owner_id"], owner_id)
+            self.assertFalse(call.kwargs["include_expired"])
+        release.assert_called_once_with(
+            owner_id,
+            [snapshot["resource_key"] for snapshot in expected_snapshots],
+            force=False,
+            expected_leases=expected_snapshots,
+        )
+
+    def test_terminal_resource_convergence_batches_more_than_64_owner_leases(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        owner_id = str(inputs["lease_owner_id"])
+        leases = self.acquired(
+            owner_id, [f"operation:batch-{index:02d}" for index in range(65)]
+        )["leases"]
+        snapshots = sorted(
+            [work_acquire._lease_snapshot(lease, owner_id=owner_id) for lease in leases],
+            key=lambda item: item["resource_key"],
+        )
+        first, second = snapshots[:64], snapshots[64:]
+        release = Mock(
+            side_effect=[
+                self.released(owner_id, first),
+                self.released(owner_id, second),
+            ]
+        )
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        remaining_lease = next(
+            lease
+            for lease in leases
+            if lease["resource_key"] == second[0]["resource_key"]
+        )
+
+        with (
+            patch.object(
+                work_acquire.resources,
+                "list_resources",
+                side_effect=[leases, [remaining_lease], []],
+            ),
+            patch.object(
+                work_acquire.resources,
+                "count_resources",
+                side_effect=[65, 1, 0],
+            ),
+            patch.object(work_acquire.resources, "grabowski_resource_release", release),
+        ):
+            result = work_acquire._converge_terminal_resource_leases(
+                record,
+                assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual("released", result["state"])
+        self.assertEqual(2, result["release_batch_count"])
+        self.assertEqual(65, len(result["released_resource_keys"]))
+        self.assertEqual(2, release.call_count)
+        self.assertEqual(64, len(release.call_args_list[0].args[1]))
+        self.assertEqual(1, len(release.call_args_list[1].args[1]))
+        self.assertFalse(release.call_args_list[0].kwargs["force"])
+        self.assertFalse(release.call_args_list[1].kwargs["force"])
+        self.assertEqual(first, release.call_args_list[0].kwargs["expected_leases"])
+        self.assertEqual(second, release.call_args_list[1].kwargs["expected_leases"])
+
+    def test_terminal_resource_convergence_stops_between_batches_on_owner_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        owner_id = str(inputs["lease_owner_id"])
+        leases = self.acquired(
+            owner_id, [f"operation:drift-{index:02d}" for index in range(65)]
+        )["leases"]
+        snapshots = sorted(
+            [work_acquire._lease_snapshot(lease, owner_id=owner_id) for lease in leases],
+            key=lambda item: item["resource_key"],
+        )
+        first = snapshots[:64]
+        late = self.acquired(owner_id, ["operation:drift-late"])["leases"][0]
+        remaining_lease = next(
+            lease
+            for lease in leases
+            if lease["resource_key"] == snapshots[64]["resource_key"]
+        )
+        events: list[str] = []
+
+        def release_batch(*args: object, **kwargs: object) -> dict[str, object]:
+            events.append("audited-release")
+            return self.released(owner_id, first)
+
+        def list_owner_leases(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            events.append("observe")
+            return leases if events.count("observe") == 1 else [remaining_lease, late]
+
+        release = Mock(side_effect=release_batch)
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+
+        with (
+            patch.object(
+                work_acquire.resources,
+                "list_resources",
+                side_effect=list_owner_leases,
+            ),
+            patch.object(
+                work_acquire.resources,
+                "count_resources",
+                side_effect=[65, 2],
+            ),
+            patch.object(work_acquire.resources, "grabowski_resource_release", release),
+            self.assertRaisesRegex(
+                work_acquire.TerminalLeaseConvergenceError,
+                "inventory drifted during batched release",
+            ),
+        ):
+            work_acquire._converge_terminal_resource_leases(
+                record,
+                assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+
+        self.assertEqual(1, release.call_count)
+        self.assertEqual(64, len(release.call_args.args[1]))
+        self.assertFalse(release.call_args.kwargs["force"])
+        self.assertEqual(["observe", "audited-release", "observe"], events)
+
+    def test_terminal_owner_lease_observation_fails_closed_when_bounded_view_is_incomplete(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        owner_id = str(inputs["lease_owner_id"])
+        lease = self.acquired(owner_id, [inputs["resource_keys"][0]])["leases"][0]
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        with (
+            patch.object(
+                work_acquire.resources, "list_resources", return_value=[lease]
+            ),
+            patch.object(
+                work_acquire.resources, "count_resources", return_value=2
+            ),
+            self.assertRaisesRegex(
+                work_acquire.TerminalLeaseConvergenceError,
+                "changed or exceeds bounded view",
+            ),
+        ):
+            work_acquire._terminal_lane_resource_observation(record)
+
+    def test_terminal_resource_generation_drift_keeps_pending_and_blocks_reacquire(self) -> None:
+        params = self.parameters()
+        inputs, receipt = self.store_lane(params)
+        lane_id = str(inputs["lane_id"])
+        owner_id = str(inputs["lease_owner_id"])
+        leases = self.acquired(owner_id, list(inputs["resource_keys"]))["leases"]
+        assessment = self.terminal_assessment(lane_id, 200)
+
+        with (
+            patch.object(
+                work_acquire.resources,
+                "list_resources",
+                return_value=leases,
+            ),
+            patch.object(
+                work_acquire.resources,
+                "count_resources",
+                return_value=len(leases),
+            ),
+            patch.object(
+                work_acquire.resources,
+                "grabowski_resource_release",
+                side_effect=RuntimeError("Resource lease changed before release"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "changed before release"),
+        ):
+            work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+
+        pending = work_acquire._read_state(self.state / f"{lane_id}.json")
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertIn("terminal_closeout_pending", pending)
+        self.assertNotIn("terminal_closeout", pending)
+
+        acquire = Mock()
+        ensure = Mock()
+        replay = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        self.assertTrue(replay["closeout_pending"])
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+
+        with self.assertRaisesRegex(RuntimeError, "current durable pending receipt"):
+            work_acquire.persist_terminal_closeout(
+                lane_id,
+                self.terminal_assessment(lane_id, 201),
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+
+        with (
+            patch.object(work_acquire.resources, "list_resources", return_value=[]),
+            patch.object(work_acquire.resources, "count_resources", return_value=0),
+        ):
+            recovered = work_acquire.persist_terminal_closeout(
+                lane_id,
+                self.terminal_assessment(
+                    lane_id, 201, lease_active=False
+                ),
+                expected_receipt_sha256=str(pending["receipt_sha256"]),
+            )
+        self.assertTrue(recovered["replayed"])
+        self.assertNotEqual(
+            pending["terminal_closeout_pending"]["assessment"]["observation_sha256"],
+            recovered["terminal_closeout"]["assessment"]["observation_sha256"],
+        )
+        self.assertNotIn("terminal_closeout_pending", recovered)
+        self.assertIn("terminal_closeout", recovered)
+        self.assertEqual(
+            recovered["resource_lease_closeout"]["state"], "already_absent"
+        )
+        self.assertEqual(
+            201, recovered["terminal_closeout"]["assessment"]["observed_at_unix"]
+        )
 
     def test_terminal_closeout_replay_retries_checkout_lifecycle_convergence(self) -> None:
         params = self.parameters()
