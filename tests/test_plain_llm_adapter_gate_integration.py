@@ -206,6 +206,75 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
                 gate.MAX_JSON_EVIDENCE_BYTES,
             )
 
+    def test_ox_alpha_adapter_output_passes_independent_gate_reconstruction(self) -> None:
+        diff = b"diff --git a/x b/x\n+changed\n"
+        state = _state(diff)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            packet_root = root / "packets" / "packet"
+            packet = gate.write_external_review_packet(
+                packet_root, state, diff
+            )
+            output = root / "ox-alpha-evidence.json"
+
+            def fake_run(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                    "",
+                )
+
+            with (
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+                mock.patch.object(
+                    plain,
+                    "resolve_provider_executable",
+                    return_value="/private/opencode",
+                ),
+                mock.patch.object(
+                    plain.secrets,
+                    "token_hex",
+                    return_value="2" * 32,
+                ),
+            ):
+                evidence = plain.run_from_manifest(
+                    manifest_path=Path(packet["manifest_path"]),
+                    output_path=output,
+                    raw_review_path=None,
+                    transmitted_prompt_path=None,
+                    provider="ox-alpha",
+                    executable="opencode",
+                    model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=100_000,
+                    context_attestation="public-context",
+                )
+
+            result = gate.evaluate_review_gate(
+                state,
+                self_review=_self_review(state["pr_diff_sha256"]),
+                external_review_evidence=evidence,
+                external_review_artifact_root=root,
+            )
+            self.assertEqual(result["verdict"], "PASS")
+            warnings = "\n".join(result["warnings"])
+            self.assertNotIn(
+                "Optional external review evidence invalid", warnings
+            )
+            self.assertEqual(
+                evidence["review_input"]["requested_model"],
+                gate.PLAIN_LLM_OX_ALPHA_MODEL,
+            )
+            self.assertEqual(
+                evidence["review_input"]["context_attestation"],
+                "public-context",
+            )
+
     def test_packet_writer_rejects_unsafe_ancestry_before_creation(self) -> None:
         diff = b"diff --git a/x b/x\n+changed\n"
         state = _state(diff)

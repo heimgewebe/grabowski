@@ -7,7 +7,11 @@ from typing import Any
 
 PLAIN_LLM_REVIEW_INPUT_MODE = "plain_llm_single_turn_v1"
 PLAIN_LLM_REVIEW_SOURCE_PREFIX = "plain-llm:"
-PLAIN_LLM_PROVIDERS = frozenset({"gemini", "grok"})
+PLAIN_LLM_PROVIDERS = frozenset({"gemini", "grok", "ox-alpha"})
+PLAIN_LLM_OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
+PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS = frozenset(
+    {"public-context", "synthetic-context", "non-sensitive-context"}
+)
 PLAIN_LLM_PROMPT_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES = 1_000_000
 PLAIN_LLM_MAX_RAW_REVIEW_BYTES = 1_000_000
