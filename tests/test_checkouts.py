@@ -2744,6 +2744,69 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(linked, audit["before_retention_repo_path"])
         self.assertEqual(canonical, audit["after_retention_repo_path"])
 
+    def test_binding_identity_rebind_ignores_cleaned_historical_archive(self) -> None:
+        binding = self._managed_binding(owner="owner-a")
+        self._publish_remote()
+        archived = checkouts.grabowski_checkout_archive(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            "historical archive fixture",
+            int(time.time()) + 3600,
+            self.head,
+            "topic",
+        )
+        archive = archived["archive"]
+        now = int(time.time())
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE archives SET cleaned_at_unix=? WHERE archive_id=?",
+                (now, archive["archive_id"]),
+            )
+            connection.execute(
+                """
+                UPDATE lifecycle_bindings
+                SET phase='active', repo_path=?, terminal_at_unix=NULL, archived_at_unix=NULL
+                WHERE checkout_key=?
+                """,
+                (str(self.checkout.resolve()), binding["checkout_key"]),
+            )
+            connection.commit()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        self.assertEqual("repo_path_canonicalization", preview["rebind_mode"])
+        self.assertEqual(
+            ["binding-repo-path-mismatch"], preview["allowed_drift_reasons"]
+        )
+
+    def test_binding_identity_rebind_rejects_current_open_archive(self) -> None:
+        binding = self._managed_binding(owner="owner-a")
+        self._publish_remote()
+        checkouts.grabowski_checkout_archive(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            "open archive fixture",
+            int(time.time()) + 3600,
+            self.head,
+            "topic",
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                """
+                UPDATE lifecycle_bindings
+                SET phase='active', repo_path=?, terminal_at_unix=NULL, archived_at_unix=NULL
+                WHERE checkout_key=?
+                """,
+                (str(self.checkout.resolve()), binding["checkout_key"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "unavailable after archive creation"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
     def test_binding_identity_rebind_rejects_repo_path_plus_branch_drift(self) -> None:
         binding = self._repo_path_drift_managed_checkout()
         self._git("branch", "-m", "topic-v2", cwd=self.checkout)

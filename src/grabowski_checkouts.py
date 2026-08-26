@@ -2965,10 +2965,23 @@ def _binding_identity_rebind_state(
             "SELECT * FROM retention WHERE checkout_key=?",
             (record["checkout_key"],),
         ).fetchone()
-        archive_row = connection.execute(
-            "SELECT archive_id FROM archives WHERE checkout_key=? LIMIT 1",
+        archive_rows = connection.execute(
+            """
+            SELECT * FROM archives
+            WHERE checkout_key=? AND cleaned_at_unix IS NULL
+            ORDER BY created_at_unix DESC, archive_id DESC
+            """,
             (record["checkout_key"],),
-        ).fetchone()
+        ).fetchall()
+        superseded_archive_ids = _archive_supersession_ids(connection)
+        archive_row = next(
+            (
+                candidate
+                for candidate in archive_rows
+                if candidate["archive_id"] not in superseded_archive_ids
+            ),
+            None,
+        )
     finally:
         connection.close()
     if lifecycle_row is None or retention_row is None:
