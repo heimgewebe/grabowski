@@ -783,6 +783,55 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
         self.assertEqual("push_rejected_or_failed", evidence["status"])
 
 
+class CaptainRequiredChecksProbeTests(unittest.TestCase):
+    def test_no_required_checks_cli_rc1_is_green_empty_set(self) -> None:
+        github_runner = mock.Mock(
+            return_value={
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "no required checks reported on the 'feature/no-required' branch\n",
+            }
+        )
+
+        probe = merge_guard.required_pr_checks_probe(
+            Path.cwd(),
+            github_runner,
+            repo_slug="heimgewebe/infra",
+            pr_number=153,
+        )
+
+        self.assertEqual("green", probe["status"])
+        self.assertEqual(0, probe["required_check_count"])
+        self.assertEqual(0, probe["non_passing_required_check_count"])
+        self.assertEqual([], probe["required_check_names"])
+        self.assertEqual([], probe["errors"])
+        self.assertEqual(
+            "no_required_checks_reported",
+            probe["query"]["nonzero_empty_result"],
+        )
+
+    def test_other_required_checks_rc1_remains_unavailable(self) -> None:
+        github_runner = mock.Mock(
+            return_value={
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "HTTP 401: Bad credentials\n",
+            }
+        )
+
+        probe = merge_guard.required_pr_checks_probe(
+            Path.cwd(),
+            github_runner,
+            repo_slug="heimgewebe/infra",
+            pr_number=153,
+        )
+
+        self.assertEqual("unavailable", probe["status"])
+        self.assertIsNone(probe["required_check_count"])
+        self.assertEqual(["required_pr_checks_query_failed"], probe["errors"])
+        self.assertNotIn("nonzero_empty_result", probe["query"])
+
+
 
 
 if __name__ == "__main__":
