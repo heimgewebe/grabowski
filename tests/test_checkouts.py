@@ -229,6 +229,17 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         return binding
 
+    def _repo_path_drift_managed_checkout(self) -> dict[str, object]:
+        binding = self._managed_binding(owner="owner-a")
+        self._publish_remote()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET repo_path=? WHERE checkout_key=?",
+                (str(self.checkout.resolve()), binding["checkout_key"]),
+            )
+            connection.commit()
+        return binding
+
     def _completed_owner_drift(self) -> dict[str, object]:
         binding = self._managed_binding(owner="owner-a")
         checkouts._mark_checkout_completed_retained(
@@ -2544,6 +2555,145 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(sentinel, result)
         terminal_preview.assert_called_once_with(binding["checkout_key"])
         rebind_preview.assert_not_called()
+
+    def test_lifecycle_reservation_canonicalizes_repo_path_from_linked_worktree(self) -> None:
+        binding = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=self._common_dir(),
+            repo_path=self.checkout,
+            checkout_path=self.checkout,
+            owner_id="owner-a",
+            purpose="canonical repo path fixture",
+            source_kind="bureau_task",
+            source_id="GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+            artifact_class="implementation_worktree",
+            retention_until_unix=int(time.time()) + 3600,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self.assertEqual(str(self.repo.resolve()), binding["repo_path"])
+
+    def test_lifecycle_reservation_does_not_silently_repair_existing_repo_path_drift(self) -> None:
+        binding = self._managed_binding(owner="owner-a")
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET repo_path=? WHERE checkout_key=?",
+                (str(self.checkout.resolve()), binding["checkout_key"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "repo_path drift requires identity rebind"):
+            checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=self._common_dir(),
+                repo_path=self.checkout,
+                checkout_path=self.checkout,
+                owner_id="owner-a",
+                purpose="managed lifecycle fixture",
+                source_kind="bureau_task",
+                source_id="GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+                artifact_class="implementation_worktree",
+                retention_until_unix=int(time.time()) + 3600,
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+        with checkouts._database() as connection:
+            row = connection.execute(
+                "SELECT repo_path FROM lifecycle_bindings WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            ).fetchone()
+        self.assertEqual(str(self.checkout.resolve()), row["repo_path"])
+
+    def test_worktree_records_keep_primary_worktree_identity_from_linked_caller(self) -> None:
+        _, _, records = checkouts._worktree_records(self.checkout)
+        by_path = {item["path"]: item for item in records}
+        primary = by_path[str(self.repo.resolve())]
+        linked = by_path[str(self.checkout.resolve())]
+        self.assertTrue(primary["is_main"])
+        self.assertFalse(primary["is_linked"])
+        self.assertFalse(linked["is_main"])
+        self.assertTrue(linked["is_linked"])
+        self.assertEqual(str(self.repo.resolve()), linked["repo_path"])
+
+    def test_binding_identity_rebind_preview_and_apply_canonicalizes_repo_path(self) -> None:
+        binding = self._repo_path_drift_managed_checkout()
+        preview = checkouts.grabowski_checkout_binding_identity_rebind_preview(
+            binding["checkout_key"]
+        )
+        self.assertEqual("repo_path_canonicalization", preview["rebind_mode"])
+        self.assertEqual(
+            ["binding-repo-path-mismatch"], preview["allowed_drift_reasons"]
+        )
+        self.assertEqual(str(self.repo.resolve()), preview["checkout"]["repo_path"])
+        self.assertEqual(str(self.repo.resolve()), preview["target_identity"]["repo_path"])
+        self.assertEqual(self.head, preview["target_identity"]["expected_head"])
+        self.assertEqual("topic", preview["target_identity"]["expected_branch"])
+
+        applied = checkouts.grabowski_checkout_binding_identity_rebind_apply(
+            binding["checkout_key"],
+            "owner-a",
+            preview["snapshot_sha256"],
+            preview["observed_at_unix"],
+            preview["confirmation"],
+        )
+        self.assertEqual("applied", applied["status"])
+        self.assertEqual("repo_path_canonicalization", applied["rebind_mode"])
+        for row in (applied["after"]["lifecycle"], applied["after"]["retention"]):
+            self.assertEqual(str(self.repo.resolve()), row["repo_path"])
+            self.assertEqual("owner-a", row["owner_id"])
+            self.assertEqual(self.head, row["expected_head"])
+            self.assertEqual("topic", row["expected_branch"])
+        self.assertEqual("active", applied["after"]["lifecycle"]["phase"])
+        self.assertEqual(
+            ["lifecycle_repo_path_update"],
+            applied["audit"]["effects"],
+        )
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(
+            item for item in inventory["worktrees"] if item["path"] == str(self.checkout)
+        )
+        self.assertTrue(linked["lifecycle_decision"]["binding_consistent"])
+        self.assertEqual([], linked["lifecycle_decision"]["binding_drift_reasons"])
+
+    def test_binding_identity_rebind_rejects_repo_path_plus_branch_drift(self) -> None:
+        binding = self._repo_path_drift_managed_checkout()
+        self._git("branch", "-m", "topic-v2", cwd=self.checkout)
+        with self.assertRaisesRegex(RuntimeError, "supported identity drift mode"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_binding_identity_rebind_rejects_repo_path_from_other_common_dir(self) -> None:
+        binding = self._repo_path_drift_managed_checkout()
+        foreign = self.root / "foreign-repo"
+        foreign.mkdir()
+        subprocess.run(
+            ["git", "-C", str(foreign), "init", "-b", "main"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET repo_path=? WHERE checkout_key=?",
+                (str(foreign), binding["checkout_key"]),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "another Git common-dir"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
+
+    def test_binding_identity_rebind_rejects_dirty_repo_path_drift(self) -> None:
+        binding = self._repo_path_drift_managed_checkout()
+        (self.checkout / "dirty-repo-path.txt").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "must be clean"):
+            checkouts.grabowski_checkout_binding_identity_rebind_preview(
+                binding["checkout_key"]
+            )
 
     def test_binding_identity_rebind_preview_and_apply_converges_branch_rename(self) -> None:
         binding, new_head, new_branch = self._renamed_managed_checkout()

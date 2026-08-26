@@ -817,6 +817,32 @@ def active_capacity_projection(repo: Path) -> dict[str, Any]:
     return _active_capacity_projection(common_dir, now=_now())
 
 
+def _canonical_worktree_repo_path(
+    repo: Path, *, expected_common_dir: Path
+) -> Path:
+    """Return Git's primary worktree path for one exact repository common-dir."""
+    _, observed_common_dir, records = _worktree_records(repo)
+    if observed_common_dir != expected_common_dir:
+        raise RuntimeError(
+            "Repository common-dir does not match the checkout lifecycle binding"
+        )
+    canonical_paths = {
+        str(record.get("repo_path"))
+        for record in records
+        if isinstance(record.get("repo_path"), str) and record.get("repo_path")
+    }
+    if len(canonical_paths) != 1:
+        raise RuntimeError(
+            "Git worktree inventory does not expose one canonical repository path"
+        )
+    canonical = _safe_path(next(iter(canonical_paths)), must_exist=True)
+    if _git_common_dir(canonical) != observed_common_dir:
+        raise RuntimeError(
+            "Canonical repository path does not match the observed Git common-dir"
+        )
+    return canonical
+
+
 def _reserve_checkout_lifecycle(
     *,
     repo_common_dir: Path,
@@ -842,7 +868,10 @@ def _reserve_checkout_lifecycle(
     artifact = _artifact_class(artifact_class)
     until = _retention_until(retention_until_unix)
     common_dir = _safe_path(repo_common_dir, must_exist=True)
-    top_level = _resolve_repo(repo_path)
+    requested_repo = _resolve_repo(repo_path)
+    canonical_repo = _canonical_worktree_repo_path(
+        requested_repo, expected_common_dir=common_dir
+    )
     checkout = _safe_path(checkout_path, must_exist=False)
     _reject_evidence_checkout(checkout)
     head = (
@@ -882,6 +911,15 @@ def _reserve_checkout_lifecycle(
             )
             if observed_contract != expected_contract:
                 raise RuntimeError("Checkout lifecycle source or identity binding conflicts")
+            if (
+                existing["repo_common_dir"] != str(common_dir)
+                or existing["checkout_path"] != str(checkout)
+            ):
+                raise RuntimeError("Checkout lifecycle repository identity binding conflicts")
+            if existing["repo_path"] != str(canonical_repo):
+                raise RuntimeError(
+                    "Checkout lifecycle repo_path drift requires identity rebind"
+                )
         count = _active_creation_count(
             connection,
             repo_common_dir=common_dir,
@@ -926,7 +964,7 @@ def _reserve_checkout_lifecycle(
             (
                 checkout_key,
                 str(common_dir),
-                str(top_level),
+                str(canonical_repo),
                 str(checkout),
                 owner,
                 normalized_purpose,
@@ -1460,8 +1498,8 @@ def _worktree_records(
             "bare": bool(raw.get("bare")),
             "prunable": bool(raw.get("prunable")),
             "prunable_reason": raw.get("prunable_reason"),
-            "is_main": checkout_path == main_path or checkout_path == top_level,
-            "is_linked": not (checkout_path == main_path or checkout_path == top_level),
+            "is_main": checkout_path == main_path,
+            "is_linked": checkout_path != main_path,
         }
         records.append(record)
     return top_level, common_dir, sorted(records, key=lambda item: item["path"])
@@ -2880,12 +2918,17 @@ def _binding_identity_rebind_state(
     repo_path = _resolve_repo(repo)
     checkout = _safe_path(checkout_path, must_exist=True)
     _reject_evidence_checkout(checkout)
-    top_level, common_dir, record = _worktree_for_path(repo_path, checkout)
+    _, common_dir, record = _worktree_for_path(repo_path, checkout)
+    canonical_repo = _safe_path(str(record["repo_path"]), must_exist=True)
+    if _git_common_dir(canonical_repo) != common_dir:
+        raise RuntimeError(
+            "Checkout canonical repository path does not match the Git common-dir"
+        )
     status = _require_clean_linked(record)
     _require_expected(record, head, branch)
     coordination = _linked_checkout_coordination(
         checkout,
-        top_level,
+        canonical_repo,
         common_dir,
         branch=record.get("branch"),
         owner_id=owner,
@@ -2896,91 +2939,155 @@ def _binding_identity_rebind_state(
     )
     _require_no_blockers(coordination)
 
-    checkout_key = record["checkout_key"]
-    lifecycle = _lifecycle_bindings([checkout_key]).get(checkout_key)
-    retention = _retention_records([checkout_key]).get(checkout_key)
-    archive = _latest_archive_for_key(checkout_key)
-    if lifecycle is None or retention is None:
-        raise RuntimeError("Checkout identity rebind requires lifecycle and retention rows")
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        raise RuntimeError("Checkout lifecycle database is missing")
+    try:
+        lifecycle_row = connection.execute(
+            "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+            (record["checkout_key"],),
+        ).fetchone()
+        retention_row = connection.execute(
+            "SELECT * FROM retention WHERE checkout_key=?",
+            (record["checkout_key"],),
+        ).fetchone()
+        archive_row = connection.execute(
+            "SELECT archive_id FROM archives WHERE checkout_key=? LIMIT 1",
+            (record["checkout_key"],),
+        ).fetchone()
+    finally:
+        connection.close()
+    if lifecycle_row is None or retention_row is None:
+        raise RuntimeError(
+            "Checkout identity rebind requires lifecycle and retention rows"
+        )
+    lifecycle = _lifecycle_public(lifecycle_row)
+    retention = _retention_public(retention_row)
     if lifecycle["owner_id"] != owner or retention["owner_id"] != owner:
-        raise PermissionError("Checkout identity rebind requires one unchanged owner")
+        raise PermissionError(
+            "Checkout identity rebind requires one unchanged owner"
+        )
     if lifecycle["phase"] != "active":
-        raise RuntimeError("Checkout identity rebind is limited to active bindings")
-    if archive is not None:
-        raise RuntimeError("Checkout identity rebind is unavailable after archive creation")
+        raise RuntimeError(
+            "Checkout identity rebind is limited to active lifecycle bindings"
+        )
+    if archive_row is not None:
+        raise RuntimeError(
+            "Checkout identity rebind is unavailable after archive creation"
+        )
     if retention["retention_until_unix"] <= observed_at_unix:
         raise RuntimeError("Checkout retention expired before identity rebind")
-    if lifecycle["expected_branch"] == branch:
-        raise RuntimeError("Checkout identity rebind requires an observed branch rename")
-    if lifecycle["expected_branch"] != retention["expected_branch"]:
-        raise RuntimeError("Checkout lifecycle and retention branch preimages disagree")
     if lifecycle["expected_head"] != retention["expected_head"]:
-        raise RuntimeError("Checkout lifecycle and retention head preimages disagree")
+        raise RuntimeError(
+            "Checkout lifecycle and retention recorded heads differ before identity rebind"
+        )
+    if lifecycle["expected_branch"] != retention["expected_branch"]:
+        raise RuntimeError(
+            "Checkout lifecycle and retention recorded branches differ before identity rebind"
+        )
 
-    expected_static_identity = {
-        "checkout_key": checkout_key,
+    static_identity = {
+        "checkout_key": record["checkout_key"],
         "repo_common_dir": str(common_dir),
-        "repo_path": str(top_level),
         "checkout_path": str(checkout),
     }
     for row_name, row in (("lifecycle", lifecycle), ("retention", retention)):
-        for field, expected in expected_static_identity.items():
+        for field, expected in static_identity.items():
             if row[field] != expected:
-                raise RuntimeError(f"Checkout {row_name} {field} changed before identity rebind")
+                raise RuntimeError(
+                    f"Checkout {row_name} {field} changed before identity rebind"
+                )
 
     consistency = _binding_consistency(
         record,
         {"binding": lifecycle, "retention": retention, "latest_archive": None},
         exists=True,
     )
-    allowed_drift_reasons = [
+    drift_reasons = consistency["drift_reasons"]
+    branch_drift_reasons = [
         "binding-expected-branch-mismatch",
         "retention-expected-branch-mismatch",
     ]
-    if consistency["drift_reasons"] != allowed_drift_reasons:
-        raise RuntimeError(
-            "Checkout identity rebind requires exactly expected-branch mismatch drift"
-        )
-
+    repo_path_drift_reasons = {
+        "binding-repo-path-mismatch",
+        "retention-repo-path-mismatch",
+    }
     recorded_head = _validate_git_object_id(
         lifecycle["expected_head"], "recorded expected_head"
     )
-    lineage = _git_read(
-        checkout,
-        ["merge-base", "--is-ancestor", recorded_head, head],
-        check=False,
-    )
-    if lineage.returncode == 1:
-        raise RuntimeError(
-            "Checkout identity rebind requires current head to descend from recorded head"
-        )
-    if lineage.returncode != 0:
-        detail = (lineage.stderr or lineage.stdout).strip()
-        raise RuntimeError(detail or "Checkout identity rebind head-lineage proof failed")
-    head_lineage = {
-        "recorded_head": recorded_head,
-        "current_head": head,
-        "recorded_head_is_ancestor": True,
-    }
+    recorded_branch = lifecycle["expected_branch"]
 
-    remote = _remote_secured_observation(record, verify_github_pull_ref=True)
+    if drift_reasons == branch_drift_reasons:
+        rebind_mode = "branch_rename"
+        if recorded_branch == branch:
+            raise RuntimeError(
+                "Checkout identity rebind requires an observed branch rename"
+            )
+        lineage = _git_read(
+            canonical_repo,
+            ["merge-base", "--is-ancestor", recorded_head, head],
+            check=False,
+        )
+        if lineage.returncode != 0:
+            raise RuntimeError(
+                "Checkout identity rebind current head does not descend from recorded head"
+            )
+        head_lineage = {
+            "recorded_head": recorded_head,
+            "current_head": head,
+            "recorded_head_is_ancestor": True,
+        }
+    elif drift_reasons and set(drift_reasons).issubset(repo_path_drift_reasons):
+        rebind_mode = "repo_path_canonicalization"
+        if recorded_head != head or retention["expected_head"] != head:
+            raise RuntimeError(
+                "Checkout repo-path rebind requires unchanged recorded and current heads"
+            )
+        if recorded_branch != branch or retention["expected_branch"] != branch:
+            raise RuntimeError(
+                "Checkout repo-path rebind requires unchanged recorded and current branches"
+            )
+        for row_name, row in (("lifecycle", lifecycle), ("retention", retention)):
+            stored_repo_path = row.get("repo_path")
+            if not isinstance(stored_repo_path, str) or not stored_repo_path:
+                raise RuntimeError(
+                    f"Checkout {row_name} repo_path is invalid before identity rebind"
+                )
+            stored_repo = _resolve_repo(stored_repo_path)
+            if _git_common_dir(stored_repo) != common_dir:
+                raise RuntimeError(
+                    f"Checkout {row_name} repo_path belongs to another Git common-dir"
+                )
+        head_lineage = {
+            "recorded_head": recorded_head,
+            "current_head": head,
+            "recorded_head_is_ancestor": True,
+        }
+    else:
+        raise RuntimeError(
+            "Checkout identity rebind requires exactly one supported identity drift mode"
+        )
+
+    remote = _remote_secured_observation(
+        record, verify_github_pull_ref=True
+    )
     if remote.get("remote_secured") is not True:
         raise RuntimeError(
-            "Checkout identity rebind requires exact remote-secured head evidence"
+            "Checkout identity rebind requires the current head to be remote-secured"
         )
-
     material = {
         "schema_version": 1,
         "kind": "checkout_binding_identity_rebind_preview",
         "observed_at_unix": observed_at_unix,
         "expires_at_unix": observed_at_unix + BINDING_IDENTITY_REBIND_PREVIEW_TTL_SECONDS,
+        "rebind_mode": rebind_mode,
         "checkout": {
-            "checkout_key": checkout_key,
+            "checkout_key": record["checkout_key"],
             "repo_common_dir": str(common_dir),
-            "repo_path": str(top_level),
+            "repo_path": str(canonical_repo),
             "checkout_path": str(checkout),
-            "head": record["head"],
-            "branch": record.get("branch"),
+            "head": head,
+            "branch": branch,
             "dirty": status["dirty"],
             "entry_count": status["entry_count"],
         },
@@ -2989,11 +3096,15 @@ def _binding_identity_rebind_state(
         "lifecycle_sha256": _sha256_json(lifecycle),
         "retention": retention,
         "retention_sha256": _sha256_json(retention),
-        "allowed_drift_reasons": allowed_drift_reasons,
+        "allowed_drift_reasons": drift_reasons,
         "head_lineage": head_lineage,
         "remote": remote,
         "coordination": coordination,
-        "target_identity": {"expected_head": head, "expected_branch": branch},
+        "target_identity": {
+            "repo_path": str(canonical_repo),
+            "expected_head": head,
+            "expected_branch": branch,
+        },
         "does_not_establish": [
             "permission_to_archive",
             "permission_to_cleanup",
@@ -3002,6 +3113,8 @@ def _binding_identity_rebind_state(
             "permission_to_change_checkout_branch",
             "permission_to_adopt_dirty_work",
             "permission_to_change_checkout_owner",
+            "permission_to_change_git_history",
+            "permission_to_move_checkout",
         ],
     }
     digest = _sha256_json(material)
@@ -3009,7 +3122,7 @@ def _binding_identity_rebind_state(
         **material,
         "snapshot_sha256": digest,
         "confirmation": (
-            f"{BINDING_IDENTITY_REBIND_CONFIRMATION}:{checkout_key}:{digest}"
+            f"{BINDING_IDENTITY_REBIND_CONFIRMATION}:{record['checkout_key']}:{digest}"
         ),
     }
 
@@ -3022,21 +3135,27 @@ def _binding_identity_rebind_state_for_key(
 ) -> dict[str, Any]:
     key = _validate_sha256(checkout_key, "checkout_key")
     lifecycle = _lifecycle_bindings([key]).get(key)
-    if lifecycle is None:
+    if not isinstance(lifecycle, dict):
         raise RuntimeError("Checkout identity rebind requires an active lifecycle binding")
-    repo_path = _resolve_repo(lifecycle["repo_path"])
-    checkout = _safe_path(lifecycle["checkout_path"], must_exist=True)
-    _, _, record = _worktree_for_path(repo_path, checkout)
+    checkout_path = _safe_path(str(lifecycle["checkout_path"]), must_exist=True)
+    repo_path = _resolve_repo(checkout_path)
+    _, common_dir, record = _worktree_for_path(repo_path, checkout_path)
     if record["checkout_key"] != key:
-        raise RuntimeError("Checkout identity rebind checkout-key binding changed")
+        raise RuntimeError("Checkout identity rebind key no longer matches Git worktree")
+    if lifecycle["repo_common_dir"] != str(common_dir):
+        raise RuntimeError(
+            "Checkout lifecycle common-dir no longer matches the observed worktree"
+        )
     branch = record.get("branch")
     if not isinstance(branch, str) or not branch:
         raise RuntimeError("Checkout identity rebind requires a named current branch")
-    head = _validate_git_object_id(record.get("head"), "current checkout head")
+    head = record.get("head")
+    if not isinstance(head, str):
+        raise RuntimeError("Checkout identity rebind requires a current head")
     return _binding_identity_rebind_state(
-        repo=str(repo_path),
-        checkout_path=str(checkout),
-        owner_id=lifecycle["owner_id"],
+        repo=str(checkout_path),
+        checkout_path=str(checkout_path),
+        owner_id=str(lifecycle["owner_id"]),
         expected_head=head,
         expected_branch=branch,
         observed_at_unix=observed_at_unix,
@@ -3057,14 +3176,15 @@ def grabowski_checkout_binding_identity_rebind_preview(
 
 
 def _binding_identity_rebind_apply(
+    *,
     checkout_key: str,
     owner_id: str,
     expected_snapshot_sha256: str,
     preview_created_at_unix: int,
     confirmation: str,
 ) -> dict[str, Any]:
-    """CAS-rebind lifecycle+retention identity to the observed safe branch rename."""
     operator._require_operator_mutation("git_cli")
+    owner = _owner(owner_id)
     snapshot_sha256 = _validate_sha256(
         expected_snapshot_sha256, "expected_snapshot_sha256"
     )
@@ -3079,8 +3199,6 @@ def _binding_identity_rebind_apply(
         <= preview_created_at_unix + BINDING_IDENTITY_REBIND_PREVIEW_TTL_SECONDS
     ):
         raise RuntimeError("Checkout identity rebind preview expired or is future-dated")
-
-    owner = _owner(owner_id)
     planned = _binding_identity_rebind_state_for_key(
         checkout_key, observed_at_unix=preview_created_at_unix
     )
@@ -3094,7 +3212,7 @@ def _binding_identity_rebind_apply(
         raise RuntimeError("Checkout retention expired before identity rebind apply")
 
     checkout = Path(planned["checkout"]["checkout_path"])
-    top_level = Path(planned["checkout"]["repo_path"])
+    canonical_repo = Path(planned["checkout"]["repo_path"])
     common_dir = Path(planned["checkout"]["repo_common_dir"])
     lease = _acquire_checkout_resources(
         owner_id=owner,
@@ -3102,11 +3220,12 @@ def _binding_identity_rebind_apply(
         checkout_path=checkout,
         purpose="atomically rebind checkout lifecycle identity",
         retention_until_unix=int(planned["retention"]["retention_until_unix"]),
-        repo_path=top_level,
+        repo_path=canonical_repo,
         branch=planned["checkout"]["branch"],
         metadata={
             "checkout_key": planned["checkout"]["checkout_key"],
             "snapshot_sha256": snapshot_sha256,
+            "rebind_mode": planned["rebind_mode"],
         },
     )
     result: dict[str, Any] | None = None
@@ -3120,119 +3239,163 @@ def _binding_identity_rebind_apply(
             raise RuntimeError(
                 "Checkout identity rebind snapshot changed after lease acquisition"
             )
+        if current["rebind_mode"] != planned["rebind_mode"]:
+            raise RuntimeError(
+                "Checkout identity rebind mode changed after lease acquisition"
+            )
         if int(current["retention"]["retention_until_unix"]) <= _now():
             raise RuntimeError(
                 "Checkout retention expired after identity rebind lease acquisition"
             )
-
         applied_at = _now()
-        checkout_key = planned["checkout"]["checkout_key"]
+        target_repo_path = planned["target_identity"]["repo_path"]
+        target_head = planned["target_identity"]["expected_head"]
+        target_branch = planned["target_identity"]["expected_branch"]
         with _operation_lock(), _database() as connection:
             connection.execute("BEGIN IMMEDIATE")
             lifecycle_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
-                (checkout_key,),
+                (planned["checkout"]["checkout_key"],),
             ).fetchone()
             retention_row = connection.execute(
                 "SELECT * FROM retention WHERE checkout_key=?",
-                (checkout_key,),
+                (planned["checkout"]["checkout_key"],),
             ).fetchone()
             if lifecycle_row is None or retention_row is None:
-                raise RuntimeError("Checkout identity rebind database state disappeared")
+                raise RuntimeError("Checkout identity rebind state disappeared")
             lifecycle_before = _lifecycle_public(lifecycle_row)
             retention_before = _retention_public(retention_row)
-            if int(retention_before["retention_until_unix"]) <= applied_at:
-                raise RuntimeError(
-                    "Checkout retention expired before identity rebind commit"
-                )
             if (
                 _sha256_json(lifecycle_before) != planned["lifecycle_sha256"]
                 or _sha256_json(retention_before) != planned["retention_sha256"]
             ):
-                raise RuntimeError("Checkout identity rebind database preimage changed")
-
+                raise RuntimeError(
+                    "Checkout identity rebind database preimage changed"
+                )
+            if retention_before["retention_until_unix"] <= applied_at:
+                raise RuntimeError(
+                    "Checkout retention expired before identity rebind apply"
+                )
             lifecycle_updated_at = max(
                 applied_at, int(lifecycle_before["updated_at_unix"]) + 1
             )
             retention_updated_at = max(
                 applied_at, int(retention_before["updated_at_unix"]) + 1
             )
-            lifecycle_update = connection.execute(
-                """
-                UPDATE lifecycle_bindings
-                SET expected_head=?, expected_branch=?, updated_at_unix=?
-                WHERE checkout_key=? AND owner_id=? AND phase='active'
-                  AND expected_head=? AND expected_branch=? AND updated_at_unix=?
-                """,
-                (
-                    planned["target_identity"]["expected_head"],
-                    planned["target_identity"]["expected_branch"],
-                    lifecycle_updated_at,
-                    checkout_key,
-                    owner,
-                    lifecycle_before["expected_head"],
-                    lifecycle_before["expected_branch"],
-                    lifecycle_before["updated_at_unix"],
-                ),
+            repo_path_mode = planned["rebind_mode"] == "repo_path_canonicalization"
+            lifecycle_needs_update = (
+                not repo_path_mode
+                or lifecycle_before["repo_path"] != target_repo_path
             )
-            if lifecycle_update.rowcount != 1:
-                raise RuntimeError(
-                    "Checkout lifecycle identity rebind lost its exact database binding"
-                )
-            retention_update = connection.execute(
-                """
-                UPDATE retention
-                SET expected_head=?, expected_branch=?, updated_at_unix=?
-                WHERE checkout_key=? AND owner_id=?
-                  AND expected_head=? AND expected_branch=? AND updated_at_unix=?
-                """,
-                (
-                    planned["target_identity"]["expected_head"],
-                    planned["target_identity"]["expected_branch"],
-                    retention_updated_at,
-                    checkout_key,
-                    owner,
-                    retention_before["expected_head"],
-                    retention_before["expected_branch"],
-                    retention_before["updated_at_unix"],
-                ),
+            retention_needs_update = (
+                not repo_path_mode
+                or retention_before["repo_path"] != target_repo_path
             )
-            if retention_update.rowcount != 1:
-                raise RuntimeError(
-                    "Checkout retention identity rebind lost its exact database binding"
+            if lifecycle_needs_update:
+                lifecycle_update = connection.execute(
+                    "UPDATE lifecycle_bindings SET repo_path=?, expected_head=?, expected_branch=?, updated_at_unix=? "
+                    "WHERE checkout_key=? AND owner_id=? AND phase='active' AND repo_path=? AND expected_head=? "
+                    "AND expected_branch=? AND updated_at_unix=?",
+                    (
+                        target_repo_path,
+                        target_head,
+                        target_branch,
+                        lifecycle_updated_at,
+                        planned["checkout"]["checkout_key"],
+                        owner,
+                        lifecycle_before["repo_path"],
+                        lifecycle_before["expected_head"],
+                        lifecycle_before["expected_branch"],
+                        lifecycle_before["updated_at_unix"],
+                    ),
                 )
+                if lifecycle_update.rowcount != 1:
+                    raise RuntimeError(
+                        "Checkout lifecycle identity rebind lost its exact database binding"
+                    )
+            if retention_needs_update:
+                retention_update = connection.execute(
+                    "UPDATE retention SET repo_path=?, expected_head=?, expected_branch=?, updated_at_unix=? "
+                    "WHERE checkout_key=? AND owner_id=? AND repo_path=? AND expected_head=? "
+                    "AND expected_branch=? AND updated_at_unix=?",
+                    (
+                        target_repo_path,
+                        target_head,
+                        target_branch,
+                        retention_updated_at,
+                        planned["checkout"]["checkout_key"],
+                        owner,
+                        retention_before["repo_path"],
+                        retention_before["expected_head"],
+                        retention_before["expected_branch"],
+                        retention_before["updated_at_unix"],
+                    ),
+                )
+                if retention_update.rowcount != 1:
+                    raise RuntimeError(
+                        "Checkout retention identity rebind lost its exact database binding"
+                    )
             connection.commit()
-
-        lifecycle_after = _lifecycle_bindings([checkout_key])[checkout_key]
-        retention_after = _retention_records([checkout_key])[checkout_key]
-        target_identity = planned["target_identity"]
-        if (
-            lifecycle_after["owner_id"] != owner
-            or retention_after["owner_id"] != owner
-            or lifecycle_after["expected_head"] != target_identity["expected_head"]
-            or retention_after["expected_head"] != target_identity["expected_head"]
-            or lifecycle_after["expected_branch"] != target_identity["expected_branch"]
-            or retention_after["expected_branch"] != target_identity["expected_branch"]
-        ):
-            raise RuntimeError("Checkout identity rebind post-state mismatch")
-
-        audit = {
-            "timestamp_unix": applied_at,
-            "operation": "checkout-binding-identity-rebind",
-            "checkout_key": checkout_key,
-            "repo": planned["checkout"]["repo_path"],
-            "checkout_path": planned["checkout"]["checkout_path"],
-            "owner_id": owner,
-            "before_head": lifecycle_before["expected_head"],
-            "before_branch": lifecycle_before["expected_branch"],
-            "after_head": target_identity["expected_head"],
-            "after_branch": target_identity["expected_branch"],
-            "snapshot_sha256": snapshot_sha256,
-            "remote_secured_refs": planned["remote"]["remote_secured_refs"],
-            "effects": [
+            lifecycle_after_row = connection.execute(
+                "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
+                (planned["checkout"]["checkout_key"],),
+            ).fetchone()
+            retention_after_row = connection.execute(
+                "SELECT * FROM retention WHERE checkout_key=?",
+                (planned["checkout"]["checkout_key"],),
+            ).fetchone()
+        if lifecycle_after_row is None or retention_after_row is None:
+            raise RuntimeError("Checkout identity rebind post-state disappeared")
+        lifecycle_after = _lifecycle_public(lifecycle_after_row)
+        retention_after = _retention_public(retention_after_row)
+        for row_name, row in (("lifecycle", lifecycle_after), ("retention", retention_after)):
+            if (
+                row["owner_id"] != owner
+                or row["repo_path"] != target_repo_path
+                or row["expected_head"] != target_head
+                or row["expected_branch"] != target_branch
+            ):
+                raise RuntimeError(
+                    f"Checkout {row_name} identity did not converge after rebind"
+                )
+        if lifecycle_after["phase"] != lifecycle_before["phase"]:
+            raise RuntimeError("Checkout identity rebind changed lifecycle phase")
+        if planned["rebind_mode"] == "branch_rename":
+            effects = [
                 "lifecycle_expected_identity_update",
                 "retention_expected_identity_update",
-            ],
+            ]
+        elif planned["rebind_mode"] == "repo_path_canonicalization":
+            effects = []
+            if lifecycle_before["repo_path"] != target_repo_path:
+                effects.append("lifecycle_repo_path_update")
+            if retention_before["repo_path"] != target_repo_path:
+                effects.append("retention_repo_path_update")
+            if not effects:
+                raise RuntimeError("Checkout repo-path identity rebind had no bounded effect")
+        else:
+            raise RuntimeError("Checkout identity rebind mode is unsupported")
+        audit = {
+            "schema_version": 1,
+            "kind": "checkout-binding-identity-rebind",
+            "timestamp_unix": applied_at,
+            "operation": "checkout-binding-identity-rebind",
+            "checkout_key": planned["checkout"]["checkout_key"],
+            "owner_id": owner,
+            "rebind_mode": planned["rebind_mode"],
+            "repo_common_dir": str(common_dir),
+            "repo": str(canonical_repo),
+            "repo_path": str(canonical_repo),
+            "checkout_path": str(checkout),
+            "before_repo_path": lifecycle_before["repo_path"],
+            "after_repo_path": target_repo_path,
+            "before_head": lifecycle_before["expected_head"],
+            "before_branch": lifecycle_before["expected_branch"],
+            "after_head": target_head,
+            "after_branch": target_branch,
+            "snapshot_sha256": snapshot_sha256,
+            "remote_secured_refs": planned["remote"]["remote_secured_refs"],
+            "effects": effects,
         }
         try:
             base._append_audit(audit)
@@ -3245,6 +3408,8 @@ def _binding_identity_rebind_apply(
             "kind": "checkout_binding_identity_rebind_result",
             "status": "applied",
             "snapshot_sha256": snapshot_sha256,
+            "rebind_mode": planned["rebind_mode"],
+            "target_identity": planned["target_identity"],
             "before": {
                 "lifecycle": lifecycle_before,
                 "retention": retention_before,
