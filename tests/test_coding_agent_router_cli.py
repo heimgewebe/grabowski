@@ -250,6 +250,45 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         )
         self.assertEqual(ambiguous["status"], "ambiguous-account")
 
+    def test_antigravity_model_discovery_canonicalizes_configured_cli_ids(self) -> None:
+        catalog, _ = router._load_catalog()
+        self.assertEqual(
+            cli._antigravity_models_from_output(
+                catalog,
+                "gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n"
+                "gemini-3.6-flash\tGemini 3.6 Flash\n"
+                "invented-model\tGemini 3.1 Pro (High)\n"
+                "Gemini 3.1 Pro (High)\n",
+            ),
+            ["gemini-3.1-pro", "gemini-3.6-flash"],
+        )
+
+    def test_grok_model_discovery_accepts_legacy_and_inline_sections_only(self) -> None:
+        catalog, _ = router._load_catalog()
+        legacy = (
+            "Default model: grok-4.6\n"
+            "Available models:\n"
+            "* grok-4.6 default\n"
+            "* arbitrary-label default\n"
+        )
+        current = (
+            "Default model: grok-4.6\n"
+            "Available models: grok-4.6, arbitrary-label\n"
+        )
+        self.assertEqual(
+            cli._grok_models_from_output(catalog, legacy), ["grok-4.6"]
+        )
+        self.assertEqual(
+            cli._grok_models_from_output(catalog, current), ["grok-4.6"]
+        )
+        self.assertEqual(
+            cli._grok_models_from_output(
+                catalog,
+                "Default model: grok-4.6\nAvailable models: arbitrary-label\n",
+            ),
+            [],
+        )
+
     def test_probe_verifies_grok_pool_only_with_stable_supergrok_binding(self) -> None:
         catalog, _ = router._load_catalog()
         auth = {
