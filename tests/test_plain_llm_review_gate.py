@@ -163,7 +163,9 @@ def _plain_external_evidence(
             "head_sha": HEAD,
             "diff_sha256": DIFF_SHA,
             "transport": (
-                "prompt_file" if provider == "grok" else "argv"
+                "prompt_file"
+                if provider in {"grok", "ox-alpha"}
+                else "argv"
             ),
             "account_transport": "account_cli",
             "provider": provider,
@@ -182,7 +184,15 @@ def _plain_external_evidence(
             "prompt_sha256": prompt_sha256,
             "prompt_nonce": prompt_nonce,
             "prompt_argument_exposure": provider == "gemini",
-            "ephemeral_prompt_file": provider == "grok",
+            "ephemeral_prompt_file": provider in {"grok", "ox-alpha"},
+            "context_attestation": (
+                "public-context" if provider == "ox-alpha" else None
+            ),
+            "paid_fallback_policy": (
+                "disabled_by_exact_model"
+                if provider == "ox-alpha"
+                else "not_established_by_adapter"
+            ),
             "transmitted_prompt_bytes": len(prompt.encode("utf-8")),
             "transmitted_prompt_path": str(prompt_path),
             "raw_review_path": str(PLAIN_RAW_REVIEW_PATH),
@@ -223,7 +233,11 @@ def _plain_external_evidence(
                 "tool_policy": (
                     "empty_tools_plan_mode"
                     if provider == "grok"
-                    else "sandboxed_plan_mode"
+                    else (
+                        "opencode_pure_plan_agent"
+                        if provider == "ox-alpha"
+                        else "sandboxed_plan_mode"
+                    )
                 ),
                 "argv_sha256": "3" * 64,
                 "stdout_sha256": response_sha256,
@@ -343,6 +357,44 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "PASS")
         self.assertNotIn(
             "Optional external review evidence invalid", _warnings(result)
+        )
+
+    def test_valid_ox_alpha_evidence_is_independently_bound(self) -> None:
+        state = _state()
+        result = _evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            external_review_evidence=_plain_external_evidence(
+                state,
+                provider="ox-alpha",
+                model=gate.PLAIN_LLM_OX_ALPHA_MODEL,
+            ),
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertNotIn(
+            "Optional external review evidence invalid", _warnings(result)
+        )
+
+    def test_ox_alpha_evidence_fails_closed_on_unsafe_provider_policy(self) -> None:
+        state = _state()
+        evidence = _plain_external_evidence(
+            state,
+            provider="ox-alpha",
+            model=gate.PLAIN_LLM_OX_ALPHA_MODEL,
+        )
+        evidence["review_input"]["context_attestation"] = "private-context"
+        evidence["review_input"]["paid_fallback_policy"] = "not_established_by_adapter"
+        result = _evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            external_review_evidence=evidence,
+        )
+        warnings = _warnings(result)
+        self.assertIn(
+            "review_input.context_attestation is unsafe for Ox Alpha", warnings
+        )
+        self.assertIn(
+            "review_input.paid_fallback_policy is unsafe for Ox Alpha", warnings
         )
 
     def test_prompt_hash_is_reconstructed_not_trusted(self) -> None:
