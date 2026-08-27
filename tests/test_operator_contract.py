@@ -2537,6 +2537,17 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
                     operator.grabowski_git(str(repo), ["mv", "old", "new"])
 
+    def test_grabowski_git_pull_requires_branch_attempt(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_guard_git", return_value=None),
+            ):
+                with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
+                    operator.grabowski_git(str(repo), ["pull", "--ff-only"])
+
     def test_grabowski_git_branch_attempt_blocks_other_branch_targets(self) -> None:
         operator = _load_operator_module()
         attempt = {

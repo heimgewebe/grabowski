@@ -253,6 +253,7 @@ GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS = frozenset(
         "commit",
         "merge",
         "mv",
+        "pull",
         "read-tree",
         "rebase",
         "reset",
