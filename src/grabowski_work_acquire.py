@@ -25,6 +25,7 @@ mcp = operator.mcp
 MUTATING = operator.MUTATING
 SCHEMA_VERSION = 1
 LANE_KIND = "grabowski.work_lane"
+TERMINAL_PENDING_KIND = "grabowski.work_lane_terminal_closeout_pending"
 ACTOR_RE = re.compile(r"[A-Za-z0-9._:@/-]{1,256}\Z")
 SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -33,6 +34,9 @@ DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
+MAX_TERMINAL_OWNER_LEASES = 512
+MAX_RESOURCE_RELEASE_BATCH = 64
+DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES = frozenset({"candidate_adopted"})
 
 
 class ScopedWriterStartPreflight(ValueError):
@@ -45,6 +49,10 @@ class LeaseAcquisitionOutcomeUnknown(RuntimeError):
 
 class LeaseCompensationOutcomeUnknown(RuntimeError):
     """A guarded resource release returned without trustworthy evidence."""
+
+
+class TerminalLeaseConvergenceError(RuntimeError):
+    """Terminal lane resource leases did not converge to zero live owner leases."""
 
 
 def _canonical(value: Any) -> bytes:
@@ -285,6 +293,57 @@ def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
     return _sha(material)
 
 
+def _terminal_pending_retry_projection(
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
+    """Return stable terminal semantics while keeping the terminal head bound."""
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    return {
+        key: item
+        for key, item in validated.items()
+        if key
+        not in {
+            "observed_at_unix",
+            "observation_sha256",
+            "assessment_sha256",
+            "audit_record_sha256",
+            "does_not_establish",
+        }
+    }
+
+
+def _terminal_pending_retry_equivalent(
+    pending: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    record: dict[str, Any],
+) -> bool:
+    """Allow only the expected post-release observation transition on retry."""
+    pending_validated = lane_closeout.validate_terminal_assessment(pending)
+    current_validated = lane_closeout.validate_terminal_assessment(current)
+    if (
+        _terminal_pending_retry_projection(pending_validated)
+        != _terminal_pending_retry_projection(current_validated)
+    ):
+        return False
+    if (
+        pending_validated.get("observation_sha256")
+        == current_validated.get("observation_sha256")
+    ):
+        return True
+    if (
+        pending_validated.get("lease_release_ready") is not True
+        or current_validated.get("lease_release_ready") is not True
+        or pending_validated.get("closeout_state")
+        in DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES
+        or current_validated.get("closeout_state")
+        in DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES
+    ):
+        return False
+    _, _, live_owner_leases = _terminal_lane_resource_observation(record)
+    return not live_owner_leases
+
+
 def _terminal_closeout_assessment(record: dict[str, Any]) -> dict[str, Any] | None:
     terminal = record.get("terminal_closeout")
     if terminal is None:
@@ -299,6 +358,34 @@ def _terminal_closeout_assessment(record: dict[str, Any]) -> dict[str, Any] | No
         or terminal.get("closeout_state") != validated.get("closeout_state")
         or terminal.get("assessment_sha256") != validated.get("assessment_sha256")):
         raise RuntimeError("work-lane terminal closeout binding is invalid")
+    return validated
+
+
+def _terminal_closeout_pending_assessment(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    pending = record.get("terminal_closeout_pending")
+    if pending is None:
+        return None
+    if (
+        not isinstance(pending, dict)
+        or pending.get("schema_version") != 1
+        or pending.get("kind") != TERMINAL_PENDING_KIND
+    ):
+        raise RuntimeError("work-lane terminal closeout pending wrapper is invalid")
+    assessment = pending.get("assessment")
+    if not isinstance(assessment, dict):
+        raise RuntimeError("work-lane terminal closeout pending assessment is missing")
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    expected_receipt_sha256 = pending.get("expected_receipt_sha256")
+    if (
+        validated.get("lane_id") != record.get("lane_id")
+        or pending.get("closeout_state") != validated.get("closeout_state")
+        or pending.get("assessment_sha256") != validated.get("assessment_sha256")
+        or not isinstance(expected_receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_receipt_sha256) is None
+    ):
+        raise RuntimeError("work-lane terminal closeout pending binding is invalid")
     return validated
 
 
@@ -453,6 +540,188 @@ def _converge_terminal_checkout_lifecycle(
     }
 
 
+def _terminal_lane_resource_observation(
+    record: dict[str, Any],
+) -> tuple[str, list[str], list[dict[str, Any]]]:
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict):
+        raise TerminalLeaseConvergenceError("terminal Work Lane inputs are missing")
+    lane_id = record.get("lane_id")
+    owner_id = inputs.get("lease_owner_id")
+    if (
+        not isinstance(lane_id, str)
+        or not isinstance(owner_id, str)
+        or owner_id != f"lane:{lane_id}"
+    ):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane lease owner identity is invalid"
+        )
+    raw_keys = inputs.get("resource_keys")
+    if not isinstance(raw_keys, list) or any(
+        not isinstance(key, str) for key in raw_keys
+    ):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane resource key set is invalid"
+        )
+    registered_resource_keys = resources.normalize_resource_keys(raw_keys)
+    leases = resources.list_resources(
+        owner_id=owner_id,
+        include_expired=False,
+        limit=MAX_TERMINAL_OWNER_LEASES,
+    )
+    if not isinstance(leases, list):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane owner lease observation is invalid"
+        )
+    live_count = resources.count_resources(
+        owner_id=owner_id, include_expired=False
+    )
+    if live_count != len(leases):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane owner lease inventory changed or exceeds bounded view"
+        )
+    snapshots = [_lease_snapshot(lease, owner_id=owner_id) for lease in leases]
+    snapshots.sort(key=lambda item: item["resource_key"])
+    if len({snapshot["resource_key"] for snapshot in snapshots}) != len(snapshots):
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane owner lease observation contains duplicates"
+        )
+    return owner_id, registered_resource_keys, snapshots
+
+
+def _converge_terminal_resource_leases(
+    record: dict[str, Any],
+    *,
+    assessment: dict[str, Any],
+    permit_deferred: bool = False,
+) -> dict[str, Any] | None:
+    """Release every unchanged live resource lease still owned by a terminal lane.
+
+    The lane must first carry a durable terminal-closeout intent.  Current lease
+    generations are observed from the resource store and released with exact
+    snapshots, so a concurrent renew/reacquire fails closed instead of deleting
+    newer authority.  Foreign owners are never touched.
+    """
+    if not isinstance(assessment, dict) or assessment.get("phase") != "terminal":
+        raise TerminalLeaseConvergenceError(
+            "resource lease convergence requires terminal assessment"
+        )
+    if assessment.get("lease_release_ready") is not True:
+        return None
+    if (
+        assessment.get("closeout_state") in DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES
+        and not permit_deferred
+    ):
+        return None
+    owner_id, registered_resource_keys, snapshots = (
+        _terminal_lane_resource_observation(record)
+    )
+    released_keys: list[str] = []
+    release_batch_count = 0
+    remaining_snapshots = list(snapshots)
+    while remaining_snapshots:
+        expected_batch = remaining_snapshots[:MAX_RESOURCE_RELEASE_BATCH]
+        owned_keys = [str(snapshot["resource_key"]) for snapshot in expected_batch]
+        # Route every successful batch through the canonical audited mutation
+        # seam before any later readback can fail.  Partial convergence then
+        # remains durable in the resource audit even when a subsequent batch
+        # or final observation requires reconciliation.
+        release_receipt = resources.grabowski_resource_release(
+            owner_id,
+            owned_keys,
+            force=False,
+            expected_leases=expected_batch,
+        )
+        if (
+            not isinstance(release_receipt, dict)
+            or release_receipt.get("owner_id") != owner_id
+            or release_receipt.get("force") is not False
+            or release_receipt.get("snapshot_guarded") is not True
+            or not isinstance(release_receipt.get("released"), list)
+        ):
+            raise TerminalLeaseConvergenceError(
+                "terminal Work Lane resource release receipt is invalid"
+            )
+        released_snapshots = [
+            _lease_snapshot(lease, owner_id=owner_id)
+            for lease in release_receipt["released"]
+        ]
+        released_snapshots.sort(key=lambda item: item["resource_key"])
+        if released_snapshots != expected_batch:
+            raise TerminalLeaseConvergenceError(
+                "terminal Work Lane resource release receipt changed identity"
+            )
+        released_keys.extend(owned_keys)
+        release_batch_count += 1
+        remaining_snapshots = remaining_snapshots[len(expected_batch) :]
+        if remaining_snapshots:
+            _, _, fresh_snapshots = _terminal_lane_resource_observation(record)
+            if fresh_snapshots != remaining_snapshots:
+                raise TerminalLeaseConvergenceError(
+                    "terminal Work Lane owner lease inventory drifted during batched release"
+                )
+    _, _, residual_snapshots = _terminal_lane_resource_observation(record)
+    if residual_snapshots:
+        raise TerminalLeaseConvergenceError(
+            "terminal Work Lane retains live owner resource leases after release"
+        )
+    return {
+        "state": "released" if released_keys else "already_absent",
+        "owner_id": owner_id,
+        "registered_resource_key_count": len(registered_resource_keys),
+        "released_resource_keys": released_keys,
+        "release_batch_count": release_batch_count,
+        "snapshot_guarded": bool(released_keys),
+        "live_owner_lease_count": 0,
+    }
+
+
+def converge_terminal_resource_closeout(
+    lane_id: str,
+    *,
+    expected_closeout_states: set[str] | frozenset[str],
+) -> dict[str, Any]:
+    """Converge one already-terminal lane's live owner leases to zero.
+
+    This is the deferred-release hook for workflows such as candidate adoption
+    that must keep coordination authority until a later publication readback.
+    The caller must bind the accepted terminal closeout states explicitly.
+    """
+    _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
+    if (
+        not isinstance(expected_closeout_states, (set, frozenset))
+        or not expected_closeout_states
+        or any(
+            not isinstance(state, str) or not state
+            for state in expected_closeout_states
+        )
+    ):
+        raise ValueError("expected_closeout_states must be a non-empty set of strings")
+    with _lane_lock(lane_id) as receipt_path:
+        record = _read_state(receipt_path)
+        if record is None or record.get("lane_id") != lane_id:
+            raise RuntimeError("work-lane receipt is missing or bound to another lane")
+        assessment = _terminal_closeout_assessment(record)
+        if assessment is None:
+            raise RuntimeError("work-lane has no durable terminal closeout")
+        closeout_state = assessment.get("closeout_state")
+        if closeout_state not in expected_closeout_states:
+            raise RuntimeError("work-lane terminal closeout state is not accepted for resource release")
+        result = _converge_terminal_resource_leases(
+            record, assessment=assessment, permit_deferred=True
+        )
+        if result is None or result.get("live_owner_lease_count") != 0:
+            raise TerminalLeaseConvergenceError(
+                "terminal Work Lane resource closeout did not converge"
+            )
+        return {
+            **result,
+            "lane_id": lane_id,
+            "closeout_state": closeout_state,
+            "durable_receipt_path": str(receipt_path),
+        }
+
+
 def persist_terminal_closeout(
     lane_id: str,
     assessment: dict[str, Any],
@@ -461,59 +730,143 @@ def persist_terminal_closeout(
     audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
     audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> dict[str, Any]:
-    """CAS-persist one terminal assessment into the existing lane receipt."""
+    """CAS-persist one terminal assessment and converge release-ready lane leases.
+
+    Terminalization is a retry-safe saga. A durable pending marker is written
+    before terminal effects; normal work acquisition treats that marker as
+    non-resumable. Closeout states that still require controller publication
+    keep their leases until converge_terminal_resource_closeout is called after
+    authoritative publication readback.
+    """
     _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
-    _text(expected_receipt_sha256, "expected_receipt_sha256", pattern=re.compile(r"[0-9a-f]{64}\Z"))
+    _text(
+        expected_receipt_sha256,
+        "expected_receipt_sha256",
+        pattern=re.compile(r"[0-9a-f]{64}\Z"),
+    )
     validated = lane_closeout.validate_terminal_assessment(assessment)
     if validated.get("lane_id") != lane_id:
         raise RuntimeError("terminal closeout assessment is bound to another lane")
-    wrapper = {
-        "schema_version": 1,
-        "kind": "grabowski.work_lane_terminal_closeout",
-        "closeout_state": validated["closeout_state"],
-        "assessment_sha256": validated["assessment_sha256"],
-        "expected_receipt_sha256": expected_receipt_sha256,
-        "assessment": validated,
-    }
+
     with _lane_lock(lane_id) as receipt_path:
         record = _read_state(receipt_path)
         if record is None or record.get("lane_id") != lane_id:
             raise RuntimeError("work-lane receipt is missing or bound to another lane")
+
         existing = _terminal_closeout_assessment(record)
         if existing is not None:
-            if _terminal_assessment_replay_sha256(existing) != _terminal_assessment_replay_sha256(validated):
+            if (
+                _terminal_assessment_replay_sha256(existing)
+                != _terminal_assessment_replay_sha256(validated)
+            ):
                 raise RuntimeError("work-lane already records another terminal assessment")
-            audit_record_sha256 = _ensure_terminal_closeout_audit(
-                record, existing, audit_fn=audit_fn, audit_lookup_fn=audit_lookup_fn
-            )
-            result = {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
-            if audit_record_sha256 is not None:
-                result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
             lifecycle = _converge_terminal_checkout_lifecycle(
                 record, assessment=existing
             )
+            resource_closeout = _converge_terminal_resource_leases(
+                record, assessment=existing
+            )
+            audit_record_sha256 = _ensure_terminal_closeout_audit(
+                record,
+                existing,
+                audit_fn=audit_fn,
+                audit_lookup_fn=audit_lookup_fn,
+            )
+            result = {
+                **record,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": True,
+            }
+            if audit_record_sha256 is not None:
+                result["terminal_closeout_audit_record_sha256"] = (
+                    audit_record_sha256
+                )
             if lifecycle is not None:
                 result["checkout_lifecycle_closeout"] = lifecycle
+            if resource_closeout is not None:
+                result["resource_lease_closeout"] = resource_closeout
             return result
-        if record.get("receipt_sha256") != expected_receipt_sha256:
-            raise RuntimeError("work-lane terminal closeout CAS preimage changed")
-        # Converge managed checkout lifecycle before publishing terminal_closeout.
-        # If this step fails, callers continue to observe no terminal closeout and
-        # therefore retry the same evidence-bound terminalization path.  The
-        # lifecycle transition itself is idempotent, so a later receipt-write
-        # failure is likewise safe to retry without reopening or deleting work.
+
+        pending = _terminal_closeout_pending_assessment(record)
+        if pending is not None:
+            pending_wrapper = record["terminal_closeout_pending"]
+            if record.get("receipt_sha256") != expected_receipt_sha256:
+                raise RuntimeError(
+                    "terminal closeout retry CAS must match the current durable pending receipt"
+                )
+            if not _terminal_pending_retry_equivalent(
+                pending, validated, record=record
+            ):
+                raise RuntimeError(
+                    "work-lane already records another terminal closeout intent"
+                )
+            # The pending wrapper is continuation/CAS evidence only.  Effects
+            # must use the caller's freshly recomputed terminal assessment so
+            # task/process/Git liveness cannot go stale across retries.
+            effective = validated
+        else:
+            if record.get("receipt_sha256") != expected_receipt_sha256:
+                raise RuntimeError("work-lane terminal closeout CAS preimage changed")
+            pending_wrapper = {
+                "schema_version": 1,
+                "kind": TERMINAL_PENDING_KIND,
+                "closeout_state": validated["closeout_state"],
+                "assessment_sha256": validated["assessment_sha256"],
+                "expected_receipt_sha256": expected_receipt_sha256,
+                "assessment": validated,
+            }
+            record = _write_state(
+                receipt_path,
+                {
+                    **record,
+                    "terminal_closeout_pending": pending_wrapper,
+                    "updated_at_unix": int(time.time()),
+                },
+            )
+            effective = validated
+
+        # The durable pending intent prevents normal work-acquire replay from
+        # re-entering execution while terminal effects converge.  Checkout
+        # validation comes first so dirty/head drift fails before lease release.
         lifecycle = _converge_terminal_checkout_lifecycle(
-            record, assessment=validated
+            record, assessment=effective
         )
-        stored = _write_state(receipt_path, {**record, "terminal_closeout": wrapper, "updated_at_unix": int(time.time())})
-        result = {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
+        resource_closeout = _converge_terminal_resource_leases(
+            record, assessment=effective
+        )
+
+        wrapper = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_terminal_closeout",
+            "closeout_state": effective["closeout_state"],
+            "assessment_sha256": effective["assessment_sha256"],
+            "expected_receipt_sha256": pending_wrapper["expected_receipt_sha256"],
+            "assessment": effective,
+        }
+        final_record = dict(record)
+        final_record.pop("terminal_closeout_pending", None)
+        final_record.update(
+            terminal_closeout=wrapper,
+            updated_at_unix=int(time.time()),
+        )
+        stored = _write_state(receipt_path, final_record)
         audit_record_sha256 = _ensure_terminal_closeout_audit(
-            stored, validated, audit_fn=audit_fn, audit_lookup_fn=audit_lookup_fn
+            stored,
+            effective,
+            audit_fn=audit_fn,
+            audit_lookup_fn=audit_lookup_fn,
         )
+        result = {
+            **stored,
+            "durable_receipt_path": str(receipt_path),
+            "replayed": pending is not None,
+        }
         if audit_record_sha256 is not None:
             result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
         if lifecycle is not None:
             result["checkout_lifecycle_closeout"] = lifecycle
+        if resource_closeout is not None:
+            result["resource_lease_closeout"] = resource_closeout
         return result
 
 
@@ -1098,6 +1451,18 @@ def acquire_work(
             raise RuntimeError("work-lane identity collision")
         if existing is not None and _terminal_closeout_assessment(existing) is not None:
             return {**existing, "durable_receipt_path": str(receipt_path), "replayed": True}
+        if (
+            existing is not None
+            and _terminal_closeout_pending_assessment(existing) is not None
+        ):
+            return {
+                **existing,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": True,
+                "closeout_pending": True,
+                "decision": "TERMINAL_CLOSEOUT_PENDING",
+                "next_action": "retry_terminal_closeout",
+            }
         existing_writer_job = (
             existing.get("writer_job")
             if isinstance(existing, dict) and isinstance(existing.get("writer_job"), dict)

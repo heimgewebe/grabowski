@@ -7698,6 +7698,34 @@ def _candidate_lane_lease_snapshots(
     return snapshots
 
 
+def _candidate_lane_lease_preservation_readback(
+    work_acquire: Any,
+    record: dict[str, Any],
+    *,
+    expected_snapshots: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Compare owner-wide current leases with the exact pre-effect observation."""
+    if expected_snapshots is None or any(
+        not isinstance(item, dict) for item in expected_snapshots
+    ):
+        return {"leases_preserved": None, "lease_state": "ambiguous_or_partial"}
+    try:
+        _, _, current_snapshots = (
+            work_acquire._terminal_lane_resource_observation(record)
+        )
+    except Exception:
+        return {"leases_preserved": None, "lease_state": "ambiguous_or_partial"}
+    if not expected_snapshots:
+        if not current_snapshots:
+            return {"leases_preserved": False, "lease_state": "absent"}
+        return {"leases_preserved": None, "lease_state": "ambiguous_or_partial"}
+    if current_snapshots == expected_snapshots:
+        return {"leases_preserved": True, "lease_state": "preserved"}
+    if not current_snapshots:
+        return {"leases_preserved": False, "lease_state": "absent"}
+    return {"leases_preserved": None, "lease_state": "ambiguous_or_partial"}
+
+
 def _candidate_open_pr_readback(
     repo: Path,
     github_runner: GithubRunner,
@@ -8515,10 +8543,8 @@ def _controller_terminalize_delivered_source(
 
     terminal_wrapper = record.get("terminal_closeout")
     if terminal_wrapper is None:
+        owner_lease_snapshots: list[dict[str, Any]] | None = None
         try:
-            snapshots = _candidate_lane_lease_snapshots(
-                resource_store, owner_id=owner_id, resource_keys=resource_keys
-            )
             status = workspace.grabowski_agent_workspace_status(workspace_id)
             tasks = status.get("tasks") if isinstance(status, dict) else None
             if not isinstance(tasks, dict) or "writer" not in tasks:
@@ -8533,6 +8559,9 @@ def _controller_terminalize_delivered_source(
             if not isinstance(writer_state, str):
                 raise GripActionError("workspace writer state is unavailable")
             process_active = bool(_candidate_process_readback(checkouts, worktree))
+            _, _, owner_lease_snapshots = (
+                work_acquire._terminal_lane_resource_observation(record)
+            )
             local = _delivery_local_commit_readback(
                 worktree,
                 runner,
@@ -8576,7 +8605,7 @@ def _controller_terminalize_delivered_source(
                 writer_state=writer_state,
                 task_active=False,
                 process_active=False,
-                lease_active=True,
+                lease_active=bool(owner_lease_snapshots),
                 git_dirty=False,
                 head_sha=head_commit,
                 remote_head_sha=head_commit,
@@ -8602,11 +8631,16 @@ def _controller_terminalize_delivered_source(
                 audit_lookup_fn=work_acquire._find_terminal_closeout_audit,
             )
         except Exception as exc:
+            lease_state = _candidate_lane_lease_preservation_readback(
+                work_acquire,
+                record,
+                expected_snapshots=owner_lease_snapshots,
+            )
             return {
                 "state": "controller_terminalization_reconcile_required",
                 "terminalized": False,
                 "reconcile_required": True,
-                "leases_preserved": True,
+                **lease_state,
                 "next_action": "refresh_exact_task_process_lease_git_remote_and_pr_readback",
                 "error": type(exc).__name__,
             }
@@ -8622,49 +8656,41 @@ def _controller_terminalize_delivered_source(
                 "next_action": "inspect_existing_source_lane_terminal_state",
             }
         terminal_lane = record
-        try:
-            snapshots = _candidate_lane_lease_snapshots(
-                resource_store,
-                owner_id=owner_id,
-                resource_keys=resource_keys,
-                allow_all_absent=True,
-            )
-        except GripActionError as exc:
-            return {
-                "state": "controller_release_reconcile_required",
-                "terminalized": False,
-                "reconcile_required": True,
-                "next_action": "read_back_exact_source_lane_lease_set_before_release",
-                "error": str(exc),
-            }
 
-    lease_release: dict[str, Any] | None = None
-    if snapshots:
+    persisted_release = (
+        terminal_lane.get("resource_lease_closeout")
+        if isinstance(terminal_lane, dict)
+        else None
+    )
+    if (
+        isinstance(persisted_release, dict)
+        and persisted_release.get("live_owner_lease_count") == 0
+    ):
+        lease_release = persisted_release
+    else:
         try:
-            lease_release = resource_store.grabowski_resource_release(
-                owner_id,
-                resource_keys,
-                force=False,
-                expected_leases=snapshots,
+            lease_release = work_acquire.converge_terminal_resource_closeout(
+                lane_id,
+                expected_closeout_states={"pr_opened", "pr_updated"},
             )
         except Exception as exc:
             return {
                 "state": "controller_release_reconcile_required",
                 "terminalized": False,
                 "reconcile_required": True,
-                "next_action": "read_back_exact_source_lane_lease_set_before_release",
+                "next_action": "read_back_terminal_source_lane_owner_leases_before_release_retry",
                 "error": type(exc).__name__,
             }
-        released = lease_release.get("released") if isinstance(lease_release, dict) else None
-        if not isinstance(released, list) or {
-            item.get("resource_key") for item in released if isinstance(item, dict)
-        } != set(resource_keys):
-            return {
-                "state": "controller_release_reconcile_required",
-                "terminalized": False,
-                "reconcile_required": True,
-                "next_action": "read_back_exact_source_lane_lease_set_after_release",
-            }
+    if (
+        not isinstance(lease_release, dict)
+        or lease_release.get("live_owner_lease_count") != 0
+    ):
+        return {
+            "state": "controller_release_reconcile_required",
+            "terminalized": False,
+            "reconcile_required": True,
+            "next_action": "read_back_terminal_source_lane_owner_leases_after_release",
+        }
     return {
         "state": "source_lane_terminalized",
         "terminalized": True,
@@ -8770,8 +8796,27 @@ def _run_candidate_integration_ready(
     branch = str(manifest.get("writer_branch", ""))
 
     if record.get("terminal_closeout") is None:
+        pending_closeout = False
         if record.get("receipt_sha256") != expected_lane_receipt_sha256:
-            raise GripActionError("source Work Lane receipt drifted before terminalization")
+            pending_wrapper = record.get("terminal_closeout_pending")
+            try:
+                candidate_pending = work_acquire._terminal_closeout_pending_assessment(record)
+            except Exception as exc:
+                raise GripActionError(
+                    "source Work Lane pending closeout is not safely readable"
+                ) from exc
+            if (
+                not isinstance(candidate_pending, dict)
+                or candidate_pending.get("closeout_state") != "candidate_adopted"
+                or not isinstance(pending_wrapper, dict)
+                or pending_wrapper.get("expected_receipt_sha256")
+                != expected_lane_receipt_sha256
+            ):
+                raise GripActionError("source Work Lane receipt drifted before terminalization")
+            # The durable marker authorizes retry of the same closeout
+            # identity, but never supplies current terminality.  Fresh task,
+            # process and Git readback below must be assessed again.
+            pending_closeout = True
         try:
             status = workspace.grabowski_agent_workspace_status(workspace_id)
         except Exception as exc:
@@ -8787,7 +8832,10 @@ def _run_candidate_integration_ready(
         if not isinstance(writer_state, str):
             raise GripActionError("workspace writer state is unavailable")
         process_active = bool(_candidate_process_readback(checkouts, worktree))
-        _candidate_lane_lease_snapshots(resource_store, owner_id=owner_id, resource_keys=resource_keys)
+        if not pending_closeout:
+            _candidate_lane_lease_snapshots(
+                resource_store, owner_id=owner_id, resource_keys=resource_keys
+            )
         orientation = _run_repo_orient(spec, {"repo": str(worktree)}, receipt, runner)
         observation = lane_closeout.LaneCloseoutObservation(
             lane_id=lane_id,
@@ -8906,14 +8954,17 @@ def _run_candidate_integration_ready(
         existing_ready_pr = pr
 
     try:
-        final_snapshots = _candidate_lane_lease_snapshots(
-            resource_store,
-            owner_id=owner_id,
-            resource_keys=resource_keys,
-            allow_all_absent=True,
+        lease_release = work_acquire.converge_terminal_resource_closeout(
+            lane_id,
+            expected_closeout_states={"candidate_adopted"},
         )
-    except GripActionError as exc:
-        _check(receipt, "source-lane-leases-released", "fail", "final lease readback is partial or drifted")
+    except Exception as exc:
+        _check(
+            receipt,
+            "source-lane-leases-released",
+            "fail",
+            "owner-wide terminal lease convergence requires reconciliation",
+        )
         return {
             "state": "integration_ready_cleanup_pending",
             "integration_ready": True,
@@ -8924,21 +8975,15 @@ def _run_candidate_integration_ready(
             "source_lane": terminal_lane,
             "branch_publication": branch_publication,
             "pr_publication": pr_publication,
-            "error": str(exc),
+            "error": type(exc).__name__,
             "reconcile_required": True,
-            "next_action": "read_back_exact_source_lane_lease_set_before_cleanup",
+            "next_action": "read_back_terminal_source_lane_owner_leases_before_release_retry",
             "receipt_status": "blocked",
         }
-    lease_release: dict[str, Any] | None = None
-    cleanup_complete = not final_snapshots
-    if final_snapshots:
-        try:
-            lease_release = resource_store.grabowski_resource_release(owner_id, resource_keys, force=False, expected_leases=final_snapshots)
-        except Exception as exc:
-            _check(receipt, "source-lane-leases-released", "fail", "snapshot-guarded release requires reconciliation")
-            return {"state": "integration_ready_cleanup_pending", "integration_ready": True, "cleanup_complete": False, "workspace_id": workspace_id, "candidate_id": expected_candidate_id, "adoption": adoption, "source_lane": terminal_lane, "branch_publication": branch_publication, "pr_publication": pr_publication, "error": type(exc).__name__, "reconcile_required": True, "next_action": "read_back_source_lane_leases_before_release_retry", "receipt_status": "blocked"}
-        released = lease_release.get("released") if isinstance(lease_release, dict) else None
-        cleanup_complete = bool(isinstance(released, list) and {item.get("resource_key") for item in released if isinstance(item, dict)} == set(resource_keys))
+    cleanup_complete = bool(
+        isinstance(lease_release, dict)
+        and lease_release.get("live_owner_lease_count") == 0
+    )
     _check(receipt, "source-lane-leases-released", "pass" if cleanup_complete else "fail", "all exact source-lane leases released" if cleanup_complete else "release readback incomplete")
     if not cleanup_complete:
         return {"state": "integration_ready_cleanup_pending", "integration_ready": True, "cleanup_complete": False, "workspace_id": workspace_id, "candidate_id": expected_candidate_id, "adoption": adoption, "source_lane": terminal_lane, "branch_publication": branch_publication, "pr_publication": pr_publication, "lease_release": lease_release, "reconcile_required": True, "next_action": "read_back_source_lane_leases", "receipt_status": "blocked"}

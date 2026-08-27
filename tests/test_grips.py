@@ -5266,6 +5266,327 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(2, sum(args == ["rev-parse", "HEAD"] for args in git_calls))
         nested.assert_not_called()
 
+    def test_controller_terminalization_uses_central_owner_closeout_without_double_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace_id = "gaw-controller-terminalize"
+            lane_id = "2" * 32
+            lane_receipt_sha256 = "3" * 64
+            owner_id = f"lane:{lane_id}"
+            branch = "feat/controller-terminalize"
+            base_commit = "4" * 40
+            head_commit = "5" * 40
+            tree = "6" * 40
+            resource_keys = [f"path:{root}", f"repo:{root}:branch:{branch}"]
+            manifest = {
+                "workspace_id": workspace_id,
+                "repository": str(root),
+                "writer_worktree": str(root),
+                "writer_branch": branch,
+                "expected_base_head": base_commit,
+                "resources": {
+                    "lane_binding": {
+                        "lane_id": lane_id,
+                        "receipt_sha256": lane_receipt_sha256,
+                    }
+                },
+            }
+            delivery_manifest = {
+                "identity": {
+                    "workspace_id": workspace_id,
+                    "lane_id": lane_id,
+                    "lane_receipt_sha256": lane_receipt_sha256,
+                },
+                "commit_range": {
+                    "head_commit": head_commit,
+                    "candidate_git_tree_sha": tree,
+                    "commit_git_tree_sha": tree,
+                },
+                "branch": {"writer_branch": branch},
+                "actions": {
+                    "commit": {"message": "deliver"},
+                    "pr": {
+                        "base": "main",
+                        "title": "Delivery",
+                        "body": "Exact delivery",
+                    },
+                },
+            }
+            delivery = {
+                "state": "delivery_pr_ready",
+                "delivery_ready": True,
+                "workspace_id": workspace_id,
+                "resulting_commit_sha": head_commit,
+                "candidate_git_tree_sha": tree,
+                "delivery_manifest": delivery_manifest,
+                "pr": {"number": 77},
+                "pr_action": "created",
+            }
+            record = {
+                "lane_id": lane_id,
+                "receipt_sha256": lane_receipt_sha256,
+                "inputs": {
+                    "lease_owner_id": owner_id,
+                    "resource_keys": resource_keys,
+                },
+            }
+            workspace = types.SimpleNamespace(
+                _manifest=Mock(return_value=deepcopy(manifest)),
+                grabowski_agent_workspace_status=Mock(
+                    return_value={
+                        "tasks": {
+                            "writer": {"state": "completed", "terminal": True},
+                            "tests": {"state": "completed", "terminal": True},
+                        }
+                    }
+                ),
+            )
+            persist = Mock(
+                return_value={
+                    **deepcopy(record),
+                    "terminal_closeout": {"closeout_state": "pr_opened"},
+                    "resource_lease_closeout": {
+                        "state": "released",
+                        "live_owner_lease_count": 0,
+                    },
+                }
+            )
+            converge = Mock(
+                return_value={
+                    "state": "already_absent",
+                    "lane_id": lane_id,
+                    "closeout_state": "pr_opened",
+                    "live_owner_lease_count": 0,
+                }
+            )
+            work_acquire = types.SimpleNamespace(
+                _terminal_lane_resource_observation=Mock(
+                    return_value=(owner_id, resource_keys, [])
+                ),
+                persist_terminal_closeout=persist,
+                converge_terminal_resource_closeout=converge,
+                operator=types.SimpleNamespace(
+                    base=types.SimpleNamespace(_append_audit_with_digest=Mock())
+                ),
+                _find_terminal_closeout_audit=Mock(),
+            )
+            resource_release = Mock(
+                side_effect=AssertionError("controller must not release twice")
+            )
+            resource_store = types.SimpleNamespace(
+                grabowski_resource_release=resource_release
+            )
+            lane_closeout = __import__("grabowski_lane_closeout")
+            modules = (
+                workspace,
+                work_acquire,
+                lane_closeout,
+                resource_store,
+                types.SimpleNamespace(),
+                object(),
+                object(),
+            )
+            pr = {
+                "number": 77,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": branch,
+                "headRefOid": head_commit,
+                "isDraft": False,
+                "title": "Delivery",
+                "body": "Exact delivery",
+            }
+            with (
+                patch.object(
+                    lane_closeout, "assess", wraps=lane_closeout.assess
+                ) as assess,
+                patch.object(grips, "_candidate_delivery_modules", return_value=modules),
+                patch.object(grips, "_candidate_lane_record", return_value=record),
+                patch.object(
+                    grips,
+                    "_candidate_lane_lease_snapshots",
+                    side_effect=AssertionError(
+                        "published delivery closeout must not require original live lease set"
+                    ),
+                ) as snapshots,
+                patch.object(grips, "_candidate_process_readback", return_value=[]),
+                patch.object(
+                    grips, "_delivery_local_commit_readback", return_value={"exact": True}
+                ),
+                patch.object(
+                    grips,
+                    "_delivery_remote_readback",
+                    return_value={"state": "exact", "head": head_commit},
+                ),
+                patch.object(
+                    grips,
+                    "_delivery_pr_readback",
+                    return_value={"state": "exact", "pr": pr},
+                ),
+            ):
+                result = grips._controller_terminalize_delivered_source(
+                    delivery=delivery,
+                    runner=FakeGit(branch=branch, head=head_commit),
+                    github_runner=FakeGh(),
+                )
+
+        self.assertEqual("source_lane_terminalized", result["state"])
+        self.assertTrue(result["terminalized"])
+        persist.assert_called_once()
+        self.assertFalse(assess.call_args.args[0].lease_active)
+        converge.assert_not_called()
+        snapshots.assert_not_called()
+        resource_release.assert_not_called()
+        self.assertEqual(0, result["lease_release"]["live_owner_lease_count"])
+
+    def test_candidate_lane_lease_preservation_readback_is_owner_wide_and_truthful(self) -> None:
+        lane_id = "a" * 32
+        owner_id = f"lane:{lane_id}"
+        keys = ["path:/one", "path:/two"]
+        late_key = "operation:late-owner-lease"
+
+        def lease(key: str) -> dict[str, object]:
+            return {
+                "resource_key": key,
+                "owner_id": owner_id,
+                "acquired_at_unix": 1,
+                "updated_at_unix": 1,
+                "expires_at_unix": 2,
+                "metadata_sha256": "b" * 64,
+            }
+
+        expected = sorted(
+            [lease(keys[0]), lease(keys[1]), lease(late_key)],
+            key=lambda item: str(item["resource_key"]),
+        )
+        registered_only = sorted(
+            [lease(keys[0]), lease(keys[1])],
+            key=lambda item: str(item["resource_key"]),
+        )
+        record = {
+            "lane_id": lane_id,
+            "inputs": {
+                "lease_owner_id": owner_id,
+                "resource_keys": keys,
+            },
+        }
+        work_acquire = types.SimpleNamespace(
+            _terminal_lane_resource_observation=Mock(
+                side_effect=[
+                    (owner_id, keys, []),
+                    (owner_id, keys, registered_only),
+                    (owner_id, keys, expected),
+                ]
+            )
+        )
+
+        self.assertEqual(
+            {"leases_preserved": False, "lease_state": "absent"},
+            grips._candidate_lane_lease_preservation_readback(
+                work_acquire, record, expected_snapshots=expected
+            ),
+        )
+        self.assertEqual(
+            {"leases_preserved": None, "lease_state": "ambiguous_or_partial"},
+            grips._candidate_lane_lease_preservation_readback(
+                work_acquire, record, expected_snapshots=expected
+            ),
+        )
+        self.assertEqual(
+            {"leases_preserved": True, "lease_state": "preserved"},
+            grips._candidate_lane_lease_preservation_readback(
+                work_acquire, record, expected_snapshots=expected
+            ),
+        )
+        self.assertEqual(
+            {"leases_preserved": None, "lease_state": "ambiguous_or_partial"},
+            grips._candidate_lane_lease_preservation_readback(
+                work_acquire, record, expected_snapshots=None
+            ),
+        )
+
+    def test_controller_terminalization_reconciles_legacy_terminal_without_release_receipt(self) -> None:
+        lane_id = "2" * 32
+        record = {
+            "lane_id": lane_id,
+            "inputs": {
+                "lease_owner_id": f"lane:{lane_id}",
+                "resource_keys": ["path:/work"],
+            },
+            "terminal_closeout": {"closeout_state": "pr_opened"},
+        }
+        workspace = types.SimpleNamespace(
+            _manifest=Mock(
+                return_value={
+                    "workspace_id": "gaw-legacy-terminal",
+                    "repository": "/repo",
+                    "writer_worktree": "/work",
+                    "writer_branch": "feat/work",
+                    "expected_base_head": "4" * 40,
+                    "resources": {
+                        "lane_binding": {
+                            "lane_id": lane_id,
+                            "receipt_sha256": "3" * 64,
+                        }
+                    },
+                }
+            )
+        )
+        converge = Mock(
+            return_value={
+                "state": "released",
+                "lane_id": lane_id,
+                "closeout_state": "pr_opened",
+                "live_owner_lease_count": 0,
+            }
+        )
+        work_acquire = types.SimpleNamespace(
+            converge_terminal_resource_closeout=converge
+        )
+        modules = (
+            workspace,
+            work_acquire,
+            object(),
+            types.SimpleNamespace(),
+            object(),
+            object(),
+            object(),
+        )
+        delivery = {
+            "delivery_ready": True,
+            "workspace_id": "gaw-legacy-terminal",
+            "resulting_commit_sha": "5" * 40,
+            "candidate_git_tree_sha": "6" * 40,
+            "delivery_manifest": {
+                "identity": {
+                    "workspace_id": "gaw-legacy-terminal",
+                    "lane_id": lane_id,
+                    "lane_receipt_sha256": "3" * 64,
+                },
+                "commit_range": {
+                    "head_commit": "5" * 40,
+                    "candidate_git_tree_sha": "6" * 40,
+                    "commit_git_tree_sha": "6" * 40,
+                },
+                "branch": {"writer_branch": "feat/work"},
+                "actions": {"pr": {}},
+            },
+            "pr": {"number": 77},
+        }
+        with (
+            patch.object(grips, "_candidate_delivery_modules", return_value=modules),
+            patch.object(grips, "_candidate_lane_record", return_value=record),
+        ):
+            result = grips._controller_terminalize_delivered_source(
+                delivery=delivery,
+                runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+        self.assertEqual("source_lane_terminalized", result["state"])
+        converge.assert_called_once_with(
+            lane_id, expected_closeout_states={"pr_opened", "pr_updated"}
+        )
+
     def test_delivery_happy_path_keeps_terminalization_controller_only(self) -> None:
         case = self._happy_path_case()
         delivery_output = {
@@ -6018,6 +6339,7 @@ class GripFoundationTests(unittest.TestCase):
         remote_exact: bool = False,
         push_failure: bool = False,
         github_failure: bool = False,
+        pending_receipt_sha256: str | None = None,
     ) -> dict[str, object]:
         candidate_id = "a" * 64
         result_sha256 = "b" * 64
@@ -6085,6 +6407,11 @@ class GripFoundationTests(unittest.TestCase):
             record["terminal_closeout"] = {
                 "closeout_state": "candidate_adopted",
             }
+        elif pending_receipt_sha256 is not None:
+            record["receipt_sha256"] = pending_receipt_sha256
+            record["terminal_closeout_pending"] = {
+                "expected_receipt_sha256": lane_receipt_sha256,
+            }
 
         terminal_records: list[dict[str, object]] = []
 
@@ -6095,7 +6422,7 @@ class GripFoundationTests(unittest.TestCase):
         ) -> dict[str, object]:
             self.assertEqual(lane_id, observed_lane_id)
             self.assertEqual("candidate_adopted", assessment["closeout_state"])
-            self.assertEqual(lane_receipt_sha256, kwargs["expected_receipt_sha256"])
+            self.assertEqual(record["receipt_sha256"], kwargs["expected_receipt_sha256"])
             events.append("lane-close")
             stored = deepcopy(record)
             stored["terminal_closeout"] = {
@@ -6106,7 +6433,15 @@ class GripFoundationTests(unittest.TestCase):
             return stored
 
         work_acquire = types.SimpleNamespace(
+            _terminal_closeout_pending_assessment=Mock(
+                return_value={
+                    "phase": "terminal",
+                    "closeout_state": "candidate_adopted",
+                    "lease_release_ready": True,
+                }
+            ),
             persist_terminal_closeout=Mock(side_effect=persist_terminal_closeout),
+            converge_terminal_resource_closeout=Mock(),
             operator=types.SimpleNamespace(
                 base=types.SimpleNamespace(_append_audit_with_digest=Mock())
             ),
@@ -6152,6 +6487,28 @@ class GripFoundationTests(unittest.TestCase):
                 "snapshot_guarded": True,
             }
 
+        def converge_terminal_resource_closeout(
+            observed_lane_id: str,
+            *,
+            expected_closeout_states: set[str],
+        ) -> dict[str, object]:
+            self.assertEqual(lane_id, observed_lane_id)
+            self.assertEqual({"candidate_adopted"}, expected_closeout_states)
+            released_keys = sorted(lease_map)
+            if released_keys:
+                events.append("release")
+            lease_map.clear()
+            return {
+                "state": "released" if released_keys else "already_absent",
+                "lane_id": lane_id,
+                "closeout_state": "candidate_adopted",
+                "released_resource_keys": released_keys,
+                "live_owner_lease_count": 0,
+            }
+
+        work_acquire.converge_terminal_resource_closeout.side_effect = (
+            converge_terminal_resource_closeout
+        )
         resource_store = types.SimpleNamespace(
             inspect_resources=Mock(side_effect=inspect_resources),
             grabowski_resource_release=Mock(side_effect=release_resources),
@@ -6268,7 +6625,8 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(case["adopted_commit"], result["output"]["resulting_commit_sha"])
         self.assertEqual(["adopt", "lane-close", "push", "pr", "release"], case["events"])
         self.assertEqual(1, case["work_acquire"].persist_terminal_closeout.call_count)
-        self.assertEqual(1, case["resource_store"].grabowski_resource_release.call_count)
+        self.assertEqual(1, case["work_acquire"].converge_terminal_resource_closeout.call_count)
+        case["resource_store"].grabowski_resource_release.assert_not_called()
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         for check_id in (
             "candidate-adoption-bound",
@@ -6278,6 +6636,68 @@ class GripFoundationTests(unittest.TestCase):
             "source-lane-leases-released",
         ):
             self.assertEqual("pass", checks[check_id])
+
+    def test_candidate_integration_ready_retries_durable_pending_closeout_with_current_receipt(self) -> None:
+        current_receipt = "8" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp, pending_receipt_sha256=current_receipt
+            )
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("integration_ready", result["output"]["state"])
+        self.assertEqual(
+            current_receipt,
+            case["work_acquire"].persist_terminal_closeout.call_args.kwargs[
+                "expected_receipt_sha256"
+            ],
+        )
+        self.assertEqual(
+            1, case["work_acquire"]._terminal_closeout_pending_assessment.call_count
+        )
+        fresh_assessment = (
+            case["work_acquire"].persist_terminal_closeout.call_args.args[1]
+        )
+        self.assertIn("assessment_sha256", fresh_assessment)
+        self.assertEqual("candidate_adopted", fresh_assessment["closeout_state"])
+
+    def test_candidate_integration_ready_pending_retry_rechecks_process_liveness(self) -> None:
+        current_receipt = "8" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp, pending_receipt_sha256=current_receipt
+            )
+            result = self._run_candidate_integration_case(
+                case, processes=[{"pid": 1234}]
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("source_lane_reconcile_required", result["output"]["state"])
+        self.assertIn(
+            "writer_or_process_active", result["output"]["lane_assessment"]["reason_codes"]
+        )
+        case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        case["work_acquire"].converge_terminal_resource_closeout.assert_not_called()
+        self.assertEqual(["adopt"], case["events"])
+
+    def test_candidate_integration_ready_pending_retry_rechecks_git_cleanliness(self) -> None:
+        current_receipt = "8" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._candidate_integration_case(
+                tmp, pending_receipt_sha256=current_receipt
+            )
+            case["fake_git"].dirty = True
+            result = self._run_candidate_integration_case(case)
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("source_lane_reconcile_required", result["output"]["state"])
+        self.assertIn(
+            "valuable_dirty_state", result["output"]["lane_assessment"]["reason_codes"]
+        )
+        case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        case["work_acquire"].converge_terminal_resource_closeout.assert_not_called()
+        self.assertEqual(["adopt"], case["events"])
 
     def test_candidate_integration_ready_blocks_unknown_adoption_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6292,6 +6712,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(["adopt"], case["events"])
         self.assertEqual([], case["fake_gh"].calls)
         case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        case["work_acquire"].converge_terminal_resource_closeout.assert_not_called()
         case["resource_store"].grabowski_resource_release.assert_not_called()
 
     def test_candidate_integration_ready_refuses_publication_while_process_is_active(self) -> None:
@@ -6307,6 +6728,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(["adopt"], case["events"])
         self.assertEqual([], case["fake_gh"].calls)
         case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        case["work_acquire"].converge_terminal_resource_closeout.assert_not_called()
         case["resource_store"].grabowski_resource_release.assert_not_called()
 
     def test_candidate_integration_ready_preserves_leases_after_push_failure(self) -> None:
@@ -6318,6 +6740,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("branch_publication_reconcile_required", result["output"]["state"])
         self.assertEqual(["adopt", "lane-close", "push"], case["events"])
         self.assertTrue(result["output"]["leases_preserved"])
+        case["work_acquire"].converge_terminal_resource_closeout.assert_not_called()
         case["resource_store"].grabowski_resource_release.assert_not_called()
         self.assertFalse(any(call[:2] == ("pr", "create") for call in case["fake_gh"].calls))
 
@@ -6334,6 +6757,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pr_readback_reconcile_required", result["output"]["state"])
         self.assertEqual(["adopt", "lane-close"], case["events"])
         self.assertTrue(result["output"]["leases_preserved"])
+        case["work_acquire"].converge_terminal_resource_closeout.assert_not_called()
         case["resource_store"].grabowski_resource_release.assert_not_called()
         self.assertFalse(any("push" in call for call in case["fake_git"].calls))
         self.assertFalse(any(call[:2] == ("pr", "create") for call in case["fake_gh"].calls))
@@ -6350,6 +6774,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pr_publication_reconcile_required", result["output"]["state"])
         self.assertEqual(["adopt", "lane-close", "push"], case["events"])
         self.assertTrue(result["output"]["leases_preserved"])
+        case["work_acquire"].converge_terminal_resource_closeout.assert_not_called()
         case["resource_store"].grabowski_resource_release.assert_not_called()
 
     def test_candidate_integration_ready_replays_exact_ready_pr_without_repeating_effects(self) -> None:
@@ -6366,6 +6791,7 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("integration_ready", result["output"]["state"])
         self.assertEqual(["adopt"], case["events"])
         case["work_acquire"].persist_terminal_closeout.assert_not_called()
+        self.assertEqual(1, case["work_acquire"].converge_terminal_resource_closeout.call_count)
         case["resource_store"].grabowski_resource_release.assert_not_called()
         self.assertFalse(any("push" in call for call in case["fake_git"].calls))
         self.assertFalse(
@@ -6375,34 +6801,30 @@ class GripFoundationTests(unittest.TestCase):
             )
         )
 
-    def test_candidate_integration_ready_does_not_treat_partial_lease_loss_as_cleanup(self) -> None:
+    def test_candidate_integration_ready_surfaces_owner_wide_cleanup_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             case = self._candidate_integration_case(
                 tmp,
                 lane_terminal=True,
                 remote_exact=True,
             )
-            inputs = case["record"]["inputs"]
-            resource_keys = list(inputs["resource_keys"])
-            owner_id = str(inputs["lease_owner_id"])
-            case["resource_store"].inspect_resources.side_effect = None
-            case["resource_store"].inspect_resources.return_value = {
-                resource_keys[0]: {
-                    "resource_key": resource_keys[0],
-                    "owner_id": owner_id,
-                    "acquired_at_unix": 10,
-                    "updated_at_unix": 10,
-                    "expires_at_unix": 1000,
-                    "metadata_sha256": "7" * 64,
-                }
-            }
+            case["work_acquire"].converge_terminal_resource_closeout.side_effect = (
+                RuntimeError("owner lease inventory changed")
+            )
             result = self._run_candidate_integration_case(case)
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertEqual("integration_ready_cleanup_pending", result["output"]["state"])
         self.assertTrue(result["output"]["integration_ready"])
         self.assertFalse(result["output"]["cleanup_complete"])
-        self.assertIn("partial", result["output"]["error"])
+        self.assertEqual("RuntimeError", result["output"]["error"])
+        self.assertEqual(
+            "read_back_terminal_source_lane_owner_leases_before_release_retry",
+            result["output"]["next_action"],
+        )
+        self.assertEqual(
+            1, case["work_acquire"].converge_terminal_resource_closeout.call_count
+        )
         case["resource_store"].grabowski_resource_release.assert_not_called()
         self.assertEqual(["adopt"], case["events"])
 
