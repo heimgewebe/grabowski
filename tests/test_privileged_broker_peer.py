@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import signal
 import sys
@@ -883,6 +884,72 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             f"{root}/20260827T010204Z-fedcba654321/debs/b.deb",
         ]))
 
+    def test_package_output_identity_rejects_symlink_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "heim-pc"
+            stage_root = home / "package-update-stages"
+            plan = stage_root / "20260827T010203Z-123456abcdef"
+            debs = plan / "debs"
+            debs.mkdir(parents=True)
+            for directory in (home, stage_root, plan, debs):
+                directory.chmod(0o700)
+            artifact = debs / "cursor.deb"
+            artifact.write_bytes(b"package")
+            artifact.chmod(0o600)
+            argv = ["/usr/bin/sha256sum", str(artifact)]
+            with mock.patch.object(broker_tool, "PACKAGE_UPDATE_STAGE_ROOT", stage_root):
+                snapshot = broker_tool._package_output_identity_snapshot(argv)
+                self.assertIn(str(artifact), snapshot)
+                artifact.unlink()
+                artifact.symlink_to("/etc/hosts")
+                with self.assertRaisesRegex(PermissionError, "symlink"):
+                    broker_tool._package_output_identity_snapshot(argv)
+                artifact.unlink()
+                source = debs / "source.deb"
+                source.write_bytes(b"package")
+                source.chmod(0o600)
+                os.link(source, artifact)
+                with self.assertRaisesRegex(PermissionError, "single-link"):
+                    broker_tool._package_output_identity_snapshot(argv)
+
+    def test_power_gate_is_revalidated_after_request_claim_before_spawn(self) -> None:
+        reference = {
+            "request_id": "4" * 32,
+            "reference_sha256": "3" * 64,
+            "action": broker_tool.POWER_ACTION,
+            "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json",
+            "argv": ["/usr/bin/true"],
+            "cwd": "/",
+            "timeout_seconds": 5,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(
+                broker_tool, "resolve_execution",
+                side_effect=[execution, PermissionError("power kill-switch is engaged")],
+            ) as resolve,
+            mock.patch.object(
+                broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
+            ),
+            mock.patch.object(broker_tool, "claim_once") as claim,
+            mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(PermissionError, "kill-switch"):
+                broker_tool.main()
+        self.assertEqual(resolve.call_count, 2)
+        claim.assert_called_once()
+        popen.assert_not_called()
+
     def test_safe_package_readback_publishes_output_evidence(self) -> None:
         reference = {
             "request_id": "6" * 32,
@@ -917,10 +984,15 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             ),
             mock.patch.object(broker_tool, "claim_once"),
             mock.patch.object(broker_tool, "append_audit"),
+            mock.patch.object(
+                broker_tool, "_package_output_identity_snapshot",
+                return_value={"stage": (1, 2, 3)},
+            ) as identity_snapshot,
             mock.patch.object(broker_tool.subprocess, "Popen", return_value=process),
             redirect_stdout(io.StringIO()) as captured,
         ):
             self.assertEqual(broker_tool.main(), 0)
+        self.assertEqual(identity_snapshot.call_count, 2)
         self._output_evidence.assert_called_once()
         response = json.loads(captured.getvalue())
         self.assertEqual(response["output_evidence"]["sha256"], "f" * 64)
@@ -948,7 +1020,13 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                     "stdout_bytes": 4,
                     "stdout_truncated": False,
                 }
-                with mock.patch.object(broker_tool, "OUTPUT_EVIDENCE_ROOT", root):
+                with (
+                    mock.patch.object(broker_tool, "OUTPUT_EVIDENCE_ROOT", root),
+                    mock.patch.object(
+                        broker_tool.grp, "getgrnam",
+                        return_value=mock.Mock(gr_gid=root.parent.stat().st_gid),
+                    ),
+                ):
                     published = broker_tool._write_output_evidence(record)
                 destination = Path(published["path"])
                 value = json.loads(destination.read_text(encoding="utf-8"))
