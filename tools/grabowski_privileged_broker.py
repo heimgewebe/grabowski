@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import pwd
 import signal
 import socket
@@ -33,6 +34,8 @@ STATE = Path("/var/lib/grabowski/privileged-broker")
 AUDIT = STATE / "audit.jsonl"
 OUTPUT_EVIDENCE_ROOT = Path("/run/grabowski/privileged-broker-evidence")
 OUTPUT_EVIDENCE_KIND = "grabowski_privileged_output_evidence"
+PACKAGE_UPDATE_STAGE_ROOT = Path("/var/lib/heim-pc/package-update-stages")
+PACKAGE_UPDATE_PLAN_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}\Z")
 MAX_OUTPUT_BYTES = 250_000
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
@@ -90,8 +93,40 @@ def append_audit(record: dict[str, object]) -> None:
         os.close(directory)
 
 
+def _package_output_evidence_allowed(argv: object) -> bool:
+    """Allow public evidence only for bounded non-secret package readbacks."""
+    if argv == [
+        "/usr/bin/stat", "-f", "-c", "%a:%S", str(PACKAGE_UPDATE_STAGE_ROOT)
+    ]:
+        return True
+    if not isinstance(argv, list) or len(argv) < 2 or argv[0] != "/usr/bin/sha256sum":
+        return False
+    plan_ids: set[str] = set()
+    for raw_path in argv[1:]:
+        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+            return False
+        path = Path(raw_path)
+        if not path.is_absolute() or os.path.normpath(raw_path) != raw_path:
+            return False
+        try:
+            relative = path.relative_to(PACKAGE_UPDATE_STAGE_ROOT)
+        except ValueError:
+            return False
+        if len(relative.parts) != 3:
+            return False
+        plan_id, bucket, filename = relative.parts
+        if (
+            PACKAGE_UPDATE_PLAN_ID_RE.fullmatch(plan_id) is None
+            or bucket not in {"debs", "snaps"}
+            or filename in {"", ".", ".."}
+        ):
+            return False
+        plan_ids.add(plan_id)
+    return len(plan_ids) == 1
+
+
 def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
-    """Publish non-secret root-owned evidence for exact broker stdout bytes."""
+    """Publish root-owned evidence only for classified non-secret output."""
     request_id = record.get("request_id")
     if not isinstance(request_id, str) or len(request_id) != 32 or any(
         character not in "0123456789abcdef" for character in request_id
@@ -108,23 +143,39 @@ def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
     }
     if any(key not in record for key in required):
         raise ValueError("privileged output evidence source record is incomplete")
+    if (
+        record.get("returncode") != 0
+        or record.get("timed_out") is not False
+        or record.get("stdout_truncated") is not False
+    ):
+        raise ValueError("privileged output evidence requires complete successful output")
 
+    parent = OUTPUT_EVIDENCE_ROOT.parent
+    parent_metadata = parent.lstat()
+    expected_uid = os.geteuid()
+    if (
+        parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != expected_uid
+        or parent_metadata.st_mode & 0o022
+    ):
+        raise PermissionError("privileged output evidence parent is unsafe")
+    evidence_gid = parent_metadata.st_gid
     try:
-        OUTPUT_EVIDENCE_ROOT.mkdir(parents=False, mode=0o700)
+        OUTPUT_EVIDENCE_ROOT.mkdir(parents=False, mode=0o750)
     except FileExistsError:
         pass
+    os.chown(OUTPUT_EVIDENCE_ROOT, expected_uid, evidence_gid)
+    os.chmod(OUTPUT_EVIDENCE_ROOT, 0o750)
     metadata = OUTPUT_EVIDENCE_ROOT.lstat()
     if (
         OUTPUT_EVIDENCE_ROOT.is_symlink()
         or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o022
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != evidence_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o750
     ):
         raise PermissionError("privileged output evidence directory is unsafe")
-    os.chmod(OUTPUT_EVIDENCE_ROOT, 0o755)
-    metadata = OUTPUT_EVIDENCE_ROOT.lstat()
-    if stat.S_IMODE(metadata.st_mode) != 0o755:
-        raise PermissionError("privileged output evidence directory mode is unsafe")
 
     evidence: dict[str, object] = {
         "schema_version": 1,
@@ -151,6 +202,8 @@ def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(destination, flags, 0o600)
     try:
+        os.fchown(descriptor, expected_uid, evidence_gid)
+        os.fchmod(descriptor, 0o640)
         offset = 0
         while offset < len(raw):
             written = os.write(descriptor, raw[offset:])
@@ -158,12 +211,12 @@ def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
                 raise OSError("privileged output evidence write was incomplete")
             offset += written
         os.fsync(descriptor)
-        os.fchmod(descriptor, 0o644)
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o644
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != evidence_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o640
             or metadata.st_nlink != 1
         ):
             raise PermissionError("privileged output evidence file is unsafe")
@@ -179,6 +232,12 @@ def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
         os.close(directory)
     return {"path": str(destination), "sha256": str(evidence["evidence_sha256"])}
 
+
+def _public_audit_record(record: dict[str, object]) -> dict[str, object]:
+    public = dict(record)
+    for key in ("stdout_sha256", "stdout_bytes", "stderr_sha256", "stderr_bytes"):
+        public.pop(key, None)
+    return public
 
 def _base_audit_record(
     reference: dict[str, object],
@@ -765,16 +824,25 @@ def main() -> int:
         "returncode": None if timed_out else process.returncode,
         "timed_out": timed_out,
         "stdout_truncated": len(stdout_bytes) > MAX_OUTPUT_BYTES,
-        "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
-        "stdout_bytes": len(stdout_bytes),
         "stderr_truncated": len(stderr_bytes) > MAX_OUTPUT_BYTES,
-        "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
-        "stderr_bytes": len(stderr_bytes),
     }
+    if reference["action"] == POWER_ACTION:
+        record.update({
+            "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+            "stdout_bytes": len(stdout_bytes),
+            "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+            "stderr_bytes": len(stderr_bytes),
+        })
     append_audit(record)
-    output_evidence = (
-        _write_output_evidence(record) if reference["action"] == POWER_ACTION else None
-    )
+    output_evidence = None
+    if (
+        reference["action"] == POWER_ACTION
+        and _package_output_evidence_allowed(argv)
+        and record["returncode"] == 0
+        and record["timed_out"] is False
+        and record["stdout_truncated"] is False
+    ):
+        output_evidence = _write_output_evidence(record)
     print(json.dumps({
         "request_id": reference["request_id"],
         "action": reference["action"],
@@ -783,7 +851,7 @@ def main() -> int:
         "timed_out": timed_out,
         "stdout": stdout,
         "stderr": stderr,
-        "audit": record,
+        "audit": _public_audit_record(record),
         "output_evidence": output_evidence,
     }, ensure_ascii=False, sort_keys=True))
     # The socket client returns non-zero for non-zero action returncodes. The

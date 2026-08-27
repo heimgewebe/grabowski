@@ -811,7 +811,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         killpg.assert_called_once_with(4242, signal.SIGTERM)
         self.assertEqual(broker_tool.ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS, 900)
 
-    def test_power_audit_binds_exact_raw_output_before_text_decoding(self) -> None:
+    def test_power_audit_keeps_raw_digest_root_only_for_unclassified_output(self) -> None:
         reference = {
             "request_id": "9" * 32,
             "reference_sha256": "8" * 64,
@@ -826,7 +826,7 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": "grabowski-operator.service",
         }
-        raw_stdout = b"exact\xffbytes\n"
+        raw_stdout = b"secret-candidate\n"
         raw_stderr = b"warn\x00bytes"
         process = mock.Mock(pid=4242, returncode=0)
         process.communicate.return_value = (raw_stdout, raw_stderr)
@@ -855,12 +855,78 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertEqual(record["stdout_bytes"], len(raw_stdout))
         self.assertEqual(record["stderr_sha256"], hashlib.sha256(raw_stderr).hexdigest())
         self.assertEqual(record["stderr_bytes"], len(raw_stderr))
-        self.assertFalse(record["stdout_truncated"])
-        self._output_evidence.assert_called_once_with(record)
+        self._output_evidence.assert_not_called()
+        response = json.loads(captured.getvalue())
+        self.assertIsNone(response["output_evidence"])
+        for key in ("stdout_sha256", "stdout_bytes", "stderr_sha256", "stderr_bytes"):
+            self.assertNotIn(key, response["audit"])
+
+    def test_package_output_evidence_classifier_is_narrow(self) -> None:
+        root = str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT)
+        plan = "20260827T010203Z-123456abcdef"
+        self.assertTrue(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/stat", "-f", "-c", "%a:%S", root
+        ]))
+        self.assertTrue(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/sha256sum",
+            f"{root}/{plan}/debs/cursor.deb",
+            f"{root}/{plan}/snaps/core.snap",
+        ]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed(["/usr/bin/printf", "secret"]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed(["/usr/bin/sha256sum", "/etc/shadow"]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/sha256sum", f"{root}/{plan}/debs/nested/file.deb"
+        ]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/sha256sum",
+            f"{root}/{plan}/debs/a.deb",
+            f"{root}/20260827T010204Z-fedcba654321/debs/b.deb",
+        ]))
+
+    def test_safe_package_readback_publishes_output_evidence(self) -> None:
+        reference = {
+            "request_id": "6" * 32,
+            "reference_sha256": "5" * 64,
+            "action": broker_tool.POWER_ACTION,
+            "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json",
+            "argv": [
+                "/usr/bin/stat", "-f", "-c", "%a:%S",
+                str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT),
+            ],
+            "cwd": "/",
+            "timeout_seconds": 5,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        process = mock.Mock(pid=4242, returncode=0)
+        process.communicate.return_value = (b"123:4096\n", b"")
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        self._output_evidence.reset_mock()
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
+            ),
+            mock.patch.object(broker_tool, "claim_once"),
+            mock.patch.object(broker_tool, "append_audit"),
+            mock.patch.object(broker_tool.subprocess, "Popen", return_value=process),
+            redirect_stdout(io.StringIO()) as captured,
+        ):
+            self.assertEqual(broker_tool.main(), 0)
+        self._output_evidence.assert_called_once()
         response = json.loads(captured.getvalue())
         self.assertEqual(response["output_evidence"]["sha256"], "f" * 64)
+        self.assertNotIn("stdout_sha256", response["audit"])
 
-    def test_output_evidence_is_content_hashed_and_read_only_to_unprivileged_callers(self) -> None:
+    def test_output_evidence_is_content_hashed_and_group_read_only(self) -> None:
         self._output_evidence_patch.stop()
         try:
             with tempfile.TemporaryDirectory() as raw:
@@ -891,8 +957,10 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                 self.assertEqual(published["sha256"], digest)
                 self.assertEqual(value["stdout_sha256"], record["stdout_sha256"])
                 self.assertEqual(value["stdout_bytes"], 4)
-                self.assertEqual(destination.stat().st_mode & 0o777, 0o644)
-                self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(root.stat().st_mode & 0o777, 0o750)
+                self.assertEqual(destination.stat().st_gid, root.parent.stat().st_gid)
+                self.assertEqual(root.stat().st_gid, root.parent.stat().st_gid)
         finally:
             self._output_evidence_patch = mock.patch.object(
                 broker_tool, "_write_output_evidence",
