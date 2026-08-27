@@ -1296,6 +1296,32 @@ class PrivilegedBrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "kill-switch"):
             privileged_broker.resolve_execution(config, parsed)
 
+    def test_power_gate_treats_dangling_kill_switch_symlink_as_engaged(self) -> None:
+        reference = self._power_reference({"argv": ["/usr/bin/id", "-u"], "cwd": "/", "timeout_seconds": 30})
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        gate = self._power_gate(self.tmp.name)
+        kill_switch = Path(gate["kill_switch_path"])
+        kill_switch.symlink_to(Path(self.tmp.name) / "missing-target")
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_power_argv": {
+                    "enabled": True,
+                    "mode": "argv-json",
+                    "target_pattern": r"\{.{1,49152}\}",
+                    "cwd_pattern": r"/[A-Za-z0-9._/@:+-]{0,999}",
+                    "timeout_seconds": 600,
+                    "max_argv": 128,
+                    "allow_shell": False,
+                    "gate": gate,
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "kill-switch"):
+            privileged_broker.resolve_execution(config, parsed)
+
     def test_power_argv_json_rejects_shell_when_disabled(self) -> None:
         reference = self._power_reference({"argv": ["/bin/bash", "-lc", "id"], "cwd": "/", "timeout_seconds": 30})
         parsed = privileged_broker.parse_reference(
