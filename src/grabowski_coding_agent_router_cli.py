@@ -13,6 +13,7 @@ import http.client
 import json
 import math
 import os
+import re
 import selectors
 import signal
 from pathlib import Path
@@ -513,6 +514,60 @@ def _configured_models(catalog: dict[str, Any], harness: str) -> list[str]:
     )
 
 
+def _configured_model_aliases(
+    catalog: dict[str, Any], harness: str
+) -> dict[str, str]:
+    configured = set(_configured_models(catalog, harness))
+    candidates: dict[str, set[str]] = {
+        model: {model} for model in configured
+    }
+    for route in catalog["routes"]:
+        canonical = route.get("model")
+        argv = route.get("argv_prefix")
+        if (
+            route.get("harness") != harness
+            or canonical not in configured
+            or not isinstance(argv, list)
+        ):
+            continue
+        for index, value in enumerate(argv[:-1]):
+            alias = argv[index + 1]
+            if value == "--model" and isinstance(alias, str) and alias:
+                candidates.setdefault(alias, set()).add(canonical)
+    return {
+        alias: next(iter(models))
+        for alias, models in candidates.items()
+        if len(models) == 1
+    }
+
+
+def _antigravity_models_from_output(
+    catalog: dict[str, Any], stdout: str
+) -> list[str]:
+    aliases = _configured_model_aliases(catalog, "antigravity")
+    discovered = {
+        aliases[model_field]
+        for line in stdout.splitlines()
+        if (model_field := line.split("\t", 1)[0].strip()) in aliases
+    }
+    return sorted(discovered)
+
+
+def _grok_models_from_output(
+    catalog: dict[str, Any], stdout: str
+) -> list[str]:
+    marker = "Available models:"
+    if marker not in stdout:
+        return []
+    available = stdout.split(marker, 1)[1]
+    discovered = []
+    for model in _configured_models(catalog, "grok"):
+        pattern = rf"(?<![A-Za-z0-9._/-]){re.escape(model)}(?![A-Za-z0-9._/-])"
+        if re.search(pattern, available):
+            discovered.append(model)
+    return discovered
+
+
 def _openhands_subscription_auth_status(
     *, home: Path | None = None, now_ms: int | None = None
 ) -> dict[str, Any]:
@@ -747,7 +802,9 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     providers["antigravity"] = {
         "available": harnesses.get("antigravity", {}).get("available") is True,
         "models": (
-            [line.strip() for line in str(antigravity.get("stdout", "")).splitlines() if line.strip()]
+            _antigravity_models_from_output(
+                catalog, str(antigravity.get("stdout", ""))
+            )
             if antigravity.get("ok") is True
             else []
         ),
@@ -788,16 +845,11 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         harnesses, "grok", ["models"], catalog
     )
     grok_auth_after = _grok_subscription_auth_status(catalog)
-    grok_models: list[str] = []
-    if grok_status.get("ok") is True:
-        active = False
-        for line in str(grok_status.get("stdout", "")).splitlines():
-            clean = line.strip()
-            if clean == "Available models:":
-                active = True
-                continue
-            if active and clean.startswith("*"):
-                grok_models.append(clean[1:].strip().split(" ", 1)[0])
+    grok_models = (
+        _grok_models_from_output(catalog, str(grok_status.get("stdout", "")))
+        if grok_status.get("ok") is True
+        else []
+    )
     before_binding = grok_auth_before.get("account_binding_sha256")
     after_binding = grok_auth_after.get("account_binding_sha256")
     grok_logged_in = (

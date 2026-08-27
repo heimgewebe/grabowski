@@ -96,6 +96,7 @@ class PlainExternalReviewTests(unittest.TestCase):
         provider: str,
         executable: str,
         model: str | None,
+        context_attestation: str | None = None,
     ) -> dict[str, object]:
         with mock.patch.object(
             plain,
@@ -112,6 +113,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                 model=model,
                 timeout_seconds=300,
                 max_prompt_bytes=100_000,
+                context_attestation=context_attestation,
             )
 
     def test_gemini_is_single_turn_isolated_and_schema_valid(self) -> None:
@@ -342,6 +344,120 @@ class PlainExternalReviewTests(unittest.TestCase):
                 schemas.EXTERNAL_REVIEW_SCHEMA.validate(evidence),
                 (),
             )
+
+    def test_ox_alpha_transmits_full_diff_by_private_file_with_exact_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+            diff_text = Path(manifest_value["diff_path"]).read_text(encoding="utf-8")
+            output = root / "ox-alpha-evidence.json"
+
+            def fake_run(argv, **kwargs):
+                self.assertEqual(
+                    argv[:8],
+                    [
+                        "/private/ox-alpha",
+                        "run",
+                        "--pure",
+                        "--agent",
+                        "plan",
+                        "--model",
+                        plain.OX_ALPHA_MODEL,
+                        "--file",
+                    ],
+                )
+                self.assertEqual(argv[9], plain.OX_ALPHA_PROMPT_MESSAGE)
+                self.assertNotIn("--auto", argv)
+                self.assertNotIn(diff_text, argv)
+                isolated = Path(str(kwargs["cwd"]))
+                prompt_path = Path(argv[8])
+                self.assertEqual(prompt_path.parent, isolated)
+                self.assertEqual(stat.S_IMODE(prompt_path.stat().st_mode), 0o600)
+                prompt = prompt_path.read_text(encoding="utf-8")
+                self.assertIn(diff_text, prompt)
+                self.assertEqual(list(isolated.iterdir()), [prompt_path])
+                environment = kwargs["environment"]
+                self.assertNotIn("OPENROUTER_API_KEY", environment)
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                    "",
+                )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"OPENROUTER_API_KEY": "must-not-leak"},
+                ),
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+            ):
+                evidence = self._run(
+                    manifest,
+                    output,
+                    provider="ox-alpha",
+                    executable="opencode",
+                    model=None,
+                    context_attestation="non-sensitive-context",
+                )
+
+            self.assertEqual(
+                evidence["diff_sha256"], manifest_value["diff_sha256"]
+            )
+            self.assertEqual(
+                evidence["review_input"]["requested_model"],
+                plain.OX_ALPHA_MODEL,
+            )
+            self.assertEqual(
+                evidence["review_input"]["context_attestation"],
+                "non-sensitive-context",
+            )
+            self.assertEqual(
+                evidence["review_input"]["paid_fallback_policy"],
+                "disabled_by_exact_model",
+            )
+            self.assertEqual(
+                evidence["reviews"][0]["tool_policy"],
+                "opencode_pure_plan_agent",
+            )
+            self.assertFalse(evidence["review_input"]["prompt_argument_exposure"])
+            self.assertTrue(evidence["review_input"]["ephemeral_prompt_file"])
+            self.assertEqual(schemas.EXTERNAL_REVIEW_SCHEMA.validate(evidence), ())
+
+    def test_ox_alpha_rejects_missing_or_unsafe_context_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            for index, attestation in enumerate((None, "private-context")):
+                output = root / f"rejected-{index}.json"
+                with (
+                    mock.patch.object(plain, "run_provider") as run,
+                    self.assertRaisesRegex(
+                        plain.PlainReviewError,
+                        "requires an explicit safe context attestation",
+                    ),
+                ):
+                    plain.run_from_manifest(
+                        manifest_path=manifest,
+                        output_path=output,
+                        raw_review_path=None,
+                        transmitted_prompt_path=None,
+                        provider="ox-alpha",
+                        executable="opencode",
+                        model=None,
+                        timeout_seconds=300,
+                        max_prompt_bytes=100_000,
+                        context_attestation=attestation,
+                    )
+                run.assert_not_called()
+                self.assertFalse(output.exists())
+                self.assertFalse(output.with_suffix(".review.txt").exists())
+                self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
     def test_non_pass_findings_remain_untriaged_inside_review(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

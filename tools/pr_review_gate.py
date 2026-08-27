@@ -37,6 +37,8 @@ try:
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
+        PLAIN_LLM_OX_ALPHA_MODEL,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -53,6 +55,8 @@ except ModuleNotFoundError:  # importlib-based tests load this file from the rep
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
+        PLAIN_LLM_OX_ALPHA_MODEL,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -1834,10 +1838,12 @@ def _plain_llm_review_input_failures(
         failures.append("review_input.provider is missing or unsupported")
     else:
         expected_transport = (
-            "prompt_file" if provider == "grok" else "argv"
+            "prompt_file"
+            if provider in {"grok", "ox-alpha"}
+            else "argv"
         )
         expected_argument_exposure = provider == "gemini"
-        expected_ephemeral_prompt_file = provider == "grok"
+        expected_ephemeral_prompt_file = provider in {"grok", "ox-alpha"}
         if review_input.get("transport") != expected_transport:
             failures.append("review_input.transport mismatch")
         if (
@@ -1865,6 +1871,19 @@ def _plain_llm_review_input_failures(
             failures.append("review_input.web_search_policy mismatch")
         if review_input.get("memory_policy") != expected_memory_policy:
             failures.append("review_input.memory_policy mismatch")
+        if provider == "ox-alpha":
+            if review_input.get("requested_model") != PLAIN_LLM_OX_ALPHA_MODEL:
+                failures.append("review_input.requested_model is not exact Ox Alpha model")
+            if (
+                review_input.get("context_attestation")
+                not in PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS
+            ):
+                failures.append("review_input.context_attestation is unsafe for Ox Alpha")
+            if (
+                review_input.get("paid_fallback_policy")
+                != "disabled_by_exact_model"
+            ):
+                failures.append("review_input.paid_fallback_policy is unsafe for Ox Alpha")
 
     if review_input.get("account_transport") != "account_cli":
         failures.append("review_input.account_transport is not account_cli")
@@ -2015,7 +2034,11 @@ def _plain_llm_external_review_failures(
     expected_tool_policy = (
         "empty_tools_plan_mode"
         if provider == "grok"
-        else "sandboxed_plan_mode"
+        else (
+            "opencode_pure_plan_agent"
+            if provider == "ox-alpha"
+            else "sandboxed_plan_mode"
+        )
     )
     if (
         provider in PLAIN_LLM_PROVIDERS
