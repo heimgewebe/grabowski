@@ -264,6 +264,27 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             comparison["rates"]["failure_signal_rate"]["relative_change"],
             0,
         )
+        selected = result["measurement"]["selected_window"]
+        self.assertEqual(
+            selected["resource_reclamation_events_per_1000_starts"],
+            28.0,
+        )
+        self.assertEqual(
+            selected["reclaimed_resources_per_1000_starts"],
+            50.0,
+        )
+        self.assertGreater(
+            comparison["rates"]["resource_reclamation_events_per_1000_starts"][
+                "relative_change"
+            ],
+            0,
+        )
+        self.assertGreater(
+            comparison["rates"]["reclaimed_resources_per_1000_starts"][
+                "relative_change"
+            ],
+            0,
+        )
         self.assertIn("overlap", comparison["semantics"])
 
     def test_evidence_view_remains_bounded_and_omits_raw_events(self) -> None:
