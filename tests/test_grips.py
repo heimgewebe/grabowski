@@ -1682,12 +1682,15 @@ class GripFoundationTests(unittest.TestCase):
     def test_checkout_binding_identity_rebind_preview_grip_validates_dedicated_schema(self) -> None:
         checkout_key = "a" * 64
         snapshot = "b" * 64
+        repo_path = "/tmp/repo"
         preview = {
             "schema_version": 1,
             "kind": "checkout_binding_identity_rebind_preview",
             "observed_at_unix": 100,
+            "rebind_mode": "branch_rename",
             "checkout": {
                 "checkout_key": checkout_key,
+                "repo_path": repo_path,
                 "head": "1" * 40,
                 "branch": "topic-v2",
                 "dirty": False,
@@ -1705,6 +1708,7 @@ class GripFoundationTests(unittest.TestCase):
             "remote": {"remote_secured": True},
             "coordination": {"blocking": False},
             "target_identity": {
+                "repo_path": repo_path,
                 "expected_head": "1" * 40,
                 "expected_branch": "topic-v2",
             },
@@ -1726,19 +1730,73 @@ class GripFoundationTests(unittest.TestCase):
         rebind_preview.assert_called_once_with(checkout_key)
         terminal_preview.assert_not_called()
         checks = {item["id"]: item for item in result["receipt"]["checks"]}
-        self.assertEqual("pass", checks["branch-rename-only"]["status"])
-        self.assertEqual("pass", checks["remote-and-lineage-proven"]["status"])
+        self.assertEqual("pass", checks["identity-drift-mode-bound"]["status"])
+        self.assertEqual("pass", checks["remote-and-identity-proven"]["status"])
 
-    def test_checkout_binding_identity_rebind_apply_grip_uses_dedicated_authority(self) -> None:
+    def test_checkout_binding_identity_rebind_preview_grip_accepts_repo_path_mode(self) -> None:
         checkout_key = "a" * 64
-        snapshot = "b" * 64
-        target = {"expected_head": "1" * 40, "expected_branch": "topic-v2"}
+        snapshot = "c" * 64
+        repo_path = "/tmp/repo"
+        head = "1" * 40
         preview = {
             "schema_version": 1,
             "kind": "checkout_binding_identity_rebind_preview",
             "observed_at_unix": 100,
+            "rebind_mode": "repo_path_canonicalization",
             "checkout": {
                 "checkout_key": checkout_key,
+                "repo_path": repo_path,
+                "head": head,
+                "branch": "topic",
+                "dirty": False,
+            },
+            "owner_id": "owner-a",
+            "allowed_drift_reasons": ["binding-repo-path-mismatch"],
+            "head_lineage": {
+                "recorded_head": head,
+                "current_head": head,
+                "recorded_head_is_ancestor": True,
+            },
+            "remote": {"remote_secured": True},
+            "coordination": {"blocking": False},
+            "target_identity": {
+                "repo_path": repo_path,
+                "expected_head": head,
+                "expected_branch": "topic",
+            },
+            "snapshot_sha256": snapshot,
+            "confirmation": f"rebind-checkout-identity:{checkout_key}:{snapshot}",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_identity_rebind_preview",
+            return_value=preview,
+        ):
+            result = grips.grip_run(
+                "checkout-binding-identity-rebind-preview",
+                {"checkout_key": checkout_key},
+            )
+        self.assertEqual("passed", result["status"])
+        checks = {item["id"]: item for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["identity-drift-mode-bound"]["status"])
+        self.assertIn("repo_path_canonicalization", checks["identity-drift-mode-bound"]["detail"])
+
+    def test_checkout_binding_identity_rebind_apply_grip_uses_dedicated_authority(self) -> None:
+        checkout_key = "a" * 64
+        snapshot = "b" * 64
+        repo_path = "/tmp/repo"
+        target = {
+            "repo_path": repo_path,
+            "expected_head": "1" * 40,
+            "expected_branch": "topic-v2",
+        }
+        preview = {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_preview",
+            "observed_at_unix": 100,
+            "rebind_mode": "branch_rename",
+            "checkout": {
+                "checkout_key": checkout_key,
+                "repo_path": repo_path,
                 "head": target["expected_head"],
                 "branch": target["expected_branch"],
                 "dirty": False,
@@ -1764,21 +1822,29 @@ class GripFoundationTests(unittest.TestCase):
             "kind": "checkout_binding_identity_rebind_result",
             "status": "applied",
             "snapshot_sha256": snapshot,
+            "rebind_mode": "branch_rename",
+            "target_identity": target,
             "before": {
                 "lifecycle": {
                     "owner_id": "owner-a",
                     "phase": "active",
+                    "repo_path": repo_path,
                     "expected_head": "0" * 40,
                     "expected_branch": "topic",
                 },
                 "retention": {
                     "owner_id": "owner-a",
+                    "repo_path": repo_path,
                     "expected_head": "0" * 40,
                     "expected_branch": "topic",
                 },
             },
             "after": {
-                "lifecycle": {"owner_id": "owner-a", "phase": "active", **target},
+                "lifecycle": {
+                    "owner_id": "owner-a",
+                    "phase": "active",
+                    **target,
+                },
                 "retention": {
                     "owner_id": "owner-a",
                     "retention_until_unix": 1000,
@@ -1827,6 +1893,76 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["retention-live-revalidated"]["status"])
         self.assertEqual("pass", checks["identity-only-effect"]["status"])
         self.assertEqual("pass", checks["target-identity-converged"]["status"])
+
+    def test_checkout_binding_identity_rebind_apply_grip_accepts_repo_path_mode(self) -> None:
+        checkout_key = "a" * 64
+        snapshot = "d" * 64
+        head = "1" * 40
+        target = {
+            "repo_path": "/tmp/repo",
+            "expected_head": head,
+            "expected_branch": "topic",
+        }
+        output = {
+            "schema_version": 1,
+            "kind": "checkout_binding_identity_rebind_result",
+            "status": "applied",
+            "snapshot_sha256": snapshot,
+            "rebind_mode": "repo_path_canonicalization",
+            "target_identity": target,
+            "before": {
+                "lifecycle": {
+                    "owner_id": "owner-a",
+                    "phase": "active",
+                    "repo_path": "/tmp/repo-linked",
+                    "expected_head": head,
+                    "expected_branch": "topic",
+                },
+                "retention": {
+                    "owner_id": "owner-a",
+                    "repo_path": "/tmp/repo",
+                    "expected_head": head,
+                    "expected_branch": "topic",
+                },
+            },
+            "after": {
+                "lifecycle": {
+                    "owner_id": "owner-a",
+                    "phase": "active",
+                    **target,
+                },
+                "retention": {
+                    "owner_id": "owner-a",
+                    "retention_until_unix": 1000,
+                    **target,
+                },
+            },
+            "audit": {
+                "effects": [
+                    "lifecycle_repo_path_update",
+                ]
+            },
+        }
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_snapshot_sha256": snapshot,
+            "preview_created_at_unix": 100,
+            "confirmation": f"rebind-checkout-identity:{checkout_key}:{snapshot}",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_identity_rebind_apply",
+            return_value=output,
+        ):
+            result = grips.grip_run(
+                "checkout-binding-identity-rebind-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("repo_path_canonicalization", result["output"]["rebind_mode"])
+        checks = {item["id"]: item for item in result["receipt"]["checks"]}
+        self.assertIn("repo_path_canonicalization", checks["identity-only-effect"]["detail"])
 
     def test_checkout_owner_handoff_preview_grip_delegates_without_new_mcp_surface(self) -> None:
         snapshot = "d" * 64
