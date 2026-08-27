@@ -37,8 +37,15 @@ try:
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_AGENT,
+        PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256,
+        PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY,
         PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
         PLAIN_LLM_OX_ALPHA_MODEL,
+        PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY,
+        PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE,
+        PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION,
+        PLAIN_LLM_OX_ALPHA_TOOL_POLICY,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -55,8 +62,15 @@ except ModuleNotFoundError:  # importlib-based tests load this file from the rep
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_AGENT,
+        PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256,
+        PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY,
         PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
         PLAIN_LLM_OX_ALPHA_MODEL,
+        PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY,
+        PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE,
+        PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION,
+        PLAIN_LLM_OX_ALPHA_TOOL_POLICY,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -1881,9 +1895,20 @@ def _plain_llm_review_input_failures(
                 failures.append("review_input.context_attestation is unsafe for Ox Alpha")
             if (
                 review_input.get("paid_fallback_policy")
-                != "disabled_by_exact_model"
+                != PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY
             ):
                 failures.append("review_input.paid_fallback_policy is unsafe for Ox Alpha")
+            if review_input.get("runtime_isolation") != PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION:
+                failures.append("review_input.runtime_isolation is unsafe for Ox Alpha")
+            if review_input.get("agent_name") != PLAIN_LLM_OX_ALPHA_AGENT:
+                failures.append("review_input.agent_name is unsafe for Ox Alpha")
+            if review_input.get("agent_config_sha256") != PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256:
+                failures.append("review_input.agent_config_sha256 mismatch for Ox Alpha")
+            if (
+                review_input.get("account_auth_copy_policy")
+                != PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY
+            ):
+                failures.append("review_input.account_auth_copy_policy is unsafe for Ox Alpha")
 
     if review_input.get("account_transport") != "account_cli":
         failures.append("review_input.account_transport is not account_cli")
@@ -1911,6 +1936,37 @@ def _plain_llm_review_input_failures(
         or "\x00" in requested_executable
     ):
         failures.append("review_input.requested_executable is missing")
+    if provider == "ox-alpha":
+        provider_argv = review_input.get("provider_argv")
+        if (
+            not isinstance(provider_argv, list)
+            or not all(isinstance(item, str) for item in provider_argv)
+            or len(provider_argv) != 10
+        ):
+            failures.append("review_input.provider_argv is invalid for Ox Alpha")
+        else:
+            expected_prefix = [
+                executable,
+                "run",
+                "--pure",
+                "--agent",
+                PLAIN_LLM_OX_ALPHA_AGENT,
+                "--model",
+                PLAIN_LLM_OX_ALPHA_MODEL,
+                "--file",
+            ]
+            prompt_file = provider_argv[8]
+            if provider_argv[:8] != expected_prefix:
+                failures.append("review_input.provider_argv policy mismatch for Ox Alpha")
+            if (
+                not Path(prompt_file).is_absolute()
+                or Path(prompt_file).name != "plain-review-prompt.txt"
+            ):
+                failures.append("review_input.provider_argv prompt file is invalid for Ox Alpha")
+            if provider_argv[9] != PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE:
+                failures.append("review_input.provider_argv message mismatch for Ox Alpha")
+            if "--auto" in provider_argv:
+                failures.append("review_input.provider_argv enables Ox Alpha auto permissions")
     expected_executable_identity = (
         "canonical_native_owner_controlled"
         if provider == "grok"
@@ -2035,7 +2091,7 @@ def _plain_llm_external_review_failures(
         "empty_tools_plan_mode"
         if provider == "grok"
         else (
-            "opencode_pure_plan_agent"
+            PLAIN_LLM_OX_ALPHA_TOOL_POLICY
             if provider == "ox-alpha"
             else "sandboxed_plan_mode"
         )
@@ -2055,6 +2111,20 @@ def _plain_llm_external_review_failures(
     ):
         if not _valid_sha256(review.get(key)):
             failures.append(f"{key} is missing or invalid")
+    if provider == "ox-alpha" and isinstance(review_input.get("provider_argv"), list):
+        expected_argv_sha256 = hashlib.sha256(
+            json.dumps(
+                review_input["provider_argv"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            _valid_sha256(review.get("argv_sha256"))
+            and _normalize_sha256(review["argv_sha256"]) != expected_argv_sha256
+        ):
+            failures.append("argv_sha256 does not match Ox Alpha provider_argv")
     if (
         _valid_sha256(review.get("stdout_sha256"))
         and _valid_sha256(review.get("review_sha256"))
