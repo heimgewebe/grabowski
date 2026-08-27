@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 import hashlib
 import importlib.util
 import io
@@ -44,8 +44,13 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             return_value={"path": "/run/grabowski/privileged-broker-evidence/test.json", "sha256": "f" * 64},
         )
         self._output_evidence = self._output_evidence_patch.start()
+        self._package_stage_lock_patch = mock.patch.object(
+            broker_tool, "_package_stage_lock", side_effect=lambda: nullcontext()
+        )
+        self._package_stage_lock_patch.start()
 
     def tearDown(self) -> None:
+        self._package_stage_lock_patch.stop()
         self._output_evidence_patch.stop()
         self._system_cgroup_patch.stop()
 
@@ -1265,6 +1270,169 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                         unit_identity=self.unit_identity(),
                         expected_argv=self.OPERATOR_ARGV,
                     )
+
+
+    def test_package_stage_operation_requires_exact_dpkg_files(self) -> None:
+        plan_id = "20260827T010203Z-123456abcdef"
+        deb = str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT / plan_id / "debs" / "a.deb")
+        operation = broker_tool._package_stage_operation([
+            "/usr/bin/systemd-run", "--system", "--wait", "--",
+            "/usr/bin/dpkg", "--refuse-downgrade", "--install", deb,
+        ])
+        self.assertEqual(operation["kind"], "apply")
+        self.assertEqual(operation["plan_id"], plan_id)
+        self.assertEqual(operation["package_paths"], [deb])
+        self.assertIs(operation["exact_evidence"], True)
+        with self.assertRaisesRegex(PermissionError, "recursive"):
+            broker_tool._package_stage_operation([
+                "/usr/bin/dpkg", "--install", "--recursive",
+                str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT / plan_id / "debs"),
+            ])
+
+    def test_package_sha256_output_is_exact_path_bound(self) -> None:
+        plan_id = "20260827T010203Z-123456abcdef"
+        first = str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT / plan_id / "debs" / "a.deb")
+        second = str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT / plan_id / "debs" / "b.deb")
+        argv = ["/usr/bin/sha256sum", first, second]
+        stdout = ("a" * 64 + "  " + first + "\n" + "b" * 64 + "  " + second + "\n").encode()
+        self.assertEqual(
+            broker_tool._parse_package_sha256_output(argv, stdout),
+            {first: "a" * 64, second: "b" * 64},
+        )
+        with self.assertRaisesRegex(ValueError, "requested argv order"):
+            broker_tool._parse_package_sha256_output(
+                argv,
+                ("b" * 64 + "  " + second + "\n" + "a" * 64 + "  " + first + "\n").encode(),
+            )
+
+    def test_package_apply_evidence_rehash_rejects_changed_stage_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            stage_root = root / "stages"
+            evidence_root = root / "evidence"
+            stage_root.mkdir(mode=0o700)
+            evidence_root.mkdir(mode=0o700)
+            plan_id = "20260827T010203Z-123456abcdef"
+            deb_dir = stage_root / plan_id / "debs"
+            deb_dir.mkdir(parents=True, mode=0o700)
+            deb = deb_dir / "a.deb"
+            deb.write_bytes(b"trusted-bytes")
+            deb.chmod(0o600)
+            digest = hashlib.sha256(deb.read_bytes()).hexdigest()
+            evidence = {
+                "schema_version": 1,
+                "kind": broker_tool.OUTPUT_EVIDENCE_KIND,
+                "request_id": "a" * 32,
+                "peer_uid": os.geteuid(),
+                "peer_unit": "grabowski-operator.service",
+                "timestamp_unix": int(broker_tool.time.time()),
+                "package_plan_id": plan_id,
+                "package_paths": [str(deb)],
+                "package_sha256": {str(deb): digest},
+            }
+            evidence["evidence_sha256"] = broker_tool.canonical_sha256(evidence)
+            evidence_path = evidence_root / "proof.json"
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            evidence_path.chmod(0o640)
+            operation = {
+                "kind": "apply", "plan_id": plan_id,
+                "package_paths": [str(deb)], "exact_evidence": True,
+            }
+            with (
+                mock.patch.object(broker_tool, "PACKAGE_UPDATE_STAGE_ROOT", stage_root),
+                mock.patch.object(broker_tool, "OUTPUT_EVIDENCE_ROOT", evidence_root),
+            ):
+                selected = broker_tool._find_package_apply_evidence(
+                    operation, peer_uid=os.geteuid(), peer_unit="grabowski-operator.service"
+                )
+                self.assertEqual(selected["evidence_sha256"], evidence["evidence_sha256"])
+                deb.write_bytes(b"replayed-different-bytes")
+                with self.assertRaisesRegex(PermissionError, "changed after authenticated hash readback"):
+                    broker_tool._find_package_apply_evidence(
+                        operation, peer_uid=os.geteuid(), peer_unit="grabowski-operator.service"
+                    )
+
+    def test_package_apply_exact_evidence_rejects_superset(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            stage_root = root / "stages"
+            evidence_root = root / "evidence"
+            stage_root.mkdir(mode=0o700)
+            evidence_root.mkdir(mode=0o700)
+            plan_id = "20260827T010203Z-123456abcdef"
+            deb_dir = stage_root / plan_id / "debs"
+            deb_dir.mkdir(parents=True, mode=0o700)
+            first = deb_dir / "a.deb"; second = deb_dir / "b.deb"
+            first.write_bytes(b"a"); second.write_bytes(b"b")
+            first.chmod(0o600); second.chmod(0o600)
+            paths = [str(first), str(second)]
+            hashes = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in paths}
+            evidence = {
+                "schema_version": 1, "kind": broker_tool.OUTPUT_EVIDENCE_KIND,
+                "request_id": "b" * 32, "peer_uid": os.geteuid(),
+                "peer_unit": "grabowski-operator.service",
+                "timestamp_unix": int(broker_tool.time.time()),
+                "package_plan_id": plan_id, "package_paths": paths,
+                "package_sha256": hashes,
+            }
+            evidence["evidence_sha256"] = broker_tool.canonical_sha256(evidence)
+            proof = evidence_root / "proof.json"
+            proof.write_text(json.dumps(evidence), encoding="utf-8"); proof.chmod(0o640)
+            operation = {
+                "kind": "apply", "plan_id": plan_id,
+                "package_paths": [str(first)], "exact_evidence": True,
+            }
+            with (
+                mock.patch.object(broker_tool, "PACKAGE_UPDATE_STAGE_ROOT", stage_root),
+                mock.patch.object(broker_tool, "OUTPUT_EVIDENCE_ROOT", evidence_root),
+            ):
+                with self.assertRaisesRegex(PermissionError, "no fresh root-owned"):
+                    broker_tool._find_package_apply_evidence(
+                        operation, peer_uid=os.geteuid(), peer_unit="grabowski-operator.service"
+                    )
+
+    def test_package_apply_revalidates_evidence_under_lock_before_spawn(self) -> None:
+        events: list[str] = []
+        operation = {
+            "kind": "apply", "plan_id": "20260827T010203Z-123456abcdef",
+            "package_paths": ["/var/lib/heim-pc/package-update-stages/20260827T010203Z-123456abcdef/debs/a.deb"],
+            "exact_evidence": True,
+        }
+        class Lock:
+            def __enter__(self):
+                events.append("lock-enter")
+            def __exit__(self, exc_type, exc, tb):
+                events.append("lock-exit")
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (b"", b"")
+        def evidence(*args, **kwargs):
+            events.append("evidence")
+            return {"evidence_sha256": "c" * 64, "request_id": "d" * 32}
+        def popen(*args, **kwargs):
+            events.append("popen")
+            return process
+        reference = {
+            "request_id": "e" * 32, "reference_sha256": "f" * 64,
+            "action": broker_tool.POWER_ACTION, "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json", "argv": ["/usr/bin/true"], "cwd": "/",
+            "timeout_seconds": 5, "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        with (
+            mock.patch.object(broker_tool, "_package_stage_operation", return_value=operation),
+            mock.patch.object(broker_tool, "_package_stage_lock", side_effect=lambda: Lock()),
+            mock.patch.object(broker_tool, "_find_package_apply_evidence", side_effect=evidence),
+            mock.patch.object(broker_tool.subprocess, "Popen", side_effect=popen),
+            mock.patch.object(broker_tool, "append_audit"),
+        ):
+            result = broker_tool._execute_broker_command(
+                reference=reference, execution=execution, operator_peer=self.peer()
+            )
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(events, ["lock-enter", "evidence", "popen", "lock-exit"])
+        self.assertEqual(result["record"]["package_apply_evidence_sha256"], "c" * 64)
 
 
 if __name__ == "__main__":

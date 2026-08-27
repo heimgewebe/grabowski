@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+import fcntl
 import grp
 import hashlib
 import json
@@ -39,6 +41,9 @@ PACKAGE_UPDATE_STAGE_ROOT = Path("/var/lib/heim-pc/package-update-stages")
 PACKAGE_UPDATE_PLAN_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}\Z")
 PACKAGE_UPDATE_BASENAME_RE = re.compile(r"[-A-Za-z0-9._+@:]{1,255}\Z")
 OUTPUT_EVIDENCE_GROUP = "grabowski"
+PACKAGE_UPDATE_STAGE_LOCK = STATE / "package-update-stage.lock"
+PACKAGE_OUTPUT_EVIDENCE_MAX_AGE_SECONDS = 3600
+MAX_OUTPUT_EVIDENCE_FILES = 4096
 MAX_OUTPUT_BYTES = 250_000
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
@@ -94,6 +99,274 @@ def append_audit(record: dict[str, object]) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _package_stage_binding(raw_path: object) -> tuple[str, str | None, str | None] | None:
+    if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute() or os.path.normpath(raw_path) != raw_path:
+        return None
+    try:
+        relative = path.relative_to(PACKAGE_UPDATE_STAGE_ROOT)
+    except ValueError:
+        return None
+    if not 1 <= len(relative.parts) <= 3:
+        return None
+    plan_id = relative.parts[0]
+    if PACKAGE_UPDATE_PLAN_ID_RE.fullmatch(plan_id) is None:
+        return None
+    if len(relative.parts) == 1:
+        return plan_id, None, None
+    bucket = relative.parts[1]
+    if bucket not in {"debs", "snaps"}:
+        return None
+    if len(relative.parts) == 2:
+        return plan_id, bucket, None
+    filename = relative.parts[2]
+    if PACKAGE_UPDATE_BASENAME_RE.fullmatch(filename) is None:
+        return None
+    return plan_id, bucket, filename
+
+
+def _argv_mentions_package_stage(argv: object) -> bool:
+    if not isinstance(argv, list):
+        return False
+    root = str(PACKAGE_UPDATE_STAGE_ROOT)
+    for value in argv:
+        if not isinstance(value, str):
+            continue
+        if value == root or _package_stage_binding(value) is not None:
+            return True
+    return False
+
+
+def _package_stage_operation(argv: object) -> dict[str, object] | None:
+    """Classify existing allowlisted package-stage argv for extra broker guards."""
+    if not _argv_mentions_package_stage(argv):
+        return None
+    if not isinstance(argv, list) or not argv:
+        raise PermissionError("package stage operation argv is invalid")
+    root = str(PACKAGE_UPDATE_STAGE_ROOT)
+    if argv == ["/usr/bin/stat", "-f", "-c", "%a:%S", root]:
+        return {"kind": "readback", "plan_id": None, "package_paths": [], "exact_evidence": False}
+    if _package_output_evidence_allowed(argv) and argv[0] == "/usr/bin/sha256sum":
+        bindings = [_package_stage_binding(value) for value in argv[1:]]
+        plan_ids = {binding[0] for binding in bindings if binding is not None}
+        if len(plan_ids) != 1 or any(binding is None or binding[2] is None for binding in bindings):
+            raise PermissionError("package hash readback paths are not exact stage files")
+        return {
+            "kind": "readback", "plan_id": next(iter(plan_ids)),
+            "package_paths": list(argv[1:]), "exact_evidence": False,
+        }
+    if argv[0] == "/usr/bin/install":
+        bindings = [binding for value in argv[1:] if (binding := _package_stage_binding(value)) is not None]
+        if not bindings:
+            raise PermissionError("package install mentions stage root without a canonical stage binding")
+        plan_ids = {binding[0] for binding in bindings}
+        if len(plan_ids) != 1:
+            raise PermissionError("package install spans multiple plans")
+        return {"kind": "mutation", "plan_id": next(iter(plan_ids)), "package_paths": [], "exact_evidence": False}
+    if argv[0] == "/usr/bin/rm":
+        bindings = [binding for value in argv[1:] if (binding := _package_stage_binding(value)) is not None]
+        if not bindings or len({binding[0] for binding in bindings}) != 1:
+            raise PermissionError("package cleanup stage binding is invalid")
+        return {"kind": "mutation", "plan_id": bindings[0][0], "package_paths": [], "exact_evidence": False}
+    if argv[0] == "/usr/bin/dpkg":
+        if "--recursive" in argv:
+            raise PermissionError("recursive dpkg package stage execution is forbidden")
+        bindings = [binding for value in argv[1:] if (binding := _package_stage_binding(value)) is not None]
+        paths = [value for value in argv[1:] if _package_stage_binding(value) is not None]
+        if (
+            "--install" not in argv or not bindings
+            or any(binding[1] != "debs" or binding[2] is None for binding in bindings)
+            or len({binding[0] for binding in bindings}) != 1
+        ):
+            raise PermissionError("dpkg package stage execution is not exact-file bound")
+        return {"kind": "apply", "plan_id": bindings[0][0], "package_paths": paths, "exact_evidence": True}
+    if argv[0] == "/usr/bin/systemd-run":
+        if "--" not in argv:
+            raise PermissionError("package systemd execution has no inner command boundary")
+        boundary = argv.index("--")
+        inner = argv[boundary + 1 :]
+        if not inner or inner[0] != "/usr/bin/dpkg" or "--install" not in inner or "--recursive" in inner:
+            raise PermissionError("package systemd execution is not an exact dpkg apply")
+        bindings = [binding for value in inner[1:] if (binding := _package_stage_binding(value)) is not None]
+        paths = [value for value in inner[1:] if _package_stage_binding(value) is not None]
+        if (
+            not bindings or any(binding[1] != "debs" or binding[2] is None for binding in bindings)
+            or len({binding[0] for binding in bindings}) != 1
+        ):
+            raise PermissionError("package systemd dpkg paths are not exact stage DEBs")
+        return {"kind": "apply", "plan_id": bindings[0][0], "package_paths": paths, "exact_evidence": True}
+    if argv[:2] in (["/usr/bin/snap", "ack"], ["/usr/bin/snap", "install"]):
+        bindings = [binding for value in argv[2:] if (binding := _package_stage_binding(value)) is not None]
+        paths = [value for value in argv[2:] if _package_stage_binding(value) is not None]
+        if (
+            len(bindings) != 1 or bindings[0][1] != "snaps" or bindings[0][2] is None
+            or len(paths) != 1
+        ):
+            raise PermissionError("snap package stage execution is not exact-file bound")
+        return {"kind": "apply", "plan_id": bindings[0][0], "package_paths": paths, "exact_evidence": False}
+    raise PermissionError("unclassified package stage operation is forbidden")
+
+
+def _ensure_package_state_root() -> None:
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = STATE.lstat()
+    if (
+        STATE.is_symlink() or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid() or metadata.st_nlink < 1
+        or (stat.S_IMODE(metadata.st_mode) & 0o022) != 0
+    ):
+        raise PermissionError("privileged broker package state root is unsafe")
+
+
+@contextmanager
+def _package_stage_lock():
+    _ensure_package_state_root()
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(PACKAGE_UPDATE_STAGE_LOCK, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1
+        ):
+            raise PermissionError("privileged broker package stage lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _parse_package_sha256_output(argv: list[str], stdout_bytes: bytes) -> dict[str, str]:
+    if not _package_output_evidence_allowed(argv) or argv[0] != "/usr/bin/sha256sum":
+        raise ValueError("package hash evidence requires classified sha256sum argv")
+    try:
+        text = stdout_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("package hash output is not UTF-8") from exc
+    observed: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        parts = raw_line.split(maxsplit=1)
+        if len(parts) != 2 or re.fullmatch(r"[0-9a-f]{64}", parts[0]) is None:
+            raise ValueError("package hash output line is malformed")
+        path = parts[1].lstrip("*").strip()
+        if path in observed:
+            raise ValueError("package hash output contains a duplicate path")
+        observed[path] = parts[0]
+    expected = list(argv[1:])
+    if list(observed) != expected:
+        raise ValueError("package hash output paths differ from requested argv order")
+    return observed
+
+
+def _read_package_hash_evidence(path: Path) -> dict[str, object]:
+    metadata = path.lstat()
+    if (
+        path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o640 or metadata.st_nlink != 1
+        or metadata.st_size > 64 * 1024
+    ):
+        raise PermissionError("package hash evidence file is unsafe")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema_version") != 1 or value.get("kind") != OUTPUT_EVIDENCE_KIND:
+        raise ValueError("package hash evidence schema is invalid")
+    digest = value.get("evidence_sha256")
+    unsigned = dict(value)
+    unsigned.pop("evidence_sha256", None)
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None or canonical_sha256(unsigned) != digest:
+        raise ValueError("package hash evidence digest is invalid")
+    paths = value.get("package_paths")
+    hashes = value.get("package_sha256")
+    plan_id = value.get("package_plan_id")
+    if (
+        not isinstance(paths, list) or not paths or not isinstance(hashes, dict)
+        or set(hashes) != set(paths) or len(hashes) != len(paths) or not isinstance(plan_id, str)
+        or PACKAGE_UPDATE_PLAN_ID_RE.fullmatch(plan_id) is None
+    ):
+        raise ValueError("package hash evidence package binding is invalid")
+    for raw_path, digest_value in hashes.items():
+        binding = _package_stage_binding(raw_path)
+        if binding is None or binding[0] != plan_id or binding[2] is None:
+            raise ValueError("package hash evidence contains an unsafe path")
+        if not isinstance(digest_value, str) or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
+            raise ValueError("package hash evidence contains an invalid digest")
+    return value
+
+
+def _sha256_regular_root_file(path: Path) -> str:
+    _package_path_identity(path, directory=False)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    _package_path_identity(path, directory=False)
+    return digest.hexdigest()
+
+
+def _find_package_apply_evidence(
+    operation: dict[str, object], *, peer_uid: int, peer_unit: str
+) -> dict[str, object]:
+    required_paths = operation.get("package_paths")
+    plan_id = operation.get("plan_id")
+    exact = operation.get("exact_evidence") is True
+    if not isinstance(required_paths, list) or not required_paths or not isinstance(plan_id, str):
+        raise PermissionError("package apply operation lacks exact stage paths")
+    root_metadata = OUTPUT_EVIDENCE_ROOT.lstat()
+    if (
+        OUTPUT_EVIDENCE_ROOT.is_symlink() or not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != os.geteuid() or root_metadata.st_mode & 0o022
+    ):
+        raise PermissionError("package output evidence root is unsafe")
+    candidates = []
+    with os.scandir(OUTPUT_EVIDENCE_ROOT) as entries:
+        for entry in entries:
+            if len(candidates) >= MAX_OUTPUT_EVIDENCE_FILES:
+                raise PermissionError("package output evidence inventory exceeds bound")
+            if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                candidates.append(Path(entry.path))
+    now = int(time.time())
+    valid: list[dict[str, object]] = []
+    for path in candidates:
+        try:
+            value = _read_package_hash_evidence(path)
+        except (OSError, PermissionError, ValueError, json.JSONDecodeError):
+            continue
+        timestamp = value.get("timestamp_unix")
+        evidence_paths = value.get("package_paths")
+        if (
+            value.get("peer_uid") != peer_uid or value.get("peer_unit") != peer_unit
+            or value.get("package_plan_id") != plan_id
+            or isinstance(timestamp, bool) or not isinstance(timestamp, int)
+            or timestamp > now + 5 or now - timestamp > PACKAGE_OUTPUT_EVIDENCE_MAX_AGE_SECONDS
+            or not isinstance(evidence_paths, list)
+        ):
+            continue
+        if exact:
+            if evidence_paths != required_paths:
+                continue
+        elif any(path_value not in evidence_paths for path_value in required_paths):
+            continue
+        valid.append(value)
+    if not valid:
+        raise PermissionError("no fresh root-owned package hash evidence matches apply")
+    valid.sort(key=lambda item: (int(item["timestamp_unix"]), str(item["request_id"])), reverse=True)
+    evidence = valid[0]
+    hashes = evidence["package_sha256"]
+    assert isinstance(hashes, dict)
+    for raw_path in required_paths:
+        expected = hashes.get(raw_path)
+        if not isinstance(expected, str) or _sha256_regular_root_file(Path(raw_path)) != expected:
+            raise PermissionError("package stage bytes changed after authenticated hash readback")
+    return evidence
 
 
 def _package_output_evidence_allowed(argv: object) -> bool:
@@ -174,7 +447,9 @@ def _package_output_identity_snapshot(argv: list[str]) -> dict[str, tuple[int, .
     return snapshot
 
 
-def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
+def _write_output_evidence(
+    record: dict[str, object], *, argv: list[str] | None = None, stdout_bytes: bytes | None = None
+) -> dict[str, str]:
     """Publish root-owned evidence only for classified non-secret output."""
     request_id = record.get("request_id")
     if not isinstance(request_id, str) or len(request_id) != 32 or any(
@@ -253,6 +528,16 @@ def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
         "stdout_truncated": record["stdout_truncated"],
         "timestamp_unix": record["timestamp_unix"],
     }
+    if isinstance(argv, list) and argv and argv[0] == "/usr/bin/sha256sum":
+        if stdout_bytes is None:
+            raise ValueError("package hash evidence requires exact stdout bytes")
+        package_sha256 = _parse_package_sha256_output(argv, stdout_bytes)
+        binding = _package_stage_binding(argv[1])
+        if binding is None:
+            raise ValueError("package hash evidence has no canonical plan binding")
+        evidence["package_plan_id"] = binding[0]
+        evidence["package_paths"] = list(argv[1:])
+        evidence["package_sha256"] = package_sha256
     evidence["evidence_sha256"] = canonical_sha256(evidence)
     raw = (json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     destination = OUTPUT_EVIDENCE_ROOT / f"{request_id}.json"
@@ -820,6 +1105,108 @@ def _communicate_after_timeout(
     return process.communicate()
 
 
+def _execute_broker_command(
+    *,
+    reference: dict[str, object],
+    execution: dict[str, object],
+    operator_peer: dict[str, object] | None,
+) -> dict[str, object]:
+    argv = execution["argv"]
+    timeout = execution["timeout_seconds"]
+    cwd = execution.get("cwd")
+    package_operation = _package_stage_operation(argv) if reference.get("action") == POWER_ACTION else None
+    package_identity_before: dict[str, tuple[int, ...]] | None = None
+    package_apply_evidence: dict[str, object] | None = None
+    context = _package_stage_lock() if package_operation is not None else nullcontext()
+    with context:
+        if package_operation is not None and package_operation.get("kind") == "readback" and _package_output_evidence_allowed(argv):
+            package_identity_before = _package_output_identity_snapshot(argv)
+        if package_operation is not None and package_operation.get("kind") == "apply":
+            if operator_peer is None:
+                raise PermissionError("package apply requires validated operator peer")
+            peer_fields = _operator_peer_audit_fields(operator_peer)
+            package_apply_evidence = _find_package_apply_evidence(
+                package_operation,
+                peer_uid=int(peer_fields["peer_uid"]),
+                peer_unit=str(peer_fields["peer_unit"]),
+            )
+        started = time.monotonic()
+        process = subprocess.Popen(
+            argv,
+            cwd=str(cwd) if cwd is not None else None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=SAFE_ENV,
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            stdout_bytes, stderr_bytes = _communicate_after_timeout(
+                action=reference.get("action"), process=process,
+            )
+        stdout = stdout_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        stderr = stderr_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
+        record = {
+            **_base_audit_record(reference, execution, started),
+            **(_operator_peer_audit_fields(operator_peer) if operator_peer is not None else {}),
+            "returncode": None if timed_out else process.returncode,
+            "timed_out": timed_out,
+            "stdout_truncated": len(stdout_bytes) > MAX_OUTPUT_BYTES,
+            "stderr_truncated": len(stderr_bytes) > MAX_OUTPUT_BYTES,
+        }
+        if reference["action"] == POWER_ACTION:
+            record.update({
+                "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+                "stdout_bytes": len(stdout_bytes),
+                "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+                "stderr_bytes": len(stderr_bytes),
+            })
+        if package_operation is not None:
+            record["package_stage_guard"] = str(package_operation.get("kind"))
+            record["package_stage_plan_id"] = package_operation.get("plan_id")
+        if package_apply_evidence is not None:
+            record["package_apply_evidence_sha256"] = package_apply_evidence.get("evidence_sha256")
+            record["package_apply_evidence_request_id"] = package_apply_evidence.get("request_id")
+        append_audit(record)
+        output_evidence = None
+        output_evidence_status = "not-applicable"
+        readback_retry_safe = False
+        if package_identity_before is not None:
+            readback_retry_safe = True
+            output_evidence_status = "unavailable"
+            if (
+                record["returncode"] == 0 and record["timed_out"] is False
+                and record["stdout_truncated"] is False
+            ):
+                try:
+                    package_identity_after = _package_output_identity_snapshot(argv)
+                    if package_identity_after != package_identity_before:
+                        raise PermissionError("package readback identity changed during execution")
+                    output_evidence = _write_output_evidence(
+                        record, argv=argv, stdout_bytes=stdout_bytes
+                    )
+                    output_evidence_status = "published"
+                except (OSError, PermissionError, RuntimeError, ValueError):
+                    output_evidence = None
+                    output_evidence_status = "unavailable"
+    return {
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+        "record": record,
+        "timed_out": timed_out,
+        "returncode": None if timed_out else process.returncode,
+        "output_evidence": output_evidence,
+        "output_evidence_status": output_evidence_status,
+        "readback_retry_safe": readback_retry_safe,
+    }
+
+
 def main() -> int:
     if os.geteuid() != 0:
         raise PermissionError("privileged broker must run as root")
@@ -851,7 +1238,6 @@ def main() -> int:
     if cwd is not None and not Path(str(cwd)).is_dir():
         raise ValueError("privileged cwd is not an existing directory")
     claim_once(STATE / "used", str(reference["request_id"]))
-    package_identity_before: dict[str, tuple[int, ...]] | None = None
     if reference.get("action") == POWER_ACTION:
         refreshed_execution = resolve_execution(config, reference)
         stable_fields = (
@@ -867,8 +1253,6 @@ def main() -> int:
         cwd = execution.get("cwd")
         if cwd is not None and not Path(str(cwd)).is_dir():
             raise ValueError("privileged cwd changed before final gate")
-        if _package_output_evidence_allowed(argv):
-            package_identity_before = _package_output_identity_snapshot(argv)
         final_execution = resolve_execution(config, reference)
         if any(final_execution.get(key) != execution.get(key) for key in stable_fields):
             raise PermissionError("power execution contract changed at final gate")
@@ -876,72 +1260,23 @@ def main() -> int:
         argv = execution["argv"]
         timeout = execution["timeout_seconds"]
         cwd = execution.get("cwd")
-    started = time.monotonic()
-    process = subprocess.Popen(
-        argv,
-        cwd=str(cwd) if cwd is not None else None,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=SAFE_ENV,
-        start_new_session=True,
+    command_result = _execute_broker_command(
+        reference=reference, execution=execution, operator_peer=operator_peer
     )
-    timed_out = False
-    try:
-        stdout_bytes, stderr_bytes = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout_bytes, stderr_bytes = _communicate_after_timeout(
-            action=reference.get("action"),
-            process=process,
-        )
-    stdout = stdout_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
-    stderr = stderr_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="replace")
-    record = {
-        **_base_audit_record(reference, execution, started),
-        **(
-            _operator_peer_audit_fields(operator_peer)
-            if operator_peer is not None
-            else {}
-        ),
-        "returncode": None if timed_out else process.returncode,
-        "timed_out": timed_out,
-        "stdout_truncated": len(stdout_bytes) > MAX_OUTPUT_BYTES,
-        "stderr_truncated": len(stderr_bytes) > MAX_OUTPUT_BYTES,
-    }
-    if reference["action"] == POWER_ACTION:
-        record.update({
-            "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
-            "stdout_bytes": len(stdout_bytes),
-            "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
-            "stderr_bytes": len(stderr_bytes),
-        })
-    append_audit(record)
-    output_evidence = None
-    output_evidence_status = "not-applicable"
-    readback_retry_safe = False
-    if package_identity_before is not None:
-        readback_retry_safe = True
-        output_evidence_status = "unavailable"
-        if (
-            record["returncode"] == 0
-            and record["timed_out"] is False
-            and record["stdout_truncated"] is False
-        ):
-            try:
-                package_identity_after = _package_output_identity_snapshot(argv)
-                if package_identity_after != package_identity_before:
-                    raise PermissionError("package readback identity changed during execution")
-                output_evidence = _write_output_evidence(record)
-                output_evidence_status = "published"
-            except (OSError, PermissionError, RuntimeError, ValueError):
-                output_evidence = None
-                output_evidence_status = "unavailable"
+    stdout = str(command_result["stdout"])
+    stderr = str(command_result["stderr"])
+    record = command_result["record"]
+    assert isinstance(record, dict)
+    timed_out = command_result["timed_out"] is True
+    output_evidence = command_result["output_evidence"]
+    output_evidence_status = str(command_result["output_evidence_status"])
+    readback_retry_safe = command_result["readback_retry_safe"] is True
+    returncode = command_result["returncode"]
     print(json.dumps({
         "request_id": reference["request_id"],
         "action": reference["action"],
         "mode": execution.get("mode", "template"),
-        "returncode": None if timed_out else process.returncode,
+        "returncode": returncode,
         "timed_out": timed_out,
         "stdout": stdout,
         "stderr": stderr,
