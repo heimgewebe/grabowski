@@ -25,8 +25,16 @@ try:
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_AGENT,
+        PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256,
+        PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_TEXT,
+        PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY,
         PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
         PLAIN_LLM_OX_ALPHA_MODEL,
+        PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY,
+        PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE,
+        PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION,
+        PLAIN_LLM_OX_ALPHA_TOOL_POLICY,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
@@ -41,8 +49,16 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_OX_ALPHA_AGENT,
+        PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256,
+        PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_TEXT,
+        PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY,
         PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS,
         PLAIN_LLM_OX_ALPHA_MODEL,
+        PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY,
+        PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE,
+        PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION,
+        PLAIN_LLM_OX_ALPHA_TOOL_POLICY,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
@@ -54,11 +70,15 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
 VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 PROVIDERS = set(PLAIN_LLM_PROVIDERS)
 OX_ALPHA_MODEL = PLAIN_LLM_OX_ALPHA_MODEL
+OX_ALPHA_AGENT = PLAIN_LLM_OX_ALPHA_AGENT
 OX_ALPHA_CONTEXT_ATTESTATIONS = PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS
-OX_ALPHA_PROMPT_MESSAGE = (
-    "Review the complete prompt in the attached file and return only its "
-    "requested JSON object."
-)
+OX_ALPHA_PROMPT_MESSAGE = PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE
+OX_ALPHA_TOOL_POLICY = PLAIN_LLM_OX_ALPHA_TOOL_POLICY
+OX_ALPHA_PAID_FALLBACK_POLICY = PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY
+OX_ALPHA_RUNTIME_ISOLATION = PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION
+OX_ALPHA_AGENT_CONFIG_TEXT = PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_TEXT
+OX_ALPHA_AGENT_CONFIG_SHA256 = PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256
+OX_ALPHA_AUTH_COPY_POLICY = PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_PROMPT_BYTES = 500_000
 DEFAULT_MAX_REVIEW_BYTES = PLAIN_LLM_MAX_RAW_REVIEW_BYTES
@@ -103,7 +123,13 @@ SESSION_ENV = frozenset(
     }
 )
 ACCOUNT_CONFIGURATION_ROOT_KEYS = frozenset(
-    {"HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
+    {
+        "HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    }
 )
 FINDING_SEVERITIES = {"low", "medium", "high", "critical"}
 
@@ -500,7 +526,7 @@ def build_provider_argv(
             "run",
             "--pure",
             "--agent",
-            "plan",
+            OX_ALPHA_AGENT,
             "--model",
             OX_ALPHA_MODEL,
             "--file",
@@ -1184,6 +1210,176 @@ def _discard_open_provider_workspace(
                 pass
 
 
+def _write_private_runtime_file(path: Path, payload: bytes, *, label: str) -> os.stat_result:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        linked = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or not _same_file_identity(opened, linked)
+        ):
+            raise PlainReviewError(f"{label} identity is unsafe")
+        return opened
+    except PlainReviewError:
+        raise
+    except OSError as exc:
+        raise PlainReviewError(f"cannot create {label}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _prepare_ox_alpha_runtime(
+    root: Path,
+    environment: dict[str, str],
+) -> tuple[dict[str, str], dict[str, Any]]:
+    original_home_raw = environment.get("HOME")
+    if not original_home_raw or not Path(original_home_raw).is_absolute():
+        raise PlainReviewError("OpenCode account HOME is unavailable")
+    original_home = Path(original_home_raw)
+    source_data_raw = environment.get("XDG_DATA_HOME")
+    source_data = (
+        Path(source_data_raw)
+        if source_data_raw
+        else original_home / ".local" / "share"
+    )
+    source_auth = source_data / "opencode" / "auth.json"
+    try:
+        source_metadata = source_auth.lstat()
+    except OSError as exc:
+        raise PlainReviewError(f"OpenCode account auth is unavailable: {exc}") from exc
+    if (
+        not stat.S_ISREG(source_metadata.st_mode)
+        or source_metadata.st_uid != os.getuid()
+        or source_metadata.st_nlink != 1
+        or stat.S_IMODE(source_metadata.st_mode) & 0o077
+    ):
+        raise PlainReviewError("OpenCode account auth identity is unsafe")
+    _validate_path_ancestry(source_auth, label="OpenCode account auth")
+    auth_payload = read_bytes(
+        source_auth,
+        label="OpenCode account auth",
+        max_bytes=64_000,
+        expected=source_metadata,
+    )
+
+    roots = {
+        "HOME": root / "home",
+        "XDG_CONFIG_HOME": root / "config",
+        "XDG_DATA_HOME": root / "data",
+        "XDG_CACHE_HOME": root / "cache",
+        "XDG_STATE_HOME": root / "state",
+    }
+    for directory in roots.values():
+        directory.mkdir(mode=0o700)
+    config_root = roots["XDG_CONFIG_HOME"] / "opencode"
+    data_root = roots["XDG_DATA_HOME"] / "opencode"
+    config_root.mkdir(mode=0o700)
+    data_root.mkdir(mode=0o700)
+    config_path = config_root / "opencode.json"
+    auth_path = data_root / "auth.json"
+    config_identity = _write_private_runtime_file(
+        config_path,
+        OX_ALPHA_AGENT_CONFIG_TEXT.encode("utf-8"),
+        label="isolated OpenCode reviewer config",
+    )
+    auth_identity = _write_private_runtime_file(
+        auth_path,
+        auth_payload,
+        label="isolated OpenCode account auth",
+    )
+    for key, value in roots.items():
+        environment[key] = str(value)
+    expected_roots = _validate_account_configuration_roots(environment)
+    public = {
+        "runtime_isolation": OX_ALPHA_RUNTIME_ISOLATION,
+        "agent_name": OX_ALPHA_AGENT,
+        "agent_config_sha256": OX_ALPHA_AGENT_CONFIG_SHA256,
+        "account_auth_copy_policy": OX_ALPHA_AUTH_COPY_POLICY,
+    }
+    guard: dict[str, Any] = {
+        "config_path": config_path,
+        "config_identity": config_identity,
+        "auth_path": auth_path,
+        "auth_identity": auth_identity,
+        "auth_sha256": sha256_bytes(auth_payload),
+        "expected_roots": expected_roots,
+    }
+    return public, guard
+
+
+def _verify_ox_alpha_runtime(
+    environment: dict[str, str], guard: dict[str, Any]
+) -> None:
+    _validate_account_configuration_roots(
+        environment,
+        expected=guard["expected_roots"],
+    )
+    config_payload = read_bytes(
+        guard["config_path"],
+        label="isolated OpenCode reviewer config",
+        max_bytes=len(OX_ALPHA_AGENT_CONFIG_TEXT.encode("utf-8")),
+        expected=guard["config_identity"],
+    )
+    if sha256_bytes(config_payload) != OX_ALPHA_AGENT_CONFIG_SHA256:
+        raise PlainReviewError("isolated OpenCode reviewer config drifted")
+    auth_payload = read_bytes(
+        guard["auth_path"],
+        label="isolated OpenCode account auth",
+        max_bytes=64_000,
+        expected=guard["auth_identity"],
+    )
+    if sha256_bytes(auth_payload) != guard["auth_sha256"]:
+        raise PlainReviewError("isolated OpenCode account auth drifted")
+
+
+def _ox_alpha_execution_policy(
+    argv: list[str],
+    *,
+    resolved_executable: str,
+    prompt_path: Path,
+    runtime_attestation: dict[str, str],
+) -> dict[str, str]:
+    expected = [
+        resolved_executable,
+        "run",
+        "--pure",
+        "--agent",
+        OX_ALPHA_AGENT,
+        "--model",
+        OX_ALPHA_MODEL,
+        "--file",
+        str(prompt_path),
+        OX_ALPHA_PROMPT_MESSAGE,
+    ]
+    if argv != expected or "--auto" in argv:
+        raise PlainReviewError("Ox Alpha execution argv does not match deny-all policy")
+    if runtime_attestation.get("runtime_isolation") != OX_ALPHA_RUNTIME_ISOLATION:
+        raise PlainReviewError("Ox Alpha runtime isolation attestation is invalid")
+    if runtime_attestation.get("agent_config_sha256") != OX_ALPHA_AGENT_CONFIG_SHA256:
+        raise PlainReviewError("Ox Alpha reviewer config attestation is invalid")
+    return {
+        **runtime_attestation,
+        "tool_policy": OX_ALPHA_TOOL_POLICY,
+        "paid_fallback_policy": OX_ALPHA_PAID_FALLBACK_POLICY,
+    }
+
+
 def run_provider(
     prompt: str,
     *,
@@ -1200,6 +1396,7 @@ def run_provider(
     list[str],
     list[str],
     str,
+    dict[str, str] | None,
 ]:
     (
         environment,
@@ -1216,16 +1413,27 @@ def run_provider(
         environment=environment,
     )
     temporary_base = _validated_provider_temporary_base()
-    with tempfile.TemporaryDirectory(
-        prefix="grabowski-plain-review-",
-        dir=temporary_base,
-    ) as isolated_directory:
+    with (
+        tempfile.TemporaryDirectory(
+            prefix="grabowski-plain-review-",
+            dir=temporary_base,
+        ) as isolated_directory,
+        tempfile.TemporaryDirectory(
+            prefix="grabowski-plain-review-runtime-",
+            dir=temporary_base,
+        ) as runtime_directory,
+    ):
         isolated_root = Path(isolated_directory)
+        runtime_root = Path(runtime_directory)
         isolated_identity = _verify_private_workspace_identity(isolated_root)
+        if provider == "ox-alpha":
+            _verify_private_workspace_identity(runtime_root)
         workspace_descriptor = os.open(
             isolated_root,
             _parent_directory_open_flags(),
         )
+        runtime_attestation: dict[str, str] | None = None
+        runtime_guard: dict[str, Any] | None = None
         try:
             if not _same_file_identity(
                 isolated_identity,
@@ -1234,6 +1442,11 @@ def run_provider(
                 raise PlainReviewError(
                     "provider workspace descriptor identity drifted"
                 )
+            if provider == "ox-alpha":
+                runtime_attestation, runtime_guard = _prepare_ox_alpha_runtime(
+                    runtime_root, environment
+                )
+                account_configuration_roots = runtime_guard["expected_roots"]
             provider_prompt_path: Path | None = None
             provider_prompt: str | None = prompt
             if provider in {"grok", "ox-alpha"}:
@@ -1241,7 +1454,7 @@ def run_provider(
                 write_text_create_only(
                     provider_prompt_path,
                     prompt,
-                    label="ephemeral Grok prompt",
+                    label="ephemeral provider prompt",
                 )
                 provider_prompt = None
             argv = build_provider_argv(
@@ -1252,6 +1465,15 @@ def run_provider(
                 prompt_path=provider_prompt_path,
                 timeout_seconds=timeout_seconds,
             )
+            if provider == "ox-alpha":
+                assert provider_prompt_path is not None
+                assert runtime_attestation is not None
+                runtime_attestation = _ox_alpha_execution_policy(
+                    argv,
+                    resolved_executable=resolved_executable,
+                    prompt_path=provider_prompt_path,
+                    runtime_attestation=runtime_attestation,
+                )
             expected_prompt = prompt.encode("utf-8")
             verify_provider_workspace(
                 isolated_root,
@@ -1289,6 +1511,8 @@ def run_provider(
                     prompt_path=provider_prompt_path,
                     expected_prompt=expected_prompt,
                 )
+                if provider == "ox-alpha" and runtime_guard is not None:
+                    _verify_ox_alpha_runtime(environment, runtime_guard)
         finally:
             try:
                 _discard_open_provider_workspace(
@@ -1305,8 +1529,8 @@ def run_provider(
         removed_session,
         sorted(environment),
         resolved_executable,
+        runtime_attestation,
     )
-
 
 def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
@@ -1887,6 +2111,7 @@ def build_evidence(
     review: dict[str, Any],
     prompt_nonce: str,
     context_attestation: str | None,
+    runtime_attestation: dict[str, str] | None,
 ) -> dict[str, Any]:
     verdict = review["verdict"]
     finding_count = review["finding_count"]
@@ -1933,9 +2158,30 @@ def build_evidence(
             "ephemeral_prompt_file": provider in {"grok", "ox-alpha"},
             "context_attestation": context_attestation,
             "paid_fallback_policy": (
-                "disabled_by_exact_model"
-                if provider == "ox-alpha"
+                runtime_attestation["paid_fallback_policy"]
+                if provider == "ox-alpha" and runtime_attestation is not None
                 else "not_established_by_adapter"
+            ),
+            "provider_argv": argv if provider == "ox-alpha" else None,
+            "runtime_isolation": (
+                runtime_attestation["runtime_isolation"]
+                if provider == "ox-alpha" and runtime_attestation is not None
+                else None
+            ),
+            "agent_name": (
+                runtime_attestation["agent_name"]
+                if provider == "ox-alpha" and runtime_attestation is not None
+                else None
+            ),
+            "agent_config_sha256": (
+                runtime_attestation["agent_config_sha256"]
+                if provider == "ox-alpha" and runtime_attestation is not None
+                else None
+            ),
+            "account_auth_copy_policy": (
+                runtime_attestation["account_auth_copy_policy"]
+                if provider == "ox-alpha" and runtime_attestation is not None
+                else None
             ),
             "transmitted_prompt_bytes": prompt_bytes,
             "transmitted_prompt_path": str(
@@ -1988,7 +2234,11 @@ def build_evidence(
                     else (
                         "empty_tools_plan_mode"
                         if provider == "grok"
-                        else "opencode_pure_plan_agent"
+                        else (
+                            runtime_attestation["tool_policy"]
+                            if runtime_attestation is not None
+                            else "unverified"
+                        )
                     )
                 ),
                 "argv_sha256": canonical_sha256(argv),
@@ -2189,6 +2439,7 @@ def run_from_manifest(
             removed_session,
             passed_environment_keys,
             resolved_executable,
+            runtime_attestation,
         ) = run_provider(
             prompt,
             provider=provider,
@@ -2248,6 +2499,7 @@ def run_from_manifest(
         review=review,
         prompt_nonce=prompt_nonce,
         context_attestation=context_attestation,
+        runtime_attestation=runtime_attestation,
     )
     evidence_text = (
         json.dumps(
@@ -2340,11 +2592,14 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_REVIEW_BYTES,
     )
     args = parser.parse_args(argv)
-    executable = args.executable or {
+    default_executable = {
         "gemini": "agy",
         "grok": "grok",
         "ox-alpha": "opencode",
-    }[args.provider]
+    }.get(args.provider)
+    if default_executable is None:
+        parser.error("unsupported plain review provider")
+    executable = args.executable or default_executable
     try:
         evidence = run_from_manifest(
             manifest_path=Path(args.manifest),

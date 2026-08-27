@@ -250,6 +250,12 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         )
         self.assertEqual(ambiguous["status"], "ambiguous-account")
 
+    def test_configured_models_fail_closed_without_routes(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "catalog routes are missing or invalid"
+        ):
+            cli._configured_models({}, "grok")
+
     def test_antigravity_model_discovery_canonicalizes_configured_cli_ids(self) -> None:
         catalog, _ = router._load_catalog()
         self.assertEqual(
@@ -269,7 +275,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "Default model: grok-4.6\n"
             "Available models:\n"
             "* grok-4.6 default\n"
-            "* arbitrary-label default\n"
+            "- arbitrary-label\n"
         )
         current = (
             "Default model: grok-4.6\n"
@@ -285,6 +291,16 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             cli._grok_models_from_output(
                 catalog,
                 "Default model: grok-4.6\nAvailable models: arbitrary-label\n",
+            ),
+            [],
+        )
+        self.assertEqual(
+            cli._grok_models_from_output(
+                catalog,
+                "Available models:\n"
+                "- arbitrary-label\n"
+                "\n"
+                "Troubleshooting: try grok-4.6 if enabled later.\n",
             ),
             [],
         )

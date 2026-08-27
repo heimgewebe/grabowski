@@ -12,6 +12,38 @@ PLAIN_LLM_OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
 PLAIN_LLM_OX_ALPHA_CONTEXT_ATTESTATIONS = frozenset(
     {"public-context", "synthetic-context", "non-sensitive-context"}
 )
+PLAIN_LLM_OX_ALPHA_AGENT = "grabowski-reviewer"
+PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE = (
+    "Review the complete prompt in the attached file and return only its "
+    "requested JSON object."
+)
+PLAIN_LLM_OX_ALPHA_TOOL_POLICY = "opencode_pure_all_tools_denied_v1"
+PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY = "disabled_by_exact_model"
+PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION = "isolated_xdg_private_auth_copy_v1"
+PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY = "owner_private_exact_copy_reverified_v1"
+PLAIN_LLM_OX_ALPHA_AGENT_CONFIG = {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {"*": "deny"},
+    "agent": {
+        PLAIN_LLM_OX_ALPHA_AGENT: {
+            "description": "Return review JSON from supplied input only",
+            "mode": "primary",
+            "permission": {"*": "deny"},
+        }
+    },
+}
+PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_TEXT = (
+    json.dumps(
+        PLAIN_LLM_OX_ALPHA_AGENT_CONFIG,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    + "\n"
+)
+PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256 = hashlib.sha256(
+    PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_TEXT.encode("utf-8")
+).hexdigest()
 PLAIN_LLM_PROMPT_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES = 1_000_000
 PLAIN_LLM_MAX_RAW_REVIEW_BYTES = 1_000_000
@@ -40,6 +72,7 @@ PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS = frozenset(
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
     }
 )
 PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS = frozenset(

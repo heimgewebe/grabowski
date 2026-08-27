@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -146,6 +147,29 @@ def _plain_external_evidence(
         finding_count=0,
         findings=[],
     )
+    provider_argv = None
+    argv_sha256 = "3" * 64
+    if provider == "ox-alpha":
+        provider_argv = [
+            "/private/ox-alpha",
+            "run",
+            "--pure",
+            "--agent",
+            gate.PLAIN_LLM_OX_ALPHA_AGENT,
+            "--model",
+            gate.PLAIN_LLM_OX_ALPHA_MODEL,
+            "--file",
+            "/private/plain-review-prompt.txt",
+            gate.PLAIN_LLM_OX_ALPHA_PROMPT_MESSAGE,
+        ]
+        argv_sha256 = hashlib.sha256(
+            json.dumps(
+                provider_argv,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
     return {
         "schema_version": 1,
         "kind": "external_review",
@@ -189,9 +213,28 @@ def _plain_external_evidence(
                 "public-context" if provider == "ox-alpha" else None
             ),
             "paid_fallback_policy": (
-                "disabled_by_exact_model"
+                gate.PLAIN_LLM_OX_ALPHA_PAID_FALLBACK_POLICY
                 if provider == "ox-alpha"
                 else "not_established_by_adapter"
+            ),
+            "provider_argv": provider_argv,
+            "runtime_isolation": (
+                gate.PLAIN_LLM_OX_ALPHA_RUNTIME_ISOLATION
+                if provider == "ox-alpha"
+                else None
+            ),
+            "agent_name": (
+                gate.PLAIN_LLM_OX_ALPHA_AGENT if provider == "ox-alpha" else None
+            ),
+            "agent_config_sha256": (
+                gate.PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256
+                if provider == "ox-alpha"
+                else None
+            ),
+            "account_auth_copy_policy": (
+                gate.PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY
+                if provider == "ox-alpha"
+                else None
             ),
             "transmitted_prompt_bytes": len(prompt.encode("utf-8")),
             "transmitted_prompt_path": str(prompt_path),
@@ -234,12 +277,12 @@ def _plain_external_evidence(
                     "empty_tools_plan_mode"
                     if provider == "grok"
                     else (
-                        "opencode_pure_plan_agent"
+                        gate.PLAIN_LLM_OX_ALPHA_TOOL_POLICY
                         if provider == "ox-alpha"
                         else "sandboxed_plan_mode"
                     )
                 ),
-                "argv_sha256": "3" * 64,
+                "argv_sha256": argv_sha256,
                 "stdout_sha256": response_sha256,
                 "stderr_sha256": "4" * 64,
                 "review_sha256": response_sha256,
@@ -395,6 +438,35 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         )
         self.assertIn(
             "review_input.paid_fallback_policy is unsafe for Ox Alpha", warnings
+        )
+
+    def test_ox_alpha_evidence_rejects_runtime_or_argv_drift(self) -> None:
+        state = _state()
+        evidence = _plain_external_evidence(
+            state,
+            provider="ox-alpha",
+            model=gate.PLAIN_LLM_OX_ALPHA_MODEL,
+        )
+        evidence["review_input"]["runtime_isolation"] = "shared-user-config"
+        evidence["review_input"]["agent_config_sha256"] = "f" * 64
+        evidence["review_input"]["provider_argv"][4] = "plan"
+        result = _evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            external_review_evidence=evidence,
+        )
+        warnings = _warnings(result)
+        self.assertIn(
+            "review_input.runtime_isolation is unsafe for Ox Alpha", warnings
+        )
+        self.assertIn(
+            "review_input.agent_config_sha256 mismatch for Ox Alpha", warnings
+        )
+        self.assertIn(
+            "review_input.provider_argv policy mismatch for Ox Alpha", warnings
+        )
+        self.assertIn(
+            "argv_sha256 does not match Ox Alpha provider_argv", warnings
         )
 
     def test_prompt_hash_is_reconstructed_not_trusted(self) -> None:
