@@ -22,7 +22,13 @@ class ReposkopEffectivenessTaskIntegrationTests(unittest.TestCase):
         _task_tests.TaskTests.tearDown(self)
 
     def test_required_writer_orders_evaluation_before_task_start(self) -> None:
-        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        argv = [
+            "/opt/codex",
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "review this detached pull request worktree",
+        ]
         operations: list[str] = []
 
         def append_event(event: dict[str, object]) -> str:
@@ -67,9 +73,10 @@ class ReposkopEffectivenessTaskIntegrationTests(unittest.TestCase):
         self.assertEqual(result["audit"]["evaluation_id"], attestation["evaluation_id"])
         self.assertEqual(len(attestation["evaluation_id"]), 64)
         self.assertEqual(attestation["surface"], "task_start")
-        self.assertEqual(attestation["finding_summary"]["finding_taxonomy_status"], "available_v2")
-        self.assertEqual(attestation["finding_summary"]["finding_taxonomy_version"], 2)
-        self.assertEqual(attestation["finding_summary"]["advisory_posture"], "informational")
+        finding_summary = attestation["finding_summary"]
+        self.assertEqual(finding_summary["finding_taxonomy_status"], "available_v2")
+        self.assertEqual(finding_summary["finding_taxonomy_version"], 2)
+        self.assertEqual(finding_summary["advisory_posture"], "informational")
 
     def test_terminal_status_and_recovery_emit_one_outcome(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
