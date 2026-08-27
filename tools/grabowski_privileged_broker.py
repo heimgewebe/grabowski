@@ -851,6 +851,7 @@ def main() -> int:
     if cwd is not None and not Path(str(cwd)).is_dir():
         raise ValueError("privileged cwd is not an existing directory")
     claim_once(STATE / "used", str(reference["request_id"]))
+    package_identity_before: dict[str, tuple[int, ...]] | None = None
     if reference.get("action") == POWER_ACTION:
         refreshed_execution = resolve_execution(config, reference)
         stable_fields = (
@@ -861,6 +862,13 @@ def main() -> int:
             raise PermissionError("power execution contract changed before spawn")
         execution = refreshed_execution
         operator_peer = _validate_blockade_lifecycle_peer(execution)
+        argv = execution["argv"]
+        timeout = execution["timeout_seconds"]
+        cwd = execution.get("cwd")
+        if cwd is not None and not Path(str(cwd)).is_dir():
+            raise ValueError("privileged cwd changed before final gate")
+        if _package_output_evidence_allowed(argv):
+            package_identity_before = _package_output_identity_snapshot(argv)
         final_execution = resolve_execution(config, reference)
         if any(final_execution.get(key) != execution.get(key) for key in stable_fields):
             raise PermissionError("power execution contract changed at final gate")
@@ -868,13 +876,6 @@ def main() -> int:
         argv = execution["argv"]
         timeout = execution["timeout_seconds"]
         cwd = execution.get("cwd")
-        if cwd is not None and not Path(str(cwd)).is_dir():
-            raise ValueError("privileged cwd changed before spawn")
-    package_identity_before = (
-        _package_output_identity_snapshot(argv)
-        if reference.get("action") == POWER_ACTION and _package_output_evidence_allowed(argv)
-        else None
-    )
     started = time.monotonic()
     process = subprocess.Popen(
         argv,
