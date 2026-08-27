@@ -161,6 +161,17 @@ def _ratio(numerator: int, denominator: int, *, scale: float = 1.0) -> float:
     return round((numerator / denominator) * scale, 6)
 
 
+def _optional_ratio(
+    numerator: int,
+    denominator: int,
+    *,
+    scale: float = 1.0,
+) -> float | None:
+    if denominator <= 0:
+        return None
+    return _ratio(numerator, denominator, scale=scale)
+
+
 def _window_metrics(window: dict[str, Any] | None, label: str) -> dict[str, Any] | None:
     if not isinstance(window, dict):
         return None
@@ -198,12 +209,12 @@ def _window_metrics(window: dict[str, Any] | None, label: str) -> dict[str, Any]
         "resource_releases": _count(resource_activity, "resource-release"),
         "resource_reclamation_events": resource_reclamation_events,
         "reclaimed_resources": reclaimed_resources,
-        "resource_reclamation_events_per_1000_starts": _ratio(
+        "resource_reclamation_events_per_1000_starts": _optional_ratio(
             resource_reclamation_events,
             task_starts,
             scale=1000.0,
         ),
-        "reclaimed_resources_per_1000_starts": _ratio(
+        "reclaimed_resources_per_1000_starts": _optional_ratio(
             reclaimed_resources,
             task_starts,
             scale=1000.0,
@@ -214,9 +225,23 @@ def _window_metrics(window: dict[str, Any] | None, label: str) -> dict[str, Any]
     }
 
 
-def _metric_delta(selected: float, comparison: float) -> dict[str, float | None]:
-    absolute = round(selected - comparison, 6)
-    relative = None if comparison == 0 else round(absolute / comparison, 6)
+def _metric_delta(
+    selected: float | int | None,
+    comparison: float | int | None,
+) -> dict[str, float | None]:
+    if selected is None or comparison is None:
+        return {
+            "selected_minus_comparison": None,
+            "relative_change": None,
+        }
+    selected_value = float(selected)
+    comparison_value = float(comparison)
+    absolute = round(selected_value - comparison_value, 6)
+    relative = (
+        None
+        if comparison_value == 0
+        else round(absolute / comparison_value, 6)
+    )
     return {
         "selected_minus_comparison": absolute,
         "relative_change": relative,
@@ -243,8 +268,8 @@ def _comparison(
         "comparison_label": comparison["label"],
         "rates": {
             field: _metric_delta(
-                float(selected.get(field, 0.0)),
-                float(comparison.get(field, 0.0)),
+                selected.get(field),
+                comparison.get(field),
             )
             for field in rate_fields
         },
