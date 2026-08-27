@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -31,6 +32,8 @@ EffectProfile = Literal[
     "unknown",
 ]
 ReposkopPolicy = Literal["required", "not_required"]
+ReposkopWorkRole = Literal["intentional_pr_review"]
+ReposkopRoleAuthority = Literal["verified_server_owned_role_evidence"]
 ReposkopCohort = Literal[
     "not_applicable",
     "risk_required",
@@ -90,6 +93,14 @@ TERMINAL_IDENTITY_FIELDS = (
 MAX_REVIEW_REASON_CODES = 16
 MIN_FALSE_POSITIVE_CLUSTER = 3
 MIN_FALSE_NEGATIVE_CLUSTER = 2
+SEMANTIC_REVIEW_COHORTS = (
+    "prospective_sample",
+    "prospective_control",
+    "risk_required",
+    "repository_write_required",
+)
+MIN_SEMANTIC_REVIEWS_PER_COHORT = 20
+MIN_SEMANTIC_REVIEW_COVERAGE_RATIO = 0.80
 REVIEW_CLASSIFICATIONS = frozenset(
     {
         "confirmed_prevention",
@@ -111,6 +122,21 @@ EVIDENCE_REF_RE = re.compile(
     r"(?:audit-record-sha256|receipt-sha256|test-run-sha256|deployment-receipt-sha256):[0-9a-f]{64}\Z"
     r"|(?:git-commit-sha|github-pr-head-sha):[0-9a-f]{40}\Z"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ReposkopRoleContext:
+    """Typed capability derived from verified, server-owned role evidence.
+
+    This type is intentionally not coerced from dictionaries, prompt text or
+    caller prose. A future caller may pass it only after verifying the bound
+    audit record as server-owned structured role evidence.
+    """
+
+    schema_version: int
+    authority: ReposkopRoleAuthority
+    work_role: ReposkopWorkRole
+    evidence_ref: str
 
 
 class ReposkopReviewError(RuntimeError):
@@ -351,9 +377,83 @@ def _finding_add(
     reasons.add(reason)
 
 
-def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
+def validate_reposkop_role_context(
+    value: ReposkopRoleContext | None,
+) -> ReposkopRoleContext | None:
+    if value is None:
+        return None
+    if type(value) is not ReposkopRoleContext:
+        raise ValueError(
+            "role_context must be typed verified server-owned role evidence"
+        )
+    if type(value.schema_version) is not int or value.schema_version != 1:
+        raise ValueError("role_context schema_version must be 1")
+    if value.authority != "verified_server_owned_role_evidence":
+        raise ValueError("role_context authority is unsupported")
+    if value.work_role != "intentional_pr_review":
+        raise ValueError("role_context work_role is unsupported")
+    if AUDIT_REF_RE.fullmatch(value.evidence_ref) is None:
+        raise ValueError("role_context evidence_ref must bind one audit record")
+    return value
+
+
+def _contextual_posture(
+    *,
+    counts: dict[str, int],
+    reasons: set[str],
+    raw_posture: str,
+    role_context: ReposkopRoleContext | None,
+) -> dict[str, Any]:
+    contextualizable = {"detached_head", "upstream_unbound"}
+    contextualized = (
+        sorted(reasons & contextualizable) if role_context is not None else []
+    )
+    remaining_reasons = sorted(reasons - set(contextualized))
+    remaining_warning_count = counts.get("warning", 0) - int(
+        "detached_head" in contextualized
+    )
+    if (
+        counts.get("critical", 0)
+        or counts.get("error", 0)
+        or remaining_warning_count > 0
+    ):
+        posture = "attention"
+    elif remaining_reasons:
+        # A verified review role may explain only the exact detached/unbound
+        # checkout warnings. Remaining information stays visible without
+        # inheriting attention from the contextualized warning.
+        posture = "informational"
+    elif contextualized:
+        posture = "expected_review_checkout"
+    else:
+        posture = raw_posture
+    return {
+        "schema_version": 1,
+        "context_status": (
+            "verified_server_owned_role_evidence"
+            if role_context is not None
+            else "not_provided"
+        ),
+        "work_role": role_context.work_role if role_context is not None else None,
+        "role_evidence_ref": (
+            role_context.evidence_ref if role_context is not None else None
+        ),
+        "raw_posture": raw_posture,
+        "posture": posture,
+        "contextualized_reason_codes": contextualized,
+        "remaining_reason_codes": remaining_reasons,
+        "decision_effect": False,
+    }
+
+
+def finding_summary(
+    report: dict[str, Any] | None = None,
+    *,
+    role_context: ReposkopRoleContext | None = None,
+) -> dict[str, Any]:
+    validated_role_context = validate_reposkop_role_context(role_context)
     if not isinstance(report, dict):
-        return {
+        raw_findings = {
             "finding_taxonomy_status": "not_available_v1",
             "finding_taxonomy_version": None,
             "finding_count": None,
@@ -362,6 +462,23 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
             "finding_reason_codes": [],
             "projection_state": None,
             "advisory_posture": "unknown",
+        }
+        return {
+            **raw_findings,
+            "raw_findings": {
+                "finding_count": None,
+                "severity_counts": {},
+                "category_counts": {},
+                "reason_codes": [],
+                "projection_state": None,
+                "advisory_posture": "unknown",
+            },
+            "contextual_posture": _contextual_posture(
+                counts={},
+                reasons=set(),
+                raw_posture="unknown",
+                role_context=validated_role_context,
+            ),
         }
 
     counts = {"critical": 0, "error": 0, "warning": 0, "information": 0}
@@ -664,6 +781,14 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
         if counts["information"]
         else "clean"
     )
+    raw_findings = {
+        "finding_count": total,
+        "severity_counts": counts,
+        "category_counts": dict(sorted(categories.items())),
+        "reason_codes": sorted(reasons),
+        "projection_state": projection_state,
+        "advisory_posture": posture,
+    }
     return {
         "finding_taxonomy_status": "available_v2",
         "finding_taxonomy_version": FINDING_TAXONOMY_VERSION,
@@ -673,6 +798,13 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
         "finding_reason_codes": sorted(reasons),
         "projection_state": projection_state,
         "advisory_posture": posture,
+        "raw_findings": raw_findings,
+        "contextual_posture": _contextual_posture(
+            counts=counts,
+            reasons=reasons,
+            raw_posture=posture,
+            role_context=validated_role_context,
+        ),
     }
 
 
@@ -2212,6 +2344,8 @@ def project_records(
     relevant = REPOSKOP_EFFECTIVENESS_OPERATIONS
     source_material = source or {}
     evaluation_complete = source_material.get("index_complete") is not False
+    requested_window_truncated = source_material.get("since_truncated") is True
+    audit_projection_complete = evaluation_complete and not requested_window_truncated
     requested: dict[str, dict[str, Any]] = {}
     completed: dict[str, dict[str, Any]] = {}
     decisions: dict[str, dict[str, Any]] = {}
@@ -2368,6 +2502,77 @@ def project_records(
     }
     reviewable_ids = required_ids | prospective_control_ids
     reviewed_ids = reviewable_ids & set(reviews)
+    cohort_reviewable_ids: dict[str, set[str]] = {
+        "prospective_sample": prospective_sample_ids,
+        "prospective_control": prospective_control_ids,
+        "risk_required": risk_required_ids,
+        "repository_write_required": repository_write_required_ids,
+    }
+    cohort_review_metrics: dict[str, dict[str, Any]] = {}
+    cohort_readiness: dict[str, dict[str, bool]] = {}
+    for cohort in SEMANTIC_REVIEW_COHORTS:
+        cohort_ids = cohort_reviewable_ids[cohort]
+        reviewed_cohort_ids = cohort_ids & reviewed_ids
+        unreviewed_cohort_ids = cohort_ids - reviewed_ids
+        reviewable_count = len(cohort_ids)
+        reviewed_count = len(reviewed_cohort_ids)
+        coverage_ratio = (
+            reviewed_count / reviewable_count if reviewable_count else None
+        )
+        cohort_review_metrics[cohort] = {
+            "reviewable": reviewable_count,
+            "reviewed": reviewed_count,
+            "unreviewed": len(unreviewed_cohort_ids),
+            "backlog": len(unreviewed_cohort_ids),
+            "coverage_ratio": coverage_ratio,
+        }
+        cohort_readiness[cohort] = {
+            "minimum_reviewed_met": (
+                reviewed_count >= MIN_SEMANTIC_REVIEWS_PER_COHORT
+            ),
+            "minimum_coverage_met": (
+                coverage_ratio is not None
+                and coverage_ratio >= MIN_SEMANTIC_REVIEW_COVERAGE_RATIO
+            ),
+        }
+    insufficient_review_cohorts = [
+        cohort
+        for cohort in SEMANTIC_REVIEW_COHORTS
+        if not all(cohort_readiness[cohort].values())
+    ]
+    semantic_review_coverage_adequate = (
+        audit_projection_complete and not insufficient_review_cohorts
+    )
+    semantic_evidence_readiness = {
+        "status": (
+            "incomplete_audit_catchup"
+            if not evaluation_complete
+            else "incomplete_audit_window"
+            if requested_window_truncated
+            else "materially_adequate_review_coverage"
+            if semantic_review_coverage_adequate
+            else "insufficient_review_coverage"
+        ),
+        "coverage_materially_adequate": semantic_review_coverage_adequate,
+        "source_window_truncated": requested_window_truncated,
+        "thresholds": {
+            "required_cohorts": list(SEMANTIC_REVIEW_COHORTS),
+            "minimum_reviewed_per_cohort": MIN_SEMANTIC_REVIEWS_PER_COHORT,
+            "minimum_coverage_ratio_per_cohort": (
+                MIN_SEMANTIC_REVIEW_COVERAGE_RATIO
+            ),
+            "audit_projection_must_be_complete": True,
+            "requested_window_must_not_be_truncated": True,
+        },
+        "cohort_checks": cohort_readiness,
+        "insufficient_cohorts": insufficient_review_cohorts,
+        "interpretation": "coverage_gate_only_not_effectiveness_evidence",
+        "does_not_establish": [
+            "reposkop_effectiveness",
+            "semantic_outcome_classification",
+            "causality_between_reposkop_and_task_outcome",
+        ],
+    }
     review_counts = {name: 0 for name in sorted(REVIEW_CLASSIFICATIONS)}
     review_evidence_refs: dict[str, list[str]] = {name: [] for name in REVIEW_CLASSIFICATIONS}
     review_reason_clusters: dict[str, dict[str, int]] = {
@@ -2670,6 +2875,8 @@ def project_records(
                 classification: dict(sorted(counts.items()))
                 for classification, counts in sorted(review_category_clusters.items())
             },
+            "cohorts": cohort_review_metrics,
+            "evidence_readiness": semantic_evidence_readiness,
         },
         "prospective": {
             "sample_required": len(prospective_sample_ids),
@@ -2745,6 +2952,7 @@ def project_records(
             "causality_between_reposkop_and_task_outcome",
             "semantic_correctness_of_agent_output",
             "review_truth_beyond_the_supplied_evidence_refs",
+            "effectiveness_from_review_coverage_alone",
             "unique_value_from_identity_break_without_semantic_review",
             "future_failure_probability",
             *(
