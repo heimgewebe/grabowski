@@ -151,6 +151,16 @@ The first real PR-settlement attempt exposed a Prepare-contract defect before an
 
 PR #890 repaired that contract, added the corresponding regression coverage, and was merged only after exact-head validation, Captain gates and authoritative GitHub readback. The repair is a bootstrap prerequisite, not a substitute for the two required end-to-end Saga pilots. Pilot settlement and measured-effect evidence remain external, receipt-bound acceptance evidence so this repository document cannot claim success merely by being merged.
 
+### Live acceptance execution — 2026-08-27
+
+The terminal live-pilot pass is bound before effect to Bureau run `BUR-RUN-20260827T101946Z-a1e003f541`, authoritative T121 TaskSpec revision 5 / `5fac05b3ec40fb0ec7f320a68cb1c2fac16d856654535fab852592d00fd8bcfb`, and protected Grabowski head `ca50b9832d65ce3ee635a637a31fc17770fe37e2`. The focused pre-pilot validation is green: `tests/test_sagas.py` reports 19 tests plus 10 subtests passed, and the Saga-focused `tests/test_grips.py` selection reports 5 passed.
+
+PR #894 remains a historical checkpoint only. A bounded readback of the current Grabowski grip-receipt store found no `OperatorSagaPlan.v1`, `OperatorSagaRunReceipt.v1`, `OperatorSagaSettlementReceipt.v1`, PR-894, or merge-`b6763034bf196afe8da364ed06191f3548cc6a81` Saga receipt. Its already completed merge therefore must not be retroactively relabelled as a live Saga pilot.
+
+This closeout documentation change is the intended **new** PR-settlement pilot target. Its existence, review, or merge alone will not establish pilot success. Success requires a fresh `saga-plan`, receipt-bound `saga-run`, the normal Captain merge path, authoritative GitHub readback, verified Captain audit binding, and `saga-settle == settled` for that exact PR/head/base identity. Only then may the resulting protected merge commit become the target of the runtime-deployment pilot.
+
+For each pilot, closeout evidence records the real start/end timestamps, top-level operator/Saga calls, caller decisions, prepare/apply/readback blocks, partial failures, terminal state, plan/run/Captain/settlement receipt digests, and the exact target identity. The before/after comparison uses the same target's unbundled required public surfaces as the comparator; no historical call-count estimate is promoted to evidence. The sample remains descriptive and does not by itself authorize policy or further automation changes.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
