@@ -31,6 +31,8 @@ from grabowski_privileged_broker import (
 CONFIG = Path("/etc/grabowski/privileged-actions.json")
 STATE = Path("/var/lib/grabowski/privileged-broker")
 AUDIT = STATE / "audit.jsonl"
+OUTPUT_EVIDENCE_ROOT = Path("/run/grabowski/privileged-broker-evidence")
+OUTPUT_EVIDENCE_KIND = "grabowski_privileged_output_evidence"
 MAX_OUTPUT_BYTES = 250_000
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
@@ -86,6 +88,96 @@ def append_audit(record: dict[str, object]) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
+    """Publish non-secret root-owned evidence for exact broker stdout bytes."""
+    request_id = record.get("request_id")
+    if not isinstance(request_id, str) or len(request_id) != 32 or any(
+        character not in "0123456789abcdef" for character in request_id
+    ):
+        raise ValueError("privileged output evidence request_id is invalid")
+    if record.get("action") != POWER_ACTION:
+        raise ValueError("privileged output evidence is only defined for operator power argv")
+    if not isinstance(record.get("peer_uid"), int) or not isinstance(record.get("peer_unit"), str):
+        raise ValueError("privileged output evidence peer identity is invalid")
+    required = {
+        "reference_sha256", "action", "mode", "argv_sha256", "cwd_sha256",
+        "returncode", "timed_out", "stdout_sha256", "stdout_bytes",
+        "stdout_truncated", "timestamp_unix",
+    }
+    if any(key not in record for key in required):
+        raise ValueError("privileged output evidence source record is incomplete")
+
+    try:
+        OUTPUT_EVIDENCE_ROOT.mkdir(parents=False, mode=0o700)
+    except FileExistsError:
+        pass
+    metadata = OUTPUT_EVIDENCE_ROOT.lstat()
+    if (
+        OUTPUT_EVIDENCE_ROOT.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise PermissionError("privileged output evidence directory is unsafe")
+    os.chmod(OUTPUT_EVIDENCE_ROOT, 0o755)
+    metadata = OUTPUT_EVIDENCE_ROOT.lstat()
+    if stat.S_IMODE(metadata.st_mode) != 0o755:
+        raise PermissionError("privileged output evidence directory mode is unsafe")
+
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "kind": OUTPUT_EVIDENCE_KIND,
+        "request_id": request_id,
+        "reference_sha256": record["reference_sha256"],
+        "action": record["action"],
+        "mode": record["mode"],
+        "argv_sha256": record["argv_sha256"],
+        "cwd_sha256": record["cwd_sha256"],
+        "peer_uid": record.get("peer_uid"),
+        "peer_unit": record.get("peer_unit"),
+        "returncode": record["returncode"],
+        "timed_out": record["timed_out"],
+        "stdout_sha256": record["stdout_sha256"],
+        "stdout_bytes": record["stdout_bytes"],
+        "stdout_truncated": record["stdout_truncated"],
+        "timestamp_unix": record["timestamp_unix"],
+    }
+    evidence["evidence_sha256"] = canonical_sha256(evidence)
+    raw = (json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    destination = OUTPUT_EVIDENCE_ROOT / f"{request_id}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(destination, flags, 0o600)
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise OSError("privileged output evidence write was incomplete")
+            offset += written
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o644)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o644
+            or metadata.st_nlink != 1
+        ):
+            raise PermissionError("privileged output evidence file is unsafe")
+    finally:
+        os.close(descriptor)
+    directory = os.open(
+        OUTPUT_EVIDENCE_ROOT,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return {"path": str(destination), "sha256": str(evidence["evidence_sha256"])}
 
 
 def _base_audit_record(
@@ -673,9 +765,16 @@ def main() -> int:
         "returncode": None if timed_out else process.returncode,
         "timed_out": timed_out,
         "stdout_truncated": len(stdout_bytes) > MAX_OUTPUT_BYTES,
+        "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+        "stdout_bytes": len(stdout_bytes),
         "stderr_truncated": len(stderr_bytes) > MAX_OUTPUT_BYTES,
+        "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+        "stderr_bytes": len(stderr_bytes),
     }
     append_audit(record)
+    output_evidence = (
+        _write_output_evidence(record) if reference["action"] == POWER_ACTION else None
+    )
     print(json.dumps({
         "request_id": reference["request_id"],
         "action": reference["action"],
@@ -685,6 +784,7 @@ def main() -> int:
         "stdout": stdout,
         "stderr": stderr,
         "audit": record,
+        "output_evidence": output_evidence,
     }, ensure_ascii=False, sort_keys=True))
     # The socket client returns non-zero for non-zero action returncodes. The
     # broker process itself exits successfully after a structured response so a
