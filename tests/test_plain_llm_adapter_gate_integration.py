@@ -104,6 +104,11 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
         self.addCleanup(self._account_home.cleanup)
         account_home = Path(self._account_home.name)
         account_home.chmod(0o700)
+        opencode_data = account_home / ".local" / "share" / "opencode"
+        opencode_data.mkdir(parents=True, mode=0o700)
+        auth = opencode_data / "auth.json"
+        auth.write_text('{"openrouter":{"type":"api","key":"test-only"}}\n', encoding="utf-8")
+        auth.chmod(0o600)
         self._account_home_patch = mock.patch.dict(
             os.environ,
             {"HOME": str(account_home)},
@@ -273,6 +278,22 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 evidence["review_input"]["context_attestation"],
                 "public-context",
+            )
+            self.assertEqual(
+                evidence["review_input"]["agent_name"],
+                gate.PLAIN_LLM_OX_ALPHA_AGENT,
+            )
+            self.assertEqual(
+                evidence["review_input"]["agent_config_sha256"],
+                gate.PLAIN_LLM_OX_ALPHA_AGENT_CONFIG_SHA256,
+            )
+            self.assertEqual(
+                evidence["reviews"][0]["tool_policy"],
+                gate.PLAIN_LLM_OX_ALPHA_TOOL_POLICY,
+            )
+            self.assertEqual(
+                evidence["review_input"]["account_auth_copy_policy"],
+                gate.PLAIN_LLM_OX_ALPHA_AUTH_COPY_POLICY,
             )
 
     def test_packet_writer_rejects_unsafe_ancestry_before_creation(self) -> None:
