@@ -183,7 +183,8 @@ def _package_stage_operation(argv: object) -> dict[str, object] | None:
             or len({binding[0] for binding in bindings}) != 1
         ):
             raise PermissionError("dpkg package stage execution is not exact-file bound")
-        return {"kind": "apply", "plan_id": bindings[0][0], "package_paths": paths, "exact_evidence": True}
+        kind = "preflight" if any(flag in argv for flag in ("--simulate", "--no-act", "--dry-run")) else "apply"
+        return {"kind": kind, "plan_id": bindings[0][0], "package_paths": paths, "exact_evidence": kind == "apply"}
     if argv[0] == "/usr/bin/systemd-run":
         if "--" not in argv:
             raise PermissionError("package systemd execution has no inner command boundary")
@@ -198,7 +199,8 @@ def _package_stage_operation(argv: object) -> dict[str, object] | None:
             or len({binding[0] for binding in bindings}) != 1
         ):
             raise PermissionError("package systemd dpkg paths are not exact stage DEBs")
-        return {"kind": "apply", "plan_id": bindings[0][0], "package_paths": paths, "exact_evidence": True}
+        kind = "preflight" if any(flag in inner for flag in ("--simulate", "--no-act", "--dry-run")) else "apply"
+        return {"kind": kind, "plan_id": bindings[0][0], "package_paths": paths, "exact_evidence": kind == "apply"}
     if argv[:2] in (["/usr/bin/snap", "ack"], ["/usr/bin/snap", "install"]):
         bindings = [binding for value in argv[2:] if (binding := _package_stage_binding(value)) is not None]
         paths = [value for value in argv[2:] if _package_stage_binding(value) is not None]
@@ -448,7 +450,9 @@ def _package_output_identity_snapshot(argv: list[str]) -> dict[str, tuple[int, .
 
 
 def _write_output_evidence(
-    record: dict[str, object], *, argv: list[str] | None = None, stdout_bytes: bytes | None = None
+    record: dict[str, object], *, argv: list[str] | None = None, stdout_bytes: bytes | None = None,
+    package_operation: dict[str, object] | None = None,
+    package_guard_evidence: dict[str, object] | None = None,
 ) -> dict[str, str]:
     """Publish root-owned evidence only for classified non-secret output."""
     request_id = record.get("request_id")
@@ -538,6 +542,24 @@ def _write_output_evidence(
         evidence["package_plan_id"] = binding[0]
         evidence["package_paths"] = list(argv[1:])
         evidence["package_sha256"] = package_sha256
+    if package_operation is not None:
+        if package_operation.get("kind") != "apply":
+            raise ValueError("package completion evidence requires an apply operation")
+        plan_id = package_operation.get("plan_id")
+        package_paths = package_operation.get("package_paths")
+        guard_sha256 = (package_guard_evidence or {}).get("evidence_sha256")
+        if (
+            not isinstance(plan_id, str) or PACKAGE_UPDATE_PLAN_ID_RE.fullmatch(plan_id) is None
+            or not isinstance(package_paths, list) or not package_paths
+            or any(not isinstance(path, str) or _package_stage_binding(path) is None for path in package_paths)
+            or not isinstance(guard_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", guard_sha256) is None
+        ):
+            raise ValueError("package completion evidence binding is invalid")
+        evidence["package_plan_id"] = plan_id
+        evidence["package_paths"] = list(package_paths)
+        evidence["package_apply_completed"] = True
+        evidence["package_apply_guard_evidence_sha256"] = guard_sha256
+        evidence["package_exact_evidence"] = package_operation.get("exact_evidence") is True
     evidence["evidence_sha256"] = canonical_sha256(evidence)
     raw = (json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     destination = OUTPUT_EVIDENCE_ROOT / f"{request_id}.json"
@@ -1188,6 +1210,22 @@ def _execute_broker_command(
                         raise PermissionError("package readback identity changed during execution")
                     output_evidence = _write_output_evidence(
                         record, argv=argv, stdout_bytes=stdout_bytes
+                    )
+                    output_evidence_status = "published"
+                except (OSError, PermissionError, RuntimeError, ValueError):
+                    output_evidence = None
+                    output_evidence_status = "unavailable"
+        elif package_operation is not None and package_operation.get("kind") == "apply":
+            output_evidence_status = "unavailable"
+            if (
+                record["returncode"] == 0 and record["timed_out"] is False
+                and record["stdout_truncated"] is False
+            ):
+                try:
+                    output_evidence = _write_output_evidence(
+                        record, argv=argv, stdout_bytes=stdout_bytes,
+                        package_operation=package_operation,
+                        package_guard_evidence=package_apply_evidence,
                     )
                     output_evidence_status = "published"
                 except (OSError, PermissionError, RuntimeError, ValueError):

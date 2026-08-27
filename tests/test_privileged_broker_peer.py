@@ -1283,6 +1283,18 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertEqual(operation["plan_id"], plan_id)
         self.assertEqual(operation["package_paths"], [deb])
         self.assertIs(operation["exact_evidence"], True)
+        preflight = broker_tool._package_stage_operation([
+            "/usr/bin/dpkg", "--simulate", "--refuse-downgrade", "--install", deb,
+        ])
+        self.assertEqual(preflight["kind"], "preflight")
+        self.assertEqual(preflight["package_paths"], [deb])
+        self.assertIs(preflight["exact_evidence"], False)
+        systemd_preflight = broker_tool._package_stage_operation([
+            "/usr/bin/systemd-run", "--system", "--wait", "--",
+            "/usr/bin/dpkg", "--dry-run", "--install", deb,
+        ])
+        self.assertEqual(systemd_preflight["kind"], "preflight")
+        self.assertIs(systemd_preflight["exact_evidence"], False)
         with self.assertRaisesRegex(PermissionError, "recursive"):
             broker_tool._package_stage_operation([
                 "/usr/bin/dpkg", "--install", "--recursive",
@@ -1433,6 +1445,11 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertEqual(result["returncode"], 0)
         self.assertEqual(events, ["lock-enter", "evidence", "popen", "lock-exit"])
         self.assertEqual(result["record"]["package_apply_evidence_sha256"], "c" * 64)
+        self.assertEqual(result["output_evidence_status"], "published")
+        self._output_evidence.assert_called_once()
+        evidence_kwargs = self._output_evidence.call_args.kwargs
+        self.assertEqual(evidence_kwargs["package_operation"], operation)
+        self.assertEqual(evidence_kwargs["package_guard_evidence"]["evidence_sha256"], "c" * 64)
 
 
 if __name__ == "__main__":
