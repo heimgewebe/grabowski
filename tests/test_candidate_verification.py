@@ -286,12 +286,50 @@ class CandidateVerificationTests(unittest.TestCase):
         self.assertEqual(summary["missing_required_verifiers"], [])
         self.assertEqual(summary["verifier_attempts"], {"review": 1, "tests": 1})
         self.assertEqual(
+            summary["verifier_provenance"],
+            {
+                receipt["verifier_kind"]: {
+                    "verification_receipt_sha256": receipt["receipt_sha256"],
+                    "source_role_receipt_sha256": receipt["source_role_receipt_sha256"],
+                }
+                for receipt in sorted(receipts, key=lambda item: item["verifier_kind"])
+            },
+        )
+        self.assertEqual(
             candidate_verification.validate_verification_summary(
                 summary,
                 candidate_manifest=candidate,
                 verification_receipts=receipts,
             ),
             summary,
+        )
+
+    def test_legacy_summary_without_verifier_provenance_remains_readable(self) -> None:
+        candidate = self.candidate()
+        receipts = [
+            self.verification("review", candidate=candidate),
+            self.verification("tests", candidate=candidate),
+        ]
+        current = candidate_verification.reduce_verifications(
+            candidate_manifest=candidate,
+            verification_receipts=receipts,
+        )
+        legacy_body = {
+            key: value
+            for key, value in current.items()
+            if key not in {"summary_sha256", "verifier_provenance"}
+        }
+        legacy = {
+            **legacy_body,
+            "summary_sha256": candidate_verification.sha256_json(legacy_body),
+        }
+        self.assertEqual(
+            candidate_verification.validate_verification_summary(
+                legacy,
+                candidate_manifest=candidate,
+                verification_receipts=receipts,
+            ),
+            legacy,
         )
 
     def test_duplicate_verifier_receipt_is_rejected(self) -> None:
