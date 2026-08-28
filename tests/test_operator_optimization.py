@@ -264,7 +264,79 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             comparison["rates"]["failure_signal_rate"]["relative_change"],
             0,
         )
+        selected = result["measurement"]["selected_window"]
+        self.assertEqual(
+            selected["resource_reclamation_events_per_1000_starts"],
+            28.0,
+        )
+        self.assertEqual(
+            selected["reclaimed_resources_per_1000_starts"],
+            50.0,
+        )
+        self.assertGreater(
+            comparison["rates"]["resource_reclamation_events_per_1000_starts"][
+                "relative_change"
+            ],
+            0,
+        )
+        self.assertGreater(
+            comparison["rates"]["reclaimed_resources_per_1000_starts"][
+                "relative_change"
+            ],
+            0,
+        )
         self.assertIn("overlap", comparison["semantics"])
+
+    def test_reclamation_rates_are_unavailable_without_task_starts(self) -> None:
+        def no_task_starts_audit_provider(**_kwargs) -> dict:
+            payload = audit_provider()
+            selected = next(
+                item for item in payload["windows"] if item["label"] == "7d"
+            )
+            selected["task_activity"]["task-start"] = 0
+            self.assertGreater(
+                selected["resource_activity"]["resource_reclamation_event_count"],
+                0,
+            )
+            return payload
+
+        result = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            window="7d",
+            health_provider=health_provider,
+            audit_provider=no_task_starts_audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+
+        selected = result["measurement"]["selected_window"]
+        self.assertIsNone(
+            selected["resource_reclamation_events_per_1000_starts"]
+        )
+        self.assertIsNone(selected["reclaimed_resources_per_1000_starts"])
+        comparison = result["measurement"]["comparison"]["rates"]
+        self.assertIsNone(
+            comparison["resource_reclamation_events_per_1000_starts"][
+                "selected_minus_comparison"
+            ]
+        )
+        self.assertIsNone(
+            comparison["resource_reclamation_events_per_1000_starts"][
+                "relative_change"
+            ]
+        )
+        self.assertIsNone(
+            comparison["reclaimed_resources_per_1000_starts"][
+                "selected_minus_comparison"
+            ]
+        )
+        self.assertIsNone(
+            comparison["reclaimed_resources_per_1000_starts"][
+                "relative_change"
+            ]
+        )
 
     def test_evidence_view_remains_bounded_and_omits_raw_events(self) -> None:
         result = self.build(view="evidence")
