@@ -566,27 +566,11 @@ def validate_verification_summary(
         candidate_manifest=candidate_manifest,
         verification_receipts=verification_receipts,
     )
-    if value == expected:
-        return expected
-    # VerificationSummary.v1 existed before reducer provenance was projected.
-    # Keep those immutable historical summaries readable without silently
-    # rewriting their digest, while every newly reduced summary carries exact
-    # VerificationReceipt and source-role receipt identities.
-    if "verifier_provenance" not in value:
-        legacy_body = {
-            key: item
-            for key, item in expected.items()
-            if key not in {"summary_sha256", "verifier_provenance"}
-        }
-        legacy_expected = {
-            **legacy_body,
-            "summary_sha256": sha256_json(legacy_body),
-        }
-        if value == legacy_expected:
-            return dict(value)
-    raise CandidateVerificationError(
-        "verification summary differs from deterministic reduction"
-    )
+    if value != expected:
+        raise CandidateVerificationError(
+            "verification summary differs from deterministic reduction"
+        )
+    return expected
 
 
 def _read_regular_json(path: Path) -> dict[str, Any]:

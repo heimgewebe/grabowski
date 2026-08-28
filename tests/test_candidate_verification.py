@@ -304,7 +304,7 @@ class CandidateVerificationTests(unittest.TestCase):
             summary,
         )
 
-    def test_legacy_summary_without_verifier_provenance_remains_readable(self) -> None:
+    def test_legacy_summary_without_verifier_provenance_is_rejected(self) -> None:
         candidate = self.candidate()
         receipts = [
             self.verification("review", candidate=candidate),
@@ -323,14 +323,15 @@ class CandidateVerificationTests(unittest.TestCase):
             **legacy_body,
             "summary_sha256": candidate_verification.sha256_json(legacy_body),
         }
-        self.assertEqual(
+        with self.assertRaisesRegex(
+            candidate_verification.CandidateVerificationError,
+            "differs from deterministic reduction",
+        ):
             candidate_verification.validate_verification_summary(
                 legacy,
                 candidate_manifest=candidate,
                 verification_receipts=receipts,
-            ),
-            legacy,
-        )
+            )
 
     def test_duplicate_verifier_receipt_is_rejected(self) -> None:
         candidate = self.candidate()
