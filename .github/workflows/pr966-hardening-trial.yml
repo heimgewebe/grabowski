@@ -41,14 +41,20 @@ jobs:
           test "$(grep -c '\"_resolve_broker_execution\"' .github/pr966_finalize_bootstrap.py)" -eq 1
           sed -i 's/\"_resolve_broker_execution\"/\"main\"/' .github/pr966_finalize_bootstrap.py
 
-      - name: Validate bootstrap syntax
-        run: python -m py_compile .github/pr966_finalize_bootstrap.py
+      - name: Validate generators
+        run: |
+          python -m py_compile .github/pr966_finalize_bootstrap.py
+          python -m py_compile .github/pr966_finalize_followup.py
 
-      - name: Generate hardened broker diff
-        run: python .github/pr966_finalize_bootstrap.py
+      - name: Generate final hardening diff
+        run: |
+          python .github/pr966_finalize_bootstrap.py
+          python .github/pr966_finalize_followup.py
 
-      - name: Compile hardened broker
-        run: python -m py_compile tools/grabowski_privileged_broker.py
+      - name: Compile hardened sources and tests
+        run: |
+          python -m py_compile tools/grabowski_privileged_broker.py
+          python -m py_compile tests/test_privileged_broker_peer.py
 
       - name: Focused privileged-broker tests
         run: python -m unittest tests.test_privileged_broker_peer
