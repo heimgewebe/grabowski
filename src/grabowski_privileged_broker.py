@@ -668,8 +668,9 @@ def _resolve_recovery_marker_publish_action(
         if candidate.get("legacy_kill_switch_path") is not None
         else None
     )
-    if kill_switch.exists() or (legacy_switch is not None and legacy_switch.exists()):
-        raise PermissionError("power kill-switch is engaged")
+    _require_kill_switch_clear(kill_switch)
+    if legacy_switch is not None:
+        _require_kill_switch_clear(legacy_switch)
     expected_uid = candidate["expected_source_uid"]
     max_age = candidate["max_recovery_age_seconds"]
     configured_target = candidate["configured_target"]
@@ -727,7 +728,9 @@ def _resolve_recovery_marker_publish_action(
 
 
 def _require_kill_switch_clear(path: Path) -> None:
-    if path.exists():
+    # A dangling symlink is still an engaged directory entry.  ``exists()``
+    # follows it and would incorrectly report the blockade as absent.
+    if os.path.lexists(path):
         raise PermissionError("power kill-switch is engaged")
 
 
@@ -933,8 +936,9 @@ def _validate_power_gate(value: Any, *, now: int | None = None) -> dict[str, Any
         if value.get("legacy_kill_switch_path") is not None
         else None
     )
-    if kill_switch.exists() or (legacy_switch is not None and legacy_switch.exists()):
-        raise PermissionError("power kill-switch is engaged")
+    _require_kill_switch_clear(kill_switch)
+    if legacy_switch is not None:
+        _require_kill_switch_clear(legacy_switch)
     marker = _validate_gate_path(value["recovery_marker_path"], label="recovery_marker_path")
     max_age = value["max_recovery_age_seconds"]
     if isinstance(max_age, bool) or not isinstance(max_age, int) or not 1 <= max_age <= MAX_RECOVERY_AGE_SECONDS:
@@ -970,6 +974,8 @@ def _validate_power_gate(value: Any, *, now: int | None = None) -> dict[str, Any
             raise PermissionError(f"power recovery marker is not ready: {reason}")
         raise PermissionError("power recovery marker is not ready")
     return {
+        "kill_switch_path": str(kill_switch),
+        "legacy_kill_switch_path": str(legacy_switch) if legacy_switch is not None else None,
         "recovery_marker_path": str(marker),
         "recovery_marker_sha256": inspected["record_sha256"],
         "recovery_marker_source_sha256": inspected["source_record_sha256"],
@@ -978,6 +984,7 @@ def _validate_power_gate(value: Any, *, now: int | None = None) -> dict[str, Any
         "recovery_marker_max_age_seconds": inspected["max_age_seconds"],
         "recovery_marker_freshness_reason": inspected["freshness_reason"],
         "recovery_marker_configured_target": inspected["configured_target"],
+        "require_root_owned_gate_files": require_root_owned,
     }
 
 def _validate_recovery_gate(value: Any, *, now: int | None = None) -> dict[str, Any]:

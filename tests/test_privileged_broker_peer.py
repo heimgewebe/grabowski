@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import signal
 import sys
@@ -37,8 +39,14 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
             broker_tool, "_validate_system_cgroup_authority", return_value=None
         )
         self._system_cgroup_patch.start()
+        self._output_evidence_patch = mock.patch.object(
+            broker_tool, "_write_output_evidence",
+            return_value={"path": "/run/grabowski/privileged-broker-evidence/test.json", "sha256": "f" * 64},
+        )
+        self._output_evidence = self._output_evidence_patch.start()
 
     def tearDown(self) -> None:
+        self._output_evidence_patch.stop()
         self._system_cgroup_patch.stop()
 
     @staticmethod
@@ -803,6 +811,240 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         )
         killpg.assert_called_once_with(4242, signal.SIGTERM)
         self.assertEqual(broker_tool.ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS, 900)
+
+    def test_power_audit_keeps_raw_digest_root_only_for_unclassified_output(self) -> None:
+        reference = {
+            "request_id": "9" * 32,
+            "reference_sha256": "8" * 64,
+            "action": broker_tool.POWER_ACTION,
+            "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json",
+            "argv": ["/usr/bin/printf", "payload"],
+            "cwd": "/",
+            "timeout_seconds": 5,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        raw_stdout = b"secret-candidate\n"
+        raw_stderr = b"warn\x00bytes"
+        process = mock.Mock(pid=4242, returncode=0)
+        process.communicate.return_value = (raw_stdout, raw_stderr)
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        audits: list[dict[str, object]] = []
+        self._output_evidence.reset_mock()
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
+            ),
+            mock.patch.object(broker_tool, "claim_once"),
+            mock.patch.object(broker_tool, "append_audit", side_effect=lambda record: audits.append(dict(record))),
+            mock.patch.object(broker_tool.subprocess, "Popen", return_value=process),
+            redirect_stdout(io.StringIO()) as captured,
+        ):
+            self.assertEqual(broker_tool.main(), 0)
+        self.assertEqual(len(audits), 1)
+        record = audits[0]
+        self.assertEqual(record["stdout_sha256"], hashlib.sha256(raw_stdout).hexdigest())
+        self.assertEqual(record["stdout_bytes"], len(raw_stdout))
+        self.assertEqual(record["stderr_sha256"], hashlib.sha256(raw_stderr).hexdigest())
+        self.assertEqual(record["stderr_bytes"], len(raw_stderr))
+        self._output_evidence.assert_not_called()
+        response = json.loads(captured.getvalue())
+        self.assertIsNone(response["output_evidence"])
+        for key in ("stdout_sha256", "stdout_bytes", "stderr_sha256", "stderr_bytes"):
+            self.assertNotIn(key, response["audit"])
+
+    def test_package_output_evidence_classifier_is_narrow(self) -> None:
+        root = str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT)
+        plan = "20260827T010203Z-123456abcdef"
+        self.assertTrue(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/stat", "-f", "-c", "%a:%S", root
+        ]))
+        self.assertTrue(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/sha256sum",
+            f"{root}/{plan}/debs/cursor.deb",
+            f"{root}/{plan}/snaps/core.snap",
+        ]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed(["/usr/bin/printf", "secret"]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed(["/usr/bin/sha256sum", "/etc/shadow"]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/sha256sum", f"{root}/{plan}/debs/nested/file.deb"
+        ]))
+        self.assertFalse(broker_tool._package_output_evidence_allowed([
+            "/usr/bin/sha256sum",
+            f"{root}/{plan}/debs/a.deb",
+            f"{root}/20260827T010204Z-fedcba654321/debs/b.deb",
+        ]))
+
+    def test_package_output_identity_rejects_symlink_and_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw) / "heim-pc"
+            stage_root = home / "package-update-stages"
+            plan = stage_root / "20260827T010203Z-123456abcdef"
+            debs = plan / "debs"
+            debs.mkdir(parents=True)
+            for directory in (home, stage_root, plan, debs):
+                directory.chmod(0o700)
+            artifact = debs / "cursor.deb"
+            artifact.write_bytes(b"package")
+            artifact.chmod(0o600)
+            argv = ["/usr/bin/sha256sum", str(artifact)]
+            with mock.patch.object(broker_tool, "PACKAGE_UPDATE_STAGE_ROOT", stage_root):
+                snapshot = broker_tool._package_output_identity_snapshot(argv)
+                self.assertIn(str(artifact), snapshot)
+                artifact.unlink()
+                artifact.symlink_to("/etc/hosts")
+                with self.assertRaisesRegex(PermissionError, "symlink"):
+                    broker_tool._package_output_identity_snapshot(argv)
+                artifact.unlink()
+                source = debs / "source.deb"
+                source.write_bytes(b"package")
+                source.chmod(0o600)
+                os.link(source, artifact)
+                with self.assertRaisesRegex(PermissionError, "single-link"):
+                    broker_tool._package_output_identity_snapshot(argv)
+
+    def test_power_gate_is_revalidated_after_request_claim_before_spawn(self) -> None:
+        reference = {
+            "request_id": "4" * 32,
+            "reference_sha256": "3" * 64,
+            "action": broker_tool.POWER_ACTION,
+            "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json",
+            "argv": ["/usr/bin/true"],
+            "cwd": "/",
+            "timeout_seconds": 5,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(
+                broker_tool, "resolve_execution",
+                side_effect=[execution, PermissionError("power kill-switch is engaged")],
+            ) as resolve,
+            mock.patch.object(
+                broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
+            ),
+            mock.patch.object(broker_tool, "claim_once") as claim,
+            mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+        ):
+            with self.assertRaisesRegex(PermissionError, "kill-switch"):
+                broker_tool.main()
+        self.assertEqual(resolve.call_count, 2)
+        claim.assert_called_once()
+        popen.assert_not_called()
+
+    def test_safe_package_readback_publishes_output_evidence(self) -> None:
+        reference = {
+            "request_id": "6" * 32,
+            "reference_sha256": "5" * 64,
+            "action": broker_tool.POWER_ACTION,
+            "target": "{}",
+        }
+        execution = {
+            "mode": "argv-json",
+            "argv": [
+                "/usr/bin/stat", "-f", "-c", "%a:%S",
+                str(broker_tool.PACKAGE_UPDATE_STAGE_ROOT),
+            ],
+            "cwd": "/",
+            "timeout_seconds": 5,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        process = mock.Mock(pid=4242, returncode=0)
+        process.communicate.return_value = (b"123:4096\n", b"")
+        fake_stdin = mock.Mock()
+        fake_stdin.buffer = io.BytesIO(b"{}")
+        self._output_evidence.reset_mock()
+        with (
+            mock.patch.object(broker_tool.os, "geteuid", return_value=0),
+            mock.patch.object(broker_tool.sys, "stdin", fake_stdin),
+            mock.patch.object(broker_tool, "parse_reference", return_value=reference),
+            mock.patch.object(broker_tool, "load_root_config", return_value={}),
+            mock.patch.object(broker_tool, "resolve_execution", return_value=execution),
+            mock.patch.object(
+                broker_tool, "_validate_blockade_lifecycle_peer", return_value=self.peer()
+            ),
+            mock.patch.object(broker_tool, "claim_once"),
+            mock.patch.object(broker_tool, "append_audit"),
+            mock.patch.object(
+                broker_tool, "_package_output_identity_snapshot",
+                return_value={"stage": (1, 2, 3)},
+            ) as identity_snapshot,
+            mock.patch.object(broker_tool.subprocess, "Popen", return_value=process),
+            redirect_stdout(io.StringIO()) as captured,
+        ):
+            self.assertEqual(broker_tool.main(), 0)
+        self.assertEqual(identity_snapshot.call_count, 2)
+        self._output_evidence.assert_called_once()
+        response = json.loads(captured.getvalue())
+        self.assertEqual(response["output_evidence"]["sha256"], "f" * 64)
+        self.assertNotIn("stdout_sha256", response["audit"])
+
+    def test_output_evidence_is_content_hashed_and_group_read_only(self) -> None:
+        self._output_evidence_patch.stop()
+        try:
+            with tempfile.TemporaryDirectory() as raw:
+                root = Path(raw) / "evidence"
+                record: dict[str, object] = {
+                    "schema_version": 1,
+                    "timestamp_unix": 123,
+                    "request_id": "7" * 32,
+                    "reference_sha256": "6" * 64,
+                    "action": broker_tool.POWER_ACTION,
+                    "mode": "argv-json",
+                    "argv_sha256": "5" * 64,
+                    "cwd_sha256": "4" * 64,
+                    "peer_uid": 1000,
+                    "peer_unit": "grabowski-operator.service",
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout_sha256": hashlib.sha256(b"abc\n").hexdigest(),
+                    "stdout_bytes": 4,
+                    "stdout_truncated": False,
+                }
+                with (
+                    mock.patch.object(broker_tool, "OUTPUT_EVIDENCE_ROOT", root),
+                    mock.patch.object(
+                        broker_tool.grp, "getgrnam",
+                        return_value=mock.Mock(gr_gid=root.parent.stat().st_gid),
+                    ),
+                ):
+                    published = broker_tool._write_output_evidence(record)
+                destination = Path(published["path"])
+                value = json.loads(destination.read_text(encoding="utf-8"))
+                digest = value.pop("evidence_sha256")
+                self.assertEqual(digest, broker_tool.canonical_sha256(value))
+                self.assertEqual(published["sha256"], digest)
+                self.assertEqual(value["stdout_sha256"], record["stdout_sha256"])
+                self.assertEqual(value["stdout_bytes"], 4)
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o640)
+                self.assertEqual(root.stat().st_mode & 0o777, 0o750)
+                self.assertEqual(destination.stat().st_gid, root.parent.stat().st_gid)
+                self.assertEqual(root.stat().st_gid, root.parent.stat().st_gid)
+        finally:
+            self._output_evidence_patch = mock.patch.object(
+                broker_tool, "_write_output_evidence",
+                return_value={"path": "/run/grabowski/privileged-broker-evidence/test.json", "sha256": "f" * 64},
+            )
+            self._output_evidence = self._output_evidence_patch.start()
 
     def test_rootbroker_action_name_requires_peer_validation_even_if_execution_fields_missing(self) -> None:
         reference = {

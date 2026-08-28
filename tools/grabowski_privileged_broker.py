@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import pwd
 import signal
 import socket
@@ -31,6 +33,12 @@ from grabowski_privileged_broker import (
 CONFIG = Path("/etc/grabowski/privileged-actions.json")
 STATE = Path("/var/lib/grabowski/privileged-broker")
 AUDIT = STATE / "audit.jsonl"
+OUTPUT_EVIDENCE_ROOT = Path("/run/grabowski/privileged-broker-evidence")
+OUTPUT_EVIDENCE_KIND = "grabowski_privileged_output_evidence"
+PACKAGE_UPDATE_STAGE_ROOT = Path("/var/lib/heim-pc/package-update-stages")
+PACKAGE_UPDATE_PLAN_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}\Z")
+PACKAGE_UPDATE_BASENAME_RE = re.compile(r"[-A-Za-z0-9._+@:]{1,255}\Z")
+OUTPUT_EVIDENCE_GROUP = "grabowski"
 MAX_OUTPUT_BYTES = 250_000
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
@@ -87,6 +95,207 @@ def append_audit(record: dict[str, object]) -> None:
     finally:
         os.close(directory)
 
+
+def _package_output_evidence_allowed(argv: object) -> bool:
+    """Allow public evidence only for bounded non-secret package readbacks."""
+    if argv == [
+        "/usr/bin/stat", "-f", "-c", "%a:%S", str(PACKAGE_UPDATE_STAGE_ROOT)
+    ]:
+        return True
+    if not isinstance(argv, list) or len(argv) < 2 or argv[0] != "/usr/bin/sha256sum":
+        return False
+    plan_ids: set[str] = set()
+    for raw_path in argv[1:]:
+        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+            return False
+        path = Path(raw_path)
+        if not path.is_absolute() or os.path.normpath(raw_path) != raw_path:
+            return False
+        try:
+            relative = path.relative_to(PACKAGE_UPDATE_STAGE_ROOT)
+        except ValueError:
+            return False
+        if len(relative.parts) != 3:
+            return False
+        plan_id, bucket, filename = relative.parts
+        if (
+            PACKAGE_UPDATE_PLAN_ID_RE.fullmatch(plan_id) is None
+            or bucket not in {"debs", "snaps"}
+            or filename in {"", ".", ".."}
+        ):
+            return False
+        plan_ids.add(plan_id)
+    return len(plan_ids) == 1
+
+
+def _package_path_identity(path: Path, *, directory: bool) -> tuple[int, ...]:
+    metadata = path.lstat()
+    expected_uid = os.geteuid()
+    if stat.S_ISLNK(metadata.st_mode):
+        raise PermissionError("package readback path may not be a symlink")
+    if directory:
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise PermissionError("package readback directory is not a directory")
+    else:
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PermissionError("package readback artifact must be a single-link regular file")
+    if metadata.st_uid != expected_uid or metadata.st_mode & 0o022:
+        raise PermissionError("package readback path is not root-controlled")
+    return (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+        metadata.st_gid, metadata.st_nlink, metadata.st_size,
+        metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+
+def _package_output_identity_snapshot(argv: list[str]) -> dict[str, tuple[int, ...]]:
+    if not _package_output_evidence_allowed(argv):
+        raise PermissionError("package output evidence argv is not classified")
+    snapshot: dict[str, tuple[int, ...]] = {}
+    # The fixed parent and stage root close component-level symlink replacement
+    # before any classified readback is spawned.
+    for directory in (PACKAGE_UPDATE_STAGE_ROOT.parent, PACKAGE_UPDATE_STAGE_ROOT):
+        snapshot[str(directory)] = _package_path_identity(directory, directory=True)
+    if argv[0] == "/usr/bin/stat":
+        return snapshot
+    for raw_path in argv[1:]:
+        path = Path(raw_path)
+        relative = path.relative_to(PACKAGE_UPDATE_STAGE_ROOT)
+        plan_id, bucket, filename = relative.parts
+        if PACKAGE_UPDATE_BASENAME_RE.fullmatch(filename) is None:
+            raise PermissionError("package readback artifact basename is unsafe")
+        plan_dir = PACKAGE_UPDATE_STAGE_ROOT / plan_id
+        bucket_dir = plan_dir / bucket
+        for directory in (plan_dir, bucket_dir):
+            key = str(directory)
+            if key not in snapshot:
+                snapshot[key] = _package_path_identity(directory, directory=True)
+        snapshot[str(path)] = _package_path_identity(path, directory=False)
+    return snapshot
+
+
+def _write_output_evidence(record: dict[str, object]) -> dict[str, str]:
+    """Publish root-owned evidence only for classified non-secret output."""
+    request_id = record.get("request_id")
+    if not isinstance(request_id, str) or len(request_id) != 32 or any(
+        character not in "0123456789abcdef" for character in request_id
+    ):
+        raise ValueError("privileged output evidence request_id is invalid")
+    if record.get("action") != POWER_ACTION:
+        raise ValueError("privileged output evidence is only defined for operator power argv")
+    if not isinstance(record.get("peer_uid"), int) or not isinstance(record.get("peer_unit"), str):
+        raise ValueError("privileged output evidence peer identity is invalid")
+    required = {
+        "reference_sha256", "action", "mode", "argv_sha256", "cwd_sha256",
+        "returncode", "timed_out", "stdout_sha256", "stdout_bytes",
+        "stdout_truncated", "timestamp_unix",
+    }
+    if any(key not in record for key in required):
+        raise ValueError("privileged output evidence source record is incomplete")
+    if (
+        record.get("returncode") != 0
+        or record.get("timed_out") is not False
+        or record.get("stdout_truncated") is not False
+    ):
+        raise ValueError("privileged output evidence requires complete successful output")
+
+    parent = OUTPUT_EVIDENCE_ROOT.parent
+    parent_metadata = parent.lstat()
+    expected_uid = os.geteuid()
+    try:
+        configured_gid = grp.getgrnam(OUTPUT_EVIDENCE_GROUP).gr_gid
+    except KeyError as exc:
+        raise PermissionError("privileged output evidence group is unavailable") from exc
+    if (
+        parent.is_symlink()
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != expected_uid
+        or parent_metadata.st_gid != configured_gid
+        or parent_metadata.st_mode & 0o022
+    ):
+        raise PermissionError("privileged output evidence parent is unsafe")
+    created = False
+    try:
+        OUTPUT_EVIDENCE_ROOT.mkdir(parents=False, mode=0o750)
+        created = True
+    except FileExistsError:
+        pass
+    metadata = OUTPUT_EVIDENCE_ROOT.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+    ):
+        raise PermissionError("privileged output evidence directory is unsafe")
+    if created:
+        os.chown(OUTPUT_EVIDENCE_ROOT, expected_uid, configured_gid)
+        os.chmod(OUTPUT_EVIDENCE_ROOT, 0o750)
+        metadata = OUTPUT_EVIDENCE_ROOT.lstat()
+    if metadata.st_gid != configured_gid or stat.S_IMODE(metadata.st_mode) != 0o750:
+        raise PermissionError("privileged output evidence directory contract drifted")
+    evidence_gid = configured_gid
+
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "kind": OUTPUT_EVIDENCE_KIND,
+        "request_id": request_id,
+        "reference_sha256": record["reference_sha256"],
+        "action": record["action"],
+        "mode": record["mode"],
+        "argv_sha256": record["argv_sha256"],
+        "cwd_sha256": record["cwd_sha256"],
+        "peer_uid": record.get("peer_uid"),
+        "peer_unit": record.get("peer_unit"),
+        "returncode": record["returncode"],
+        "timed_out": record["timed_out"],
+        "stdout_sha256": record["stdout_sha256"],
+        "stdout_bytes": record["stdout_bytes"],
+        "stdout_truncated": record["stdout_truncated"],
+        "timestamp_unix": record["timestamp_unix"],
+    }
+    evidence["evidence_sha256"] = canonical_sha256(evidence)
+    raw = (json.dumps(evidence, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    destination = OUTPUT_EVIDENCE_ROOT / f"{request_id}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(destination, flags, 0o600)
+    try:
+        os.fchown(descriptor, expected_uid, evidence_gid)
+        os.fchmod(descriptor, 0o640)
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise OSError("privileged output evidence write was incomplete")
+            offset += written
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != evidence_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o640
+            or metadata.st_nlink != 1
+        ):
+            raise PermissionError("privileged output evidence file is unsafe")
+    finally:
+        os.close(descriptor)
+    directory = os.open(
+        OUTPUT_EVIDENCE_ROOT,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return {"path": str(destination), "sha256": str(evidence["evidence_sha256"])}
+
+
+def _public_audit_record(record: dict[str, object]) -> dict[str, object]:
+    public = dict(record)
+    for key in ("stdout_sha256", "stdout_bytes", "stderr_sha256", "stderr_bytes"):
+        public.pop(key, None)
+    return public
 
 def _base_audit_record(
     reference: dict[str, object],
@@ -642,6 +851,31 @@ def main() -> int:
     if cwd is not None and not Path(str(cwd)).is_dir():
         raise ValueError("privileged cwd is not an existing directory")
     claim_once(STATE / "used", str(reference["request_id"]))
+    package_identity_before: dict[str, tuple[int, ...]] | None = None
+    if reference.get("action") == POWER_ACTION:
+        refreshed_execution = resolve_execution(config, reference)
+        stable_fields = (
+            "mode", "argv", "cwd", "timeout_seconds",
+            "allowed_peer_uid", "allowed_peer_unit",
+        )
+        if any(refreshed_execution.get(key) != execution.get(key) for key in stable_fields):
+            raise PermissionError("power execution contract changed before spawn")
+        execution = refreshed_execution
+        operator_peer = _validate_blockade_lifecycle_peer(execution)
+        argv = execution["argv"]
+        timeout = execution["timeout_seconds"]
+        cwd = execution.get("cwd")
+        if cwd is not None and not Path(str(cwd)).is_dir():
+            raise ValueError("privileged cwd changed before final gate")
+        if _package_output_evidence_allowed(argv):
+            package_identity_before = _package_output_identity_snapshot(argv)
+        final_execution = resolve_execution(config, reference)
+        if any(final_execution.get(key) != execution.get(key) for key in stable_fields):
+            raise PermissionError("power execution contract changed at final gate")
+        execution = final_execution
+        argv = execution["argv"]
+        timeout = execution["timeout_seconds"]
+        cwd = execution.get("cwd")
     started = time.monotonic()
     process = subprocess.Popen(
         argv,
@@ -675,7 +909,34 @@ def main() -> int:
         "stdout_truncated": len(stdout_bytes) > MAX_OUTPUT_BYTES,
         "stderr_truncated": len(stderr_bytes) > MAX_OUTPUT_BYTES,
     }
+    if reference["action"] == POWER_ACTION:
+        record.update({
+            "stdout_sha256": hashlib.sha256(stdout_bytes).hexdigest(),
+            "stdout_bytes": len(stdout_bytes),
+            "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+            "stderr_bytes": len(stderr_bytes),
+        })
     append_audit(record)
+    output_evidence = None
+    output_evidence_status = "not-applicable"
+    readback_retry_safe = False
+    if package_identity_before is not None:
+        readback_retry_safe = True
+        output_evidence_status = "unavailable"
+        if (
+            record["returncode"] == 0
+            and record["timed_out"] is False
+            and record["stdout_truncated"] is False
+        ):
+            try:
+                package_identity_after = _package_output_identity_snapshot(argv)
+                if package_identity_after != package_identity_before:
+                    raise PermissionError("package readback identity changed during execution")
+                output_evidence = _write_output_evidence(record)
+                output_evidence_status = "published"
+            except (OSError, PermissionError, RuntimeError, ValueError):
+                output_evidence = None
+                output_evidence_status = "unavailable"
     print(json.dumps({
         "request_id": reference["request_id"],
         "action": reference["action"],
@@ -684,7 +945,10 @@ def main() -> int:
         "timed_out": timed_out,
         "stdout": stdout,
         "stderr": stderr,
-        "audit": record,
+        "audit": _public_audit_record(record),
+        "output_evidence": output_evidence,
+        "output_evidence_status": output_evidence_status,
+        "readback_retry_safe": readback_retry_safe,
     }, ensure_ascii=False, sort_keys=True))
     # The socket client returns non-zero for non-zero action returncodes. The
     # broker process itself exits successfully after a structured response so a
