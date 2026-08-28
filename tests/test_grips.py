@@ -16191,6 +16191,8 @@ class RuntimeRefreshLeaseReleaseGripTests(unittest.TestCase):
         "path:/home/alex/.local/share/bureau",
         "path:/home/alex/.local/state/bureau/runtime-refresh",
         "path:/home/alex/.local/state/bureau/runtime-refresh/workspaces/" + "c" * 40,
+        "service:bureau-runtime-refresh.service",
+        "service:bureau-runtime-refresh.timer",
     ]
 
     def success_output(self) -> dict[str, object]:
@@ -16237,6 +16239,30 @@ class RuntimeRefreshLeaseReleaseGripTests(unittest.TestCase):
         self.assertEqual("pass", checks["exact-intent-resource-binding"])
         self.assertEqual("pass", checks["unchanged-owner-release"])
         self.assertEqual("pass", checks["idempotent-reacquire-ready"])
+
+    def test_grip_rejects_unsupported_resource_kind_in_release_readback(self) -> None:
+        output = self.success_output()
+        output["resource_keys"] = [*self.KEYS, "component:bureau.runtime"]
+        output["released"] = [
+            {"resource_key": key} for key in output["resource_keys"]
+        ]
+        with patch.object(
+            resources,
+            "grabowski_runtime_refresh_lease_release",
+            return_value=output,
+        ):
+            result = grips.grip_run(
+                "runtime-refresh-lease-release",
+                {
+                    "target_sha256": self.TARGET,
+                    "result_sha256": self.RESULT,
+                },
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("fail", checks["exact-intent-resource-binding"])
 
     def test_grip_blocks_rejected_terminal_evidence(self) -> None:
         with patch.object(
