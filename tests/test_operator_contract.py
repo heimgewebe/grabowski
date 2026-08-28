@@ -2504,6 +2504,47 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     operator._guard_git(arguments, Path("/repo"))
 
+    def test_unclassified_local_git_mutators_are_blocked_fail_closed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            for arguments in (
+                ["fetch", "origin"],
+                ["worktree", "add", "/tmp/other"],
+                ["sparse-checkout", "init", "--cone"],
+                ["bisect", "start"],
+                ["clean", "-fd"],
+                ["config", "core.filemode", "false"],
+                ["hash-object", "-w", "README.md"],
+            ):
+                with self.subTest(arguments=arguments):
+                    with self.assertRaisesRegex(
+                        PermissionError, "Unclassified local Git subcommand"
+                    ):
+                        operator._guard_git(arguments, repo)
+
+    def test_explicit_local_git_read_subset_remains_allowed(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            for arguments in (
+                ["status", "--short"],
+                ["diff", "--stat"],
+                ["rev-parse", "--git-dir"],
+                ["ls-files", "--stage"],
+                ["log", "--oneline", "-1"],
+            ):
+                with self.subTest(arguments=arguments):
+                    operator._guard_git(arguments, repo)
+
+    def test_git_environment_disables_optional_read_side_effects(self) -> None:
+        operator = _load_operator_module()
+        with patch.object(operator, "_safe_environment", return_value={"PATH": "/usr/bin"}):
+            environment = operator._git_environment()
+        self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
+
     def test_grabowski_git_local_mutation_requires_branch_attempt(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:

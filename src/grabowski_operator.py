@@ -267,6 +267,42 @@ GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS = frozenset(
         "update-ref",
     }
 )
+GIT_LOCAL_READ_ONLY_SUBCOMMANDS = frozenset(
+    {
+        "annotate",
+        "blame",
+        "cat-file",
+        "check-attr",
+        "check-ignore",
+        "check-mailmap",
+        "check-ref-format",
+        "cherry",
+        "describe",
+        "diff",
+        "diff-files",
+        "diff-index",
+        "diff-tree",
+        "for-each-ref",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge-base",
+        "name-rev",
+        "range-diff",
+        "rev-list",
+        "rev-parse",
+        "shortlog",
+        "show",
+        "show-branch",
+        "status",
+        "verify-commit",
+        "verify-tag",
+        "version",
+        "whatchanged",
+    }
+)
 PRIVILEGED_REFERENCE_TTL_SECONDS = 900
 PRIVILEGED_REFERENCE_REPLAY_POLICY = "single-use-external-broker"
 _SECRET_KEY_PREFIX = "s" + "k-"
@@ -3775,6 +3811,7 @@ def _git_environment() -> dict[str, str]:
     environment["GCM_INTERACTIVE"] = "never"
     environment["GIT_PAGER"] = "cat"
     environment["PAGER"] = "cat"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 
 
@@ -4451,6 +4488,15 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
         )
     if subcommand != "push":
         _reject_configured_alias(repo, subcommand)
+        if (
+            subcommand not in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS
+            and subcommand not in GIT_LOCAL_READ_ONLY_SUBCOMMANDS
+        ):
+            raise PermissionError(
+                "Unclassified local Git subcommand is blocked in grabowski_git; "
+                "use a typed operation or classify it explicitly before execution: "
+                f"{subcommand}"
+            )
         return
 
     if configurations:

@@ -65,6 +65,7 @@ Disjoint lanes may run in parallel. Controller integration remains authoritative
 ### Same-owner branch mutation attempts
 
 A branch/path lease proves the logical owner and resource scope, but it does not by itself distinguish two concurrent controller attempts that reuse that same owner. Local branch or index mutation through `grabowski_git` therefore requires a `branch_attempt` binding containing the owner, operation id, attempt id, attached branch and the exact pre-effect Git preimage. The preimage binds HEAD, the staged index and in-progress merge/cherry-pick/revert/rebase refs.
+Unclassified local Git subcommands fail closed. Beyond `push`, `grabowski_git` accepts only explicitly classified branch/index mutators or a conservative read-only set; new Git subcommands must be classified deliberately or routed through a typed operation before use. The read-only Git environment pins `GIT_OPTIONAL_LOCKS=0` so commands such as `status` cannot perform optional index refreshes as a side effect.
 
 The existing branch resource remains the only serialization point. Exact owner + operation + attempt re-entry is a continuation and may preserve the live lease. A different attempt from the same owner on the same live branch lease fails before the Git effect with `reconcile_required`; a changed branch or Git preimage does the same. Disjoint branch resources remain independent, so this does not create a repository-wide lock.
 
