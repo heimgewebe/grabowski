@@ -13634,6 +13634,24 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIsNotNone(resources.inspect_resource(head_key))
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
+    def test_atomic_merge_guard_rejects_incomplete_resource_authority(self) -> None:
+        class IncompleteResourceAuthority:
+            pass
+
+        parameters = authorized_captain_run_parameters()
+        with self.assertRaisesRegex(
+            ValueError, "merge guard resource authority is missing required operations"
+        ):
+            merge_guard.CaptainMergeGuardRunner(
+                repo_path=Path.cwd(),
+                action=parameters["actions"][0],
+                parameters=parameters,
+                github_runner=FakeGh(),
+                resource_authority=IncompleteResourceAuthority(),
+                execution_intent_sha256="f" * 64,
+                lease_owner_id="captain-test-owner",
+            )
+
     def test_atomic_merge_guard_prefers_server_actor_to_caller_lease_owner(self) -> None:
         class Session:
             pass
@@ -13647,6 +13665,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             action=parameters["actions"][0],
             parameters=parameters,
             github_runner=FakeGh(),
+            resource_authority=resources,
             execution_intent_sha256="f" * 64,
             lease_owner_id="visible-foreign-owner",
             server_actor_identity=identity,
@@ -13759,6 +13778,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         runner = merge_guard.CaptainMergeGuardRunner(
             repo_path=Path.cwd(), action=parameters["actions"][0],
             parameters=parameters, github_runner=raw_runner,
+            resource_authority=resources,
             execution_intent_sha256="f" * 64, lease_owner_id="captain-test-owner",
         )
         bindings, errors = runner._live_bindings()
@@ -13816,6 +13836,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             action=parameters["actions"][0],
             parameters=parameters,
             github_runner=gh,
+            resource_authority=resources,
             execution_intent_sha256="f" * 64,
             lease_owner_id="captain-test-owner",
         )
@@ -14216,6 +14237,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                     action=captain_action(),
                     parameters=parameters,
                     github_runner=FakeGh(),
+                    resource_authority=resources,
                     execution_intent_sha256="f" * 64,
                     lease_owner_id="captain-test-owner",
                 )

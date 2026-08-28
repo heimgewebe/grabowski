@@ -224,7 +224,15 @@ def run_captain_preflight(core: CoreModule, spec: Any, parameters: dict[str, Any
     }
 
 
-def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], receipt: dict[str, Any], runner: Any, github_runner: Any) -> dict[str, Any]:
+def run_captain_run(
+    core: CoreModule,
+    spec: Any,
+    parameters: dict[str, Any],
+    receipt: dict[str, Any],
+    runner: Any,
+    github_runner: Any,
+    resource_authority: grabowski_merge_guard.MergeGuardResourceAuthority,
+) -> dict[str, Any]:
     actions = core._captain_actions(parameters)
     allow_execution = core._mechanic_bool(parameters, "allow_execution", False)
     action_names = ", ".join(action["action"] for action in actions)
@@ -289,6 +297,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 action=action,
                 parameters=parameters,
                 github_runner=github_runner,
+                resource_authority=resource_authority,
                 execution_intent_sha256=str(intent_info["intent_sha256"]),
                 lease_owner_id=str(
                     parameters["execution_intent"]["context"].get("lease_owner_id", "")
