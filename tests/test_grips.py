@@ -3685,6 +3685,7 @@ class GripFoundationTests(unittest.TestCase):
                 "-c",
                 "push.recurseSubmodules=no",
                 "push",
+                "--set-upstream",
                 "origin",
                 "HEAD:refs/heads/feat/work",
             ),
@@ -6523,7 +6524,12 @@ class GripFoundationTests(unittest.TestCase):
                 normalized = list(argv)
                 while len(normalized) >= 2 and normalized[0] == "-c":
                     normalized = normalized[2:]
-                if normalized == ["push", "origin", f"HEAD:refs/heads/{self.branch}"]:
+                if normalized == [
+                    "push",
+                    "--set-upstream",
+                    "origin",
+                    f"HEAD:refs/heads/{self.branch}",
+                ]:
                     events.append("push")
                     if push_failure:
                         self.calls.append(tuple(argv))
