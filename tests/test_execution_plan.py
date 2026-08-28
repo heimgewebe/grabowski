@@ -276,6 +276,36 @@ class ExecutionPlanTests(unittest.TestCase):
                 }
             )
 
+    def test_noncritical_node_cannot_be_silently_omitted_without_degradation_contract(self) -> None:
+        nodes = copy.deepcopy(writer_verify_plan()["nodes"]) + [
+            {
+                "node_id": "observer",
+                "kind": "observer",
+                "critical": False,
+                "mutates": False,
+                "write_scope": [],
+            }
+        ]
+        edges = copy.deepcopy(writer_verify_plan()["edges"]) + [
+            {
+                "from": "tests",
+                "to": "observer",
+                "artifact": "VerificationReceipt.v1",
+            }
+        ]
+        with self.assertRaisesRegex(
+            execution_plan.ExecutionPlanError, "no degraded-completion contract"
+        ):
+            writer_verify_plan(
+                nodes=nodes,
+                edges=edges,
+                completion_policy={
+                    "required_nodes": ["writer", "tests", "reduce"],
+                    "require_all_critical": True,
+                    "verifier_quorum": 1,
+                },
+            )
+
     def test_independent_review_requires_quorum(self) -> None:
         with self.assertRaisesRegex(execution_plan.ExecutionPlanError, "requires verifier quorum"):
             writer_verify_plan(
