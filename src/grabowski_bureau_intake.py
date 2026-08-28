@@ -142,6 +142,48 @@ class BureauIdempotencyKeySelector(TypedDict):
     idempotency_key: str
 
 
+class BureauCandidateRecordRequest(TypedDict, total=False):
+    """Strict top-level adapter shape; Bureau owns value/domain validation."""
+
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    schema_version: Any
+    operation: Any
+    idempotency_key: Any
+    title: Any
+    source_kind: Any
+    desired_outcome: Any
+    repo: Any
+    source_locator: Any
+    source_sha256: Any
+    observed_at: Any
+    task_id: Any
+    candidate_id: Any
+    supersedes_event_id: Any
+    note: Any
+    catalog_validation: Any
+
+
+class BureauCandidateCloseOperation(TypedDict):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    operation: Any
+
+
+class BureauCandidateCloseRequest(BureauCandidateCloseOperation, total=False):
+    """Close envelope with strict field names and Bureau-owned value semantics."""
+
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    schema_version: Any
+    idempotency_key: Any
+    candidate_id: Any
+    expected_event_id: Any
+    outcome: Any
+    evidence: Any
+    note: Any
+
+
 @dataclass(frozen=True)
 class RegularFileSnapshot:
     path: Path
@@ -1170,7 +1212,9 @@ def _proposal_directory(proposal_id: str) -> Path:
 
 
 @mcp.tool(name="grabowski_bureau_candidate_record", annotations=MUTATING)
-def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]:
+def grabowski_bureau_candidate_record(
+    request: BureauCandidateRecordRequest | BureauCandidateCloseRequest,
+) -> dict[str, Any]:
     """Record one source-bound Bureau candidate through the canonical typed intake contract."""
     operator._require_operator_mutation("terminal_execute")
     if not isinstance(request, dict):
