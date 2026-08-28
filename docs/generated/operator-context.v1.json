@@ -1982,7 +1982,7 @@
     },
     {
       "category": "resource",
-      "description": "Release one terminal runtime-refresh attempt's exact unchanged path leases.",
+      "description": "Release one terminal runtime-refresh attempt's exact unchanged resource leases.",
       "effects": [
         "lease-remove",
         "audit-append",
@@ -3665,7 +3665,7 @@
       "src/grabowski_reposkop_context.py": "c27482b00c4085c03eb3c417ea1dc3df514b3c375ec37d27ca77dbb4e4835f21",
       "src/grabowski_reposkop_effectiveness.py": "4c24196d75374ca0a979d3138086da0b885f5525960ba4a32b401db514662331",
       "src/grabowski_reposkop_shadow.py": "8d21fdff7cbb524b72ca8d078a3a318cd0db60cc103518eeff02ad25fb89912e",
-      "src/grabowski_resources.py": "fe8214836862669f37cb52d4f4b7ae8494862c7b4dcb4d64bbd93ab84804002d",
+      "src/grabowski_resources.py": "8d548a506111961be313af96f25917b2b25c15582c032626814f0965436aeb58",
       "src/grabowski_runtime.py": "d1a18cf29edcb9e2701ece27775947a94dfea079e56b8269fc93defff62b6591",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
