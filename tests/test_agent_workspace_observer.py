@@ -196,6 +196,24 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertEqual(trace["normalized_events"], [])
         self.assertEqual(trace["coverage"]["execute"]["reason"], "event_log_integrity_invalid")
 
+    def test_attention_trace_does_not_promote_controller_preflight_or_checkout_to_execution(self) -> None:
+        identifier = "gaw-observer-attention-controller-only"
+        manifest = self._manifest(identifier)
+        workspace._append_workspace_event(
+            manifest, "role_preflight", role="writer", outcome="passed",
+            evidence={"toolchain": "available"},
+        )
+        workspace._append_workspace_event(
+            manifest, "writer_checkout_lifecycle_bound", role="writer", outcome="bound",
+            evidence={"checkout_key": "opaque"},
+        )
+        with mock.patch.object(workspace, "_status_data", return_value=self._status()):
+            report = observer.grabowski_agent_workspace_observe(identifier, "attention-trace-controller-only")
+        trace = report["attention_trace"]
+        self.assertEqual(trace["signal_status"], "NO_SIGNAL")
+        self.assertEqual(trace["coverage"]["execute"]["status"], "NO_SIGNAL")
+        self.assertEqual(trace["normalized_events"], [])
+
     def test_optimizer_requires_multiple_unique_workspaces_and_is_proposal_only(self) -> None:
         identifiers = ["gaw-observer-test-00000003", "gaw-observer-test-00000004"]
         manifests = {identifier: self._manifest(identifier) for identifier in identifiers}

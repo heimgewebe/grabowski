@@ -853,6 +853,16 @@ ATTENTION_TRACE_CATEGORIES = (
     "user_intervention",
 )
 ATTENTION_TRACE_EVENT_CATEGORIES = frozenset({"execute", "verify", "error", "delegate"})
+ATTENTION_TRACE_WRITER_EXECUTION_EVENTS = frozenset({
+    "role_started",
+    "role_finished",
+    "writer_revision_started",
+    "writer_revision_start_reconciled",
+})
+ATTENTION_TRACE_DELEGATION_EVENTS = frozenset({
+    "writer_handoff_started",
+    "writer_handoff_start_reconciled",
+})
 
 
 def _attention_declared_scope(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -896,14 +906,18 @@ def _attention_event_category(event: dict[str, Any]) -> str | None:
         or any(token in lowered for token in ("failure", "failed", "error", "blocked"))
     ):
         return "error"
-    if "handoff" in lowered or "delegat" in lowered:
+    if lowered in ATTENTION_TRACE_DELEGATION_EVENTS:
         return "delegate"
-    if role in {"tests", "review"} or any(
-        token in lowered for token in ("collection", "collect", "review", "test", "verify", "validation")
+    if role == "writer" and lowered in ATTENTION_TRACE_WRITER_EXECUTION_EVENTS:
+        return "execute"
+    if (
+        role in {"tests", "review"}
+        and lowered in {"role_started", "role_finished", "role_retry_started"}
+    ) or any(
+        token in lowered
+        for token in ("collection_completed", "revalidation", "review_verdict", "validation_completed")
     ):
         return "verify"
-    if role == "writer" or any(token in lowered for token in ("writer", "checkout", "worktree")):
-        return "execute"
     return None
 
 

@@ -26,7 +26,6 @@ import grabowski_artifacts
 import grabowski_merge_delivery_surface
 import grabowski_agent_workspace
 import grabowski_agent_workspace_observer
-import grabowski_attention_trace  # noqa: F401
 import grabowski_operations
 import grabowski_privileged
 import grabowski_recovery
