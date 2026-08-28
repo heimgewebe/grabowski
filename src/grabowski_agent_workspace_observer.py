@@ -839,6 +839,195 @@ def _immutable_snapshot_status(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+ATTENTION_TRACE_SCHEMA_VERSION = 1
+ATTENTION_TRACE_CATEGORIES = (
+    "search",
+    "discover",
+    "read",
+    "edit",
+    "execute",
+    "verify",
+    "error",
+    "delegate",
+    "compact",
+    "user_intervention",
+)
+ATTENTION_TRACE_EVENT_CATEGORIES = frozenset({"execute", "verify", "error", "delegate"})
+
+
+def _attention_declared_scope(manifest: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "kind": "declared_constraint",
+        "source": "workspace_manifest.scope",
+        "valid": False,
+        "attention_evidence": False,
+        "allowed_paths": [],
+        "forbidden_paths": [],
+    }
+    scope = manifest.get("scope")
+    if not isinstance(scope, dict):
+        return result
+    bounded: dict[str, list[str]] = {}
+    for key in ("allowed_paths", "forbidden_paths"):
+        value = scope.get(key, [])
+        if not isinstance(value, list) or len(value) > 256:
+            return result
+        paths: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item or len(item) > 4096 or "\x00" in item:
+                return result
+            paths.append(item)
+        if len(paths) != len(set(paths)):
+            return result
+        bounded[key] = paths
+    result.update({"valid": True, **bounded})
+    return result
+
+
+def _attention_event_category(event: dict[str, Any]) -> str | None:
+    event_type = event.get("event_type")
+    if not isinstance(event_type, str) or not event_type:
+        return None
+    lowered = event_type.lower()
+    outcome = str(event.get("outcome", "")).lower()
+    role = str(event.get("role", "")).lower()
+    if (
+        outcome in {"blocked", "error", "failed", "environment_failure"}
+        or any(token in lowered for token in ("failure", "failed", "error", "blocked"))
+    ):
+        return "error"
+    if "handoff" in lowered or "delegat" in lowered:
+        return "delegate"
+    if role in {"tests", "review"} or any(
+        token in lowered for token in ("collection", "collect", "review", "test", "verify", "validation")
+    ):
+        return "verify"
+    if role == "writer" or any(token in lowered for token in ("writer", "checkout", "worktree")):
+        return "execute"
+    return None
+
+
+def _attention_trace(
+    workspace_id: str,
+    manifest: dict[str, Any],
+    events: list[dict[str, Any]],
+    event_log: dict[str, Any],
+) -> dict[str, Any]:
+    event_log_present = event_log.get("present") is True
+    event_log_integrity_valid = event_log.get("integrity_valid") is True
+    normalized_events: list[dict[str, Any]] = []
+    if event_log_present and event_log_integrity_valid:
+        for event in events:
+            category = _attention_event_category(event)
+            if category is None:
+                continue
+            normalized_events.append({
+                "category": category,
+                "source_event": {
+                    "sequence": event.get("sequence"),
+                    "event_type": event.get("event_type"),
+                    "event_sha256": event.get("event_sha256"),
+                    "recorded_at": event.get("recorded_at"),
+                },
+                "role": event.get("role"),
+                "outcome": event.get("outcome"),
+            })
+
+    category_counts = {
+        category: sum(1 for event in normalized_events if event["category"] == category)
+        for category in ATTENTION_TRACE_CATEGORIES
+    }
+    coverage: dict[str, dict[str, Any]] = {}
+    for category in ATTENTION_TRACE_CATEGORIES:
+        count = category_counts[category]
+        if count:
+            coverage[category] = {
+                "status": "PARTIAL_SIGNAL",
+                "event_count": count,
+                "source": "agent_workspace_event_log",
+            }
+        elif category not in ATTENTION_TRACE_EVENT_CATEGORIES:
+            coverage[category] = {
+                "status": "NO_SIGNAL",
+                "event_count": 0,
+                "reason": "not_instrumented_by_workspace_event_contract",
+            }
+        elif not event_log_integrity_valid:
+            coverage[category] = {
+                "status": "NO_SIGNAL",
+                "event_count": 0,
+                "reason": "event_log_integrity_invalid",
+            }
+        elif not event_log_present:
+            coverage[category] = {
+                "status": "NO_SIGNAL",
+                "event_count": 0,
+                "reason": "workspace_event_log_missing",
+            }
+        else:
+            coverage[category] = {
+                "status": "NO_SIGNAL",
+                "event_count": 0,
+                "reason": "no_directly_mapped_event_observed",
+            }
+
+    if not event_log_integrity_valid:
+        signal_status = "INVALID_EVIDENCE"
+        signal_reason = "workspace event log failed integrity validation; event projection failed closed"
+    elif not event_log_present:
+        signal_status = "NO_SIGNAL"
+        signal_reason = "workspace has no typed event log"
+    elif not normalized_events:
+        signal_status = "NO_SIGNAL"
+        signal_reason = "event log contains no events that directly map to attention_trace_v1 categories"
+    else:
+        signal_status = "PARTIAL_SIGNAL"
+        signal_reason = (
+            "only directly evidenced workspace lifecycle activity is projected; "
+            "provider file access and hidden model state remain unobserved"
+        )
+
+    trace = {
+        "schema_version": ATTENTION_TRACE_SCHEMA_VERSION,
+        "kind": "attention_trace_v1",
+        "workspace_id": workspace_id,
+        "signal_status": signal_status,
+        "signal_reason": signal_reason,
+        "provenance": {
+            "source": "agent_workspace_event_log",
+            "event_log_present": event_log_present,
+            "event_log_integrity_valid": event_log_integrity_valid,
+            "event_log_sha256": event_log.get("sha256"),
+            "event_count": event_log.get("event_count", 0),
+            "last_sequence": event_log.get("last_sequence", 0),
+            "integrity_reason": event_log.get("reason"),
+        },
+        "expected_scope": _attention_declared_scope(manifest),
+        "coverage": coverage,
+        "normalized_events": normalized_events,
+        "privacy": {
+            "raw_event_evidence_included": False,
+            "raw_commands_included": False,
+            "prompts_included": False,
+            "environment_values_included": False,
+            "credentials_included": False,
+        },
+        "does_not_establish": [
+            "internal_model_understanding",
+            "files_searched",
+            "files_read",
+            "complete_tool_usage",
+            "edit_timing",
+            "workspace_correctness",
+            "review_completeness",
+            "merge_readiness",
+        ],
+        "execution_authorized": False,
+    }
+    trace["trace_sha256"] = _sha256_json(trace)
+    return trace
+
+
 def _observer_report(
     workspace_id: str,
     *,
@@ -977,6 +1166,7 @@ def _observer_report(
         "inferences": inferences,
         "proposals": proposals,
         "timeline": events,
+        "attention_trace": _attention_trace(workspace_id, manifest, events, integrity),
         "privacy": {
             "raw_commands_included": False,
             "environment_values_included": False,
