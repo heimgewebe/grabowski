@@ -989,6 +989,107 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
+    def test_candidate_record_registered_schema_rejects_unknown_top_level_fields(self) -> None:
+        if not hasattr(intake.mcp, "list_tools") or not hasattr(
+            intake.mcp, "_tool_manager"
+        ):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        tool = next(
+            item
+            for item in asyncio.run(intake.mcp.list_tools())
+            if item.name == "grabowski_bureau_candidate_record"
+        )
+        schema = tool.inputSchema
+        self.assertEqual({"request"}, set(schema["properties"]))
+        self.assertEqual({"request"}, set(schema["required"]))
+        self.assertEqual(
+            {
+                "#/$defs/BureauCandidateRecordRequest",
+                "#/$defs/BureauCandidateCloseRequest",
+            },
+            {variant["$ref"] for variant in schema["properties"]["request"]["anyOf"]},
+        )
+        record = schema["$defs"]["BureauCandidateRecordRequest"]
+        close = schema["$defs"]["BureauCandidateCloseRequest"]
+        self.assertFalse(record["additionalProperties"])
+        self.assertFalse(close["additionalProperties"])
+        self.assertEqual(
+            {
+                "schema_version",
+                "operation",
+                "idempotency_key",
+                "title",
+                "source_kind",
+                "desired_outcome",
+                "repo",
+                "source_locator",
+                "source_sha256",
+                "observed_at",
+                "task_id",
+                "candidate_id",
+                "supersedes_event_id",
+                "note",
+                "catalog_validation",
+            },
+            set(record["properties"]),
+        )
+        self.assertEqual(
+            {
+                "schema_version",
+                "operation",
+                "idempotency_key",
+                "candidate_id",
+                "expected_event_id",
+                "outcome",
+                "evidence",
+                "note",
+            },
+            set(close["properties"]),
+        )
+        self.assertEqual(set(), set(record.get("required", [])))
+        self.assertEqual({"operation"}, set(close["required"]))
+
+        valid = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:strict-candidate-schema:v1",
+            "title": "Strict candidate request schema",
+            "source_kind": "conversation",
+            "desired_outcome": "Reject unknown fields before Bureau dispatch",
+        }
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "kind": "bureau_candidate_record_result",
+                "status": "recorded",
+            },
+        ) as invoke:
+            result = asyncio.run(
+                intake.mcp._tool_manager.call_tool(
+                    "grabowski_bureau_candidate_record", {"request": valid}
+                )
+            )
+        self.assertEqual("recorded", result["status"])
+        invoke.assert_called_once()
+
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with mock.patch.object(intake, "_invoke_bureau") as invoke:
+            with self.assertRaises(ToolError):
+                asyncio.run(
+                    intake.mcp._tool_manager.call_tool(
+                        "grabowski_bureau_candidate_record",
+                        {
+                            "request": {
+                                **valid,
+                                "acceptance_criteria": ["not a candidate field"],
+                            }
+                        },
+                    )
+                )
+        invoke.assert_not_called()
+
+
     def test_candidate_assess_registered_schema_is_additive_and_cache_safe(self) -> None:
         if not hasattr(intake.mcp, "list_tools"):
             self.skipTest("real FastMCP unavailable in dependency-free validation")
