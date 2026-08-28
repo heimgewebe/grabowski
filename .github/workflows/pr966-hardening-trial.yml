@@ -1,0 +1,61 @@
+name: PR966 hardening trial
+
+on:
+  pull_request:
+    branches:
+      - fix/rootbroker-package-apply-guard-v1
+
+permissions:
+  contents: read
+
+jobs:
+  hardening-trial:
+    if: github.head_ref == 'automation/pr966-hardening-20260828-0745'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Assert target head is unchanged
+        env:
+          EXPECTED: 5e0ef1138ae2e93b37b75b5742b37f33e5c4bdcf
+        run: |
+          git fetch --no-tags origin refs/heads/fix/rootbroker-package-apply-guard-v1:refs/remotes/origin/pr966-target
+          test "$(git rev-parse refs/remotes/origin/pr966-target)" = "$EXPECTED"
+          git merge-base --is-ancestor "$EXPECTED" HEAD
+
+      - name: Validate bootstrap syntax
+        run: python -m py_compile .github/pr966_finalize_bootstrap.py
+
+      - name: Generate hardened broker diff
+        run: python .github/pr966_finalize_bootstrap.py
+
+      - name: Compile hardened broker
+        run: python -m py_compile tools/grabowski_privileged_broker.py
+
+      - name: Focused privileged-broker tests
+        run: python -m unittest tests.test_privileged_broker_peer
+
+      - name: Diff hygiene
+        run: git diff --check
+
+      - name: Validate repository
+        run: make validate
+
+      - name: Prove reproducible deployment staging
+        run: make deploy-check
+
+      - name: Show generated diff summary
+        if: always()
+        run: |
+          git status --short
+          git diff --stat
