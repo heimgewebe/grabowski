@@ -150,9 +150,11 @@ class FakeGit:
             push_argv = push_argv[2:]
         if push_argv == [
             "push",
+            "--set-upstream",
             "origin",
             f"HEAD:refs/heads/{self.branch}",
         ]:
+            self.upstream = f"origin/{self.branch}"
             return {"returncode": 0, "stdout": "", "stderr": "pushed"}
         if argv == ["ls-remote", "origin", f"refs/heads/{self.branch}"]:
             return {"returncode": 0, "stdout": f"{self.remote_head}\trefs/heads/{self.branch}", "stderr": ""}
@@ -6874,6 +6876,23 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("a" * 40, result["output"]["remote_head"])
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["remote_head"])
+
+    def test_branch_publish_sets_and_verifies_upstream_tracking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = FakeGit(branch="feat/work", head="a" * 40, upstream=None)
+            result = grips.run_grip(
+                "branch-publish",
+                {"repo": tmp, "branch": "feat/work", "expected_head": "a" * 40},
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("origin/feat/work", result["output"]["upstream"])
+        push = next(call for call in fake.calls if "push" in call)
+        self.assertIn("--set-upstream", push)
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["upstream"])
 
     def test_branch_publish_rejects_remote_option_injection_before_git(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
