@@ -5002,6 +5002,9 @@ class ResourceTests(unittest.TestCase):
         status: str = "deployed",
         effect_started: bool | None = None,
         resource_contract: str = "historical-five",
+        persist_observation: bool = True,
+        source_precondition: bool = False,
+        source_precondition_drift: bool = False,
     ) -> dict[str, object]:
         state_root = self.root / "runtime-refresh"
         attempts_root = state_root / "attempts"
@@ -5028,6 +5031,19 @@ class ResourceTests(unittest.TestCase):
                 f"path:{prefix}",
                 f"path:{state_root}",
                 f"path:{workspace}",
+            ],
+            "current-mixed": [
+                f"path:{prefix}",
+                f"path:{state_root}",
+                f"path:{workspace}",
+                "service:bureau-runtime-refresh.service",
+                "service:bureau-runtime-refresh.timer",
+            ],
+            "unsupported-mixed": [
+                f"path:{prefix}",
+                f"path:{state_root}",
+                f"path:{workspace}",
+                "component:bureau.runtime",
             ],
             "historical-five": [
                 f"path:{bin_dir / 'bureau'}",
@@ -5159,6 +5175,50 @@ class ResourceTests(unittest.TestCase):
             "required_checks": ["validate (3.10)", "validate (3.12)"],
             "does_not_establish": ["deployment_outcome"],
         }
+        if source_precondition:
+            registered_manifest_sha256 = (
+                "f" * 64 if source_precondition_drift else "e" * 64
+            )
+            intent["source_precondition"] = {
+                "schema_version": 1,
+                "policy": "registered-source-or-verified-target-ancestor",
+                "identity_sources": [
+                    "deployment-manifest.source_commit",
+                    "canonical-registry.source_commit",
+                ],
+                "require_deployment_registry_identity_match": True,
+                "registered_deployed_source_commit": "d" * 40,
+                "registered_manifest_sha256": registered_manifest_sha256,
+                "registered_registry_source_commit": "d" * 40,
+                "ancestry_verification": "git-merge-base-is-ancestor",
+                "require_target_freshness": True,
+                "required_before": ["prepare-intent", "apply"],
+                "fail_closed": True,
+                "does_not_establish": ["future_runtime_health"],
+            }
+            intent["approval_task_id"] = task_id
+            intent["runtime_approval"] = {
+                "schema_version": 1,
+                "required": True,
+                "required_level": "break_glass",
+                "action_class": "runtime_mutation",
+                "action_classes": ["runtime_mutation"],
+                "allowed": True,
+                "reason": "approved",
+                "expected_reference": target_sha256,
+                "expected_task_id": task_id,
+                "evidence": {
+                    "schema_version": 1,
+                    "approved": True,
+                    "level": "break_glass",
+                    "scope": ["runtime_mutation"],
+                    "source": "test-authority",
+                    "reviewer": "operator:test-runtime-refresh",
+                    "reference": target_sha256,
+                    "task_id": task_id,
+                    "note": "test runtime refresh",
+                },
+            }
         intent["intent_sha256"] = resources._runtime_refresh_payload_digest(
             intent, "intent_sha256"
         )
@@ -5250,19 +5310,24 @@ class ResourceTests(unittest.TestCase):
         result["result_sha256"] = resources._runtime_refresh_payload_digest(
             result, "result_sha256"
         )
-        for path, payload in (
-            (
-                observations_root
-                / (
-                    "20260803T090000.000000Z-"
-                    f"{main_commit[:12]}-{observation['observation_sha256'][:12]}.json"
-                ),
-                observation,
-            ),
+        payloads = [
             (intents_root / f"{intent['intent_sha256']}.json", intent),
             (attempt_dir / "started.json", started),
             (attempt_dir / "result.json", result),
-        ):
+        ]
+        if persist_observation:
+            payloads.insert(
+                0,
+                (
+                    observations_root
+                    / (
+                        "20260803T090000.000000Z-"
+                        f"{main_commit[:12]}-{observation['observation_sha256'][:12]}.json"
+                    ),
+                    observation,
+                ),
+            )
+        for path, payload in payloads:
             path.write_text(
                 json.dumps(
                     payload,
@@ -5358,6 +5423,86 @@ class ResourceTests(unittest.TestCase):
             fixture["resource_keys"],
             [item["resource_key"] for item in reacquired["leases"]],
         )
+
+    def test_runtime_refresh_terminal_release_accepts_current_mixed_contract_without_observation_receipt(self) -> None:
+        fixture = self._runtime_refresh_fixture(
+            resource_contract="current-mixed",
+            persist_observation=False,
+            source_precondition=True,
+        )
+        self.assertTrue(
+            any(key.startswith("service:") for key in fixture["resource_keys"])
+        )
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            result = resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        self.assertEqual("complete", result["state"])
+        self.assertEqual(
+            fixture["resource_keys"],
+            [item["resource_key"] for item in result["released"]],
+        )
+        reacquired = resources.acquire_resources(
+            fixture["owner"],
+            fixture["resource_keys"],
+            purpose="next mixed-contract runtime refresh",
+            ttl_seconds=120,
+        )
+        self.assertEqual(
+            fixture["resource_keys"],
+            [item["resource_key"] for item in reacquired["leases"]],
+        )
+
+    def test_runtime_refresh_terminal_release_without_observation_requires_source_precondition(self) -> None:
+        fixture = self._runtime_refresh_fixture(persist_observation=False)
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ), self.assertRaisesRegex(
+            resources.nonconflict.NonConflictDenied, "source precondition is invalid"
+        ):
+            resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+
+    def test_runtime_refresh_terminal_release_rejects_source_precondition_drift(self) -> None:
+        fixture = self._runtime_refresh_fixture(
+            persist_observation=False,
+            source_precondition=True,
+            source_precondition_drift=True,
+        )
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ), self.assertRaisesRegex(
+            resources.nonconflict.NonConflictDenied, "source precondition differs"
+        ):
+            resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+
+    def test_runtime_refresh_terminal_release_rejects_unknown_resource_kind(self) -> None:
+        fixture = self._runtime_refresh_fixture(resource_contract="unsupported-mixed")
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ), self.assertRaisesRegex(
+            resources.nonconflict.NonConflictDenied, "unsupported resource kind"
+        ):
+            resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
 
     def test_runtime_refresh_terminal_source_rejects_caller_subset_and_superset(self) -> None:
         fixture = self._runtime_refresh_fixture(resource_contract="current-three")

@@ -12672,13 +12672,24 @@ def _run_runtime_refresh_lease_release(
         }
     terminal = output.get("terminal_evidence")
     resources_bound = output.get("resource_keys")
+
+    def _canonical_runtime_refresh_resource_key(value: object) -> bool:
+        if not isinstance(value, str):
+            return False
+        resource_kind = value.split(":", 1)[0] if ":" in value else ""
+        if resource_kind not in {"path", "service"}:
+            return False
+        try:
+            return resources.normalize_resource_key(value) == value
+        except ValueError:
+            return False
+
     exact_binding = (
         isinstance(resources_bound, list)
         and bool(resources_bound)
         and resources_bound == sorted(set(resources_bound))
         and all(
-            isinstance(item, str) and item.startswith("path:")
-            for item in resources_bound
+            _canonical_runtime_refresh_resource_key(item) for item in resources_bound
         )
     )
     resource_count = len(resources_bound) if isinstance(resources_bound, list) else 0
