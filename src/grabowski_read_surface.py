@@ -18,6 +18,7 @@ import grabowski_checkouts as checkouts
 import grabowski_mcp as base
 import grabowski_audit_signal as audit_signal
 import grabowski_consumer_surface as consumer_surface
+import grabowski_git_preimage
 import grabowski_operator_core as operator
 import grabowski_runtime_extensions as runtime_extensions
 
@@ -1626,14 +1627,55 @@ def grabowski_checkout_summary(
     )
 
 
+def _git_preimage_probe(
+    repository: Path, arguments: list[str]
+) -> subprocess.CompletedProcess[bytes]:
+    environment = _read_environment()
+    for key in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_EXEC_PATH",
+        "GIT_CONFIG",
+    ):
+        environment.pop(key, None)
+    for key in tuple(environment):
+        if key.startswith("GIT_CONFIG_"):
+            environment.pop(key, None)
+    return subprocess.run(
+        _git_command(repository, *arguments),
+        cwd=repository,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
 @mcp.tool(name="grabowski_git_status", annotations=LOCAL_READ)
-def grabowski_git_status(repo: RepositoryPath) -> dict[str, Any]:
-    """Read fixed short Git status for one allowed repository."""
+def grabowski_git_status(
+    repo: RepositoryPath, include_branch_preimage: bool = False
+) -> dict[str, Any]:
+    """Read fixed short Git status and optionally the exact CAS branch preimage."""
     repository = _resolve_repository(repo)
-    return _run_read(
+    result = _run_read(
         _git_command(repository, "status", "--short", "--branch", "--untracked-files=normal"),
         cwd=repository,
     )
+    if include_branch_preimage:
+        result["branch_preimage"] = {
+            "kind": "grabowski_git_branch_preimage",
+            **grabowski_git_preimage.capture_branch_preimage(
+                repository,
+                lambda arguments: _git_preimage_probe(repository, arguments),
+            ),
+        }
+    return result
 
 
 @mcp.tool(name="grabowski_git_diff", annotations=LOCAL_READ)

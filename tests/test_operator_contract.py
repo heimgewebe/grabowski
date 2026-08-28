@@ -701,7 +701,6 @@ class OperatorContractTests(unittest.TestCase):
             "grabowski_job_logs",
             "grabowski_job_cancel",
             "grabowski_git",
-            "grabowski_git_branch_preimage",
             "grabowski_github",
             "grabowski_user_service",
             "grabowski_tmux_list",
@@ -2556,17 +2555,6 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
                     operator.grabowski_git(str(repo), ["commit", "-m", "unsafe"])
 
-    def test_grabowski_git_branch_preimage_enforces_read_policy(self) -> None:
-        operator = _load_operator_module()
-        with patch.object(
-            operator.base,
-            "_resolve_existing",
-            side_effect=PermissionError("outside configured read roots"),
-        ) as resolve:
-            with self.assertRaisesRegex(PermissionError, "outside configured read roots"):
-                operator.grabowski_git_branch_preimage("/tmp/private-repo")
-        resolve.assert_called_once_with("/tmp/private-repo", "read")
-
     def test_grabowski_git_mv_requires_branch_attempt(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -2607,9 +2595,16 @@ class OperatorContractTests(unittest.TestCase):
             ["checkout", "other"],
             ["switch", "other"],
             ["switch", "-c", "other"],
+            ["rebase", "main", "other"],
+            ["rebase", "--continue"],
+            ["stash", "branch", "other"],
+            ["update-index", "--assume-unchanged", "README.md"],
+            ["update-index", "--skip-worktree", "README.md"],
         ):
             with self.subTest(arguments=arguments):
-                with self.assertRaisesRegex(PermissionError, "branch|target refs"):
+                with self.assertRaisesRegex(
+                    PermissionError, "branch|target refs|rebase|index"
+                ):
                     operator._reject_cross_branch_mutation_target(
                         arguments[0], arguments[1:], attempt["branch"]
                     )

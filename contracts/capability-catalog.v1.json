@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "1d7cdd754bbfd9e2a3c548b91ab163739bd7ee374dbaf9fcbe3547cdcc09d146",
+  "capability_source_sha256": "3e1d048b7b5e656ee82a4523fbd8e93ddcaef4835b5cc2fd54c00aea350a267f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "a79cb79e57f7774d14198cac965a6d16a7fdcda7d1c845a716d8cb6355ffbd64",
+  "contract_sha256": "29057aa12134643c2a82d6476aa8ff9579809bbf8b9ff9e5bb92022527d0d526",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -569,25 +569,14 @@
     },
     {
       "category": "version-control",
-      "description": "Read fixed short Git status for one allowed repository.",
+      "description": "Read fixed short Git status and optionally the exact CAS branch preimage.",
       "effects": [],
       "id": "grabowski_git_status",
-      "purpose": "Read fixed short Git status for one allowed repository.",
+      "purpose": "Read fixed short Git status and optionally the exact CAS branch preimage for one allowed repository.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_git_status"
-    },
-    {
-      "category": "version-control",
-      "description": "Read one exact local branch/index preimage for a later CAS-bound mutation.",
-      "effects": [],
-      "id": "grabowski_git_branch_preimage",
-      "purpose": "Read one exact local branch/index preimage for a later CAS-bound mutation.",
-      "read_only": true,
-      "reversibility": "not-applicable",
-      "risk_class": "low",
-      "tool": "grabowski_git_branch_preimage"
     },
     {
       "category": "version-control",

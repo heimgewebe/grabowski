@@ -45,6 +45,7 @@ import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 import grabowski_effect_interceptor
 import grabowski_grips
+import grabowski_git_preimage
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 
@@ -265,6 +266,16 @@ GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS = frozenset(
         "symbolic-ref",
         "update-index",
         "update-ref",
+    }
+)
+GIT_UPDATE_INDEX_UNOBSERVED_FLAG_OPTIONS = frozenset(
+    {
+        "--assume-unchanged",
+        "--no-assume-unchanged",
+        "--skip-worktree",
+        "--no-skip-worktree",
+        "--fsmonitor-valid",
+        "--no-fsmonitor-valid",
     }
 )
 GIT_LOCAL_READ_ONLY_SUBCOMMANDS = frozenset(
@@ -4154,59 +4165,11 @@ def _git_probe_bytes(repo: Path, arguments: list[str]) -> subprocess.CompletedPr
 
 
 def _git_branch_preimage(repo: Path, *, require_attached: bool = True) -> dict[str, Any]:
-    branch_probe = _git_probe_bytes(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
-    branch: str | None = None
-    if branch_probe.returncode == 0:
-        branch = branch_probe.stdout.decode("utf-8", errors="strict").strip()
-        if not branch:
-            raise RuntimeError("Git branch observation returned an empty branch")
-    elif branch_probe.returncode != 1:
-        raise RuntimeError("Git branch observation failed")
-    if require_attached and branch is None:
-        raise PermissionError("Local branch mutation requires an attached Git branch")
-
-    head_probe = _git_probe_bytes(repo, ["rev-parse", "--verify", "--quiet", "HEAD"])
-    head: str | None
-    head_state: str
-    if head_probe.returncode == 0:
-        head = head_probe.stdout.decode("ascii", errors="strict").strip()
-        if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None:
-            raise RuntimeError("Git HEAD observation is not an object id")
-        head_state = "present"
-    elif head_probe.returncode == 1 and branch is not None:
-        head = None
-        head_state = "unborn"
-    else:
-        raise RuntimeError("Git HEAD observation failed")
-
-    index_probe = _git_probe_bytes(repo, ["ls-files", "--stage", "-z"])
-    if index_probe.returncode != 0:
-        raise RuntimeError("Git index observation failed")
-    index_sha256 = hashlib.sha256(index_probe.stdout).hexdigest()
-
-    operation_refs: dict[str, str] = {}
-    for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
-        ref_probe = _git_probe_bytes(repo, ["rev-parse", "--verify", "--quiet", name])
-        if ref_probe.returncode == 0:
-            value = ref_probe.stdout.decode("ascii", errors="strict").strip()
-            if value:
-                operation_refs[name] = value
-        elif ref_probe.returncode != 1:
-            raise RuntimeError(f"Git operation-state observation failed: {name}")
-
-    material: dict[str, Any] = {
-        "schema_version": 1,
-        "repository": str(repo),
-        "branch": branch,
-        "head": head,
-        "head_state": head_state,
-        "index_sha256": index_sha256,
-        "operation_refs": operation_refs,
-    }
-    return {
-        **material,
-        "preimage_sha256": hashlib.sha256(_canonical_json_bytes(material)).hexdigest(),
-    }
+    return grabowski_git_preimage.capture_branch_preimage(
+        repo,
+        lambda arguments: _git_probe_bytes(repo, arguments),
+        require_attached=require_attached,
+    )
 
 
 def _reject_cross_branch_mutation_target(
@@ -4214,6 +4177,24 @@ def _reject_cross_branch_mutation_target(
 ) -> None:
     """Keep one branch-attempt lease scoped to the branch it actually protects."""
     bound_ref = f"refs/heads/{bound_branch}"
+
+    if subcommand == "rebase":
+        raise PermissionError(
+            "git rebase is blocked on the branch-attempt surface because a conflict can detach HEAD and escape the bound branch recovery contract"
+        )
+
+    if subcommand == "stash" and command_arguments[:1] == ["branch"]:
+        raise PermissionError(
+            "git stash branch is blocked because it switches or creates a branch outside the single-branch attempt contract"
+        )
+
+    if subcommand == "update-index" and any(
+        item.split("=", 1)[0] in GIT_UPDATE_INDEX_UNOBSERVED_FLAG_OPTIONS
+        for item in command_arguments
+    ):
+        raise PermissionError(
+            "git update-index behavior flags are blocked because the branch preimage does not expose those index bits"
+        )
 
     if subcommand == "update-ref":
         if "--stdin" in command_arguments:
@@ -4458,20 +4439,6 @@ def _branch_attempt_reconcile_result(
         "stdout_truncated": False,
         "stderr_truncated": False,
         "branch_mutation": material,
-    }
-
-
-@mcp.tool(name="grabowski_git_branch_preimage", annotations=READ_ONLY)
-def grabowski_git_branch_preimage(repo: str) -> dict[str, Any]:
-    """Read one exact local branch/index preimage for a later CAS-bound mutation."""
-    _require_operator_capability("git_cli")
-    path = base._resolve_existing(repo, "read")
-    if not path.is_dir():
-        raise ValueError(f"Repository path is not a directory: {path}")
-    return {
-        "schema_version": 1,
-        "kind": "grabowski_git_branch_preimage",
-        **_git_branch_preimage(path),
     }
 
 
@@ -5223,6 +5190,7 @@ def grabowski_git(
         raise PermissionError("Git mutation of immutable evidence is blocked.")
     _guard_git(arguments, path)
     subcommand, _command_arguments, _configurations = _split_git_invocation(arguments)
+    execution_timeout_seconds = _timeout(timeout_seconds)
 
     branch_context: dict[str, Any] | None = None
     if subcommand in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS:
@@ -5262,6 +5230,7 @@ def grabowski_git(
                 normalized_attempt["branch"],
                 operation_id=normalized_attempt["operation_id"],
                 attempt_id=normalized_attempt["attempt_id"],
+                ttl_seconds=execution_timeout_seconds + 30,
             )
         except resources.SameOwnerBranchAttemptConflict as exc:
             return _branch_attempt_reconcile_result(
@@ -5339,7 +5308,7 @@ def grabowski_git(
     result = _run(
         command,
         cwd=path,
-        timeout_seconds=_timeout(timeout_seconds),
+        timeout_seconds=execution_timeout_seconds,
         max_output_bytes=MAX_OUTPUT_BYTES,
         environment=environment,
     )

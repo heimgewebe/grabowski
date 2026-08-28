@@ -302,6 +302,49 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertIs(result, sentinel)
         self.assertEqual(runner.call_args.args[0][-4:], ["status", "--short", "--branch", "--untracked-files=normal"])
 
+    def test_git_status_optionally_returns_shared_branch_preimage(self) -> None:
+        repo = Path("/tmp/repository")
+        status = {"returncode": 0}
+        preimage = {
+            "schema_version": 1,
+            "repository": str(repo),
+            "branch": "feature",
+            "head": "a" * 40,
+            "head_state": "present",
+            "index_sha256": "b" * 64,
+            "operation_refs": {},
+            "preimage_sha256": "c" * 64,
+        }
+        with (
+            patch.object(read_surface, "_resolve_repository", return_value=repo),
+            patch.object(read_surface, "_run_read", return_value=status),
+            patch.object(
+                read_surface.grabowski_git_preimage,
+                "capture_branch_preimage",
+                return_value=preimage,
+                create=True,
+            ) as builder,
+        ):
+            result = read_surface.grabowski_git_status(
+                str(repo), include_branch_preimage=True
+            )
+        self.assertEqual(
+            result["branch_preimage"]["kind"], "grabowski_git_branch_preimage"
+        )
+        self.assertEqual(result["branch_preimage"]["preimage_sha256"], "c" * 64)
+        self.assertEqual(builder.call_args.args[0], repo)
+
+    def test_git_status_preimage_still_enforces_read_policy(self) -> None:
+        with patch.object(
+            read_surface.base,
+            "_resolve_existing",
+            side_effect=PermissionError("Path is outside allowed roots"),
+        ):
+            with self.assertRaisesRegex(PermissionError, "outside allowed roots"):
+                read_surface.grabowski_git_status(
+                    "/tmp/private-repo", include_branch_preimage=True
+                )
+
     def test_git_diff_has_no_arbitrary_arguments(self) -> None:
         repo = Path("/tmp/repository")
         with patch.object(read_surface, "_resolve_repository", return_value=repo), patch.object(read_surface, "_run_read", return_value={"returncode": 0}) as runner:

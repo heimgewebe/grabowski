@@ -59,6 +59,7 @@ import grabowski_merge_authority as merge_authority
 import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
+
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
@@ -573,7 +574,6 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_reposkop_context": ("file_read", "file_write", "terminal_execute"),
     "grabowski_operator_optimization_report": (),
     "grabowski_git_status": (),
-    "grabowski_git_branch_preimage": ("git_cli",),
     "grabowski_git_diff": (),
     "grabowski_git_log": (),
     "grabowski_git_show": (),
@@ -809,7 +809,6 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_job_logs",
     "grabowski_job_cancel",
     "grabowski_git",
-    "grabowski_git_branch_preimage",
     "grabowski_git_branch",
     "grabowski_checkout_inventory",
     "grabowski_checkout_binding_terminal_preview",

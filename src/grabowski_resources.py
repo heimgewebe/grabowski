@@ -5226,13 +5226,13 @@ def _overlay_live_same_owner_branch_attempt(
     branch_key: str,
     binding: dict[str, Any],
     now: int,
+    required_expires_at_unix: int,
 ) -> dict[str, Any] | None:
     """Overlay one attempt binding onto an existing same-owner branch lease.
 
-    The existing lease remains the authority surface: purpose, acquisition time,
-    expiry and all pre-existing metadata are preserved. Only the ephemeral
-    attempt marker is added, so the marker can be removed after terminal Git
-    readback without replacing Work Lane identity.
+    The existing lease remains the authority surface: purpose, acquisition time
+    and all pre-existing metadata are preserved. Expiry may be extended only for
+    the bounded attempt lifetime and is restored after terminal Git readback.
     """
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -5279,6 +5279,47 @@ def _overlay_live_same_owner_branch_attempt(
                     raise RuntimeError(
                         "branch mutation attempt lease origin is invalid"
                     )
+                previous_expires = existing_attempt.get("previous_expires_at_unix")
+                attempt_expires = existing_attempt.get("attempt_expires_at_unix")
+                if origin == "preexisting":
+                    if not isinstance(previous_expires, int) or previous_expires <= 0:
+                        raise RuntimeError(
+                            "branch mutation attempt previous expiry is invalid"
+                        )
+                    if not isinstance(attempt_expires, int) or attempt_expires <= 0:
+                        raise RuntimeError(
+                            "branch mutation attempt expiry is invalid"
+                        )
+                    if int(row["expires_at_unix"]) != attempt_expires:
+                        raise RuntimeError(
+                            "branch mutation attempt expiry changed during attempt"
+                        )
+                    if attempt_expires < required_expires_at_unix:
+                        updated_attempt = {
+                            **existing_attempt,
+                            "attempt_expires_at_unix": required_expires_at_unix,
+                        }
+                        updated_metadata = {
+                            **observed_metadata,
+                            BRANCH_MUTATION_ATTEMPT_METADATA_KEY: updated_attempt,
+                        }
+                        metadata_json, metadata_sha256 = _metadata(updated_metadata)
+                        connection.execute(
+                            """
+                            UPDATE leases
+                            SET expires_at_unix=?, metadata_sha256=?, metadata_json=?
+                            WHERE resource_key=?
+                            """,
+                            (
+                                required_expires_at_unix,
+                                metadata_sha256,
+                                metadata_json,
+                                branch_key,
+                            ),
+                        )
+                        row = connection.execute(
+                            "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+                        ).fetchone()
                 connection.commit()
                 return {
                     "lease": _public(row),
@@ -5287,12 +5328,19 @@ def _overlay_live_same_owner_branch_attempt(
                     "previous_metadata_sha256": existing_attempt.get(
                         "previous_metadata_sha256"
                     ),
+                    "previous_expires_at_unix": previous_expires,
                 }
 
+            previous_expires_at_unix = int(row["expires_at_unix"])
+            attempt_expires_at_unix = max(
+                previous_expires_at_unix, required_expires_at_unix
+            )
             attempt_metadata = {
                 **binding,
                 "lease_origin": "preexisting",
                 "previous_metadata_sha256": observed_metadata_sha256,
+                "previous_expires_at_unix": previous_expires_at_unix,
+                "attempt_expires_at_unix": attempt_expires_at_unix,
             }
             overlaid_metadata = {
                 **observed_metadata,
@@ -5302,10 +5350,15 @@ def _overlay_live_same_owner_branch_attempt(
             connection.execute(
                 """
                 UPDATE leases
-                SET metadata_sha256=?, metadata_json=?
+                SET expires_at_unix=?, metadata_sha256=?, metadata_json=?
                 WHERE resource_key=?
                 """,
-                (metadata_sha256, metadata_json, branch_key),
+                (
+                    attempt_expires_at_unix,
+                    metadata_sha256,
+                    metadata_json,
+                    branch_key,
+                ),
             )
             updated = connection.execute(
                 "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
@@ -5321,6 +5374,7 @@ def _overlay_live_same_owner_branch_attempt(
         "lease_origin": "preexisting",
         "preserved": True,
         "previous_metadata_sha256": observed_metadata_sha256,
+        "previous_expires_at_unix": previous_expires_at_unix,
     }
 
 
@@ -5352,7 +5406,11 @@ def acquire_branch_mutation_attempt(
     )
     now = _now()
     overlaid = _overlay_live_same_owner_branch_attempt(
-        owner=owner, branch_key=branch_key, binding=binding, now=now
+        owner=owner,
+        branch_key=branch_key,
+        binding=binding,
+        now=now,
+        required_expires_at_unix=now + ttl,
     )
     if overlaid is not None:
         lease = overlaid["lease"]
@@ -5371,6 +5429,7 @@ def acquire_branch_mutation_attempt(
             "previous_metadata_sha256": overlaid[
                 "previous_metadata_sha256"
             ],
+            "previous_expires_at_unix": overlaid["previous_expires_at_unix"],
             "preserved": True,
             "release_required_after_terminal_readback": True,
         }
@@ -5397,6 +5456,7 @@ def acquire_branch_mutation_attempt(
         "lease": lease,
         "lease_origin": "attempt_only",
         "previous_metadata_sha256": None,
+        "previous_expires_at_unix": None,
         "preserved": branch_key in result["preserved"],
         "release_required_after_terminal_readback": True,
     }
@@ -5444,6 +5504,9 @@ def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str,
         or SHA256_RE.fullmatch(expected_previous) is None
     ):
         raise ValueError("preexisting lease previous metadata SHA-256 is invalid")
+    expected_previous_expires = attempt_lease.get("previous_expires_at_unix")
+    if not isinstance(expected_previous_expires, int) or expected_previous_expires <= 0:
+        raise ValueError("preexisting lease previous expiry is invalid")
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -5484,6 +5547,21 @@ def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str,
                 raise RuntimeError(
                     "branch mutation attempt restore binding changed before cleanup"
                 )
+            if (
+                observed_attempt.get("previous_expires_at_unix")
+                != expected_previous_expires
+            ):
+                raise RuntimeError(
+                    "branch mutation attempt previous expiry changed before cleanup"
+                )
+            observed_attempt_expires = observed_attempt.get("attempt_expires_at_unix")
+            if (
+                not isinstance(observed_attempt_expires, int)
+                or int(row["expires_at_unix"]) != observed_attempt_expires
+            ):
+                raise RuntimeError(
+                    "branch mutation attempt expiry changed before cleanup"
+                )
             restored_metadata = dict(metadata)
             restored_metadata.pop(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
             metadata_json, metadata_sha256 = _metadata(restored_metadata)
@@ -5494,10 +5572,15 @@ def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str,
             connection.execute(
                 """
                 UPDATE leases
-                SET metadata_sha256=?, metadata_json=?
+                SET expires_at_unix=?, metadata_sha256=?, metadata_json=?
                 WHERE resource_key=?
                 """,
-                (metadata_sha256, metadata_json, branch_key),
+                (
+                    expected_previous_expires,
+                    metadata_sha256,
+                    metadata_json,
+                    branch_key,
+                ),
             )
             restored = connection.execute(
                 "SELECT * FROM leases WHERE resource_key=?", (branch_key,)

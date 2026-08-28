@@ -4593,6 +4593,68 @@ class ResourceTests(unittest.TestCase):
         )
         self.assertEqual(original_record["metadata_json"], restored["metadata_json"])
 
+    def test_branch_attempt_temporarily_extends_short_work_lane_lease_and_restores_expiry(self) -> None:
+        (self.root / ".git").mkdir()
+        lane_id = "b" * 32
+        owner = f"lane:{lane_id}"
+        branch = "feat/work-lane-short-expiry"
+        key = f"repo:{self.root}:branch:{branch}"
+        metadata = self.work_lane_metadata(
+            self.root, target=self.root / "writer", lane_id=lane_id
+        )
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="work lane writer authority",
+            ttl_seconds=30,
+            metadata=metadata,
+        )
+        with resources._database() as connection:
+            original = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(original)
+        original_record = dict(original)
+
+        attempt = resources.acquire_branch_mutation_attempt(
+            owner,
+            str(self.root),
+            branch,
+            operation_id="operation-a",
+            attempt_id="attempt-1",
+            ttl_seconds=120,
+        )
+        with resources._database() as connection:
+            active = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(active)
+        active_metadata = resources._row_metadata(active)
+        marker = active_metadata[resources.BRANCH_MUTATION_ATTEMPT_METADATA_KEY]
+        self.assertEqual(
+            original_record["expires_at_unix"], marker["previous_expires_at_unix"]
+        )
+        self.assertEqual(active["expires_at_unix"], marker["attempt_expires_at_unix"])
+        self.assertGreater(active["expires_at_unix"], original_record["expires_at_unix"])
+        self.assertEqual(
+            original_record["expires_at_unix"], attempt["previous_expires_at_unix"]
+        )
+
+        cleanup = resources.complete_branch_mutation_attempt(attempt)
+        self.assertEqual("restored", cleanup["action"])
+        with resources._database() as connection:
+            restored = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(restored)
+        self.assertEqual(
+            original_record["expires_at_unix"], restored["expires_at_unix"]
+        )
+        self.assertEqual(original_record["metadata_json"], restored["metadata_json"])
+        self.assertEqual(
+            original_record["metadata_sha256"], restored["metadata_sha256"]
+        )
+
     def test_branch_attempt_only_lease_is_snapshot_released_after_terminal_readback(self) -> None:
         (self.root / ".git").mkdir()
         branch = "feat/attempt-only-cleanup"
