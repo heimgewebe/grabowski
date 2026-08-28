@@ -1922,7 +1922,7 @@
     },
     {
       "category": "resource",
-      "description": "Release one terminal runtime-refresh attempt's exact unchanged path leases.",
+      "description": "Release one terminal runtime-refresh attempt's exact unchanged resource leases.",
       "effects": [
         "lease-remove",
         "audit-append",
