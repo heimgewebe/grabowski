@@ -45,11 +45,13 @@ jobs:
         run: |
           python -m py_compile .github/pr966_finalize_bootstrap.py
           python -m py_compile .github/pr966_finalize_followup.py
+          python -m py_compile .github/pr966_finalize_testfix.py
 
       - name: Generate final hardening diff
         run: |
           python .github/pr966_finalize_bootstrap.py
           python .github/pr966_finalize_followup.py
+          python .github/pr966_finalize_testfix.py
 
       - name: Compile hardened sources and tests
         run: |
