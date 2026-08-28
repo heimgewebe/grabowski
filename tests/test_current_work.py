@@ -68,6 +68,7 @@ def checkout(
     binding_phase: str | None = None,
     binding_consistent: bool = True,
     retention_active: bool = False,
+    retention_until_unix: int | None = None,
     drift_reasons: list[str] | None = None,
 ) -> dict:
     binding = (
@@ -77,6 +78,14 @@ def checkout(
             "source": {"kind": "bureau-task", "id": "T095"},
         }
         if binding_owner is not None
+        else None
+    )
+    retention = (
+        {
+            "owner_id": binding_owner or "operator:test-retention",
+            "retention_until_unix": retention_until_unix,
+        }
+        if retention_until_unix is not None
         else None
     )
     return {
@@ -95,7 +104,11 @@ def checkout(
             ],
             "processes": processes or [],
         },
-        "lifecycle": {"state": lifecycle_state, "binding": binding},
+        "lifecycle": {
+            "state": lifecycle_state,
+            "binding": binding,
+            "retention": retention,
+        },
         "lifecycle_state": lifecycle_state,
         "lifecycle_decision": {
             "binding_present": binding is not None,
@@ -901,8 +914,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         group = result["work"][0]
         self.assertEqual(group["work_id"], "checkout:managed-drift-owner")
         self.assertEqual(group["binding_status"], "checkout-bound")
-        self.assertEqual(group["projection_state"], "hygiene")
-        self.assertEqual(group["work_class"], "hygiene")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertEqual(group["work_class"], "operational")
         self.assertFalse(
             any(
                 ref.get("source") == "checkout-lifecycle-binding"
@@ -1676,6 +1689,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             binding_phase="active",
             binding_consistent=False,
             retention_active=False,
+            retention_until_unix=1,
             drift_reasons=["expected-branch-mismatch"],
         )
         result = project(
@@ -1718,6 +1732,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             binding_phase="active",
             binding_consistent=False,
             retention_active=True,
+            retention_until_unix=2000,
             drift_reasons=["expected-branch-mismatch"],
         )
         result = project(

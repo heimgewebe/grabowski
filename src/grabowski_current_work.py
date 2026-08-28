@@ -295,7 +295,8 @@ def _historical_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
     """
     historical_phase = item["binding_phase"] in {"completed_retained", "archived"}
     expired_active_phase = (
-        item["binding_phase"] == "active" and not item["retention_active"]
+        item["binding_phase"] == "active"
+        and item["retention_expiration_proven"]
     )
     return bool(
         item["lifecycle_state"] == "managed_lifecycle_drift"
@@ -576,6 +577,19 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
             raise CurrentWorkProjectionError(
                 "absent checkout binding must be consistent and drift-free"
             )
+    retention_active = _boolean(
+        decision.get("retention_active"),
+        "checkout.lifecycle_decision.retention_active",
+    )
+    retention_until_unix = (
+        retention.get("retention_until_unix") if isinstance(retention, dict) else None
+    )
+    retention_expiration_proven = bool(
+        isinstance(retention_until_unix, int)
+        and not isinstance(retention_until_unix, bool)
+        and retention_until_unix > 0
+        and not retention_active
+    )
     return {
         "checkout_key": _identifier(raw.get("checkout_key"), "checkout.checkout_key"),
         "repository": repository,
@@ -608,10 +622,8 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
             for item in process_rows if isinstance(item, dict)
         ][:MAX_EVIDENCE],
         "retention_owner_id": str(retention.get("owner_id")) if isinstance(retention, dict) and retention.get("owner_id") else "",
-        "retention_active": _boolean(
-            decision.get("retention_active"),
-            "checkout.lifecycle_decision.retention_active",
-        ),
+        "retention_active": retention_active,
+        "retention_expiration_proven": retention_expiration_proven,
         "binding_owner_id": binding_owner_id,
         "binding_source": dict(binding.get("source")) if isinstance(binding, dict) and isinstance(binding.get("source"), dict) else None,
         "binding_present": binding_present,
