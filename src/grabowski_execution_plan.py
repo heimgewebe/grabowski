@@ -401,6 +401,10 @@ def _completion_policy(
     critical = {node["node_id"] for node in nodes if node["critical"]}
     if not critical.issubset(set(required)):
         raise ExecutionPlanError("completion policy skips a critical node")
+    if set(required) != node_ids:
+        raise ExecutionPlanError(
+            "P4 has no degraded-completion contract; every declared node must be required"
+        )
     verifier_count = sum(1 for node in nodes if node["kind"] == "verifier")
     quorum = _bounded_int(
         value.get("verifier_quorum"),
