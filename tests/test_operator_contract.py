@@ -2743,6 +2743,109 @@ class OperatorContractTests(unittest.TestCase):
             )
             self.assertEqual("2", commits.stdout.strip())
 
+    def test_grabowski_git_preserves_existing_work_lane_branch_lease(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            resource_db = root / "resources.sqlite3"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+                check=True,
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "grabowski@example.invalid",
+                ],
+                check=True,
+            )
+            (repo / "README.md").write_text("baseline\n")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"],
+                check=True,
+            )
+            lane_id = "c" * 32
+            owner = f"lane:{lane_id}"
+            branch_key = f"repo:{repo}:branch:feature"
+            lane_metadata = {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane",
+                "lane_id": lane_id,
+                "repo": str(repo),
+                "target_path": str(repo),
+            }
+
+            with (
+                patch.object(resources, "RESOURCE_DB", resource_db),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="c" * 64),
+            ):
+                resources.acquire_resources(
+                    owner,
+                    [branch_key],
+                    purpose="work lane writer authority",
+                    ttl_seconds=120,
+                    metadata=lane_metadata,
+                )
+                with resources._database() as connection:
+                    original = connection.execute(
+                        "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+                    ).fetchone()
+                self.assertIsNotNone(original)
+                original_record = dict(original)
+                preimage = operator._git_branch_preimage(repo)
+                result = operator.grabowski_git(
+                    str(repo),
+                    ["commit", "--allow-empty", "-m", "work lane mutation"],
+                    branch_attempt={
+                        "schema_version": 1,
+                        "owner_id": owner,
+                        "operation_id": "operation-a",
+                        "attempt_id": "attempt-1",
+                        "branch": "feature",
+                        "expected_preimage_sha256": preimage["preimage_sha256"],
+                    },
+                )
+                with resources._database() as connection:
+                    restored = connection.execute(
+                        "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+                    ).fetchone()
+
+            self.assertEqual(0, result["returncode"])
+            receipt = result["branch_mutation"]
+            self.assertEqual("completed", receipt["status"])
+            self.assertEqual("preexisting", receipt["lease_origin"])
+            self.assertEqual("restored", receipt["lease_cleanup"]["action"])
+            self.assertFalse(receipt["release_required_after_terminal_readback"])
+            self.assertIsNotNone(restored)
+            self.assertEqual(original_record["purpose"], restored["purpose"])
+            self.assertEqual(
+                original_record["acquired_at_unix"], restored["acquired_at_unix"]
+            )
+            self.assertEqual(
+                original_record["updated_at_unix"], restored["updated_at_unix"]
+            )
+            self.assertEqual(
+                original_record["expires_at_unix"], restored["expires_at_unix"]
+            )
+            self.assertEqual(
+                original_record["metadata_sha256"], restored["metadata_sha256"]
+            )
+            self.assertEqual(original_record["metadata_json"], restored["metadata_json"])
+
     def test_grabowski_git_same_attempt_continuation_preserves_unchanged_preimage(self) -> None:
         operator = _load_operator_module()
         import grabowski_resources as resources

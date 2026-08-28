@@ -4404,6 +4404,7 @@ def _branch_attempt_reconcile_result(
     reason: str,
     lease: dict[str, Any] | None = None,
     existing_attempt_binding_sha256: str | None = None,
+    lease_cleanup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     material = {
         "schema_version": 1,
@@ -4424,6 +4425,8 @@ def _branch_attempt_reconcile_result(
         "lease_resource_key": None if lease is None else lease.get("resource_key"),
         "attempt_binding_sha256": None if lease is None else lease.get("attempt_binding_sha256"),
         "existing_attempt_binding_sha256": existing_attempt_binding_sha256,
+        "lease_cleanup": lease_cleanup,
+        "release_required_after_terminal_readback": lease is not None and lease_cleanup is None,
     }
     material["receipt_sha256"] = hashlib.sha256(_canonical_json_bytes(material)).hexdigest()
     audit_sha256 = _append_effect_audit(
@@ -5275,6 +5278,15 @@ def grabowski_git(
             normalized_attempt["expected_preimage_sha256"]
             != observed_after_lease["preimage_sha256"]
         ):
+            try:
+                lease_cleanup = resources.complete_branch_mutation_attempt(
+                    attempt_lease
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "branch attempt cleanup failed after pre-effect Git preimage drift; "
+                    "reconcile the exact branch lease before another mutation"
+                ) from exc
             return _branch_attempt_reconcile_result(
                 repo=path,
                 arguments=arguments,
@@ -5282,6 +5294,7 @@ def grabowski_git(
                 observed=observed_after_lease,
                 reason="git-preimage-drift-after-attempt-lease",
                 lease=attempt_lease,
+                lease_cleanup=lease_cleanup,
             )
         branch_context = {
             "attempt": normalized_attempt,
@@ -5341,10 +5354,18 @@ def grabowski_git(
         postimage = _git_branch_preimage(path, require_attached=False)
     except Exception as exc:
         postimage_error = type(exc).__name__
+    lease_cleanup: dict[str, Any] | None = None
+    lease_cleanup_error: str | None = None
+    if postimage is not None:
+        try:
+            lease_cleanup = resources.complete_branch_mutation_attempt(attempt_lease)
+        except Exception as exc:
+            lease_cleanup_error = type(exc).__name__
     completed = (
         result.get("returncode") == 0
         and result.get("timed_out") is False
         and postimage is not None
+        and lease_cleanup is not None
     )
     status = "completed" if completed else "outcome_unknown"
     receipt: dict[str, Any] = {
@@ -5369,7 +5390,10 @@ def grabowski_git(
         "attempt_binding_sha256": attempt_lease["attempt_binding_sha256"],
         "lease_metadata_sha256": attempt_lease["lease"]["metadata_sha256"],
         "lease_expires_at_unix": attempt_lease["lease"]["expires_at_unix"],
-        "release_required_after_terminal_readback": True,
+        "lease_origin": attempt_lease.get("lease_origin"),
+        "lease_cleanup": lease_cleanup,
+        "lease_cleanup_error_class": lease_cleanup_error,
+        "release_required_after_terminal_readback": lease_cleanup is None,
         "command_argv_sha256": result.get("argv_sha256"),
         "command_returncode": result.get("returncode"),
         "command_timed_out": result.get("timed_out"),
