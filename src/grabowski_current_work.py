@@ -284,20 +284,25 @@ def _dirty_has_resource_overlap(item: dict[str, Any]) -> bool:
     )
 
 
-def _terminal_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
-    """Keep terminal identity drift visible without making it operative work.
+def _historical_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
+    """Keep coordination-free historical identity drift out of operative work.
 
-    A completed/archived checkout with no dirty state, live lease, process or
-    coordination overlap is historical lifecycle hygiene.  Retention may still
-    protect it from cleanup, but does not by itself make the checkout an active
-    effect lane.  Active-phase drift and every live/ambiguous surface remain
-    fail-closed and blocking.
+    Completed/archived drift is historical hygiene as before.  An active-phase
+    binding whose retention has expired is also historical once the checkout is
+    clean and no lease, process or coordination overlap remains.  This changes
+    only the current-work projection: lifecycle repair and cleanup authority stay
+    fail-closed, while dirty, retained or otherwise live surfaces remain blocking.
     """
+    historical_phase = item["binding_phase"] in {"completed_retained", "archived"}
+    expired_active_phase = (
+        item["binding_phase"] == "active"
+        and item["retention_expiration_proven"]
+    )
     return bool(
         item["lifecycle_state"] == "managed_lifecycle_drift"
         and item["binding_present"]
         and not item["binding_consistent"]
-        and item["binding_phase"] in {"completed_retained", "archived"}
+        and (historical_phase or expired_active_phase)
         and not item["is_main"]
         and not item["dirty"]
         and not item["coordination_blocking"]
@@ -572,6 +577,19 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
             raise CurrentWorkProjectionError(
                 "absent checkout binding must be consistent and drift-free"
             )
+    retention_active = _boolean(
+        decision.get("retention_active"),
+        "checkout.lifecycle_decision.retention_active",
+    )
+    retention_until_unix = (
+        retention.get("retention_until_unix") if isinstance(retention, dict) else None
+    )
+    retention_expiration_proven = bool(
+        isinstance(retention_until_unix, int)
+        and not isinstance(retention_until_unix, bool)
+        and retention_until_unix > 0
+        and not retention_active
+    )
     return {
         "checkout_key": _identifier(raw.get("checkout_key"), "checkout.checkout_key"),
         "repository": repository,
@@ -604,10 +622,8 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
             for item in process_rows if isinstance(item, dict)
         ][:MAX_EVIDENCE],
         "retention_owner_id": str(retention.get("owner_id")) if isinstance(retention, dict) and retention.get("owner_id") else "",
-        "retention_active": _boolean(
-            decision.get("retention_active"),
-            "checkout.lifecycle_decision.retention_active",
-        ),
+        "retention_active": retention_active,
+        "retention_expiration_proven": retention_expiration_proven,
         "binding_owner_id": binding_owner_id,
         "binding_source": dict(binding.get("source")) if isinstance(binding, dict) and isinstance(binding.get("source"), dict) else None,
         "binding_present": binding_present,
@@ -1069,7 +1085,7 @@ def _add_checkouts(
             )
 
         if item["binding_present"] and not item["binding_consistent"]:
-            if _terminal_binding_drift_is_hygiene(item):
+            if _historical_binding_drift_is_hygiene(item):
                 _hygiene(group, "managed-lifecycle-drift")
             else:
                 _blocking(group, "managed-lifecycle-drift")
@@ -1342,7 +1358,7 @@ def _add_binding_reconciliation(
             state == "binding_identity_drift"
             and group.get("checkout_refs")
             and all(
-                _terminal_binding_drift_is_hygiene(item)
+                _historical_binding_drift_is_hygiene(item)
                 for item in group["checkout_refs"]
             )
         )
