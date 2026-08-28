@@ -126,6 +126,94 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
         self.assertTrue(ownership["operator_may_coordinate_all_roles"])
         self.assertTrue(ownership["single_unisolated_agent_may_not_substitute_for_all_roles"])
 
+    def test_attention_trace_projects_partial_lifecycle_signal_without_file_claims(self) -> None:
+        identifier = "gaw-observer-attention-partial"
+        manifest = self._manifest(identifier)
+        manifest["scope"] = {
+            "allowed_paths": ["src/feature.py", "tests/test_feature.py"],
+            "forbidden_paths": ["secrets/"],
+        }
+        workspace._atomic_json(self.root / identifier / "manifest.json", manifest)
+        writer = workspace._append_workspace_event(
+            manifest, "role_started", role="writer", outcome="started",
+            evidence={"private_path": "/must/not/leak"},
+        )
+        workspace._append_workspace_event(
+            manifest, "role_finished", role="tests", outcome="passed",
+            evidence={"private_path": "/must/not/leak"},
+        )
+        with mock.patch.object(workspace, "_status_data", return_value=self._status()):
+            first = observer.grabowski_agent_workspace_observe(identifier, "attention-trace")
+            second = observer.grabowski_agent_workspace_observe(identifier, "attention-trace-repeat")
+        trace = first["attention_trace"]
+        self.assertEqual(trace["schema_version"], 1)
+        self.assertEqual(trace["kind"], "attention_trace_v1")
+        self.assertEqual(trace["signal_status"], "PARTIAL_SIGNAL")
+        self.assertEqual(trace["coverage"]["execute"]["status"], "PARTIAL_SIGNAL")
+        self.assertEqual(trace["coverage"]["verify"]["status"], "PARTIAL_SIGNAL")
+        self.assertEqual(trace["coverage"]["search"]["status"], "NO_SIGNAL")
+        self.assertEqual(
+            trace["coverage"]["search"]["reason"],
+            "not_instrumented_by_workspace_event_contract",
+        )
+        self.assertEqual(trace["expected_scope"]["allowed_paths"], ["src/feature.py", "tests/test_feature.py"])
+        self.assertFalse(trace["expected_scope"]["attention_evidence"])
+        self.assertEqual(trace["normalized_events"][0]["source_event"]["event_sha256"], writer["event_sha256"])
+        self.assertNotIn("evidence", trace["normalized_events"][0])
+        self.assertNotIn("/must/not/leak", str(trace))
+        self.assertFalse(trace["execution_authorized"])
+        self.assertEqual(trace["trace_sha256"], second["attention_trace"]["trace_sha256"])
+
+    def test_attention_trace_missing_event_log_is_explicit_no_signal(self) -> None:
+        identifier = "gaw-observer-attention-missing"
+        self._manifest(identifier)
+        with mock.patch.object(workspace, "_status_data", return_value=self._status()):
+            report = observer.grabowski_agent_workspace_observe(identifier, "attention-trace-missing")
+        trace = report["attention_trace"]
+        self.assertEqual(trace["signal_status"], "NO_SIGNAL")
+        self.assertEqual(trace["normalized_events"], [])
+        self.assertFalse(trace["provenance"]["event_log_present"])
+        self.assertTrue(all(item["status"] == "NO_SIGNAL" for item in trace["coverage"].values()))
+
+    def test_attention_trace_invalid_event_log_fails_closed(self) -> None:
+        identifier = "gaw-observer-attention-invalid"
+        manifest = self._manifest(identifier)
+        workspace._append_workspace_event(
+            manifest, "role_started", role="writer", outcome="started",
+            evidence={"task_id": "writer-1"},
+        )
+        path = workspace._event_log_path(identifier)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        tampered = json.loads(lines[0])
+        tampered["outcome"] = "passed"
+        lines[0] = json.dumps(tampered, sort_keys=True, separators=(",", ":"))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with mock.patch.object(workspace, "_status_data", return_value=self._status()):
+            report = observer.grabowski_agent_workspace_observe(identifier, "attention-trace-invalid")
+        trace = report["attention_trace"]
+        self.assertEqual(trace["signal_status"], "INVALID_EVIDENCE")
+        self.assertFalse(trace["provenance"]["event_log_integrity_valid"])
+        self.assertEqual(trace["normalized_events"], [])
+        self.assertEqual(trace["coverage"]["execute"]["reason"], "event_log_integrity_invalid")
+
+    def test_attention_trace_does_not_promote_controller_preflight_or_checkout_to_execution(self) -> None:
+        identifier = "gaw-observer-attention-controller-only"
+        manifest = self._manifest(identifier)
+        workspace._append_workspace_event(
+            manifest, "role_preflight", role="writer", outcome="passed",
+            evidence={"toolchain": "available"},
+        )
+        workspace._append_workspace_event(
+            manifest, "writer_checkout_lifecycle_bound", role="writer", outcome="bound",
+            evidence={"checkout_key": "opaque"},
+        )
+        with mock.patch.object(workspace, "_status_data", return_value=self._status()):
+            report = observer.grabowski_agent_workspace_observe(identifier, "attention-trace-controller-only")
+        trace = report["attention_trace"]
+        self.assertEqual(trace["signal_status"], "NO_SIGNAL")
+        self.assertEqual(trace["coverage"]["execute"]["status"], "NO_SIGNAL")
+        self.assertEqual(trace["normalized_events"], [])
+
     def test_optimizer_requires_multiple_unique_workspaces_and_is_proposal_only(self) -> None:
         identifiers = ["gaw-observer-test-00000003", "gaw-observer-test-00000004"]
         manifests = {identifier: self._manifest(identifier) for identifier in identifiers}

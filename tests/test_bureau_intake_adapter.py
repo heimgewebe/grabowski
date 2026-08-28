@@ -989,6 +989,140 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
+    def test_candidate_record_registered_schema_rejects_unknown_top_level_fields(self) -> None:
+        if not hasattr(intake.mcp, "list_tools") or not hasattr(
+            intake.mcp, "_tool_manager"
+        ):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        tool = next(
+            item
+            for item in asyncio.run(intake.mcp.list_tools())
+            if item.name == "grabowski_bureau_candidate_record"
+        )
+        schema = tool.inputSchema
+        self.assertEqual({"request"}, set(schema["properties"]))
+        self.assertEqual({"request"}, set(schema["required"]))
+        self.assertEqual(
+            {
+                "#/$defs/BureauCandidateRecordRequest",
+                "#/$defs/BureauCandidateCloseRequest",
+            },
+            {variant["$ref"] for variant in schema["properties"]["request"]["anyOf"]},
+        )
+        record = schema["$defs"]["BureauCandidateRecordRequest"]
+        close = schema["$defs"]["BureauCandidateCloseRequest"]
+        self.assertFalse(record["additionalProperties"])
+        self.assertFalse(close["additionalProperties"])
+        self.assertEqual(
+            {
+                "schema_version",
+                "operation",
+                "idempotency_key",
+                "title",
+                "source_kind",
+                "desired_outcome",
+                "repo",
+                "source_locator",
+                "source_sha256",
+                "observed_at",
+                "task_id",
+                "candidate_id",
+                "supersedes_event_id",
+                "note",
+                "catalog_validation",
+            },
+            set(record["properties"]),
+        )
+        self.assertEqual(
+            {
+                "schema_version",
+                "operation",
+                "idempotency_key",
+                "candidate_id",
+                "expected_event_id",
+                "outcome",
+                "evidence",
+                "note",
+            },
+            set(close["properties"]),
+        )
+        self.assertEqual(set(), set(record.get("required", [])))
+        self.assertEqual({"operation"}, set(close["required"]))
+        self.assertNotIn("const", record["properties"]["operation"])
+        self.assertNotIn("enum", record["properties"]["operation"])
+        self.assertNotIn("const", close["properties"]["operation"])
+        self.assertNotIn("enum", close["properties"]["operation"])
+
+        valid = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:strict-candidate-schema:v1",
+            "title": "Strict candidate request schema",
+            "source_kind": "conversation",
+            "desired_outcome": "Reject unknown fields before Bureau dispatch",
+        }
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "kind": "bureau_candidate_record_result",
+                "status": "recorded",
+            },
+        ) as invoke:
+            result = asyncio.run(
+                intake.mcp._tool_manager.call_tool(
+                    "grabowski_bureau_candidate_record", {"request": valid}
+                )
+            )
+        self.assertEqual("recorded", result["status"])
+        invoke.assert_called_once()
+
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with mock.patch.object(intake, "_invoke_bureau") as invoke:
+            with self.assertRaises(ToolError):
+                asyncio.run(
+                    intake.mcp._tool_manager.call_tool(
+                        "grabowski_bureau_candidate_record",
+                        {
+                            "request": {
+                                **valid,
+                                "acceptance_criteria": ["not a candidate field"],
+                            }
+                        },
+                    )
+                )
+        invoke.assert_not_called()
+
+        for operation in (None, "unsupported-operation"):
+            with self.subTest(operation=operation):
+                with (
+                    mock.patch.object(
+                        intake,
+                        "_invoke_bureau",
+                        return_value={
+                            "kind": "bureau_operator_intake_failure",
+                            "status": "failed",
+                            "code": "operation-unsupported",
+                        },
+                    ) as invoke,
+                    mock.patch.object(intake, "_audit") as audit,
+                ):
+                    result = asyncio.run(
+                        intake.mcp._tool_manager.call_tool(
+                            "grabowski_bureau_candidate_record",
+                            {"request": {**valid, "operation": operation}},
+                        )
+                    )
+                self.assertEqual("failed", result["status"])
+                invoke.assert_called_once()
+                audit.assert_called_once()
+                request_path = Path(invoke.call_args.args[0][-1])
+                forwarded = json.loads(request_path.read_text())
+                if operation is None:
+                    self.assertIsNone(forwarded["operation"])
+                else:
+                    self.assertEqual(operation, forwarded["operation"])
+
     def test_candidate_assess_registered_schema_is_additive_and_cache_safe(self) -> None:
         if not hasattr(intake.mcp, "list_tools"):
             self.skipTest("real FastMCP unavailable in dependency-free validation")
