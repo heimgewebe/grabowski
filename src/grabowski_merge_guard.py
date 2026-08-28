@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 import weakref
 
@@ -22,6 +22,46 @@ from grabowski_pr_diff import (
     canonicalize_github_pr_diff_identity,
     github_pr_diff_identity_sha256,
 )
+
+
+class MergeGuardResourceAuthority(Protocol):
+    """Exact resource operations required by the Captain merge guard.
+
+    The resource store remains the authority; the merge guard receives that
+    authority from the composition root instead of importing it itself.
+    """
+
+    def acquire_merge_guard_resources(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
+
+    def reconcile_delegated_operator_leases(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
+
+    def release_resources(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def release_task_authority_adoption(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+_REQUIRED_RESOURCE_AUTHORITY_METHODS = (
+    "acquire_merge_guard_resources",
+    "reconcile_delegated_operator_leases",
+    "release_resources",
+    "release_task_authority_adoption",
+)
+
+
+def _require_merge_guard_resource_authority(
+    authority: MergeGuardResourceAuthority,
+) -> MergeGuardResourceAuthority:
+    missing = [
+        name
+        for name in _REQUIRED_RESOURCE_AUTHORITY_METHODS
+        if not callable(getattr(authority, name, None))
+    ]
+    if missing:
+        raise ValueError(
+            "merge guard resource authority is missing required operations: "
+            + ", ".join(missing)
+        )
+    return authority
 
 
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -2080,6 +2120,7 @@ class CaptainMergeGuardRunner:
         action: dict[str, Any],
         parameters: dict[str, Any],
         github_runner: Any,
+        resource_authority: MergeGuardResourceAuthority,
         execution_intent_sha256: str,
         lease_owner_id: str,
         server_actor_identity: dict[str, Any] | None = None,
@@ -2106,6 +2147,9 @@ class CaptainMergeGuardRunner:
             self.repo_path = self.requested_repo_path
             self.repository_binding_error = f"{type(exc).__name__}:{exc}"
         self.github_runner = github_runner
+        self.resource_authority = _require_merge_guard_resource_authority(
+            resource_authority
+        )
         self.execution_intent_sha256 = execution_intent_sha256
         self.requested_lease_owner_id = lease_owner_id
         self.lease_owner_id = lease_owner_id
@@ -3965,7 +4009,7 @@ class CaptainMergeGuardRunner:
             self.receipt["errors"] = errors
             raise RuntimeError("merge lease guard blocked: " + "; ".join(errors))
 
-        import grabowski_resources as resources
+        resources = self.resource_authority
 
         target = self.action["target"]
         bindings["local_resource_repository"] = str(resource_repository)
@@ -4240,7 +4284,7 @@ class CaptainMergeGuardRunner:
         return {**material, "terminal_evidence_sha256": _sha256_json(material)}
 
     def finalize(self, execution_result: dict[str, Any]) -> None:
-        import grabowski_resources as resources
+        resources = self.resource_authority
 
         self.receipt["completed_at_unix_ns"] = time.time_ns()
         cleanup_required = self.acquisition is not None and self.owner_id is not None
