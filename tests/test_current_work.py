@@ -901,7 +901,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         group = result["work"][0]
         self.assertEqual(group["work_id"], "checkout:managed-drift-owner")
         self.assertEqual(group["binding_status"], "checkout-bound")
-        self.assertEqual(group["projection_state"], "blocking")
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
         self.assertFalse(
             any(
                 ref.get("source") == "checkout-lifecycle-binding"
@@ -1665,6 +1666,86 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "checkout-binding-binding_identity_drift",
             matching[0]["action_reasons"],
         )
+
+    def test_expired_active_binding_identity_drift_is_hygiene(self) -> None:
+        existing = checkout(
+            "key-expired-active-drift",
+            "/home/alex/repos/.worktrees/key-expired-active-drift",
+            lifecycle_state="managed_lifecycle_drift",
+            binding_owner="operator:expired-active-drift",
+            binding_phase="active",
+            binding_consistent=False,
+            retention_active=False,
+            drift_reasons=["expected-branch-mismatch"],
+        )
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-expired-active-drift",
+                        "state": "binding_identity_drift",
+                        "blocking": True,
+                        "reasons": ["expected-branch-mismatch"],
+                        "binding_identity": {"checkout_key": "key-expired-active-drift"},
+                        "worktree_identity": {"checkout_key": "key-expired-active-drift"},
+                        "evidence": {"owner_id": "operator:expired-active-drift"},
+                        "recommended_next_step": "reconcile_binding_identity_before_lifecycle_action",
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        matching = [
+            row
+            for row in result["work"]
+            if row["binding"]["id"] == "key-expired-active-drift"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["projection_state"], "hygiene")
+        self.assertEqual(matching[0]["work_class"], "hygiene")
+        self.assertIn(
+            "checkout-binding-binding_identity_drift",
+            matching[0]["action_reasons"],
+        )
+
+    def test_retained_active_binding_identity_drift_remains_blocking(self) -> None:
+        existing = checkout(
+            "key-retained-active-drift",
+            "/home/alex/repos/.worktrees/key-retained-active-drift",
+            lifecycle_state="managed_lifecycle_drift",
+            binding_owner="operator:retained-active-drift",
+            binding_phase="active",
+            binding_consistent=False,
+            retention_active=True,
+            drift_reasons=["expected-branch-mismatch"],
+        )
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-retained-active-drift",
+                        "state": "binding_identity_drift",
+                        "blocking": True,
+                        "reasons": ["expected-branch-mismatch"],
+                        "binding_identity": {"checkout_key": "key-retained-active-drift"},
+                        "worktree_identity": {"checkout_key": "key-retained-active-drift"},
+                        "evidence": {"owner_id": "operator:retained-active-drift"},
+                        "recommended_next_step": "reconcile_binding_identity_before_lifecycle_action",
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        matching = [
+            row
+            for row in result["work"]
+            if row["binding"]["id"] == "key-retained-active-drift"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["projection_state"], "blocking")
+        self.assertEqual(matching[0]["work_class"], "operational")
 
     def test_historical_reconciliation_does_not_displace_active_work(self) -> None:
         bindings = [
