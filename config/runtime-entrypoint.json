@@ -47,6 +47,7 @@
     "grabowski_reposkop_context",
     "grabowski_operator_optimization_report",
     "grabowski_git_status",
+    "grabowski_git_branch_preimage",
     "grabowski_git_diff",
     "grabowski_git_log",
     "grabowski_git_show",

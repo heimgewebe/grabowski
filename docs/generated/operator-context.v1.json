@@ -640,6 +640,17 @@
     },
     {
       "category": "version-control",
+      "description": "Read one exact local branch/index preimage for a later CAS-bound mutation.",
+      "effects": [],
+      "id": "grabowski_git_branch_preimage",
+      "purpose": "Read one exact local branch/index preimage for a later CAS-bound mutation.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_branch_preimage"
+    },
+    {
+      "category": "version-control",
       "description": "Read a bounded unstaged or staged Git diff without external helpers.",
       "effects": [],
       "id": "grabowski_git_diff",
@@ -824,7 +835,7 @@
     },
     {
       "category": "version-control",
-      "description": "Run Git with a fail-closed single-branch push subset.",
+      "description": "Run Git with guarded publication and CAS-bound local branch mutation.",
       "effects": [
         "git-dependent"
       ],
@@ -2886,6 +2897,7 @@
       "grabowski_reposkop_context",
       "grabowski_operator_optimization_report",
       "grabowski_git_status",
+      "grabowski_git_branch_preimage",
       "grabowski_git_diff",
       "grabowski_git_log",
       "grabowski_git_show",
@@ -3558,7 +3570,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "29c0079f26612c4ebaec98b38af7303a9e54f4c599b543aedd2d38023b2604e9"
+      "sha256": "1d7cdd754bbfd9e2a3c548b91ab163739bd7ee374dbaf9fcbe3547cdcc09d146"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3566,7 +3578,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "c26c726ab979110678865eacc4bcef45f5842e8e8804e97739e717eae616dab4"
+      "sha256": "a79cb79e57f7774d14198cac965a6d16a7fdcda7d1c845a716d8cb6355ffbd64"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3646,7 +3658,7 @@
       "src/grabowski_nonconflict.py": "ea52f020e073a6417bc699edf031db40fb201faee217803e1502529ddc4f0bf2",
       "src/grabowski_ntfy_dispatch.py": "baf5c167603f442fb2672dd108611aa448d9414c59a8a97fad27ab3bc4aea363",
       "src/grabowski_operations.py": "dbefeb9b7623d5ef8e42025b9b9afe604e0c2378fcbb7dcde45eb30ef3fff232",
-      "src/grabowski_operator.py": "c8d0fe7b39ab901afcb6133b3d3f8e8448bac352c10a3854327f3a119ac0d17d",
+      "src/grabowski_operator.py": "682d4f180207cf6f6ed366324aa76aa55085f2ef34db6f819f101ffaff86594f",
       "src/grabowski_operator_obligation.py": "2eec8a842f934aeb6cb4d03f507f61be586c82729414575dacf2b10601649586",
       "src/grabowski_operator_obligation_evidence.py": "ebdeccbb31fe3744881a566a537f3ff5bb83b03a4f45d4cf64fe52f4b027ddf6",
       "src/grabowski_operator_optimization.py": "6e21534f87f9646f957c40c7607554b7f54b165b47516170f09fdc9314cd1dbf",

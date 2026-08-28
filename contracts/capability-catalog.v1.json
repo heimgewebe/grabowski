@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "29c0079f26612c4ebaec98b38af7303a9e54f4c599b543aedd2d38023b2604e9",
+  "capability_source_sha256": "1d7cdd754bbfd9e2a3c548b91ab163739bd7ee374dbaf9fcbe3547cdcc09d146",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "c26c726ab979110678865eacc4bcef45f5842e8e8804e97739e717eae616dab4",
+  "contract_sha256": "a79cb79e57f7774d14198cac965a6d16a7fdcda7d1c845a716d8cb6355ffbd64",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -580,6 +580,17 @@
     },
     {
       "category": "version-control",
+      "description": "Read one exact local branch/index preimage for a later CAS-bound mutation.",
+      "effects": [],
+      "id": "grabowski_git_branch_preimage",
+      "purpose": "Read one exact local branch/index preimage for a later CAS-bound mutation.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_git_branch_preimage"
+    },
+    {
+      "category": "version-control",
       "description": "Read a bounded unstaged or staged Git diff without external helpers.",
       "effects": [],
       "id": "grabowski_git_diff",
@@ -764,7 +775,7 @@
     },
     {
       "category": "version-control",
-      "description": "Run Git with a fail-closed single-branch push subset.",
+      "description": "Run Git with guarded publication and CAS-bound local branch mutation.",
       "effects": [
         "git-dependent"
       ],

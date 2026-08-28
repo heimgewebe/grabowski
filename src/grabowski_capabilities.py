@@ -1185,6 +1185,13 @@ TOOL_PROFILES.update(
             "effects": [],
             "reversibility": "not-applicable",
         },
+        "grabowski_git_branch_preimage": {
+            "category": "version-control",
+            "purpose": "Read one exact local branch/index preimage for a later CAS-bound mutation.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
         "grabowski_git_diff": {
             "category": "version-control",
             "purpose": "Read a bounded staged or unstaged Git diff without external helpers.",
