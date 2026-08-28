@@ -161,6 +161,17 @@ def _ratio(numerator: int, denominator: int, *, scale: float = 1.0) -> float:
     return round((numerator / denominator) * scale, 6)
 
 
+def _optional_ratio(
+    numerator: int,
+    denominator: int,
+    *,
+    scale: float = 1.0,
+) -> float | None:
+    if denominator <= 0:
+        return None
+    return _ratio(numerator, denominator, scale=scale)
+
+
 def _window_metrics(window: dict[str, Any] | None, label: str) -> dict[str, Any] | None:
     if not isinstance(window, dict):
         return None
@@ -173,6 +184,11 @@ def _window_metrics(window: dict[str, Any] | None, label: str) -> dict[str, Any]
     bureau_activity = window.get("bureau_activity")
     task_starts = _count(task_activity, "task-start")
     task_cancels = _count(task_activity, "task-cancel")
+    resource_reclamation_events = _count(
+        resource_activity,
+        "resource_reclamation_event_count",
+    )
+    reclaimed_resources = _count(resource_activity, "reclaimed_resource_count")
     return {
         "label": label,
         "seconds": seconds,
@@ -191,20 +207,41 @@ def _window_metrics(window: dict[str, Any] | None, label: str) -> dict[str, Any]
         ),
         "resource_acquires": _count(resource_activity, "resource-acquire"),
         "resource_releases": _count(resource_activity, "resource-release"),
-        "resource_reclamation_events": _count(
-            resource_activity,
-            "resource_reclamation_event_count",
+        "resource_reclamation_events": resource_reclamation_events,
+        "reclaimed_resources": reclaimed_resources,
+        "resource_reclamation_events_per_1000_starts": _optional_ratio(
+            resource_reclamation_events,
+            task_starts,
+            scale=1000.0,
         ),
-        "reclaimed_resources": _count(resource_activity, "reclaimed_resource_count"),
+        "reclaimed_resources_per_1000_starts": _optional_ratio(
+            reclaimed_resources,
+            task_starts,
+            scale=1000.0,
+        ),
         "bureau_candidate_records": _count(bureau_activity, "bureau-candidate-record"),
         "bureau_task_proposals": _count(bureau_activity, "bureau-task-propose"),
         "bureau_task_publishes": _count(bureau_activity, "bureau-task-publish"),
     }
 
 
-def _metric_delta(selected: float, comparison: float) -> dict[str, float | None]:
-    absolute = round(selected - comparison, 6)
-    relative = None if comparison == 0 else round(absolute / comparison, 6)
+def _metric_delta(
+    selected: float | int | None,
+    comparison: float | int | None,
+) -> dict[str, float | None]:
+    if selected is None or comparison is None:
+        return {
+            "selected_minus_comparison": None,
+            "relative_change": None,
+        }
+    selected_value = float(selected)
+    comparison_value = float(comparison)
+    absolute = round(selected_value - comparison_value, 6)
+    relative = (
+        None
+        if comparison_value == 0
+        else round(absolute / comparison_value, 6)
+    )
     return {
         "selected_minus_comparison": absolute,
         "relative_change": relative,
@@ -223,14 +260,16 @@ def _comparison(
         "failure_signals_per_day",
         "task_starts_per_day",
         "task_cancels_per_1000_starts",
+        "resource_reclamation_events_per_1000_starts",
+        "reclaimed_resources_per_1000_starts",
     )
     return {
         "selected_label": selected["label"],
         "comparison_label": comparison["label"],
         "rates": {
             field: _metric_delta(
-                float(selected.get(field, 0.0)),
-                float(comparison.get(field, 0.0)),
+                selected.get(field),
+                comparison.get(field),
             )
             for field in rate_fields
         },
