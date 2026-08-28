@@ -5954,6 +5954,7 @@ def _run_branch_publish(
             "-c",
             "push.recurseSubmodules=no",
             "push",
+            "--set-upstream",
             remote,
             f"HEAD:refs/heads/{branch}",
         ],
@@ -5965,12 +5966,35 @@ def _run_branch_publish(
         _check(receipt, "remote_head", "fail", f"actual={remote_head} expected={expected_head}")
         raise GripActionError("remote head did not match expected_head after push")
     _check(receipt, "remote_head", "pass", remote_head)
+    upstream_result = _git_optional(
+        repo=Path(orientation["root"]),
+        runner=runner,
+        argv=["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    upstream = (
+        str(upstream_result.get("stdout", "")).strip()
+        if int(upstream_result.get("returncode", 1)) == 0
+        else ""
+    )
+    expected_upstream = f"{remote}/{branch}"
+    if upstream != expected_upstream:
+        _check(
+            receipt,
+            "upstream",
+            "fail",
+            "upstream_readback_failed"
+            if not upstream
+            else f"actual={upstream} expected={expected_upstream}",
+        )
+        raise GripActionError("branch-publish did not establish expected upstream")
+    _check(receipt, "upstream", "pass", upstream)
     return {
         "branch": branch,
         "head": expected_head,
         "remote": remote,
         "ref": ref,
         "remote_head": remote_head,
+        "upstream": upstream,
         "push_stdout": push.get("stdout", ""),
         "push_stderr": push.get("stderr", ""),
     }
