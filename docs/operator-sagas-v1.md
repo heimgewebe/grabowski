@@ -155,9 +155,15 @@ PR #890 repaired that contract, added the corresponding regression coverage, and
 
 PR #962 merged the staging documentation as protected commit `fd3b130ad967898586605f94f3e2dbc840fc8b0e`, but a fresh bounded receipt readback after that merge found no `OperatorSagaPlan.v1`, `OperatorSagaRunReceipt.v1`, or `OperatorSagaSettlementReceipt.v1` evidence for the attempt. PR #962 therefore remains a staging checkpoint and must not be retroactively counted as a live Saga pilot.
 
-The current terminal acceptance attempt is bound before effect to Bureau run `BUR-RUN-20260827T151132Z-35a64bfe0d`, authoritative T121 TaskSpec digest `633456e6dfa0c2774f4ded0a3da5a38256f0cf0069581278d766701aea9c7db7`, and protected baseline `fd3b130ad967898586605f94f3e2dbc840fc8b0e`. PR #894 remains historical for the same reason: no receipt-bound Saga execution may be inferred from its already completed merge.
+The 2026-08-27 terminal acceptance attempt was bound before effect to Bureau run `BUR-RUN-20260827T151132Z-35a64bfe0d`, authoritative T121 TaskSpec digest `633456e6dfa0c2774f4ded0a3da5a38256f0cf0069581278d766701aea9c7db7`, and protected baseline `fd3b130ad967898586605f94f3e2dbc840fc8b0e`. PR #894 remains historical for the same reason: no receipt-bound Saga execution may be inferred from its already completed merge.
 
 The follow-up documentation change carrying this paragraph is the **new** PR-settlement pilot target. Before invoking Captain, execution must produce a fresh `saga-plan` and receipt-bound `saga-run` for the exact PR/head/base identity. Only after the normal Captain merge succeeds may the pilot perform authoritative GitHub readback, verify the Captain audit binding, and require `saga-settle == settled`. Only that settled protected merge commit may become the target of the runtime-deployment pilot.
+
+### Live acceptance continuation — 2026-08-28
+
+The 2026-08-27 run `BUR-RUN-20260827T151132Z-35a64bfe0d` is now authoritatively orphaned: its worker heartbeat is stale, no external executor is bound, and its owner-bound resource leases are terminal/released-or-expired. It is therefore historical evidence, not the current execution authority.
+
+A fresh coordinated pickup `BUR-RUN-20260828T092000Z-53800fade1` owns the exact T121 resource set against protected baseline `171713083ba40231f0002e4f40589e63d9dfba6c`. This continuation change is the new PR-settlement pilot target. It claims no pilot success before a fresh `saga-plan`, receipt-bound `saga-run`, normal Captain merge, authoritative GitHub readback and `saga-settle == settled` all agree on the exact PR identity. Only that settled merge commit may become the runtime-deployment pilot target.
 
 For each pilot, closeout evidence records the real start/end timestamps, top-level operator/Saga calls, caller decisions, prepare/apply/readback blocks, partial failures, terminal state, plan/run/Captain/settlement receipt digests, and the exact target identity. The before/after comparison uses the same target's unbundled required public surfaces as the comparator; no historical call-count estimate is promoted to evidence. The sample remains descriptive and does not by itself authorize policy or further automation changes.
 
