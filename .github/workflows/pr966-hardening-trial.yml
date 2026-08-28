@@ -33,6 +33,11 @@ jobs:
           test "$(git rev-parse refs/remotes/origin/pr966-target)" = "$EXPECTED"
           git merge-base --is-ancestor "$EXPECTED" HEAD
 
+      - name: Normalize bootstrap selector
+        run: |
+          test "$(grep -c '\"_resolve_broker_execution\"' .github/pr966_finalize_bootstrap.py)" -eq 1
+          sed -i 's/\"_resolve_broker_execution\"/\"main\"/' .github/pr966_finalize_bootstrap.py
+
       - name: Validate bootstrap syntax
         run: python -m py_compile .github/pr966_finalize_bootstrap.py
 
