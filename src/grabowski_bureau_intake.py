@@ -148,7 +148,7 @@ class BureauCandidateRecordRequest(TypedDict, total=False):
     __pydantic_config__ = {"extra": "forbid", "strict": True}
 
     schema_version: Any
-    operation: Literal["record"]
+    operation: Any
     idempotency_key: Any
     title: Any
     source_kind: Any
@@ -167,7 +167,7 @@ class BureauCandidateRecordRequest(TypedDict, total=False):
 class BureauCandidateCloseOperation(TypedDict):
     __pydantic_config__ = {"extra": "forbid", "strict": True}
 
-    operation: Literal["close"]
+    operation: Any
 
 
 class BureauCandidateCloseRequest(BureauCandidateCloseOperation, total=False):

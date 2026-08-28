@@ -1048,6 +1048,10 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(set(), set(record.get("required", [])))
         self.assertEqual({"operation"}, set(close["required"]))
+        self.assertNotIn("const", record["properties"]["operation"])
+        self.assertNotIn("enum", record["properties"]["operation"])
+        self.assertNotIn("const", close["properties"]["operation"])
+        self.assertNotIn("enum", close["properties"]["operation"])
 
         valid = {
             "schema_version": 1,
@@ -1089,6 +1093,35 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                 )
         invoke.assert_not_called()
 
+        for operation in (None, "unsupported-operation"):
+            with self.subTest(operation=operation):
+                with (
+                    mock.patch.object(
+                        intake,
+                        "_invoke_bureau",
+                        return_value={
+                            "kind": "bureau_operator_intake_failure",
+                            "status": "failed",
+                            "code": "operation-unsupported",
+                        },
+                    ) as invoke,
+                    mock.patch.object(intake, "_audit") as audit,
+                ):
+                    result = asyncio.run(
+                        intake.mcp._tool_manager.call_tool(
+                            "grabowski_bureau_candidate_record",
+                            {"request": {**valid, "operation": operation}},
+                        )
+                    )
+                self.assertEqual("failed", result["status"])
+                invoke.assert_called_once()
+                audit.assert_called_once()
+                request_path = Path(invoke.call_args.args[0][-1])
+                forwarded = json.loads(request_path.read_text())
+                if operation is None:
+                    self.assertIsNone(forwarded["operation"])
+                else:
+                    self.assertEqual(operation, forwarded["operation"])
 
     def test_candidate_assess_registered_schema_is_additive_and_cache_safe(self) -> None:
         if not hasattr(intake.mcp, "list_tools"):
