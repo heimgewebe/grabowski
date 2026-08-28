@@ -25,6 +25,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install project
+        run: pip install -e .
+
       - name: Assert target head is unchanged
         env:
           EXPECTED: 5e0ef1138ae2e93b37b75b5742b37f33e5c4bdcf
