@@ -2538,6 +2538,44 @@ class OperatorContractTests(unittest.TestCase):
                 with self.subTest(arguments=arguments):
                     operator._guard_git(arguments, repo)
 
+    def test_read_only_git_output_writes_are_blocked(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            operator.subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            output = str(repo / "command-output")
+            for arguments in (
+                ["diff", f"--output={output}"],
+                ["diff", "--output", output],
+                ["show", f"--output={output}"],
+                ["log", "--output", output],
+            ):
+                with self.subTest(arguments=arguments):
+                    with self.assertRaisesRegex(
+                        PermissionError, "read-only-classified"
+                    ):
+                        operator._guard_git(arguments, repo)
+
+    def test_git_stash_is_blocked_without_repository_scope_serialization(self) -> None:
+        operator = _load_operator_module()
+        for arguments in (
+            ["stash"],
+            ["stash", "push"],
+            ["stash", "save"],
+            ["stash", "apply"],
+            ["stash", "pop"],
+            ["stash", "store", "a" * 40],
+            ["stash", "drop"],
+            ["stash", "clear"],
+            ["stash", "branch", "recovery"],
+            ["stash", "create"],
+            ["stash", "list"],
+            ["stash", "show"],
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(PermissionError, "repository-wide"):
+                    operator._guard_git(arguments, Path("/repo"))
+
     def test_git_environment_disables_optional_read_side_effects(self) -> None:
         operator = _load_operator_module()
         with patch.object(operator, "_safe_environment", return_value={"PATH": "/usr/bin"}):
@@ -2593,17 +2631,21 @@ class OperatorContractTests(unittest.TestCase):
             ["branch", "-f", "other", "HEAD"],
             ["symbolic-ref", "HEAD", "refs/heads/other"],
             ["checkout", "other"],
+            ["checkout", "--detach", "HEAD"],
+            ["checkout", "-d", "HEAD"],
             ["switch", "other"],
             ["switch", "-c", "other"],
+            ["switch", "--detach", "HEAD"],
+            ["switch", "--detach=HEAD"],
+            ["switch", "-d", "HEAD"],
             ["rebase", "main", "other"],
             ["rebase", "--continue"],
-            ["stash", "branch", "other"],
             ["update-index", "--assume-unchanged", "README.md"],
             ["update-index", "--skip-worktree", "README.md"],
         ):
             with self.subTest(arguments=arguments):
                 with self.assertRaisesRegex(
-                    PermissionError, "branch|target refs|rebase|index"
+                    PermissionError, "branch|target refs|detach|rebase|index"
                 ):
                     operator._reject_cross_branch_mutation_target(
                         arguments[0], arguments[1:], attempt["branch"]
@@ -2700,6 +2742,11 @@ class OperatorContractTests(unittest.TestCase):
                 thread = threading.Thread(target=execute_first)
                 thread.start()
                 self.assertTrue(entered_effect.wait(timeout=2))
+                duplicate_result = operator.grabowski_git(
+                    str(repo),
+                    ["commit", "--allow-empty", "-m", "attempt one duplicate"],
+                    branch_attempt=first_attempt,
+                )
                 second_result = operator.grabowski_git(
                     str(repo),
                     ["commit", "--allow-empty", "-m", "attempt two"],
@@ -2717,6 +2764,20 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual("operation-a", first_receipt["operation_id"])
             self.assertEqual("attempt-1", first_receipt["attempt_id"])
             self.assertEqual(preimage["preimage_sha256"], first_receipt["expected_preimage_sha256"])
+
+            duplicate_receipt = duplicate_result["branch_mutation"]
+            self.assertEqual("reconcile_required", duplicate_receipt["status"])
+            self.assertEqual(
+                "same-owner-attempt-already-running", duplicate_receipt["reason"]
+            )
+            self.assertFalse(duplicate_receipt["effect_attempted"])
+            self.assertFalse(duplicate_receipt["retry_allowed"])
+            self.assertEqual("operation-a", duplicate_receipt["operation_id"])
+            self.assertEqual("attempt-1", duplicate_receipt["attempt_id"])
+            self.assertEqual(
+                first_receipt["attempt_binding_sha256"],
+                duplicate_receipt["existing_attempt_binding_sha256"],
+            )
 
             second_receipt = second_result["branch_mutation"]
             self.assertEqual("reconcile_required", second_receipt["status"])

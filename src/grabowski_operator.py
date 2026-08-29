@@ -4183,11 +4183,6 @@ def _reject_cross_branch_mutation_target(
             "git rebase is blocked on the branch-attempt surface because a conflict can detach HEAD and escape the bound branch recovery contract"
         )
 
-    if subcommand == "stash" and command_arguments[:1] == ["branch"]:
-        raise PermissionError(
-            "git stash branch is blocked because it switches or creates a branch outside the single-branch attempt contract"
-        )
-
     if subcommand == "update-index" and any(
         item.split("=", 1)[0] in GIT_UPDATE_INDEX_UNOBSERVED_FLAG_OPTIONS
         for item in command_arguments
@@ -4243,6 +4238,25 @@ def _reject_cross_branch_mutation_target(
         return
 
     if subcommand in {"checkout", "switch"}:
+        positional_only = False
+        for item in command_arguments:
+            if item == "--":
+                positional_only = True
+                continue
+            if positional_only:
+                continue
+            if (
+                item == "--detach"
+                or item.startswith("--detach=")
+                or (
+                    item.startswith("-")
+                    and not item.startswith("--")
+                    and "d" in item[1:]
+                )
+            ):
+                raise PermissionError(
+                    f"git {subcommand} detach mode is blocked because the branch-attempt surface must remain attached to branch_attempt.branch"
+                )
         branch_options = {
             "-b",
             "-B",
@@ -4456,6 +4470,10 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
         raise PermissionError(
             "Git subtree push is blocked in grabowski_git; use the typed publication path."
         )
+    if subcommand == "stash":
+        raise PermissionError(
+            "Git stash is blocked because its repository-wide stash refs and stack are not serialized by a branch-attempt lease."
+        )
     if subcommand != "push":
         _reject_configured_alias(repo, subcommand)
         if (
@@ -4466,6 +4484,13 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
                 "Unclassified local Git subcommand is blocked in grabowski_git; "
                 "use a typed operation or classify it explicitly before execution: "
                 f"{subcommand}"
+            )
+        if subcommand in GIT_LOCAL_READ_ONLY_SUBCOMMANDS and any(
+            item == "--output" or item.startswith("--output=")
+            for item in command_arguments
+        ):
+            raise PermissionError(
+                f"Git {subcommand} --output is blocked because a read-only-classified command may not write filesystem output."
             )
         return
 
@@ -5230,6 +5255,9 @@ def grabowski_git(
                 normalized_attempt["branch"],
                 operation_id=normalized_attempt["operation_id"],
                 attempt_id=normalized_attempt["attempt_id"],
+                expected_preimage_sha256=normalized_attempt[
+                    "expected_preimage_sha256"
+                ],
                 ttl_seconds=execution_timeout_seconds + 30,
             )
         except resources.SameOwnerBranchAttemptConflict as exc:
@@ -5238,7 +5266,11 @@ def grabowski_git(
                 arguments=arguments,
                 attempt=normalized_attempt,
                 observed=observed_before,
-                reason="same-owner-attempt-conflict",
+                reason=(
+                    "same-owner-attempt-already-running"
+                    if exc.already_running
+                    else "same-owner-attempt-conflict"
+                ),
                 existing_attempt_binding_sha256=exc.existing_binding_sha256,
             )
 

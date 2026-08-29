@@ -163,7 +163,7 @@ class ResourceConflict(RuntimeError):
 
 
 class SameOwnerBranchAttemptConflict(RuntimeError):
-    """A live branch lease belongs to the owner but to a different attempt."""
+    """A live branch lease already carries an active mutation attempt."""
 
     def __init__(
         self,
@@ -172,9 +172,15 @@ class SameOwnerBranchAttemptConflict(RuntimeError):
         existing_binding_sha256: str,
         requested_binding_sha256: str,
     ) -> None:
+        self.already_running = existing_binding_sha256 == requested_binding_sha256
         super().__init__(
-            "Live same-owner branch lease belongs to a different operation/attempt; "
-            "read back and reconcile before retry"
+            (
+                "The exact same-owner branch mutation attempt is already running; "
+                "read back and reconcile before retry"
+                if self.already_running
+                else "Live same-owner branch lease belongs to a different operation/attempt; "
+                "read back and reconcile before retry"
+            )
         )
         self.resource_key = resource_key
         self.owner_id = owner_id
@@ -1123,7 +1129,7 @@ def _lease_identity_metadata(
 
 
 def _branch_mutation_attempt_binding(
-    *, operation_id: str, attempt_id: str
+    *, operation_id: str, attempt_id: str, expected_preimage_sha256: str
 ) -> dict[str, Any]:
     for label, value in (("operation_id", operation_id), ("attempt_id", attempt_id)):
         if (
@@ -1133,10 +1139,16 @@ def _branch_mutation_attempt_binding(
             raise ValueError(
                 f"{label} must match [A-Za-z0-9][A-Za-z0-9._:@/-]{{0,127}}"
             )
+    if (
+        not isinstance(expected_preimage_sha256, str)
+        or SHA256_RE.fullmatch(expected_preimage_sha256) is None
+    ):
+        raise ValueError("expected_preimage_sha256 must be a lowercase SHA-256")
     material: dict[str, Any] = {
         "schema_version": BRANCH_MUTATION_ATTEMPT_SCHEMA_VERSION,
         "operation_id": operation_id,
         "attempt_id": attempt_id,
+        "expected_preimage_sha256": expected_preimage_sha256,
     }
     material["binding_sha256"] = hashlib.sha256(
         _canonical_json(material).encode("utf-8")
@@ -5236,6 +5248,29 @@ def acquire_resources(
                         raise RuntimeError(
                             "non-conflict exception leases are non-renewable; reassess and reacquire"
                         )
+                    observed_attempt = observed_metadata.get(
+                        BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                    )
+                    requested_attempt = persisted_metadata.get(
+                        BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                    )
+                    if isinstance(observed_attempt, dict) and isinstance(
+                        requested_attempt, dict
+                    ):
+                        observed_binding = observed_attempt.get("binding_sha256")
+                        requested_binding = requested_attempt.get("binding_sha256")
+                        if (
+                            not isinstance(observed_binding, str)
+                            or SHA256_RE.fullmatch(observed_binding) is None
+                            or not isinstance(requested_binding, str)
+                            or SHA256_RE.fullmatch(requested_binding) is None
+                        ):
+                            raise RuntimeError(
+                                "branch mutation attempt binding metadata is invalid"
+                            )
+                        raise SameOwnerBranchAttemptConflict(
+                            key, owner, observed_binding, requested_binding
+                        )
                     observed_identity_metadata = _lease_identity_metadata(
                         observed_metadata,
                         preserve_task_attempt=_preserve_live_same_owner,
@@ -5244,27 +5279,6 @@ def acquire_resources(
                         row["purpose"] != lease_purpose
                         or observed_identity_metadata != requested_identity_metadata
                     ):
-                        observed_attempt = observed_metadata.get(
-                            BRANCH_MUTATION_ATTEMPT_METADATA_KEY
-                        )
-                        requested_attempt = persisted_metadata.get(
-                            BRANCH_MUTATION_ATTEMPT_METADATA_KEY
-                        )
-                        if isinstance(observed_attempt, dict) and isinstance(
-                            requested_attempt, dict
-                        ):
-                            observed_binding = observed_attempt.get("binding_sha256")
-                            requested_binding = requested_attempt.get("binding_sha256")
-                            if (
-                                isinstance(observed_binding, str)
-                                and SHA256_RE.fullmatch(observed_binding) is not None
-                                and isinstance(requested_binding, str)
-                                and SHA256_RE.fullmatch(requested_binding) is not None
-                                and observed_binding != requested_binding
-                            ):
-                                raise SameOwnerBranchAttemptConflict(
-                                    key, owner, observed_binding, requested_binding
-                                )
                         raise RuntimeError(
                             "Live same-owner lease identity changed; release and "
                             f"reacquire: {key}"
@@ -5423,42 +5437,9 @@ def _overlay_live_same_owner_branch_attempt(
                         raise RuntimeError(
                             "branch mutation attempt expiry changed during attempt"
                         )
-                    if attempt_expires < required_expires_at_unix:
-                        updated_attempt = {
-                            **existing_attempt,
-                            "attempt_expires_at_unix": required_expires_at_unix,
-                        }
-                        updated_metadata = {
-                            **observed_metadata,
-                            BRANCH_MUTATION_ATTEMPT_METADATA_KEY: updated_attempt,
-                        }
-                        metadata_json, metadata_sha256 = _metadata(updated_metadata)
-                        connection.execute(
-                            """
-                            UPDATE leases
-                            SET expires_at_unix=?, metadata_sha256=?, metadata_json=?
-                            WHERE resource_key=?
-                            """,
-                            (
-                                required_expires_at_unix,
-                                metadata_sha256,
-                                metadata_json,
-                                branch_key,
-                            ),
-                        )
-                        row = connection.execute(
-                            "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
-                        ).fetchone()
-                connection.commit()
-                return {
-                    "lease": _public(row),
-                    "lease_origin": origin,
-                    "preserved": True,
-                    "previous_metadata_sha256": existing_attempt.get(
-                        "previous_metadata_sha256"
-                    ),
-                    "previous_expires_at_unix": previous_expires,
-                }
+                raise SameOwnerBranchAttemptConflict(
+                    branch_key, owner, existing_binding, requested_binding
+                )
 
             previous_expires_at_unix = int(row["expires_at_unix"])
             attempt_expires_at_unix = max(
@@ -5514,6 +5495,7 @@ def acquire_branch_mutation_attempt(
     *,
     operation_id: str,
     attempt_id: str,
+    expected_preimage_sha256: str,
     ttl_seconds: int = 900,
 ) -> dict[str, Any]:
     """Serialize overlapping same-owner branch attempts without replacing authority.
@@ -5531,7 +5513,9 @@ def acquire_branch_mutation_attempt(
     ttl = _ttl(ttl_seconds)
     branch_key = normalize_resource_key(f"repo:{repository_path}:branch:{branch}")
     binding = _branch_mutation_attempt_binding(
-        operation_id=operation_id, attempt_id=attempt_id
+        operation_id=operation_id,
+        attempt_id=attempt_id,
+        expected_preimage_sha256=expected_preimage_sha256,
     )
     now = _now()
     overlaid = _overlay_live_same_owner_branch_attempt(
@@ -5552,6 +5536,7 @@ def acquire_branch_mutation_attempt(
             "resource_key": branch_key,
             "operation_id": operation_id,
             "attempt_id": attempt_id,
+            "expected_preimage_sha256": expected_preimage_sha256,
             "attempt_binding_sha256": binding["binding_sha256"],
             "lease": lease,
             "lease_origin": overlaid["lease_origin"],
@@ -5581,6 +5566,7 @@ def acquire_branch_mutation_attempt(
         "resource_key": branch_key,
         "operation_id": operation_id,
         "attempt_id": attempt_id,
+        "expected_preimage_sha256": expected_preimage_sha256,
         "attempt_binding_sha256": binding["binding_sha256"],
         "lease": lease,
         "lease_origin": "attempt_only",

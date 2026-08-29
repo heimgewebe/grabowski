@@ -4446,10 +4446,11 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(current["metadata_json"], original["metadata_json"])
         self.assertEqual(current["metadata_sha256"], original["metadata_sha256"])
 
-    def test_branch_attempt_same_owner_cas_distinguishes_attempts_and_preserves_continuation(self) -> None:
+    def test_branch_attempt_same_owner_cas_blocks_live_duplicate_and_preserves_sequential_continuation(self) -> None:
         (self.root / ".git").mkdir()
         owner = "operator:same-owner"
         branch = "feat/same-owner-cas"
+        preimage = "a" * 64
 
         first = resources.acquire_branch_mutation_attempt(
             owner,
@@ -4457,23 +4458,37 @@ class ResourceTests(unittest.TestCase):
             branch,
             operation_id="operation-a",
             attempt_id="attempt-1",
+            expected_preimage_sha256=preimage,
             ttl_seconds=120,
         )
+        with self.assertRaises(resources.SameOwnerBranchAttemptConflict) as duplicate:
+            resources.acquire_branch_mutation_attempt(
+                owner,
+                str(self.root),
+                branch,
+                operation_id="operation-a",
+                attempt_id="attempt-1",
+                expected_preimage_sha256=preimage,
+                ttl_seconds=120,
+            )
+        self.assertTrue(duplicate.exception.already_running)
+        self.assertEqual(
+            duplicate.exception.existing_binding_sha256,
+            duplicate.exception.requested_binding_sha256,
+        )
+
+        resources.complete_branch_mutation_attempt(first)
         continued = resources.acquire_branch_mutation_attempt(
             owner,
             str(self.root),
             branch,
             operation_id="operation-a",
             attempt_id="attempt-1",
+            expected_preimage_sha256=preimage,
             ttl_seconds=120,
         )
-        self.assertTrue(continued["preserved"])
         self.assertEqual(
             first["attempt_binding_sha256"], continued["attempt_binding_sha256"]
-        )
-        self.assertEqual(
-            first["lease"]["metadata_sha256"],
-            continued["lease"]["metadata_sha256"],
         )
 
         with self.assertRaises(resources.SameOwnerBranchAttemptConflict) as blocked:
@@ -4483,9 +4498,11 @@ class ResourceTests(unittest.TestCase):
                 branch,
                 operation_id="operation-b",
                 attempt_id="attempt-2",
+                expected_preimage_sha256=preimage,
                 ttl_seconds=120,
             )
         self.assertEqual(first["resource_key"], blocked.exception.resource_key)
+        self.assertFalse(blocked.exception.already_running)
         self.assertNotEqual(
             blocked.exception.existing_binding_sha256,
             blocked.exception.requested_binding_sha256,
@@ -4497,10 +4514,74 @@ class ResourceTests(unittest.TestCase):
             "feat/disjoint",
             operation_id="operation-b",
             attempt_id="attempt-2",
+            expected_preimage_sha256=preimage,
             ttl_seconds=120,
         )
         self.assertNotEqual(first["resource_key"], disjoint["resource_key"])
         self.assertEqual(owner, disjoint["lease"]["owner_id"])
+
+    def test_branch_attempt_concurrent_exact_duplicate_admits_only_one(self) -> None:
+        (self.root / ".git").mkdir()
+        with resources._database():
+            pass
+        start_barrier = threading.Barrier(3)
+        overlay_barrier = threading.Barrier(2)
+        admitted: list[dict[str, object]] = []
+        conflicts: list[resources.SameOwnerBranchAttemptConflict] = []
+        errors: list[BaseException] = []
+        original_overlay = resources._overlay_live_same_owner_branch_attempt
+
+        def synchronize_empty_overlay(**kwargs: object) -> None:
+            result = original_overlay(**kwargs)
+            if result is not None:
+                raise AssertionError("both callers must observe the empty overlay path")
+            overlay_barrier.wait(timeout=2)
+
+        def acquire() -> None:
+            try:
+                start_barrier.wait(timeout=2)
+                admitted.append(
+                    resources.acquire_branch_mutation_attempt(
+                        "operator:concurrent-duplicate",
+                        str(self.root),
+                        "feat/concurrent-duplicate",
+                        operation_id="operation-a",
+                        attempt_id="attempt-1",
+                        expected_preimage_sha256="e" * 64,
+                        ttl_seconds=120,
+                    )
+                )
+            except resources.SameOwnerBranchAttemptConflict as exc:
+                conflicts.append(exc)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=acquire) for _ in range(2)]
+        with patch.object(
+            resources,
+            "_overlay_live_same_owner_branch_attempt",
+            side_effect=synchronize_empty_overlay,
+        ):
+            for thread in threads:
+                thread.start()
+            start_barrier.wait(timeout=2)
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(admitted))
+        self.assertEqual(1, len(conflicts))
+        self.assertTrue(conflicts[0].already_running)
+        self.assertEqual(
+            admitted[0]["attempt_binding_sha256"],
+            conflicts[0].existing_binding_sha256,
+        )
+        self.assertEqual(
+            conflicts[0].existing_binding_sha256,
+            conflicts[0].requested_binding_sha256,
+        )
+        resources.complete_branch_mutation_attempt(admitted[0])
 
     def test_branch_attempt_preserves_and_restores_existing_work_lane_branch_lease(self) -> None:
         (self.root / ".git").mkdir()
@@ -4531,6 +4612,7 @@ class ResourceTests(unittest.TestCase):
             branch,
             operation_id="operation-a",
             attempt_id="attempt-1",
+            expected_preimage_sha256="b" * 64,
             ttl_seconds=60,
         )
         self.assertEqual("preexisting", attempt["lease_origin"])
@@ -4568,6 +4650,7 @@ class ResourceTests(unittest.TestCase):
                 branch,
                 operation_id="operation-b",
                 attempt_id="attempt-2",
+                expected_preimage_sha256="b" * 64,
                 ttl_seconds=60,
             )
 
@@ -4622,6 +4705,7 @@ class ResourceTests(unittest.TestCase):
             branch,
             operation_id="operation-a",
             attempt_id="attempt-1",
+            expected_preimage_sha256="c" * 64,
             ttl_seconds=120,
         )
         with resources._database() as connection:
@@ -4664,6 +4748,7 @@ class ResourceTests(unittest.TestCase):
             branch,
             operation_id="operation-a",
             attempt_id="attempt-1",
+            expected_preimage_sha256="d" * 64,
             ttl_seconds=60,
         )
         self.assertEqual("attempt_only", attempt["lease_origin"])
