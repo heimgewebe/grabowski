@@ -189,7 +189,10 @@ def _expected_package_apt_systemd_argv(plan_id: str, paths: list[str]) -> list[s
         # ProtectKernelModules= would make that tree read-only and turns a verified
         # offline kernel update into a deterministic partial dpkg transaction.
         "--property=ProtectControlGroups=yes",
-        "--property=PrivateDevices=yes",
+        # Kernel package hooks must identify the root/ESP block devices. Keep
+        # the device cgroup closed while allowing read-only block identity.
+        "--property=DevicePolicy=closed",
+        "--property=DeviceAllow=block-* r",
         "--property=RestrictNamespaces=yes",
         "--property=ProtectKernelLogs=yes",
         "--property=ProtectClock=yes",
