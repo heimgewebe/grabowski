@@ -20,7 +20,6 @@ MAX_TEXT = 512
 MAX_CURSOR = 128
 PAGE_LIMIT_MAX = 50
 MIXED_SOURCE_SCOPE = "mixed_global_and_repository_filtered_bounded_source_snapshot"
-GLOBAL_SOURCE_SCOPE = "global_bounded_source_snapshot"
 GLOBAL_SOURCE_NAMES = (
     "tasks",
     "attention",
@@ -88,8 +87,9 @@ def _scope_contract(repositories: list[str]) -> dict[str, Any]:
         "repository_scoped_aggregates": False,
         "aggregates_depend_on_repository_filters": True,
         "filter_propagation": (
-            "repository-filtered checkout evidence may attach to global work groups "
-            "and change their projected state or action reasons"
+            "repository-filtered checkout evidence may attach to global work groups, "
+            "change their projected state or action reasons, and change whether global "
+            "physical observations are classified as unbound"
         ),
         "does_not_establish": [
             "repository-scoped total_projected",
@@ -2098,7 +2098,7 @@ def build_current_work_projection(
             "process_total_unbound": unbound_process_total,
             "sample_truncated": unbound_tmux_total > len(unbound_tmux) or unbound_process_total > len(unbound_processes),
         },
-        "unbound_physical_scope": GLOBAL_SOURCE_SCOPE,
+        "unbound_physical_scope": MIXED_SOURCE_SCOPE,
         "scope_notes": scope_notes,
         "warnings": warnings,
         "recommended_next_action_scope": MIXED_SOURCE_SCOPE,

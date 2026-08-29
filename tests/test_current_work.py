@@ -1116,7 +1116,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             result["convergence_summary_scope"], current_work.MIXED_SOURCE_SCOPE
         )
         self.assertEqual(
-            result["unbound_physical_scope"], current_work.GLOBAL_SOURCE_SCOPE
+            result["unbound_physical_scope"], current_work.MIXED_SOURCE_SCOPE
         )
         self.assertEqual(
             result["recommended_next_action_scope"], current_work.MIXED_SOURCE_SCOPE
@@ -1198,6 +1198,53 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(broad_group["projection_state"], "blocking")
         self.assertTrue(broad_group["action_required"])
         self.assertIn("dirty-checkout-resource-overlap", broad_group["action_reasons"])
+
+    def test_repository_filter_can_change_unbound_physical_classification(self) -> None:
+        workspace = "filter-propagation"
+        other_repo = "/home/alex/repos/other"
+        checkout_path = "/home/alex/repos/.worktrees/filter-physical-propagation"
+        tmux_payload = {
+            "returncode": 0,
+            "stdout": f"{workspace}\t1\t0\t80\n",
+        }
+        narrow = project(
+            repository_filters=[REPOSITORY],
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": []}],
+            tmux_payload=tmux_payload,
+        )
+        broad = project(
+            repository_filters=[REPOSITORY, other_repo],
+            checkout_payloads=[
+                {"repository": REPOSITORY, "worktrees": []},
+                {
+                    "repository": other_repo,
+                    "worktrees": [
+                        checkout(
+                            "filter-physical-propagation",
+                            checkout_path,
+                            lifecycle_state="retained",
+                            binding_owner=f"agent-workspace:{workspace}",
+                            binding_phase="active",
+                            retention_active=True,
+                        )
+                    ],
+                },
+            ],
+            tmux_payload=tmux_payload,
+        )
+
+        self.assertEqual(narrow["unbound_physical"]["tmux_total_unbound"], 1)
+        self.assertEqual(broad["unbound_physical"]["tmux_total_unbound"], 0)
+        self.assertEqual(
+            narrow["unbound_physical_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            broad["unbound_physical_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertIn(
+            "physical observations are classified as unbound",
+            broad["scope_contract"]["filter_propagation"],
+        )
 
     def test_truncation_and_source_errors_are_visible(self) -> None:
         result = project(

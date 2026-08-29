@@ -184,7 +184,7 @@ def current_work_provider(*_args, **_kwargs) -> dict:
         "convergence_summary_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
         "source_counts": {"tasks": 2, "worktrees": 185},
         "source_counts_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
-        "unbound_physical_scope": "global_bounded_source_snapshot",
+        "unbound_physical_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
         "recommended_next_action_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
         "next_convergence_action_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
         "scope_notes": ["mixed source scope"],
