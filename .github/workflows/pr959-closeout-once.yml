@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  EXPECTED_PARENT: 6d986e8456dbfd7f8a840ce1f86d77b13552635f
+  EXPECTED_PARENT: 890f51e528f7b67266056d7b10383e782045e614
   WRITER_PATH: .github/workflows/pr959-closeout-once.yml
 
 jobs:
@@ -63,16 +63,28 @@ jobs:
 
           python - <<'PY'
           from pathlib import Path
+          import re
 
-          def replace_once(path: str, old: str, new: str) -> None:
+          def replace_once(label: str, path: str, old: str, new: str) -> None:
               target = Path(path)
               text = target.read_text(encoding="utf-8")
               count = text.count(old)
               if count != 1:
-                  raise SystemExit(f"{path}: expected one patch anchor, found {count}")
+                  raise SystemExit(f"{label}: expected one patch anchor, found {count}")
               target.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print(f"patched: {label}")
+
+          def regex_once(label: str, path: str, pattern: str, replacement: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              updated, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one regex match, found {count}")
+              target.write_text(updated, encoding="utf-8")
+              print(f"patched: {label}")
 
           replace_once(
+              "operator recursive submodule guard",
               "src/grabowski_operator.py",
               '''    bound_ref = f"refs/heads/{bound_branch}"
 
@@ -93,6 +105,7 @@ jobs:
           )
 
           replace_once(
+              "operator value-taking checkout parser",
               "src/grabowski_operator.py",
               '''        named_branch: str | None = None
                   positional_only = False
@@ -131,36 +144,44 @@ jobs:
           ''',
           )
 
-          replace_once(
+          regex_once(
+              "attempt-only cleanup binding",
               "src/grabowski_resources.py",
-              '''        released = release_resources(
-                      owner, [branch_key], expected_leases=[expected_snapshot]
-                  )
-          ''',
+              r'''        released = release_resources\(\n            owner, \[branch_key\], expected_leases=\[expected_snapshot\]\n        \)''',
               '''        released = release_resources(
                       owner,
                       [branch_key],
                       expected_leases=[expected_snapshot],
                       _branch_attempt_cleanup_binding_sha256=binding_sha256,
-                  )
-          ''',
+                  )''',
           )
 
-          replace_once(
-              "src/grabowski_resources.py",
-              '''                row_metadata = _row_metadata(row)
+          renew_path = Path("src/grabowski_resources.py")
+          resources_text = renew_path.read_text(encoding="utf-8")
+          renew_start = resources_text.index("def renew_resources(")
+          release_start = resources_text.index("def release_resources(", renew_start)
+          renew_block = resources_text[renew_start:release_start]
+          old_renew = '''                row_metadata = _row_metadata(row)
                           if row_metadata.get("lease_mode") == "emergency-recovery":
-          ''',
-              '''                row_metadata = _row_metadata(row)
+          '''
+          new_renew = '''                row_metadata = _row_metadata(row)
                           if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in row_metadata:
                               raise RuntimeError(
                                   "branch mutation attempt leases are non-renewable while an effect may be running"
                               )
                           if row_metadata.get("lease_mode") == "emergency-recovery":
-          ''',
-          )
+          '''
+          if renew_block.count(old_renew) != 1:
+              raise SystemExit(
+                  f"renew live-attempt guard: expected one block anchor, found {renew_block.count(old_renew)}"
+              )
+          renew_block = renew_block.replace(old_renew, new_renew, 1)
+          resources_text = resources_text[:renew_start] + renew_block + resources_text[release_start:]
+          renew_path.write_text(resources_text, encoding="utf-8")
+          print("patched: renew live-attempt guard")
 
           replace_once(
+              "release private cleanup binding",
               "src/grabowski_resources.py",
               '''def release_resources(
                   owner_id: str,
@@ -195,15 +216,17 @@ jobs:
           ''',
           )
 
-          replace_once(
-              "src/grabowski_resources.py",
-              '''                if expected_by_key is not None and _release_lease_snapshot(
+          resources_text = renew_path.read_text(encoding="utf-8")
+          release_start = resources_text.index("def release_resources(")
+          inspect_start = resources_text.index("def inspect_resource(", release_start)
+          release_block = resources_text[release_start:inspect_start]
+          old_release = '''                if expected_by_key is not None and _release_lease_snapshot(
                           row
                       ) != expected_by_key[key]:
                           raise RuntimeError(f"Resource lease changed before release: {key}")
                       released.append(_public(row))
-          ''',
-              '''                if expected_by_key is not None and _release_lease_snapshot(
+          '''
+          new_release = '''                if expected_by_key is not None and _release_lease_snapshot(
                           row
                       ) != expected_by_key[key]:
                           raise RuntimeError(f"Resource lease changed before release: {key}")
@@ -227,10 +250,18 @@ jobs:
                                   "live branch mutation attempt lease requires attempt-specific cleanup"
                               )
                       released.append(_public(row))
-          ''',
-          )
+          '''
+          if release_block.count(old_release) != 1:
+              raise SystemExit(
+                  f"release live-attempt guard: expected one block anchor, found {release_block.count(old_release)}"
+              )
+          release_block = release_block.replace(old_release, new_release, 1)
+          resources_text = resources_text[:release_start] + release_block + resources_text[inspect_start:]
+          renew_path.write_text(resources_text, encoding="utf-8")
+          print("patched: release live-attempt guard")
 
           replace_once(
+              "operator review regressions",
               "tests/test_operator_contract.py",
               '''            ["update-index", "--skip-worktree", "README.md"],
                   ):
@@ -246,6 +277,7 @@ jobs:
           )
 
           replace_once(
+              "operator regression error classes",
               "tests/test_operator_contract.py",
               '''                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet"
           ''',
@@ -254,6 +286,7 @@ jobs:
           )
 
           replace_once(
+              "resource release-renew regressions",
               "tests/test_resources.py",
               '''        self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))
 
@@ -297,6 +330,7 @@ jobs:
           )
           PY
 
+          python -m py_compile src/grabowski_operator.py src/grabowski_resources.py
           make context-refresh
           rm -- "$WRITER_PATH"
           git add -A
