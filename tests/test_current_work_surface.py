@@ -87,6 +87,61 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             result["does_not_establish"],
         )
 
+    def test_scope_source_enumeration_matches_actual_collectors(self) -> None:
+        seen_sources: list[str] = []
+
+        def collect(
+            source: str,
+            _capability: str,
+            loader: object,
+            _errors: list[dict],
+            _default: object,
+        ) -> object:
+            seen_sources.append(source)
+            return loader()
+
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_attempt_source", side_effect=collect
+        ), patch.object(
+            surface, "_task_payload", return_value=task_payload()
+        ), patch.object(
+            surface,
+            "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface,
+            "_checkout_payloads",
+            return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            result = surface.grabowski_current_work([REPOSITORY])
+
+        declared = set(result["scope_contract"]["global_sources"]) | set(
+            result["scope_contract"]["repository_filtered_sources"]
+        )
+        self.assertEqual(set(seen_sources), declared)
+        self.assertEqual(len(seen_sources), len(declared))
+
     def test_source_capability_failure_is_visible_as_partial_evidence(self) -> None:
         def gate(capability: str) -> None:
             if capability == "tmux_interaction":

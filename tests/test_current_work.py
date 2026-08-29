@@ -1108,16 +1108,96 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "checkout_binding_reconciliation", scope["repository_filtered_sources"]
         )
         self.assertFalse(scope["repository_scoped_aggregates"])
+        self.assertTrue(scope["aggregates_depend_on_repository_filters"])
+        self.assertIn("attach to global work groups", scope["filter_propagation"])
         self.assertEqual(result["total_projected_scope"], current_work.MIXED_SOURCE_SCOPE)
+        self.assertEqual(result["source_counts_scope"], current_work.MIXED_SOURCE_SCOPE)
         self.assertEqual(
             result["convergence_summary_scope"], current_work.MIXED_SOURCE_SCOPE
         )
+        self.assertEqual(
+            result["unbound_physical_scope"], current_work.GLOBAL_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            result["recommended_next_action_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            result["next_convergence_action_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
         self.assertTrue(
+            any("repository filters apply only" in item for item in result["scope_notes"])
+        )
+        self.assertFalse(
             any("repository filters apply only" in item for item in result["warnings"])
         )
         self.assertTrue(
             any("repository-scoped total_projected" in item for item in result["does_not_establish"])
         )
+        self.assertTrue(
+            any("filter-invariant" in item for item in result["does_not_establish"])
+        )
+
+    def test_scope_source_enumeration_matches_collected_source_contract(self) -> None:
+        result = project()
+        scope = result["scope_contract"]
+        global_sources = set(scope["global_sources"])
+        filtered_sources = set(scope["repository_filtered_sources"])
+        self.assertFalse(global_sources & filtered_sources)
+        self.assertEqual(
+            global_sources | filtered_sources,
+            set(result["source_truncation"]) - {"source_errors"},
+        )
+
+    def test_repository_filter_can_change_globally_sourced_task_projection(self) -> None:
+        other_repo = "/home/alex/repos/other"
+        checkout_path = "/home/alex/repos/.worktrees/filter-propagation"
+        task_payload = {
+            "tasks": [
+                task(
+                    "global-propagation",
+                    state="running",
+                    cwd="/home/alex/global",
+                    resource_keys=[f"path:{checkout_path}"],
+                )
+            ],
+            "pagination": {"has_more": False},
+        }
+        narrow = project(
+            tasks_payload=task_payload,
+            repository_filters=[REPOSITORY],
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": []}],
+        )
+        broad = project(
+            tasks_payload=task_payload,
+            repository_filters=[REPOSITORY, other_repo],
+            checkout_payloads=[
+                {"repository": REPOSITORY, "worktrees": []},
+                {
+                    "repository": other_repo,
+                    "worktrees": [
+                        checkout(
+                            "filter-propagation",
+                            checkout_path,
+                            dirty=True,
+                            blocking=True,
+                        )
+                    ],
+                },
+            ],
+        )
+        narrow_group = next(
+            item for item in narrow["work"]
+            if item["work_id"] == "task:global-propagation"
+        )
+        broad_group = next(
+            item for item in broad["work"]
+            if item["work_id"] == "task:global-propagation"
+        )
+        self.assertEqual(narrow_group["projection_state"], "active")
+        self.assertFalse(narrow_group["action_required"])
+        self.assertEqual(broad_group["projection_state"], "blocking")
+        self.assertTrue(broad_group["action_required"])
+        self.assertIn("dirty-checkout-resource-overlap", broad_group["action_reasons"])
 
     def test_truncation_and_source_errors_are_visible(self) -> None:
         result = project(

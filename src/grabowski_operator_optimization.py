@@ -804,16 +804,6 @@ def _current_work_findings(
         isinstance(scope_contract, dict)
         and scope_contract.get("kind") == "mixed_global_and_repository_filtered"
     )
-    if mixed_scope:
-        warnings.append(
-            {
-                "code": "current_work_mixed_scope",
-                "global_sources": list(scope_contract.get("global_sources") or []),
-                "repository_filtered_sources": list(
-                    scope_contract.get("repository_filtered_sources") or []
-                ),
-            }
-        )
     state_counts = current.get("state_counts")
     total = _count(current, "total_projected")
     blocking = _count(state_counts, "blocking")
@@ -839,9 +829,13 @@ def _current_work_findings(
                 "attention faster than it identifies a finishable chain."
             ),
             alternative_interpretation=(
-                "Global task, attention, lease, worker or physical sources may dominate "
-                "the aggregate even when checkout evidence is limited to the selected "
-                "repository set."
+                (
+                    "Global task, attention, lease, worker or physical sources may dominate "
+                    "the aggregate even when checkout evidence is limited to the selected "
+                    "repository set; independently, the selected checkout evidence may "
+                    "genuinely contain many dirty or conflicting work groups and may alter "
+                    "bindings or state on globally sourced groups."
+                )
                 if mixed_scope
                 else "The observed source set may genuinely contain many independent dirty or conflicting work groups."
             ),
@@ -1105,6 +1099,11 @@ def _source_evidence(evidence: ReportEvidence) -> dict[str, Any]:
                     "state_counts_scope",
                     "convergence_summary_scope",
                     "source_counts",
+                    "source_counts_scope",
+                    "unbound_physical_scope",
+                    "recommended_next_action_scope",
+                    "next_convergence_action_scope",
+                    "scope_notes",
                     "source_truncation",
                     "warnings",
                 )
@@ -1198,6 +1197,16 @@ def build_operator_optimization_report(
             "window": window,
             "comparison_window": evidence.comparison_label,
             "repositories": selected_repositories,
+            "repositories_apply_to": [
+                "current_work.checkouts",
+                "current_work.checkout_binding_reconciliation",
+            ],
+            "repository_scoped_findings": False,
+            "current_work_scope_contract": (
+                evidence.current_work.get("scope_contract")
+                if isinstance(evidence.current_work, dict)
+                else None
+            ),
             "personal_activity_observation": False,
             "excluded_personal_telemetry": [
                 "window_titles",
@@ -1233,6 +1242,8 @@ def build_operator_optimization_report(
             "merge_or_deploy_readiness",
             "permission_to_change_foreign_work",
             "live_routing_promotion",
+            "repository_scoped_findings",
+            "repository_scoped_audit_friction_or_execution_outcomes",
         ],
     }
     if selected_view in {"standard", "evidence"}:
