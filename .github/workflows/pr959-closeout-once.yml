@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  EXPECTED_PARENT: a343441797aec28d4121087530e1ba5a9be2e2c6
+  EXPECTED_PARENT: 777720258e114871c27e7f54dc3c8aa4021a3504
   WRITER_PATH: .github/workflows/pr959-closeout-once.yml
 
 jobs:
@@ -63,250 +63,228 @@ jobs:
 
           python - <<'PY'
           from pathlib import Path
-          import re
 
-          def replace_once(label: str, path: str, old: str, new: str) -> None:
-              target = Path(path)
-              text = target.read_text(encoding="utf-8")
+          def replace_once(path: Path, label: str, old: str, new: str) -> None:
+              text = path.read_text(encoding="utf-8")
               count = text.count(old)
               if count != 1:
-                  raise SystemExit(f"{label}: expected one patch anchor, found {count}")
-              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+                  raise SystemExit(f"{label}: expected one anchor, found {count}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
               print(f"patched: {label}")
 
-          def regex_once(label: str, path: str, pattern: str, replacement: str) -> None:
-              target = Path(path)
-              text = target.read_text(encoding="utf-8")
-              updated, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
-              if count != 1:
-                  raise SystemExit(f"{label}: expected one regex match, found {count}")
-              target.write_text(updated, encoding="utf-8")
-              print(f"patched: {label}")
-
+          operator = Path("src/grabowski_operator.py")
           replace_once(
-              "operator recursive submodule guard",
-              "src/grabowski_operator.py",
-              '''    bound_ref = f"refs/heads/{bound_branch}"
-
-              if subcommand == "rebase":
-          ''',
-              '''    bound_ref = f"refs/heads/{bound_branch}"
-
-              if any(
-                  item == "--recurse-submodules" or item.startswith("--recurse-submodules=")
-                  for item in command_arguments
-              ):
-                  raise PermissionError(
-                      "recursive Git submodule mutation is blocked because a parent branch-attempt lease does not serialize nested repositories"
-                  )
-
-              if subcommand == "rebase":
-          ''',
+              operator,
+              "recursive submodule mutation",
+              '    bound_ref = f"refs/heads/{bound_branch}"\n\n    if subcommand == "rebase":\n',
+              '    bound_ref = f"refs/heads/{bound_branch}"\n\n'
+              '    if any(\n'
+              '        item == "--recurse-submodules" or item.startswith("--recurse-submodules=")\n'
+              '        for item in command_arguments\n'
+              '    ):\n'
+              '        raise PermissionError(\n'
+              '            "recursive Git submodule mutation is blocked because a parent branch-attempt lease does not serialize nested repositories"\n'
+              '        )\n\n'
+              '    if subcommand == "rebase":\n',
+          )
+          replace_once(
+              operator,
+              "value-taking checkout options",
+              '        named_branch: str | None = None\n'
+              '        positional_only = False\n'
+              '        index = 0\n'
+              '        while index < len(command_arguments):\n'
+              '            item = command_arguments[index]\n'
+              '            if item == "--":\n'
+              '                positional_only = True\n'
+              '                index += 1\n'
+              '                continue\n'
+              '            if not positional_only and item in branch_options:\n',
+              '        value_options = {"--conflict"}\n'
+              '        if subcommand == "checkout":\n'
+              '            value_options.add("--pathspec-from-file")\n'
+              '        named_branch: str | None = None\n'
+              '        positional_only = False\n'
+              '        index = 0\n'
+              '        while index < len(command_arguments):\n'
+              '            item = command_arguments[index]\n'
+              '            if item == "--":\n'
+              '                positional_only = True\n'
+              '                index += 1\n'
+              '                continue\n'
+              '            if not positional_only and item in value_options:\n'
+              '                if index + 1 >= len(command_arguments):\n'
+              '                    raise ValueError(f"git {subcommand} {item} requires a value")\n'
+              '                index += 2\n'
+              '                continue\n'
+              '            if not positional_only and any(\n'
+              '                item.startswith(option + "=") for option in value_options\n'
+              '            ):\n'
+              '                index += 1\n'
+              '                continue\n'
+              '            if not positional_only and item in branch_options:\n',
           )
 
+          resources = Path("src/grabowski_resources.py")
+          text = resources.read_text(encoding="utf-8")
+          complete_start = text.index("def complete_branch_mutation_attempt(")
+          attempt_start = text.index('    if origin == "attempt_only":', complete_start)
+          preexisting_start = text.index('    if origin != "preexisting":', attempt_start)
+          attempt_block = "\n".join([
+              '    if origin == "attempt_only":',
+              '        expected = attempt_lease.get("lease")',
+              '        if not isinstance(expected, dict):',
+              '            raise ValueError("attempt-only lease snapshot is missing")',
+              '        expected_snapshot = _release_lease_snapshot(expected)',
+              '        with _database() as connection:',
+              '            connection.execute("BEGIN IMMEDIATE")',
+              '            try:',
+              '                row = connection.execute(',
+              '                    "SELECT * FROM leases WHERE resource_key=?", (branch_key,)',
+              '                ).fetchone()',
+              '                if row is None:',
+              '                    raise RuntimeError(',
+              '                        "attempt-only branch lease disappeared before cleanup"',
+              '                    )',
+              '                if row["owner_id"] != owner:',
+              '                    raise PermissionError(',
+              '                        "attempt-only branch lease owner changed before cleanup"',
+              '                    )',
+              '                if _release_lease_snapshot(row) != expected_snapshot:',
+              '                    raise RuntimeError(',
+              '                        "attempt-only branch lease changed before cleanup"',
+              '                    )',
+              '                metadata = _row_metadata(row)',
+              '                _, observed_sha256 = _metadata(metadata)',
+              '                if row["metadata_sha256"] != observed_sha256:',
+              '                    raise RuntimeError(',
+              '                        f"Resource lease metadata integrity mismatch: {branch_key}"',
+              '                    )',
+              '                observed_attempt = metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)',
+              '                if not isinstance(observed_attempt, dict):',
+              '                    raise RuntimeError(',
+              '                        "branch mutation attempt marker disappeared before cleanup"',
+              '                    )',
+              '                if observed_attempt.get("binding_sha256") != binding_sha256:',
+              '                    raise RuntimeError(',
+              '                        "branch mutation attempt binding changed before cleanup"',
+              '                    )',
+              '                if observed_attempt.get("lease_origin") != "attempt_only":',
+              '                    raise RuntimeError(',
+              '                        "branch mutation attempt origin changed before cleanup"',
+              '                    )',
+              '                released = _public(row)',
+              '                connection.execute(',
+              '                    "DELETE FROM leases WHERE resource_key=? AND owner_id=?",',
+              '                    (branch_key, owner),',
+              '                )',
+              '                connection.commit()',
+              '            except Exception:',
+              '                connection.rollback()',
+              '                raise',
+              '        if _release_lease_snapshot(released) != expected_snapshot:',
+              '            raise RuntimeError("attempt-only branch lease release snapshot drifted")',
+              '        return {',
+              '            "schema_version": 1,',
+              '            "kind": "grabowski_branch_mutation_attempt_cleanup",',
+              '            "resource_key": branch_key,',
+              '            "lease_origin": origin,',
+              '            "action": "released",',
+              '            "snapshot_guarded": True,',
+              '        }',
+              '',
+          ])
+          text = text[:attempt_start] + attempt_block + text[preexisting_start:]
+
+          renew_start = text.index("def renew_resources(")
+          release_start = text.index("def release_resources(", renew_start)
+          renew_block = text[renew_start:release_start]
+          renew_marker = '                row_metadata = _row_metadata(row)\n'
+          if renew_block.count(renew_marker) != 1:
+              raise SystemExit(f"renew marker count={renew_block.count(renew_marker)}")
+          renew_guard = (
+              renew_marker
+              + '                if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in row_metadata:\n'
+              + '                    raise RuntimeError(\n'
+              + '                        "branch mutation attempt leases are non-renewable while an effect may be running"\n'
+              + '                    )\n'
+          )
+          renew_block = renew_block.replace(renew_marker, renew_guard, 1)
+          text = text[:renew_start] + renew_block + text[release_start:]
+
+          release_start = text.index("def release_resources(")
+          inspect_start = text.index("def inspect_resource(", release_start)
+          release_block = text[release_start:inspect_start]
+          release_marker = '            released.append(_public(row))\n'
+          if release_block.count(release_marker) != 1:
+              raise SystemExit(f"release marker count={release_block.count(release_marker)}")
+          release_guard = (
+              '            row_metadata = _row_metadata(row)\n'
+              + '            if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in row_metadata:\n'
+              + '                raise RuntimeError(\n'
+              + '                    "live branch mutation attempt lease requires attempt-specific cleanup"\n'
+              + '                )\n'
+              + release_marker
+          )
+          release_block = release_block.replace(release_marker, release_guard, 1)
+          text = text[:release_start] + release_block + text[inspect_start:]
+          resources.write_text(text, encoding="utf-8")
+          print("patched: attempt-specific resource cleanup and generic mutation guards")
+
+          operator_tests = Path("tests/test_operator_contract.py")
           replace_once(
-              "operator value-taking checkout parser",
-              "src/grabowski_operator.py",
-              '''        named_branch: str | None = None
-                  positional_only = False
-                  index = 0
-                  while index < len(command_arguments):
-                      item = command_arguments[index]
-                      if item == "--":
-                          positional_only = True
-                          index += 1
-                          continue
-                      if not positional_only and item in branch_options:
-          ''',
-              '''        value_options = {"--conflict"}
-                  if subcommand == "checkout":
-                      value_options.add("--pathspec-from-file")
-                  named_branch: str | None = None
-                  positional_only = False
-                  index = 0
-                  while index < len(command_arguments):
-                      item = command_arguments[index]
-                      if item == "--":
-                          positional_only = True
-                          index += 1
-                          continue
-                      if not positional_only and item in value_options:
-                          if index + 1 >= len(command_arguments):
-                              raise ValueError(f"git {subcommand} {item} requires a value")
-                          index += 2
-                          continue
-                      if not positional_only and any(
-                          item.startswith(option + "=") for option in value_options
-                      ):
-                          index += 1
-                          continue
-                      if not positional_only and item in branch_options:
-          ''',
+              operator_tests,
+              "operator regression cases",
+              '            ["update-index", "--skip-worktree", "README.md"],\n        ):\n',
+              '            ["update-index", "--skip-worktree", "README.md"],\n'
+              '            ["checkout", "--conflict", "merge", "other"],\n'
+              '            ["checkout", "--conflict=merge", "other"],\n'
+              '            ["switch", "--conflict", "merge", "other"],\n'
+              '            ["reset", "--hard", "--recurse-submodules"],\n'
+              '            ["checkout", "--recurse-submodules", "feature"],\n'
+              '        ):\n',
+          )
+          replace_once(
+              operator_tests,
+              "operator regression error match",
+              '                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet"\n',
+              '                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet|submodule"\n',
           )
 
-          regex_once(
-              "attempt-only cleanup binding",
-              "src/grabowski_resources.py",
-              r'''        released = release_resources\(\n            owner, \[branch_key\], expected_leases=\[expected_snapshot\]\n        \)''',
-              '''        released = release_resources(
-                      owner,
-                      [branch_key],
-                      expected_leases=[expected_snapshot],
-                      _branch_attempt_cleanup_binding_sha256=binding_sha256,
-                  )''',
-          )
-
-          resources_path = Path("src/grabowski_resources.py")
-          resources_text = resources_path.read_text(encoding="utf-8")
-          renew_start = resources_text.index("def renew_resources(")
-          release_start = resources_text.index("def release_resources(", renew_start)
-          renew_block = resources_text[renew_start:release_start]
-          old_renew = '''                row_metadata = _row_metadata(row)
-                          if row_metadata.get("lease_mode") == "emergency-recovery":
-          '''
-          new_renew = '''                row_metadata = _row_metadata(row)
-                          if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in row_metadata:
-                              raise RuntimeError(
-                                  "branch mutation attempt leases are non-renewable while an effect may be running"
-                              )
-                          if row_metadata.get("lease_mode") == "emergency-recovery":
-          '''
-          if renew_block.count(old_renew) != 1:
-              raise SystemExit(f"renew live-attempt guard: found {renew_block.count(old_renew)} anchors")
-          renew_block = renew_block.replace(old_renew, new_renew, 1)
-          resources_text = resources_text[:renew_start] + renew_block + resources_text[release_start:]
-
-          release_start = resources_text.index("def release_resources(")
-          inspect_start = resources_text.index("def inspect_resource(", release_start)
-          release_block = resources_text[release_start:inspect_start]
-          old_signature_tail = '''    expected_leases: list[dict[str, Any]] | None = None,
-              ) -> dict[str, Any]:
-                  owner = _owner(owner_id)
-                  keys = normalize_resource_keys(resource_keys)
-                  expected_by_key: dict[str, dict[str, Any]] | None = None
-          '''
-          new_signature_tail = '''    expected_leases: list[dict[str, Any]] | None = None,
-                  _branch_attempt_cleanup_binding_sha256: str | None = None,
-              ) -> dict[str, Any]:
-                  owner = _owner(owner_id)
-                  keys = normalize_resource_keys(resource_keys)
-                  if _branch_attempt_cleanup_binding_sha256 is not None:
-                      if (
-                          SHA256_RE.fullmatch(_branch_attempt_cleanup_binding_sha256) is None
-                          or force
-                          or expected_leases is None
-                          or len(keys) != 1
-                      ):
-                          raise ValueError("branch attempt cleanup binding is invalid")
-                  expected_by_key: dict[str, dict[str, Any]] | None = None
-          '''
-          if release_block.count(old_signature_tail) != 1:
-              raise SystemExit(f"release signature guard: found {release_block.count(old_signature_tail)} anchors")
-          release_block = release_block.replace(old_signature_tail, new_signature_tail, 1)
-
-          old_release = '''                if expected_by_key is not None and _release_lease_snapshot(
-                          row
-                      ) != expected_by_key[key]:
-                          raise RuntimeError(f"Resource lease changed before release: {key}")
-                      released.append(_public(row))
-          '''
-          new_release = '''                if expected_by_key is not None and _release_lease_snapshot(
-                          row
-                      ) != expected_by_key[key]:
-                          raise RuntimeError(f"Resource lease changed before release: {key}")
-                      row_metadata = _row_metadata(row)
-                      active_attempt = row_metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
-                      if active_attempt is not None:
-                          if not isinstance(active_attempt, dict):
-                              raise RuntimeError("branch mutation attempt lease metadata is invalid")
-                          observed_binding = active_attempt.get("binding_sha256")
-                          if (
-                              not isinstance(observed_binding, str)
-                              or SHA256_RE.fullmatch(observed_binding) is None
-                          ):
-                              raise RuntimeError("branch mutation attempt binding metadata is invalid")
-                          if (
-                              expected_by_key is None
-                              or _branch_attempt_cleanup_binding_sha256 is None
-                              or observed_binding != _branch_attempt_cleanup_binding_sha256
-                          ):
-                              raise RuntimeError(
-                                  "live branch mutation attempt lease requires attempt-specific cleanup"
-                              )
-                      released.append(_public(row))
-          '''
-          if release_block.count(old_release) != 1:
-              raise SystemExit(f"release live-attempt guard: found {release_block.count(old_release)} anchors")
-          release_block = release_block.replace(old_release, new_release, 1)
-          resources_text = resources_text[:release_start] + release_block + resources_text[inspect_start:]
-          resources_path.write_text(resources_text, encoding="utf-8")
-          print("patched: resource live-attempt renew/release guards")
-
+          resource_tests = Path("tests/test_resources.py")
           replace_once(
-              "operator review regressions",
-              "tests/test_operator_contract.py",
-              '''            ["update-index", "--skip-worktree", "README.md"],
-                  ):
-          ''',
-              '''            ["update-index", "--skip-worktree", "README.md"],
-                      ["checkout", "--conflict", "merge", "other"],
-                      ["checkout", "--conflict=merge", "other"],
-                      ["switch", "--conflict", "merge", "other"],
-                      ["reset", "--hard", "--recurse-submodules"],
-                      ["checkout", "--recurse-submodules", "feature"],
-                  ):
-          ''',
-          )
-
-          replace_once(
-              "operator regression error classes",
-              "tests/test_operator_contract.py",
-              '''                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet"
-          ''',
-              '''                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet|submodule"
-          ''',
-          )
-
-          replace_once(
-              "resource release-renew regressions",
-              "tests/test_resources.py",
-              '''        self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))
-
-                  def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:
-          ''',
-              '''        self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))
-
-                  def test_branch_attempt_generic_release_and_renew_cannot_clear_live_marker(self) -> None:
-                      (self.root / ".git").mkdir()
-                      owner = "operator:attempt-generic-mutation"
-                      attempt = resources.acquire_branch_mutation_attempt(
-                          owner,
-                          str(self.root),
-                          "feat/generic-mutation-guard",
-                          operation_id="operation-a",
-                          attempt_id="attempt-1",
-                          expected_preimage_sha256="f" * 64,
-                          ttl_seconds=60,
-                      )
-                      key = attempt["resource_key"]
-                      snapshot = resources._release_lease_snapshot(attempt["lease"])
-
-                      with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
-                          resources.release_resources(owner, [key])
-                      with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
-                          resources.release_resources(owner, [key], expected_leases=[snapshot])
-                      with self.assertRaisesRegex(RuntimeError, "non-renewable"):
-                          resources.renew_resources(owner, [key], ttl_seconds=120)
-                      with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
-                          resources.release_resources("operator:force-cleanup", [key], force=True)
-
-                      self.assertIsNotNone(resources.inspect_resource(key))
-                      cleanup = resources.complete_branch_mutation_attempt(attempt)
-                      self.assertEqual("released", cleanup["action"])
-                      self.assertIsNone(resources.inspect_resource(key))
-
-                  def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:
-          ''',
+              resource_tests,
+              "generic attempt release and renew regression",
+              '        self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))\n\n'
+              '    def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:\n',
+              '        self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))\n\n'
+              '    def test_branch_attempt_generic_release_and_renew_cannot_clear_live_marker(self) -> None:\n'
+              '        (self.root / ".git").mkdir()\n'
+              '        owner = "operator:attempt-generic-mutation"\n'
+              '        attempt = resources.acquire_branch_mutation_attempt(\n'
+              '            owner,\n'
+              '            str(self.root),\n'
+              '            "feat/generic-mutation-guard",\n'
+              '            operation_id="operation-a",\n'
+              '            attempt_id="attempt-1",\n'
+              '            expected_preimage_sha256="f" * 64,\n'
+              '            ttl_seconds=60,\n'
+              '        )\n'
+              '        key = attempt["resource_key"]\n'
+              '        snapshot = resources._release_lease_snapshot(attempt["lease"])\n\n'
+              '        with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):\n'
+              '            resources.release_resources(owner, [key])\n'
+              '        with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):\n'
+              '            resources.release_resources(owner, [key], expected_leases=[snapshot])\n'
+              '        with self.assertRaisesRegex(RuntimeError, "non-renewable"):\n'
+              '            resources.renew_resources(owner, [key], ttl_seconds=120)\n'
+              '        with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):\n'
+              '            resources.release_resources("operator:force-cleanup", [key], force=True)\n\n'
+              '        self.assertIsNotNone(resources.inspect_resource(key))\n'
+              '        cleanup = resources.complete_branch_mutation_attempt(attempt)\n'
+              '        self.assertEqual("released", cleanup["action"])\n'
+              '        self.assertIsNone(resources.inspect_resource(key))\n\n'
+              '    def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:\n',
           )
           PY
 
