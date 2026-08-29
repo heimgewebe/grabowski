@@ -27,6 +27,7 @@ from pydantic import Field
 import grabowski_client_snapshot as client_snapshot
 import grabowski_connector_contract as connector_contract
 import grabowski_mcp as base
+import grabowski_midcutover_resume as midcutover
 import grabowski_deployment_observer as deployment_observer
 import grabowski_operator_core as operator
 import grabowski_privileged as privileged
@@ -58,6 +59,7 @@ SourceRepository = Annotated[str, Field(min_length=1, max_length=4096)]
 SourceLeaseOwner = Annotated[str, Field(min_length=1, max_length=128, pattern=r"[A-Za-z0-9._:@-]{1,128}")]
 SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
+CANONICAL_OPERATOR_MODULE = "grabowski_operator"
 PUBLIC_GITHUB_REPOSITORY_URL = "https://github.com/heimgewebe/grabowski.git"
 PUBLIC_GITHUB_MAIN_REF = "refs/heads/main"
 PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS = 15
@@ -1556,6 +1558,11 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         deploy_fields is not None
         and _missing_finalization_deploy_is_runtime_proven(status, deploy_fields)
     )
+    noeffect_proven_terminal = bool(
+        deploy_fields is not None
+        and not runtime_proven_terminal
+        and _missing_finalization_deploy_is_noeffect_proven(status, deploy_fields)
+    )
     return {
         "unit": entry.name,
         "kind": "deploy" if deploy_fields is not None else "midcutover_resume",
@@ -1567,9 +1574,10 @@ def _classify_indexed_job(entry: Path) -> dict[str, Any]:
         "fields": command_fields,
         "readback_required": readback_required,
         "runtime_proven_terminal": runtime_proven_terminal,
+        "noeffect_proven_terminal": noeffect_proven_terminal,
         "terminal": (
             final_status in TERMINAL_JOB_STATUSES and not readback_required
-        ) or runtime_proven_terminal,
+        ) or runtime_proven_terminal or noeffect_proven_terminal,
         "reusable": final_status in REUSABLE_JOB_STATUSES and not readback_required,
     }
 
@@ -1863,6 +1871,192 @@ def _missing_finalization_deploy_is_runtime_proven(
     return proven
 
 
+def _active_runtime_process_matches_stable_pointer(deployment: dict[str, Any]) -> bool:
+    """Bind the live canonical operator to the exact immutable stable release."""
+    release_id = deployment.get("release_id")
+    if not isinstance(release_id, str) or not release_id:
+        return False
+    stable_runtime = base.EXPECTED_STABLE_RUNTIME
+    try:
+        if not stable_runtime.is_symlink():
+            return False
+        release_path = stable_runtime.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    if release_path.name != release_id:
+        return False
+
+    try:
+        observed = subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                "grabowski-operator.service",
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=MainPID",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    fields: dict[str, str] = {}
+    for line in observed.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in fields:
+            return False
+        fields[key] = value
+    if (
+        observed.returncode != 0
+        or set(fields) != {"LoadState", "ActiveState", "SubState", "MainPID"}
+        or fields["LoadState"] != "loaded"
+        or fields["ActiveState"] != "active"
+        or fields["SubState"] != "running"
+    ):
+        return False
+    try:
+        pid = int(fields["MainPID"])
+    except ValueError:
+        return False
+    try:
+        raw_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        maps_text = Path(f"/proc/{pid}/maps").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    if not raw_cmdline or len(raw_cmdline) > 16 * 1024 or len(maps_text) > 8 * 1024 * 1024:
+        return False
+    try:
+        argv = [
+            part.decode("utf-8")
+            for part in raw_cmdline.rstrip(b"\0").split(b"\0")
+        ]
+    except UnicodeDecodeError:
+        return False
+    expected = [
+        str(stable_runtime / ".venv/bin/python"),
+        "-m",
+        CANONICAL_OPERATOR_MODULE,
+        "--transport",
+        "streamable-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18181",
+    ]
+    if argv != expected:
+        return False
+
+    releases_root = release_path.parent
+    mapped_release_ids: set[str] = set()
+    for line in maps_text.splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) != 6:
+            continue
+        mapped = parts[5]
+        if mapped.endswith(" (deleted)"):
+            if mapped.startswith(str(releases_root) + os.sep):
+                return False
+            continue
+        try:
+            relative = Path(mapped).relative_to(releases_root)
+        except ValueError:
+            continue
+        if relative.parts:
+            mapped_release_ids.add(relative.parts[0])
+    return mapped_release_ids == {release_id}
+
+
+def _missing_finalization_deploy_is_noeffect_proven(
+    status: dict[str, Any],
+    command_fields: dict[str, Any],
+) -> bool:
+    """Prove an interrupted deploy no longer owns an unresolved cutover.
+
+    A missing runner receipt is normally an ambiguity and must keep blocking.
+    The one safe negative case is when an independently bound canonical operator
+    is serving a complete artifact-valid *different* release and the existing
+    mid-cutover classifier says no cutover remains to resume.  This does not
+    synthesize the missing receipt; it only removes the dead job from the
+    concurrency index after its target is proven not to be active.
+    """
+    if status.get("final_status") in TERMINAL_JOB_STATUSES | REUSABLE_JOB_STATUSES:
+        return False
+    finalization = status.get("finalization_receipt")
+    if not isinstance(finalization, dict):
+        return False
+    if finalization.get("state") not in {"missing_receipt", "not_configured"}:
+        return False
+    if finalization.get("valid") is True:
+        return False
+    properties = status.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    if (
+        properties.get("ActiveState") != "inactive"
+        or properties.get("SubState") != "dead"
+        or properties.get("Result") != "success"
+        or str(properties.get("ExecMainStatus")) != "0"
+    ):
+        return False
+
+    deployment = base._deployment_metadata()
+    source_independent_integrity = (
+        "manifest_parse_valid",
+        "manifest_schema_valid",
+        "release_path_valid",
+        "release_id_valid",
+        "repo_head_valid",
+        "stable_runtime_manifest_valid",
+        "runtime_pointer_valid",
+        "runtime_input_identity_valid",
+        "lock_identity_valid",
+        "source_snapshot_identity_valid",
+        "runtime_asset_snapshot_identity_valid",
+        "runtime_asset_identity_valid",
+        "embedded_contract_valid",
+        "entrypoint_contract_identity_valid",
+        "agent_instructions_identity_valid",
+        "release_python_identity_valid",
+        "executable_identity_valid",
+        "pip_identity_valid",
+        "protocol_identity_valid",
+        "python_runtime_identity_valid",
+        "platform_identity_valid",
+        "artifact_integrity_valid",
+        "environment_compatibility_valid",
+    )
+    expected_head = command_fields.get("expected_head")
+    if not (
+        isinstance(deployment, dict)
+        and deployment.get("completion_status") == "complete"
+        and isinstance(expected_head, str)
+        and OBJECT_ID_RE.fullmatch(expected_head) is not None
+        and deployment.get("repo_head") != expected_head
+        and all(deployment.get(key) is True for key in source_independent_integrity)
+        and _active_runtime_process_matches_stable_pointer(deployment)
+    ):
+        return False
+    try:
+        classification = midcutover.classify_from_durable_state(
+            expected_head=expected_head,
+            snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
+        )
+    except Exception:  # noqa: BLE001 - ambiguity must remain blocking
+        return False
+    return bool(
+        classification.get("lane") == midcutover.LANE_SCHEDULED_DEPLOY
+        and not classification.get("reasons")
+        and classification.get("resume_binding") is None
+    )
+
+
 def inflight_runtime_job_evidence(
     command: list[str] | None = None, *, prune: bool = False
 ) -> dict[str, Any]:
@@ -2053,6 +2247,8 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
         if _missing_finalization_deploy_is_runtime_proven(
             status, candidate_fields, runtime_proof_cache=runtime_proof_cache
         ):
+            continue
+        if _missing_finalization_deploy_is_noeffect_proven(status, candidate_fields):
             continue
         retained_units.append(entry.name)
         if final_status not in REUSABLE_JOB_STATUSES:
