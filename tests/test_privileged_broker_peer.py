@@ -1289,6 +1289,11 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertIn("--property=PrivateNetwork=yes", apply_argv)
         self.assertIn("--property=ProtectProc=invisible", apply_argv)
         self.assertNotIn("--property=ProcSubset=pid", apply_argv)
+        self.assertNotIn("--property=PrivateDevices=yes", apply_argv)
+        self.assertIn("--property=DevicePolicy=closed", apply_argv)
+        self.assertNotIn("--property=DeviceAllow=block-* r", apply_argv)
+        self.assertIn("--property=DeviceAllow=/dev/nvme0n1p3 r", apply_argv)
+        self.assertIn("--property=DeviceAllow=/dev/nvme0n1p1 r", apply_argv)
         self.assertIn("--property=ProtectKernelTunables=yes", apply_argv)
         self.assertNotIn("--property=ProtectKernelModules=yes", apply_argv)
         self.assertTrue(
