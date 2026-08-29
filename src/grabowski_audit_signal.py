@@ -143,6 +143,7 @@ def _audit_transition_match_index(
         for index, (candidate, _timestamp_unix) in enumerate(entries):
             if _audit_transition_identity(intent, candidate) == completion_identity:
                 return index
+        return None
     for index, (candidate, _timestamp_unix) in enumerate(entries):
         if _audit_transition_identity(intent, candidate) is None:
             return index
