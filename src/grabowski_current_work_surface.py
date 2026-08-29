@@ -247,7 +247,7 @@ def grabowski_current_work(
     limit: int = 20,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Project bounded operator work from existing task, lease, checkout, worker and physical sources."""
+    """Project global operator work plus repository-filtered Git checkout surfaces."""
     repository_filters = _require_repositories(repositories)
     if view not in current_work.CURRENT_WORK_VIEWS:
         raise ValueError("view must be current or history")

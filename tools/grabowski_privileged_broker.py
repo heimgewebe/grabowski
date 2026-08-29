@@ -180,14 +180,21 @@ def _expected_package_apt_systemd_argv(plan_id: str, paths: list[str]) -> list[s
         "--property=PrivateNetwork=yes",
         f"--property=BindPaths={capture}:/run",
         "--property=ProtectProc=invisible",
-        "--property=ProcSubset=pid",
+        # Do not set ProcSubset=pid: kernel package maintainer scripts need
+        # read-only non-process /proc interfaces such as cmdline, cpuinfo,
+        # mounts and swaps while building initramfs and updating kernelstub.
         "--property=BindReadOnlyPaths=/dev/null:/run/systemd/private /dev/null:/run/dbus/system_bus_socket",
         "--property=ProtectKernelTunables=yes",
         # Kernel DEBs legitimately create /usr/lib/modules/<version> during unpack.
         # ProtectKernelModules= would make that tree read-only and turns a verified
         # offline kernel update into a deterministic partial dpkg transaction.
         "--property=ProtectControlGroups=yes",
-        "--property=PrivateDevices=yes",
+        # Kernel package hooks must identify the root/ESP block devices. Keep
+        # the device cgroup closed while allowing read-only identity for the
+        # audited root and ESP devices only.
+        "--property=DevicePolicy=closed",
+        "--property=DeviceAllow=/dev/nvme0n1p3 r",
+        "--property=DeviceAllow=/dev/nvme0n1p1 r",
         "--property=RestrictNamespaces=yes",
         "--property=ProtectKernelLogs=yes",
         "--property=ProtectClock=yes",
