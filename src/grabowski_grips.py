@@ -13818,7 +13818,17 @@ def _run_captain_run(
     runner: CommandRunner,
     github_runner: GithubRunner,
 ) -> dict[str, Any]:
-    return grabowski_grip_orchestration.run_captain_run(sys.modules[__name__], spec, parameters, receipt, runner, github_runner)
+    import grabowski_resources as resources
+
+    return grabowski_grip_orchestration.run_captain_run(
+        sys.modules[__name__],
+        spec,
+        parameters,
+        receipt,
+        runner,
+        github_runner,
+        resources,
+    )
 
 
 def _run_forrest_server_exit_apply(
