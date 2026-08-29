@@ -112,6 +112,43 @@ def _audit_signal_entry(
     }
 
 
+def _retention_transition_identity(record: dict[str, Any]) -> tuple[str, int] | None:
+    plan_sha256 = record.get("plan_sha256")
+    attempt = record.get("attempt")
+    if (
+        not _audit_sha256_valid(plan_sha256)
+        or isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+    ):
+        return None
+    return plan_sha256, attempt
+
+
+def _audit_transition_identity(
+    intent: str, record: dict[str, Any]
+) -> tuple[str, int] | None:
+    if intent == "runtime-state-retention-intent":
+        return _retention_transition_identity(record)
+    return None
+
+
+def _audit_transition_match_index(
+    intent: str,
+    entries: list[tuple[dict[str, Any], int]],
+    completion_record: dict[str, Any],
+) -> int | None:
+    completion_identity = _audit_transition_identity(intent, completion_record)
+    if completion_identity is not None:
+        for index, (candidate, _timestamp_unix) in enumerate(entries):
+            if _audit_transition_identity(intent, candidate) == completion_identity:
+                return index
+    for index, (candidate, _timestamp_unix) in enumerate(entries):
+        if _audit_transition_identity(intent, candidate) is None:
+            return index
+    return None
+
+
 def _audit_transition_gap_signal(
     prepared_records: list[tuple[dict[str, Any], int | None]],
     *,
@@ -136,8 +173,11 @@ def _audit_transition_gap_signal(
                 pending[key].append((record, timestamp_unix))
                 break
             if operation == completion:
-                if pending[key]:
-                    pending[key].pop(0)
+                match_index = _audit_transition_match_index(
+                    intent, pending[key], record
+                )
+                if match_index is not None:
+                    pending[key].pop(match_index)
                     completed_counts[intent] += 1
                 break
     gaps: list[tuple[str, dict[str, Any], int]] = []
@@ -158,7 +198,7 @@ def _audit_transition_gap_signal(
         count=len(gaps),
         observed_count=len(gaps),
         evidence_refs=refs,
-        evidence_quality="explicit_operation_pair_fifo",
+        evidence_quality="explicit_identity_with_legacy_fifo_fallback",
         recommended_action=(
             "trace each unmatched intent and read the exact target state before retry"
             if gaps
@@ -168,7 +208,10 @@ def _audit_transition_gap_signal(
             "grace_seconds": AUDIT_SIGNAL_GRACE_SECONDS,
             "unmatched_intents_by_transition": dict(sorted(by_transition.items())),
             "completed_pairs_by_transition": dict(sorted(completed_counts.items())),
-            "pairing_semantics": "same-operation-family FIFO within the verified audit snapshot",
+            "pairing_semantics": (
+                "retention pairs by (plan_sha256, attempt) when present; "
+                "records without identity and other transition families use FIFO"
+            ),
         },
         does_not_establish=[
             "effect_absence_outside_the_audit_chain",
