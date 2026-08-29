@@ -183,7 +183,9 @@ def _expected_package_apt_systemd_argv(plan_id: str, paths: list[str]) -> list[s
         "--property=ProcSubset=pid",
         "--property=BindReadOnlyPaths=/dev/null:/run/systemd/private /dev/null:/run/dbus/system_bus_socket",
         "--property=ProtectKernelTunables=yes",
-        "--property=ProtectKernelModules=yes",
+        # Kernel DEBs legitimately create /usr/lib/modules/<version> during unpack.
+        # ProtectKernelModules= would make that tree read-only and turns a verified
+        # offline kernel update into a deterministic partial dpkg transaction.
         "--property=ProtectControlGroups=yes",
         "--property=PrivateDevices=yes",
         "--property=RestrictNamespaces=yes",
