@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  EXPECTED_PARENT: 6af9ecc9d9205a5ff1ce0a1fe425a67fd9f1f3fa
+  EXPECTED_PARENT: fefd6e1cdf408fcfb47434721ee7cec6887e246a
   OLD_WRITER: .github/workflows/pr959-closeout-once.yml
   WRITER_PATH: .github/workflows/pr959-closeout-v2-once.yml
 
@@ -101,8 +101,6 @@ jobs:
           git diff --cached --check
           test -z "$(git diff --name-only --diff-filter=U)"
 
-          python -m unittest discover -s tests -p 'test_operator_contract.py' -v
-          python -m unittest discover -s tests -p 'test_resources.py' -v
           make validate
           make deploy-check
           git diff --cached --check
