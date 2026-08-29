@@ -799,6 +799,11 @@ def _current_work_findings(
                 "sources": sorted(key for key, value in truncation.items() if value),
             }
         )
+    scope_contract = current.get("scope_contract")
+    mixed_scope = bool(
+        isinstance(scope_contract, dict)
+        and scope_contract.get("kind") == "mixed_global_and_repository_filtered"
+    )
     state_counts = current.get("state_counts")
     total = _count(current, "total_projected")
     blocking = _count(state_counts, "blocking")
@@ -812,8 +817,10 @@ def _current_work_findings(
             evidence_scope="live_snapshot",
             title="Current-work projection is dominated by blocking state",
             observation=(
-                f"{blocking} of {total} projected work groups are blocking; "
-                f"{resumable} are resumable."
+                f"{blocking} of {total} "
+                + ("mixed-scope " if mixed_scope else "")
+                + "projected work groups are blocking; "
+                + f"{resumable} are resumable."
             ),
             evidence_count=blocking,
             evidence_refs=[_evidence_ref("current-work", evidence.current_work_sha)],
@@ -822,14 +829,25 @@ def _current_work_findings(
                 "attention faster than it identifies a finishable chain."
             ),
             alternative_interpretation=(
-                "The repository set may genuinely contain many independent dirty or "
-                "conflicting work groups."
+                (
+                    "Global task, attention, lease, worker or physical sources may dominate "
+                    "the aggregate even when checkout evidence is limited to the selected "
+                    "repository set; independently, the selected checkout evidence may "
+                    "genuinely contain many dirty or conflicting work groups and may alter "
+                    "bindings or state on globally sourced groups."
+                )
+                if mixed_scope
+                else "The observed source set may genuinely contain many independent dirty or conflicting work groups."
             ),
             recommended_action=(
                 "Separate finishable authoritative work from historical binding drift, "
                 "dirty foreign work and heuristic-only attention before ranking actions."
             ),
-            does_not_establish=["safe_cleanup", "absence_of_real_blockers"],
+            does_not_establish=[
+                "safe_cleanup",
+                "absence_of_real_blockers",
+                "repository_specific_blocker_count",
+            ],
         )
     ]
 
@@ -973,6 +991,9 @@ def _source_bindings(evidence: ReportEvidence) -> dict[str, Any]:
             "generated_at_unix": (
                 current.get("generated_at_unix") if isinstance(current, dict) else None
             ),
+            "scope_contract": (
+                current.get("scope_contract") if isinstance(current, dict) else None
+            ),
         },
     }
 
@@ -1073,7 +1094,16 @@ def _source_evidence(evidence: ReportEvidence) -> dict[str, Any]:
                     "total_projected",
                     "state_counts",
                     "convergence_summary",
+                    "scope_contract",
+                    "total_projected_scope",
+                    "state_counts_scope",
+                    "convergence_summary_scope",
                     "source_counts",
+                    "source_counts_scope",
+                    "unbound_physical_scope",
+                    "recommended_next_action_scope",
+                    "next_convergence_action_scope",
+                    "scope_notes",
                     "source_truncation",
                     "warnings",
                 )
@@ -1167,6 +1197,16 @@ def build_operator_optimization_report(
             "window": window,
             "comparison_window": evidence.comparison_label,
             "repositories": selected_repositories,
+            "repositories_apply_to": [
+                "current_work.checkouts",
+                "current_work.checkout_binding_reconciliation",
+            ],
+            "repository_scoped_findings": False,
+            "current_work_scope_contract": (
+                evidence.current_work.get("scope_contract")
+                if isinstance(evidence.current_work, dict)
+                else None
+            ),
             "personal_activity_observation": False,
             "excluded_personal_telemetry": [
                 "window_titles",
@@ -1202,6 +1242,8 @@ def build_operator_optimization_report(
             "merge_or_deploy_readiness",
             "permission_to_change_foreign_work",
             "live_routing_promotion",
+            "repository_scoped_findings",
+            "repository_scoped_audit_friction_or_execution_outcomes",
         ],
     }
     if selected_view in {"standard", "evidence"}:

@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "29c0079f26612c4ebaec98b38af7303a9e54f4c599b543aedd2d38023b2604e9",
+  "capability_source_sha256": "890a173ff189e28ba6d5b42b03cc53add9f7e55d2982547f51fc0061759951f7",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "c26c726ab979110678865eacc4bcef45f5842e8e8804e97739e717eae616dab4",
   "integrity": {
@@ -515,10 +515,10 @@
     },
     {
       "category": "operations-observability",
-      "description": "Project work for absolute local repository paths without blocking the MCP event loop.",
+      "description": "Project global operator work plus repository-filtered Git surfaces without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_current_work",
-      "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
+      "purpose": "Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
