@@ -20,7 +20,7 @@
       "claude": 10,
       "codex": 24
     },
-    "work_lanes_indexed": 1375
+    "work_lanes_indexed": 1424
   },
   "decision": {
     "online_shadow": false,
@@ -58,6 +58,7 @@
     "Agent Workspace event logs do not bind directly to provider session cwd; Work Lane target_path plus branch/revision is used.",
     "All exactly attributable provider sessions for one Work Lane are merged chronologically; target-only and ambiguous matches are excluded.",
     "Codex command normalization covers the live-validated exec_command, free-form exec, and bash-wrapped shell forms; direct mutation tools are not expanded from raw patch payloads, and outputs without explicit process status remain unknown.",
+    "Shell verification is recognized only from structurally known test/check runner invocations; incidental test-related words in reads, searches, scripts, or free text do not count as verification.",
     "Task-supplied localization evidence is intentionally not read from prompts, so detector C is advisory only.",
     "Historical provider logs do not expose a canonical post-every-action repository revision.",
     "Work Lane closeout reason codes are a narrower baseline than full PR CI/review evidence; any positive promotion candidate requires external baseline validation.",
@@ -166,11 +167,12 @@
       "lane_id": "00f982a8f4b28ea6240768eae7d12561",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 5,
+        "discover": 2,
+        "execute": 11,
         "mutate": 1,
         "read": 31,
         "search": 16,
-        "verify": 15
+        "verify": 7
       },
       "outcome_counts": {
         "failure": 4,
@@ -253,10 +255,10 @@
       "lead_time_seconds_max": null,
       "operation_counts": {
         "discover": 2,
-        "execute": 7,
+        "execute": 9,
         "read": 16,
         "search": 12,
-        "verify": 3
+        "verify": 1
       },
       "outcome_counts": {
         "failure": 1,
@@ -296,8 +298,7 @@
       "lane_id": "fd2a0fd141a55a7848748f02bc42f03e",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 45,
-        "verify": 2
+        "execute": 47
       },
       "outcome_counts": {
         "unknown": 47
@@ -336,8 +337,7 @@
       "lane_id": "5cd7689d9bd8ec6594b5f0900e4b8df0",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 53,
-        "verify": 3
+        "execute": 56
       },
       "outcome_counts": {
         "unknown": 56
@@ -378,8 +378,7 @@
       "lane_id": "cc4c52d589ad8ff08ed14118caf3d34e",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 20,
-        "verify": 10
+        "execute": 30
       },
       "outcome_counts": {
         "unknown": 30
@@ -420,10 +419,10 @@
       "lane_id": "6352ac1e9a9177b7f7d1ac1a279f4406",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 37,
-        "read": 20,
+        "execute": 49,
+        "read": 21,
         "search": 20,
-        "verify": 19
+        "verify": 6
       },
       "outcome_counts": {
         "success": 50,
@@ -464,9 +463,8 @@
       "lane_id": "c82c7a204a0569a9a5f5b994a27a20b8",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 9,
-        "read": 3,
-        "verify": 3
+        "execute": 12,
+        "read": 3
       },
       "outcome_counts": {
         "success": 3,
@@ -507,8 +505,7 @@
       "lane_id": "d0367a9001d17c808e99010fa1c03ddb",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 6,
-        "verify": 2
+        "execute": 8
       },
       "outcome_counts": {
         "unknown": 8
@@ -547,8 +544,7 @@
       "lane_id": "c5ed46f76b07d16315802bc5a53e7653",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 1,
-        "verify": 1
+        "execute": 2
       },
       "outcome_counts": {
         "unknown": 2
@@ -626,8 +622,7 @@
       "lane_id": "54464d73c706f2a09832f4fda859fa0d",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 163,
-        "verify": 17
+        "execute": 180
       },
       "outcome_counts": {
         "unknown": 180
@@ -666,10 +661,9 @@
       "lane_id": "0db4fb8acf2b8d1c5f0d8ca527fd59a5",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 34,
+        "execute": 51,
         "read": 9,
-        "search": 4,
-        "verify": 17
+        "search": 4
       },
       "outcome_counts": {
         "success": 13,
@@ -797,8 +791,7 @@
       "lane_id": "3ed576ddb64f97762971ed14c5fb25ea",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 31,
-        "verify": 12
+        "execute": 43
       },
       "outcome_counts": {
         "unknown": 43
@@ -837,8 +830,7 @@
       "lane_id": "a60c30a9ed5fa63eda9bc292fa93fcc8",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 8,
-        "verify": 2
+        "execute": 10
       },
       "outcome_counts": {
         "unknown": 10
@@ -880,8 +872,7 @@
       "lead_time_seconds_max": null,
       "operation_counts": {
         "delegate": 32,
-        "execute": 564,
-        "verify": 69
+        "execute": 633
       },
       "outcome_counts": {
         "unknown": 665
@@ -1044,10 +1035,9 @@
       "operation_counts": {
         "discover": 2,
         "edit": 15,
-        "execute": 48,
+        "execute": 51,
         "read": 19,
-        "search": 1,
-        "verify": 3
+        "search": 1
       },
       "outcome_counts": {
         "success": 88
@@ -1165,8 +1155,7 @@
       "lane_id": "71b3a9c8915d1cc77b7913d26ad5edad",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 183,
-        "verify": 17
+        "execute": 200
       },
       "outcome_counts": {
         "unknown": 200
@@ -1249,8 +1238,7 @@
       "lead_time_seconds_max": null,
       "operation_counts": {
         "delegate": 3,
-        "execute": 40,
-        "verify": 6
+        "execute": 46
       },
       "outcome_counts": {
         "unknown": 49
@@ -1289,8 +1277,7 @@
       "lane_id": "23d081cdbb683197e67589af6f221748",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 28,
-        "verify": 2
+        "execute": 30
       },
       "outcome_counts": {
         "unknown": 30
@@ -1329,8 +1316,7 @@
       "lane_id": "c28b5fbd35605233b9a7194a06e96724",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 65,
-        "verify": 2
+        "execute": 67
       },
       "outcome_counts": {
         "unknown": 67
@@ -1369,8 +1355,7 @@
       "lane_id": "88dfe71cfa99c239549c4ccc3ef2c489",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 126,
-        "verify": 24
+        "execute": 150
       },
       "outcome_counts": {
         "unknown": 150
@@ -1487,8 +1472,7 @@
       "lane_id": "80ca07b3016e78cf75d79c16f7048334",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 106,
-        "verify": 6
+        "execute": 112
       },
       "outcome_counts": {
         "unknown": 112
@@ -1521,13 +1505,13 @@
     "high_confidence_findings": 0,
     "operation_counts": {
       "delegate": 35,
-      "discover": 13,
+      "discover": 15,
       "edit": 15,
-      "execute": 1874,
+      "execute": 2092,
       "mutate": 1,
-      "read": 149,
+      "read": 150,
       "search": 70,
-      "verify": 236
+      "verify": 15
     },
     "outcome_counts": {
       "failure": 9,

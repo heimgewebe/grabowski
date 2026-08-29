@@ -48,7 +48,7 @@ a lane are merged chronologically rather than selecting only the largest session
 
 Recorded final rerun inventory:
 
-- 1,375 Work Lane receipts indexed;
+- 1,424 Work Lane receipts indexed;
 - 141 Claude sessions indexed;
 - 813 Codex sessions indexed;
 - 39 exactly attributable Work Lanes;
@@ -136,13 +136,22 @@ processing and adapter complexity before this pilot has demonstrated any actiona
 benefit; under the pilot's usefulness gate, that is a reason to stop rather than to build
 more telemetry.
 
+A final critical self-review found that verification classification was still too broad:
+test-related substrings anywhere in a shell command could be counted as a verification.
+An aggregate audit of the exact cohort showed 236 such classifications, including 206
+free-form commands beginning with `const` and additional reads/searches/wrappers. The
+classifier now requires a structurally known test/check runner invocation (including
+bounded shell/env/timeout wrappers and common Python/build-tool forms). Incidental words
+in reads, searches, scripts, and free text no longer count. The corrected cohort contains
+15 verification actions and the detector/decision result remains unchanged.
+
 ## Final pilot result
 
 The final hardened 31-run cohort produced:
 
 - 2,393 normalized tool events;
-- 149 reads, 70 searches, 13 discovers, 15 repo edits, 1 other repo mutation, 236 verifies,
-  35 delegates, and 1,874 other executions;
+- 150 reads, 70 searches, 15 discovers, 15 repo edits, 1 other repo mutation, 15 verifies,
+  35 delegates, and 2,092 other executions;
 - outcomes: 345 explicit successes, 9 explicit failures, and 2,039 unknown outcomes;
 - `repeated_failure_without_state_delta`: **0**;
 - `verification_gap`: **0**;
@@ -158,9 +167,10 @@ The final hardened 31-run cohort produced:
 
 The large unknown-outcome count is intentional evidence conservatism, not hidden success.
 It weakens any claim that the pilot proves trajectories can never help; it does not create
-positive evidence for building more machinery. Notably, correcting Codex command
-classification increased observed verifies from 30 in the earlier run to 236 in the final
-run, yet still produced no promotion-grade A, B, or D finding.
+positive evidence for building more machinery. Correcting Codex command extraction first
+raised candidate verifies from 30 to 236; the later structural verification audit then
+rejected 221 incidental substring matches and left 15 evidenced verification invocations.
+Even after both corrections there is still no promotion-grade A, B, or D finding.
 
 The success-cohort "any finding" rate is 1/10 (10%). This is only a conservative
 false-positive proxy, not empirical precision: the remaining finding is detector C, for

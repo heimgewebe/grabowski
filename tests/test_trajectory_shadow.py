@@ -141,3 +141,26 @@ def test_codex_command_schemas_and_explicit_outcomes(tmp_path: Path) -> None:
     assert events[0].result_fingerprint is not None
     assert events[1].result_fingerprint is not None
     assert events[4].confidence <= 0.75
+
+
+def test_shell_verification_classification_is_structural() -> None:
+    verification_commands = [
+        "pytest -q tests/test_example.py",
+        "python3 -m pytest -q",
+        "cd /tmp && pytest -q",
+        "timeout 120 pytest -q",
+        "env FOO=bar ruff check .",
+        "bash -lc 'python -m unittest tests.test_example'",
+        "uv run pytest -q",
+        "cargo test",
+        "go test ./...",
+        "npm run test",
+        "make validate",
+    ]
+    for command in verification_commands:
+        assert ts._classify_shell(command, "/tmp/worktree")[0] == "verify", command
+
+    assert ts._classify_shell("rg pytest src", "/tmp/worktree")[0] == "search"
+    assert ts._classify_shell("cat pytest.ini", "/tmp/worktree")[0] == "read"
+    assert ts._classify_shell("printf pytest", "/tmp/worktree")[0] == "execute"
+    assert ts._classify_shell('const x = "pytest"', "/tmp/worktree")[0] == "execute"

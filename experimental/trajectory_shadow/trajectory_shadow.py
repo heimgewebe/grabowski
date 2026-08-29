@@ -35,21 +35,8 @@ SUCCESS_CLOSEOUTS = {
     "deployed",
     "no_change_proven",
 }
-VERIFY_WORDS = (
-    "pytest",
-    "unittest",
-    "ruff",
-    "mypy",
-    "pyright",
-    "cargo test",
-    "go test",
-    "npm test",
-    "npm run test",
-    "pnpm test",
-    "yarn test",
-    "make test",
-    "make check",
-)
+VERIFY_DIRECT_EXES = {"pytest", "tox", "nox", "mypy", "pyright"}
+SHELL_CONTROL_TOKENS = {"&&", "||", ";", "|"}
 READ_EXES = {"cat", "sed", "head", "tail", "less", "git"}
 SEARCH_EXES = {"rg", "grep"}
 DISCOVER_EXES = {"find", "fd", "ls"}
@@ -109,18 +96,92 @@ def _safe_target_from_tokens(command: str, cwd: str) -> str | None:
     return None
 
 
+def _is_shell_assignment(token: str) -> bool:
+    return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token) is not None
+
+
+def _is_verification_segment(tokens: list[str]) -> bool:
+    segment = list(tokens)
+    while segment and _is_shell_assignment(segment[0]):
+        segment.pop(0)
+    if not segment:
+        return False
+
+    exe = os.path.basename(segment[0])
+    if exe == "env":
+        index = 1
+        while index < len(segment) and (segment[index].startswith("-") or _is_shell_assignment(segment[index])):
+            index += 1
+        return _is_verification_segment(segment[index:])
+    if exe == "timeout":
+        index = 1
+        while index < len(segment) and segment[index].startswith("-"):
+            index += 1
+        if index < len(segment):
+            index += 1  # duration
+        return _is_verification_segment(segment[index:])
+    if exe in {"bash", "sh", "zsh"}:
+        for index, token in enumerate(segment[1:], start=1):
+            if token in {"-c", "-lc"} and index + 1 < len(segment):
+                try:
+                    nested = shlex.split(segment[index + 1], posix=True)
+                except ValueError:
+                    return False
+                return _is_verification_command(nested)
+        return False
+
+    if exe in VERIFY_DIRECT_EXES:
+        return True
+    if exe == "ruff":
+        return len(segment) > 1 and segment[1] == "check"
+    if exe in {"python", "python3"}:
+        for index, token in enumerate(segment[1:], start=1):
+            if token == "-m" and index + 1 < len(segment):
+                module = segment[index + 1]
+                return module in {"pytest", "unittest", "ruff", "mypy", "pyright"}
+        return False
+    if exe == "uv":
+        if len(segment) < 3 or segment[1] != "run":
+            return False
+        nested = segment[2:]
+        while nested and nested[0].startswith("-"):
+            nested = nested[1:]
+        return _is_verification_segment(nested)
+    if exe in {"cargo", "go"}:
+        return len(segment) > 1 and segment[1] == "test"
+    if exe in {"npm", "pnpm", "yarn"}:
+        if len(segment) > 1 and segment[1] == "test":
+            return True
+        return len(segment) > 2 and segment[1] == "run" and segment[2] == "test"
+    if exe == "make":
+        return any(token in {"test", "check", "validate", "deploy-check"} for token in segment[1:] if not token.startswith("-"))
+    return False
+
+
+def _is_verification_command(tokens: list[str]) -> bool:
+    segment: list[str] = []
+    for token in tokens:
+        if token in SHELL_CONTROL_TOKENS:
+            if _is_verification_segment(segment):
+                return True
+            segment = []
+        else:
+            segment.append(token)
+    return _is_verification_segment(segment)
+
+
 def _classify_shell(command: str, cwd: str) -> tuple[str, str | None, str]:
     normalized = " ".join(command.strip().split())
     lowered = normalized.lower()
     fingerprint = _hash({"command": normalized})
-    if any(word in lowered for word in VERIFY_WORDS):
-        return "verify", _safe_target_from_tokens(normalized, cwd), fingerprint
     try:
         tokens = shlex.split(normalized, posix=True)
     except ValueError:
         return "execute", None, fingerprint
     if not tokens:
         return "execute", None, fingerprint
+    if _is_verification_command(tokens):
+        return "verify", _safe_target_from_tokens(normalized, cwd), fingerprint
     exe = os.path.basename(tokens[0])
     if exe in SEARCH_EXES:
         return "search", _safe_target_from_tokens(normalized, cwd), fingerprint
@@ -1068,6 +1129,7 @@ def build_report(
             "Agent Workspace event logs do not bind directly to provider session cwd; Work Lane target_path plus branch/revision is used.",
             "All exactly attributable provider sessions for one Work Lane are merged chronologically; target-only and ambiguous matches are excluded.",
             "Codex command normalization covers the live-validated exec_command, free-form exec, and bash-wrapped shell forms; direct mutation tools are not expanded from raw patch payloads, and outputs without explicit process status remain unknown.",
+            "Shell verification is recognized only from structurally known test/check runner invocations; incidental test-related words in reads, searches, scripts, or free text do not count as verification.",
             "Task-supplied localization evidence is intentionally not read from prompts, so detector C is advisory only.",
             "Historical provider logs do not expose a canonical post-every-action repository revision.",
             "Work Lane closeout reason codes are a narrower baseline than full PR CI/review evidence; any positive promotion candidate requires external baseline validation.",
