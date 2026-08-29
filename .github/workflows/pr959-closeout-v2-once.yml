@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  EXPECTED_PARENT: 765a638f3fed90aaaad0d269b9319f74b79395e7
+  EXPECTED_PARENT: 6af9ecc9d9205a5ff1ce0a1fe425a67fd9f1f3fa
   OLD_WRITER: .github/workflows/pr959-closeout-once.yml
   WRITER_PATH: .github/workflows/pr959-closeout-v2-once.yml
 
@@ -36,6 +36,16 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+
+      - name: Install pinned project dependencies for Python 3.12
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            "filelock==3.32.2" \
+            "jsonschema==4.26.0" \
+            "mcp==1.27.2" \
+            "pyyaml==6.0.3"
 
       - name: Merge current main and apply bounded review fixes
         shell: bash
@@ -101,6 +111,16 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.10"
+
+      - name: Install pinned project dependencies for Python 3.10
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check \
+            "filelock==3.32.2" \
+            "jsonschema==4.26.0" \
+            "mcp==1.27.2" \
+            "pyyaml==6.0.3"
 
       - name: Validate repository under Python 3.10
         shell: bash
