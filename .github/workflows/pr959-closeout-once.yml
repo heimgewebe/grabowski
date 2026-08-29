@@ -1,0 +1,312 @@
+name: PR 959 bounded closeout writer
+
+on:
+  push:
+    branches:
+      - bureau/grabowski-operator-surface-v1-fu-same-owner-branch-attempt-cas-20260821/8efba1a625
+
+permissions:
+  contents: write
+
+env:
+  EXPECTED_PARENT: 6d986e8456dbfd7f8a840ce1f86d77b13552635f
+  WRITER_PATH: .github/workflows/pr959-closeout-once.yml
+
+jobs:
+  closeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify one-shot preimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          test "$(git diff --name-only HEAD^ HEAD)" = "$WRITER_PATH"
+          test "$(git branch --show-current)" = "$GITHUB_REF_NAME"
+          test -z "$(git status --porcelain)"
+
+      - name: Merge main, harden review gaps, test, and publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "grabowski-pr959-closeout"
+          git config user.email "grabowski-pr959-closeout@users.noreply.github.com"
+          git fetch --no-tags origin main
+
+          set +e
+          git merge --no-ff --no-commit origin/main
+          merge_rc=$?
+          set -e
+          if [ "$merge_rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -gt 0
+            for path in "${conflicts[@]}"; do
+              case "$path" in
+                contracts/capability-catalog.v1.json|contracts/publication-profiles.v1.json|docs/generated/operator-context.md|docs/generated/operator-context.v1.json)
+                  git checkout --ours -- "$path"
+                  git add "$path"
+                  ;;
+                *)
+                  echo "Unexpected semantic merge conflict: $path" >&2
+                  exit 41
+                  ;;
+              esac
+            done
+            test -z "$(git diff --name-only --diff-filter=U)"
+          fi
+
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one patch anchor, found {count}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace_once(
+              "src/grabowski_operator.py",
+              '''    bound_ref = f"refs/heads/{bound_branch}"
+
+              if subcommand == "rebase":
+          ''',
+              '''    bound_ref = f"refs/heads/{bound_branch}"
+
+              if any(
+                  item == "--recurse-submodules" or item.startswith("--recurse-submodules=")
+                  for item in command_arguments
+              ):
+                  raise PermissionError(
+                      "recursive Git submodule mutation is blocked because a parent branch-attempt lease does not serialize nested repositories"
+                  )
+
+              if subcommand == "rebase":
+          ''',
+          )
+
+          replace_once(
+              "src/grabowski_operator.py",
+              '''        named_branch: str | None = None
+                  positional_only = False
+                  index = 0
+                  while index < len(command_arguments):
+                      item = command_arguments[index]
+                      if item == "--":
+                          positional_only = True
+                          index += 1
+                          continue
+                      if not positional_only and item in branch_options:
+          ''',
+              '''        value_options = {"--conflict"}
+                  if subcommand == "checkout":
+                      value_options.add("--pathspec-from-file")
+                  named_branch: str | None = None
+                  positional_only = False
+                  index = 0
+                  while index < len(command_arguments):
+                      item = command_arguments[index]
+                      if item == "--":
+                          positional_only = True
+                          index += 1
+                          continue
+                      if not positional_only and item in value_options:
+                          if index + 1 >= len(command_arguments):
+                              raise ValueError(f"git {subcommand} {item} requires a value")
+                          index += 2
+                          continue
+                      if not positional_only and any(
+                          item.startswith(option + "=") for option in value_options
+                      ):
+                          index += 1
+                          continue
+                      if not positional_only and item in branch_options:
+          ''',
+          )
+
+          replace_once(
+              "src/grabowski_resources.py",
+              '''        released = release_resources(
+                      owner, [branch_key], expected_leases=[expected_snapshot]
+                  )
+          ''',
+              '''        released = release_resources(
+                      owner,
+                      [branch_key],
+                      expected_leases=[expected_snapshot],
+                      _branch_attempt_cleanup_binding_sha256=binding_sha256,
+                  )
+          ''',
+          )
+
+          replace_once(
+              "src/grabowski_resources.py",
+              '''                row_metadata = _row_metadata(row)
+                          if row_metadata.get("lease_mode") == "emergency-recovery":
+          ''',
+              '''                row_metadata = _row_metadata(row)
+                          if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in row_metadata:
+                              raise RuntimeError(
+                                  "branch mutation attempt leases are non-renewable while an effect may be running"
+                              )
+                          if row_metadata.get("lease_mode") == "emergency-recovery":
+          ''',
+          )
+
+          replace_once(
+              "src/grabowski_resources.py",
+              '''def release_resources(
+                  owner_id: str,
+                  resource_keys: Iterable[str],
+                  *,
+                  force: bool = False,
+                  expected_leases: list[dict[str, Any]] | None = None,
+              ) -> dict[str, Any]:
+                  owner = _owner(owner_id)
+                  keys = normalize_resource_keys(resource_keys)
+                  expected_by_key: dict[str, dict[str, Any]] | None = None
+          ''',
+              '''def release_resources(
+                  owner_id: str,
+                  resource_keys: Iterable[str],
+                  *,
+                  force: bool = False,
+                  expected_leases: list[dict[str, Any]] | None = None,
+                  _branch_attempt_cleanup_binding_sha256: str | None = None,
+              ) -> dict[str, Any]:
+                  owner = _owner(owner_id)
+                  keys = normalize_resource_keys(resource_keys)
+                  if _branch_attempt_cleanup_binding_sha256 is not None:
+                      if (
+                          SHA256_RE.fullmatch(_branch_attempt_cleanup_binding_sha256) is None
+                          or force
+                          or expected_leases is None
+                          or len(keys) != 1
+                      ):
+                          raise ValueError("branch attempt cleanup binding is invalid")
+                  expected_by_key: dict[str, dict[str, Any]] | None = None
+          ''',
+          )
+
+          replace_once(
+              "src/grabowski_resources.py",
+              '''                if expected_by_key is not None and _release_lease_snapshot(
+                          row
+                      ) != expected_by_key[key]:
+                          raise RuntimeError(f"Resource lease changed before release: {key}")
+                      released.append(_public(row))
+          ''',
+              '''                if expected_by_key is not None and _release_lease_snapshot(
+                          row
+                      ) != expected_by_key[key]:
+                          raise RuntimeError(f"Resource lease changed before release: {key}")
+                      row_metadata = _row_metadata(row)
+                      active_attempt = row_metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
+                      if active_attempt is not None:
+                          if not isinstance(active_attempt, dict):
+                              raise RuntimeError("branch mutation attempt lease metadata is invalid")
+                          observed_binding = active_attempt.get("binding_sha256")
+                          if (
+                              not isinstance(observed_binding, str)
+                              or SHA256_RE.fullmatch(observed_binding) is None
+                          ):
+                              raise RuntimeError("branch mutation attempt binding metadata is invalid")
+                          if (
+                              expected_by_key is None
+                              or _branch_attempt_cleanup_binding_sha256 is None
+                              or observed_binding != _branch_attempt_cleanup_binding_sha256
+                          ):
+                              raise RuntimeError(
+                                  "live branch mutation attempt lease requires attempt-specific cleanup"
+                              )
+                      released.append(_public(row))
+          ''',
+          )
+
+          replace_once(
+              "tests/test_operator_contract.py",
+              '''            ["update-index", "--skip-worktree", "README.md"],
+                  ):
+          ''',
+              '''            ["update-index", "--skip-worktree", "README.md"],
+                      ["checkout", "--conflict", "merge", "other"],
+                      ["checkout", "--conflict=merge", "other"],
+                      ["switch", "--conflict", "merge", "other"],
+                      ["reset", "--hard", "--recurse-submodules"],
+                      ["checkout", "--recurse-submodules", "feature"],
+                  ):
+          ''',
+          )
+
+          replace_once(
+              "tests/test_operator_contract.py",
+              '''                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet"
+          ''',
+              '''                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet|submodule"
+          ''',
+          )
+
+          replace_once(
+              "tests/test_resources.py",
+              '''        self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))
+
+                  def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:
+          ''',
+              '''        self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))
+
+                  def test_branch_attempt_generic_release_and_renew_cannot_clear_live_marker(self) -> None:
+                      (self.root / ".git").mkdir()
+                      owner = "operator:attempt-generic-mutation"
+                      attempt = resources.acquire_branch_mutation_attempt(
+                          owner,
+                          str(self.root),
+                          "feat/generic-mutation-guard",
+                          operation_id="operation-a",
+                          attempt_id="attempt-1",
+                          expected_preimage_sha256="f" * 64,
+                          ttl_seconds=60,
+                      )
+                      key = attempt["resource_key"]
+                      snapshot = resources._release_lease_snapshot(attempt["lease"])
+
+                      with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
+                          resources.release_resources(owner, [key])
+                      with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
+                          resources.release_resources(
+                              owner, [key], expected_leases=[snapshot]
+                          )
+                      with self.assertRaisesRegex(RuntimeError, "non-renewable"):
+                          resources.renew_resources(owner, [key], ttl_seconds=120)
+                      with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
+                          resources.release_resources("operator:force-cleanup", [key], force=True)
+
+                      self.assertIsNotNone(resources.inspect_resource(key))
+                      cleanup = resources.complete_branch_mutation_attempt(attempt)
+                      self.assertEqual("released", cleanup["action"])
+                      self.assertIsNone(resources.inspect_resource(key))
+
+                  def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:
+          ''',
+          )
+          PY
+
+          make context-refresh
+          rm -- "$WRITER_PATH"
+          git add -A
+          git diff --cached --check
+
+          python -m unittest discover -s tests -p 'test_operator_contract.py' -v
+          python -m unittest discover -s tests -p 'test_resources.py' -v
+          make context-check profiles-check
+
+          git diff --cached --check
+          git status --short
+          git commit -m "fix(operator): close branch attempt review gaps"
+          git push origin "HEAD:$GITHUB_REF_NAME"
