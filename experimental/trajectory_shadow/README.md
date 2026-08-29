@@ -1,6 +1,6 @@
 # Trajectory shadow pilot (experimental)
 
-Status: **STOP / do not promote** (2026-08-28).
+Status: **STOP / do not promote** (final hardened rerun 2026-08-29).
 
 This directory contains a read-only, post-hoc pilot owned by the existing Bureau scope
 `GRABOWSKI-OPERATOR-SURFACE-V1-T047`. It is not a public runtime contract, does not
@@ -17,19 +17,18 @@ score. Outcome evidence remains authoritative for those questions.
 
 ## Live source audit
 
-The audit used local live state on 2026-08-28:
+The initial source audit used local live state on 2026-08-28. The final adapter and cohort
+were recalibrated against the then-current local sources on 2026-08-29.
 
-- Grabowski repo and Runtime were healthy; the experimental lane was isolated from
-  active unrelated work.
-- `attention_trace_v1` still reproduced the historical inventory: 59 Agent Workspaces,
+- `attention_trace_v1` reproduced the historical inventory: 59 Agent Workspaces,
   57 event logs, 552 events, 129 lifecycle events mappable to attention categories, and
   48 workspaces with any attention signal. It still has no direct search/read/edit/discover
-  observation.
+  observation and was not changed by this pilot.
 - Claude session logs were present under `~/.claude/projects`; Codex session logs were
   present under `~/.codex/sessions`; Pi was not present locally.
 - Mindwalk was neither installed as an executable nor importable as a Python module. No
-  dependency was added solely for this pilot because the local adapters were sufficient
-  to answer the utility question.
+  dependency was added solely for this pilot because local adapters were sufficient for
+  the utility test.
 
 ## Attribution gate
 
@@ -39,24 +38,27 @@ matches. The pilot therefore does not use repository+time-window guesses.
 Accepted attribution requires:
 
 1. exact Work Lane `target_path == session cwd`;
-2. the target path must identify exactly one Work Lane; and
-3. branch equality and/or exact base-revision equality.
+2. the target path must identify exactly one Work Lane;
+3. if both a session base revision and Work Lane base revision are known, they must agree;
+4. branch equality and/or exact base-revision equality must reinforce the target match.
 
+A known base-revision mismatch rejects attribution even when the branch name matches.
 Target-only and ambiguous matches are excluded. All exactly bound provider sessions for
 a lane are merged chronologically rather than selecting only the largest session.
 
-Final inventory:
+Recorded final rerun inventory:
 
-- 1,355 Work Lane receipts indexed;
+- 1,375 Work Lane receipts indexed;
 - 141 Claude sessions indexed;
-- 812 Codex sessions indexed;
-- 41 exactly attributable Work Lanes;
-- 90 exact session bindings across those lanes;
-- 32 Work Lanes with actual tool actions, used as the pilot cohort.
+- 813 Codex sessions indexed;
+- 39 exactly attributable Work Lanes;
+- 73 exact session bindings across those lanes;
+- 31 Work Lanes with actual tool actions, used as the pilot cohort.
 
-The 32-run cohort contains 10 baseline-success runs, 4 blocked runs, and 18 runs whose
+The 31-run cohort contains 10 baseline-success runs, 4 blocked runs, and 17 runs whose
 local Work Lane closeout baseline is incomplete/unknown. It includes 3 runs with observed
-tool failures and 2 runs with delegation/handoff events.
+tool failures and 2 runs with delegation/handoff events. The lower cohort size versus an
+earlier run is the expected result of rejecting known base-revision contradictions.
 
 ## Normalized trace
 
@@ -75,7 +77,7 @@ Only minimized metadata is persisted:
 
 The pilot does not persist Chain-of-Thought, prompts, commands, file contents, credentials,
 secret values, or raw tool outputs. Raw result material is consumed transiently only to
-produce SHA-256 equality digests.
+produce SHA-256 equality digests or establish bounded explicit status metadata.
 
 ## Exactly four detectors
 
@@ -85,7 +87,7 @@ produce SHA-256 equality digests.
    - no successful read/search/discover/context evidence between attempts.
 
 2. `verification_gap`
-   - only considered at an evidenced Work Lane closeout boundary;
+   - only considered at a successful evidenced Work Lane closeout boundary;
    - a successful repo mutation occurs after the last successful verification.
 
 3. `mutation_without_evidenced_localization`
@@ -95,9 +97,10 @@ produce SHA-256 equality digests.
 
 4. `action_oscillation_without_progress`
    - either A-B-A-B with equal repeated results and no state delta, or the stricter
-     edit -> failed verify -> inverse edit -> same edit -> same failed verify pattern.
+     successful edit -> failed verify -> successful inverse edit -> same successful edit
+     -> same failed verify pattern.
 
-## Calibration finding that prevented a false promotion
+## Calibration findings
 
 The first implementation produced one apparent high-confidence `verification_gap` with
 about 28,861 seconds of apparent lead time. Manual baseline validation showed that this
@@ -111,17 +114,36 @@ was a false positive:
   settlement was green.
 
 The adapter was hardened so external Read/Grep/Glob/Edit/Write targets cannot establish
-repo localization or repo mutation. A regression test covers this case. The pilot was then
-rerun from the full local sources.
+repo localization or repo mutation.
+
+A later Codex review exposed two additional material adapter gaps plus one attribution
+gap. A live local schema audit then showed:
+
+- 11,252 `exec_command` calls, with commands carried in `cmd`;
+- 2,080 `shell` calls, all observed as `bash` wrappers and 2,077 in the common
+  `bash -lc <inner command>` three-element form;
+- 16,690 free-form `exec` calls;
+- `exec_command` outputs commonly carry an explicit `Process exited with code N` wrapper.
+
+The final adapter recognizes only these live-validated command shapes. Explicit exit status
+establishes success/failure; absence of explicit process status remains `unknown` rather
+than being promoted to success. Generic free-text such as `exit code: 1` is not trusted as
+process status because it can be quoted command output.
+
+Direct mutation tools such as Codex `apply_patch` are deliberately not reconstructed from
+raw patch payloads. Closing that remaining visibility gap would require more raw-data
+processing and adapter complexity before this pilot has demonstrated any actionable
+benefit; under the pilot's usefulness gate, that is a reason to stop rather than to build
+more telemetry.
 
 ## Final pilot result
 
-The hardened 32-run cohort produced:
+The final hardened 31-run cohort produced:
 
-- 2,843 normalized tool events;
-- 149 reads, 70 searches, 13 discovers, 15 repo edits, 1 other repo mutation, 30 verifies,
-  35 delegates, and 2,530 other executions;
-- 9 observed tool failures across 3 runs;
+- 2,393 normalized tool events;
+- 149 reads, 70 searches, 13 discovers, 15 repo edits, 1 other repo mutation, 236 verifies,
+  35 delegates, and 1,874 other executions;
+- outcomes: 345 explicit successes, 9 explicit failures, and 2,039 unknown outcomes;
 - `repeated_failure_without_state_delta`: **0**;
 - `verification_gap`: **0**;
 - `action_oscillation_without_progress`: **0**;
@@ -133,6 +155,12 @@ The hardened 32-run cohort produced:
 - evidence-supported runtime saved: **0 seconds**;
 - measurable lead time: **none**;
 - token/compute savings: **not determinable**.
+
+The large unknown-outcome count is intentional evidence conservatism, not hidden success.
+It weakens any claim that the pilot proves trajectories can never help; it does not create
+positive evidence for building more machinery. Notably, correcting Codex command
+classification increased observed verifies from 30 in the earlier run to 236 in the final
+run, yet still produced no promotion-grade A, B, or D finding.
 
 The success-cohort "any finding" rate is 1/10 (10%). This is only a conservative
 false-positive proxy, not empirical precision: the remaining finding is detector C, for
@@ -147,19 +175,19 @@ diff/test/review/acceptance fact. Therefore any future promotion-grade candidate
 need a second join against existing PR/CI/review/outcome evidence before it could count as
 `actionable_incremental_information`.
 
-That broader baseline join is intentionally not built now: after adapter hardening there
-are no high-confidence candidates to validate, so adding more machinery cannot change the
-current STOP decision.
+That broader baseline join is intentionally not built now: after all observed adapter and
+attribution hardening there are no high-confidence candidates to validate, so adding more
+machinery has no demonstrated path to changing the current decision.
 
 ## Decision
 
 Do **not** create `trajectory_evidence_v1`, an online shadow path, a recovery advisory, a
 Mindwalk runtime dependency, a visualization, or a merge gate from this pilot.
 
-The evidence currently says that richer provider traces exist and can be attributed for a
-bounded cohort, but the four requested detectors did not demonstrate incremental,
-actionable information over the existing outcome/control-plane evidence. More telemetry
-alone is not a product improvement.
+The evidence does **not** say that trajectory information is universally useless. It says
+that this bounded real-run pilot, after material schema and attribution corrections, did
+not demonstrate incremental actionable information over existing outcome/control-plane
+evidence. More telemetry by itself is not a product improvement.
 
 Revisit only if new real failure cases appear whose existing Grabowski evidence is too late
 or insufficient, and use those cases as labeled counterexamples. T047 remains the existing

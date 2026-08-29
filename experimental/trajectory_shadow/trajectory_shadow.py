@@ -55,6 +55,8 @@ SEARCH_EXES = {"rg", "grep"}
 DISCOVER_EXES = {"find", "fd", "ls"}
 MUTATE_EXES = {"cp", "mv", "rm", "install", "touch", "patch"}
 CONTEXT_TOOL_MARKERS = ("repoground", "reposkop", "context_compose", "find_symbol", "get_callers")
+CODEX_SHELL_NAMES = {"exec", "exec_command", "shell", "local_shell", "local_shell_call"}
+CODEX_PROCESS_EXIT_RE = re.compile(r"(?m)^Process exited with code (-?\d+)\s*$")
 
 
 def _hash(value: Any) -> str:
@@ -341,6 +343,8 @@ def exact_attributions(
         if len(candidates) != 1:
             continue
         lane = candidates[0]
+        if session.base_commit and lane.base_head and session.base_commit != lane.base_head:
+            continue
         reinforcement: list[str] = []
         if session.branch and lane.branch and session.branch == lane.branch:
             reinforcement.append("branch")
@@ -491,9 +495,48 @@ def _parse_codex_input(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _codex_command(name: str, subtype: str, raw_input: Any, parsed_input: dict[str, Any]) -> str:
+    if name not in CODEX_SHELL_NAMES and subtype != "local_shell_call":
+        return ""
+    candidate: Any = None
+    if name == "exec" and isinstance(raw_input, str) and not parsed_input:
+        candidate = raw_input
+    else:
+        for key in ("cmd", "command", "shell_command"):
+            value = parsed_input.get(key)
+            if isinstance(value, (str, list)):
+                candidate = value
+                break
+    if isinstance(candidate, str):
+        return candidate
+    if isinstance(candidate, list) and candidate and all(isinstance(item, str) for item in candidate):
+        if (
+            len(candidate) >= 3
+            and os.path.basename(candidate[0]) in {"bash", "sh", "zsh"}
+            and candidate[1] in {"-c", "-lc"}
+        ):
+            return candidate[2]
+        return shlex.join(candidate)
+    return ""
+
+
+def _codex_exit_code(name: str, output: Any) -> int | None:
+    code = _exit_code(output)
+    if code is not None:
+        return code
+    # The live 2026-08-29 schema audit found this wrapper on exec_command
+    # outputs. Other free-form output text is deliberately not interpreted as
+    # process status because it may merely quote a command's own output.
+    if name == "exec_command" and isinstance(output, str):
+        match = CODEX_PROCESS_EXIT_RE.search(output)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def extract_codex(session: Session) -> list[Event]:
     events: list[Event] = []
-    pending: dict[str, int] = {}
+    pending: dict[str, tuple[int, str]] = {}
     sequence = 0
     try:
         handle = session.path.open(encoding="utf-8", errors="replace")
@@ -516,13 +559,10 @@ def extract_codex(session: Session) -> list[Event]:
                 sequence += 1
                 call_id = payload.get("call_id") or payload.get("id")
                 name = str(payload.get("name") or subtype)
-                inp = _parse_codex_input(payload.get("input") or payload.get("arguments"))
-                command = ""
-                for key in ("cmd", "command", "shell_command"):
-                    if isinstance(inp.get(key), str):
-                        command = inp[key]
-                        break
-                if name in {"exec", "local_shell", "local_shell_call"}:
+                raw_input = payload.get("input") if payload.get("input") is not None else payload.get("arguments")
+                inp = _parse_codex_input(raw_input)
+                command = _codex_command(name, subtype, raw_input, inp)
+                if command:
                     operation, target, command_hash = _classify_shell(command, session.cwd)
                 elif any(marker in name.lower() for marker in CONTEXT_TOOL_MARKERS):
                     operation, target, command_hash = "context", ".", _hash({"tool": name})
@@ -546,21 +586,17 @@ def extract_codex(session: Session) -> list[Event]:
                 )
                 events.append(event)
                 if isinstance(call_id, str):
-                    pending[call_id] = len(events) - 1
+                    pending[call_id] = (len(events) - 1, name)
             elif subtype in {"custom_tool_call_output", "function_call_output", "local_shell_call_output"}:
                 call_id = payload.get("call_id")
                 if not isinstance(call_id, str) or call_id not in pending:
                     continue
-                event = events[pending.pop(call_id)]
+                event_index, name = pending.pop(call_id)
+                event = events[event_index]
                 output = payload.get("output")
-                code = _exit_code(output)
-                if code is None and isinstance(output, str):
-                    try:
-                        decoded = json.loads(output)
-                    except json.JSONDecodeError:
-                        decoded = None
-                    code = _exit_code(decoded)
-                event.outcome = "failure" if code is not None and code != 0 else "success"
+                code = _codex_exit_code(name, output)
+                if code is not None:
+                    event.outcome = "failure" if code != 0 else "success"
                 event.result_fingerprint = _result_fingerprint(output)
                 if code is None:
                     event.confidence = min(event.confidence, 0.75)
@@ -718,6 +754,7 @@ def detect(
             continue
         if not (
             e1.operation == undo.operation == e2.operation == "edit"
+            and e1.outcome == undo.outcome == e2.outcome == "success"
             and v1.operation == v2.operation == "verify"
             and v1.outcome == v2.outcome == "failure"
             and e1.target == undo.target == e2.target
@@ -762,7 +799,7 @@ def _baseline_class(lane: Lane) -> str:
 
 
 def evaluate_lane(lane: Lane, session: Session, events: list[Event], reinforcement: tuple[str, ...]) -> dict[str, Any]:
-    findings = detect(events, terminal_evidenced=lane.closeout_state is not None)
+    findings = detect(events, terminal_evidenced=lane.closeout_state in SUCCESS_CLOSEOUTS)
     first_by_detector: dict[str, dict[str, Any]] = {}
     for finding in findings:
         first_by_detector.setdefault(finding["detector"], finding)
@@ -1030,7 +1067,7 @@ def build_report(
         "limitations": [
             "Agent Workspace event logs do not bind directly to provider session cwd; Work Lane target_path plus branch/revision is used.",
             "All exactly attributable provider sessions for one Work Lane are merged chronologically; target-only and ambiguous matches are excluded.",
-            "Codex shell classification is less complete than Claude native Read/Edit/Grep/Glob events.",
+            "Codex command normalization covers the live-validated exec_command, free-form exec, and bash-wrapped shell forms; direct mutation tools are not expanded from raw patch payloads, and outputs without explicit process status remain unknown.",
             "Task-supplied localization evidence is intentionally not read from prompts, so detector C is advisory only.",
             "Historical provider logs do not expose a canonical post-every-action repository revision.",
             "Work Lane closeout reason codes are a narrower baseline than full PR CI/review evidence; any positive promotion candidate requires external baseline validation.",

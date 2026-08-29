@@ -1,26 +1,26 @@
 {
   "cohort": {
-    "analyzed_runs": 32,
+    "analyzed_runs": 31,
     "baseline_classes": {
       "blocked": 4,
       "success": 10,
-      "unknown": 18
+      "unknown": 17
     },
     "claude_sessions_indexed": 141,
-    "codex_sessions_indexed": 812,
-    "exact_attributions": 41,
-    "exact_session_bindings": 90,
-    "exact_with_tool_actions": 32,
+    "codex_sessions_indexed": 813,
+    "exact_attributions": 39,
+    "exact_session_bindings": 73,
+    "exact_with_tool_actions": 31,
     "run_adapter_sets": {
       "claude": 7,
       "claude+codex": 3,
-      "codex": 22
+      "codex": 21
     },
     "session_adapter_counts": {
       "claude": 10,
-      "codex": 25
+      "codex": 24
     },
-    "work_lanes_indexed": 1355
+    "work_lanes_indexed": 1375
   },
   "decision": {
     "online_shadow": false,
@@ -57,7 +57,7 @@
   "limitations": [
     "Agent Workspace event logs do not bind directly to provider session cwd; Work Lane target_path plus branch/revision is used.",
     "All exactly attributable provider sessions for one Work Lane are merged chronologically; target-only and ambiguous matches are excluded.",
-    "Codex shell classification is less complete than Claude native Read/Edit/Grep/Glob events.",
+    "Codex command normalization covers the live-validated exec_command, free-form exec, and bash-wrapped shell forms; direct mutation tools are not expanded from raw patch payloads, and outputs without explicit process status remain unknown.",
     "Task-supplied localization evidence is intentionally not read from prompts, so detector C is advisory only.",
     "Historical provider logs do not expose a canonical post-every-action repository revision.",
     "Work Lane closeout reason codes are a narrower baseline than full PR CI/review evidence; any positive promotion candidate requires external baseline validation.",
@@ -114,7 +114,7 @@
         "execute": 57
       },
       "outcome_counts": {
-        "success": 57
+        "unknown": 57
       },
       "privacy": {
         "commands_persisted": false,
@@ -296,10 +296,11 @@
       "lane_id": "fd2a0fd141a55a7848748f02bc42f03e",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 47
+        "execute": 45,
+        "verify": 2
       },
       "outcome_counts": {
-        "success": 47
+        "unknown": 47
       },
       "privacy": {
         "commands_persisted": false,
@@ -329,16 +330,17 @@
         "lane_state": "ready",
         "reason_codes": []
       },
-      "event_count": 79,
+      "event_count": 56,
       "finding_counts": {},
       "findings": [],
       "lane_id": "5cd7689d9bd8ec6594b5f0900e4b8df0",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 79
+        "execute": 53,
+        "verify": 3
       },
       "outcome_counts": {
-        "success": 79
+        "unknown": 56
       },
       "privacy": {
         "commands_persisted": false,
@@ -348,8 +350,8 @@
         "prompts_persisted": false,
         "raw_tool_outputs_persisted": false
       },
-      "session_count": 7,
-      "session_tool_actions_indexed": 79,
+      "session_count": 5,
+      "session_tool_actions_indexed": 56,
       "source_adapter": "codex",
       "source_adapters": [
         "codex"
@@ -376,10 +378,11 @@
       "lane_id": "cc4c52d589ad8ff08ed14118caf3d34e",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 30
+        "execute": 20,
+        "verify": 10
       },
       "outcome_counts": {
-        "success": 30
+        "unknown": 30
       },
       "privacy": {
         "commands_persisted": false,
@@ -417,13 +420,14 @@
       "lane_id": "6352ac1e9a9177b7f7d1ac1a279f4406",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 48,
+        "execute": 37,
         "read": 20,
         "search": 20,
-        "verify": 8
+        "verify": 19
       },
       "outcome_counts": {
-        "success": 96
+        "success": 50,
+        "unknown": 46
       },
       "privacy": {
         "commands_persisted": false,
@@ -454,17 +458,19 @@
         "lane_state": "blocked",
         "reason_codes": []
       },
-      "event_count": 23,
+      "event_count": 15,
       "finding_counts": {},
       "findings": [],
       "lane_id": "c82c7a204a0569a9a5f5b994a27a20b8",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 20,
-        "read": 3
+        "execute": 9,
+        "read": 3,
+        "verify": 3
       },
       "outcome_counts": {
-        "success": 23
+        "success": 3,
+        "unknown": 12
       },
       "privacy": {
         "commands_persisted": false,
@@ -474,8 +480,8 @@
         "prompts_persisted": false,
         "raw_tool_outputs_persisted": false
       },
-      "session_count": 6,
-      "session_tool_actions_indexed": 23,
+      "session_count": 4,
+      "session_tool_actions_indexed": 15,
       "source_adapter": "claude+codex",
       "source_adapters": [
         "claude",
@@ -501,10 +507,11 @@
       "lane_id": "d0367a9001d17c808e99010fa1c03ddb",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 8
+        "execute": 6,
+        "verify": 2
       },
       "outcome_counts": {
-        "success": 8
+        "unknown": 8
       },
       "privacy": {
         "commands_persisted": false,
@@ -540,10 +547,11 @@
       "lane_id": "c5ed46f76b07d16315802bc5a53e7653",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 2
+        "execute": 1,
+        "verify": 1
       },
       "outcome_counts": {
-        "success": 2
+        "unknown": 2
       },
       "privacy": {
         "commands_persisted": false,
@@ -582,7 +590,7 @@
         "execute": 11
       },
       "outcome_counts": {
-        "success": 11
+        "unknown": 11
       },
       "privacy": {
         "commands_persisted": false,
@@ -612,16 +620,17 @@
         "lane_state": "blocked",
         "reason_codes": []
       },
-      "event_count": 352,
+      "event_count": 180,
       "finding_counts": {},
       "findings": [],
       "lane_id": "54464d73c706f2a09832f4fda859fa0d",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 352
+        "execute": 163,
+        "verify": 17
       },
       "outcome_counts": {
-        "success": 352
+        "unknown": 180
       },
       "privacy": {
         "commands_persisted": false,
@@ -631,8 +640,8 @@
         "prompts_persisted": false,
         "raw_tool_outputs_persisted": false
       },
-      "session_count": 12,
-      "session_tool_actions_indexed": 352,
+      "session_count": 7,
+      "session_tool_actions_indexed": 180,
       "source_adapter": "codex",
       "source_adapters": [
         "codex"
@@ -657,12 +666,14 @@
       "lane_id": "0db4fb8acf2b8d1c5f0d8ca527fd59a5",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 51,
+        "execute": 34,
         "read": 9,
-        "search": 4
+        "search": 4,
+        "verify": 17
       },
       "outcome_counts": {
-        "success": 64
+        "success": 13,
+        "unknown": 51
       },
       "privacy": {
         "commands_persisted": false,
@@ -677,44 +688,6 @@
       "source_adapter": "claude+codex",
       "source_adapters": [
         "claude",
-        "codex"
-      ]
-    },
-    {
-      "actionable_incremental_information": [],
-      "attribution": "exact",
-      "attribution_reinforcement": [
-        "branch"
-      ],
-      "baseline": {
-        "class": "unknown",
-        "closeout_state": null,
-        "lane_state": "ready",
-        "reason_codes": []
-      },
-      "event_count": 32,
-      "finding_counts": {},
-      "findings": [],
-      "lane_id": "23a540b3968f2d19efff4434ec51a1c1",
-      "lead_time_seconds_max": null,
-      "operation_counts": {
-        "execute": 32
-      },
-      "outcome_counts": {
-        "success": 32
-      },
-      "privacy": {
-        "commands_persisted": false,
-        "credentials_persisted": false,
-        "file_contents_persisted": false,
-        "only_result_digests_used_for_equality": true,
-        "prompts_persisted": false,
-        "raw_tool_outputs_persisted": false
-      },
-      "session_count": 1,
-      "session_tool_actions_indexed": 32,
-      "source_adapter": "codex",
-      "source_adapters": [
         "codex"
       ]
     },
@@ -824,10 +797,11 @@
       "lane_id": "3ed576ddb64f97762971ed14c5fb25ea",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 43
+        "execute": 31,
+        "verify": 12
       },
       "outcome_counts": {
-        "success": 43
+        "unknown": 43
       },
       "privacy": {
         "commands_persisted": false,
@@ -863,10 +837,11 @@
       "lane_id": "a60c30a9ed5fa63eda9bc292fa93fcc8",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 10
+        "execute": 8,
+        "verify": 2
       },
       "outcome_counts": {
-        "success": 10
+        "unknown": 10
       },
       "privacy": {
         "commands_persisted": false,
@@ -905,10 +880,11 @@
       "lead_time_seconds_max": null,
       "operation_counts": {
         "delegate": 32,
-        "execute": 633
+        "execute": 564,
+        "verify": 69
       },
       "outcome_counts": {
-        "success": 665
+        "unknown": 665
       },
       "privacy": {
         "commands_persisted": false,
@@ -1153,7 +1129,7 @@
         "execute": 58
       },
       "outcome_counts": {
-        "success": 58
+        "unknown": 58
       },
       "privacy": {
         "commands_persisted": false,
@@ -1189,10 +1165,11 @@
       "lane_id": "71b3a9c8915d1cc77b7913d26ad5edad",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 200
+        "execute": 183,
+        "verify": 17
       },
       "outcome_counts": {
-        "success": 200
+        "unknown": 200
       },
       "privacy": {
         "commands_persisted": false,
@@ -1233,7 +1210,7 @@
         "execute": 40
       },
       "outcome_counts": {
-        "success": 40
+        "unknown": 40
       },
       "privacy": {
         "commands_persisted": false,
@@ -1272,10 +1249,11 @@
       "lead_time_seconds_max": null,
       "operation_counts": {
         "delegate": 3,
-        "execute": 46
+        "execute": 40,
+        "verify": 6
       },
       "outcome_counts": {
-        "success": 49
+        "unknown": 49
       },
       "privacy": {
         "commands_persisted": false,
@@ -1311,10 +1289,11 @@
       "lane_id": "23d081cdbb683197e67589af6f221748",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 30
+        "execute": 28,
+        "verify": 2
       },
       "outcome_counts": {
-        "success": 30
+        "unknown": 30
       },
       "privacy": {
         "commands_persisted": false,
@@ -1350,10 +1329,11 @@
       "lane_id": "c28b5fbd35605233b9a7194a06e96724",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 67
+        "execute": 65,
+        "verify": 2
       },
       "outcome_counts": {
-        "success": 67
+        "unknown": 67
       },
       "privacy": {
         "commands_persisted": false,
@@ -1389,10 +1369,11 @@
       "lane_id": "88dfe71cfa99c239549c4ccc3ef2c489",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 150
+        "execute": 126,
+        "verify": 24
       },
       "outcome_counts": {
-        "success": 150
+        "unknown": 150
       },
       "privacy": {
         "commands_persisted": false,
@@ -1422,16 +1403,16 @@
         "lane_state": "ready",
         "reason_codes": []
       },
-      "event_count": 168,
+      "event_count": 61,
       "finding_counts": {},
       "findings": [],
       "lane_id": "2934752db6ec70640708febb1fd920ff",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 168
+        "execute": 61
       },
       "outcome_counts": {
-        "success": 168
+        "unknown": 61
       },
       "privacy": {
         "commands_persisted": false,
@@ -1441,8 +1422,8 @@
         "prompts_persisted": false,
         "raw_tool_outputs_persisted": false
       },
-      "session_count": 5,
-      "session_tool_actions_indexed": 168,
+      "session_count": 1,
+      "session_tool_actions_indexed": 61,
       "source_adapter": "codex",
       "source_adapters": [
         "codex"
@@ -1461,16 +1442,16 @@
         "lane_state": "ready",
         "reason_codes": []
       },
-      "event_count": 162,
+      "event_count": 54,
       "finding_counts": {},
       "findings": [],
       "lane_id": "f4abc092bc7b385789a99950425125a6",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 162
+        "execute": 54
       },
       "outcome_counts": {
-        "success": 162
+        "unknown": 54
       },
       "privacy": {
         "commands_persisted": false,
@@ -1480,8 +1461,8 @@
         "prompts_persisted": false,
         "raw_tool_outputs_persisted": false
       },
-      "session_count": 3,
-      "session_tool_actions_indexed": 162,
+      "session_count": 1,
+      "session_tool_actions_indexed": 54,
       "source_adapter": "codex",
       "source_adapters": [
         "codex"
@@ -1506,10 +1487,11 @@
       "lane_id": "80ca07b3016e78cf75d79c16f7048334",
       "lead_time_seconds_max": null,
       "operation_counts": {
-        "execute": 112
+        "execute": 106,
+        "verify": 6
       },
       "outcome_counts": {
-        "success": 112
+        "unknown": 112
       },
       "privacy": {
         "commands_persisted": false,
@@ -1535,21 +1517,22 @@
       "repeated_failure_without_state_delta": 0,
       "verification_gap": 0
     },
-    "events": 2843,
+    "events": 2393,
     "high_confidence_findings": 0,
     "operation_counts": {
       "delegate": 35,
       "discover": 13,
       "edit": 15,
-      "execute": 2530,
+      "execute": 1874,
       "mutate": 1,
       "read": 149,
       "search": 70,
-      "verify": 30
+      "verify": 236
     },
     "outcome_counts": {
       "failure": 9,
-      "success": 2834
+      "success": 345,
+      "unknown": 2039
     },
     "runs_with_delegation": 2,
     "runs_with_failure_events": 3

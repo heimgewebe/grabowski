@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from experimental.trajectory_shadow import trajectory_shadow as ts
@@ -63,6 +64,8 @@ def test_exact_attribution_rejects_target_only_and_ambiguous_targets(tmp_path: P
     lane = ts.Lane(lane_id="lane-1", target_path="/tmp/worktree", branch="branch-a", base_head="base-a", repo="/tmp/repo", source_kind="prompt", source_id=None, state="ready", created_at=1.0, updated_at=2.0, closeout_state=None, baseline_observed_at=None, baseline_reason_codes=())
     matches = ts.exact_attributions([lane], [session])
     assert matches["lane-1"][1][0][1] == ("branch", "base_revision")
+    conflicting_base = ts.Session(adapter="codex", path=tmp_path / "conflict.jsonl", session_id="conflict", cwd="/tmp/worktree", branch="branch-a", base_commit="different-base", tool_actions=1, first_at=1.0, last_at=2.0)
+    assert ts.exact_attributions([lane], [conflicting_base]) == {}
     target_only = ts.Session(adapter="claude", path=tmp_path / "session2.jsonl", session_id="s2", cwd="/tmp/worktree", branch=None, base_commit=None, tool_actions=10, first_at=1.0, last_at=2.0)
     assert ts.exact_attributions([lane], [target_only]) == {}
     duplicate = ts.Lane(lane_id="lane-2", target_path="/tmp/worktree", branch="branch-a", base_head="base-a", repo="/tmp/repo", source_kind="prompt", source_id=None, state="ready", created_at=1.0, updated_at=2.0, closeout_state=None, baseline_observed_at=None, baseline_reason_codes=())
@@ -100,3 +103,41 @@ def test_actionable_incremental_information_excludes_localization_only(tmp_path:
     result = ts.evaluate_lane(lane, session, events, ("branch",))
     assert result["finding_counts"]["mutation_without_evidenced_localization"] == 1
     assert all(item["detector"] != "mutation_without_evidenced_localization" for item in result["actionable_incremental_information"])
+
+
+def test_blocked_closeout_does_not_create_verification_gap() -> None:
+    lane = ts.Lane(lane_id="blocked", target_path="/tmp/worktree", branch="branch", base_head="base", repo="/tmp/repo", source_kind="prompt", source_id=None, state="blocked", created_at=1.0, updated_at=3.0, closeout_state="blocked_with_durable_followup", baseline_observed_at=3.0, baseline_reason_codes=("failure_observed",))
+    session = ts.Session(adapter="claude", path=Path("/tmp/session"), session_id="s", cwd="/tmp/worktree", branch="branch", base_commit=None, tool_actions=1, first_at=1.0, last_at=2.0)
+    result = ts.evaluate_lane(lane, session, [event(1, operation="edit", target="src/a.py", outcome="success")], ("branch",))
+    assert result["finding_counts"].get("verification_gap", 0) == 0
+
+
+def test_edit_fail_undo_pattern_requires_successful_edits() -> None:
+    events = [event(1, operation="edit", target="src/a.py", outcome="failure", mutation_from="old", mutation_to="new", state_epoch=0), event(2, operation="verify", outcome="failure", action="tests", result="failure", state_epoch=0), event(3, operation="edit", target="src/a.py", outcome="success", mutation_from="new", mutation_to="old", state_epoch=0), event(4, operation="edit", target="src/a.py", outcome="success", mutation_from="old", mutation_to="new", state_epoch=1), event(5, operation="verify", outcome="failure", action="tests", result="failure", state_epoch=2)]
+    findings = ts.detect(events, terminal_evidenced=False)
+    assert not any(item["detector"] == "action_oscillation_without_progress" and item.get("pattern") == "edit_fail_undo_same_edit_same_fail" for item in findings)
+
+
+def test_codex_command_schemas_and_explicit_outcomes(tmp_path: Path) -> None:
+    session_path = tmp_path / "codex.jsonl"
+    rows = [
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:01Z", "payload": {"type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": json.dumps({"cmd": "pytest -q tests/test_example.py", "workdir": "/tmp/worktree"})}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:02Z", "payload": {"type": "function_call_output", "call_id": "c1", "output": "Chunk ID: a\nProcess exited with code 1\nFinal output:\nfailed"}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:03Z", "payload": {"type": "function_call", "name": "exec_command", "call_id": "c2", "arguments": json.dumps({"cmd": "cat README.md", "workdir": "/tmp/worktree"})}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:04Z", "payload": {"type": "function_call_output", "call_id": "c2", "output": "Chunk ID: b\nProcess exited with code 0\nFinal output:\nok"}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:05Z", "payload": {"type": "function_call", "name": "shell", "call_id": "c3", "arguments": json.dumps({"command": ["bash", "-lc", "rg needle src"], "workdir": "/tmp/worktree"})}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:06Z", "payload": {"type": "function_call_output", "call_id": "c3", "output": "opaque shell output"}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:07Z", "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c4", "input": "rg needle src"}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:08Z", "payload": {"type": "custom_tool_call_output", "call_id": "c4", "output": ["opaque", "output"]}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:09Z", "payload": {"type": "function_call", "name": "exec_command", "call_id": "c5", "arguments": json.dumps({"cmd": "cat AGENTS.md", "workdir": "/tmp/worktree"})}},
+        {"type": "response_item", "timestamp": "2026-08-29T00:00:10Z", "payload": {"type": "function_call_output", "call_id": "c5", "output": "exit code: 1"}},
+    ]
+    session_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    session = ts.Session(adapter="codex", path=session_path, session_id="codex", cwd="/tmp/worktree", branch="branch", base_commit="base", tool_actions=5, first_at=1.0, last_at=10.0)
+    events = ts.extract_codex(session)
+
+    assert [item.operation for item in events] == ["verify", "read", "search", "search", "read"]
+    assert [item.outcome for item in events] == ["failure", "success", "unknown", "unknown", "unknown"]
+    assert events[0].result_fingerprint is not None
+    assert events[1].result_fingerprint is not None
+    assert events[4].confidence <= 0.75
