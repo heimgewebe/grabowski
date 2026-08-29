@@ -1871,39 +1871,14 @@ def _missing_finalization_deploy_is_runtime_proven(
     return proven
 
 
-def _linux_process_started_at_unix(pid: int) -> float | None:
-    """Return one Linux process start time without trusting wall-clock prose."""
-    if type(pid) is not int or pid <= 0:
-        return None
-    try:
-        process_stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        close = process_stat.rfind(")")
-        if close < 0:
-            return None
-        fields = process_stat[close + 2 :].split()
-        start_ticks = int(fields[19])
-        clock_ticks = int(os.sysconf("SC_CLK_TCK"))
-        boot_time = None
-        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
-            if line.startswith("btime "):
-                boot_time = int(line.split()[1])
-                break
-        if boot_time is None or clock_ticks <= 0:
-            return None
-        return boot_time + (start_ticks / clock_ticks)
-    except (OSError, UnicodeError, ValueError, IndexError):
-        return None
-
-
 def _active_runtime_process_matches_stable_pointer(deployment: dict[str, Any]) -> bool:
-    """Bind the live canonical operator to the current stable release pointer."""
+    """Bind the live canonical operator to the exact immutable stable release."""
     release_id = deployment.get("release_id")
     if not isinstance(release_id, str) or not release_id:
         return False
     stable_runtime = base.EXPECTED_STABLE_RUNTIME
     try:
-        pointer_info = stable_runtime.lstat()
-        if not stat.S_ISLNK(pointer_info.st_mode):
+        if not stable_runtime.is_symlink():
             return False
         release_path = stable_runtime.resolve(strict=True)
     except (OSError, RuntimeError):
@@ -1950,16 +1925,12 @@ def _active_runtime_process_matches_stable_pointer(deployment: dict[str, Any]) -
         pid = int(fields["MainPID"])
     except ValueError:
         return False
-    process_started = _linux_process_started_at_unix(pid)
-    if process_started is None or pointer_info.st_mtime > process_started:
-        # If the stable pointer changed after this process started, its original
-        # release cannot be recovered from argv alone.  Preserve the ambiguity.
-        return False
     try:
         raw_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
+        maps_text = Path(f"/proc/{pid}/maps").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
         return False
-    if not raw_cmdline or len(raw_cmdline) > 16 * 1024:
+    if not raw_cmdline or len(raw_cmdline) > 16 * 1024 or len(maps_text) > 8 * 1024 * 1024:
         return False
     try:
         argv = [
@@ -1979,7 +1950,27 @@ def _active_runtime_process_matches_stable_pointer(deployment: dict[str, Any]) -
         "--port",
         "18181",
     ]
-    return argv == expected
+    if argv != expected:
+        return False
+
+    releases_root = release_path.parent
+    mapped_release_ids: set[str] = set()
+    for line in maps_text.splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) != 6:
+            continue
+        mapped = parts[5]
+        if mapped.endswith(" (deleted)"):
+            if mapped.startswith(str(releases_root) + os.sep):
+                return False
+            continue
+        try:
+            relative = Path(mapped).relative_to(releases_root)
+        except ValueError:
+            continue
+        if relative.parts:
+            mapped_release_ids.add(relative.parts[0])
+    return mapped_release_ids == {release_id}
 
 
 def _missing_finalization_deploy_is_noeffect_proven(

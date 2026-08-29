@@ -1641,14 +1641,16 @@ class SelfDeployToolTests(unittest.TestCase):
                 self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
         write_index.assert_called_once_with(root, units=[], pending_unit=None)
 
-    def test_active_runtime_process_binding_requires_pointer_older_than_exact_operator(self) -> None:
+    def test_active_runtime_process_binding_requires_exact_mapped_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            release = root / "release-old"
-            release.mkdir()
+            releases = root / "grabowski-mcp-releases"
+            release = releases / "release-old"
+            other_release = releases / "release-new"
+            release.mkdir(parents=True)
+            other_release.mkdir()
             stable = root / "stable"
             stable.symlink_to(release)
-            pointer_mtime = stable.lstat().st_mtime
             cmdline = (
                 str(stable / ".venv/bin/python"),
                 "-m",
@@ -1668,11 +1670,21 @@ class SelfDeployToolTests(unittest.TestCase):
                 stderr="",
             )
             original_read_bytes = Path.read_bytes
+            original_read_text = Path.read_text
 
             def read_bytes(path: Path) -> bytes:
                 if str(path) == "/proc/123/cmdline":
                     return raw_cmdline
                 return original_read_bytes(path)
+
+            def exact_maps(path: Path, *args, **kwargs) -> str:
+                if str(path) == "/proc/123/maps":
+                    return (
+                        "00000000-00001000 r-xp 00000000 00:00 1 "
+                        + str(release / ".venv/lib/python3.10/site-packages/rpds.so")
+                        + "\n"
+                    )
+                return original_read_text(path, *args, **kwargs)
 
             with patch.object(
                 SELF_DEPLOY.base, "EXPECTED_STABLE_RUNTIME", stable, create=True
@@ -1681,7 +1693,7 @@ class SelfDeployToolTests(unittest.TestCase):
             ), patch.object(
                 Path, "read_bytes", read_bytes
             ), patch.object(
-                SELF_DEPLOY, "_linux_process_started_at_unix", return_value=pointer_mtime + 10
+                Path, "read_text", exact_maps
             ):
                 self.assertTrue(
                     SELF_DEPLOY._active_runtime_process_matches_stable_pointer(
@@ -1689,12 +1701,23 @@ class SelfDeployToolTests(unittest.TestCase):
                     )
                 )
 
+            def wrong_maps(path: Path, *args, **kwargs) -> str:
+                if str(path) == "/proc/123/maps":
+                    return (
+                        "00000000-00001000 r-xp 00000000 00:00 1 "
+                        + str(other_release / ".venv/lib/python3.10/site-packages/rpds.so")
+                        + "\n"
+                    )
+                return original_read_text(path, *args, **kwargs)
+
             with patch.object(
                 SELF_DEPLOY.base, "EXPECTED_STABLE_RUNTIME", stable, create=True
             ), patch.object(
                 SELF_DEPLOY.subprocess, "run", return_value=completed
             ), patch.object(
-                SELF_DEPLOY, "_linux_process_started_at_unix", return_value=pointer_mtime - 1
+                Path, "read_bytes", read_bytes
+            ), patch.object(
+                Path, "read_text", wrong_maps
             ):
                 self.assertFalse(
                     SELF_DEPLOY._active_runtime_process_matches_stable_pointer(
