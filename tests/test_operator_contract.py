@@ -2692,6 +2692,109 @@ class OperatorContractTests(unittest.TestCase):
         self.assertEqual("unborn", preimage["head_state"])
         self.assertRegex(preimage["preimage_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_git_branch_preimage_binds_unstaged_tracked_worktree_content(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+                check=True,
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "grabowski@example.invalid",
+                ],
+                check=True,
+            )
+            readme = repo / "README.md"
+            readme.write_text("baseline\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"],
+                check=True,
+            )
+
+            before = operator._git_branch_preimage(repo)
+            readme.write_text("unsaved\n", encoding="utf-8")
+            after = operator._git_branch_preimage(repo)
+
+        self.assertEqual(before["head"], after["head"])
+        self.assertEqual(before["index_sha256"], after["index_sha256"])
+        self.assertNotEqual(
+            before["worktree_diff_sha256"], after["worktree_diff_sha256"]
+        )
+        self.assertNotEqual(before["preimage_sha256"], after["preimage_sha256"])
+
+    def test_grabowski_git_stale_preimage_preserves_unstaged_edit_before_checkout(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+                check=True,
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "grabowski@example.invalid",
+                ],
+                check=True,
+            )
+            readme = repo / "README.md"
+            readme.write_text("baseline\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"],
+                check=True,
+            )
+            preimage = operator._git_branch_preimage(repo)
+            readme.write_text("unsaved\n", encoding="utf-8")
+
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                result = operator.grabowski_git(
+                    str(repo),
+                    ["checkout", "HEAD", "--", "README.md"],
+                    branch_attempt={
+                        "schema_version": 1,
+                        "owner_id": "operator:worktree-preimage",
+                        "operation_id": "operation-a",
+                        "attempt_id": "attempt-1",
+                        "branch": "feature",
+                        "expected_preimage_sha256": preimage["preimage_sha256"],
+                    },
+                )
+
+            receipt = result["branch_mutation"]
+            self.assertEqual("reconcile_required", receipt["status"])
+            self.assertEqual("git-preimage-drift-before-effect", receipt["reason"])
+            self.assertFalse(receipt["effect_attempted"])
+            self.assertNotEqual(
+                preimage["preimage_sha256"], receipt["observed_preimage_sha256"]
+            )
+            self.assertEqual("unsaved\n", readme.read_text(encoding="utf-8"))
+
     def test_grabowski_git_same_owner_competing_attempt_blocks_before_second_effect(self) -> None:
         operator = _load_operator_module()
         import grabowski_resources as resources
