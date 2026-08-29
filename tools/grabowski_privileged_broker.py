@@ -180,7 +180,9 @@ def _expected_package_apt_systemd_argv(plan_id: str, paths: list[str]) -> list[s
         "--property=PrivateNetwork=yes",
         f"--property=BindPaths={capture}:/run",
         "--property=ProtectProc=invisible",
-        "--property=ProcSubset=pid",
+        # Do not set ProcSubset=pid: kernel package maintainer scripts need
+        # read-only non-process /proc interfaces such as cmdline, cpuinfo,
+        # mounts and swaps while building initramfs and updating kernelstub.
         "--property=BindReadOnlyPaths=/dev/null:/run/systemd/private /dev/null:/run/dbus/system_bus_socket",
         "--property=ProtectKernelTunables=yes",
         # Kernel DEBs legitimately create /usr/lib/modules/<version> during unpack.
