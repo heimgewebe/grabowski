@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  EXPECTED_PARENT: 890f51e528f7b67266056d7b10383e782045e614
+  EXPECTED_PARENT: a343441797aec28d4121087530e1ba5a9be2e2c6
   WRITER_PATH: .github/workflows/pr959-closeout-once.yml
 
 jobs:
@@ -156,8 +156,8 @@ jobs:
                   )''',
           )
 
-          renew_path = Path("src/grabowski_resources.py")
-          resources_text = renew_path.read_text(encoding="utf-8")
+          resources_path = Path("src/grabowski_resources.py")
+          resources_text = resources_path.read_text(encoding="utf-8")
           renew_start = resources_text.index("def renew_resources(")
           release_start = resources_text.index("def release_resources(", renew_start)
           renew_block = resources_text[renew_start:release_start]
@@ -172,34 +172,20 @@ jobs:
                           if row_metadata.get("lease_mode") == "emergency-recovery":
           '''
           if renew_block.count(old_renew) != 1:
-              raise SystemExit(
-                  f"renew live-attempt guard: expected one block anchor, found {renew_block.count(old_renew)}"
-              )
+              raise SystemExit(f"renew live-attempt guard: found {renew_block.count(old_renew)} anchors")
           renew_block = renew_block.replace(old_renew, new_renew, 1)
           resources_text = resources_text[:renew_start] + renew_block + resources_text[release_start:]
-          renew_path.write_text(resources_text, encoding="utf-8")
-          print("patched: renew live-attempt guard")
 
-          replace_once(
-              "release private cleanup binding",
-              "src/grabowski_resources.py",
-              '''def release_resources(
-                  owner_id: str,
-                  resource_keys: Iterable[str],
-                  *,
-                  force: bool = False,
-                  expected_leases: list[dict[str, Any]] | None = None,
+          release_start = resources_text.index("def release_resources(")
+          inspect_start = resources_text.index("def inspect_resource(", release_start)
+          release_block = resources_text[release_start:inspect_start]
+          old_signature_tail = '''    expected_leases: list[dict[str, Any]] | None = None,
               ) -> dict[str, Any]:
                   owner = _owner(owner_id)
                   keys = normalize_resource_keys(resource_keys)
                   expected_by_key: dict[str, dict[str, Any]] | None = None
-          ''',
-              '''def release_resources(
-                  owner_id: str,
-                  resource_keys: Iterable[str],
-                  *,
-                  force: bool = False,
-                  expected_leases: list[dict[str, Any]] | None = None,
+          '''
+          new_signature_tail = '''    expected_leases: list[dict[str, Any]] | None = None,
                   _branch_attempt_cleanup_binding_sha256: str | None = None,
               ) -> dict[str, Any]:
                   owner = _owner(owner_id)
@@ -213,13 +199,11 @@ jobs:
                       ):
                           raise ValueError("branch attempt cleanup binding is invalid")
                   expected_by_key: dict[str, dict[str, Any]] | None = None
-          ''',
-          )
+          '''
+          if release_block.count(old_signature_tail) != 1:
+              raise SystemExit(f"release signature guard: found {release_block.count(old_signature_tail)} anchors")
+          release_block = release_block.replace(old_signature_tail, new_signature_tail, 1)
 
-          resources_text = renew_path.read_text(encoding="utf-8")
-          release_start = resources_text.index("def release_resources(")
-          inspect_start = resources_text.index("def inspect_resource(", release_start)
-          release_block = resources_text[release_start:inspect_start]
           old_release = '''                if expected_by_key is not None and _release_lease_snapshot(
                           row
                       ) != expected_by_key[key]:
@@ -252,13 +236,11 @@ jobs:
                       released.append(_public(row))
           '''
           if release_block.count(old_release) != 1:
-              raise SystemExit(
-                  f"release live-attempt guard: expected one block anchor, found {release_block.count(old_release)}"
-              )
+              raise SystemExit(f"release live-attempt guard: found {release_block.count(old_release)} anchors")
           release_block = release_block.replace(old_release, new_release, 1)
           resources_text = resources_text[:release_start] + release_block + resources_text[inspect_start:]
-          renew_path.write_text(resources_text, encoding="utf-8")
-          print("patched: release live-attempt guard")
+          resources_path.write_text(resources_text, encoding="utf-8")
+          print("patched: resource live-attempt renew/release guards")
 
           replace_once(
               "operator review regressions",
@@ -312,9 +294,7 @@ jobs:
                       with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
                           resources.release_resources(owner, [key])
                       with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
-                          resources.release_resources(
-                              owner, [key], expected_leases=[snapshot]
-                          )
+                          resources.release_resources(owner, [key], expected_leases=[snapshot])
                       with self.assertRaisesRegex(RuntimeError, "non-renewable"):
                           resources.renew_resources(owner, [key], ttl_seconds=120)
                       with self.assertRaisesRegex(RuntimeError, "attempt-specific cleanup"):
