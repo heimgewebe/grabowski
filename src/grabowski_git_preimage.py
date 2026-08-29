@@ -15,7 +15,7 @@ def capture_branch_preimage(
     *,
     require_attached: bool = True,
 ) -> dict[str, Any]:
-    """Build one exact branch/index CAS preimage from a caller-owned Git probe."""
+    """Build one exact branch/index/worktree CAS preimage from a caller-owned Git probe."""
     branch_probe = probe(["symbolic-ref", "--quiet", "--short", "HEAD"])
     branch: str | None = None
     if branch_probe.returncode == 0:
@@ -46,6 +46,23 @@ def capture_branch_preimage(
         raise RuntimeError("Git index observation failed")
     index_sha256 = hashlib.sha256(index_probe.stdout).hexdigest()
 
+    worktree_probe = probe(
+        [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--no-color",
+            "--ignore-submodules=none",
+            "--",
+        ]
+    )
+    if worktree_probe.returncode != 0:
+        raise RuntimeError("Git worktree observation failed")
+    worktree_diff_sha256 = hashlib.sha256(worktree_probe.stdout).hexdigest()
+
     operation_refs: dict[str, str] = {}
     for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
         ref_probe = probe(["rev-parse", "--verify", "--quiet", name])
@@ -63,6 +80,7 @@ def capture_branch_preimage(
         "head": head,
         "head_state": head_state,
         "index_sha256": index_sha256,
+        "worktree_diff_sha256": worktree_diff_sha256,
         "operation_refs": operation_refs,
     }
     return {
