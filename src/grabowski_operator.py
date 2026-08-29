@@ -4178,6 +4178,14 @@ def _reject_cross_branch_mutation_target(
     """Keep one branch-attempt lease scoped to the branch it actually protects."""
     bound_ref = f"refs/heads/{bound_branch}"
 
+    if any(
+        item == "--recurse-submodules" or item.startswith("--recurse-submodules=")
+        for item in command_arguments
+    ):
+        raise PermissionError(
+            f"git {subcommand} recursive submodule mutation is blocked because nested repositories are outside branch_attempt.branch authority"
+        )
+
     if subcommand == "rebase":
         raise PermissionError(
             "git rebase is blocked on the branch-attempt surface because a conflict can detach HEAD and escape the bound branch recovery contract"
@@ -4287,6 +4295,11 @@ def _reject_cross_branch_mutation_target(
                 if index + 1 >= len(command_arguments):
                     raise ValueError(f"git {subcommand} {item} requires a branch")
                 named_branch = command_arguments[index + 1]
+                index += 2
+                continue
+            if not positional_only and item in {"--conflict", "--pathspec-from-file"}:
+                if index + 1 >= len(command_arguments):
+                    raise ValueError(f"git {subcommand} {item} requires a value")
                 index += 2
                 continue
             if not positional_only:

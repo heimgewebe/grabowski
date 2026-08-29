@@ -5923,6 +5923,15 @@ def renew_resources(
                 ) != expected_by_key[key]:
                     raise RuntimeError(f"Resource lease changed before renew: {key}")
                 row_metadata = _row_metadata(row)
+                branch_attempt = row_metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
+                if branch_attempt is not None:
+                    if not isinstance(branch_attempt, dict):
+                        raise RuntimeError(
+                            f"Branch mutation attempt lease metadata is invalid: {key}"
+                        )
+                    raise RuntimeError(
+                        f"Live branch mutation attempt lease cannot be renewed generically: {key}; complete the exact branch attempt first"
+                    )
                 if row_metadata.get("lease_mode") == "emergency-recovery":
                     raise RuntimeError(
                         "emergency-recovery leases are non-renewable; "
@@ -6005,6 +6014,21 @@ def release_resources(
                     row
                 ) != expected_by_key[key]:
                     raise RuntimeError(f"Resource lease changed before release: {key}")
+                row_metadata = _row_metadata(row)
+                branch_attempt = row_metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
+                if branch_attempt is not None:
+                    if not isinstance(branch_attempt, dict):
+                        raise RuntimeError(
+                            f"Branch mutation attempt lease metadata is invalid: {key}"
+                        )
+                    if (
+                        force
+                        or expected_by_key is None
+                        or branch_attempt.get("lease_origin") != "attempt_only"
+                    ):
+                        raise RuntimeError(
+                            f"Live branch mutation attempt lease cannot be released generically: {key}; use exact branch-attempt cleanup"
+                        )
                 released.append(_public(row))
             if released:
                 connection.executemany(

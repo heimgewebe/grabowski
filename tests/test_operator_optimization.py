@@ -152,7 +152,42 @@ def current_work_provider(*_args, **_kwargs) -> dict:
             "primary_stage": "blocking",
             "blocking_count": 177,
         },
+        "scope_contract": {
+            "kind": "mixed_global_and_repository_filtered",
+            "repository_filters": [REPOSITORY],
+            "repository_filtered_sources": [
+                "checkouts",
+                "checkout_binding_reconciliation",
+            ],
+            "global_sources": [
+                "tasks",
+                "attention",
+                "resources",
+                "browser_workers",
+                "gui_workers",
+                "tmux",
+                "processes",
+            ],
+            "aggregate_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+            "repository_scoped_aggregates": False,
+            "aggregates_depend_on_repository_filters": True,
+            "filter_propagation": "repository-filtered checkout evidence may attach to global work groups and change their projected state or action reasons",
+            "does_not_establish": [
+                "repository-scoped total_projected",
+                "repository-scoped state_counts",
+                "repository-scoped convergence_summary",
+                "repository-filter-invariant aggregate values",
+            ],
+        },
+        "total_projected_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "state_counts_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "convergence_summary_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
         "source_counts": {"tasks": 2, "worktrees": 185},
+        "source_counts_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "unbound_physical_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "recommended_next_action_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "next_convergence_action_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "scope_notes": ["mixed source scope"],
         "source_truncation": {"attention": True, "tasks": False},
         "source_errors": [],
         "warnings": ["one or more source surfaces were truncated"],
@@ -192,7 +227,34 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         self.assertEqual(result["authority"], "derived_read_only_advisory")
         self.assertTrue(result["source_health"]["all_sources_available"])
         self.assertFalse(result["source_health"]["bounded_source_set_complete"])
+        self.assertFalse(
+            any(item.get("code") == "current_work_mixed_scope" for item in result["warnings"])
+        )
+        self.assertEqual(
+            result["scope"]["repositories_apply_to"],
+            [
+                "current_work.checkouts",
+                "current_work.checkout_binding_reconciliation",
+            ],
+        )
+        self.assertFalse(result["scope"]["repository_scoped_findings"])
+        self.assertEqual(
+            result["scope"]["current_work_scope_contract"]["kind"],
+            "mixed_global_and_repository_filtered",
+        )
+        current_finding = next(
+            item for item in result["findings"]
+            if item["id"] == "current_work_attention_noise"
+        )
+        self.assertIn("mixed-scope", current_finding["observation"])
+        self.assertIn("Global task", current_finding["alternative_interpretation"])
+        self.assertIn("genuinely contain many dirty", current_finding["alternative_interpretation"])
+        self.assertIn(
+            "repository_specific_blocker_count",
+            current_finding["does_not_establish"],
+        )
         self.assertIn("operator_productivity", result["does_not_establish"])
+        self.assertIn("repository_scoped_findings", result["does_not_establish"])
         self.assertTrue(result["report_sha256"])
 
     def test_report_uses_bounded_reclamation_and_retryability_attribution(self) -> None:
@@ -354,8 +416,79 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             "outcome-summary-sha",
         )
         self.assertIn("execution_governor_candidates", evidence)
+        self.assertEqual(
+            evidence["current_work_summary"]["scope_contract"]["kind"],
+            "mixed_global_and_repository_filtered",
+        )
+        self.assertEqual(
+            result["source_bindings"]["current_work"]["scope_contract"]["kind"],
+            "mixed_global_and_repository_filtered",
+        )
+        self.assertEqual(
+            evidence["current_work_summary"]["source_counts_scope"],
+            "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        )
+        self.assertIn("scope_notes", evidence["current_work_summary"])
         self.assertNotIn("events", evidence)
         self.assertNotIn("work", evidence["current_work_summary"])
+
+    def test_legacy_current_work_payload_remains_compatible(self) -> None:
+        def legacy_current_work_provider(*_args, **_kwargs) -> dict:
+            payload = current_work_provider()
+            for key in (
+                "scope_contract",
+                "total_projected_scope",
+                "state_counts_scope",
+                "convergence_summary_scope",
+                "source_counts_scope",
+                "unbound_physical_scope",
+                "recommended_next_action_scope",
+                "next_convergence_action_scope",
+                "scope_notes",
+            ):
+                payload.pop(key, None)
+            return payload
+
+        result = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            health_provider=health_provider,
+            audit_provider=audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=legacy_current_work_provider,
+        )
+        finding = next(
+            item for item in result["findings"]
+            if item["id"] == "current_work_attention_noise"
+        )
+        self.assertNotIn("mixed-scope", finding["observation"])
+        self.assertIn("genuinely contain many independent", finding["alternative_interpretation"])
+        self.assertIsNone(result["scope"]["current_work_scope_contract"])
+        self.assertIn("repository_specific_blocker_count", finding["does_not_establish"])
+
+    def test_scope_notes_do_not_degrade_source_health(self) -> None:
+        def complete_current_work_provider(*_args, **_kwargs) -> dict:
+            payload = current_work_provider()
+            payload["source_truncation"] = {
+                key: False for key in payload["source_truncation"]
+            }
+            payload["source_errors"] = []
+            payload["warnings"] = []
+            payload["scope_notes"] = ["mixed source scope"]
+            return payload
+
+        result = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            health_provider=health_provider,
+            audit_provider=audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=complete_current_work_provider,
+        )
+        self.assertTrue(result["source_health"]["bounded_source_set_complete"])
+        self.assertTrue(result["source_health"]["complete"])
 
     def test_partial_source_failure_is_explicit_not_false_green(self) -> None:
         def broken_health() -> dict:

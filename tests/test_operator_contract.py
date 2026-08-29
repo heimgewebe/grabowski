@@ -2637,6 +2637,7 @@ class OperatorContractTests(unittest.TestCase):
             ["checkout", "-Bother"],
             ["checkout", "-qbother"],
             ["checkout", "--orphan=other"],
+            ["checkout", "--conflict", "merge", "other"],
             ["switch", "other"],
             ["switch", "-c", "other"],
             ["switch", "-cother"],
@@ -2644,17 +2645,20 @@ class OperatorContractTests(unittest.TestCase):
             ["switch", "-qcother"],
             ["switch", "--create=other"],
             ["switch", "--force-create=other"],
+            ["switch", "--conflict", "merge", "other"],
             ["switch", "--detach", "HEAD"],
             ["switch", "--detach=HEAD"],
             ["switch", "-d", "HEAD"],
             ["rebase", "main", "other"],
             ["rebase", "--continue"],
+            ["reset", "--hard", "--recurse-submodules"],
+            ["restore", "--recurse-submodules", "README.md"],
             ["update-index", "--assume-unchanged", "README.md"],
             ["update-index", "--skip-worktree", "README.md"],
         ):
             with self.subTest(arguments=arguments):
                 with self.assertRaisesRegex(
-                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet"
+                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet|submodule"
                 ):
                     operator._reject_cross_branch_mutation_target(
                         arguments[0], arguments[1:], attempt["branch"]

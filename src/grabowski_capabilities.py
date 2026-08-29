@@ -1152,7 +1152,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_current_work": {
             "category": "operations-observability",
-            "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
+            "purpose": "Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

@@ -4757,6 +4757,31 @@ class ResourceTests(unittest.TestCase):
         self.assertTrue(cleanup["snapshot_guarded"])
         self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))
 
+    def test_branch_attempt_blocks_generic_release_and_renew_until_exact_cleanup(self) -> None:
+        (self.root / ".git").mkdir()
+        owner = "operator:attempt-protection"
+        branch = "feat/attempt-protection"
+        attempt = resources.acquire_branch_mutation_attempt(
+            owner,
+            str(self.root),
+            branch,
+            operation_id="operation-a",
+            attempt_id="attempt-1",
+            expected_preimage_sha256="f" * 64,
+            ttl_seconds=120,
+        )
+        key = attempt["resource_key"]
+
+        with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
+            resources.release_resources(owner, [key])
+        with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
+            resources.renew_resources(owner, [key], ttl_seconds=120)
+        self.assertIsNotNone(resources.inspect_resource(key))
+
+        cleanup = resources.complete_branch_mutation_attempt(attempt)
+        self.assertEqual("released", cleanup["action"])
+        self.assertIsNone(resources.inspect_resource(key))
+
     def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:
         (self.root / ".git").mkdir()
         key = f"repo:{self.root}"

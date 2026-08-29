@@ -81,7 +81,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_deployment_identity` | context | yes | low | Read bounded runtime identity and integrity flags without local paths. |
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |
 | `grabowski_checkout_summary` | version-control | yes | low | Read a bounded summary of Grabowski repository worktrees. |
-| `grabowski_current_work` | operations-observability | yes | low | Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth. |
+| `grabowski_current_work` | operations-observability | yes | low | Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth. |
 | `grabowski_work_acquire` | work-coordination | no | high | Atomically bind and prepare one controller lane, or persist and audit its evidence-bound terminal closeout with retry-safe audit recovery. |
 | `grabowski_reposkop_context` | repository-observation | no | low | Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt. |
 | `grabowski_operator_optimization_report` | operations-observability | yes | low | Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report. |
