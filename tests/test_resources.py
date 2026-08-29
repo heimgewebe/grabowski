@@ -4757,6 +4757,28 @@ class ResourceTests(unittest.TestCase):
         self.assertTrue(cleanup["snapshot_guarded"])
         self.assertIsNone(resources.inspect_resource(attempt["resource_key"]))
 
+    def test_branch_attempt_only_cleanup_rejects_snapshot_drift(self) -> None:
+        (self.root / ".git").mkdir()
+        attempt = resources.acquire_branch_mutation_attempt(
+            "operator:attempt-only-drift",
+            str(self.root),
+            "feat/attempt-only-drift",
+            operation_id="operation-a",
+            attempt_id="attempt-1",
+            expected_preimage_sha256="e" * 64,
+            ttl_seconds=120,
+        )
+        key = attempt["resource_key"]
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET updated_at_unix=updated_at_unix+1 WHERE resource_key=?",
+                (key,),
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "changed before cleanup"):
+            resources.complete_branch_mutation_attempt(attempt)
+        self.assertIsNotNone(resources.inspect_resource(key))
+
     def test_branch_attempt_blocks_generic_release_and_renew_until_exact_cleanup(self) -> None:
         (self.root / ".git").mkdir()
         owner = "operator:attempt-protection"
@@ -4771,11 +4793,37 @@ class ResourceTests(unittest.TestCase):
             ttl_seconds=120,
         )
         key = attempt["resource_key"]
+        expected_snapshot = resources._release_lease_snapshot(attempt["lease"])
 
         with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
             resources.release_resources(owner, [key])
         with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
+            resources.release_resources(
+                owner, [key], expected_leases=[expected_snapshot]
+            )
+        with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
+            resources.release_resources(
+                owner, [key], force=True, expected_leases=[expected_snapshot]
+            )
+        with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
             resources.renew_resources(owner, [key], ttl_seconds=120)
+        with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
+            resources.renew_resources(
+                owner,
+                [key],
+                ttl_seconds=120,
+                expected_leases=[expected_snapshot],
+            )
+        with self.assertRaisesRegex(RuntimeError, "branch mutation attempt"):
+            resources.rebind_same_owner_resources(
+                owner,
+                [key],
+                purpose="attempt rebind must fail",
+                ttl_seconds=120,
+                metadata={},
+                expected_current_leases=[expected_snapshot],
+                expected_original_leases=[expected_snapshot],
+            )
         self.assertIsNotNone(resources.inspect_resource(key))
 
         cleanup = resources.complete_branch_mutation_attempt(attempt)

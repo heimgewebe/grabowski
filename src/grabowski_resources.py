@@ -5595,13 +5595,57 @@ def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str,
         if not isinstance(expected, dict):
             raise ValueError("attempt-only lease snapshot is missing")
         expected_snapshot = _release_lease_snapshot(expected)
-        released = release_resources(
-            owner, [branch_key], expected_leases=[expected_snapshot]
-        )
-        if not isinstance(released.get("released"), list) or len(released["released"]) != 1:
-            raise RuntimeError("attempt-only branch lease release was not exact")
-        if _release_lease_snapshot(released["released"][0]) != expected_snapshot:
-            raise RuntimeError("attempt-only branch lease release snapshot drifted")
+        with _database() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "attempt-only branch lease disappeared before cleanup"
+                    )
+                if row["owner_id"] != owner:
+                    raise PermissionError(
+                        "attempt-only branch lease owner changed before cleanup"
+                    )
+                if _release_lease_snapshot(row) != expected_snapshot:
+                    raise RuntimeError(
+                        "attempt-only branch lease changed before cleanup"
+                    )
+                metadata = _row_metadata(row)
+                _, observed_metadata_sha256 = _metadata(metadata)
+                if row["metadata_sha256"] != observed_metadata_sha256:
+                    raise RuntimeError(
+                        f"Resource lease metadata integrity mismatch: {branch_key}"
+                    )
+                observed_attempt = metadata.get(
+                    BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                )
+                if not isinstance(observed_attempt, dict):
+                    raise RuntimeError(
+                        "branch mutation attempt marker disappeared before cleanup"
+                    )
+                if observed_attempt.get("binding_sha256") != binding_sha256:
+                    raise RuntimeError(
+                        "branch mutation attempt binding changed before cleanup"
+                    )
+                if observed_attempt.get("lease_origin") != "attempt_only":
+                    raise RuntimeError(
+                        "branch mutation attempt origin changed before cleanup"
+                    )
+                deleted = connection.execute(
+                    "DELETE FROM leases WHERE resource_key=? AND owner_id=?",
+                    (branch_key, owner),
+                )
+                if deleted.rowcount != 1:
+                    raise RuntimeError(
+                        "attempt-only branch lease release was not exact"
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         return {
             "schema_version": 1,
             "kind": "grabowski_branch_mutation_attempt_cleanup",
@@ -5794,6 +5838,17 @@ def rebind_same_owner_resources(
                 if row["metadata_sha256"] != observed_metadata_sha256:
                     raise RuntimeError(
                         f"Resource lease metadata integrity mismatch: {key}"
+                    )
+                branch_attempt = observed_metadata.get(
+                    BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                )
+                if branch_attempt is not None:
+                    if not isinstance(branch_attempt, dict):
+                        raise RuntimeError(
+                            f"Branch mutation attempt lease metadata is invalid: {key}"
+                        )
+                    raise RuntimeError(
+                        f"Live branch mutation attempt lease cannot be rebound generically: {key}; complete the exact branch attempt first"
                     )
                 observed_rows[key] = row
                 observed_metadata_by_key[key] = observed_metadata
@@ -6021,14 +6076,9 @@ def release_resources(
                         raise RuntimeError(
                             f"Branch mutation attempt lease metadata is invalid: {key}"
                         )
-                    if (
-                        force
-                        or expected_by_key is None
-                        or branch_attempt.get("lease_origin") != "attempt_only"
-                    ):
-                        raise RuntimeError(
-                            f"Live branch mutation attempt lease cannot be released generically: {key}; use exact branch-attempt cleanup"
-                        )
+                    raise RuntimeError(
+                        f"Live branch mutation attempt lease cannot be released generically: {key}; use exact branch-attempt cleanup"
+                    )
                 released.append(_public(row))
             if released:
                 connection.executemany(
