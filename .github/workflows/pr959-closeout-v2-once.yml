@@ -1,0 +1,125 @@
+name: PR 959 bounded closeout v2
+
+on:
+  push:
+    branches:
+      - bureau/grabowski-operator-surface-v1-fu-same-owner-branch-attempt-cas-20260821/8efba1a625
+
+permissions:
+  contents: write
+
+env:
+  EXPECTED_PARENT: 765a638f3fed90aaaad0d269b9319f74b79395e7
+  OLD_WRITER: .github/workflows/pr959-closeout-once.yml
+  WRITER_PATH: .github/workflows/pr959-closeout-v2-once.yml
+
+jobs:
+  closeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify one-shot preimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
+          test "$(git diff --name-only HEAD^ HEAD)" = "$WRITER_PATH"
+          test "$(git branch --show-current)" = "$GITHUB_REF_NAME"
+          test -z "$(git status --porcelain)"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Merge current main and apply bounded review fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "grabowski-pr959-closeout"
+          git config user.email "grabowski-pr959-closeout@users.noreply.github.com"
+          git fetch --no-tags origin main
+
+          set +e
+          git merge --no-ff --no-commit origin/main
+          merge_rc=$?
+          set -e
+          if [ "$merge_rc" -ne 0 ]; then
+            mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+            test "${#conflicts[@]}" -gt 0
+            for path in "${conflicts[@]}"; do
+              case "$path" in
+                contracts/capability-catalog.v1.json|contracts/publication-profiles.v1.json|docs/generated/operator-context.md|docs/generated/operator-context.v1.json)
+                  git checkout --ours -- "$path"
+                  git add "$path"
+                  ;;
+                *)
+                  echo "Unexpected semantic merge conflict: $path" >&2
+                  exit 41
+                  ;;
+              esac
+            done
+            test -z "$(git diff --name-only --diff-filter=U)"
+          fi
+
+          python - <<'EXTRACT'
+          from pathlib import Path
+
+          source = Path(".github/workflows/pr959-closeout-once.yml").read_text(encoding="utf-8")
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "          PY\n"
+          start = source.index(start_marker) + len(start_marker)
+          end = source.index(end_marker, start)
+          body = source[start:end]
+          lines = body.splitlines()
+          if not lines or any(line and not line.startswith("          ") for line in lines):
+              raise SystemExit("old writer patch body has unexpected indentation")
+          script = "\n".join(line[10:] if line else "" for line in lines) + "\n"
+          Path("/tmp/pr959_patch.py").write_text(script, encoding="utf-8")
+          EXTRACT
+
+          python /tmp/pr959_patch.py
+          python -m py_compile src/grabowski_operator.py src/grabowski_resources.py
+          make context-refresh
+          rm -- "$OLD_WRITER" "$WRITER_PATH"
+          git add -A
+          git diff --cached --check
+          test -z "$(git diff --name-only --diff-filter=U)"
+
+          python -m unittest discover -s tests -p 'test_operator_contract.py' -v
+          python -m unittest discover -s tests -p 'test_resources.py' -v
+          make validate
+          make deploy-check
+          git diff --cached --check
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+
+      - name: Validate repository under Python 3.10
+        shell: bash
+        run: |
+          set -euo pipefail
+          python --version
+          make validate
+          make deploy-check
+          git diff --cached --check
+          test -z "$(git diff --name-only --diff-filter=U)"
+
+      - name: Commit and publish exact validated tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$OLD_WRITER"
+          test ! -e "$WRITER_PATH"
+          test -z "$(git diff --name-only --diff-filter=U)"
+          git diff --cached --check
+          git status --short
+          git commit -m "fix(operator): close branch attempt review gaps"
+          git push origin "HEAD:$GITHUB_REF_NAME"
