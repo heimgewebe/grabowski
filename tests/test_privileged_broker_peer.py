@@ -1286,6 +1286,9 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertIs(preflight["exact_evidence"], True)
 
         apply_argv = broker_tool._expected_package_apt_systemd_argv(plan_id, [deb])
+        self.assertIn("--property=PrivateNetwork=yes", apply_argv)
+        self.assertIn("--property=ProtectKernelTunables=yes", apply_argv)
+        self.assertNotIn("--property=ProtectKernelModules=yes", apply_argv)
         operation = broker_tool._package_stage_operation(apply_argv)
         self.assertEqual(operation["kind"], "apply")
         self.assertEqual(operation["operation"], "apt_apply")
