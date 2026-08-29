@@ -2731,9 +2731,118 @@ class OperatorContractTests(unittest.TestCase):
         self.assertEqual(before["head"], after["head"])
         self.assertEqual(before["index_sha256"], after["index_sha256"])
         self.assertNotEqual(
-            before["worktree_diff_sha256"], after["worktree_diff_sha256"]
+            before["worktree_sha256"], after["worktree_sha256"]
         )
         self.assertNotEqual(before["preimage_sha256"], after["preimage_sha256"])
+
+    def test_grabowski_git_stale_preimage_preserves_normalized_eol_bytes_before_checkout(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"],
+                check=True,
+            )
+            (repo / ".gitattributes").write_text("README.md text eol=lf\n", encoding="utf-8")
+            readme = repo / "README.md"
+            readme.write_bytes(b"baseline\n")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes", "README.md"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"], check=True
+            )
+            preimage = operator._git_branch_preimage(repo)
+            readme.write_bytes(b"baseline\r\n")
+            semantic_diff = operator.subprocess.run(
+                ["git", "-C", str(repo), "diff", "--", "README.md"],
+                stdout=operator.subprocess.PIPE,
+                check=True,
+            )
+            self.assertEqual(b"", semantic_diff.stdout)
+
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                result = operator.grabowski_git(
+                    str(repo),
+                    ["checkout", "HEAD", "--", "README.md"],
+                    branch_attempt={
+                        "schema_version": 1,
+                        "owner_id": "operator:worktree-eol-preimage",
+                        "operation_id": "operation-a",
+                        "attempt_id": "attempt-1",
+                        "branch": "feature",
+                        "expected_preimage_sha256": preimage["preimage_sha256"],
+                    },
+                )
+
+            receipt = result["branch_mutation"]
+            self.assertEqual("reconcile_required", receipt["status"])
+            self.assertFalse(receipt["effect_attempted"])
+            self.assertEqual(b"baseline\r\n", readme.read_bytes())
+
+    def test_grabowski_git_stale_preimage_preserves_assume_unchanged_edit_before_checkout(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"],
+                check=True,
+            )
+            readme = repo / "README.md"
+            readme.write_text("baseline\n", encoding="utf-8")
+            operator.subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "update-index", "--assume-unchanged", "README.md"], check=True
+            )
+            preimage = operator._git_branch_preimage(repo)
+            readme.write_text("unsaved\n", encoding="utf-8")
+            semantic_diff = operator.subprocess.run(
+                ["git", "-C", str(repo), "diff", "--", "README.md"],
+                stdout=operator.subprocess.PIPE,
+                check=True,
+            )
+            self.assertEqual(b"", semantic_diff.stdout)
+
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                result = operator.grabowski_git(
+                    str(repo),
+                    ["checkout", "HEAD", "--", "README.md"],
+                    branch_attempt={
+                        "schema_version": 1,
+                        "owner_id": "operator:worktree-assume-preimage",
+                        "operation_id": "operation-a",
+                        "attempt_id": "attempt-1",
+                        "branch": "feature",
+                        "expected_preimage_sha256": preimage["preimage_sha256"],
+                    },
+                )
+
+            receipt = result["branch_mutation"]
+            self.assertEqual("reconcile_required", receipt["status"])
+            self.assertFalse(receipt["effect_attempted"])
+            self.assertEqual("unsaved\n", readme.read_text(encoding="utf-8"))
 
     def test_grabowski_git_stale_preimage_preserves_unstaged_edit_before_checkout(self) -> None:
         operator = _load_operator_module()
@@ -2766,6 +2875,28 @@ class OperatorContractTests(unittest.TestCase):
                 ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"],
                 check=True,
             )
+            preimage = operator._git_branch_preimage(repo)
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                clean_result = operator.grabowski_git(
+                    str(repo),
+                    ["checkout", "HEAD", "--", "README.md"],
+                    branch_attempt={
+                        "schema_version": 1,
+                        "owner_id": "operator:worktree-preimage-clean",
+                        "operation_id": "operation-clean",
+                        "attempt_id": "attempt-clean",
+                        "branch": "feature",
+                        "expected_preimage_sha256": preimage["preimage_sha256"],
+                    },
+                )
+            clean_receipt = clean_result["branch_mutation"]
+            self.assertEqual("completed", clean_receipt["status"])
+            self.assertTrue(clean_receipt["effect_attempted"])
+            self.assertEqual("baseline\n", readme.read_text(encoding="utf-8"))
+
             preimage = operator._git_branch_preimage(repo)
             readme.write_text("unsaved\n", encoding="utf-8")
 
