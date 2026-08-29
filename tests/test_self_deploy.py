@@ -1529,6 +1529,20 @@ class SelfDeployToolTests(unittest.TestCase):
                 "runtime_binding_valid": True,
                 "provenance_valid": True,
             }
+            deployment.update({
+                "runtime_input_identity_valid": True,
+                "lock_identity_valid": True,
+                "source_snapshot_identity_valid": True,
+                "runtime_asset_snapshot_identity_valid": True,
+                "embedded_contract_valid": True,
+                "entrypoint_contract_identity_valid": True,
+                "agent_instructions_identity_valid": True,
+                "executable_identity_valid": True,
+                "pip_identity_valid": True,
+                "protocol_identity_valid": True,
+                "python_runtime_identity_valid": True,
+                "platform_identity_valid": True,
+            })
             with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
                 SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
             ), patch.object(
@@ -1537,9 +1551,156 @@ class SelfDeployToolTests(unittest.TestCase):
                 SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
             ), patch.object(
                 SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ), patch.object(
+                SELF_DEPLOY, "_active_runtime_process_matches_stable_pointer", return_value=True
+            ), patch.object(
+                SELF_DEPLOY.midcutover,
+                "classify_from_durable_state",
+                return_value={
+                    "lane": SELF_DEPLOY.midcutover.LANE_FAIL_CLOSED,
+                    "reasons": ["selector_is_canonical"],
+                    "resume_binding": None,
+                },
             ):
                 with self.assertRaisesRegex(RuntimeError, "uncertain non-reusable outcome"):
                     SELF_DEPLOY._matching_inflight_deploy_job(desired, repo)
+
+    def test_missing_finalization_mismatched_runtime_is_pruned_when_recovery_proves_noeffect(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        previous = SELF_DEPLOY._deploy_command(repo, runner, "a" * 40, 8)
+        desired = SELF_DEPLOY._deploy_command(repo, runner, "b" * 40, 8)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": previous,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(previous),
+                "cwd": str(repo),
+            }
+            status = {
+                "final_status": "missing_finalization_evidence",
+                "finalization_receipt": {"valid": False, "state": "missing_receipt"},
+                "properties": {
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "Result": "success",
+                    "ExecMainStatus": "0",
+                },
+            }
+            deployment = {
+                "completion_status": "complete",
+                "repo_head": "c" * 40,
+                "manifest_parse_valid": True,
+                "manifest_schema_valid": True,
+                "release_path_valid": True,
+                "release_id_valid": True,
+                "repo_head_valid": True,
+                "stable_runtime_manifest_valid": True,
+                "runtime_pointer_valid": True,
+                "artifact_integrity_valid": True,
+                "runtime_asset_identity_valid": True,
+                "release_python_identity_valid": True,
+                "environment_compatibility_valid": True,
+                "runtime_binding_valid": True,
+                "provenance_valid": True,
+            }
+            classification = {
+                "lane": SELF_DEPLOY.midcutover.LANE_SCHEDULED_DEPLOY,
+                "reasons": [],
+                "resume_binding": None,
+            }
+            deployment.update({
+                "runtime_input_identity_valid": True,
+                "lock_identity_valid": True,
+                "source_snapshot_identity_valid": True,
+                "runtime_asset_snapshot_identity_valid": True,
+                "embedded_contract_valid": True,
+                "entrypoint_contract_identity_valid": True,
+                "agent_instructions_identity_valid": True,
+                "executable_identity_valid": True,
+                "pip_identity_valid": True,
+                "protocol_identity_valid": True,
+                "python_runtime_identity_valid": True,
+                "platform_identity_valid": True,
+            })
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=root), patch.object(
+                SELF_DEPLOY, "_deploy_index", return_value={"units": [job_dir.name], "pending_unit": None}
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator, "grabowski_job_status", return_value=status
+            ), patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata", return_value=deployment, create=True
+            ), patch.object(
+                SELF_DEPLOY, "_active_runtime_process_matches_stable_pointer", return_value=True
+            ), patch.object(
+                SELF_DEPLOY.midcutover, "classify_from_durable_state", return_value=classification
+            ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index:
+                self.assertIsNone(SELF_DEPLOY._matching_inflight_deploy_job(desired, repo))
+        write_index.assert_called_once_with(root, units=[], pending_unit=None)
+
+    def test_active_runtime_process_binding_requires_pointer_older_than_exact_operator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release = root / "release-old"
+            release.mkdir()
+            stable = root / "stable"
+            stable.symlink_to(release)
+            pointer_mtime = stable.lstat().st_mtime
+            cmdline = (
+                str(stable / ".venv/bin/python"),
+                "-m",
+                "grabowski_operator",
+                "--transport",
+                "streamable-http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "18181",
+            )
+            raw_cmdline = b"\0".join(item.encode() for item in cmdline) + b"\0"
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="MainPID=123\nLoadState=loaded\nActiveState=active\nSubState=running\n",
+                stderr="",
+            )
+            original_read_bytes = Path.read_bytes
+
+            def read_bytes(path: Path) -> bytes:
+                if str(path) == "/proc/123/cmdline":
+                    return raw_cmdline
+                return original_read_bytes(path)
+
+            with patch.object(
+                SELF_DEPLOY.base, "EXPECTED_STABLE_RUNTIME", stable, create=True
+            ), patch.object(
+                SELF_DEPLOY.subprocess, "run", return_value=completed
+            ), patch.object(
+                Path, "read_bytes", read_bytes
+            ), patch.object(
+                SELF_DEPLOY, "_linux_process_started_at_unix", return_value=pointer_mtime + 10
+            ):
+                self.assertTrue(
+                    SELF_DEPLOY._active_runtime_process_matches_stable_pointer(
+                        {"release_id": release.name}
+                    )
+                )
+
+            with patch.object(
+                SELF_DEPLOY.base, "EXPECTED_STABLE_RUNTIME", stable, create=True
+            ), patch.object(
+                SELF_DEPLOY.subprocess, "run", return_value=completed
+            ), patch.object(
+                SELF_DEPLOY, "_linux_process_started_at_unix", return_value=pointer_mtime - 1
+            ):
+                self.assertFalse(
+                    SELF_DEPLOY._active_runtime_process_matches_stable_pointer(
+                        {"release_id": release.name}
+                    )
+                )
 
     def test_missing_finalization_runtime_match_still_requires_sidecar_readback(self) -> None:
         status = {
