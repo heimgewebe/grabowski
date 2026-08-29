@@ -4196,6 +4196,10 @@ def _reject_cross_branch_mutation_target(
             raise PermissionError(
                 "git update-ref --stdin is blocked because its target refs are not argv-bound"
             )
+        if "--no-deref" in command_arguments:
+            raise PermissionError(
+                "git update-ref --no-deref is blocked because targeting HEAD would escape branch_attempt.branch"
+            )
         positionals: list[str] = []
         skip_value = False
         for item in command_arguments:
@@ -4215,6 +4219,10 @@ def _reject_cross_branch_mutation_target(
         return
 
     if subcommand == "symbolic-ref":
+        if any(item in {"--delete", "-d"} for item in command_arguments):
+            raise PermissionError(
+                "git symbolic-ref deletion is blocked because deleting HEAD would escape the attached branch contract"
+            )
         positionals: list[str] = []
         skip_value = False
         for item in command_arguments:
@@ -4281,6 +4289,30 @@ def _reject_cross_branch_mutation_target(
                 named_branch = command_arguments[index + 1]
                 index += 2
                 continue
+            if not positional_only:
+                attached_branch: str | None = None
+                short_branch_options = ("b", "B") if subcommand == "checkout" else ("c", "C")
+                if item.startswith("-") and not item.startswith("--"):
+                    short_cluster = item[1:]
+                    for option_index, option in enumerate(short_cluster):
+                        if option in short_branch_options:
+                            attached_branch = short_cluster[option_index + 1 :]
+                            if not attached_branch:
+                                raise ValueError(
+                                    f"git {subcommand} -{option} requires a branch"
+                                )
+                            break
+                if attached_branch is None:
+                    for long_option in ("--orphan=", "--create=", "--force-create="):
+                        if item.startswith(long_option):
+                            attached_branch = item[len(long_option) :]
+                            break
+                if attached_branch is not None:
+                    if not attached_branch:
+                        raise ValueError(f"git {subcommand} branch option requires a branch")
+                    named_branch = attached_branch
+                    index += 1
+                    continue
             if not positional_only and item.startswith("-"):
                 index += 1
                 continue
@@ -4473,6 +4505,10 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
     if subcommand == "stash":
         raise PermissionError(
             "Git stash is blocked because its repository-wide stash refs and stack are not serialized by a branch-attempt lease."
+        )
+    if subcommand == "pull":
+        raise PermissionError(
+            "Git pull is blocked because fetch-side refs and metadata are repository-wide and are not serialized by a branch-attempt lease."
         )
     if subcommand != "push":
         _reject_configured_alias(repo, subcommand)
@@ -5217,6 +5253,37 @@ def grabowski_git(
     subcommand, _command_arguments, _configurations = _split_git_invocation(arguments)
     execution_timeout_seconds = _timeout(timeout_seconds)
 
+    if subcommand == "push":
+        remote, _source, _destination = _parse_safe_push_arguments(_command_arguments)
+        command_prefix = [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            f"remote.{remote}.mirror=false",
+            "-c",
+            f"remote.{remote}.receivepack=git-receive-pack",
+            "-c",
+            "push.followTags=false",
+            "-c",
+            "push.pushOption=",
+            "-c",
+            "push.gpgSign=false",
+            "-c",
+            "push.recurseSubmodules=no",
+            "-C",
+            str(path),
+        ]
+        environment = _git_push_environment()
+    else:
+        command_prefix = ["git", "-C", str(path)]
+        environment = _git_environment()
+    command = _validate_argv([*command_prefix, *arguments], cwd=path)
+
     branch_context: dict[str, Any] | None = None
     if subcommand in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS:
         if branch_attempt is None:
@@ -5274,7 +5341,17 @@ def grabowski_git(
                 existing_attempt_binding_sha256=exc.existing_binding_sha256,
             )
 
-        observed_after_lease = _git_branch_preimage(path)
+        try:
+            observed_after_lease = _git_branch_preimage(path)
+        except Exception:
+            try:
+                resources.complete_branch_mutation_attempt(attempt_lease)
+            except Exception as cleanup_exc:
+                raise RuntimeError(
+                    "branch attempt cleanup failed after post-acquire Git preimage observation failed; "
+                    "reconcile the exact branch lease before another mutation"
+                ) from cleanup_exc
+            raise
         if (
             normalized_attempt["expected_preimage_sha256"]
             != observed_after_lease["preimage_sha256"]
@@ -5307,36 +5384,6 @@ def grabowski_git(
             "branch_attempt is accepted only for local branch/index mutation subcommands"
         )
 
-    if subcommand == "push":
-        remote, _source, _destination = _parse_safe_push_arguments(_command_arguments)
-        command_prefix = [
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "protocol.ext.allow=never",
-            "-c",
-            f"remote.{remote}.mirror=false",
-            "-c",
-            f"remote.{remote}.receivepack=git-receive-pack",
-            "-c",
-            "push.followTags=false",
-            "-c",
-            "push.pushOption=",
-            "-c",
-            "push.gpgSign=false",
-            "-c",
-            "push.recurseSubmodules=no",
-            "-C",
-            str(path),
-        ]
-        environment = _git_push_environment()
-    else:
-        command_prefix = ["git", "-C", str(path)]
-        environment = _git_environment()
-    command = _validate_argv([*command_prefix, *arguments], cwd=path)
     result = _run(
         command,
         cwd=path,

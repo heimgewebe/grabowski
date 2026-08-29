@@ -2604,15 +2604,12 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
                     operator.grabowski_git(str(repo), ["mv", "old", "new"])
 
-    def test_grabowski_git_pull_requires_branch_attempt(self) -> None:
+    def test_grabowski_git_pull_is_blocked_as_repository_wide_mutation(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            with (
-                patch.object(operator, "_require_operator_mutation", return_value=None),
-                patch.object(operator, "_guard_git", return_value=None),
-            ):
-                with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
+            with patch.object(operator, "_require_operator_mutation", return_value=None):
+                with self.assertRaisesRegex(PermissionError, "repository-wide"):
                     operator.grabowski_git(str(repo), ["pull", "--ff-only"])
 
     def test_grabowski_git_branch_attempt_blocks_other_branch_targets(self) -> None:
@@ -2628,13 +2625,25 @@ class OperatorContractTests(unittest.TestCase):
         for arguments in (
             ["update-ref", "refs/heads/other", "b" * 40],
             ["update-ref", "--stdin"],
+            ["update-ref", "--no-deref", "HEAD", "b" * 40],
             ["branch", "-f", "other", "HEAD"],
             ["symbolic-ref", "HEAD", "refs/heads/other"],
+            ["symbolic-ref", "--delete", "HEAD"],
+            ["symbolic-ref", "-d", "HEAD"],
             ["checkout", "other"],
             ["checkout", "--detach", "HEAD"],
             ["checkout", "-d", "HEAD"],
+            ["checkout", "-bother"],
+            ["checkout", "-Bother"],
+            ["checkout", "-qbother"],
+            ["checkout", "--orphan=other"],
             ["switch", "other"],
             ["switch", "-c", "other"],
+            ["switch", "-cother"],
+            ["switch", "-Cother"],
+            ["switch", "-qcother"],
+            ["switch", "--create=other"],
+            ["switch", "--force-create=other"],
             ["switch", "--detach", "HEAD"],
             ["switch", "--detach=HEAD"],
             ["switch", "-d", "HEAD"],
@@ -2645,7 +2654,7 @@ class OperatorContractTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments):
                 with self.assertRaisesRegex(
-                    PermissionError, "branch|target refs|detach|rebase|index"
+                    PermissionError, "branch|target refs|detach|rebase|index|HEAD|delet"
                 ):
                     operator._reject_cross_branch_mutation_target(
                         arguments[0], arguments[1:], attempt["branch"]
@@ -2947,6 +2956,83 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(
                 preimage["preimage_sha256"], second["branch_mutation"]["postimage_sha256"]
             )
+
+    def test_grabowski_git_cleans_attempt_lease_when_post_acquire_preimage_read_fails(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(["git", "init", "-q", "-b", "feature", str(repo)], check=True)
+            preimage = operator._git_branch_preimage(repo)
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:preimage-cleanup",
+                "operation_id": "operation-a",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+                "expected_preimage_sha256": preimage["preimage_sha256"],
+            }
+            lease = {
+                "resource_key": "repo:/tmp/repo:branch:feature",
+                "attempt_binding_sha256": "b" * 64,
+                "lease": {"metadata_sha256": "c" * 64, "expires_at_unix": 9999999999},
+            }
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_validate_argv", side_effect=lambda argv, cwd: argv),
+                patch.object(
+                    operator,
+                    "_git_branch_preimage",
+                    side_effect=[preimage, RuntimeError("post-acquire read failed")],
+                ),
+                patch.object(resources, "acquire_branch_mutation_attempt", return_value=lease),
+                patch.object(
+                    resources,
+                    "complete_branch_mutation_attempt",
+                    return_value={"action": "released"},
+                ) as cleanup,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "post-acquire read failed"):
+                    operator.grabowski_git(
+                        str(repo),
+                        ["update-index", "--refresh"],
+                        branch_attempt=attempt,
+                    )
+            cleanup.assert_called_once_with(lease)
+
+    def test_grabowski_git_validates_command_before_attempt_lease_acquisition(self) -> None:
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(["git", "init", "-q", "-b", "feature", str(repo)], check=True)
+            preimage = operator._git_branch_preimage(repo)
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:validation-order",
+                "operation_id": "operation-a",
+                "attempt_id": "attempt-1",
+                "branch": "feature",
+                "expected_preimage_sha256": preimage["preimage_sha256"],
+            }
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(
+                    operator,
+                    "_validate_argv",
+                    side_effect=PermissionError("blocked before lease"),
+                ),
+                patch.object(resources, "acquire_branch_mutation_attempt") as acquire,
+            ):
+                with self.assertRaisesRegex(PermissionError, "before lease"):
+                    operator.grabowski_git(
+                        str(repo),
+                        ["update-index", "--refresh"],
+                        branch_attempt=attempt,
+                    )
+            acquire.assert_not_called()
 
     def test_grabowski_git_uses_sanitized_git_environment(self) -> None:
         operator = _load_operator_module()
