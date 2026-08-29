@@ -1090,6 +1090,35 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 ]
             )
 
+    def test_repository_filters_do_not_claim_global_source_scope(self) -> None:
+        result = project(
+            tasks_payload={
+                "tasks": [task("global-task", cwd="/home/alex/repos/other")],
+                "pagination": {"has_more": False},
+            }
+        )
+
+        self.assertEqual(result["work"][0]["work_id"], "task:global-task")
+        scope = result["scope_contract"]
+        self.assertEqual(scope["kind"], "mixed_global_and_repository_filtered")
+        self.assertIn("tasks", scope["global_sources"])
+        self.assertIn("attention", scope["global_sources"])
+        self.assertIn("checkouts", scope["repository_filtered_sources"])
+        self.assertIn(
+            "checkout_binding_reconciliation", scope["repository_filtered_sources"]
+        )
+        self.assertFalse(scope["repository_scoped_aggregates"])
+        self.assertEqual(result["total_projected_scope"], current_work.MIXED_SOURCE_SCOPE)
+        self.assertEqual(
+            result["convergence_summary_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertTrue(
+            any("repository filters apply only" in item for item in result["warnings"])
+        )
+        self.assertTrue(
+            any("repository-scoped total_projected" in item for item in result["does_not_establish"])
+        )
+
     def test_truncation_and_source_errors_are_visible(self) -> None:
         result = project(
             tasks_payload={"tasks": [], "pagination": {"has_more": True}},
@@ -1225,8 +1254,12 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("task-lifecycle-unresolved-for-live-lease", group["action_reasons"])
         self.assertEqual(group["observation"]["completeness"], "partial")
-        self.assertEqual(result["total_projected_scope"], "bounded_source_snapshot")
-        self.assertEqual(result["state_counts_scope"], "bounded_source_snapshot")
+        self.assertEqual(
+            result["total_projected_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            result["state_counts_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
 
     def test_archived_attention_with_live_task_lease_is_blocking(self) -> None:
         task_id = "closed-live-lease"

@@ -77,6 +77,11 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         self.assertEqual(result["view"], "current")
         self.assertEqual(result["total_projected"], 1)
         self.assertEqual(result["work"][0]["work_id"], "task:abc123")
+        self.assertEqual(
+            result["scope_contract"]["kind"],
+            "mixed_global_and_repository_filtered",
+        )
+        self.assertFalse(result["scope_contract"]["repository_scoped_aggregates"])
         self.assertIn(
             "a new independently mutable lifecycle or work-state truth",
             result["does_not_establish"],

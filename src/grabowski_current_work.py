@@ -19,6 +19,20 @@ MAX_UNBOUND_SAMPLE = 50
 MAX_TEXT = 512
 MAX_CURSOR = 128
 PAGE_LIMIT_MAX = 50
+MIXED_SOURCE_SCOPE = "mixed_global_and_repository_filtered_bounded_source_snapshot"
+GLOBAL_SOURCE_NAMES = (
+    "tasks",
+    "attention",
+    "resources",
+    "browser_workers",
+    "gui_workers",
+    "tmux",
+    "processes",
+)
+REPOSITORY_FILTERED_SOURCE_NAMES = (
+    "checkouts",
+    "checkout_binding_reconciliation",
+)
 
 ACTIVE_TASK_STATES = {"launching", "running"}
 TERMINAL_TASK_STATES = {
@@ -61,6 +75,22 @@ SAFE_ID_RE = re.compile(r"[A-Za-z0-9_.:@/+\-=]{1,256}\Z")
 
 class CurrentWorkProjectionError(ValueError):
     pass
+
+
+def _scope_contract(repositories: list[str]) -> dict[str, Any]:
+    return {
+        "kind": "mixed_global_and_repository_filtered",
+        "repository_filters": list(repositories),
+        "repository_filtered_sources": list(REPOSITORY_FILTERED_SOURCE_NAMES),
+        "global_sources": list(GLOBAL_SOURCE_NAMES),
+        "aggregate_scope": MIXED_SOURCE_SCOPE,
+        "repository_scoped_aggregates": False,
+        "does_not_establish": [
+            "repository-scoped total_projected",
+            "repository-scoped state_counts",
+            "repository-scoped convergence_summary",
+        ],
+    }
 
 
 def _text(value: Any, field: str, *, empty: bool = False) -> str:
@@ -1937,8 +1967,10 @@ def build_current_work_projection(
             "priority": 9,
         }
 
+    scope_contract = _scope_contract(repositories)
     snapshot_material = {
         "view": view,
+        "scope_contract": scope_contract,
         "groups": [_snapshot_group(group) for group in projected],
         "unbound_tmux": unbound_tmux,
         "unbound_processes": sorted(
@@ -1990,6 +2022,10 @@ def build_current_work_projection(
         warnings.append(
             "bounded page mixes heuristic-only hygiene with positively bound work"
         )
+    warnings.append(
+        "repository filters apply only to checkout and checkout-binding reconciliation "
+        "sources; aggregate counts also include global operator sources"
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1998,11 +2034,13 @@ def build_current_work_projection(
         "generated_at_unix": generated_at_unix,
         "snapshot_sha256": snapshot_sha256,
         "repository_filters": repositories,
+        "scope_contract": scope_contract,
         "count": len(page),
         "total_projected": len(projected),
-        "total_projected_scope": "bounded_source_snapshot",
+        "total_projected_scope": MIXED_SOURCE_SCOPE,
         "state_counts": state_counts,
-        "state_counts_scope": "bounded_source_snapshot",
+        "state_counts_scope": MIXED_SOURCE_SCOPE,
+        "convergence_summary_scope": MIXED_SOURCE_SCOPE,
         "selection": {
             "authority_or_physical_bound_count": page_positive_bound,
             "heuristic_only_count": page_heuristic_only,
@@ -2082,6 +2120,7 @@ def build_current_work_projection(
             "GitHub PR status or remote deployment truth not collected by current_work",
             "permission to delete dirty checkout state",
             "cleanup safety without terminal+clean+remote-secured+coordination-free evidence",
+            "repository-scoped total_projected, state_counts or convergence_summary from repository_filters alone",
         ],
     }
 

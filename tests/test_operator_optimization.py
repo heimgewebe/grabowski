@@ -152,6 +152,33 @@ def current_work_provider(*_args, **_kwargs) -> dict:
             "primary_stage": "blocking",
             "blocking_count": 177,
         },
+        "scope_contract": {
+            "kind": "mixed_global_and_repository_filtered",
+            "repository_filters": [REPOSITORY],
+            "repository_filtered_sources": [
+                "checkouts",
+                "checkout_binding_reconciliation",
+            ],
+            "global_sources": [
+                "tasks",
+                "attention",
+                "resources",
+                "browser_workers",
+                "gui_workers",
+                "tmux",
+                "processes",
+            ],
+            "aggregate_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+            "repository_scoped_aggregates": False,
+            "does_not_establish": [
+                "repository-scoped total_projected",
+                "repository-scoped state_counts",
+                "repository-scoped convergence_summary",
+            ],
+        },
+        "total_projected_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "state_counts_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
+        "convergence_summary_scope": "mixed_global_and_repository_filtered_bounded_source_snapshot",
         "source_counts": {"tasks": 2, "worktrees": 185},
         "source_truncation": {"attention": True, "tasks": False},
         "source_errors": [],
@@ -192,6 +219,21 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         self.assertEqual(result["authority"], "derived_read_only_advisory")
         self.assertTrue(result["source_health"]["all_sources_available"])
         self.assertFalse(result["source_health"]["bounded_source_set_complete"])
+        mixed_warning = next(
+            item for item in result["warnings"]
+            if item.get("code") == "current_work_mixed_scope"
+        )
+        self.assertIn("tasks", mixed_warning["global_sources"])
+        current_finding = next(
+            item for item in result["findings"]
+            if item["id"] == "current_work_attention_noise"
+        )
+        self.assertIn("mixed-scope", current_finding["observation"])
+        self.assertIn("Global task", current_finding["alternative_interpretation"])
+        self.assertIn(
+            "repository_specific_blocker_count",
+            current_finding["does_not_establish"],
+        )
         self.assertIn("operator_productivity", result["does_not_establish"])
         self.assertTrue(result["report_sha256"])
 
@@ -354,6 +396,14 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             "outcome-summary-sha",
         )
         self.assertIn("execution_governor_candidates", evidence)
+        self.assertEqual(
+            evidence["current_work_summary"]["scope_contract"]["kind"],
+            "mixed_global_and_repository_filtered",
+        )
+        self.assertEqual(
+            result["source_bindings"]["current_work"]["scope_contract"]["kind"],
+            "mixed_global_and_repository_filtered",
+        )
         self.assertNotIn("events", evidence)
         self.assertNotIn("work", evidence["current_work_summary"])
 
