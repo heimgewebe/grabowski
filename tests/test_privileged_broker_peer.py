@@ -1286,6 +1286,25 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
         self.assertIs(preflight["exact_evidence"], True)
 
         apply_argv = broker_tool._expected_package_apt_systemd_argv(plan_id, [deb])
+        self.assertIn("--property=PrivateNetwork=yes", apply_argv)
+        self.assertIn("--property=ProtectProc=invisible", apply_argv)
+        self.assertNotIn("--property=ProcSubset=pid", apply_argv)
+        self.assertNotIn("--property=PrivateDevices=yes", apply_argv)
+        self.assertIn("--property=DevicePolicy=closed", apply_argv)
+        self.assertNotIn("--property=DeviceAllow=block-* r", apply_argv)
+        self.assertIn("--property=DeviceAllow=/dev/nvme0n1p3 r", apply_argv)
+        self.assertIn("--property=DeviceAllow=/dev/nvme0n1p1 r", apply_argv)
+        self.assertIn("--property=ProtectKernelTunables=yes", apply_argv)
+        self.assertNotIn("--property=ProtectKernelModules=yes", apply_argv)
+        self.assertTrue(
+            any(
+                value.startswith("--property=CapabilityBoundingSet=")
+                and "CAP_SYS_MODULE" in value
+                for value in apply_argv
+            )
+        )
+        self.assertIn("--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK", apply_argv)
+        self.assertIn("--property=IPAddressDeny=any", apply_argv)
         operation = broker_tool._package_stage_operation(apply_argv)
         self.assertEqual(operation["kind"], "apply")
         self.assertEqual(operation["operation"], "apt_apply")

@@ -71,7 +71,9 @@ async def grabowski_current_work(
         list[str],
         Field(
             description=(
-                "Absolute local repository paths; short aliases such as "
+                "Absolute local repository paths used only to scope checkout and "
+                "checkout-binding reconciliation sources; task, attention, lease, "
+                "worker and physical sources remain global. Short aliases such as "
                 "'grabowski' are rejected."
             )
         ),
@@ -87,7 +89,7 @@ async def grabowski_current_work(
     ] = 20,
     cursor: str | None = None,
 ) -> dict[str, object]:
-    """Project work for absolute local repository paths without blocking the MCP event loop."""
+    """Project global operator work plus repository-filtered Git surfaces without blocking the MCP event loop."""
     return await asyncio.to_thread(
         grabowski_current_work_surface.grabowski_current_work,
         repositories,

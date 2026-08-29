@@ -1090,6 +1090,162 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 ]
             )
 
+    def test_repository_filters_do_not_claim_global_source_scope(self) -> None:
+        result = project(
+            tasks_payload={
+                "tasks": [task("global-task", cwd="/home/alex/repos/other")],
+                "pagination": {"has_more": False},
+            }
+        )
+
+        self.assertEqual(result["work"][0]["work_id"], "task:global-task")
+        scope = result["scope_contract"]
+        self.assertEqual(scope["kind"], "mixed_global_and_repository_filtered")
+        self.assertIn("tasks", scope["global_sources"])
+        self.assertIn("attention", scope["global_sources"])
+        self.assertIn("checkouts", scope["repository_filtered_sources"])
+        self.assertIn(
+            "checkout_binding_reconciliation", scope["repository_filtered_sources"]
+        )
+        self.assertFalse(scope["repository_scoped_aggregates"])
+        self.assertTrue(scope["aggregates_depend_on_repository_filters"])
+        self.assertIn("attach to global work groups", scope["filter_propagation"])
+        self.assertEqual(result["total_projected_scope"], current_work.MIXED_SOURCE_SCOPE)
+        self.assertEqual(result["source_counts_scope"], current_work.MIXED_SOURCE_SCOPE)
+        self.assertEqual(
+            result["convergence_summary_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            result["unbound_physical_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            result["recommended_next_action_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            result["next_convergence_action_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertTrue(
+            any("repository filters apply only" in item for item in result["scope_notes"])
+        )
+        self.assertFalse(
+            any("repository filters apply only" in item for item in result["warnings"])
+        )
+        self.assertTrue(
+            any("repository-scoped total_projected" in item for item in result["does_not_establish"])
+        )
+        self.assertTrue(
+            any("filter-invariant" in item for item in result["does_not_establish"])
+        )
+
+    def test_scope_source_enumeration_matches_collected_source_contract(self) -> None:
+        result = project()
+        scope = result["scope_contract"]
+        global_sources = set(scope["global_sources"])
+        filtered_sources = set(scope["repository_filtered_sources"])
+        self.assertFalse(global_sources & filtered_sources)
+        self.assertEqual(
+            global_sources | filtered_sources,
+            set(result["source_truncation"]) - {"source_errors"},
+        )
+
+    def test_repository_filter_can_change_globally_sourced_task_projection(self) -> None:
+        other_repo = "/home/alex/repos/other"
+        checkout_path = "/home/alex/repos/.worktrees/filter-propagation"
+        task_payload = {
+            "tasks": [
+                task(
+                    "global-propagation",
+                    state="running",
+                    cwd="/home/alex/global",
+                    resource_keys=[f"path:{checkout_path}"],
+                )
+            ],
+            "pagination": {"has_more": False},
+        }
+        narrow = project(
+            tasks_payload=task_payload,
+            repository_filters=[REPOSITORY],
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": []}],
+        )
+        broad = project(
+            tasks_payload=task_payload,
+            repository_filters=[REPOSITORY, other_repo],
+            checkout_payloads=[
+                {"repository": REPOSITORY, "worktrees": []},
+                {
+                    "repository": other_repo,
+                    "worktrees": [
+                        checkout(
+                            "filter-propagation",
+                            checkout_path,
+                            dirty=True,
+                            blocking=True,
+                        )
+                    ],
+                },
+            ],
+        )
+        narrow_group = next(
+            item for item in narrow["work"]
+            if item["work_id"] == "task:global-propagation"
+        )
+        broad_group = next(
+            item for item in broad["work"]
+            if item["work_id"] == "task:global-propagation"
+        )
+        self.assertEqual(narrow_group["projection_state"], "active")
+        self.assertFalse(narrow_group["action_required"])
+        self.assertEqual(broad_group["projection_state"], "blocking")
+        self.assertTrue(broad_group["action_required"])
+        self.assertIn("dirty-checkout-resource-overlap", broad_group["action_reasons"])
+
+    def test_repository_filter_can_change_unbound_physical_classification(self) -> None:
+        workspace = "filter-propagation"
+        other_repo = "/home/alex/repos/other"
+        checkout_path = "/home/alex/repos/.worktrees/filter-physical-propagation"
+        tmux_payload = {
+            "returncode": 0,
+            "stdout": f"{workspace}\t1\t0\t80\n",
+        }
+        narrow = project(
+            repository_filters=[REPOSITORY],
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": []}],
+            tmux_payload=tmux_payload,
+        )
+        broad = project(
+            repository_filters=[REPOSITORY, other_repo],
+            checkout_payloads=[
+                {"repository": REPOSITORY, "worktrees": []},
+                {
+                    "repository": other_repo,
+                    "worktrees": [
+                        checkout(
+                            "filter-physical-propagation",
+                            checkout_path,
+                            lifecycle_state="retained",
+                            binding_owner=f"agent-workspace:{workspace}",
+                            binding_phase="active",
+                            retention_active=True,
+                        )
+                    ],
+                },
+            ],
+            tmux_payload=tmux_payload,
+        )
+
+        self.assertEqual(narrow["unbound_physical"]["tmux_total_unbound"], 1)
+        self.assertEqual(broad["unbound_physical"]["tmux_total_unbound"], 0)
+        self.assertEqual(
+            narrow["unbound_physical_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            broad["unbound_physical_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertIn(
+            "physical observations are classified as unbound",
+            broad["scope_contract"]["filter_propagation"],
+        )
+
     def test_truncation_and_source_errors_are_visible(self) -> None:
         result = project(
             tasks_payload={"tasks": [], "pagination": {"has_more": True}},
@@ -1225,8 +1381,12 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("task-lifecycle-unresolved-for-live-lease", group["action_reasons"])
         self.assertEqual(group["observation"]["completeness"], "partial")
-        self.assertEqual(result["total_projected_scope"], "bounded_source_snapshot")
-        self.assertEqual(result["state_counts_scope"], "bounded_source_snapshot")
+        self.assertEqual(
+            result["total_projected_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
+        self.assertEqual(
+            result["state_counts_scope"], current_work.MIXED_SOURCE_SCOPE
+        )
 
     def test_archived_attention_with_live_task_lease_is_blocking(self) -> None:
         task_id = "closed-live-lease"
