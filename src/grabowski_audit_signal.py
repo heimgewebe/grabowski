@@ -133,19 +133,32 @@ def _audit_transition_identity(
     return None
 
 
+def _audit_transition_identity_fields_present(
+    intent: str, record: dict[str, Any]
+) -> bool:
+    return intent == "runtime-state-retention-intent" and (
+        "plan_sha256" in record or "attempt" in record
+    )
+
+
 def _audit_transition_match_index(
     intent: str,
     entries: list[tuple[dict[str, Any], int]],
     completion_record: dict[str, Any],
 ) -> int | None:
+    completion_fields_present = _audit_transition_identity_fields_present(
+        intent, completion_record
+    )
     completion_identity = _audit_transition_identity(intent, completion_record)
-    if completion_identity is not None:
+    if completion_fields_present:
+        if completion_identity is None:
+            return None
         for index, (candidate, _timestamp_unix) in enumerate(entries):
             if _audit_transition_identity(intent, candidate) == completion_identity:
                 return index
         return None
     for index, (candidate, _timestamp_unix) in enumerate(entries):
-        if _audit_transition_identity(intent, candidate) is None:
+        if not _audit_transition_identity_fields_present(intent, candidate):
             return index
     return None
 
@@ -210,8 +223,9 @@ def _audit_transition_gap_signal(
             "unmatched_intents_by_transition": dict(sorted(by_transition.items())),
             "completed_pairs_by_transition": dict(sorted(completed_counts.items())),
             "pairing_semantics": (
-                "retention pairs by (plan_sha256, attempt) when present; "
-                "records without identity and other transition families use FIFO"
+                "retention pairs by (plan_sha256, attempt) when present and valid; "
+                "only records with both identity fields absent use legacy FIFO; "
+                "other transition families use FIFO"
             ),
         },
         does_not_establish=[
