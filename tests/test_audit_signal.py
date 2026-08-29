@@ -168,6 +168,114 @@ class AuditSignalTests(unittest.TestCase):
         )
         self.assertEqual((result["status"], result["count"]), ("clear", 0))
 
+    def test_retention_completion_matches_identity_before_legacy_fifo(self) -> None:
+        now = 1_800_000_000
+        plan_sha256 = "1" * 64
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": "a" * 64,
+                    },
+                    now - 1_000,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": "b" * 64,
+                        "plan_sha256": plan_sha256,
+                        "attempt": 2,
+                    },
+                    now - 900,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-complete",
+                        "record_sha256": "c" * 64,
+                        "plan_sha256": plan_sha256,
+                        "attempt": 2,
+                    },
+                    now - 899,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["severity"], result["count"]), ("observed", "high", 1))
+        self.assertEqual(
+            result["evidence_refs"], ["audit-record-sha256:" + "a" * 64]
+        )
+        self.assertEqual(
+            result["details"]["completed_pairs_by_transition"],
+            {"runtime-state-retention-intent": 1},
+        )
+
+    def test_retention_completion_does_not_consume_different_identity(self) -> None:
+        now = 1_800_000_000
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": "d" * 64,
+                        "plan_sha256": "1" * 64,
+                        "attempt": 1,
+                    },
+                    now - 1_000,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-complete",
+                        "record_sha256": "e" * 64,
+                        "plan_sha256": "2" * 64,
+                        "attempt": 1,
+                    },
+                    now - 999,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["severity"], result["count"]), ("observed", "high", 1))
+        self.assertEqual(
+            result["evidence_refs"], ["audit-record-sha256:" + "d" * 64]
+        )
+
+    def test_deployment_transition_keeps_fifo_pairing(self) -> None:
+        now = 1_800_000_000
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-deploy-schedule-intent",
+                        "record_sha256": "a" * 64,
+                    },
+                    now - 1_000,
+                ),
+                (
+                    {
+                        "operation": "runtime-deploy-schedule-intent",
+                        "record_sha256": "b" * 64,
+                    },
+                    now - 900,
+                ),
+                (
+                    {
+                        "operation": "runtime-deploy-scheduled",
+                        "record_sha256": "c" * 64,
+                    },
+                    now - 800,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["count"]), ("observed", 1))
+        self.assertEqual(
+            result["evidence_refs"], ["audit-record-sha256:" + "b" * 64]
+        )
+
     def test_incomplete_friction_window_is_not_false_clear(self) -> None:
         source = {
             "available": True,
