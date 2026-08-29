@@ -540,6 +540,13 @@ def reduce_verifications(
             verifier: observed[verifier]["verifier_attempt"]
             for verifier in sorted(observed)
         },
+        "verifier_provenance": {
+            verifier: {
+                "verification_receipt_sha256": observed[verifier]["receipt_sha256"],
+                "source_role_receipt_sha256": observed[verifier]["source_role_receipt_sha256"],
+            }
+            for verifier in sorted(observed)
+        },
         "outcome": outcome,
         "findings": normalized_findings,
         "findings_sha256": sha256_json(normalized_findings),
