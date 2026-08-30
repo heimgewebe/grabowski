@@ -403,6 +403,197 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             set(runner.TREATMENT_RESOURCE_TOOLS) | set(runner.TREATMENT_MCP_TOOLS),
         )
 
+    def test_current_resource_aliases_and_structured_output_are_internal(self) -> None:
+        value = request(condition="treatment")
+        current_tools = [
+            *runner.READ_ONLY_BUILTINS,
+            runner.STRUCTURED_OUTPUT_TOOL,
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            *runner.TREATMENT_MCP_TOOLS,
+        ]
+        messages = runner.parse_jsonl(
+            stream(
+                value,
+                tool_name="ReadMcpResourceTool",
+                init_tools=current_tools,
+            )
+        )
+        assistant = next(item for item in messages if item["type"] == "assistant")
+        assistant["message"]["content"].append(
+            {
+                "type": "tool_use",
+                "id": "structured-output-1",
+                "name": runner.STRUCTURED_OUTPUT_TOOL,
+                "input": answer(),
+            }
+        )
+        raw = b"".join(
+            json.dumps(item, sort_keys=True).encode("utf-8") + b"\n"
+            for item in messages
+        )
+        started = datetime.now(timezone.utc)
+        receipt = runner.build_receipt(
+            value,
+            raw,
+            transcript_artifact="transcript.jsonl",
+            returncode=0,
+            started_at=started,
+            ended_at=started,
+        )
+        self.assertEqual(
+            receipt["tool_calls"],
+            [
+                {
+                    "sequence": 1,
+                    "name": "repobrief_resource_read",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": len(
+                        runner._canonical_json(
+                            {"file_path": "src/example.py"}
+                        ).encode("utf-8")
+                    ),
+                    "output_bytes": len(
+                        runner._canonical_json(
+                            "def example():\n    return True\n"
+                        ).encode("utf-8")
+                    ),
+                }
+            ],
+        )
+        baseline = request()
+        runner.build_receipt(
+            baseline,
+            stream(
+                baseline,
+                init_tools=[*runner.READ_ONLY_BUILTINS, runner.STRUCTURED_OUTPUT_TOOL],
+            ),
+            transcript_artifact="baseline.jsonl",
+            returncode=0,
+            started_at=started,
+            ended_at=started,
+        )
+
+    def test_extra_repobrief_tool_surface_and_use_are_rejected(self) -> None:
+        value = request(condition="treatment")
+        current_tools = [
+            *runner.READ_ONLY_BUILTINS,
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            *runner.TREATMENT_MCP_TOOLS,
+        ]
+        started = datetime.now(timezone.utc)
+        t002h_extra_tools = [
+            "mcp__repobrief__bundle_discover",
+            "mcp__repobrief__find_references",
+            "mcp__repobrief__find_symbol",
+            "mcp__repobrief__get_callees",
+            "mcp__repobrief__get_callers",
+            "mcp__repobrief__query_existing_index",
+            "mcp__repobrief__range_get",
+            "mcp__repobrief__snapshot_status",
+        ]
+        with self.assertRaisesRegex(runner.RunnerError, "exposed unapproved tools"):
+            runner.build_receipt(
+                value,
+                stream(
+                    value,
+                    init_tools=[*current_tools, *t002h_extra_tools],
+                ),
+                transcript_artifact="extra-tool.jsonl",
+                returncode=0,
+                started_at=started,
+                ended_at=started,
+            )
+        with self.assertRaisesRegex(runner.RunnerError, "used unapproved tool"):
+            runner.build_receipt(
+                value,
+                stream(
+                    value,
+                    tool_name="mcp__repobrief__find_symbol",
+                    init_tools=current_tools,
+                ),
+                transcript_artifact="unauthorized-use.jsonl",
+                returncode=0,
+                started_at=started,
+                ended_at=started,
+            )
+
+    def test_benchmark_mcp_proxy_filters_list_and_rejects_unauthorized_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            log = root / "calls.json"
+            upstream = root / "fake_mcp.py"
+            upstream.write_text(
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "log = Path(sys.argv[1])\n"
+                "calls = []\n"
+                "for line in sys.stdin:\n"
+                "    message = json.loads(line)\n"
+                "    method = message.get('method')\n"
+                "    if method == 'tools/list':\n"
+                "        print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'method': 'sampling/createMessage', 'params': {}}), flush=True)\n"
+                "        result = {'tools': ["
+                "{'name': 'ask_context'}, {'name': 'find_symbol'}, "
+                "{'name': 'grounding_verify'}]}\n"
+                "        print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)\n"
+                "    elif method == 'tools/call':\n"
+                "        name = message['params']['name']\n"
+                "        calls.append(name)\n"
+                "        log.write_text(json.dumps(calls))\n"
+                "        print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': {'content': name}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            encoded_upstream = runner._canonical_json(
+                [sys.executable, str(upstream), str(log)]
+            )
+            requests = [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "find_symbol", "arguments": {}},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {}},
+                },
+            ]
+            payload = b"".join(
+                json.dumps(item, sort_keys=True).encode("utf-8") + b"\n"
+                for item in requests
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--benchmark-mcp-proxy",
+                    encoded_upstream,
+                ],
+                input=payload,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            responses = {
+                item["id"]: item
+                for item in runner.parse_jsonl(completed.stdout)
+            }
+            self.assertEqual(
+                [tool["name"] for tool in responses[1]["result"]["tools"]],
+                ["ask_context", "grounding_verify"],
+            )
+            self.assertEqual(responses[2]["error"]["code"], -32601)
+            self.assertIn("not authorized", responses[2]["error"]["message"])
+            self.assertEqual(responses[3]["result"]["content"], "ask_context")
+            self.assertEqual(json.loads(log.read_text()), ["ask_context"])
+
     def test_provider_budget_is_positive_bounded_and_enforced(self) -> None:
         self.assertEqual(runner._parse_max_budget_usd("0.0500"), "0.05")
         self.assertEqual(runner._parse_max_budget_usd("1.00"), "1")
@@ -743,10 +934,12 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             document = json.loads(path.read_text(encoding="utf-8"))
             server = document["mcpServers"]["repobrief"]
             self.assertEqual(server["type"], "stdio")
-            self.assertEqual(server["command"], "python")
+            self.assertEqual(server["command"], sys.executable)
+            self.assertEqual(server["args"][0], str(MODULE_PATH.resolve()))
+            self.assertEqual(server["args"][1], "--benchmark-mcp-proxy")
             self.assertEqual(
-                server["args"],
-                ["repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
+                json.loads(server["args"][2]),
+                ["python", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
             )
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
