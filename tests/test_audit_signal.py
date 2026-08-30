@@ -524,7 +524,7 @@ class AuditSignalTests(unittest.TestCase):
             "retention_effect_retried",
         ):
             self.assertIn(f'"{field}"', scalar_block)
-        for field in ("plan_sha256", "receipt_sha256"):
+        for field in ("plan_sha256", "receipt_sha256", "intent_record_sha256"):
             self.assertIn(f'"{field}"', trace_block)
             self.assertIn(f'"{field}"', anchor_block)
 

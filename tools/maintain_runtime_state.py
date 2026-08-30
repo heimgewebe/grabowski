@@ -1617,7 +1617,6 @@ def _retention_audit_reconciliation_state(
     if not intent_found:
         raise RuntimeError("retention reconciliation intent record was not found in verified audit")
     return {
-        "snapshot_last_record_sha256": snapshot.last_record_sha256,
         "original_completion": original_completion,
         "existing_reconciliation": existing_reconciliation,
     }

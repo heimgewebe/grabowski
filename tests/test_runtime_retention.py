@@ -1954,7 +1954,6 @@ class RuntimeRetentionTests(unittest.TestCase):
                 RETENTION,
                 "_retention_audit_reconciliation_state",
                 return_value={
-                    "snapshot_last_record_sha256": "c" * 64,
                     "original_completion": None,
                     "existing_reconciliation": None,
                 },
@@ -2013,7 +2012,6 @@ class RuntimeRetentionTests(unittest.TestCase):
                 RETENTION,
                 "_retention_audit_reconciliation_state",
                 return_value={
-                    "snapshot_last_record_sha256": "f" * 64,
                     "original_completion": None,
                     "existing_reconciliation": {
                         "record_sha256": "1" * 64,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import Counter
-import heapq
 import hashlib
 import re
 import sys
@@ -255,17 +254,13 @@ def _audit_transition_gap_signal(
         str, tuple[tuple[str, int, str], dict[str, Any], int]
     ] = {}
     historical_reconciled_keys: set[tuple[str, int, str]] = set()
+    historical_completed_keys: set[tuple[str, int, str]] = set()
+    historical_open_keys_by_identity: dict[
+        tuple[str, int], dict[tuple[str, int, str], None]
+    ] = {}
     historical_unmatched: dict[
         tuple[str, int, str], tuple[str, dict[str, Any], int]
     ] = {}
-    historical_intent_order: dict[tuple[str, int, str], int] = {}
-    historical_unmatched_keys_by_identity: dict[
-        tuple[str, int], set[tuple[str, int, str]]
-    ] = {}
-    historical_unmatched_heap_by_identity: dict[
-        tuple[str, int], list[tuple[int, tuple[str, int, str]]]
-    ] = {}
-    seen_retention_completion_identities: set[tuple[str, int]] = set()
     completed_counts: Counter[str] = Counter()
     reconciled_counts: Counter[str] = Counter()
     reconciled_records: list[dict[str, Any]] = []
@@ -288,6 +283,32 @@ def _audit_transition_gap_signal(
                 pending_retention_keys_by_identity.pop(key[:2], None)
         return item
 
+    def _remember_historical_open(key: tuple[str, int, str]) -> None:
+        keys = historical_open_keys_by_identity.setdefault(key[:2], {})
+        keys.setdefault(key, None)
+
+    def _pop_historical_open(key: tuple[str, int, str]) -> bool:
+        keys = historical_open_keys_by_identity.get(key[:2])
+        if keys is None or key not in keys:
+            return False
+        keys.pop(key, None)
+        if not keys:
+            historical_open_keys_by_identity.pop(key[:2], None)
+        return True
+
+    def _pop_latest_historical_open(
+        identity: tuple[str, int],
+    ) -> tuple[str, int, str] | None:
+        keys = historical_open_keys_by_identity.get(identity)
+        if not keys:
+            return None
+        # Dict insertion order is the verified audit order of the intent records,
+        # so a completion consumes exactly the latest still-open historical intent.
+        key = next(reversed(keys))
+        if not _pop_historical_open(key):
+            raise RuntimeError("historical retention open-index drift")
+        return key
+
     def _remember_historical_unmatched(
         key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
     ) -> None:
@@ -296,43 +317,13 @@ def _audit_transition_gap_signal(
             record,
             timestamp_unix,
         )
-        identity = key[:2]
-        keys = historical_unmatched_keys_by_identity.setdefault(identity, set())
-        if key not in keys:
-            keys.add(key)
-            order = historical_intent_order[key]
-            heapq.heappush(
-                historical_unmatched_heap_by_identity.setdefault(identity, []),
-                (-order, key),
-            )
 
     def _pop_historical_unmatched(
         key: tuple[str, int, str]
     ) -> tuple[str, dict[str, Any], int] | None:
-        item = historical_unmatched.pop(key, None)
-        keys = historical_unmatched_keys_by_identity.get(key[:2])
-        if keys is not None:
-            keys.discard(key)
-            if not keys:
-                historical_unmatched_keys_by_identity.pop(key[:2], None)
-                historical_unmatched_heap_by_identity.pop(key[:2], None)
-        return item
+        return historical_unmatched.pop(key, None)
 
-    def _pop_latest_historical_unmatched(
-        identity: tuple[str, int],
-    ) -> tuple[str, dict[str, Any], int] | None:
-        keys = historical_unmatched_keys_by_identity.get(identity)
-        heap = historical_unmatched_heap_by_identity.get(identity)
-        if not keys or not heap:
-            return None
-        while heap:
-            _negative_order, key = heapq.heappop(heap)
-            if key in keys:
-                return _pop_historical_unmatched(key)
-        historical_unmatched_heap_by_identity.pop(identity, None)
-        return None
-
-    for audit_order, (record, timestamp_unix) in enumerate(prepared_records):
+    for record, timestamp_unix in prepared_records:
         if timestamp_unix is None or timestamp_unix > end_unix:
             continue
         operation = record.get("operation")
@@ -345,18 +336,20 @@ def _audit_transition_gap_signal(
                     historical_retention_intents_by_digest[key[2]] = (
                         key, record, timestamp_unix
                     )
-                    historical_intent_order[key] = audit_order
+                    _remember_historical_open(key)
             elif operation == retention_pair[1]:
                 identity = _retention_transition_identity(record)
                 if identity is not None:
-                    seen_retention_completion_identities.add(identity)
+                    completed_key = _pop_latest_historical_open(identity)
+                    if completed_key is not None:
+                        historical_completed_keys.add(completed_key)
             elif operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
                 target_key = _retention_reconciliation_target_key(record)
-                identity = _retention_transition_identity(record)
                 if (
                     target_key in historical_retention_intents
                     and _retention_reconciliation_record_valid(record)
-                    and identity not in seen_retention_completion_identities
+                    and target_key not in historical_completed_keys
+                    and _pop_historical_open(target_key)
                 ):
                     historical_reconciled_keys.add(target_key)
             continue
@@ -389,10 +382,9 @@ def _audit_transition_gap_signal(
             if historical_target is None:
                 continue
             historical_key, historical_record, historical_timestamp = historical_target
-            historical_identity = historical_key[:2]
             if (
                 historical_key in historical_reconciled_keys
-                or historical_identity in seen_retention_completion_identities
+                or historical_key in historical_completed_keys
             ):
                 continue
             if (
@@ -400,6 +392,7 @@ def _audit_transition_gap_signal(
                 and _retention_reconciliation_record_valid(record)
             ):
                 _pop_historical_unmatched(historical_key)
+                _pop_historical_open(historical_key)
                 historical_reconciled_keys.add(historical_key)
                 reconciled_counts[retention_pair[0]] += 1
                 reconciled_records.append(record)
@@ -439,15 +432,14 @@ def _audit_transition_gap_signal(
                     matched = True
             if matched:
                 completed_counts[retention_pair[0]] += 1
-            if identity is not None:
-                seen_retention_completion_identities.add(identity)
+            if identity is not None and not matched:
                 # One completion can resolve at most one intent.  Prefer a matching
                 # in-window pending intent; only when none matched may it close one
-                # historical unknown of the same identity.
-                if (
-                    not matched
-                    and _pop_latest_historical_unmatched(identity) is not None
-                ):
+                # still-open historical intent of the same identity.
+                historical_key = _pop_latest_historical_open(identity)
+                if historical_key is not None:
+                    _pop_historical_unmatched(historical_key)
+                    historical_completed_keys.add(historical_key)
                     completed_counts[retention_pair[0]] += 1
             continue
 
@@ -484,6 +476,10 @@ def _audit_transition_gap_signal(
         for _intent, record, _timestamp in gaps
         if (ref := _audit_record_ref(record))
     ]
+    execution_gap_refs, execution_gap_refs_truncated = _audit_signal_refs(
+        execution_refs
+    )
+    unique_execution_ref_count = len(set(ref for ref in execution_refs if ref))
     reconciliation_refs_all = [
         ref for record in reconciled_records if (ref := _audit_record_ref(record))
     ]
@@ -491,28 +487,34 @@ def _audit_transition_gap_signal(
         reconciliation_refs_all
     )
     unique_reconciliation_ref_count = len(
-        dict.fromkeys(ref for ref in reconciliation_refs_all if ref)
+        set(ref for ref in reconciliation_refs_all if ref)
     )
     observed_count = len(gaps) + len(reconciled_records)
     if gaps:
         severity = "high"
+        count = len(gaps)
+        primary_evidence_refs = execution_refs
         recommended_action = "trace each unmatched intent and read the exact target state before retry"
     elif reconciled_records:
         severity = "medium"
+        count = len(reconciled_records)
+        primary_evidence_refs = reconciliation_refs_all
         recommended_action = (
             "review append-only completion-audit reconciliation evidence; "
             "do not retry the retention effect"
         )
     else:
         severity = "none"
+        count = 0
+        primary_evidence_refs = []
         recommended_action = "none"
     return _audit_signal_entry(
         "transition_gap",
         status="observed" if observed_count else "clear",
         severity=severity,
-        count=observed_count,
+        count=count,
         observed_count=observed_count,
-        evidence_refs=execution_refs + reconciliation_refs_all,
+        evidence_refs=primary_evidence_refs,
         evidence_quality=(
             "explicit_identity_with_terminal_receipt_reconciliation_and_legacy_fifo_fallback"
         ),
@@ -521,6 +523,13 @@ def _audit_transition_gap_signal(
             "grace_seconds": AUDIT_SIGNAL_GRACE_SECONDS,
             "execution_gap_count": len(gaps),
             "completion_audit_gap_count": len(reconciled_records),
+            "count_semantics": "execution_gaps_when_present_else_completion_audit_gaps",
+            "observed_count_semantics": "execution_gaps_plus_completion_audit_gaps",
+            "execution_gap_evidence_refs": execution_gap_refs,
+            "execution_gap_evidence_refs_truncated": execution_gap_refs_truncated,
+            "execution_gap_evidence_refs_omitted_count": max(
+                0, unique_execution_ref_count - len(execution_gap_refs)
+            ),
             "unmatched_intents_by_transition": dict(sorted(by_transition.items())),
             "completed_pairs_by_transition": dict(sorted(completed_counts.items())),
             "completion_audit_gaps_by_transition": dict(sorted(reconciled_counts.items())),
@@ -532,9 +541,10 @@ def _audit_transition_gap_signal(
             "pairing_semantics": (
                 "retention identities are indexed by (plan_sha256, attempt, "
                 "intent_record_sha256); append-only reconciliations resolve only that "
-                "exact indexed intent, including older verified intents outside the "
-                "reporting window when no prior matching completion exists; invalid "
-                "current reconciliation evidence keeps that exact historical intent "
+                "exact indexed intent; an in-window reconciliation may reference an "
+                "older verified intent outside the reporting window only while that "
+                "exact intent remains open after preceding completions and reconciliations; "
+                "invalid current reconciliation evidence keeps that exact historical intent "
                 "visible as an execution_gap; records with both identity fields absent "
                 "retain legacy FIFO behavior; other transition families use FIFO"
             ),

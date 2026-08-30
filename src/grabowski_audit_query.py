@@ -80,6 +80,9 @@ _EXACT_FILTER_FIELDS = {
     "repo",
     "service",
     "branch",
+    "plan_sha256",
+    "receipt_sha256",
+    "intent_record_sha256",
 }
 _TRACE_SCALAR_FIELDS = (
     "task_id",
@@ -92,6 +95,7 @@ _TRACE_SCALAR_FIELDS = (
     "branch",
     "plan_sha256",
     "receipt_sha256",
+    "intent_record_sha256",
 )
 _TRACE_ANCHOR_KINDS = {
     "record_sha256",
@@ -105,6 +109,7 @@ _TRACE_ANCHOR_KINDS = {
     "path",
     "plan_sha256",
     "receipt_sha256",
+    "intent_record_sha256",
 }
 
 
@@ -239,7 +244,10 @@ def _sha256_text(value: Any, *, label: str) -> str:
 def _validate_filters(filters: dict[str, Any]) -> None:
     for key, expected in filters.items():
         if key in _EXACT_FILTER_FIELDS:
-            _bounded_nonempty_text(expected, label=f"filters.{key}")
+            if key in _SHA256_RECORD_FIELDS:
+                _sha256_text(expected, label=f"filters.{key}")
+            else:
+                _bounded_nonempty_text(expected, label=f"filters.{key}")
         elif key == "operation_prefix":
             _bounded_nonempty_text(expected, label="filters.operation_prefix", maximum=256)
         elif key in {"resource_key", "held_resource_key", "requested_resource_key"}:
