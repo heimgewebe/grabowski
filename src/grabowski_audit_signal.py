@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import heapq
 import hashlib
 import re
 import sys
@@ -245,7 +246,7 @@ def _audit_transition_gap_signal(
         tuple[str, int, str], tuple[dict[str, Any], int]
     ] = {}
     pending_retention_keys_by_identity: dict[
-        tuple[str, int], list[tuple[str, int, str]]
+        tuple[str, int], dict[tuple[str, int, str], None]
     ] = {}
     historical_retention_intents: dict[
         tuple[str, int, str], tuple[dict[str, Any], int]
@@ -254,8 +255,12 @@ def _audit_transition_gap_signal(
     historical_unmatched: dict[
         tuple[str, int, str], tuple[str, dict[str, Any], int]
     ] = {}
+    historical_intent_order: dict[tuple[str, int, str], int] = {}
     historical_unmatched_keys_by_identity: dict[
-        tuple[str, int], list[tuple[str, int, str]]
+        tuple[str, int], set[tuple[str, int, str]]
+    ] = {}
+    historical_unmatched_heap_by_identity: dict[
+        tuple[str, int], list[tuple[int, tuple[str, int, str]]]
     ] = {}
     seen_retention_completion_identities: set[tuple[str, int]] = set()
     completed_counts: Counter[str] = Counter()
@@ -266,9 +271,8 @@ def _audit_transition_gap_signal(
         key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
     ) -> None:
         pending_retention[key] = (record, timestamp_unix)
-        keys = pending_retention_keys_by_identity.setdefault(key[:2], [])
-        if key not in keys:
-            keys.append(key)
+        keys = pending_retention_keys_by_identity.setdefault(key[:2], {})
+        keys.setdefault(key, None)
 
     def _pop_pending_retention(
         key: tuple[str, int, str]
@@ -276,8 +280,7 @@ def _audit_transition_gap_signal(
         item = pending_retention.pop(key, None)
         keys = pending_retention_keys_by_identity.get(key[:2])
         if keys is not None:
-            if key in keys:
-                keys.remove(key)
+            keys.pop(key, None)
             if not keys:
                 pending_retention_keys_by_identity.pop(key[:2], None)
         return item
@@ -290,9 +293,15 @@ def _audit_transition_gap_signal(
             record,
             timestamp_unix,
         )
-        keys = historical_unmatched_keys_by_identity.setdefault(key[:2], [])
+        identity = key[:2]
+        keys = historical_unmatched_keys_by_identity.setdefault(identity, set())
         if key not in keys:
-            keys.append(key)
+            keys.add(key)
+            order = historical_intent_order[key]
+            heapq.heappush(
+                historical_unmatched_heap_by_identity.setdefault(identity, []),
+                (-order, key),
+            )
 
     def _pop_historical_unmatched(
         key: tuple[str, int, str]
@@ -300,13 +309,27 @@ def _audit_transition_gap_signal(
         item = historical_unmatched.pop(key, None)
         keys = historical_unmatched_keys_by_identity.get(key[:2])
         if keys is not None:
-            if key in keys:
-                keys.remove(key)
+            keys.discard(key)
             if not keys:
                 historical_unmatched_keys_by_identity.pop(key[:2], None)
+                historical_unmatched_heap_by_identity.pop(key[:2], None)
         return item
 
-    for record, timestamp_unix in prepared_records:
+    def _pop_latest_historical_unmatched(
+        identity: tuple[str, int],
+    ) -> tuple[str, dict[str, Any], int] | None:
+        keys = historical_unmatched_keys_by_identity.get(identity)
+        heap = historical_unmatched_heap_by_identity.get(identity)
+        if not keys or not heap:
+            return None
+        while heap:
+            _negative_order, key = heapq.heappop(heap)
+            if key in keys:
+                return _pop_historical_unmatched(key)
+        historical_unmatched_heap_by_identity.pop(identity, None)
+        return None
+
+    for audit_order, (record, timestamp_unix) in enumerate(prepared_records):
         if timestamp_unix is None or timestamp_unix > end_unix:
             continue
         operation = record.get("operation")
@@ -316,6 +339,7 @@ def _audit_transition_gap_signal(
                 key = _retention_intent_index_key(record)
                 if key is not None:
                     historical_retention_intents[key] = (record, timestamp_unix)
+                    historical_intent_order[key] = audit_order
             elif operation == retention_pair[1]:
                 identity = _retention_transition_identity(record)
                 if identity is not None:
@@ -384,13 +408,12 @@ def _audit_transition_gap_signal(
             matched = False
             if completion_fields_present:
                 if identity is not None:
-                    keys = pending_retention_keys_by_identity.get(identity, [])
+                    keys = pending_retention_keys_by_identity.get(identity, {})
                     if keys:
-                        # A retry can append the same logical intent identity again
-                        # before any receipt exists.  The completion belongs to the
-                        # most recent preceding intent in verified audit order; older
-                        # duplicates remain fail-closed as separate unknown execution.
-                        latest_key = keys[-1]
+                        # Dict insertion order is verified audit order. Membership and
+                        # exact removal stay O(1), while reversed(keys) selects the
+                        # most recent preceding duplicate deterministically.
+                        latest_key = next(reversed(keys))
                         _pop_pending_retention(latest_key)
                         matched = True
             else:
@@ -404,13 +427,12 @@ def _audit_transition_gap_signal(
                 completed_counts[retention_pair[0]] += 1
             if identity is not None:
                 seen_retention_completion_identities.add(identity)
-                unresolved_keys = historical_unmatched_keys_by_identity.get(
-                    identity, []
-                )
-                if unresolved_keys:
-                    latest_key = unresolved_keys[-1]
-                    if _pop_historical_unmatched(latest_key) is not None:
-                        completed_counts[retention_pair[0]] += 1
+                # Historical invalid reconciliations can arrive in any order.
+                # The heap is keyed by original verified intent order, not by the
+                # later reconciliation order, so one completion closes exactly the
+                # most recent preceding unknown intent.
+                if _pop_latest_historical_unmatched(identity) is not None:
+                    completed_counts[retention_pair[0]] += 1
             continue
 
         for intent, completion in AUDIT_TRANSITION_PAIRS:

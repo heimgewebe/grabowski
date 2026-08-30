@@ -569,6 +569,19 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
             ["audit-record-sha256:" + first_intent_sha],
         )
 
+    def test_duplicate_identity_indexes_use_constant_time_membership_and_removal(self) -> None:
+        import inspect
+
+        source = inspect.getsource(signal._audit_transition_gap_signal)
+        self.assertIn("pending_retention_keys_by_identity.setdefault(key[:2], {})", source)
+        self.assertIn("keys.setdefault(key, None)", source)
+        self.assertIn("keys.pop(key, None)", source)
+        self.assertIn("historical_unmatched_keys_by_identity.setdefault(identity, set())", source)
+        self.assertIn("keys.discard(key)", source)
+        self.assertIn("heapq.heappush", source)
+        self.assertIn("heapq.heappop", source)
+        self.assertNotIn("keys.remove(key)", source)
+
     def test_completion_closes_only_latest_historical_duplicate_unknown(self) -> None:
         now = 1_800_000_000
         plan_sha = "a" * 64
@@ -594,7 +607,10 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
                 now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 200,
             ),
         ]
-        for index, intent_sha in enumerate((first_intent_sha, second_intent_sha)):
+        # Reconciliation arrival is intentionally reverse intent order.  A later
+        # completion must still close the second/newer intent, not the last
+        # reconciliation observed.
+        for index, intent_sha in enumerate((second_intent_sha, first_intent_sha)):
             records.append(
                 (
                     {
