@@ -331,5 +331,96 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
                 self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
 
 
+    def test_invalid_recent_reconciliation_keeps_exact_historical_intent_high(self) -> None:
+        now = 1_800_000_000
+        intent_sha = "a" * 64
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": intent_sha,
+                        "plan_sha256": "b" * 64,
+                        "attempt": 1,
+                    },
+                    now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 100,
+                ),
+                (
+                    {
+                        "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                        "record_sha256": "c" * 64,
+                        "reconciliation_kind": "completion_audit_gap",
+                        "plan_sha256": "b" * 64,
+                        "attempt": 1,
+                        "receipt_sha256": "d" * 64,
+                        "intent_record_sha256": intent_sha,
+                        "completed": True,
+                    },
+                    now - 100,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["severity"]), ("observed", "high"))
+        self.assertEqual(result["details"]["execution_gap_count"], 1)
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
+        self.assertEqual(
+            result["evidence_refs"], ["audit-record-sha256:" + intent_sha]
+        )
+
+    def test_reconciliation_detail_refs_are_bounded_with_omission_count(self) -> None:
+        now = 1_800_000_000
+        records: list[tuple[dict[str, object], int]] = []
+        for index in range(signal.AUDIT_SIGNAL_MAX_EVIDENCE_REFS + 5):
+            plan_sha = f"{index + 1:064x}"
+            intent_sha = f"{index + 101:064x}"
+            reconciliation_sha = f"{index + 201:064x}"
+            records.extend(
+                [
+                    (
+                        {
+                            "operation": "runtime-state-retention-intent",
+                            "record_sha256": intent_sha,
+                            "plan_sha256": plan_sha,
+                            "attempt": 1,
+                        },
+                        now - 2_000 + index * 2,
+                    ),
+                    (
+                        {
+                            "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                            "record_sha256": reconciliation_sha,
+                            "reconciliation_kind": "completion_audit_gap",
+                            "plan_sha256": plan_sha,
+                            "attempt": 1,
+                            "receipt_sha256": f"{index + 301:064x}",
+                            "intent_record_sha256": intent_sha,
+                            "completed": True,
+                            "retention_effect_retried": False,
+                        },
+                        now - 1_999 + index * 2,
+                    ),
+                ]
+            )
+        result = signal._audit_transition_gap_signal(
+            records,
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        details = result["details"]
+        self.assertEqual(details["execution_gap_count"], 0)
+        self.assertEqual(
+            details["completion_audit_gap_count"],
+            signal.AUDIT_SIGNAL_MAX_EVIDENCE_REFS + 5,
+        )
+        self.assertEqual(
+            len(details["completion_audit_gap_evidence_refs"]),
+            signal.AUDIT_SIGNAL_MAX_EVIDENCE_REFS,
+        )
+        self.assertTrue(details["completion_audit_gap_evidence_refs_truncated"])
+        self.assertEqual(details["completion_audit_gap_evidence_refs_omitted_count"], 5)
+
+
 if __name__ == "__main__":
     unittest.main()

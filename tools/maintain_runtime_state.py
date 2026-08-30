@@ -1523,12 +1523,27 @@ def _verified_terminal_retention_receipt(
         != receipt_sha256
     ):
         raise RuntimeError(f"retention terminal receipt integrity is invalid: {path}")
+    expected_previous_receipt_sha256: str | None = None
+    for previous_attempt in range(1, attempt):
+        previous_path = _canonical_retention_receipt_path(
+            plan_sha256=plan_sha256,
+            attempt=previous_attempt,
+            receipt_root=canonical_path.parent,
+        )
+        expected_previous_receipt_sha256 = _verified_partial_receipt(
+            previous_path,
+            plan_sha256=plan_sha256,
+            expected_attempt=previous_attempt,
+            expected_previous_receipt_sha256=expected_previous_receipt_sha256,
+        )
     retry = payload.get("retry")
     if (
         payload.get("schema_version") != 3
         or payload.get("operation") != "grabowski-runtime-state-retention"
         or payload.get("plan_sha256") != plan_sha256
         or payload.get("attempt") != attempt
+        or payload.get("previous_receipt_sha256")
+        != expected_previous_receipt_sha256
         or payload.get("completed") is not True
         or not isinstance(retry, dict)
         or retry.get("required") is not False

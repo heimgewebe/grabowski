@@ -2135,6 +2135,101 @@ class RuntimeRetentionTests(unittest.TestCase):
                     receipt_root=root,
                 )
 
+    def test_terminal_reconciliation_receipt_binds_partial_receipt_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            plan_sha256 = "c" * 64
+            partial = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": plan_sha256,
+                "attempt": 1,
+                "previous_receipt_sha256": None,
+                "completed": False,
+                "retry": {
+                    "required": True,
+                    "strategy": "rebuild_live_plan_and_chain_partial_receipt",
+                },
+            }
+            partial["receipt_sha256"] = RETENTION._sha256(partial)
+            partial_path = root / f"{plan_sha256}.json"
+            partial_path.write_text(json.dumps(partial), encoding="utf-8")
+            partial_path.chmod(0o600)
+            terminal = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": plan_sha256,
+                "attempt": 2,
+                "previous_receipt_sha256": partial["receipt_sha256"],
+                "reset_failed": [],
+                "reset_failures": [],
+                "archived_jobs": [],
+                "completed": True,
+                "retry": {
+                    "required": False,
+                    "strategy": "rebuild_live_plan_and_chain_partial_receipt",
+                },
+                "completed_at_unix": 1_800_000_000,
+            }
+            terminal["receipt_sha256"] = RETENTION._sha256(terminal)
+            terminal_path = root / f"{plan_sha256}.retry-02.json"
+            terminal_path.write_text(json.dumps(terminal), encoding="utf-8")
+            terminal_path.chmod(0o600)
+            with patch.object(RETENTION, "RECEIPT_ROOT", root):
+                verified = RETENTION._verified_terminal_retention_receipt(
+                    terminal_path,
+                    plan_sha256=plan_sha256,
+                    attempt=2,
+                    expected_receipt_sha256=terminal["receipt_sha256"],
+                )
+                self.assertEqual(verified["receipt_sha256"], terminal["receipt_sha256"])
+
+                wrong_chain = dict(terminal)
+                wrong_chain["previous_receipt_sha256"] = "d" * 64
+                wrong_chain["receipt_sha256"] = RETENTION._sha256(
+                    {key: value for key, value in wrong_chain.items() if key != "receipt_sha256"}
+                )
+                terminal_path.write_text(json.dumps(wrong_chain), encoding="utf-8")
+                terminal_path.chmod(0o600)
+                with self.assertRaisesRegex(RuntimeError, "binding is invalid"):
+                    RETENTION._verified_terminal_retention_receipt(
+                        terminal_path,
+                        plan_sha256=plan_sha256,
+                        attempt=2,
+                        expected_receipt_sha256=wrong_chain["receipt_sha256"],
+                    )
+
+            first_plan_sha256 = "e" * 64
+            first_path = root / f"{first_plan_sha256}.json"
+            first_terminal = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": first_plan_sha256,
+                "attempt": 1,
+                "previous_receipt_sha256": "f" * 64,
+                "reset_failed": [],
+                "reset_failures": [],
+                "archived_jobs": [],
+                "completed": True,
+                "retry": {
+                    "required": False,
+                    "strategy": "rebuild_live_plan_and_chain_partial_receipt",
+                },
+                "completed_at_unix": 1_800_000_000,
+            }
+            first_terminal["receipt_sha256"] = RETENTION._sha256(first_terminal)
+            first_path.write_text(json.dumps(first_terminal), encoding="utf-8")
+            first_path.chmod(0o600)
+            with patch.object(RETENTION, "RECEIPT_ROOT", root):
+                with self.assertRaisesRegex(RuntimeError, "binding is invalid"):
+                    RETENTION._verified_terminal_retention_receipt(
+                        first_path,
+                        plan_sha256=first_plan_sha256,
+                        attempt=1,
+                        expected_receipt_sha256=first_terminal["receipt_sha256"],
+                    )
+
     def test_reconciliation_state_requires_explicit_negative_retry_evidence(self) -> None:
         plan_sha256 = "7" * 64
         intent_sha256 = "8" * 64
