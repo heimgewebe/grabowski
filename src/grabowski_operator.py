@@ -268,6 +268,22 @@ GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS = frozenset(
         "update-ref",
     }
 )
+GIT_WORKTREE_DESTRUCTIVE_SUBCOMMANDS = frozenset(
+    {
+        "am",
+        "apply",
+        "checkout",
+        "cherry-pick",
+        "merge",
+        "mv",
+        "read-tree",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "switch",
+    }
+)
 GIT_UPDATE_INDEX_UNOBSERVED_FLAG_OPTIONS = frozenset(
     {
         "--assume-unchanged",
@@ -4522,6 +4538,12 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
     if subcommand == "pull":
         raise PermissionError(
             "Git pull is blocked because fetch-side refs and metadata are repository-wide and are not serialized by a branch-attempt lease."
+        )
+    if subcommand in GIT_WORKTREE_DESTRUCTIVE_SUBCOMMANDS:
+        raise PermissionError(
+            f"Git {subcommand} is blocked on grabowski_git because branch_attempt CAS "
+            "cannot exclude uncoordinated external worktree writers from the final "
+            "preimage-to-effect interval; use a dedicated isolated checkout/worktree operation."
         )
     if subcommand != "push":
         _reject_configured_alias(repo, subcommand)
