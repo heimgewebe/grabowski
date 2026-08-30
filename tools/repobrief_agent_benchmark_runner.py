@@ -816,8 +816,11 @@ def run_benchmark_mcp_proxy(upstream: Sequence[str]) -> int:
         for raw in process.stdout:
             message = _mcp_message(raw, label="upstream")
             identifier = message.get("id")
+            actual_response = "method" not in message and (
+                "result" in message or "error" in message
+            )
             filter_tools = False
-            if identifier is not None:
+            if identifier is not None and actual_response:
                 with state_lock:
                     if identifier in tools_list_ids:
                         tools_list_ids.remove(identifier)

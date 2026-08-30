@@ -534,6 +534,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 "    message = json.loads(line)\n"
                 "    method = message.get('method')\n"
                 "    if method == 'tools/list':\n"
+                "        print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'method': 'sampling/createMessage', 'params': {}}), flush=True)\n"
                 "        result = {'tools': ["
                 "{'name': 'ask_context'}, {'name': 'find_symbol'}, "
                 "{'name': 'grounding_verify'}]}\n"
