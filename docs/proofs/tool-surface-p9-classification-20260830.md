@@ -3,7 +3,9 @@
 ## Binding
 
 - repository: `heimgewebe/grabowski`
-- current-main revision: `30ccbe9b49f794fc4ffe1cbb2062e5d9fbf0dfca`
+- M1 measurement revision: `30ccbe9b49f794fc4ffe1cbb2062e5d9fbf0dfca`
+- integration base after D2 closeout: `bcf28564121d72f3092ef5867b32635af36f449f`
+- intervening main change: only `docs/proofs/coupling-d2-stop-20260830.md`; no tool/runtime/analyzer source changed
 - M1 report SHA-256: `7105f30c7c11b40ecc19e9016436d1782f0464d135336d7dd8f91c556046c769`
 - captured canonical report file SHA-256: `42ec390ffb18eb8151e66173272f98799a1b0b2085305f298f56a9d4b4537879`
 - measurement window: 168 hours
