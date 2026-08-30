@@ -212,27 +212,20 @@ def _audit_transition_gap_signal(
             and _retention_transition_identity(record) is not None
         )
     ]
-    historical_retention_completion_identities = {
-        identity
-        for record, timestamp_unix in prepared_records
-        if (
-            timestamp_unix is not None
-            and timestamp_unix <= end_unix
-            and record.get("operation") == "runtime-state-retention-complete"
-            and (identity := _retention_transition_identity(record)) is not None
-        )
-    }
+    seen_retention_completion_identities: set[tuple[str, int]] = set()
     completed_counts: Counter[str] = Counter()
     reconciled_counts: Counter[str] = Counter()
     reconciled_records: list[dict[str, Any]] = []
     for record, timestamp_unix in prepared_records:
-        if (
-            timestamp_unix is None
-            or timestamp_unix < start_unix
-            or timestamp_unix > end_unix
-        ):
+        if timestamp_unix is None or timestamp_unix > end_unix:
             continue
         operation = record.get("operation")
+        if timestamp_unix < start_unix:
+            if operation == "runtime-state-retention-complete":
+                identity = _retention_transition_identity(record)
+                if identity is not None:
+                    seen_retention_completion_identities.add(identity)
+            continue
         if operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
             key = ("runtime-state-retention-intent", "runtime-state-retention-complete")
             match_index = _retention_reconciliation_match_index(pending[key], record)
@@ -241,7 +234,7 @@ def _audit_transition_gap_signal(
                 pending[key].pop(match_index)
             elif (
                 _retention_transition_identity(record)
-                not in historical_retention_completion_identities
+                not in seen_retention_completion_identities
                 and _retention_reconciliation_match_index(
                     historical_retention_intents, record
                 )
@@ -264,6 +257,10 @@ def _audit_transition_gap_signal(
                 if match_index is not None:
                     pending[key].pop(match_index)
                     completed_counts[intent] += 1
+                if intent == "runtime-state-retention-intent":
+                    identity = _retention_transition_identity(record)
+                    if identity is not None:
+                        seen_retention_completion_identities.add(identity)
                 break
     gaps: list[tuple[str, dict[str, Any], int]] = []
     for (intent, _completion), entries in pending.items():
