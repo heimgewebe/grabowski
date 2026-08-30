@@ -53,6 +53,54 @@ class _PagedFilesGh:
         return {"returncode": 0, "stdout": self.stdout, "stderr": ""}
 
 
+class _RenamePrGh:
+    def __init__(
+        self,
+        *,
+        change_status: str = "renamed",
+        previous_path: str | None = "old-name.txt",
+    ) -> None:
+        self.base_sha = "a" * 40
+        self.head_sha = "b" * 40
+        self.change_status = change_status
+        self.change_type = change_status.upper()
+        self.previous_path = previous_path
+        self.new_path = "new-name.txt"
+        self.diff_text = "captain-rename-diff\n"
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, _repo: Path, argv: list[str]) -> dict[str, object]:
+        self.calls.append(tuple(argv))
+        if argv[:2] == ["pr", "view"]:
+            payload = {
+                "number": 212,
+                "state": "OPEN",
+                "headRefName": "feature/rename",
+                "headRefOid": self.head_sha,
+                "baseRefName": "main",
+                "baseRefOid": self.base_sha,
+                "isCrossRepository": False,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "changedFiles": 1,
+                "files": [
+                    {"path": self.new_path, "changeType": self.change_type}
+                ],
+            }
+            return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+        if argv[:2] == ["api", "--paginate"]:
+            record = [self.new_path, self.change_status, self.previous_path]
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(record) + "\n",
+                "stderr": "",
+            }
+        if argv[:2] == ["pr", "diff"]:
+            return {"returncode": 0, "stdout": self.diff_text, "stderr": ""}
+        raise AssertionError(f"unexpected GitHub call: {argv!r}")
+
+
 class _LargePrGh:
     def __init__(
         self,
@@ -176,6 +224,83 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             ["MODIFIED", "ADDED", "DELETED", "RENAMED"],
         )
         self.assertEqual(records[-1]["previousPath"], "old-d.txt")
+
+    def test_live_bindings_refreshes_rename_and_copy_previous_paths(self) -> None:
+        for change_status in ("renamed", "copied"):
+            with self.subTest(change_status=change_status):
+                gh = _RenamePrGh(change_status=change_status)
+                runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+                runner.action = {
+                    "target": {
+                        "repo": "heimgewebe/commonworld",
+                        "pr": 212,
+                        "base": "main",
+                    }
+                }
+                runner.parameters = {
+                    "expected_head": gh.head_sha,
+                    "expected_base_sha": gh.base_sha,
+                    "diff_sha256": merge_guard.github_pr_diff_identity_sha256(
+                        gh.diff_text.encode("utf-8")
+                    ),
+                }
+                runner.static_errors = []
+                runner.repo_path = Path.cwd()
+                runner.github_runner = gh
+                runner.receipt = {}
+                runner.execution_intent_sha256 = "1" * 64
+                runner._revalidate_codex_review = lambda _bindings, phase: []
+
+                bindings, errors = runner._live_bindings()
+
+                self.assertEqual(errors, [])
+                self.assertIsNotNone(bindings)
+                assert bindings is not None
+                expected_paths = (
+                    [gh.new_path, gh.previous_path]
+                    if change_status == "renamed"
+                    else [gh.new_path]
+                )
+                self.assertEqual(bindings["changed_paths"], expected_paths)
+                self.assertEqual(runner.receipt["live_files"]["record_count"], 1)
+                self.assertTrue(
+                    any(call[:2] == ("api", "--paginate") for call in gh.calls)
+                )
+
+    def test_live_bindings_rejects_missing_or_invalid_previous_path(self) -> None:
+        for previous_path in (None, "../old-name.txt", "new-name.txt"):
+            with self.subTest(previous_path=previous_path):
+                gh = _RenamePrGh(previous_path=previous_path)
+                runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+                runner.action = {
+                    "target": {
+                        "repo": "heimgewebe/commonworld",
+                        "pr": 212,
+                        "base": "main",
+                    }
+                }
+                runner.parameters = {
+                    "expected_head": gh.head_sha,
+                    "expected_base_sha": gh.base_sha,
+                    "diff_sha256": merge_guard.github_pr_diff_identity_sha256(
+                        gh.diff_text.encode("utf-8")
+                    ),
+                }
+                runner.static_errors = []
+                runner.repo_path = Path.cwd()
+                runner.github_runner = gh
+                runner.receipt = {}
+                runner.execution_intent_sha256 = "1" * 64
+                runner._revalidate_codex_review = lambda _bindings, phase: []
+
+                _bindings, errors = runner._live_bindings()
+
+                self.assertIn(
+                    "merge_guard_changed_path_requires_previous_name:0", errors
+                )
+                self.assertFalse(
+                    any(call[:2] == ("pr", "merge") for call in gh.calls)
+                )
 
     def test_missing_pr_object_fetches_bounded_refs_and_reprobes_exact_shas(self) -> None:
         base_sha = "a" * 40
