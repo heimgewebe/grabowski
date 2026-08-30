@@ -103,6 +103,7 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
                         "receipt_sha256": "4" * 64,
                         "intent_record_sha256": intent_sha,
                         "completed": True,
+                        "retention_effect_retried": False,
                     },
                     now - 900,
                 ),
@@ -144,6 +145,7 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
                         "receipt_sha256": "8" * 64,
                         "intent_record_sha256": "9" * 64,
                         "completed": True,
+                        "retention_effect_retried": False,
                     },
                     now - 900,
                 ),
@@ -179,6 +181,7 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
                         "receipt_sha256": "4" * 64,
                         "intent_record_sha256": intent_sha,
                         "completed": True,
+                        "retention_effect_retried": False,
                     },
                     now - 100,
                 ),
@@ -227,6 +230,7 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
                         "receipt_sha256": "8" * 64,
                         "intent_record_sha256": intent_sha,
                         "completed": True,
+                        "retention_effect_retried": False,
                     },
                     now - 100,
                 ),
@@ -263,6 +267,7 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
                         "receipt_sha256": "d" * 64,
                         "intent_record_sha256": intent_sha,
                         "completed": True,
+                        "retention_effect_retried": False,
                     },
                     now - 200,
                 ),
@@ -287,6 +292,43 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
             result["evidence_refs"],
             ["audit-record-sha256:" + reconciliation_sha],
         )
+
+
+    def test_reconciliation_requires_explicit_negative_retry_evidence(self) -> None:
+        now = 1_800_000_000
+        for retry_fields in ({}, {"retention_effect_retried": True}):
+            with self.subTest(retry_fields=retry_fields):
+                intent_sha = "f" * 64
+                reconciliation = {
+                    "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                    "record_sha256": "0" * 64,
+                    "reconciliation_kind": "completion_audit_gap",
+                    "plan_sha256": "1" * 64,
+                    "attempt": 1,
+                    "receipt_sha256": "2" * 64,
+                    "intent_record_sha256": intent_sha,
+                    "completed": True,
+                    **retry_fields,
+                }
+                result = signal._audit_transition_gap_signal(
+                    [
+                        (
+                            {
+                                "operation": "runtime-state-retention-intent",
+                                "record_sha256": intent_sha,
+                                "plan_sha256": "1" * 64,
+                                "attempt": 1,
+                            },
+                            now - 1_000,
+                        ),
+                        (reconciliation, now - 900),
+                    ],
+                    start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+                    end_unix=now,
+                )
+                self.assertEqual((result["status"], result["severity"]), ("observed", "high"))
+                self.assertEqual(result["details"]["execution_gap_count"], 1)
+                self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
 
 
 if __name__ == "__main__":

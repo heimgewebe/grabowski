@@ -178,6 +178,7 @@ def _retention_reconciliation_match_index(
         or identity is None
         or reconciliation_record.get("reconciliation_kind") != "completion_audit_gap"
         or reconciliation_record.get("completed") is not True
+        or reconciliation_record.get("retention_effect_retried") is not False
         or not _audit_sha256_valid(reconciliation_record.get("receipt_sha256"))
         or not _audit_sha256_valid(intent_record_sha256)
     ):
