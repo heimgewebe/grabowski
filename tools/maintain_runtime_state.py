@@ -1592,6 +1592,7 @@ def _retention_audit_reconciliation_state(
                 or record.get("receipt_sha256") != receipt_sha256
                 or record.get("reconciliation_kind") != "completion_audit_gap"
                 or record.get("completed") is not True
+                or record.get("retention_effect_retried") is not False
             ):
                 raise RuntimeError("retention completion reconciliation binding conflicts")
             existing_reconciliation = {

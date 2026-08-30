@@ -2135,6 +2135,49 @@ class RuntimeRetentionTests(unittest.TestCase):
                     receipt_root=root,
                 )
 
+    def test_reconciliation_state_requires_explicit_negative_retry_evidence(self) -> None:
+        plan_sha256 = "7" * 64
+        intent_sha256 = "8" * 64
+        receipt_sha256 = "9" * 64
+        for retry_fields in ({}, {"retention_effect_retried": True}):
+            with self.subTest(retry_fields=retry_fields):
+                fake_query = types.ModuleType("grabowski_audit_query")
+                fake_query.capture_verified_audit_snapshot = lambda: types.SimpleNamespace(
+                    last_record_sha256="a" * 64
+                )
+                items = [
+                    {
+                        "evidence": {"record_sha256": intent_sha256},
+                        "record": {
+                            "operation": "runtime-state-retention-intent",
+                            "plan_sha256": plan_sha256,
+                            "attempt": 1,
+                        },
+                    },
+                    {
+                        "evidence": {"record_sha256": "b" * 64},
+                        "record": {
+                            "operation": RETENTION.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                            "plan_sha256": plan_sha256,
+                            "attempt": 1,
+                            "intent_record_sha256": intent_sha256,
+                            "receipt_sha256": receipt_sha256,
+                            "reconciliation_kind": "completion_audit_gap",
+                            "completed": True,
+                            **retry_fields,
+                        },
+                    },
+                ]
+                fake_query._iter_snapshot_items = lambda _snapshot, order: iter(items)
+                with patch.dict("sys.modules", {"grabowski_audit_query": fake_query}):
+                    with self.assertRaisesRegex(RuntimeError, "binding conflicts"):
+                        RETENTION._retention_audit_reconciliation_state(
+                            intent_record_sha256=intent_sha256,
+                            plan_sha256=plan_sha256,
+                            attempt=1,
+                            receipt_sha256=receipt_sha256,
+                        )
+
     def test_reconciliation_mutation_gate_denial_prevents_receipt_and_audit_work(self) -> None:
         with patch.object(
             RETENTION,
