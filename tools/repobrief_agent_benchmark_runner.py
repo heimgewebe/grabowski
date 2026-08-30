@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -38,7 +39,15 @@ MAX_PROVIDER_BUDGET_USD = Decimal("1.00")
 MAX_CREDENTIAL_BYTES = 64 * 1024
 MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
 READ_ONLY_BUILTINS = ("Read", "Glob", "Grep")
+STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
 TREATMENT_RESOURCE_TOOLS = ("ListMcpResources", "ReadMcpResource")
+TREATMENT_RESOURCE_TOOL_ALIASES = (
+    ("ListMcpResources", "ListMcpResourcesTool"),
+    ("ReadMcpResource", "ReadMcpResourceTool"),
+)
+TREATMENT_RESOURCE_TOOL_NAMES = frozenset(
+    name for aliases in TREATMENT_RESOURCE_TOOL_ALIASES for name in aliases
+)
 TREATMENT_MCP_TOOLS = (
     "mcp__repobrief__ask_context",
     "mcp__repobrief__grounding_verify",
@@ -50,6 +59,8 @@ ABSTRACT_TOOL_MAP = {
     "Grep": "grep",
     "ListMcpResources": "repobrief_resource_read",
     "ReadMcpResource": "repobrief_resource_read",
+    "ListMcpResourcesTool": "repobrief_resource_read",
+    "ReadMcpResourceTool": "repobrief_resource_read",
     "mcp__repobrief__ask_context": "ask_context",
     "mcp__repobrief__grounding_verify": "grounding_verify",
     "mcp__repobrief__live_freshness": "live_freshness",
@@ -61,6 +72,10 @@ TREATMENT_ABSTRACT = BASELINE_ABSTRACT | {
     "live_freshness",
     "repobrief_resource_read",
 }
+TREATMENT_MCP_SERVER_TOOLS = frozenset(
+    name.removeprefix("mcp__repobrief__") for name in TREATMENT_MCP_TOOLS
+)
+MAX_MCP_MESSAGE_BYTES = 4 * 1024 * 1024
 CLAIM_VOCABULARY = (
     "arbitrary_write_authority",
     "citation_invalid",
@@ -686,11 +701,17 @@ def write_mcp_config(request: Mapping[str, Any], workspace: Path) -> Path:
     servers: dict[str, Any] = {}
     if request.get("condition") == "treatment":
         binding = _mapping(request.get("repobrief"))
-        command = [str(item) for item in _list(binding.get("mcp_command"))]
+        upstream = [str(item) for item in _list(binding.get("mcp_command"))]
+        proxy = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--benchmark-mcp-proxy",
+            _canonical_json(upstream),
+        ]
         servers["repobrief"] = {
             "type": "stdio",
-            "command": command[0],
-            "args": command[1:],
+            "command": proxy[0],
+            "args": proxy[1:],
         }
     document = {"mcpServers": servers}
     path = workspace.parent / "repobrief-mcp.json"
@@ -698,6 +719,138 @@ def write_mcp_config(request: Mapping[str, Any], workspace: Path) -> Path:
         path, (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
     )
     return path
+
+
+def _mcp_message(raw: bytes, *, label: str) -> dict[str, Any]:
+    if not raw or len(raw) > MAX_MCP_MESSAGE_BYTES or not raw.endswith(b"\n"):
+        raise RunnerError(f"{label} MCP message is empty, oversized, or unterminated")
+    return _load_object_bytes(raw[:-1], label=label)
+
+
+def _mcp_write(message: Mapping[str, Any], lock: threading.Lock) -> None:
+    payload = _canonical_json(message).encode("utf-8") + b"\n"
+    with lock:
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.flush()
+
+
+def _mcp_filter_tools_list(message: Mapping[str, Any]) -> dict[str, Any]:
+    filtered = dict(message)
+    result = _mapping(filtered.get("result"))
+    tools = _list(result.get("tools"))
+    if not tools:
+        return filtered
+    kept: list[Any] = []
+    for raw_tool in tools:
+        tool = _mapping(raw_tool)
+        name = tool.get("name")
+        if isinstance(name, str) and name in TREATMENT_MCP_SERVER_TOOLS:
+            kept.append(raw_tool)
+    filtered["result"] = {**result, "tools": kept}
+    return filtered
+
+
+def run_benchmark_mcp_proxy(upstream: Sequence[str]) -> int:
+    command = [str(item) for item in upstream]
+    if not command or any(not item for item in command):
+        raise RunnerError("benchmark MCP proxy requires a non-empty upstream argv")
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            env=dict(os.environ),
+        )
+    except OSError as exc:
+        raise RunnerError("benchmark MCP upstream could not be started") from exc
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        raise RunnerError("benchmark MCP upstream pipes are unavailable")
+
+    output_lock = threading.Lock()
+    state_lock = threading.Lock()
+    tools_list_ids: set[Any] = set()
+    writer_errors: list[BaseException] = []
+
+    def client_to_upstream() -> None:
+        try:
+            for raw in sys.stdin.buffer:
+                message = _mcp_message(raw, label="client")
+                method = message.get("method")
+                identifier = message.get("id")
+                if method == "tools/call":
+                    params = _mapping(message.get("params"))
+                    name = params.get("name")
+                    if not isinstance(name, str) or name not in TREATMENT_MCP_SERVER_TOOLS:
+                        if identifier is not None:
+                            _mcp_write(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": identifier,
+                                    "error": {
+                                        "code": -32601,
+                                        "message": "benchmark MCP tool is not authorized",
+                                    },
+                                },
+                                output_lock,
+                            )
+                        continue
+                if method == "tools/list" and identifier is not None:
+                    with state_lock:
+                        tools_list_ids.add(identifier)
+                process.stdin.write(raw)
+                process.stdin.flush()
+        except (BrokenPipeError, OSError, RunnerError) as exc:
+            writer_errors.append(exc)
+        finally:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+
+    writer = threading.Thread(target=client_to_upstream, daemon=True)
+    writer.start()
+    try:
+        for raw in process.stdout:
+            message = _mcp_message(raw, label="upstream")
+            identifier = message.get("id")
+            filter_tools = False
+            if identifier is not None:
+                with state_lock:
+                    if identifier in tools_list_ids:
+                        tools_list_ids.remove(identifier)
+                        filter_tools = True
+            if filter_tools and "result" in message:
+                message = _mcp_filter_tools_list(message)
+            _mcp_write(message, output_lock)
+        returncode = process.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError, RunnerError):
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        process.stdout.close()
+    if writer_errors:
+        raise RunnerError("benchmark MCP client stream failed") from writer_errors[0]
+    return returncode
+
+
+def benchmark_mcp_proxy_main(argv: Sequence[str]) -> int:
+    if len(argv) != 1:
+        print("benchmark MCP proxy requires one encoded upstream argv", file=sys.stderr)
+        return 2
+    try:
+        decoded = json.loads(argv[0])
+        if not isinstance(decoded, list) or any(
+            not isinstance(item, str) or not item for item in decoded
+        ):
+            raise RunnerError("benchmark MCP proxy upstream argv is invalid")
+        return run_benchmark_mcp_proxy(decoded)
+    except (json.JSONDecodeError, RunnerError) as exc:
+        print(f"benchmark MCP proxy failed: {exc}", file=sys.stderr)
+        return 2
 
 
 def _prompt(request: Mapping[str, Any]) -> str:
@@ -897,11 +1050,11 @@ def _validate_init(request: Mapping[str, Any], init: Mapping[str, Any]) -> str:
         raise RunnerError("provider model does not match request")
     available = set(_list(init.get("tools")))
     required = set(READ_ONLY_BUILTINS)
-    allowed = set(required)
+    allowed = set(required) | {STRUCTURED_OUTPUT_TOOL}
     if request.get("condition") == "treatment":
-        treatment_tools = set(TREATMENT_RESOURCE_TOOLS) | set(TREATMENT_MCP_TOOLS)
-        required.update(treatment_tools)
-        allowed.update(treatment_tools)
+        required.update(TREATMENT_MCP_TOOLS)
+        allowed.update(TREATMENT_RESOURCE_TOOL_NAMES)
+        allowed.update(TREATMENT_MCP_TOOLS)
     unknown = available.difference(allowed)
     if unknown:
         raise RunnerError(f"provider exposed unapproved tools: {sorted(unknown)!r}")
@@ -910,6 +1063,14 @@ def _validate_init(request: Mapping[str, Any], init: Mapping[str, Any]) -> str:
         raise RunnerError(
             f"provider did not expose all required tools: {sorted(missing)!r}"
         )
+    if request.get("condition") == "treatment":
+        missing_resource_kinds = [
+            aliases
+            for aliases in TREATMENT_RESOURCE_TOOL_ALIASES
+            if available.isdisjoint(aliases)
+        ]
+        if missing_resource_kinds:
+            raise RunnerError("provider did not expose all required resource tool kinds")
     return model
 
 
@@ -984,13 +1145,21 @@ def normalize_tool_calls(
     request: Mapping[str, Any], messages: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
     uses, results = _tool_blocks(messages)
+    benchmark_uses: list[dict[str, Any]] = []
+    internal_use_ids: set[str] = set()
+    for use in uses:
+        concrete = _require_string(use.get("name"), "tool_use.name", maximum=300)
+        if concrete == STRUCTURED_OUTPUT_TOOL:
+            internal_use_ids.add(str(use.get("id")))
+        else:
+            benchmark_uses.append(use)
     budgets = _mapping(request.get("budgets"))
-    if len(uses) > int(budgets.get("max_tool_calls", -1)):
+    if len(benchmark_uses) > int(budgets.get("max_tool_calls", -1)):
         raise RunnerError("provider tool-call budget exceeded")
     calls: list[dict[str, Any]] = []
     total_input = 0
     total_output = 0
-    for sequence, use in enumerate(uses, start=1):
+    for sequence, use in enumerate(benchmark_uses, start=1):
         identifier = str(use.get("id"))
         result = results.get(identifier)
         if result is None:
@@ -1013,7 +1182,9 @@ def normalize_tool_calls(
                 "output_bytes": output_bytes,
             }
         )
-    extra_results = set(results).difference(str(item.get("id")) for item in uses)
+    extra_results = set(results).difference(
+        str(item.get("id")) for item in benchmark_uses
+    ).difference(internal_use_ids)
     if extra_results:
         raise RunnerError("provider transcript contains orphan tool results")
     if total_input > int(budgets.get("max_tool_input_bytes", -1)):
@@ -1289,7 +1460,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "--benchmark-mcp-proxy":
+        return benchmark_mcp_proxy_main(raw_argv[1:])
+    args = build_parser().parse_args(raw_argv)
     try:
         request = _load_object_bytes(_bounded_stdin(), label="stdin request")
         receipt = execute(
