@@ -49,6 +49,8 @@ _SCALAR_RECORD_FIELDS = (
     "intent_record_sha256",
     "attempt",
     "reconciliation_kind",
+    "completed",
+    "retention_effect_retried",
     "launcher_returncode",
     "launcher_outcome_unknown",
     "recovery_required",
@@ -65,6 +67,7 @@ _STRING_LIST_RECORD_FIELDS = (
     "requested_resource_keys",
 )
 _SHA256_RECORD_FIELDS = frozenset({"plan_sha256", "receipt_sha256", "intent_record_sha256"})
+_BOOLEAN_RECORD_FIELDS = frozenset({"completed", "retention_effect_retried"})
 _EXACT_FILTER_FIELDS = {
     "operation",
     "task_id",
@@ -333,6 +336,12 @@ def _project_record(record: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             continue
         if key == "reconciliation_kind":
             if value == "completion_audit_gap":
+                projected[key] = value
+            else:
+                omitted.append(key)
+            continue
+        if key in _BOOLEAN_RECORD_FIELDS:
+            if type(value) is bool:
                 projected[key] = value
             else:
                 omitted.append(key)

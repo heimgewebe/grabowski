@@ -514,13 +514,45 @@ class AuditSignalTests(unittest.TestCase):
         scalar_block = source.split("_SCALAR_RECORD_FIELDS = (", 1)[1].split(")", 1)[0]
         trace_block = source.split("_TRACE_SCALAR_FIELDS = (", 1)[1].split(")", 1)[0]
         anchor_block = source.split("_TRACE_ANCHOR_KINDS = {", 1)[1].split("}", 1)[0]
-        for field in ("plan_sha256", "receipt_sha256", "intent_record_sha256", "attempt", "reconciliation_kind"):
+        for field in (
+            "plan_sha256",
+            "receipt_sha256",
+            "intent_record_sha256",
+            "attempt",
+            "reconciliation_kind",
+            "completed",
+            "retention_effect_retried",
+        ):
             self.assertIn(f'"{field}"', scalar_block)
         for field in ("plan_sha256", "receipt_sha256"):
             self.assertIn(f'"{field}"', trace_block)
             self.assertIn(f'"{field}"', anchor_block)
 
         tree = ast.parse(source)
+        boolean_fields = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_BOOLEAN_RECORD_FIELDS"
+                for target in node.targets
+            )
+        )
+        boolean_namespace: dict[str, object] = {}
+        exec(
+            compile(
+                ast.Module(body=[boolean_fields], type_ignores=[]),
+                "<audit-query-boolean-fields>",
+                "exec",
+            ),
+            boolean_namespace,
+        )
+        self.assertEqual(
+            boolean_namespace["_BOOLEAN_RECORD_FIELDS"],
+            frozenset({"completed", "retention_effect_retried"}),
+        )
+
         sha_fields = next(
             node
             for node in tree.body
@@ -543,6 +575,42 @@ class AuditSignalTests(unittest.TestCase):
         self.assertEqual(trace_scalar({"plan_sha256": "a" * 64}, "plan_sha256"), "a" * 64)
         self.assertIsNone(trace_scalar({"plan_sha256": "not-a-digest"}, "plan_sha256"))
         self.assertIsNone(trace_scalar({"receipt_sha256": "secret-value"}, "receipt_sha256"))
+
+        project_record = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_project_record"
+        )
+        project_namespace = {
+            "Any": object,
+            "_SCALAR_RECORD_FIELDS": ("completed", "retention_effect_retried"),
+            "_STRING_LIST_RECORD_FIELDS": (),
+            "_SHA256_RECORD_FIELDS": frozenset(),
+            "_BOOLEAN_RECORD_FIELDS": frozenset(
+                {"completed", "retention_effect_retried"}
+            ),
+        }
+        exec(
+            compile(
+                ast.Module(body=[project_record], type_ignores=[]),
+                "<audit-query-project-record>",
+                "exec",
+            ),
+            project_namespace,
+        )
+        project = project_namespace["_project_record"]
+        projected, omitted = project(
+            {"completed": True, "retention_effect_retried": False}
+        )
+        self.assertEqual(
+            projected, {"completed": True, "retention_effect_retried": False}
+        )
+        self.assertEqual(omitted, [])
+        projected, omitted = project(
+            {"completed": 1, "retention_effect_retried": "false"}
+        )
+        self.assertEqual(projected, {})
+        self.assertEqual(omitted, ["completed", "retention_effect_retried"])
 
 
 
