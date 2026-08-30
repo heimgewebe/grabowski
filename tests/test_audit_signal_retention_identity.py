@@ -155,5 +155,88 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
         self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
 
 
+    def test_recent_reconciliation_matches_exact_historical_intent_outside_window(self) -> None:
+        now = 1_800_000_000
+        intent_sha = "1" * 64
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": intent_sha,
+                        "plan_sha256": "2" * 64,
+                        "attempt": 1,
+                    },
+                    now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 100,
+                ),
+                (
+                    {
+                        "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                        "record_sha256": "3" * 64,
+                        "reconciliation_kind": "completion_audit_gap",
+                        "plan_sha256": "2" * 64,
+                        "attempt": 1,
+                        "receipt_sha256": "4" * 64,
+                        "intent_record_sha256": intent_sha,
+                        "completed": True,
+                    },
+                    now - 100,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["severity"]), ("observed", "medium"))
+        self.assertEqual(result["details"]["execution_gap_count"], 0)
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 1)
+        self.assertEqual(
+            result["evidence_refs"], ["audit-record-sha256:" + "3" * 64]
+        )
+
+    def test_historical_completion_blocks_later_reconciliation_classification(self) -> None:
+        now = 1_800_000_000
+        intent_sha = "5" * 64
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": intent_sha,
+                        "plan_sha256": "6" * 64,
+                        "attempt": 1,
+                    },
+                    now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 300,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-complete",
+                        "record_sha256": "7" * 64,
+                        "plan_sha256": "6" * 64,
+                        "attempt": 1,
+                        "receipt_sha256": "8" * 64,
+                    },
+                    now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 200,
+                ),
+                (
+                    {
+                        "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                        "record_sha256": "9" * 64,
+                        "reconciliation_kind": "completion_audit_gap",
+                        "plan_sha256": "6" * 64,
+                        "attempt": 1,
+                        "receipt_sha256": "8" * 64,
+                        "intent_record_sha256": intent_sha,
+                        "completed": True,
+                    },
+                    now - 100,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["severity"]), ("clear", "none"))
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

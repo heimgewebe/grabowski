@@ -201,6 +201,27 @@ def _audit_transition_gap_signal(
     pending: dict[tuple[str, str], list[tuple[dict[str, Any], int]]] = {
         pair: [] for pair in AUDIT_TRANSITION_PAIRS
     }
+    historical_retention_intents = [
+        (record, timestamp_unix)
+        for record, timestamp_unix in prepared_records
+        if (
+            timestamp_unix is not None
+            and timestamp_unix < start_unix
+            and timestamp_unix <= end_unix
+            and record.get("operation") == "runtime-state-retention-intent"
+            and _retention_transition_identity(record) is not None
+        )
+    ]
+    historical_retention_completion_identities = {
+        identity
+        for record, timestamp_unix in prepared_records
+        if (
+            timestamp_unix is not None
+            and timestamp_unix <= end_unix
+            and record.get("operation") == "runtime-state-retention-complete"
+            and (identity := _retention_transition_identity(record)) is not None
+        )
+    }
     completed_counts: Counter[str] = Counter()
     reconciled_counts: Counter[str] = Counter()
     reconciled_records: list[dict[str, Any]] = []
@@ -215,8 +236,19 @@ def _audit_transition_gap_signal(
         if operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
             key = ("runtime-state-retention-intent", "runtime-state-retention-complete")
             match_index = _retention_reconciliation_match_index(pending[key], record)
+            matched = match_index is not None
             if match_index is not None:
                 pending[key].pop(match_index)
+            elif (
+                _retention_transition_identity(record)
+                not in historical_retention_completion_identities
+                and _retention_reconciliation_match_index(
+                    historical_retention_intents, record
+                )
+                is not None
+            ):
+                matched = True
+            if matched:
                 reconciled_counts[key[0]] += 1
                 reconciled_records.append(record)
             continue
@@ -281,8 +313,10 @@ def _audit_transition_gap_signal(
             "completion_audit_gap_evidence_refs": reconciliation_refs,
             "pairing_semantics": (
                 "retention pairs by (plan_sha256, attempt) when present and valid; "
-                "append-only reconciliations resolve only the exact intent_record_sha256 "
-                "and remain visible as completion_audit_gap; only records with both "
+                "append-only reconciliations resolve only the exact intent_record_sha256, "
+                "including an older verified intent outside the reporting window when no "
+                "matching completion exists, and remain visible as completion_audit_gap; "
+                "only records with both "
                 "identity fields absent use legacy FIFO; other transition families use FIFO"
             ),
         },
