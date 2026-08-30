@@ -10377,6 +10377,161 @@ def _workspace_cleanup_references(
     return references, errors
 
 
+def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
+    """Read one persisted task row without refreshing task state."""
+    if task_id is None:
+        return {"task_id": None, "state": "not_started", "terminal": False}
+    connection = None
+    try:
+        connection = checkouts._readonly_connection(tasks.TASK_DB)
+        if connection is None:
+            raise RuntimeError("task inventory projection is unavailable")
+        row = connection.execute(
+            """
+            SELECT task_id, host, unit, state, attempt, resume_policy,
+                   argv_sha256, cwd
+            FROM tasks
+            WHERE task_id=?
+            """,
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"task inventory row is missing: {task_id}")
+        value = dict(row)
+    except Exception as exc:
+        return {
+            "task_id": task_id,
+            "state": "observation_error",
+            "terminal": False,
+            "error": _error_summary(exc),
+            "reconcile_required": True,
+        }
+    finally:
+        if connection is not None:
+            connection.close()
+    state = str(value.get("state", "unknown"))
+    return {
+        "task_id": task_id,
+        "host": value.get("host"),
+        "unit": value.get("unit"),
+        "state": state,
+        "terminal": state in TERMINAL_TASK_STATES,
+        "attempt": value.get("attempt"),
+        "resume_policy": value.get("resume_policy"),
+        "argv_sha256": value.get("argv_sha256"),
+        "cwd": value.get("cwd"),
+        "outcome_receipt": None,
+    }
+
+
+def _workspace_cleanup_resource_snapshot() -> dict[str, Any]:
+    """Read all live resource leases once for one cleanup inventory."""
+    try:
+        leases = checkouts._read_resource_leases()
+    except Exception as exc:
+        return {
+            "complete": False,
+            "error": _error_summary(exc),
+            "by_key": {},
+            "by_owner": {},
+        }
+    by_key: dict[str, dict[str, Any]] = {}
+    by_owner: dict[str, list[dict[str, Any]]] = {}
+    for lease in leases:
+        if not isinstance(lease, dict):
+            return {
+                "complete": False,
+                "error": "live resource lease snapshot contains a non-object entry",
+                "by_key": {},
+                "by_owner": {},
+            }
+        key = lease.get("resource_key")
+        owner_id = lease.get("owner_id")
+        if not isinstance(key, str) or not key or not isinstance(owner_id, str) or not owner_id:
+            return {
+                "complete": False,
+                "error": "live resource lease snapshot contains an invalid identity",
+                "by_key": {},
+                "by_owner": {},
+            }
+        by_key[key] = lease
+        by_owner.setdefault(owner_id, []).append(lease)
+    return {
+        "complete": True,
+        "error": None,
+        "by_key": by_key,
+        "by_owner": by_owner,
+    }
+
+
+def _workspace_cleanup_checkout_coordination(
+    checkout_path: Path,
+    repo_path: Path,
+    repo_common_dir: Path,
+    *,
+    owner_id: str,
+    resource_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Reuse cleanup lease evidence while still observing tasks and processes live."""
+    if resource_snapshot is None:
+        return checkouts._linked_checkout_coordination(
+            checkout_path,
+            repo_path,
+            repo_common_dir,
+            owner_id=owner_id,
+            include_processes=True,
+            include_tasks=True,
+            include_resources=True,
+        )
+    base = checkouts._linked_checkout_coordination(
+        checkout_path,
+        repo_path,
+        repo_common_dir,
+        owner_id=owner_id,
+        include_processes=True,
+        include_tasks=True,
+        include_resources=False,
+    )
+    if resource_snapshot.get("complete") is not True:
+        error = str(resource_snapshot.get("error") or "resource lease snapshot incomplete")
+        return {
+            "resource_leases": [
+                {
+                    "blocking": True,
+                    "observation_error": error,
+                }
+            ],
+            "tasks": list(base.get("tasks") or []),
+            "processes": list(base.get("processes") or []),
+            "blocking": True,
+            "blocking_counts": {
+                "resource_leases": 1,
+                "tasks": len(base.get("tasks") or []),
+                "processes": len(base.get("processes") or []),
+            },
+        }
+    by_key = resource_snapshot.get("by_key")
+    if not isinstance(by_key, dict):
+        raise AgentWorkspaceActionError("resource lease snapshot key index is invalid")
+    resource_blockers: list[dict[str, Any]] = []
+    for lease in by_key.values():
+        if not isinstance(lease, dict):
+            raise AgentWorkspaceActionError("resource lease snapshot entry is invalid")
+        resource_key = lease.get("resource_key")
+        if not isinstance(resource_key, str):
+            raise AgentWorkspaceActionError("resource lease snapshot key is invalid")
+        if not checkouts._resource_related(
+            resource_key, [checkout_path, repo_common_dir]
+        ):
+            continue
+        resource_blockers.append({**lease, "blocking": True})
+    return checkouts._coordination_result(
+        resource_blockers,
+        list(base.get("tasks") or []),
+        list(base.get("processes") or []),
+    )
+
+
 def _workspace_created_unix(manifest: dict[str, Any]) -> int | None:
     created_at = manifest.get("created_at")
     if not isinstance(created_at, str) or not created_at:
@@ -10390,8 +10545,17 @@ def _workspace_created_unix(manifest: dict[str, Any]) -> int | None:
     return int(parsed.timestamp())
 
 
-def _closed_workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
-    liveness = _workspace_liveness(manifest)
+def _closed_workspace_liveness(
+    manifest: dict[str, Any],
+    *,
+    resource_snapshot: dict[str, Any] | None = None,
+    task_reader: Callable[[str | None], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    liveness = _workspace_liveness(
+        manifest,
+        resource_snapshot=resource_snapshot,
+        task_reader=task_reader,
+    )
     raw_resource_keys = manifest.get("resources", {}).get("lease_keys")
     exact_resource_keys: list[str] = []
     exact_live_resource_keys: list[str] = []
@@ -10409,8 +10573,22 @@ def _closed_workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
         try:
             exact_resource_keys = resources.normalize_resource_keys(raw_resource_keys)
             observed_at_unix = _now()
+            if resource_snapshot is not None:
+                if resource_snapshot.get("complete") is not True:
+                    raise AgentWorkspaceActionError(
+                        str(resource_snapshot.get("error") or "resource lease snapshot incomplete")
+                    )
+                by_key = resource_snapshot.get("by_key")
+                if not isinstance(by_key, dict):
+                    raise AgentWorkspaceActionError("resource lease snapshot key index is invalid")
+            else:
+                by_key = None
             for key in exact_resource_keys:
-                lease = resources.inspect_resource(key)
+                lease = (
+                    by_key.get(key)
+                    if isinstance(by_key, dict)
+                    else resources.inspect_resource(key)
+                )
                 if lease is None:
                     continue
                 expires_at_unix = lease.get("expires_at_unix")
@@ -10444,15 +10622,21 @@ def _closed_workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
+def _workspace_liveness(
+    manifest: dict[str, Any],
+    *,
+    resource_snapshot: dict[str, Any] | None = None,
+    task_reader: Callable[[str | None], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     task_states: dict[str, dict[str, Any]] = {}
+    read_task = task_reader or _task_public
     nonterminal_roles: list[str] = []
     execution_live_roles: list[str] = []
     recovery_attention_roles: list[str] = []
     task_observation_error_roles: list[str] = []
     for role_name in ("writer", "tests", "review"):
         task_id = manifest.get("tasks", {}).get(role_name)
-        public = _task_public(task_id)
+        public = read_task(task_id)
         task_states[role_name] = public
         if task_id is None:
             continue
@@ -10475,11 +10659,21 @@ def _workspace_liveness(manifest: dict[str, Any]) -> dict[str, Any]:
             preserved_lane_resource_keys = sorted(raw_keys)
     elif isinstance(resource_owner, str) and resource_owner:
         try:
-            observed = resources.list_resources(
-                owner_id=resource_owner,
-                include_expired=False,
-                limit=MAX_PATHS + 8,
-            )
+            if resource_snapshot is not None:
+                if resource_snapshot.get("complete") is not True:
+                    raise AgentWorkspaceActionError(
+                        str(resource_snapshot.get("error") or "resource lease snapshot incomplete")
+                    )
+                by_owner = resource_snapshot.get("by_owner")
+                if not isinstance(by_owner, dict):
+                    raise AgentWorkspaceActionError("resource lease snapshot owner index is invalid")
+                observed = by_owner.get(resource_owner, [])
+            else:
+                observed = resources.list_resources(
+                    owner_id=resource_owner,
+                    include_expired=False,
+                    limit=MAX_PATHS + 8,
+                )
             live_resource_keys = sorted(
                 str(item.get("resource_key"))
                 for item in observed
@@ -10693,7 +10887,10 @@ def _workspace_cleanup_archive_lifecycle(
 
 
 def _workspace_cleanup_plan_data(
-    manifest: dict[str, Any]
+    manifest: dict[str, Any],
+    *,
+    resource_snapshot: dict[str, Any] | None = None,
+    task_reader: Callable[[str | None], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     identifier = str(manifest["workspace_id"])
     repository = str(manifest["repository"])
@@ -10713,9 +10910,17 @@ def _workspace_cleanup_plan_data(
         and _resource_close_contract_satisfied(manifest, close_receipt)
     )
     liveness = (
-        _closed_workspace_liveness(manifest)
+        _closed_workspace_liveness(
+            manifest,
+            resource_snapshot=resource_snapshot,
+            task_reader=task_reader,
+        )
         if fully_closed
-        else _workspace_liveness(manifest)
+        else _workspace_liveness(
+            manifest,
+            resource_snapshot=resource_snapshot,
+            task_reader=task_reader,
+        )
     )
     stale_reconciliation = _stale_workspace_reconciliation_plan(manifest, liveness)
     blockers: list[dict[str, Any]] = []
@@ -10905,14 +11110,12 @@ def _workspace_cleanup_plan_data(
                         "actual": record.get("head"),
                     }
                 )
-            coordination = checkouts._linked_checkout_coordination(
+            coordination = _workspace_cleanup_checkout_coordination(
                 checkout_path,
                 top_level,
                 common_dir,
                 owner_id=owner,
-                include_processes=True,
-                include_tasks=True,
-                include_resources=True,
+                resource_snapshot=resource_snapshot,
             )
             checkout_state["coordination"] = coordination
             if coordination.get("blocking"):
@@ -11159,6 +11362,15 @@ def _workspace_cleanup_plan_data(
     return {**body, "plan_sha256": _sha256_json(body)}
 
 
+def _workspace_cleanup_plan_current(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Revalidate one cleanup plan against one fresh read-only lease snapshot."""
+    return _workspace_cleanup_plan_data(
+        manifest,
+        resource_snapshot=_workspace_cleanup_resource_snapshot(),
+        task_reader=_workspace_cleanup_task_public,
+    )
+
+
 @mcp.tool(name="grabowski_agent_workspace_cleanup_plan", annotations=READ_ONLY)
 def grabowski_agent_workspace_cleanup_plan(
     workspace_ids: list[str] | None = None,
@@ -11196,7 +11408,15 @@ def grabowski_agent_workspace_cleanup_plan(
         raise AgentWorkspaceError(
             f"cleanup inventory exceeds {MAX_CLEANUP_WORKSPACES} workspaces"
         )
-    plans = [_workspace_cleanup_plan_data(_manifest(identifier)) for identifier in selected]
+    resource_snapshot = _workspace_cleanup_resource_snapshot()
+    plans = [
+        _workspace_cleanup_plan_data(
+            _manifest(identifier),
+            resource_snapshot=resource_snapshot,
+            task_reader=_workspace_cleanup_task_public,
+        )
+        for identifier in selected
+    ]
     summary = {
         "workspace_count": len(plans),
         "eligible_count": sum(1 for plan in plans if plan["eligible"]),
@@ -11316,7 +11536,7 @@ def grabowski_agent_workspace_reconcile_stale(
                 "idempotent": True,
                 "close_receipt": existing,
             }
-        plan = _workspace_cleanup_plan_data(manifest)
+        plan = _workspace_cleanup_plan_current(manifest)
         if plan["plan_sha256"] != expected_hash:
             raise AgentWorkspaceError("workspace lifecycle plan is stale; rerun cleanup_plan")
         stale = plan["stale_reconciliation"]
@@ -11733,7 +11953,7 @@ def grabowski_agent_workspace_reconcile_idle_tmux(
         recovery_expected_matches = recovery_source_plan_sha256 == expected_hash
         recovery_current_plan: dict[str, Any] | None = None
         if recovery_source_plan_sha256 is not None and not recovery_expected_matches:
-            recovery_current_plan = _workspace_cleanup_plan_data(manifest)
+            recovery_current_plan = _workspace_cleanup_plan_current(manifest)
             recovery_expected_matches = (
                 recovery_current_plan["plan_sha256"] == expected_hash
             )
@@ -11767,7 +11987,7 @@ def grabowski_agent_workspace_reconcile_idle_tmux(
                     raise AgentWorkspaceActionError(
                         "idle tmux transition intent conflicts with a recreated same-name session"
                     )
-                recovery_live_plan = _workspace_cleanup_plan_data(manifest)
+                recovery_live_plan = _workspace_cleanup_plan_current(manifest)
                 recovery_transition = recovery_live_plan["stale_reconciliation"].get(
                     "idle_tmux_transition"
                 )
@@ -11802,7 +12022,7 @@ def grabowski_agent_workspace_reconcile_idle_tmux(
                 )
                 _persist_idle_tmux_transition_manifest(manifest, transition_receipt)
         else:
-            plan = recovery_current_plan or _workspace_cleanup_plan_data(manifest)
+            plan = recovery_current_plan or _workspace_cleanup_plan_current(manifest)
             if plan["plan_sha256"] != expected_hash:
                 raise AgentWorkspaceError(
                     "workspace lifecycle plan is stale; rerun cleanup_plan"
@@ -11823,7 +12043,7 @@ def grabowski_agent_workspace_reconcile_idle_tmux(
                 raise AgentWorkspaceError(
                     "idle tmux transition has no exact session binding"
                 )
-            pre_mutation_plan = _workspace_cleanup_plan_data(manifest)
+            pre_mutation_plan = _workspace_cleanup_plan_current(manifest)
             if pre_mutation_plan["plan_sha256"] != expected_hash:
                 raise AgentWorkspaceError(
                     "workspace lifecycle plan changed before idle tmux removal; rerun cleanup_plan"
@@ -11884,7 +12104,7 @@ def grabowski_agent_workspace_reconcile_idle_tmux(
                 recovered_after_ambiguous_effect=False,
             )
             _persist_idle_tmux_transition_manifest(manifest, transition_receipt)
-        post_tmux_plan = _workspace_cleanup_plan_data(manifest)
+        post_tmux_plan = _workspace_cleanup_plan_current(manifest)
         post_tmux_plan_sha256 = str(post_tmux_plan["plan_sha256"])
         source_plan_sha256 = str(transition_receipt["source_plan_sha256"])
         tmux_mutation_performed = bool(transition_receipt["tmux_mutation_performed"])
@@ -11915,7 +12135,7 @@ def grabowski_agent_workspace_reconcile_idle_tmux(
         if "workspace lifecycle plan is stale" not in str(exc):
             raise
         with _lock(identifier):
-            current_plan = _workspace_cleanup_plan_data(_manifest(identifier))
+            current_plan = _workspace_cleanup_plan_current(_manifest(identifier))
         return {
             "workspace_id": identifier,
             "state": "idle_tmux_removed_stale_reconciliation_blocked",
@@ -11975,7 +12195,7 @@ def _workspace_lifecycle_cleanup_plan(
 ) -> dict[str, Any]:
     projected_manifest = dict(manifest)
     projected_manifest.pop("workspace_cleanup_intent", None)
-    return _workspace_cleanup_plan_data(projected_manifest)
+    return _workspace_cleanup_plan_current(projected_manifest)
 
 
 def _workspace_lifecycle_classification(
@@ -12706,7 +12926,7 @@ def grabowski_agent_workspace_cleanup(
             manifest, expected_hash, owner
         )
         if reconciliation is not None:
-            reconciliation_plan = _workspace_cleanup_plan_data(manifest)
+            reconciliation_plan = _workspace_cleanup_plan_current(manifest)
             intent = manifest.get("workspace_cleanup_intent")
             if not isinstance(intent, dict) or not isinstance(
                 intent.get("intent_id"), str
@@ -12765,7 +12985,7 @@ def grabowski_agent_workspace_cleanup(
                         "requires_fresh_cleanup_plan": True,
                         "worktree_preserved": True,
                     }
-            plan = _workspace_cleanup_plan_data(manifest)
+            plan = _workspace_cleanup_plan_current(manifest)
             if plan["plan_sha256"] != expected_hash:
                 raise AgentWorkspaceError(
                     "workspace cleanup plan is stale; rerun cleanup_plan"
