@@ -26,7 +26,13 @@ Observed on the bound revision:
 - internal edges in that SCC: **120**
 - direct mutual-import pairs inside the SCC: **11**
 
-The previous post-S2 measurement used by S3 had a largest SCC of 37 modules. S3 therefore produced a measurable **37 → 34** reduction while the repository continued to grow.
+The older post-S2 snapshot used in the rest-plan discussion had a largest SCC of 37 modules. The exact S3 boundary is narrower and was remeasured directly from Git objects with the same static-import/SCC calculation:
+
+- S3 parent `a3c9c81d2c2a53c4626a86e6d8bf8d2bd7e005e8`: **130 modules / 381 edges / largest SCC 36**
+- S3 commit `8bf15e8ec07bd2a4eddfb4b2bf29ce2fd99bfb7e`: **130 modules / 380 edges / largest SCC 34**
+- current bound main `30ccbe9b49f794fc4ffe1cbb2062e5d9fbf0dfca`: **131 modules / 385 edges / largest SCC 34**
+
+Thus the broader post-S2-to-current progression is **37 → 34**, while S3 itself produced the directly attributable **36 → 34** reduction and that reduction remained stable as the repository grew afterward.
 
 ## D2 sensitivity ranking
 
@@ -87,7 +93,7 @@ Operator optimization report binding:
 
 Rationale against the Restplan threshold:
 
-- S3 already achieved a real 37 → 34 SCC reduction.
+- S3 achieved a directly measured **36 → 34** SCC reduction; the broader post-S2-to-current progression is **37 → 34**.
 - No remaining single edge has comparable leverage; the best is 34 → 33.
 - The strongest two-edge local candidate has an upper-bound 34 → 32 effect but requires a broad checkout authority extraction.
 - No current production/friction evidence ties that candidate to a leading operational failure.
