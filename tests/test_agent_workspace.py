@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import os
+import sqlite3
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
@@ -6729,6 +6730,93 @@ class AgentWorkspaceTests(unittest.TestCase):
         if isinstance(head, str) and head and isinstance(branch, str) and branch:
             self.git.publish_remote_head(head, branch)
 
+    def test_task_public_reads_persisted_state_without_status_refresh(self) -> None:
+        task_db = workspace.tasks.TASK_DB
+        task_db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(task_db) as connection:
+            connection.execute(
+                """
+                CREATE TABLE tasks(
+                    task_id TEXT PRIMARY KEY,
+                    host TEXT NOT NULL,
+                    unit TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    resume_policy TEXT NOT NULL,
+                    argv_sha256 TEXT NOT NULL,
+                    cwd TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    "writer-task",
+                    "heim-pc",
+                    "writer.service",
+                    "completed",
+                    1,
+                    "never",
+                    "a" * 64,
+                    str(self.git.writer),
+                ),
+            )
+        with mock.patch.object(
+            workspace.tasks,
+            "grabowski_task_status",
+            side_effect=AssertionError("cleanup planning must not refresh task state"),
+        ) as task_status:
+            public = workspace._workspace_cleanup_task_public("writer-task")
+        task_status.assert_not_called()
+        self.assertEqual(public["state"], "completed")
+        self.assertTrue(public["terminal"])
+        self.assertEqual(public["unit"], "writer.service")
+
+    def test_cleanup_plan_reads_resource_lease_snapshot_once(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_read_resource_leases",
+                return_value=[],
+            ) as read_leases,
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            report = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )
+        read_leases.assert_called_once_with()
+        self.assertEqual(report["summary"]["eligible_count"], 1)
+
+    def test_cleanup_plan_blocks_when_resource_snapshot_is_unavailable(self) -> None:
+        manifest = self._closed_cleanup_manifest()
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_capability"),
+            mock.patch.object(
+                workspace.checkouts,
+                "_read_resource_leases",
+                side_effect=RuntimeError("resource snapshot unavailable"),
+            ),
+            mock.patch.object(
+                workspace.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False, "blocking_counts": {}},
+            ),
+        ):
+            plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+        self.assertFalse(plan["eligible"])
+        self.assertIn(
+            "workspace_resource_outcome_unknown",
+            {item["code"] for item in plan["blockers"]},
+        )
+
     def test_cleanup_plan_marks_closed_clean_linked_worktree_eligible(self) -> None:
         manifest = self._closed_cleanup_manifest()
         with (
@@ -6754,11 +6842,16 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest["tasks"]["writer"] = "writer-task"
         workspace._write_manifest(manifest)
         live_key = manifest["resources"]["lease_keys"][0]
+        live_lease = {
+            "resource_key": live_key,
+            "owner_id": manifest["resources"]["owner_id"],
+            "expires_at_unix": int(time.time()) + 1000,
+        }
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(
                 workspace,
-                "_task_public",
+                "_workspace_cleanup_task_public",
                 return_value={
                     "task_id": "writer-task",
                     "state": "running",
@@ -6766,9 +6859,9 @@ class AgentWorkspaceTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(
-                workspace.resources,
-                "list_resources",
-                return_value=[{"resource_key": live_key}],
+                workspace.checkouts,
+                "_read_resource_leases",
+                return_value=[live_lease],
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=False),
             mock.patch.object(
@@ -6802,11 +6895,10 @@ class AgentWorkspaceTests(unittest.TestCase):
         }
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
-            mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(
-                workspace.resources,
-                "inspect_resource",
-                return_value=foreign_lease,
+                workspace.checkouts,
+                "_read_resource_leases",
+                return_value=[foreign_lease],
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=False),
             mock.patch.object(
@@ -7424,7 +7516,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
-            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace, "_workspace_cleanup_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace.resources, "release_resources", release_resources),
             mock.patch.object(workspace.tasks, "grabowski_task_cancel", task_cancel),
@@ -7504,7 +7596,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
-            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace, "_workspace_cleanup_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
             mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
@@ -7946,8 +8038,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(intent["session_identity"], identity)
             original_cleanup_plan_data = workspace._workspace_cleanup_plan_data
 
-            def drifted_plan_data(current_manifest: dict) -> dict:
-                current_plan = original_cleanup_plan_data(current_manifest)
+            def drifted_plan_data(current_manifest: dict, **kwargs: object) -> dict:
+                current_plan = original_cleanup_plan_data(current_manifest, **kwargs)
                 body = dict(current_plan)
                 body.pop("plan_sha256")
                 body["test_benign_plan_drift"] = True
@@ -7981,9 +8073,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         identity = {"session_id": "$45", "session_created": 1784050150}
         resources_live = False
 
-        def list_resources(**kwargs: object) -> list[dict[str, str]]:
+        def read_resource_leases() -> list[dict[str, object]]:
             return (
-                [{"resource_key": "path:/new-live-resource"}]
+                [{
+                    "resource_key": "path:/new-live-resource",
+                    "owner_id": manifest["resources"]["owner_id"],
+                    "expires_at_unix": 1784051000,
+                }]
                 if resources_live
                 else []
             )
@@ -7991,7 +8087,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
-            mock.patch.object(workspace.resources, "list_resources", side_effect=list_resources),
+            mock.patch.object(workspace.checkouts, "_read_resource_leases", side_effect=read_resource_leases),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
             mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
             mock.patch.object(workspace, "_tmux_exact_session_identity", return_value=identity),
@@ -8097,13 +8193,18 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"
         manifest["tasks"] = {"writer": None, "tests": None, "review": None}
         workspace._write_manifest(manifest)
+        live_lease = {
+            "resource_key": "path:/live",
+            "owner_id": manifest["resources"]["owner_id"],
+            "expires_at_unix": 1784051000,
+        }
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
             mock.patch.object(
-                workspace.resources,
-                "list_resources",
-                return_value=[{"resource_key": "path:/live"}],
+                workspace.checkouts,
+                "_read_resource_leases",
+                return_value=[live_lease],
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
             mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
@@ -8135,7 +8236,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 [],
                 [],
                 [],
-                [{"resource_key": "path:/new-live-resource"}],
+                [{"resource_key": "path:/new-live-resource", "owner_id": manifest["resources"]["owner_id"], "expires_at_unix": 1784051000}],
             ]
         )
 
@@ -8154,9 +8255,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
             mock.patch.object(
-                workspace.resources,
-                "list_resources",
-                side_effect=lambda **kwargs: next(resource_observations),
+                workspace.checkouts,
+                "_read_resource_leases",
+                side_effect=lambda: next(resource_observations),
             ),
             mock.patch.object(workspace, "_tmux_has_session", side_effect=has_session),
             mock.patch.object(workspace, "_tmux_has_exact_session", side_effect=has_session),
@@ -8208,7 +8309,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             [
                 [],
                 [],
-                [{"resource_key": "path:/new-live-resource"}],
+                [{"resource_key": "path:/new-live-resource", "owner_id": manifest["resources"]["owner_id"], "expires_at_unix": 1784051000}],
             ]
         )
 
@@ -8216,9 +8317,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
             mock.patch.object(
-                workspace.resources,
-                "list_resources",
-                side_effect=lambda **kwargs: next(resource_observations),
+                workspace.checkouts,
+                "_read_resource_leases",
+                side_effect=lambda: next(resource_observations),
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
             mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
@@ -8272,7 +8373,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
-            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace, "_workspace_cleanup_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
             mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
@@ -8308,7 +8409,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
-            mock.patch.object(workspace, "_task_public", side_effect=task_public),
+            mock.patch.object(workspace, "_workspace_cleanup_task_public", side_effect=task_public),
             mock.patch.object(workspace.resources, "list_resources", return_value=[]),
             mock.patch.object(workspace, "_tmux_has_session", return_value=True),
             mock.patch.object(workspace, "_tmux_has_exact_session", return_value=True),
@@ -8343,7 +8444,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
             mock.patch.object(
                 workspace,
-                "_task_public",
+                "_workspace_cleanup_task_public",
                 side_effect=lambda task_id: (
                     {"task_id": None, "state": "not_started", "terminal": False}
                     if task_id is None
@@ -8404,12 +8505,17 @@ class AgentWorkspaceTests(unittest.TestCase):
         manifest["created_at"] = "2026-01-01T00:00:00+00:00"
         manifest["tasks"] = {"writer": None, "tests": None, "review": None}
         workspace._write_manifest(manifest)
+        live_lease = {
+            "resource_key": "path:/live",
+            "owner_id": manifest["resources"]["owner_id"],
+            "expires_at_unix": 1784051000,
+        }
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(
-                workspace.resources,
-                "list_resources",
-                return_value=[{"resource_key": "path:/live"}],
+                workspace.checkouts,
+                "_read_resource_leases",
+                return_value=[live_lease],
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=False),
             mock.patch.object(workspace, "_now", return_value=1784050000),
@@ -8601,9 +8707,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             "dirty = True\n", encoding="utf-8"
         )
         coordination = {
+            "resource_leases": [],
+            "tasks": [],
+            "processes": [{"pid": 4242, "cwd": str(self.git.writer)}],
             "blocking": True,
             "blocking_counts": {
-                "resource_leases": 1,
+                "resource_leases": 0,
                 "tasks": 0,
                 "processes": 1,
             },
