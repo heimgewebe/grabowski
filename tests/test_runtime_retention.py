@@ -1923,8 +1923,10 @@ class RuntimeRetentionTests(unittest.TestCase):
 
     def test_reconciliation_appends_only_audit_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "receipt.json"
+            root = Path(temporary)
+            root.chmod(0o700)
             plan_sha256 = "a" * 64
+            path = root / f"{plan_sha256}.json"
             intent_sha256 = "b" * 64
             payload = {
                 "schema_version": 3,
@@ -1943,6 +1945,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             path.chmod(0o600)
             with patch.object(
+                RETENTION, "RECEIPT_ROOT", root
+            ), patch.object(
                 RETENTION, "_require_reconciliation_mutation_authority"
             ) as mutation_authority, patch.object(
                 RETENTION, "_retention_coordination_lock", return_value=nullcontext()
@@ -1978,8 +1982,10 @@ class RuntimeRetentionTests(unittest.TestCase):
 
     def test_reconciliation_is_idempotent_for_existing_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "receipt.json"
+            root = Path(temporary)
+            root.chmod(0o700)
             plan_sha256 = "d" * 64
+            path = root / f"{plan_sha256}.json"
             intent_sha256 = "e" * 64
             payload = {
                 "schema_version": 3,
@@ -1998,6 +2004,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             path.chmod(0o600)
             with patch.object(
+                RETENTION, "RECEIPT_ROOT", root
+            ), patch.object(
                 RETENTION, "_require_reconciliation_mutation_authority"
             ) as mutation_authority, patch.object(
                 RETENTION, "_retention_coordination_lock", return_value=nullcontext()
@@ -2027,7 +2035,10 @@ class RuntimeRetentionTests(unittest.TestCase):
 
     def test_reconciliation_rejects_foreign_terminal_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "receipt.json"
+            root = Path(temporary)
+            root.chmod(0o700)
+            expected_plan_sha256 = "4" * 64
+            path = root / f"{expected_plan_sha256}.json"
             payload = {
                 "schema_version": 3,
                 "operation": "grabowski-runtime-state-retention",
@@ -2045,18 +2056,84 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             path.chmod(0o600)
             with patch.object(
+                RETENTION, "RECEIPT_ROOT", root
+            ), patch.object(
                 RETENTION, "_require_reconciliation_mutation_authority"
             ) as mutation_authority, patch.object(
                 RETENTION, "_retention_coordination_lock", return_value=nullcontext()
             ), self.assertRaisesRegex(RuntimeError, "binding is invalid"):
                 RETENTION.reconcile_retention_completion_audit(
                     intent_record_sha256="3" * 64,
-                    plan_sha256="4" * 64,
+                    plan_sha256=expected_plan_sha256,
                     attempt=1,
                     receipt_path=path,
                     expected_receipt_sha256=payload["receipt_sha256"],
                 )
             mutation_authority.assert_called_once_with()
+
+    def test_reconciliation_rejects_self_consistent_receipt_outside_canonical_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            canonical_root = root / "receipts"
+            canonical_root.mkdir(mode=0o700)
+            plan_sha256 = "5" * 64
+            forged_path = root / "forged.json"
+            payload = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": plan_sha256,
+                "attempt": 1,
+                "previous_receipt_sha256": None,
+                "reset_failed": [],
+                "reset_failures": [],
+                "archived_jobs": [],
+                "completed": True,
+                "retry": {
+                    "required": False,
+                    "strategy": "rebuild_live_plan_and_chain_partial_receipt",
+                },
+                "completed_at_unix": 1_800_000_000,
+            }
+            payload["receipt_sha256"] = RETENTION._sha256(payload)
+            forged_path.write_text(json.dumps(payload), encoding="utf-8")
+            forged_path.chmod(0o600)
+            with patch.object(RETENTION, "RECEIPT_ROOT", canonical_root):
+                with self.assertRaisesRegex(RuntimeError, "canonical receipt target"):
+                    RETENTION._verified_terminal_retention_receipt(
+                        forged_path,
+                        plan_sha256=plan_sha256,
+                        attempt=1,
+                        expected_receipt_sha256=payload["receipt_sha256"],
+                    )
+
+    def test_canonical_retention_receipt_path_binds_attempt_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            plan_sha256 = "6" * 64
+            self.assertEqual(
+                RETENTION._canonical_retention_receipt_path(
+                    plan_sha256=plan_sha256,
+                    attempt=1,
+                    receipt_root=root,
+                ),
+                root / f"{plan_sha256}.json",
+            )
+            self.assertEqual(
+                RETENTION._canonical_retention_receipt_path(
+                    plan_sha256=plan_sha256,
+                    attempt=2,
+                    receipt_root=root,
+                ),
+                root / f"{plan_sha256}.retry-02.json",
+            )
+            with self.assertRaisesRegex(RuntimeError, "attempt is invalid"):
+                RETENTION._canonical_retention_receipt_path(
+                    plan_sha256=plan_sha256,
+                    attempt=RETENTION.MAX_RETENTION_RECEIPT_ATTEMPTS + 1,
+                    receipt_root=root,
+                )
 
     def test_reconciliation_mutation_gate_denial_prevents_receipt_and_audit_work(self) -> None:
         with patch.object(

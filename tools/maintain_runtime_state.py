@@ -1470,6 +1470,32 @@ RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION = (
 )
 
 
+def _canonical_retention_receipt_path(
+    *,
+    plan_sha256: str,
+    attempt: int,
+    receipt_root: Path | None = None,
+) -> Path:
+    if re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
+        raise RuntimeError("retention reconciliation plan hash is invalid")
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+        or attempt > MAX_RETENTION_RECEIPT_ATTEMPTS
+    ):
+        raise RuntimeError("retention reconciliation attempt is invalid")
+    root = _private_directory(
+        RECEIPT_ROOT if receipt_root is None else receipt_root
+    )
+    name = (
+        f"{plan_sha256}.json"
+        if attempt == 1
+        else f"{plan_sha256}.retry-{attempt:02d}.json"
+    )
+    return root / name
+
+
 def _verified_terminal_retention_receipt(
     path: Path,
     *,
@@ -1477,10 +1503,14 @@ def _verified_terminal_retention_receipt(
     attempt: int,
     expected_receipt_sha256: str,
 ) -> dict[str, Any]:
-    if re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
-        raise RuntimeError("retention reconciliation plan hash is invalid")
-    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
-        raise RuntimeError("retention reconciliation attempt is invalid")
+    canonical_path = _canonical_retention_receipt_path(
+        plan_sha256=plan_sha256,
+        attempt=attempt,
+    )
+    if path != canonical_path:
+        raise RuntimeError(
+            "retention reconciliation receipt path is not the canonical receipt target"
+        )
     if re.fullmatch(r"[0-9a-f]{64}", expected_receipt_sha256) is None:
         raise RuntimeError("retention reconciliation receipt hash is invalid")
     payload, _ = _read_json_file(path, max_bytes=MAX_RETENTION_RECEIPT_BYTES)
