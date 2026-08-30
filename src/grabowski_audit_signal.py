@@ -245,7 +245,7 @@ def _audit_transition_gap_signal(
         tuple[str, int, str], tuple[dict[str, Any], int]
     ] = {}
     pending_retention_keys_by_identity: dict[
-        tuple[str, int], set[tuple[str, int, str]]
+        tuple[str, int], list[tuple[str, int, str]]
     ] = {}
     historical_retention_intents: dict[
         tuple[str, int, str], tuple[dict[str, Any], int]
@@ -255,7 +255,7 @@ def _audit_transition_gap_signal(
         tuple[str, int, str], tuple[str, dict[str, Any], int]
     ] = {}
     historical_unmatched_keys_by_identity: dict[
-        tuple[str, int], set[tuple[str, int, str]]
+        tuple[str, int], list[tuple[str, int, str]]
     ] = {}
     seen_retention_completion_identities: set[tuple[str, int]] = set()
     completed_counts: Counter[str] = Counter()
@@ -266,7 +266,9 @@ def _audit_transition_gap_signal(
         key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
     ) -> None:
         pending_retention[key] = (record, timestamp_unix)
-        pending_retention_keys_by_identity.setdefault(key[:2], set()).add(key)
+        keys = pending_retention_keys_by_identity.setdefault(key[:2], [])
+        if key not in keys:
+            keys.append(key)
 
     def _pop_pending_retention(
         key: tuple[str, int, str]
@@ -274,7 +276,8 @@ def _audit_transition_gap_signal(
         item = pending_retention.pop(key, None)
         keys = pending_retention_keys_by_identity.get(key[:2])
         if keys is not None:
-            keys.discard(key)
+            if key in keys:
+                keys.remove(key)
             if not keys:
                 pending_retention_keys_by_identity.pop(key[:2], None)
         return item
@@ -287,7 +290,9 @@ def _audit_transition_gap_signal(
             record,
             timestamp_unix,
         )
-        historical_unmatched_keys_by_identity.setdefault(key[:2], set()).add(key)
+        keys = historical_unmatched_keys_by_identity.setdefault(key[:2], [])
+        if key not in keys:
+            keys.append(key)
 
     def _pop_historical_unmatched(
         key: tuple[str, int, str]
@@ -295,7 +300,8 @@ def _audit_transition_gap_signal(
         item = historical_unmatched.pop(key, None)
         keys = historical_unmatched_keys_by_identity.get(key[:2])
         if keys is not None:
-            keys.discard(key)
+            if key in keys:
+                keys.remove(key)
             if not keys:
                 historical_unmatched_keys_by_identity.pop(key[:2], None)
         return item
@@ -378,10 +384,14 @@ def _audit_transition_gap_signal(
             matched = False
             if completion_fields_present:
                 if identity is not None:
-                    keys = pending_retention_keys_by_identity.get(identity, set())
-                    if len(keys) == 1:
-                        only_key = next(iter(keys))
-                        _pop_pending_retention(only_key)
+                    keys = pending_retention_keys_by_identity.get(identity, [])
+                    if keys:
+                        # A retry can append the same logical intent identity again
+                        # before any receipt exists.  The completion belongs to the
+                        # most recent preceding intent in verified audit order; older
+                        # duplicates remain fail-closed as separate unknown execution.
+                        latest_key = keys[-1]
+                        _pop_pending_retention(latest_key)
                         matched = True
             else:
                 match_index = _audit_transition_match_index(
@@ -394,11 +404,12 @@ def _audit_transition_gap_signal(
                 completed_counts[retention_pair[0]] += 1
             if identity is not None:
                 seen_retention_completion_identities.add(identity)
-                unresolved_keys = list(
-                    historical_unmatched_keys_by_identity.get(identity, set())
+                unresolved_keys = historical_unmatched_keys_by_identity.get(
+                    identity, []
                 )
-                for unresolved_key in unresolved_keys:
-                    if _pop_historical_unmatched(unresolved_key) is not None:
+                if unresolved_keys:
+                    latest_key = unresolved_keys[-1]
+                    if _pop_historical_unmatched(latest_key) is not None:
                         completed_counts[retention_pair[0]] += 1
             continue
 
