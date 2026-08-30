@@ -735,6 +735,45 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         )
         blocked_run.assert_not_called()
 
+    def test_session_escalation_normalizes_only_exact_integral_json_floats(self) -> None:
+        now = 1_000_000
+        base = {
+            "target": {"repo": "heimgewebe/grabowski"},
+            "reason": "bounded transport normalization test",
+            "recovery": {"plan": "no mutation in this unit test"},
+        }
+        with patch.object(grabowski_mcp.time, "time", return_value=now):
+            integral = {**base, "expires_at_unix": float(now + 60)}
+            grabowski_mcp._validate_session_escalation(integral)
+
+            for invalid in (
+                True,
+                str(now + 60),
+                float(now + 60) + 0.5,
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+            ):
+                with self.subTest(invalid=invalid):
+                    with self.assertRaisesRegex(RuntimeError, "must be an integer"):
+                        grabowski_mcp._validate_session_escalation(
+                            {**base, "expires_at_unix": invalid}
+                        )
+
+            with self.assertRaisesRegex(RuntimeError, "is expired"):
+                grabowski_mcp._validate_session_escalation(
+                    {**base, "expires_at_unix": float(now - 1)}
+                )
+            with self.assertRaisesRegex(RuntimeError, "too far in the future"):
+                grabowski_mcp._validate_session_escalation(
+                    {
+                        **base,
+                        "expires_at_unix": float(
+                            now + grabowski_mcp.SESSION_ESCALATION_MAX_SECONDS + 1
+                        ),
+                    }
+                )
+
     def test_high_risk_grip_requires_explicit_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -774,6 +813,15 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 )
                 self.assertTrue(valid["allowed"])
 
+                transport_parameters = json.loads(json.dumps(valid_parameters))
+                transport_parameters["session_escalation"]["expires_at_unix"] = float(
+                    valid_parameters["session_escalation"]["expires_at_unix"]
+                )
+                transported = grabowski_mcp._session_grip_policy_decision(
+                    "captain-run", transport_parameters
+                )
+                self.assertTrue(transported["allowed"])
+
                 class Session:
                     pass
 
@@ -784,7 +832,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}
                 ) as run:
                     result = grabowski_mcp.grip_run(
-                        "captain-run", valid_parameters, ctx=RequestContext()
+                        "captain-run", transport_parameters, ctx=RequestContext()
                     )
 
                 self.assertEqual(result, {"ok": True})

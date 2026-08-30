@@ -56,6 +56,9 @@ SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
 COMPONENT_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,255}\Z")
 OPERATION_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,255}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+BRANCH_MUTATION_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
+BRANCH_MUTATION_ATTEMPT_SCHEMA_VERSION = 1
+BRANCH_MUTATION_ATTEMPT_METADATA_KEY = "branch_mutation_attempt"
 TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -157,6 +160,32 @@ class ResourceConflict(RuntimeError):
         self.resource_key = resource_key
         self.owner_id = owner_id
         self.expires_at_unix = expires_at_unix
+
+
+class SameOwnerBranchAttemptConflict(RuntimeError):
+    """A live branch lease already carries an active mutation attempt."""
+
+    def __init__(
+        self,
+        resource_key: str,
+        owner_id: str,
+        existing_binding_sha256: str,
+        requested_binding_sha256: str,
+    ) -> None:
+        self.already_running = existing_binding_sha256 == requested_binding_sha256
+        super().__init__(
+            (
+                "The exact same-owner branch mutation attempt is already running; "
+                "read back and reconcile before retry"
+                if self.already_running
+                else "Live same-owner branch lease belongs to a different operation/attempt; "
+                "read back and reconcile before retry"
+            )
+        )
+        self.resource_key = resource_key
+        self.owner_id = owner_id
+        self.existing_binding_sha256 = existing_binding_sha256
+        self.requested_binding_sha256 = requested_binding_sha256
 
 
 def _now() -> int:
@@ -1097,6 +1126,34 @@ def _lease_identity_metadata(
     if preserve_task_attempt:
         ignored.update({"attempt", "recovered_after_expiry"})
     return {key: value for key, value in metadata.items() if key not in ignored}
+
+
+def _branch_mutation_attempt_binding(
+    *, operation_id: str, attempt_id: str, expected_preimage_sha256: str
+) -> dict[str, Any]:
+    for label, value in (("operation_id", operation_id), ("attempt_id", attempt_id)):
+        if (
+            not isinstance(value, str)
+            or BRANCH_MUTATION_ATTEMPT_ID_RE.fullmatch(value) is None
+        ):
+            raise ValueError(
+                f"{label} must match [A-Za-z0-9][A-Za-z0-9._:@/-]{{0,127}}"
+            )
+    if (
+        not isinstance(expected_preimage_sha256, str)
+        or SHA256_RE.fullmatch(expected_preimage_sha256) is None
+    ):
+        raise ValueError("expected_preimage_sha256 must be a lowercase SHA-256")
+    material: dict[str, Any] = {
+        "schema_version": BRANCH_MUTATION_ATTEMPT_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "expected_preimage_sha256": expected_preimage_sha256,
+    }
+    material["binding_sha256"] = hashlib.sha256(
+        _canonical_json(material).encode("utf-8")
+    ).hexdigest()
+    return material
 
 
 def _expired_same_owner_reentry_snapshot(row: sqlite3.Row) -> dict[str, Any]:
@@ -5191,6 +5248,29 @@ def acquire_resources(
                         raise RuntimeError(
                             "non-conflict exception leases are non-renewable; reassess and reacquire"
                         )
+                    observed_attempt = observed_metadata.get(
+                        BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                    )
+                    requested_attempt = persisted_metadata.get(
+                        BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                    )
+                    if isinstance(observed_attempt, dict) and isinstance(
+                        requested_attempt, dict
+                    ):
+                        observed_binding = observed_attempt.get("binding_sha256")
+                        requested_binding = requested_attempt.get("binding_sha256")
+                        if (
+                            not isinstance(observed_binding, str)
+                            or SHA256_RE.fullmatch(observed_binding) is None
+                            or not isinstance(requested_binding, str)
+                            or SHA256_RE.fullmatch(requested_binding) is None
+                        ):
+                            raise RuntimeError(
+                                "branch mutation attempt binding metadata is invalid"
+                            )
+                        raise SameOwnerBranchAttemptConflict(
+                            key, owner, observed_binding, requested_binding
+                        )
                     observed_identity_metadata = _lease_identity_metadata(
                         observed_metadata,
                         preserve_task_attempt=_preserve_live_same_owner,
@@ -5283,6 +5363,404 @@ def acquire_resources(
     }
 
 
+def _overlay_live_same_owner_branch_attempt(
+    *,
+    owner: str,
+    branch_key: str,
+    binding: dict[str, Any],
+    now: int,
+    required_expires_at_unix: int,
+) -> dict[str, Any] | None:
+    """Overlay one attempt binding onto an existing same-owner branch lease.
+
+    The existing lease remains the authority surface: purpose, acquisition time
+    and all pre-existing metadata are preserved. Expiry may be extended only for
+    the bounded attempt lifetime and is restored after terminal Git readback.
+    """
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+            ).fetchone()
+            if row is None or int(row["expires_at_unix"]) <= now:
+                connection.commit()
+                return None
+            if row["owner_id"] != owner:
+                raise ResourceConflict(
+                    branch_key, row["owner_id"], row["expires_at_unix"]
+                )
+            observed_metadata = _row_metadata(row)
+            _, observed_metadata_sha256 = _metadata(observed_metadata)
+            if row["metadata_sha256"] != observed_metadata_sha256:
+                raise RuntimeError(
+                    f"Resource lease metadata integrity mismatch: {branch_key}"
+                )
+            existing_attempt = observed_metadata.get(
+                BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+            )
+            if existing_attempt is not None:
+                if not isinstance(existing_attempt, dict):
+                    raise RuntimeError(
+                        "branch mutation attempt lease metadata is invalid"
+                    )
+                existing_binding = existing_attempt.get("binding_sha256")
+                requested_binding = binding["binding_sha256"]
+                if (
+                    not isinstance(existing_binding, str)
+                    or SHA256_RE.fullmatch(existing_binding) is None
+                ):
+                    raise RuntimeError(
+                        "branch mutation attempt binding metadata is invalid"
+                    )
+                if existing_binding != requested_binding:
+                    raise SameOwnerBranchAttemptConflict(
+                        branch_key, owner, existing_binding, requested_binding
+                    )
+                origin = existing_attempt.get("lease_origin")
+                if origin not in {"preexisting", "attempt_only"}:
+                    raise RuntimeError(
+                        "branch mutation attempt lease origin is invalid"
+                    )
+                previous_expires = existing_attempt.get("previous_expires_at_unix")
+                attempt_expires = existing_attempt.get("attempt_expires_at_unix")
+                if origin == "preexisting":
+                    if not isinstance(previous_expires, int) or previous_expires <= 0:
+                        raise RuntimeError(
+                            "branch mutation attempt previous expiry is invalid"
+                        )
+                    if not isinstance(attempt_expires, int) or attempt_expires <= 0:
+                        raise RuntimeError(
+                            "branch mutation attempt expiry is invalid"
+                        )
+                    if int(row["expires_at_unix"]) != attempt_expires:
+                        raise RuntimeError(
+                            "branch mutation attempt expiry changed during attempt"
+                        )
+                raise SameOwnerBranchAttemptConflict(
+                    branch_key, owner, existing_binding, requested_binding
+                )
+
+            previous_expires_at_unix = int(row["expires_at_unix"])
+            attempt_expires_at_unix = max(
+                previous_expires_at_unix, required_expires_at_unix
+            )
+            attempt_metadata = {
+                **binding,
+                "lease_origin": "preexisting",
+                "previous_metadata_sha256": observed_metadata_sha256,
+                "previous_expires_at_unix": previous_expires_at_unix,
+                "attempt_expires_at_unix": attempt_expires_at_unix,
+            }
+            overlaid_metadata = {
+                **observed_metadata,
+                BRANCH_MUTATION_ATTEMPT_METADATA_KEY: attempt_metadata,
+            }
+            metadata_json, metadata_sha256 = _metadata(overlaid_metadata)
+            connection.execute(
+                """
+                UPDATE leases
+                SET expires_at_unix=?, metadata_sha256=?, metadata_json=?
+                WHERE resource_key=?
+                """,
+                (
+                    attempt_expires_at_unix,
+                    metadata_sha256,
+                    metadata_json,
+                    branch_key,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+            ).fetchone()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    if updated is None:  # pragma: no cover - guarded by the transaction
+        raise RuntimeError("branch mutation attempt overlay disappeared")
+    return {
+        "lease": _public(updated),
+        "lease_origin": "preexisting",
+        "preserved": True,
+        "previous_metadata_sha256": observed_metadata_sha256,
+        "previous_expires_at_unix": previous_expires_at_unix,
+    }
+
+
+def acquire_branch_mutation_attempt(
+    owner_id: str,
+    repository: str,
+    branch: str,
+    *,
+    operation_id: str,
+    attempt_id: str,
+    expected_preimage_sha256: str,
+    ttl_seconds: int = 900,
+) -> dict[str, Any]:
+    """Serialize overlapping same-owner branch attempts without replacing authority.
+
+    A live same-owner branch lease (including a Work Lane lease) remains intact
+    and receives only an ephemeral attempt marker. If no live lease exists, an
+    attempt-only branch lease is acquired through the normal resource contract.
+    """
+    owner = _owner(owner_id)
+    repository_path = Path(repository).expanduser().resolve(strict=True)
+    if not repository_path.is_dir():
+        raise ValueError("repository must be a directory")
+    if not isinstance(branch, str) or not branch or len(branch.encode("utf-8")) > 512:
+        raise ValueError("branch must be non-empty bounded text")
+    ttl = _ttl(ttl_seconds)
+    branch_key = normalize_resource_key(f"repo:{repository_path}:branch:{branch}")
+    binding = _branch_mutation_attempt_binding(
+        operation_id=operation_id,
+        attempt_id=attempt_id,
+        expected_preimage_sha256=expected_preimage_sha256,
+    )
+    now = _now()
+    overlaid = _overlay_live_same_owner_branch_attempt(
+        owner=owner,
+        branch_key=branch_key,
+        binding=binding,
+        now=now,
+        required_expires_at_unix=now + ttl,
+    )
+    if overlaid is not None:
+        lease = overlaid["lease"]
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_branch_mutation_attempt_lease",
+            "owner_id": owner,
+            "repository": str(repository_path),
+            "branch": branch,
+            "resource_key": branch_key,
+            "operation_id": operation_id,
+            "attempt_id": attempt_id,
+            "expected_preimage_sha256": expected_preimage_sha256,
+            "attempt_binding_sha256": binding["binding_sha256"],
+            "lease": lease,
+            "lease_origin": overlaid["lease_origin"],
+            "previous_metadata_sha256": overlaid[
+                "previous_metadata_sha256"
+            ],
+            "previous_expires_at_unix": overlaid["previous_expires_at_unix"],
+            "preserved": True,
+            "release_required_after_terminal_readback": True,
+        }
+
+    attempt_metadata = {**binding, "lease_origin": "attempt_only"}
+    result = acquire_resources(
+        owner,
+        [branch_key],
+        purpose="branch mutation attempt",
+        ttl_seconds=ttl,
+        metadata={BRANCH_MUTATION_ATTEMPT_METADATA_KEY: attempt_metadata},
+    )
+    lease = result["leases"][0]
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_branch_mutation_attempt_lease",
+        "owner_id": owner,
+        "repository": str(repository_path),
+        "branch": branch,
+        "resource_key": branch_key,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "expected_preimage_sha256": expected_preimage_sha256,
+        "attempt_binding_sha256": binding["binding_sha256"],
+        "lease": lease,
+        "lease_origin": "attempt_only",
+        "previous_metadata_sha256": None,
+        "previous_expires_at_unix": None,
+        "preserved": branch_key in result["preserved"],
+        "release_required_after_terminal_readback": True,
+    }
+
+
+def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str, Any]:
+    """Restore or snapshot-release one exact attempt after terminal readback."""
+    if not isinstance(attempt_lease, dict):
+        raise ValueError("attempt_lease must be an object")
+    owner = _owner(attempt_lease.get("owner_id"))
+    branch_key = normalize_resource_key(attempt_lease.get("resource_key"))
+    binding_sha256 = attempt_lease.get("attempt_binding_sha256")
+    if (
+        not isinstance(binding_sha256, str)
+        or SHA256_RE.fullmatch(binding_sha256) is None
+    ):
+        raise ValueError("attempt_lease attempt binding SHA-256 is invalid")
+    origin = attempt_lease.get("lease_origin")
+    if origin == "attempt_only":
+        expected = attempt_lease.get("lease")
+        if not isinstance(expected, dict):
+            raise ValueError("attempt-only lease snapshot is missing")
+        expected_snapshot = _release_lease_snapshot(expected)
+        with _database() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "attempt-only branch lease disappeared before cleanup"
+                    )
+                if row["owner_id"] != owner:
+                    raise PermissionError(
+                        "attempt-only branch lease owner changed before cleanup"
+                    )
+                if _release_lease_snapshot(row) != expected_snapshot:
+                    raise RuntimeError(
+                        "attempt-only branch lease changed before cleanup"
+                    )
+                metadata = _row_metadata(row)
+                _, observed_metadata_sha256 = _metadata(metadata)
+                if row["metadata_sha256"] != observed_metadata_sha256:
+                    raise RuntimeError(
+                        f"Resource lease metadata integrity mismatch: {branch_key}"
+                    )
+                observed_attempt = metadata.get(
+                    BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                )
+                if not isinstance(observed_attempt, dict):
+                    raise RuntimeError(
+                        "branch mutation attempt marker disappeared before cleanup"
+                    )
+                if observed_attempt.get("binding_sha256") != binding_sha256:
+                    raise RuntimeError(
+                        "branch mutation attempt binding changed before cleanup"
+                    )
+                if observed_attempt.get("lease_origin") != "attempt_only":
+                    raise RuntimeError(
+                        "branch mutation attempt origin changed before cleanup"
+                    )
+                deleted = connection.execute(
+                    "DELETE FROM leases WHERE resource_key=? AND owner_id=?",
+                    (branch_key, owner),
+                )
+                if deleted.rowcount != 1:
+                    raise RuntimeError(
+                        "attempt-only branch lease release was not exact"
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_branch_mutation_attempt_cleanup",
+            "resource_key": branch_key,
+            "lease_origin": origin,
+            "action": "released",
+            "snapshot_guarded": True,
+        }
+    if origin != "preexisting":
+        raise ValueError("attempt_lease lease_origin is invalid")
+
+    expected_previous = attempt_lease.get("previous_metadata_sha256")
+    if (
+        not isinstance(expected_previous, str)
+        or SHA256_RE.fullmatch(expected_previous) is None
+    ):
+        raise ValueError("preexisting lease previous metadata SHA-256 is invalid")
+    expected_previous_expires = attempt_lease.get("previous_expires_at_unix")
+    if not isinstance(expected_previous_expires, int) or expected_previous_expires <= 0:
+        raise ValueError("preexisting lease previous expiry is invalid")
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "preexisting branch lease disappeared before attempt cleanup"
+                )
+            if row["owner_id"] != owner:
+                raise PermissionError(
+                    "preexisting branch lease owner changed before attempt cleanup"
+                )
+            metadata = _row_metadata(row)
+            _, observed_sha256 = _metadata(metadata)
+            if row["metadata_sha256"] != observed_sha256:
+                raise RuntimeError(
+                    f"Resource lease metadata integrity mismatch: {branch_key}"
+                )
+            observed_attempt = metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
+            if not isinstance(observed_attempt, dict):
+                raise RuntimeError(
+                    "branch mutation attempt marker disappeared before cleanup"
+                )
+            if observed_attempt.get("binding_sha256") != binding_sha256:
+                raise RuntimeError(
+                    "branch mutation attempt binding changed before cleanup"
+                )
+            if observed_attempt.get("lease_origin") != "preexisting":
+                raise RuntimeError(
+                    "branch mutation attempt origin changed before cleanup"
+                )
+            if (
+                observed_attempt.get("previous_metadata_sha256")
+                != expected_previous
+            ):
+                raise RuntimeError(
+                    "branch mutation attempt restore binding changed before cleanup"
+                )
+            if (
+                observed_attempt.get("previous_expires_at_unix")
+                != expected_previous_expires
+            ):
+                raise RuntimeError(
+                    "branch mutation attempt previous expiry changed before cleanup"
+                )
+            observed_attempt_expires = observed_attempt.get("attempt_expires_at_unix")
+            if (
+                not isinstance(observed_attempt_expires, int)
+                or int(row["expires_at_unix"]) != observed_attempt_expires
+            ):
+                raise RuntimeError(
+                    "branch mutation attempt expiry changed before cleanup"
+                )
+            restored_metadata = dict(metadata)
+            restored_metadata.pop(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
+            metadata_json, metadata_sha256 = _metadata(restored_metadata)
+            if metadata_sha256 != expected_previous:
+                raise RuntimeError(
+                    "preexisting branch lease metadata changed during attempt"
+                )
+            connection.execute(
+                """
+                UPDATE leases
+                SET expires_at_unix=?, metadata_sha256=?, metadata_json=?
+                WHERE resource_key=?
+                """,
+                (
+                    expected_previous_expires,
+                    metadata_sha256,
+                    metadata_json,
+                    branch_key,
+                ),
+            )
+            restored = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (branch_key,)
+            ).fetchone()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    if restored is None:  # pragma: no cover - guarded by the transaction
+        raise RuntimeError("preexisting branch lease restoration disappeared")
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_branch_mutation_attempt_cleanup",
+        "resource_key": branch_key,
+        "lease_origin": origin,
+        "action": "restored",
+        "snapshot_guarded": False,
+        "restored_lease": _public(restored),
+    }
+
+
 def rebind_same_owner_resources(
     owner_id: str,
     resource_keys: Iterable[str],
@@ -5360,6 +5838,17 @@ def rebind_same_owner_resources(
                 if row["metadata_sha256"] != observed_metadata_sha256:
                     raise RuntimeError(
                         f"Resource lease metadata integrity mismatch: {key}"
+                    )
+                branch_attempt = observed_metadata.get(
+                    BRANCH_MUTATION_ATTEMPT_METADATA_KEY
+                )
+                if branch_attempt is not None:
+                    if not isinstance(branch_attempt, dict):
+                        raise RuntimeError(
+                            f"Branch mutation attempt lease metadata is invalid: {key}"
+                        )
+                    raise RuntimeError(
+                        f"Live branch mutation attempt lease cannot be rebound generically: {key}; complete the exact branch attempt first"
                     )
                 observed_rows[key] = row
                 observed_metadata_by_key[key] = observed_metadata
@@ -5489,6 +5978,15 @@ def renew_resources(
                 ) != expected_by_key[key]:
                     raise RuntimeError(f"Resource lease changed before renew: {key}")
                 row_metadata = _row_metadata(row)
+                branch_attempt = row_metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
+                if branch_attempt is not None:
+                    if not isinstance(branch_attempt, dict):
+                        raise RuntimeError(
+                            f"Branch mutation attempt lease metadata is invalid: {key}"
+                        )
+                    raise RuntimeError(
+                        f"Live branch mutation attempt lease cannot be renewed generically: {key}; complete the exact branch attempt first"
+                    )
                 if row_metadata.get("lease_mode") == "emergency-recovery":
                     raise RuntimeError(
                         "emergency-recovery leases are non-renewable; "
@@ -5571,6 +6069,16 @@ def release_resources(
                     row
                 ) != expected_by_key[key]:
                     raise RuntimeError(f"Resource lease changed before release: {key}")
+                row_metadata = _row_metadata(row)
+                branch_attempt = row_metadata.get(BRANCH_MUTATION_ATTEMPT_METADATA_KEY)
+                if branch_attempt is not None:
+                    if not isinstance(branch_attempt, dict):
+                        raise RuntimeError(
+                            f"Branch mutation attempt lease metadata is invalid: {key}"
+                        )
+                    raise RuntimeError(
+                        f"Live branch mutation attempt lease cannot be released generically: {key}; use exact branch-attempt cleanup"
+                    )
                 released.append(_public(row))
             if released:
                 connection.executemany(

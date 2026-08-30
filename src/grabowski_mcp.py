@@ -59,6 +59,7 @@ import grabowski_merge_authority as merge_authority
 import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
+
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
@@ -1511,7 +1512,13 @@ def _validate_session_escalation(value: Any) -> None:
     if not isinstance(value.get("reason"), str) or not value.get("reason").strip():
         raise RuntimeError("session_escalation.reason must be non-empty")
     expires = value.get("expires_at_unix")
-    if not isinstance(expires, int) or isinstance(expires, bool):
+    if isinstance(expires, bool):
+        raise RuntimeError("session_escalation.expires_at_unix must be an integer")
+    if isinstance(expires, float):
+        if not expires.is_integer():
+            raise RuntimeError("session_escalation.expires_at_unix must be an integer")
+        expires = int(expires)
+    elif not isinstance(expires, int):
         raise RuntimeError("session_escalation.expires_at_unix must be an integer")
     now = int(time.time())
     if expires <= now:

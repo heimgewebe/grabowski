@@ -1180,7 +1180,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_git_status": {
             "category": "version-control",
-            "purpose": "Read fixed short Git status for one allowed repository.",
+            "purpose": "Read fixed short Git status and optionally the exact CAS branch preimage for one allowed repository.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
