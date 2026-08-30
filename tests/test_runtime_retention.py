@@ -1943,6 +1943,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             path.chmod(0o600)
             with patch.object(
+                RETENTION, "_require_reconciliation_mutation_authority"
+            ) as mutation_authority, patch.object(
                 RETENTION, "_retention_coordination_lock", return_value=nullcontext()
             ), patch.object(
                 RETENTION,
@@ -1963,6 +1965,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                     expected_receipt_sha256=payload["receipt_sha256"],
                 )
             self.assertEqual(result["status"], "reconciled")
+            mutation_authority.assert_called_once_with()
             self.assertFalse(result["retention_effect_retried"])
             apply_plan.assert_not_called()
             record = append_audit.call_args.args[0]
@@ -1995,6 +1998,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             path.chmod(0o600)
             with patch.object(
+                RETENTION, "_require_reconciliation_mutation_authority"
+            ) as mutation_authority, patch.object(
                 RETENTION, "_retention_coordination_lock", return_value=nullcontext()
             ), patch.object(
                 RETENTION,
@@ -2016,6 +2021,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                     expected_receipt_sha256=payload["receipt_sha256"],
                 )
             self.assertEqual(result["status"], "already-reconciled")
+            mutation_authority.assert_called_once_with()
             self.assertTrue(result["idempotent"])
             append_audit.assert_not_called()
 
@@ -2039,6 +2045,8 @@ class RuntimeRetentionTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             path.chmod(0o600)
             with patch.object(
+                RETENTION, "_require_reconciliation_mutation_authority"
+            ) as mutation_authority, patch.object(
                 RETENTION, "_retention_coordination_lock", return_value=nullcontext()
             ), self.assertRaisesRegex(RuntimeError, "binding is invalid"):
                 RETENTION.reconcile_retention_completion_audit(
@@ -2048,6 +2056,44 @@ class RuntimeRetentionTests(unittest.TestCase):
                     receipt_path=path,
                     expected_receipt_sha256=payload["receipt_sha256"],
                 )
+            mutation_authority.assert_called_once_with()
+
+    def test_reconciliation_mutation_gate_denial_prevents_receipt_and_audit_work(self) -> None:
+        with patch.object(
+            RETENTION,
+            "_require_reconciliation_mutation_authority",
+            side_effect=PermissionError("blocked by test mutation gate"),
+        ) as mutation_authority, patch.object(
+            RETENTION, "_retention_coordination_lock"
+        ) as coordination_lock, patch.object(
+            RETENTION, "_verified_terminal_retention_receipt"
+        ) as receipt_read, patch.object(
+            RETENTION, "_append_audit_record"
+        ) as append_audit:
+            with self.assertRaisesRegex(PermissionError, "blocked by test mutation gate"):
+                RETENTION.reconcile_retention_completion_audit(
+                    intent_record_sha256="a" * 64,
+                    plan_sha256="b" * 64,
+                    attempt=1,
+                    receipt_path=Path("/does/not/matter.json"),
+                    expected_receipt_sha256="c" * 64,
+                )
+        mutation_authority.assert_called_once_with()
+        coordination_lock.assert_not_called()
+        receipt_read.assert_not_called()
+        append_audit.assert_not_called()
+
+    def test_reconciliation_mutation_authority_uses_central_file_write_gate(self) -> None:
+        fake_base = types.ModuleType("grabowski_mcp")
+        fake_base.AUDIT_LOG = Path("/tmp/grabowski-audit-test/write-audit.jsonl")
+        fake_base._require_mutations_enabled = Mock()
+        with patch.dict("sys.modules", {"grabowski_mcp": fake_base}):
+            RETENTION._require_reconciliation_mutation_authority()
+        fake_base._require_mutations_enabled.assert_called_once_with(
+            "file_write",
+            path=str(fake_base.AUDIT_LOG),
+            fresh_preflight=True,
+        )
 
 if __name__ == "__main__":
     unittest.main()

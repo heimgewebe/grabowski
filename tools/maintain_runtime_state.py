@@ -1577,6 +1577,19 @@ def _retention_audit_reconciliation_state(
     }
 
 
+def _require_reconciliation_mutation_authority() -> None:
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import grabowski_mcp as base
+
+    base._require_mutations_enabled(
+        "file_write",
+        path=str(base.AUDIT_LOG),
+        fresh_preflight=True,
+    )
+
+
 def _retention_coordination_lock():
     source = str(SRC)
     if source not in sys.path:
@@ -1594,6 +1607,7 @@ def reconcile_retention_completion_audit(
     receipt_path: Path,
     expected_receipt_sha256: str,
 ) -> dict[str, Any]:
+    _require_reconciliation_mutation_authority()
     with _retention_coordination_lock():
         return _reconcile_retention_completion_audit_locked(
             intent_record_sha256=intent_record_sha256,
