@@ -1,6 +1,6 @@
 # Trajectory shadow pilot (experimental)
 
-Status: **STOP / do not promote** (final hardened rerun 2026-08-29).
+Status: **STOP / do not promote** (historical v1 snapshot finalized 2026-08-29; parser/evidence semantics hardened 2026-08-30).
 
 This directory contains a read-only, post-hoc pilot owned by the existing Bureau scope
 `GRABOWSKI-OPERATOR-SURFACE-V1-T047`. It is not a public runtime contract, does not
@@ -46,7 +46,7 @@ A known base-revision mismatch rejects attribution even when the branch name mat
 Target-only and ambiguous matches are excluded. All exactly bound provider sessions for
 a lane are merged chronologically rather than selecting only the largest session.
 
-Recorded final rerun inventory:
+Recorded historical v1 rerun inventory (2026-08-29):
 
 - 1,424 Work Lane receipts indexed;
 - 141 Claude sessions indexed;
@@ -142,10 +142,20 @@ An aggregate audit of the exact cohort showed 236 such classifications, includin
 free-form commands beginning with `const` and additional reads/searches/wrappers. The
 classifier now requires a structurally known test/check runner invocation (including
 bounded shell/env/timeout wrappers and common Python/build-tool forms). Incidental words
-in reads, searches, scripts, and free text no longer count. The corrected cohort contains
-15 verification actions and the detector/decision result remains unchanged.
+in reads, searches, scripts, and free text no longer count. The historical v1 cohort
+contains 15 verification actions.
 
-## Final pilot result
+A further exact-head review on 2026-08-30 found one remaining shell-control-flow gap:
+a test/check segment could still be treated as verification even when `||` could skip or
+mask it, or when a later `;`/`|` could replace its exit status. Schema v2 now fails closed
+on those shapes while retaining safe `&&` composition. A live v2 rerun surfaces one
+`verification_gap` promotion candidate in the already-known PR #951 lane. That candidate
+is not counted as actionable: external baseline validation confirms terminal head
+`2cd16612a9dd6eb9f91577bad9efd778ac149896`, successful Python 3.10/3.12 validation,
+CodeQL, and Codex review settlement before merge. The promotion decision therefore remains
+STOP after manual validation.
+
+## Historical v1 pilot result
 
 The final hardened 31-run cohort produced:
 
@@ -181,13 +191,14 @@ labeled ground truth from which a defensible precision percentage could be compu
 
 Local Work Lane closeout receipts provide lane state, terminal closeout class, reason codes
 and terminal observation time. They do not by themselves reconstruct every historical
-diff/test/review/acceptance fact. Therefore any future promotion-grade candidate would
-need a second join against existing PR/CI/review/outcome evidence before it could count as
-`actionable_incremental_information`.
+diff/test/review/acceptance fact. Schema v2 therefore labels structurally eligible matches
+only as `promotion_candidates`; the generated report records zero externally validated
+actionable findings until a separate PR/CI/review/outcome validation is performed.
 
-That broader baseline join is intentionally not built now: after all observed adapter and
-attribution hardening there are no high-confidence candidates to validate, so adding more
-machinery has no demonstrated path to changing the current decision.
+That broader baseline join is intentionally not built into this pilot. The single candidate
+surfaced by the 2026-08-30 shell hardening was manually validated against existing PR #951
+evidence and did not demonstrate added recovery value. Building a general join still has no
+demonstrated path to changing the STOP decision.
 
 ## Decision
 
@@ -208,10 +219,16 @@ owner for any such future behavior-observability work; do not open a parallel Bu
 ```bash
 python3 experimental/trajectory_shadow/trajectory_shadow.py \
   --limit 48 \
-  --report experimental/trajectory_shadow/pilot_report_2026-08-28.json
+  --report /tmp/trajectory-shadow-current-v2.json
 
-python3 -m pytest -q tests/test_trajectory_shadow.py
+python3 -m pytest -q \
+  tests/test_trajectory_shadow.py \
+  tests/test_trajectory_shadow_wrapper_options.py
 ```
+
+The checked-in `pilot_report_2026-08-28.json` is retained as the historical schema-v1
+snapshot behind the documented 2026-08-29 decision. Current live inputs are not frozen,
+so reproduction should write a new schema-v2 report rather than overwrite that artifact.
 
 The CLI is read-only with respect to Grabowski runtime/workspaces/sessions. `--report` and
 optional `--output-root` only write sanitized experimental artifacts chosen by the caller.

@@ -96,13 +96,13 @@ def test_sanitized_event_contains_digests_but_no_raw_content() -> None:
     assert "prompt" not in payload
 
 
-def test_actionable_incremental_information_excludes_localization_only(tmp_path: Path) -> None:
+def test_promotion_candidates_exclude_localization_only(tmp_path: Path) -> None:
     lane = ts.Lane(lane_id="lane-1", target_path="/tmp/worktree", branch="branch-a", base_head="base-a", repo="/tmp/repo", source_kind="prompt", source_id=None, state="ready", created_at=1.0, updated_at=10.0, closeout_state="pr_merged", baseline_observed_at=10.0, baseline_reason_codes=("merged_pr_observed",))
     session = ts.Session(adapter="claude", path=tmp_path / "session.jsonl", session_id="s1", cwd="/tmp/worktree", branch="branch-a", base_commit=None, tool_actions=3, first_at=1.0, last_at=3.0)
     events = [event(1, operation="edit", target="src/a.py"), event(2, operation="read", target="src/b.py", result="r"), event(3, operation="execute", result="x")]
     result = ts.evaluate_lane(lane, session, events, ("branch",))
     assert result["finding_counts"]["mutation_without_evidenced_localization"] == 1
-    assert all(item["detector"] != "mutation_without_evidenced_localization" for item in result["actionable_incremental_information"])
+    assert all(item["detector"] != "mutation_without_evidenced_localization" for item in result["promotion_candidates"])
 
 
 def test_blocked_closeout_does_not_create_verification_gap() -> None:
@@ -160,6 +160,22 @@ def test_shell_verification_classification_is_structural() -> None:
     for command in verification_commands:
         assert ts._classify_shell(command, "/tmp/worktree")[0] == "verify", command
 
+    unsafe_verification_commands = [
+        "true || pytest -q",
+        "pytest -q || true",
+        "pytest -q ; true",
+        "pytest -q | cat",
+        "bash -lc 'true || pytest -q'",
+        "bash -lc 'pytest -q || true'",
+        "bash -lc 'pytest -q | cat'",
+    ]
+    for command in unsafe_verification_commands:
+        assert ts._classify_shell(command, "/tmp/worktree")[0] == "execute", command
+
+    assert ts._classify_shell("cd /tmp ; pytest -q", "/tmp/worktree")[0] == "verify"
+    assert ts._classify_shell("pytest -q && true", "/tmp/worktree")[0] == "verify"
+    assert ts._classify_shell("bash -lc 'cd /tmp ; pytest -q'", "/tmp/worktree")[0] == "verify"
+    assert ts._classify_shell("bash -lc 'pytest -q && true'", "/tmp/worktree")[0] == "verify"
     assert ts._classify_shell("rg pytest src", "/tmp/worktree")[0] == "search"
     assert ts._classify_shell("cat pytest.ini", "/tmp/worktree")[0] == "read"
     assert ts._classify_shell("printf pytest", "/tmp/worktree")[0] == "execute"

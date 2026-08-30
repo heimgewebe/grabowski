@@ -21,7 +21,7 @@ import re
 import shlex
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DETECTORS = (
     "repeated_failure_without_state_delta",
     "verification_gap",
@@ -184,15 +184,33 @@ def _is_verification_segment(tokens: list[str]) -> bool:
 
 
 def _is_verification_command(tokens: list[str]) -> bool:
+    # A successful `a || verify` can skip verification entirely, while
+    # `verify || fallback` can mask a failed verification.  Without full shell
+    # control-flow evaluation, either form is unsafe evidence of verification.
+    if "||" in tokens:
+        return False
+
+    segments: list[list[str]] = []
+    separators: list[str] = []
     segment: list[str] = []
     for token in tokens:
         if token in SHELL_CONTROL_TOKENS:
-            if _is_verification_segment(segment):
-                return True
+            segments.append(segment)
+            separators.append(token)
             segment = []
         else:
             segment.append(token)
-    return _is_verification_segment(segment)
+    segments.append(segment)
+
+    for index, candidate in enumerate(segments):
+        if not _is_verification_segment(candidate):
+            continue
+        # `;` and `|` after verification can replace/mask its exit status.
+        # `&&` preserves the invariant that overall success implies the
+        # verification segment ran and succeeded.
+        if all(separator == "&&" for separator in separators[index:]):
+            return True
+    return False
 
 
 def _classify_shell(command: str, cwd: str) -> tuple[str, str | None, str]:
@@ -891,7 +909,7 @@ def evaluate_lane(lane: Lane, session: Session, events: list[Event], reinforceme
         first_by_detector.setdefault(finding["detector"], finding)
     baseline_class = _baseline_class(lane)
     baseline_text = " ".join(lane.baseline_reason_codes).lower()
-    actionable = []
+    promotion_candidates = []
     for finding in findings:
         detector = finding["detector"]
         # Localization cannot be promotion-grade without prompt/task-context observability.
@@ -912,7 +930,7 @@ def evaluate_lane(lane: Lane, session: Session, events: list[Event], reinforceme
         # High-precision incremental candidates require exact attribution, a concrete
         # recovery action, and either measurable lead or demonstrable redundant work.
         if finding["confidence"] >= 0.9 and (later_actions >= 2 or (lead is not None and lead > 0)):
-            actionable.append(
+            promotion_candidates.append(
                 {
                     "detector": detector,
                     "sequence": finding["sequence"],
@@ -921,7 +939,11 @@ def evaluate_lane(lane: Lane, session: Session, events: list[Event], reinforceme
                     "recovery": finding.get("recovery", []),
                 }
             )
-    lead_values = [x["lead_seconds"] for x in actionable if isinstance(x.get("lead_seconds"), (int, float))]
+    lead_values = [
+        x["lead_seconds"]
+        for x in promotion_candidates
+        if isinstance(x.get("lead_seconds"), (int, float))
+    ]
     return {
         "lane_id": lane.lane_id,
         "source_adapter": session.adapter,
@@ -938,7 +960,7 @@ def evaluate_lane(lane: Lane, session: Session, events: list[Event], reinforceme
         "outcome_counts": dict(collections.Counter(event.outcome for event in events)),
         "finding_counts": dict(collections.Counter(item["detector"] for item in findings)),
         "findings": findings,
-        "actionable_incremental_information": actionable,
+        "promotion_candidates": promotion_candidates,
         "lead_time_seconds_max": max(lead_values) if lead_values else None,
         "privacy": {
             "prompts_persisted": False,
@@ -1015,14 +1037,14 @@ def build_report(
             )
 
     detector_counts = collections.Counter()
-    actionable_counts = collections.Counter()
+    promotion_candidate_counts = collections.Counter()
     operation_counts = collections.Counter()
     outcome_counts = collections.Counter()
     run_adapter_sets = collections.Counter()
     session_adapters = collections.Counter()
     baselines = collections.Counter()
     total_events = 0
-    actionable_runs = 0
+    promotion_candidate_runs = 0
     lead_values: list[float] = []
     redundant_after_signal = 0
     for run in runs:
@@ -1034,10 +1056,10 @@ def build_report(
         operation_counts.update(run["operation_counts"])
         outcome_counts.update(run["outcome_counts"])
         detector_counts.update(run["finding_counts"])
-        if run["actionable_incremental_information"]:
-            actionable_runs += 1
-        for item in run["actionable_incremental_information"]:
-            actionable_counts[item["detector"]] += 1
+        if run["promotion_candidates"]:
+            promotion_candidate_runs += 1
+        for item in run["promotion_candidates"]:
+            promotion_candidate_counts[item["detector"]] += 1
             redundant_after_signal += int(item["redundant_actions_after_signal"])
             if isinstance(item.get("lead_seconds"), (int, float)):
                 lead_values.append(float(item["lead_seconds"]))
@@ -1056,7 +1078,7 @@ def build_report(
         for finding in run["findings"]
         if finding["confidence"] >= 0.9
     )
-    actionable_items = sum(len(run["actionable_incremental_information"]) for run in runs)
+    promotion_candidate_items = sum(len(run["promotion_candidates"]) for run in runs)
     exact_session_bindings = sum(len(bindings) for _, bindings in matches.values())
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -1065,12 +1087,14 @@ def build_report(
         "public_runtime_contract": False,
         "online_intervention": False,
         "decision": {
-            "promotion": "stop" if actionable_items == 0 else "manual_baseline_validation_required",
+            "promotion": (
+                "stop" if promotion_candidate_items == 0 else "manual_baseline_validation_required"
+            ),
             "trajectory_evidence_v1": False,
             "online_shadow": False,
             "reason": (
                 "No promotion-grade actionable incremental information was observed in the exact cohort."
-                if actionable_items == 0
+                if promotion_candidate_items == 0
                 else "At least one candidate needs full existing PR/CI/review baseline validation before any promotion."
             ),
         },
@@ -1098,26 +1122,34 @@ def build_report(
             "high_confidence_findings": high_conf_findings,
         },
         "incremental_information": {
-            "actionable_runs": actionable_runs,
-            "actionable_items": actionable_items,
-            "actionable_by_detector": dict(actionable_counts),
-            "redundant_actions_after_first_valid_signals": redundant_after_signal,
-            "lead_time_seconds": {
+            "promotion_candidate_runs": promotion_candidate_runs,
+            "promotion_candidate_items": promotion_candidate_items,
+            "promotion_candidates_by_detector": dict(promotion_candidate_counts),
+            "candidate_redundant_actions_after_first_signal": redundant_after_signal,
+            "candidate_lead_time_seconds": {
                 "count": len(lead_values),
                 "max": max(lead_values) if lead_values else None,
                 "median": sorted(lead_values)[len(lead_values) // 2] if lead_values else None,
             },
             "baseline_overlap_rule": "detector-specific tokens in existing Work Lane closeout reason_codes suppress promotion",
-            "recoverable_cases": actionable_runs,
-            "existing_recovery_action_earlier_opportunities": actionable_items,
-            "evidence_supported_runtime_seconds_saved": 0 if actionable_items == 0 else None,
-            "evidence_supported_tool_actions_saved": 0 if actionable_items == 0 else None,
+            "external_baseline_validation_in_report": False,
+            "externally_validated_actionable_items": 0,
+            "recoverable_cases": 0 if promotion_candidate_items == 0 else None,
+            "existing_recovery_action_earlier_opportunities": (
+                0 if promotion_candidate_items == 0 else None
+            ),
+            "evidence_supported_runtime_seconds_saved": (
+                0 if promotion_candidate_items == 0 else None
+            ),
+            "evidence_supported_tool_actions_saved": (
+                0 if promotion_candidate_items == 0 else None
+            ),
             "token_or_compute_savings": None,
         },
         "precision": {
             "empirical_precision": None,
-            "promotion_grade_findings": high_conf_findings,
-            "validated_actionable_findings": actionable_items,
+            "promotion_grade_candidates": promotion_candidate_items,
+            "externally_validated_actionable_findings": 0,
             "reason": "No labeled ground truth exists for the cohort; do not convert structural detector matches into a fake precision percentage.",
         },
         "false_positive_risk": {
