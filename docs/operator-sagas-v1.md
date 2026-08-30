@@ -177,6 +177,14 @@ This continuation commit is the new PR-settlement pilot target. It must first be
 
 Only the exact merge commit proven by that settlement may become the runtime-deployment pilot target. The deployment pilot must independently produce a fresh deployment `saga-plan`, receipt-bound `saga-run`, normal Captain deployment result, exact deployment-identity readback and `saga-settle == settled`. No staging commit, scheduled deployment or historical receipt is substituted for those proofs.
 
+### Terminal live acceptance continuation — 2026-08-30
+
+PR #980 merged at `2026-08-30T07:27:17Z` with final PR head `eb7702363febb0a9164b06012496dec5cba954b4` as merge commit `30ccbe9b49f794fc4ffe1cbb2062e5d9fbf0dfca`. The pre-merge Saga evidence retained from that attempt was bound to an earlier PR head, not to the final merged head. A fresh read of the verified Grabowski audit material from the merge through this continuation contains neither a `saga-settle` invocation nor the final PR-head/merge identities. PR #980 is therefore historical merge context, not the required settled PR pilot. This absence claim is bounded to the verified audit material inspected for that interval; it does not infer facts outside that evidence window.
+
+This follow-up documentation change is the next PR-settlement pilot target because it records the newly established live truth rather than fabricating a retrospective settlement. Before its merge effect, execution must create a fresh PR-settlement `saga-plan` and receipt-bound `saga-run` for the exact new PR/head/base identity. The existing Captain path must then pass its normal review, CI and merge gates. Only an authoritative GitHub readback plus `saga-settle == settled` may establish pilot 1.
+
+Only the exact merge commit proven by that settlement may become the runtime-deployment pilot target. Pilot 2 must independently create a fresh runtime-deployment `saga-plan` and receipt-bound `saga-run`, execute the existing Captain deployment action, read the deployed identity to exact convergence, verify the Captain audit pair, and require `saga-settle == settled`. No merge, scheduled deployment or historical receipt is promoted to acceptance evidence without those bindings.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
