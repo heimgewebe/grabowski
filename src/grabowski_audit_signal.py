@@ -427,11 +427,13 @@ def _audit_transition_gap_signal(
                 completed_counts[retention_pair[0]] += 1
             if identity is not None:
                 seen_retention_completion_identities.add(identity)
-                # Historical invalid reconciliations can arrive in any order.
-                # The heap is keyed by original verified intent order, not by the
-                # later reconciliation order, so one completion closes exactly the
-                # most recent preceding unknown intent.
-                if _pop_latest_historical_unmatched(identity) is not None:
+                # One completion can resolve at most one intent.  Prefer a matching
+                # in-window pending intent; only when none matched may it close one
+                # historical unknown of the same identity.
+                if (
+                    not matched
+                    and _pop_latest_historical_unmatched(identity) is not None
+                ):
                     completed_counts[retention_pair[0]] += 1
             continue
 

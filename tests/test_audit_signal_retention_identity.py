@@ -653,5 +653,71 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
         )
 
 
+    def test_completion_consumes_pending_before_historical_unknown(self) -> None:
+        now = 1_800_000_000
+        plan_sha = "3" * 64
+        historical_intent_sha = "4" * 64
+        pending_intent_sha = "5" * 64
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": historical_intent_sha,
+                        "plan_sha256": plan_sha,
+                        "attempt": 1,
+                    },
+                    now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 200,
+                ),
+                (
+                    {
+                        "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                        "record_sha256": "6" * 64,
+                        "reconciliation_kind": "completion_audit_gap",
+                        "plan_sha256": plan_sha,
+                        "attempt": 1,
+                        "receipt_sha256": "7" * 64,
+                        "intent_record_sha256": historical_intent_sha,
+                        "completed": True,
+                        "retention_effect_retried": True,
+                    },
+                    now - 1_200,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": pending_intent_sha,
+                        "plan_sha256": plan_sha,
+                        "attempt": 1,
+                    },
+                    now - 1_000,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-complete",
+                        "record_sha256": "8" * 64,
+                        "plan_sha256": plan_sha,
+                        "attempt": 1,
+                        "receipt_sha256": "9" * 64,
+                        "completed": True,
+                    },
+                    now - 900,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["severity"]), ("observed", "high"))
+        self.assertEqual(result["details"]["execution_gap_count"], 1)
+        self.assertEqual(
+            result["details"]["completed_pairs_by_transition"],
+            {"runtime-state-retention-intent": 1},
+        )
+        self.assertEqual(
+            result["evidence_refs"],
+            ["audit-record-sha256:" + historical_intent_sha],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
