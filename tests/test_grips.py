@@ -2615,6 +2615,27 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("2" * 64, binding["output_sha256"])
         self.assertEqual("passed", binding["status"])
 
+    def test_saga_verified_audit_record_search_is_not_tail_limited(self) -> None:
+        import grabowski_audit_query
+
+        target_sha = "9" * 64
+        old_record = json.dumps(
+            {"record_sha256": target_sha}, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+        old_segment = types.SimpleNamespace(captured_data=old_record)
+        recent_segment = types.SimpleNamespace(
+            captured_data=b'{"operation":"noise"}\n' * 100_001
+        )
+        snapshot = types.SimpleNamespace(segments=(old_segment, recent_segment))
+        with patch.object(
+            grabowski_audit_query,
+            "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ):
+            records = grips._saga_verified_audit_records([target_sha])
+
+        self.assertEqual(target_sha, records[target_sha]["record_sha256"])
+
     def test_saga_audit_result_reference_rejects_nonpassed_completion(self) -> None:
         plan = sagas.build_plan("pr-settlement", _saga_pr_target(), "t121-audit-result-ref-blocked")
         intent_sha, completion_sha, intent, completion, ref = _saga_audit_records(

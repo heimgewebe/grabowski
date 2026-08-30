@@ -9551,9 +9551,8 @@ def _saga_verified_audit_records(
     pending = set(record_sha256s)
     needles = {item: f'"record_sha256":"{item}"'.encode("ascii") for item in pending}
     found: dict[str, dict[str, Any]] = {}
-    remaining = 100_000
     for segment in reversed(snapshot.segments):
-        if remaining <= 0 or not pending:
+        if not pending:
             break
         try:
             data = (
@@ -9565,10 +9564,9 @@ def _saga_verified_audit_records(
             raise GripPreflightError(
                 f"verified Captain audit segment unavailable: {type(exc).__name__}"
             ) from exc
-        lines = data.splitlines()
-        selected = lines[-min(len(lines), remaining):]
-        remaining -= len(selected)
-        for raw_line in reversed(selected):
+        if not any(needles[item] in data for item in pending):
+            continue
+        for raw_line in reversed(data.splitlines()):
             candidates = [item for item in pending if needles[item] in raw_line]
             if not candidates:
                 continue
@@ -9586,7 +9584,7 @@ def _saga_verified_audit_records(
                     break
     if pending:
         raise GripPreflightError(
-            "Captain audit record is absent from the bounded verified audit window: "
+            "Captain audit record is absent from the verified audit chain: "
             + ",".join(sorted(pending))
         )
     return found
