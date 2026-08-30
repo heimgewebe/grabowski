@@ -2593,7 +2593,7 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
                     operator.grabowski_git(str(repo), ["commit", "-m", "unsafe"])
 
-    def test_grabowski_git_mv_requires_branch_attempt(self) -> None:
+    def test_grabowski_git_add_requires_branch_attempt(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -2602,7 +2602,101 @@ class OperatorContractTests(unittest.TestCase):
                 patch.object(operator, "_guard_git", return_value=None),
             ):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
-                    operator.grabowski_git(str(repo), ["mv", "old", "new"])
+                    operator.grabowski_git(str(repo), ["add", "README.md"])
+
+    def test_grabowski_git_blocks_worktree_destructive_subcommands_before_attempt_observation(self) -> None:
+        operator = _load_operator_module()
+        commands = (
+            ["am"],
+            ["apply", "change.patch"],
+            ["checkout", "HEAD", "--", "README.md"],
+            ["cherry-pick", "HEAD"],
+            ["merge", "HEAD"],
+            ["mv", "README.md", "README2.md"],
+            ["read-tree", "HEAD"],
+            ["reset", "--hard", "HEAD"],
+            ["restore", "README.md"],
+            ["revert", "HEAD"],
+            ["rm", "README.md"],
+            ["switch", "feature"],
+        )
+        self.assertEqual(
+            {arguments[0] for arguments in commands},
+            operator.GIT_WORKTREE_DESTRUCTIVE_SUBCOMMANDS,
+        )
+        attempt = {
+            "schema_version": 1,
+            "owner_id": "operator:external-writer-guard",
+            "operation_id": "operation-a",
+            "attempt_id": "attempt-1",
+            "branch": "feature",
+            "expected_preimage_sha256": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_git_branch_preimage") as preimage,
+                patch.object(operator, "_run") as run,
+            ):
+                for arguments in commands:
+                    with self.subTest(arguments=arguments):
+                        with self.assertRaisesRegex(
+                            PermissionError, "external worktree writers"
+                        ):
+                            operator.grabowski_git(
+                                str(repo), arguments, branch_attempt=attempt
+                            )
+                preimage.assert_not_called()
+                run.assert_not_called()
+
+    def test_grabowski_git_blocks_checkout_that_could_erase_external_writer_bytes(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            operator.subprocess.run(
+                ["git", "init", "-q", "-b", "feature", str(repo)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"],
+                check=True,
+            )
+            readme = repo / "README.md"
+            readme.write_bytes(b"baseline\n")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "README.md"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "baseline"],
+                check=True,
+            )
+            preimage = operator._git_branch_preimage(repo)
+            readme.write_bytes(b"external-writer-bytes\n")
+            with (
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                with self.assertRaisesRegex(PermissionError, "external worktree writers"):
+                    operator.grabowski_git(
+                        str(repo),
+                        ["checkout", "HEAD", "--", "README.md"],
+                        branch_attempt={
+                            "schema_version": 1,
+                            "owner_id": "operator:external-writer-bytes",
+                            "operation_id": "operation-a",
+                            "attempt_id": "attempt-1",
+                            "branch": "feature",
+                            "expected_preimage_sha256": preimage["preimage_sha256"],
+                        },
+                    )
+            self.assertEqual(b"external-writer-bytes\n", readme.read_bytes())
 
     def test_grabowski_git_pull_is_blocked_as_repository_wide_mutation(self) -> None:
         operator = _load_operator_module()
@@ -2735,7 +2829,7 @@ class OperatorContractTests(unittest.TestCase):
         )
         self.assertNotEqual(before["preimage_sha256"], after["preimage_sha256"])
 
-    def test_grabowski_git_stale_preimage_preserves_normalized_eol_bytes_before_checkout(self) -> None:
+    def test_grabowski_git_stale_preimage_preserves_normalized_eol_bytes_before_index_mutation(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -2774,7 +2868,7 @@ class OperatorContractTests(unittest.TestCase):
             ):
                 result = operator.grabowski_git(
                     str(repo),
-                    ["checkout", "HEAD", "--", "README.md"],
+                    ["update-index", "--refresh"],
                     branch_attempt={
                         "schema_version": 1,
                         "owner_id": "operator:worktree-eol-preimage",
@@ -2790,7 +2884,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertFalse(receipt["effect_attempted"])
             self.assertEqual(b"baseline\r\n", readme.read_bytes())
 
-    def test_grabowski_git_stale_preimage_preserves_assume_unchanged_edit_before_checkout(self) -> None:
+    def test_grabowski_git_stale_preimage_preserves_assume_unchanged_edit_before_index_mutation(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -2828,7 +2922,7 @@ class OperatorContractTests(unittest.TestCase):
             ):
                 result = operator.grabowski_git(
                     str(repo),
-                    ["checkout", "HEAD", "--", "README.md"],
+                    ["update-index", "--refresh"],
                     branch_attempt={
                         "schema_version": 1,
                         "owner_id": "operator:worktree-assume-preimage",
@@ -2844,7 +2938,7 @@ class OperatorContractTests(unittest.TestCase):
             self.assertFalse(receipt["effect_attempted"])
             self.assertEqual("unsaved\n", readme.read_text(encoding="utf-8"))
 
-    def test_grabowski_git_stale_preimage_preserves_unstaged_edit_before_checkout(self) -> None:
+    def test_grabowski_git_stale_preimage_preserves_unstaged_edit_before_index_mutation(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -2882,7 +2976,7 @@ class OperatorContractTests(unittest.TestCase):
             ):
                 clean_result = operator.grabowski_git(
                     str(repo),
-                    ["checkout", "HEAD", "--", "README.md"],
+                    ["update-index", "--refresh"],
                     branch_attempt={
                         "schema_version": 1,
                         "owner_id": "operator:worktree-preimage-clean",
@@ -2906,7 +3000,7 @@ class OperatorContractTests(unittest.TestCase):
             ):
                 result = operator.grabowski_git(
                     str(repo),
-                    ["checkout", "HEAD", "--", "README.md"],
+                    ["update-index", "--refresh"],
                     branch_attempt={
                         "schema_version": 1,
                         "owner_id": "operator:worktree-preimage",
