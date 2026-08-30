@@ -3668,10 +3668,18 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_changed_file_count_invalid")
         elif changed_files > _MERGE_GUARD_MAX_CHANGED_PATHS:
             errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
-        if (
+        rename_or_copy_indexes = [
+            index
+            for index, item in enumerate(raw_files if isinstance(raw_files, list) else [])
+            if isinstance(item, dict)
+            and item.get("changeType") in {"RENAMED", "COPIED"}
+        ]
+        requires_complete_file_projection = (
             type(changed_files) is int
-            and 100 < changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
-        ):
+            and changed_files <= _MERGE_GUARD_MAX_CHANGED_PATHS
+            and (changed_files > 100 or bool(rename_or_copy_indexes))
+        )
+        if requires_complete_file_projection:
             complete_files, files_receipt, files_errors = _merge_guard_github_file_records(
                 self.repo_path,
                 self.github_runner,
@@ -3683,9 +3691,10 @@ class CaptainMergeGuardRunner:
             if not files_errors:
                 raw_files = complete_files
             else:
-                errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
-                if isinstance(raw_files, list) and len(raw_files) > 128:
-                    errors.append("merge_guard_changed_path_count_exceeds_limit")
+                if type(changed_files) is int and changed_files > 100:
+                    errors.append("merge_guard_changed_file_count_exceeds_supported_limit")
+                    if isinstance(raw_files, list) and len(raw_files) > 128:
+                        errors.append("merge_guard_changed_path_count_exceeds_limit")
         if not isinstance(raw_files, list):
             errors.append("merge_guard_changed_file_list_missing")
         else:
@@ -3705,7 +3714,26 @@ class CaptainMergeGuardRunner:
                     errors.append(f"merge_guard_changed_path_invalid:{index}")
                     continue
                 if change_type in {"RENAMED", "COPIED"}:
-                    errors.append(f"merge_guard_changed_path_requires_previous_name:{index}")
+                    previous_path = item.get("previousPath")
+                    if (
+                        not isinstance(previous_path, str)
+                        or not previous_path
+                        or previous_path.startswith("/")
+                        or "\x00" in previous_path
+                        or any(
+                            part in {"", ".", ".."}
+                            for part in previous_path.split("/")
+                        )
+                        or previous_path == path
+                    ):
+                        errors.append(
+                            f"merge_guard_changed_path_requires_previous_name:{index}"
+                        )
+                        continue
+                    if change_type == "RENAMED":
+                        changed_paths.extend((previous_path, path))
+                    else:
+                        changed_paths.append(path)
                     continue
                 if change_type not in {"ADDED", "MODIFIED", "DELETED"}:
                     errors.append(f"merge_guard_change_type_invalid:{index}")
@@ -3713,7 +3741,10 @@ class CaptainMergeGuardRunner:
                 changed_paths.append(path)
             if type(changed_files) is int and changed_files != len(raw_files):
                 errors.append("merge_guard_changed_file_list_incomplete")
-            if len(raw_files) > _MERGE_GUARD_MAX_CHANGED_PATHS:
+            if (
+                len(raw_files) > _MERGE_GUARD_MAX_CHANGED_PATHS
+                or len(changed_paths) > _MERGE_GUARD_MAX_CHANGED_PATHS
+            ):
                 errors.append("merge_guard_changed_path_count_exceeds_limit")
             if len(changed_paths) != len(set(changed_paths)):
                 errors.append("merge_guard_changed_paths_duplicate")
