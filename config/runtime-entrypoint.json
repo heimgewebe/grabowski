@@ -361,6 +361,10 @@
       "source": "src/grabowski_read_surface.py"
     },
     {
+      "module": "grabowski_git_preimage",
+      "source": "src/grabowski_git_preimage.py"
+    },
+    {
       "module": "grabowski_self_deploy",
       "source": "src/grabowski_self_deploy.py"
     },

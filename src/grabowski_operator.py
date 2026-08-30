@@ -45,6 +45,7 @@ import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 import grabowski_effect_interceptor
 import grabowski_grips
+import grabowski_git_preimage
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 
@@ -239,6 +240,80 @@ SENSITIVE_ENV_PARTS = (
 )
 PRIVILEGE_ESCALATORS = {"sudo", "su", "pkexec", "doas"}
 PROTECTED_BRANCHES = {"main", "master"}
+GIT_BRANCH_ATTEMPT_SCHEMA_VERSION = 1
+GIT_BRANCH_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
+GIT_BRANCH_ATTEMPT_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "am",
+        "apply",
+        "branch",
+        "checkout",
+        "cherry-pick",
+        "commit",
+        "merge",
+        "mv",
+        "pull",
+        "read-tree",
+        "rebase",
+        "reset",
+        "restore",
+        "revert",
+        "rm",
+        "stash",
+        "switch",
+        "symbolic-ref",
+        "update-index",
+        "update-ref",
+    }
+)
+GIT_UPDATE_INDEX_UNOBSERVED_FLAG_OPTIONS = frozenset(
+    {
+        "--assume-unchanged",
+        "--no-assume-unchanged",
+        "--skip-worktree",
+        "--no-skip-worktree",
+        "--fsmonitor-valid",
+        "--no-fsmonitor-valid",
+    }
+)
+GIT_LOCAL_READ_ONLY_SUBCOMMANDS = frozenset(
+    {
+        "annotate",
+        "blame",
+        "cat-file",
+        "check-attr",
+        "check-ignore",
+        "check-mailmap",
+        "check-ref-format",
+        "cherry",
+        "describe",
+        "diff",
+        "diff-files",
+        "diff-index",
+        "diff-tree",
+        "for-each-ref",
+        "grep",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge-base",
+        "name-rev",
+        "range-diff",
+        "rev-list",
+        "rev-parse",
+        "shortlog",
+        "show",
+        "show-branch",
+        "status",
+        "verify-commit",
+        "verify-tag",
+        "version",
+        "whatchanged",
+    }
+)
 PRIVILEGED_REFERENCE_TTL_SECONDS = 900
 PRIVILEGED_REFERENCE_REPLAY_POLICY = "single-use-external-broker"
 _SECRET_KEY_PREFIX = "s" + "k-"
@@ -3747,6 +3822,7 @@ def _git_environment() -> dict[str, str]:
     environment["GCM_INTERACTIVE"] = "never"
     environment["GIT_PAGER"] = "cat"
     environment["PAGER"] = "cat"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 
 
@@ -4078,6 +4154,353 @@ def _reject_push_configuration(repo: Path, remote: str) -> None:
         )
 
 
+def _git_probe_bytes(repo: Path, arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=_git_environment(),
+    )
+
+
+def _git_branch_preimage(repo: Path, *, require_attached: bool = True) -> dict[str, Any]:
+    return grabowski_git_preimage.capture_branch_preimage(
+        repo,
+        lambda arguments: _git_probe_bytes(repo, arguments),
+        require_attached=require_attached,
+    )
+
+
+def _reject_cross_branch_mutation_target(
+    subcommand: str, command_arguments: list[str], bound_branch: str
+) -> None:
+    """Keep one branch-attempt lease scoped to the branch it actually protects."""
+    bound_ref = f"refs/heads/{bound_branch}"
+
+    if any(
+        item == "--recurse-submodules" or item.startswith("--recurse-submodules=")
+        for item in command_arguments
+    ):
+        raise PermissionError(
+            f"git {subcommand} recursive submodule mutation is blocked because nested repositories are outside branch_attempt.branch authority"
+        )
+
+    if subcommand == "rebase":
+        raise PermissionError(
+            "git rebase is blocked on the branch-attempt surface because a conflict can detach HEAD and escape the bound branch recovery contract"
+        )
+
+    if subcommand == "update-index" and any(
+        item.split("=", 1)[0] in GIT_UPDATE_INDEX_UNOBSERVED_FLAG_OPTIONS
+        for item in command_arguments
+    ):
+        raise PermissionError(
+            "git update-index behavior flags are blocked because the branch preimage does not expose those index bits"
+        )
+
+    if subcommand == "update-ref":
+        if "--stdin" in command_arguments:
+            raise PermissionError(
+                "git update-ref --stdin is blocked because its target refs are not argv-bound"
+            )
+        if "--no-deref" in command_arguments:
+            raise PermissionError(
+                "git update-ref --no-deref is blocked because targeting HEAD would escape branch_attempt.branch"
+            )
+        positionals: list[str] = []
+        skip_value = False
+        for item in command_arguments:
+            if skip_value:
+                skip_value = False
+                continue
+            if item == "-m":
+                skip_value = True
+                continue
+            if item.startswith("-"):
+                continue
+            positionals.append(item)
+        if not positionals or positionals[0] not in {"HEAD", bound_ref}:
+            raise PermissionError(
+                "git update-ref mutation must target HEAD or branch_attempt.branch"
+            )
+        return
+
+    if subcommand == "symbolic-ref":
+        if any(item in {"--delete", "-d"} for item in command_arguments):
+            raise PermissionError(
+                "git symbolic-ref deletion is blocked because deleting HEAD would escape the attached branch contract"
+            )
+        positionals: list[str] = []
+        skip_value = False
+        for item in command_arguments:
+            if skip_value:
+                skip_value = False
+                continue
+            if item == "-m":
+                skip_value = True
+                continue
+            if item.startswith("-"):
+                continue
+            positionals.append(item)
+        if not positionals or positionals[0] != "HEAD":
+            raise PermissionError(
+                "git symbolic-ref mutation is limited to HEAD for a branch attempt"
+            )
+        if len(positionals) > 1 and positionals[1] != bound_ref:
+            raise PermissionError(
+                "git symbolic-ref may attach HEAD only to branch_attempt.branch"
+            )
+        return
+
+    if subcommand in {"checkout", "switch"}:
+        positional_only = False
+        for item in command_arguments:
+            if item == "--":
+                positional_only = True
+                continue
+            if positional_only:
+                continue
+            if (
+                item == "--detach"
+                or item.startswith("--detach=")
+                or (
+                    item.startswith("-")
+                    and not item.startswith("--")
+                    and "d" in item[1:]
+                )
+            ):
+                raise PermissionError(
+                    f"git {subcommand} detach mode is blocked because the branch-attempt surface must remain attached to branch_attempt.branch"
+                )
+        branch_options = {
+            "-b",
+            "-B",
+            "--orphan",
+            "-c",
+            "-C",
+            "--create",
+            "--force-create",
+        }
+        named_branch: str | None = None
+        positional_only = False
+        index = 0
+        while index < len(command_arguments):
+            item = command_arguments[index]
+            if item == "--":
+                positional_only = True
+                index += 1
+                continue
+            if not positional_only and item in branch_options:
+                if index + 1 >= len(command_arguments):
+                    raise ValueError(f"git {subcommand} {item} requires a branch")
+                named_branch = command_arguments[index + 1]
+                index += 2
+                continue
+            if not positional_only and item in {"--conflict", "--pathspec-from-file"}:
+                if index + 1 >= len(command_arguments):
+                    raise ValueError(f"git {subcommand} {item} requires a value")
+                index += 2
+                continue
+            if not positional_only:
+                attached_branch: str | None = None
+                short_branch_options = ("b", "B") if subcommand == "checkout" else ("c", "C")
+                if item.startswith("-") and not item.startswith("--"):
+                    short_cluster = item[1:]
+                    for option_index, option in enumerate(short_cluster):
+                        if option in short_branch_options:
+                            attached_branch = short_cluster[option_index + 1 :]
+                            if not attached_branch:
+                                raise ValueError(
+                                    f"git {subcommand} -{option} requires a branch"
+                                )
+                            break
+                if attached_branch is None:
+                    for long_option in ("--orphan=", "--create=", "--force-create="):
+                        if item.startswith(long_option):
+                            attached_branch = item[len(long_option) :]
+                            break
+                if attached_branch is not None:
+                    if not attached_branch:
+                        raise ValueError(f"git {subcommand} branch option requires a branch")
+                    named_branch = attached_branch
+                    index += 1
+                    continue
+            if not positional_only and item.startswith("-"):
+                index += 1
+                continue
+            if not positional_only and named_branch is None:
+                named_branch = item
+            index += 1
+        if named_branch is not None and named_branch not in {bound_branch, "HEAD"}:
+            raise PermissionError(
+                f"git {subcommand} may not switch to a branch outside branch_attempt.branch"
+            )
+        return
+
+    if subcommand != "branch":
+        return
+
+    takes_value = {
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+        "--sort",
+        "--format",
+        "--set-upstream-to",
+        "-u",
+    }
+    positionals: list[str] = []
+    skip_value = False
+    positional_only = False
+    for item in command_arguments:
+        if skip_value:
+            skip_value = False
+            continue
+        if item == "--":
+            positional_only = True
+            continue
+        if not positional_only and item in takes_value:
+            skip_value = True
+            continue
+        if not positional_only and any(
+            item.startswith(prefix)
+            for prefix in (
+                "--contains=",
+                "--no-contains=",
+                "--merged=",
+                "--no-merged=",
+                "--points-at=",
+                "--sort=",
+                "--format=",
+                "--set-upstream-to=",
+            )
+        ):
+            continue
+        if not positional_only and item.startswith("-"):
+            continue
+        positionals.append(item)
+
+    rename_or_copy = any(
+        item in {"-m", "-M", "--move", "-c", "-C", "--copy"}
+        for item in command_arguments
+    )
+    targets = positionals if rename_or_copy else positionals[:1]
+    for target in targets:
+        if target != bound_branch:
+            raise PermissionError(
+                "git branch mutation may not target a branch outside branch_attempt.branch"
+            )
+
+
+
+def _normalize_git_branch_attempt(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("branch_attempt must be an object")
+    allowed = {
+        "schema_version",
+        "owner_id",
+        "operation_id",
+        "attempt_id",
+        "branch",
+        "expected_preimage_sha256",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"branch_attempt contains unsupported fields: {unknown}")
+    if value.get("schema_version") != GIT_BRANCH_ATTEMPT_SCHEMA_VERSION:
+        raise ValueError("branch_attempt.schema_version must be 1")
+    owner_id = value.get("owner_id")
+    if not isinstance(owner_id, str) or re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", owner_id) is None:
+        raise ValueError("branch_attempt.owner_id is invalid")
+    normalized: dict[str, Any] = {
+        "schema_version": GIT_BRANCH_ATTEMPT_SCHEMA_VERSION,
+        "owner_id": owner_id,
+    }
+    for name in ("operation_id", "attempt_id"):
+        item = value.get(name)
+        if not isinstance(item, str) or GIT_BRANCH_ATTEMPT_ID_RE.fullmatch(item) is None:
+            raise ValueError(f"branch_attempt.{name} is invalid")
+        normalized[name] = item
+    branch = value.get("branch")
+    if not isinstance(branch, str) or not branch or len(branch.encode("utf-8")) > 512:
+        raise ValueError("branch_attempt.branch is invalid")
+    normalized["branch"] = branch
+    expected = value.get("expected_preimage_sha256")
+    if not isinstance(expected, str) or GIT_BRANCH_ATTEMPT_SHA256_RE.fullmatch(expected) is None:
+        raise ValueError("branch_attempt.expected_preimage_sha256 is invalid")
+    normalized["expected_preimage_sha256"] = expected
+    return normalized
+
+
+def _branch_attempt_reconcile_result(
+    *,
+    repo: Path,
+    arguments: list[str],
+    attempt: dict[str, Any],
+    observed: dict[str, Any],
+    reason: str,
+    lease: dict[str, Any] | None = None,
+    existing_attempt_binding_sha256: str | None = None,
+    lease_cleanup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_git_branch_mutation_receipt",
+        "status": "reconcile_required",
+        "effect_attempted": False,
+        "retry_allowed": False,
+        "reason": reason,
+        "repository": str(repo),
+        "branch": attempt["branch"],
+        "owner_id": attempt["owner_id"],
+        "operation_id": attempt["operation_id"],
+        "attempt_id": attempt["attempt_id"],
+        "expected_preimage_sha256": attempt["expected_preimage_sha256"],
+        "observed_preimage_sha256": observed["preimage_sha256"],
+        "observed_head": observed["head"],
+        "observed_index_sha256": observed["index_sha256"],
+        "lease_resource_key": None if lease is None else lease.get("resource_key"),
+        "attempt_binding_sha256": None if lease is None else lease.get("attempt_binding_sha256"),
+        "existing_attempt_binding_sha256": existing_attempt_binding_sha256,
+        "lease_cleanup": lease_cleanup,
+        "release_required_after_terminal_readback": lease is not None and lease_cleanup is None,
+    }
+    material["receipt_sha256"] = hashlib.sha256(_canonical_json_bytes(material)).hexdigest()
+    audit_sha256 = _append_effect_audit(
+        {
+            "timestamp_unix": int(time.time()),
+            "operation": "git-branch-mutation-reconcile-required",
+            "owner_id": attempt["owner_id"],
+            "operation_id": attempt["operation_id"],
+            "attempt_id": attempt["attempt_id"],
+            "branch": attempt["branch"],
+            "expected_preimage_sha256": attempt["expected_preimage_sha256"],
+            "observed_preimage_sha256": observed["preimage_sha256"],
+            "reason": reason,
+            "effect_attempted": False,
+            "receipt_sha256": material["receipt_sha256"],
+        }
+    )
+    material["audit_record_sha256"] = audit_sha256
+    return {
+        "argv": _redact_argv(["git", *arguments]),
+        "argv_sha256": _argv_hash(["git", *arguments]),
+        "command": _redacted_command(["git", *arguments]),
+        "cwd": str(repo),
+        "returncode": None,
+        "timed_out": False,
+        "duration_seconds": 0.0,
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "branch_mutation": material,
+    }
+
+
 def _guard_git(arguments: list[str], repo: Path) -> None:
     if not arguments:
         raise ValueError("Git arguments must not be empty")
@@ -4092,8 +4515,32 @@ def _guard_git(arguments: list[str], repo: Path) -> None:
         raise PermissionError(
             "Git subtree push is blocked in grabowski_git; use the typed publication path."
         )
+    if subcommand == "stash":
+        raise PermissionError(
+            "Git stash is blocked because its repository-wide stash refs and stack are not serialized by a branch-attempt lease."
+        )
+    if subcommand == "pull":
+        raise PermissionError(
+            "Git pull is blocked because fetch-side refs and metadata are repository-wide and are not serialized by a branch-attempt lease."
+        )
     if subcommand != "push":
         _reject_configured_alias(repo, subcommand)
+        if (
+            subcommand not in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS
+            and subcommand not in GIT_LOCAL_READ_ONLY_SUBCOMMANDS
+        ):
+            raise PermissionError(
+                "Unclassified local Git subcommand is blocked in grabowski_git; "
+                "use a typed operation or classify it explicitly before execution: "
+                f"{subcommand}"
+            )
+        if subcommand in GIT_LOCAL_READ_ONLY_SUBCOMMANDS and any(
+            item == "--output" or item.startswith("--output=")
+            for item in command_arguments
+        ):
+            raise PermissionError(
+                f"Git {subcommand} --output is blocked because a read-only-classified command may not write filesystem output."
+            )
         return
 
     if configurations:
@@ -4806,8 +5253,9 @@ def grabowski_git(
     repo: str,
     arguments: list[str],
     timeout_seconds: int = DEFAULT_TIMEOUT,
+    branch_attempt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run Git with a fail-closed single-branch push subset."""
+    """Run Git with guarded publication and CAS-bound local branch mutation."""
     path = Path(repo).expanduser().resolve(strict=True)
     _require_operator_mutation("git_cli", path=str(path), repo=str(path))
     if not path.is_dir():
@@ -4816,6 +5264,8 @@ def grabowski_git(
         raise PermissionError("Git mutation of immutable evidence is blocked.")
     _guard_git(arguments, path)
     subcommand, _command_arguments, _configurations = _split_git_invocation(arguments)
+    execution_timeout_seconds = _timeout(timeout_seconds)
+
     if subcommand == "push":
         remote, _source, _destination = _parse_safe_push_arguments(_command_arguments)
         command_prefix = [
@@ -4846,13 +5296,190 @@ def grabowski_git(
         command_prefix = ["git", "-C", str(path)]
         environment = _git_environment()
     command = _validate_argv([*command_prefix, *arguments], cwd=path)
-    return _run(
+
+    branch_context: dict[str, Any] | None = None
+    if subcommand in GIT_LOCAL_BRANCH_MUTATION_SUBCOMMANDS:
+        if branch_attempt is None:
+            raise PermissionError(
+                "Local Git branch/index mutation requires a branch_attempt bound "
+                "to owner, operation, attempt and an exact observed Git preimage."
+            )
+        normalized_attempt = _normalize_git_branch_attempt(branch_attempt)
+        _reject_cross_branch_mutation_target(
+            subcommand, _command_arguments, normalized_attempt["branch"]
+        )
+        observed_before = _git_branch_preimage(path)
+        if normalized_attempt["branch"] != observed_before["branch"]:
+            return _branch_attempt_reconcile_result(
+                repo=path,
+                arguments=arguments,
+                attempt=normalized_attempt,
+                observed=observed_before,
+                reason="branch-drift-before-effect",
+            )
+        if normalized_attempt["expected_preimage_sha256"] != observed_before["preimage_sha256"]:
+            return _branch_attempt_reconcile_result(
+                repo=path,
+                arguments=arguments,
+                attempt=normalized_attempt,
+                observed=observed_before,
+                reason="git-preimage-drift-before-effect",
+            )
+
+        import grabowski_resources as resources
+
+        try:
+            attempt_lease = resources.acquire_branch_mutation_attempt(
+                normalized_attempt["owner_id"],
+                str(path),
+                normalized_attempt["branch"],
+                operation_id=normalized_attempt["operation_id"],
+                attempt_id=normalized_attempt["attempt_id"],
+                expected_preimage_sha256=normalized_attempt[
+                    "expected_preimage_sha256"
+                ],
+                ttl_seconds=execution_timeout_seconds + 30,
+            )
+        except resources.SameOwnerBranchAttemptConflict as exc:
+            return _branch_attempt_reconcile_result(
+                repo=path,
+                arguments=arguments,
+                attempt=normalized_attempt,
+                observed=observed_before,
+                reason=(
+                    "same-owner-attempt-already-running"
+                    if exc.already_running
+                    else "same-owner-attempt-conflict"
+                ),
+                existing_attempt_binding_sha256=exc.existing_binding_sha256,
+            )
+
+        try:
+            observed_after_lease = _git_branch_preimage(path)
+        except Exception:
+            try:
+                resources.complete_branch_mutation_attempt(attempt_lease)
+            except Exception as cleanup_exc:
+                raise RuntimeError(
+                    "branch attempt cleanup failed after post-acquire Git preimage observation failed; "
+                    "reconcile the exact branch lease before another mutation"
+                ) from cleanup_exc
+            raise
+        if (
+            normalized_attempt["expected_preimage_sha256"]
+            != observed_after_lease["preimage_sha256"]
+        ):
+            try:
+                lease_cleanup = resources.complete_branch_mutation_attempt(
+                    attempt_lease
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "branch attempt cleanup failed after pre-effect Git preimage drift; "
+                    "reconcile the exact branch lease before another mutation"
+                ) from exc
+            return _branch_attempt_reconcile_result(
+                repo=path,
+                arguments=arguments,
+                attempt=normalized_attempt,
+                observed=observed_after_lease,
+                reason="git-preimage-drift-after-attempt-lease",
+                lease=attempt_lease,
+                lease_cleanup=lease_cleanup,
+            )
+        branch_context = {
+            "attempt": normalized_attempt,
+            "lease": attempt_lease,
+            "preimage": observed_after_lease,
+        }
+    elif branch_attempt is not None:
+        raise ValueError(
+            "branch_attempt is accepted only for local branch/index mutation subcommands"
+        )
+
+    result = _run(
         command,
         cwd=path,
-        timeout_seconds=_timeout(timeout_seconds),
+        timeout_seconds=execution_timeout_seconds,
         max_output_bytes=MAX_OUTPUT_BYTES,
         environment=environment,
     )
+    if branch_context is None:
+        return result
+
+    attempt = branch_context["attempt"]
+    attempt_lease = branch_context["lease"]
+    postimage: dict[str, Any] | None = None
+    postimage_error: str | None = None
+    try:
+        postimage = _git_branch_preimage(path, require_attached=False)
+    except Exception as exc:
+        postimage_error = type(exc).__name__
+    lease_cleanup: dict[str, Any] | None = None
+    lease_cleanup_error: str | None = None
+    if postimage is not None:
+        try:
+            lease_cleanup = resources.complete_branch_mutation_attempt(attempt_lease)
+        except Exception as exc:
+            lease_cleanup_error = type(exc).__name__
+    completed = (
+        result.get("returncode") == 0
+        and result.get("timed_out") is False
+        and postimage is not None
+        and lease_cleanup is not None
+    )
+    status = "completed" if completed else "outcome_unknown"
+    receipt: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_git_branch_mutation_receipt",
+        "status": status,
+        "effect_attempted": True,
+        "retry_allowed": False,
+        "requires_readback_before_next_attempt": True,
+        "repository": str(path),
+        "branch": attempt["branch"],
+        "owner_id": attempt["owner_id"],
+        "operation_id": attempt["operation_id"],
+        "attempt_id": attempt["attempt_id"],
+        "expected_preimage_sha256": attempt["expected_preimage_sha256"],
+        "observed_preimage_sha256": branch_context["preimage"]["preimage_sha256"],
+        "postimage_sha256": None if postimage is None else postimage["preimage_sha256"],
+        "post_head": None if postimage is None else postimage["head"],
+        "post_index_sha256": None if postimage is None else postimage["index_sha256"],
+        "postimage_error_class": postimage_error,
+        "resource_key": attempt_lease["resource_key"],
+        "attempt_binding_sha256": attempt_lease["attempt_binding_sha256"],
+        "lease_metadata_sha256": attempt_lease["lease"]["metadata_sha256"],
+        "lease_expires_at_unix": attempt_lease["lease"]["expires_at_unix"],
+        "lease_origin": attempt_lease.get("lease_origin"),
+        "lease_cleanup": lease_cleanup,
+        "lease_cleanup_error_class": lease_cleanup_error,
+        "release_required_after_terminal_readback": lease_cleanup is None,
+        "command_argv_sha256": result.get("argv_sha256"),
+        "command_returncode": result.get("returncode"),
+        "command_timed_out": result.get("timed_out"),
+    }
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical_json_bytes(receipt)).hexdigest()
+    receipt["audit_record_sha256"] = _append_effect_audit(
+        {
+            "timestamp_unix": int(time.time()),
+            "operation": "git-branch-mutation-attempt",
+            "status": status,
+            "owner_id": attempt["owner_id"],
+            "operation_id": attempt["operation_id"],
+            "attempt_id": attempt["attempt_id"],
+            "branch": attempt["branch"],
+            "expected_preimage_sha256": attempt["expected_preimage_sha256"],
+            "observed_preimage_sha256": branch_context["preimage"]["preimage_sha256"],
+            "postimage_sha256": None if postimage is None else postimage["preimage_sha256"],
+            "attempt_binding_sha256": attempt_lease["attempt_binding_sha256"],
+            "resource_key": attempt_lease["resource_key"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "command_argv_sha256": result.get("argv_sha256"),
+        }
+    )
+    result["branch_mutation"] = receipt
+    return result
 
 
 @mcp.tool(name="grabowski_github", annotations=MUTATING)
