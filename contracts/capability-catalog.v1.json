@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "890a173ff189e28ba6d5b42b03cc53add9f7e55d2982547f51fc0061759951f7",
+  "capability_source_sha256": "741a584dddf4261737cf650ed47a818d6c4551230555798503949476961cbb9f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "c26c726ab979110678865eacc4bcef45f5842e8e8804e97739e717eae616dab4",
+  "contract_sha256": "29057aa12134643c2a82d6476aa8ff9579809bbf8b9ff9e5bb92022527d0d526",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -569,10 +569,10 @@
     },
     {
       "category": "version-control",
-      "description": "Read fixed short Git status for one allowed repository.",
+      "description": "Read fixed short Git status and optionally the exact CAS branch preimage.",
       "effects": [],
       "id": "grabowski_git_status",
-      "purpose": "Read fixed short Git status for one allowed repository.",
+      "purpose": "Read fixed short Git status and optionally the exact CAS branch preimage for one allowed repository.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -764,7 +764,7 @@
     },
     {
       "category": "version-control",
-      "description": "Run Git with a fail-closed single-branch push subset.",
+      "description": "Run Git with guarded publication and CAS-bound local branch mutation.",
       "effects": [
         "git-dependent"
       ],
