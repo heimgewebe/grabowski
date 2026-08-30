@@ -109,14 +109,39 @@ def _is_verification_segment(tokens: list[str]) -> bool:
 
     exe = os.path.basename(segment[0])
     if exe == "env":
+        value_options = {"-a", "--argv0", "-C", "--chdir", "-u", "--unset"}
         index = 1
-        while index < len(segment) and (segment[index].startswith("-") or _is_shell_assignment(segment[index])):
-            index += 1
+        while index < len(segment):
+            token = segment[index]
+            if token == "--":
+                index += 1
+                break
+            if _is_shell_assignment(token):
+                index += 1
+                continue
+            if token in value_options:
+                index += 2
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            break
         return _is_verification_segment(segment[index:])
     if exe == "timeout":
+        value_options = {"-k", "--kill-after", "-s", "--signal"}
         index = 1
-        while index < len(segment) and segment[index].startswith("-"):
-            index += 1
+        while index < len(segment):
+            token = segment[index]
+            if token == "--":
+                index += 1
+                break
+            if token in value_options:
+                index += 2
+                continue
+            if token.startswith("-"):
+                index += 1
+                continue
+            break
         if index < len(segment):
             index += 1  # duration
         return _is_verification_segment(segment[index:])
