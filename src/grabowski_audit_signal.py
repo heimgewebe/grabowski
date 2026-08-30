@@ -166,10 +166,19 @@ def _audit_transition_match_index(
     return None
 
 
-def _retention_reconciliation_target_index(
-    entries: list[tuple[dict[str, Any], int]],
+def _retention_intent_index_key(
+    record: dict[str, Any],
+) -> tuple[str, int, str] | None:
+    identity = _retention_transition_identity(record)
+    record_sha256 = record.get("record_sha256")
+    if identity is None or not _audit_sha256_valid(record_sha256):
+        return None
+    return identity[0], identity[1], record_sha256
+
+
+def _retention_reconciliation_target_key(
     reconciliation_record: dict[str, Any],
-) -> int | None:
+) -> tuple[str, int, str] | None:
     identity = _retention_transition_identity(reconciliation_record)
     intent_record_sha256 = reconciliation_record.get("intent_record_sha256")
     if (
@@ -179,12 +188,30 @@ def _retention_reconciliation_target_index(
         or not _audit_sha256_valid(intent_record_sha256)
     ):
         return None
-    expected_ref = f"audit-record-sha256:{intent_record_sha256}"
+    return identity[0], identity[1], intent_record_sha256
+
+
+def _retention_reconciliation_record_valid(
+    reconciliation_record: dict[str, Any],
+) -> bool:
+    return bool(
+        _retention_reconciliation_target_key(reconciliation_record) is not None
+        and reconciliation_record.get("reconciliation_kind") == "completion_audit_gap"
+        and reconciliation_record.get("completed") is True
+        and reconciliation_record.get("retention_effect_retried") is False
+        and _audit_sha256_valid(reconciliation_record.get("receipt_sha256"))
+    )
+
+
+def _retention_reconciliation_target_index(
+    entries: list[tuple[dict[str, Any], int]],
+    reconciliation_record: dict[str, Any],
+) -> int | None:
+    target_key = _retention_reconciliation_target_key(reconciliation_record)
+    if target_key is None:
+        return None
     for index, (candidate, _timestamp_unix) in enumerate(entries):
-        if (
-            _retention_transition_identity(candidate) == identity
-            and _audit_record_ref(candidate) == expected_ref
-        ):
+        if _retention_intent_index_key(candidate) == target_key:
             return index
     return None
 
@@ -193,18 +220,9 @@ def _retention_reconciliation_match_index(
     entries: list[tuple[dict[str, Any], int]],
     reconciliation_record: dict[str, Any],
 ) -> int | None:
-    target_index = _retention_reconciliation_target_index(
-        entries, reconciliation_record
-    )
-    if (
-        target_index is None
-        or reconciliation_record.get("reconciliation_kind") != "completion_audit_gap"
-        or reconciliation_record.get("completed") is not True
-        or reconciliation_record.get("retention_effect_retried") is not False
-        or not _audit_sha256_valid(reconciliation_record.get("receipt_sha256"))
-    ):
+    if not _retention_reconciliation_record_valid(reconciliation_record):
         return None
-    return target_index
+    return _retention_reconciliation_target_index(entries, reconciliation_record)
 
 
 def _audit_transition_gap_signal(
@@ -213,16 +231,71 @@ def _audit_transition_gap_signal(
     start_unix: int,
     end_unix: int,
 ) -> dict[str, Any]:
+    retention_pair = (
+        "runtime-state-retention-intent",
+        "runtime-state-retention-complete",
+    )
     pending: dict[tuple[str, str], list[tuple[dict[str, Any], int]]] = {
         pair: [] for pair in AUDIT_TRANSITION_PAIRS
     }
-    historical_retention_intents: list[tuple[dict[str, Any], int]] = []
-    historical_reconciled_refs: set[str] = set()
-    historical_unmatched: dict[str, tuple[str, dict[str, Any], int]] = {}
+    pending_retention: dict[
+        tuple[str, int, str], tuple[dict[str, Any], int]
+    ] = {}
+    pending_retention_keys_by_identity: dict[
+        tuple[str, int], set[tuple[str, int, str]]
+    ] = {}
+    historical_retention_intents: dict[
+        tuple[str, int, str], tuple[dict[str, Any], int]
+    ] = {}
+    historical_reconciled_keys: set[tuple[str, int, str]] = set()
+    historical_unmatched: dict[
+        tuple[str, int, str], tuple[str, dict[str, Any], int]
+    ] = {}
+    historical_unmatched_keys_by_identity: dict[
+        tuple[str, int], set[tuple[str, int, str]]
+    ] = {}
     seen_retention_completion_identities: set[tuple[str, int]] = set()
     completed_counts: Counter[str] = Counter()
     reconciled_counts: Counter[str] = Counter()
     reconciled_records: list[dict[str, Any]] = []
+
+    def _remember_pending_retention(
+        key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
+    ) -> None:
+        pending_retention[key] = (record, timestamp_unix)
+        pending_retention_keys_by_identity.setdefault(key[:2], set()).add(key)
+
+    def _pop_pending_retention(
+        key: tuple[str, int, str]
+    ) -> tuple[dict[str, Any], int] | None:
+        item = pending_retention.pop(key, None)
+        keys = pending_retention_keys_by_identity.get(key[:2])
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                pending_retention_keys_by_identity.pop(key[:2], None)
+        return item
+
+    def _remember_historical_unmatched(
+        key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
+    ) -> None:
+        historical_unmatched[key] = (
+            retention_pair[0],
+            record,
+            timestamp_unix,
+        )
+        historical_unmatched_keys_by_identity.setdefault(key[:2], set()).add(key)
+
+    def _pop_historical_unmatched(
+        key: tuple[str, int, str]
+    ) -> tuple[str, dict[str, Any], int] | None:
+        item = historical_unmatched.pop(key, None)
+        keys = historical_unmatched_keys_by_identity.get(key[:2])
+        if keys is not None:
+            keys.discard(key)
+            if not keys:
+                historical_unmatched_keys_by_identity.pop(key[:2], None)
+        return item
 
     for record, timestamp_unix in prepared_records:
         if timestamp_unix is None or timestamp_unix > end_unix:
@@ -230,84 +303,106 @@ def _audit_transition_gap_signal(
         operation = record.get("operation")
 
         if timestamp_unix < start_unix:
-            if (
-                operation == "runtime-state-retention-intent"
-                and _retention_transition_identity(record) is not None
-            ):
-                historical_retention_intents.append((record, timestamp_unix))
-            elif operation == "runtime-state-retention-complete":
+            if operation == retention_pair[0]:
+                key = _retention_intent_index_key(record)
+                if key is not None:
+                    historical_retention_intents[key] = (record, timestamp_unix)
+            elif operation == retention_pair[1]:
                 identity = _retention_transition_identity(record)
                 if identity is not None:
                     seen_retention_completion_identities.add(identity)
             elif operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
-                match_index = _retention_reconciliation_match_index(
-                    historical_retention_intents, record
-                )
+                target_key = _retention_reconciliation_target_key(record)
                 identity = _retention_transition_identity(record)
                 if (
-                    match_index is not None
+                    target_key in historical_retention_intents
+                    and _retention_reconciliation_record_valid(record)
                     and identity not in seen_retention_completion_identities
                 ):
-                    candidate, _candidate_timestamp = historical_retention_intents[
-                        match_index
-                    ]
-                    if ref := _audit_record_ref(candidate):
-                        historical_reconciled_refs.add(ref)
+                    historical_reconciled_keys.add(target_key)
+            continue
+
+        if operation == retention_pair[0]:
+            key = _retention_intent_index_key(record)
+            if key is None:
+                # Preserve legacy/malformed fail-closed FIFO behavior separately.
+                pending[retention_pair].append((record, timestamp_unix))
+            else:
+                _remember_pending_retention(key, record, timestamp_unix)
             continue
 
         if operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
-            key = ("runtime-state-retention-intent", "runtime-state-retention-complete")
-            current_target_index = _retention_reconciliation_target_index(
-                pending[key], record
-            )
-            current_match_index = _retention_reconciliation_match_index(
-                pending[key], record
-            )
-            if current_target_index is not None:
-                if current_match_index is not None:
-                    pending[key].pop(current_match_index)
-                    reconciled_counts[key[0]] += 1
+            target_key = _retention_reconciliation_target_key(record)
+            if target_key is None:
+                continue
+            if target_key in pending_retention:
+                if _retention_reconciliation_record_valid(record):
+                    _pop_pending_retention(target_key)
+                    reconciled_counts[retention_pair[0]] += 1
                     reconciled_records.append(record)
-                # Invalid reconciliation evidence must not consume an in-window intent.
+                # Invalid evidence leaves the indexed in-window intent pending/HIGH.
                 continue
 
-            historical_target_index = _retention_reconciliation_target_index(
-                historical_retention_intents, record
-            )
-            if historical_target_index is None:
+            historical_target = historical_retention_intents.get(target_key)
+            if historical_target is None:
                 continue
-            candidate, candidate_timestamp = historical_retention_intents[
-                historical_target_index
-            ]
-            candidate_ref = _audit_record_ref(candidate)
-            identity = _retention_transition_identity(record)
+            identity = target_key[:2]
             if (
-                candidate_ref is None
-                or candidate_ref in historical_reconciled_refs
+                target_key in historical_reconciled_keys
                 or identity in seen_retention_completion_identities
             ):
                 continue
-
-            historical_match_index = _retention_reconciliation_match_index(
-                historical_retention_intents, record
-            )
-            if historical_match_index is not None:
-                historical_unmatched.pop(candidate_ref, None)
-                historical_reconciled_refs.add(candidate_ref)
-                reconciled_counts[key[0]] += 1
+            historical_record, historical_timestamp = historical_target
+            if _retention_reconciliation_record_valid(record):
+                _pop_historical_unmatched(target_key)
+                historical_reconciled_keys.add(target_key)
+                reconciled_counts[retention_pair[0]] += 1
                 reconciled_records.append(record)
             else:
-                # The current invalid reconciliation is fresh evidence that the exact
-                # historical intent remains unresolved; retain that intent as HIGH.
-                historical_unmatched[candidate_ref] = (
-                    key[0],
-                    candidate,
-                    candidate_timestamp,
+                # Fresh invalid reconciliation evidence keeps the exact old intent HIGH.
+                _remember_historical_unmatched(
+                    target_key,
+                    historical_record,
+                    historical_timestamp,
                 )
+            continue
+
+        if operation == retention_pair[1]:
+            completion_fields_present = _audit_transition_identity_fields_present(
+                retention_pair[0], record
+            )
+            identity = _retention_transition_identity(record)
+            matched = False
+            if completion_fields_present:
+                if identity is not None:
+                    keys = pending_retention_keys_by_identity.get(identity, set())
+                    if len(keys) == 1:
+                        only_key = next(iter(keys))
+                        _pop_pending_retention(only_key)
+                        matched = True
+            else:
+                match_index = _audit_transition_match_index(
+                    retention_pair[0], pending[retention_pair], record
+                )
+                if match_index is not None:
+                    pending[retention_pair].pop(match_index)
+                    matched = True
+            if matched:
+                completed_counts[retention_pair[0]] += 1
+            if identity is not None:
+                seen_retention_completion_identities.add(identity)
+                unresolved_keys = list(
+                    historical_unmatched_keys_by_identity.get(identity, set())
+                )
+                for unresolved_key in unresolved_keys:
+                    if _pop_historical_unmatched(unresolved_key) is not None:
+                        completed_counts[retention_pair[0]] += 1
             continue
 
         for intent, completion in AUDIT_TRANSITION_PAIRS:
             key = (intent, completion)
+            if key == retention_pair:
+                continue
             if operation == intent:
                 pending[key].append((record, timestamp_unix))
                 break
@@ -318,26 +413,14 @@ def _audit_transition_gap_signal(
                 if match_index is not None:
                     pending[key].pop(match_index)
                     completed_counts[intent] += 1
-                if intent == "runtime-state-retention-intent":
-                    identity = _retention_transition_identity(record)
-                    if identity is not None:
-                        seen_retention_completion_identities.add(identity)
-                        for ref, (
-                            _gap_intent,
-                            historical_record,
-                            _gap_timestamp,
-                        ) in list(historical_unmatched.items()):
-                            if (
-                                _retention_transition_identity(historical_record)
-                                == identity
-                            ):
-                                historical_unmatched.pop(ref, None)
-                                completed_counts[intent] += 1
                 break
 
     gaps: list[tuple[str, dict[str, Any], int]] = list(
         historical_unmatched.values()
     )
+    for record, timestamp_unix in pending_retention.values():
+        if timestamp_unix <= end_unix - AUDIT_SIGNAL_GRACE_SECONDS:
+            gaps.append((retention_pair[0], record, timestamp_unix))
     for (intent, _completion), entries in pending.items():
         for record, timestamp_unix in entries:
             if timestamp_unix <= end_unix - AUDIT_SIGNAL_GRACE_SECONDS:
@@ -395,13 +478,13 @@ def _audit_transition_gap_signal(
                 0, unique_reconciliation_ref_count - len(reconciliation_refs)
             ),
             "pairing_semantics": (
-                "retention pairs by (plan_sha256, attempt) when present and valid; "
-                "append-only reconciliations resolve only the exact intent_record_sha256, "
-                "including an older verified intent outside the reporting window when no "
-                "matching completion exists; invalid current reconciliation evidence keeps "
-                "that exact historical intent visible as an execution_gap; only records "
-                "with both identity fields absent use legacy FIFO; other transition "
-                "families use FIFO"
+                "retention identities are indexed by (plan_sha256, attempt, "
+                "intent_record_sha256); append-only reconciliations resolve only that "
+                "exact indexed intent, including older verified intents outside the "
+                "reporting window when no prior matching completion exists; invalid "
+                "current reconciliation evidence keeps that exact historical intent "
+                "visible as an execution_gap; records with both identity fields absent "
+                "retain legacy FIFO behavior; other transition families use FIFO"
             ),
         },
         does_not_establish=[

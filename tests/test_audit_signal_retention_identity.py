@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -420,6 +421,54 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
         )
         self.assertTrue(details["completion_audit_gap_evidence_refs_truncated"])
         self.assertEqual(details["completion_audit_gap_evidence_refs_omitted_count"], 5)
+
+
+    def test_historical_reconciliation_uses_index_not_linear_target_scan(self) -> None:
+        now = 1_800_000_000
+        records: list[tuple[dict[str, object], int]] = []
+        pair_count = 1_000
+        for index in range(pair_count):
+            plan_sha = f"{index + 1:064x}"
+            intent_sha = f"{index + 10_001:064x}"
+            records.extend(
+                [
+                    (
+                        {
+                            "operation": "runtime-state-retention-intent",
+                            "record_sha256": intent_sha,
+                            "plan_sha256": plan_sha,
+                            "attempt": 1,
+                        },
+                        now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 10_000 + index * 2,
+                    ),
+                    (
+                        {
+                            "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                            "record_sha256": f"{index + 20_001:064x}",
+                            "reconciliation_kind": "completion_audit_gap",
+                            "plan_sha256": plan_sha,
+                            "attempt": 1,
+                            "receipt_sha256": f"{index + 30_001:064x}",
+                            "intent_record_sha256": intent_sha,
+                            "completed": True,
+                            "retention_effect_retried": False,
+                        },
+                        now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 9_999 + index * 2,
+                    ),
+                ]
+            )
+        with unittest.mock.patch.object(
+            signal,
+            "_retention_reconciliation_target_index",
+            wraps=signal._retention_reconciliation_target_index,
+        ) as linear_lookup:
+            result = signal._audit_transition_gap_signal(
+                records,
+                start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+                end_unix=now,
+            )
+        self.assertEqual(linear_lookup.call_count, 0)
+        self.assertEqual((result["status"], result["severity"]), ("clear", "none"))
 
 
 if __name__ == "__main__":
