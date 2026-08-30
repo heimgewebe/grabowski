@@ -251,6 +251,9 @@ def _audit_transition_gap_signal(
     historical_retention_intents: dict[
         tuple[str, int, str], tuple[dict[str, Any], int]
     ] = {}
+    historical_retention_intents_by_digest: dict[
+        str, tuple[tuple[str, int, str], dict[str, Any], int]
+    ] = {}
     historical_reconciled_keys: set[tuple[str, int, str]] = set()
     historical_unmatched: dict[
         tuple[str, int, str], tuple[str, dict[str, Any], int]
@@ -339,6 +342,9 @@ def _audit_transition_gap_signal(
                 key = _retention_intent_index_key(record)
                 if key is not None:
                     historical_retention_intents[key] = (record, timestamp_unix)
+                    historical_retention_intents_by_digest[key[2]] = (
+                        key, record, timestamp_unix
+                    )
                     historical_intent_order[key] = audit_order
             elif operation == retention_pair[1]:
                 identity = _retention_transition_identity(record)
@@ -366,9 +372,7 @@ def _audit_transition_gap_signal(
 
         if operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
             target_key = _retention_reconciliation_target_key(record)
-            if target_key is None:
-                continue
-            if target_key in pending_retention:
+            if target_key is not None and target_key in pending_retention:
                 if _retention_reconciliation_record_valid(record):
                     _pop_pending_retention(target_key)
                     reconciled_counts[retention_pair[0]] += 1
@@ -376,25 +380,35 @@ def _audit_transition_gap_signal(
                 # Invalid evidence leaves the indexed in-window intent pending/HIGH.
                 continue
 
-            historical_target = historical_retention_intents.get(target_key)
+            intent_record_sha256 = record.get("intent_record_sha256")
+            historical_target = (
+                historical_retention_intents_by_digest.get(intent_record_sha256)
+                if _audit_sha256_valid(intent_record_sha256)
+                else None
+            )
             if historical_target is None:
                 continue
-            identity = target_key[:2]
+            historical_key, historical_record, historical_timestamp = historical_target
+            historical_identity = historical_key[:2]
             if (
-                target_key in historical_reconciled_keys
-                or identity in seen_retention_completion_identities
+                historical_key in historical_reconciled_keys
+                or historical_identity in seen_retention_completion_identities
             ):
                 continue
-            historical_record, historical_timestamp = historical_target
-            if _retention_reconciliation_record_valid(record):
-                _pop_historical_unmatched(target_key)
-                historical_reconciled_keys.add(target_key)
+            if (
+                target_key == historical_key
+                and _retention_reconciliation_record_valid(record)
+            ):
+                _pop_historical_unmatched(historical_key)
+                historical_reconciled_keys.add(historical_key)
                 reconciled_counts[retention_pair[0]] += 1
                 reconciled_records.append(record)
             else:
-                # Fresh invalid reconciliation evidence keeps the exact old intent HIGH.
+                # Resolve the referenced historical intent by its immutable digest
+                # before trusting the reconciliation's claimed plan/attempt.  A
+                # mismatched or malformed identity therefore stays visible as HIGH.
                 _remember_historical_unmatched(
-                    target_key,
+                    historical_key,
                     historical_record,
                     historical_timestamp,
                 )
