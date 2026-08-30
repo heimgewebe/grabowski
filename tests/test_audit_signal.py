@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 import sys
@@ -506,6 +507,43 @@ class AuditSignalTests(unittest.TestCase):
                 "#/$defs/staleAttention",
             ],
         )
+
+
+    def test_retention_transition_identity_is_safe_and_traceable(self) -> None:
+        source = (ROOT / "src" / "grabowski_audit_query.py").read_text(encoding="utf-8")
+        scalar_block = source.split("_SCALAR_RECORD_FIELDS = (", 1)[1].split(")", 1)[0]
+        trace_block = source.split("_TRACE_SCALAR_FIELDS = (", 1)[1].split(")", 1)[0]
+        anchor_block = source.split("_TRACE_ANCHOR_KINDS = {", 1)[1].split("}", 1)[0]
+        for field in ("plan_sha256", "receipt_sha256", "intent_record_sha256", "attempt", "reconciliation_kind"):
+            self.assertIn(f'"{field}"', scalar_block)
+        for field in ("plan_sha256", "receipt_sha256"):
+            self.assertIn(f'"{field}"', trace_block)
+            self.assertIn(f'"{field}"', anchor_block)
+
+        tree = ast.parse(source)
+        sha_fields = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_SHA256_RECORD_FIELDS"
+                for target in node.targets
+            )
+        )
+        helper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_trace_scalar_value"
+        )
+        namespace = {"Any": object}
+        exec(compile(ast.Module(body=[sha_fields, helper], type_ignores=[]), "<audit-query-trace-helper>", "exec"), namespace)
+        trace_scalar = namespace["_trace_scalar_value"]
+        self.assertEqual(trace_scalar({"plan_sha256": "a" * 64}, "plan_sha256"), "a" * 64)
+        self.assertIsNone(trace_scalar({"plan_sha256": "not-a-digest"}, "plan_sha256"))
+        self.assertIsNone(trace_scalar({"receipt_sha256": "secret-value"}, "receipt_sha256"))
+
 
 
 if __name__ == "__main__":

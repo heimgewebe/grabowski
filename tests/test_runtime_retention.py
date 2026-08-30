@@ -1858,5 +1858,196 @@ class RuntimeRetentionTests(unittest.TestCase):
                         worktree_hygiene_repositories=[str(repo)],
                     )
 
+
+    def test_completion_audit_failure_keeps_terminal_receipt_and_prevents_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            archive = root / "archive"
+            receipts = root / "receipts"
+            job_name = "grabowski-job-acdeff012345"
+            unit = job_name + ".service"
+            self._job(jobs, job_name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50,
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=archive,
+                receipt_root=receipts,
+                task_db=root / "missing.sqlite3",
+                failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            appended: list[dict[str, object]] = []
+
+            def append_audit(record: dict[str, object]) -> None:
+                appended.append(record)
+                if len(appended) == 2:
+                    raise OSError("simulated completion append failure")
+
+            fake_base._append_audit = append_audit
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            completed = Mock(returncode=0, stderr="")
+            with patch.dict(
+                "sys.modules",
+                {
+                    "grabowski_self_deploy": fake_self_deploy,
+                    "grabowski_mcp": fake_base,
+                },
+            ), patch.object(RETENTION, "_run", return_value=completed), patch.object(
+                RETENTION,
+                "_systemd_unit_states",
+                return_value={unit: self._state(unit)},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "completion audit failed"):
+                    RETENTION.apply_plan(
+                        plan,
+                        expected_plan_sha256=plan["plan_sha256"],
+                    )
+
+            receipt_path = receipts / f"{plan['plan_sha256']}.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertTrue(receipt["completed"])
+            self.assertFalse(receipt["retry"]["required"])
+            self.assertEqual(len(appended), 2)
+            with self.assertRaisesRegex(RuntimeError, "terminal receipt"):
+                RETENTION._select_receipt_target(
+                    receipts, plan_sha256=plan["plan_sha256"]
+                )
+
+    def test_reconciliation_appends_only_audit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.json"
+            plan_sha256 = "a" * 64
+            intent_sha256 = "b" * 64
+            payload = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": plan_sha256,
+                "attempt": 1,
+                "previous_receipt_sha256": None,
+                "reset_failed": [{"unit": "one"}],
+                "reset_failures": [],
+                "archived_jobs": [],
+                "completed": True,
+                "retry": {"required": False, "strategy": "rebuild_live_plan_and_chain_partial_receipt"},
+                "completed_at_unix": 1_800_000_000,
+            }
+            payload["receipt_sha256"] = RETENTION._sha256(payload)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+            with patch.object(
+                RETENTION, "_retention_coordination_lock", return_value=nullcontext()
+            ), patch.object(
+                RETENTION,
+                "_retention_audit_reconciliation_state",
+                return_value={
+                    "snapshot_last_record_sha256": "c" * 64,
+                    "original_completion": None,
+                    "existing_reconciliation": None,
+                },
+            ), patch.object(
+                RETENTION, "_append_audit_record", side_effect=lambda record: record
+            ) as append_audit, patch.object(RETENTION, "apply_plan") as apply_plan:
+                result = RETENTION.reconcile_retention_completion_audit(
+                    intent_record_sha256=intent_sha256,
+                    plan_sha256=plan_sha256,
+                    attempt=1,
+                    receipt_path=path,
+                    expected_receipt_sha256=payload["receipt_sha256"],
+                )
+            self.assertEqual(result["status"], "reconciled")
+            self.assertFalse(result["retention_effect_retried"])
+            apply_plan.assert_not_called()
+            record = append_audit.call_args.args[0]
+            self.assertEqual(
+                record["operation"],
+                RETENTION.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+            )
+            self.assertEqual(record["intent_record_sha256"], intent_sha256)
+            self.assertEqual(record["receipt_sha256"], payload["receipt_sha256"])
+
+    def test_reconciliation_is_idempotent_for_existing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.json"
+            plan_sha256 = "d" * 64
+            intent_sha256 = "e" * 64
+            payload = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": plan_sha256,
+                "attempt": 1,
+                "previous_receipt_sha256": None,
+                "reset_failed": [],
+                "reset_failures": [],
+                "archived_jobs": [],
+                "completed": True,
+                "retry": {"required": False, "strategy": "rebuild_live_plan_and_chain_partial_receipt"},
+                "completed_at_unix": 1_800_000_000,
+            }
+            payload["receipt_sha256"] = RETENTION._sha256(payload)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+            with patch.object(
+                RETENTION, "_retention_coordination_lock", return_value=nullcontext()
+            ), patch.object(
+                RETENTION,
+                "_retention_audit_reconciliation_state",
+                return_value={
+                    "snapshot_last_record_sha256": "f" * 64,
+                    "original_completion": None,
+                    "existing_reconciliation": {
+                        "record_sha256": "1" * 64,
+                        "record": {},
+                    },
+                },
+            ), patch.object(RETENTION, "_append_audit_record") as append_audit:
+                result = RETENTION.reconcile_retention_completion_audit(
+                    intent_record_sha256=intent_sha256,
+                    plan_sha256=plan_sha256,
+                    attempt=1,
+                    receipt_path=path,
+                    expected_receipt_sha256=payload["receipt_sha256"],
+                )
+            self.assertEqual(result["status"], "already-reconciled")
+            self.assertTrue(result["idempotent"])
+            append_audit.assert_not_called()
+
+    def test_reconciliation_rejects_foreign_terminal_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "receipt.json"
+            payload = {
+                "schema_version": 3,
+                "operation": "grabowski-runtime-state-retention",
+                "plan_sha256": "2" * 64,
+                "attempt": 1,
+                "previous_receipt_sha256": None,
+                "reset_failed": [],
+                "reset_failures": [],
+                "archived_jobs": [],
+                "completed": True,
+                "retry": {"required": False, "strategy": "rebuild_live_plan_and_chain_partial_receipt"},
+                "completed_at_unix": 1_800_000_000,
+            }
+            payload["receipt_sha256"] = RETENTION._sha256(payload)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            path.chmod(0o600)
+            with patch.object(
+                RETENTION, "_retention_coordination_lock", return_value=nullcontext()
+            ), self.assertRaisesRegex(RuntimeError, "binding is invalid"):
+                RETENTION.reconcile_retention_completion_audit(
+                    intent_record_sha256="3" * 64,
+                    plan_sha256="4" * 64,
+                    attempt=1,
+                    receipt_path=path,
+                    expected_receipt_sha256=payload["receipt_sha256"],
+                )
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,6 +24,9 @@ AUDIT_TRANSITION_PAIRS = (
     ("runtime-state-retention-intent", "runtime-state-retention-complete"),
     ("runtime-deploy-schedule-intent", "runtime-deploy-scheduled"),
 )
+RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION = (
+    "runtime-state-retention-completion-audit-reconciled"
+)
 AUDIT_CONTRADICTION_OPERATION_TERMS = (
     "contract",
     "envelope",
@@ -163,6 +166,32 @@ def _audit_transition_match_index(
     return None
 
 
+def _retention_reconciliation_match_index(
+    entries: list[tuple[dict[str, Any], int]],
+    reconciliation_record: dict[str, Any],
+) -> int | None:
+    identity = _retention_transition_identity(reconciliation_record)
+    intent_record_sha256 = reconciliation_record.get("intent_record_sha256")
+    if (
+        reconciliation_record.get("operation")
+        != RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION
+        or identity is None
+        or reconciliation_record.get("reconciliation_kind") != "completion_audit_gap"
+        or reconciliation_record.get("completed") is not True
+        or not _audit_sha256_valid(reconciliation_record.get("receipt_sha256"))
+        or not _audit_sha256_valid(intent_record_sha256)
+    ):
+        return None
+    expected_ref = f"audit-record-sha256:{intent_record_sha256}"
+    for index, (candidate, _timestamp_unix) in enumerate(entries):
+        if (
+            _retention_transition_identity(candidate) == identity
+            and _audit_record_ref(candidate) == expected_ref
+        ):
+            return index
+    return None
+
+
 def _audit_transition_gap_signal(
     prepared_records: list[tuple[dict[str, Any], int | None]],
     *,
@@ -173,6 +202,8 @@ def _audit_transition_gap_signal(
         pair: [] for pair in AUDIT_TRANSITION_PAIRS
     }
     completed_counts: Counter[str] = Counter()
+    reconciled_counts: Counter[str] = Counter()
+    reconciled_records: list[dict[str, Any]] = []
     for record, timestamp_unix in prepared_records:
         if (
             timestamp_unix is None
@@ -181,6 +212,14 @@ def _audit_transition_gap_signal(
         ):
             continue
         operation = record.get("operation")
+        if operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
+            key = ("runtime-state-retention-intent", "runtime-state-retention-complete")
+            match_index = _retention_reconciliation_match_index(pending[key], record)
+            if match_index is not None:
+                pending[key].pop(match_index)
+                reconciled_counts[key[0]] += 1
+                reconciled_records.append(record)
+            continue
         for intent, completion in AUDIT_TRANSITION_PAIRS:
             key = (intent, completion)
             if operation == intent:
@@ -200,32 +239,51 @@ def _audit_transition_gap_signal(
             if timestamp_unix <= end_unix - AUDIT_SIGNAL_GRACE_SECONDS:
                 gaps.append((intent, record, timestamp_unix))
     by_transition = Counter(intent for intent, _record, _timestamp in gaps)
-    refs = [
+    execution_refs = [
         ref
         for _intent, record, _timestamp in gaps
         if (ref := _audit_record_ref(record))
     ]
+    reconciliation_refs = [
+        ref for record in reconciled_records if (ref := _audit_record_ref(record))
+    ]
+    observed_count = len(gaps) + len(reconciled_records)
+    if gaps:
+        severity = "high"
+        recommended_action = "trace each unmatched intent and read the exact target state before retry"
+    elif reconciled_records:
+        severity = "medium"
+        recommended_action = (
+            "review append-only completion-audit reconciliation evidence; "
+            "do not retry the retention effect"
+        )
+    else:
+        severity = "none"
+        recommended_action = "none"
     return _audit_signal_entry(
         "transition_gap",
-        status="observed" if gaps else "clear",
-        severity="high" if gaps else "none",
-        count=len(gaps),
-        observed_count=len(gaps),
-        evidence_refs=refs,
-        evidence_quality="explicit_identity_with_legacy_fifo_fallback",
-        recommended_action=(
-            "trace each unmatched intent and read the exact target state before retry"
-            if gaps
-            else "none"
+        status="observed" if observed_count else "clear",
+        severity=severity,
+        count=observed_count,
+        observed_count=observed_count,
+        evidence_refs=execution_refs + reconciliation_refs,
+        evidence_quality=(
+            "explicit_identity_with_terminal_receipt_reconciliation_and_legacy_fifo_fallback"
         ),
+        recommended_action=recommended_action,
         details={
             "grace_seconds": AUDIT_SIGNAL_GRACE_SECONDS,
+            "execution_gap_count": len(gaps),
+            "completion_audit_gap_count": len(reconciled_records),
             "unmatched_intents_by_transition": dict(sorted(by_transition.items())),
             "completed_pairs_by_transition": dict(sorted(completed_counts.items())),
+            "completion_audit_gaps_by_transition": dict(sorted(reconciled_counts.items())),
+            "completion_audit_gap_evidence_refs": reconciliation_refs,
             "pairing_semantics": (
                 "retention pairs by (plan_sha256, attempt) when present and valid; "
-                "only records with both identity fields absent use legacy FIFO; "
-                "other transition families use FIFO"
+                "append-only reconciliations resolve only the exact intent_record_sha256 "
+                "and remain visible as completion_audit_gap; only records with both "
+                "identity fields absent use legacy FIFO; other transition families use FIFO"
             ),
         },
         does_not_establish=[
@@ -233,6 +291,8 @@ def _audit_transition_gap_signal(
             "causality",
             "safe_retry",
             "exact_cross-operation_identity_when_no_transaction_id_is_logged",
+            "that_the_original_completion_audit_record_existed",
+            "cause_of_the_completion_audit_gap",
         ],
     )
 
