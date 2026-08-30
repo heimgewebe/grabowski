@@ -471,5 +471,51 @@ class AuditSignalRetentionIdentityTests(unittest.TestCase):
         self.assertEqual((result["status"], result["severity"]), ("clear", "none"))
 
 
+    def test_recent_reconciliation_matches_legacy_intent_evidence_digest(self) -> None:
+        now = 1_800_000_000
+        legacy_evidence_sha = "9" * 64
+        plan_sha = "8" * 64
+        result = signal._audit_transition_gap_signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "plan_sha256": plan_sha,
+                        "attempt": 1,
+                        signal.AUDIT_EVIDENCE_RECORD_SHA256_FIELD: legacy_evidence_sha,
+                    },
+                    now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 100,
+                ),
+                (
+                    {
+                        "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                        "record_sha256": "7" * 64,
+                        "reconciliation_kind": "completion_audit_gap",
+                        "plan_sha256": plan_sha,
+                        "attempt": 1,
+                        "receipt_sha256": "6" * 64,
+                        "intent_record_sha256": legacy_evidence_sha,
+                        "completed": True,
+                        "retention_effect_retried": False,
+                    },
+                    now - 100,
+                ),
+            ],
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        self.assertEqual((result["status"], result["severity"]), ("observed", "medium"))
+        self.assertEqual(result["details"]["execution_gap_count"], 0)
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 1)
+        self.assertEqual(
+            signal._audit_record_ref(
+                {
+                    signal.AUDIT_EVIDENCE_RECORD_SHA256_FIELD: legacy_evidence_sha,
+                }
+            ),
+            "audit-record-sha256:" + legacy_evidence_sha,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

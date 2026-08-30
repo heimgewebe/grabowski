@@ -27,6 +27,7 @@ AUDIT_TRANSITION_PAIRS = (
 RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION = (
     "runtime-state-retention-completion-audit-reconciled"
 )
+AUDIT_EVIDENCE_RECORD_SHA256_FIELD = "__grabowski_audit_evidence_record_sha256"
 AUDIT_CONTRADICTION_OPERATION_TERMS = (
     "contract",
     "envelope",
@@ -66,15 +67,17 @@ def _runtime_snapshot_timestamp_valid(value: Any, *, end_unix: int) -> bool:
     )
 
 
+def _audit_record_evidence_sha256(record: dict[str, Any]) -> str | None:
+    stored = record.get("record_sha256")
+    if _audit_sha256_valid(stored):
+        return stored
+    derived = record.get(AUDIT_EVIDENCE_RECORD_SHA256_FIELD)
+    return derived if _audit_sha256_valid(derived) else None
+
+
 def _audit_record_ref(record: dict[str, Any]) -> str | None:
-    value = record.get("record_sha256")
-    if (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    ):
-        return f"audit-record-sha256:{value}"
-    return None
+    value = _audit_record_evidence_sha256(record)
+    return f"audit-record-sha256:{value}" if value is not None else None
 
 
 def _audit_signal_refs(values: list[str]) -> tuple[list[str], bool]:
@@ -170,8 +173,8 @@ def _retention_intent_index_key(
     record: dict[str, Any],
 ) -> tuple[str, int, str] | None:
     identity = _retention_transition_identity(record)
-    record_sha256 = record.get("record_sha256")
-    if identity is None or not _audit_sha256_valid(record_sha256):
+    record_sha256 = _audit_record_evidence_sha256(record)
+    if identity is None or record_sha256 is None:
         return None
     return identity[0], identity[1], record_sha256
 
