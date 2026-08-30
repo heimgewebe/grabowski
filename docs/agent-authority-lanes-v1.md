@@ -62,6 +62,15 @@ one authoritative mutating writer per overlapping-resource lane
 
 Disjoint lanes may run in parallel. Controller integration remains authoritative even when implementation is delegated.
 
+### Same-owner branch mutation attempts
+
+A branch/path lease proves the logical owner and resource scope, but it does not by itself distinguish two concurrent controller attempts that reuse that same owner. Local branch or index mutation through `grabowski_git` therefore requires a `branch_attempt` binding containing the owner, operation id, attempt id, attached branch and the exact pre-effect Git preimage. The preimage binds HEAD, the staged index and in-progress merge/cherry-pick/revert/rebase refs.
+Unclassified local Git subcommands fail closed. Beyond `push`, `grabowski_git` accepts only explicitly classified branch/index mutators or a conservative read-only set; new Git subcommands must be classified deliberately or routed through a typed operation before use. The read-only Git environment pins `GIT_OPTIONAL_LOCKS=0` so commands such as `status` cannot perform optional index refreshes as a side effect.
+
+The existing branch resource remains the only serialization point. When the same owner already holds that branch through a Work Lane or another live lease, the attempt CAS overlays only an ephemeral attempt marker: it preserves the lease purpose, acquisition time, expiry and prior metadata. A different attempt from the same owner fails before the Git effect with `reconcile_required`; a changed branch or Git preimage also reconciles before effect. Disjoint branch resources remain independent, so this does not create a repository-wide lock.
+
+After terminal Git readback, an overlaid attempt marker is removed and the prior lease metadata identity is restored. A branch lease created only for the mutation attempt is released through its exact snapshot instead. Cleanup failure keeps the mutation receipt non-terminal (`outcome_unknown`) and forbids a blind retry. Every attempted branch effect emits a receipt that binds owner, operation, attempt, expected and observed preimage, the branch-attempt lease binding, cleanup evidence and the post-effect Git observation.
+
 ## Operational truth and hygiene
 
 `grabowski_current_work` treats current tasks, leases, checkouts, workers and processes as operational truth. Historical checkout-binding reconciliation without any current physical or authoritative surface is classified as `hygiene` and remains visible without displacing current work.

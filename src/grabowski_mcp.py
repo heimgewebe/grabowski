@@ -59,6 +59,7 @@ import grabowski_merge_authority as merge_authority
 import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
+
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"

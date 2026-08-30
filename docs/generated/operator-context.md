@@ -85,7 +85,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_work_acquire` | work-coordination | no | high | Atomically bind and prepare one controller lane, or persist and audit its evidence-bound terminal closeout with retry-safe audit recovery. |
 | `grabowski_reposkop_context` | repository-observation | no | low | Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt. |
 | `grabowski_operator_optimization_report` | operations-observability | yes | low | Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report. |
-| `grabowski_git_status` | version-control | yes | low | Read fixed short Git status for one allowed repository. |
+| `grabowski_git_status` | version-control | yes | low | Read fixed short Git status and optionally the exact CAS branch preimage for one allowed repository. |
 | `grabowski_git_diff` | version-control | yes | low | Read a bounded staged or unstaged Git diff without external helpers. |
 | `grabowski_git_log` | version-control | yes | low | Read a bounded fixed-format Git commit log. |
 | `grabowski_git_show` | version-control | yes | low | Read one bounded Git revision without external diff or textconv helpers. |
