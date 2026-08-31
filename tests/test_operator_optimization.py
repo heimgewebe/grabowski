@@ -98,6 +98,41 @@ def audit_provider(**_kwargs) -> dict:
         "signal_projection": {
             "signals": [
                 {
+                    "id": "uncertain_outcome",
+                    "status": "observed",
+                    "severity": "critical",
+                    "count": 2,
+                    "evidence_refs": ["audit-record-sha256:uncertain"],
+                    "recommended_action": "read the exact target state and recovery evidence before any retry",
+                    "does_not_establish": [
+                        "mutation_failure",
+                        "safe_retry",
+                        "root_cause",
+                    ],
+                },
+                {
+                    "id": "contract_contradiction",
+                    "status": "clear",
+                    "severity": "none",
+                    "count": 0,
+                    "evidence_refs": [],
+                    "recommended_action": "none",
+                    "does_not_establish": ["root_cause"],
+                },
+                {
+                    "id": "transition_gap",
+                    "status": "observed",
+                    "severity": "high",
+                    "count": 1,
+                    "evidence_refs": ["audit-record-sha256:transition"],
+                    "recommended_action": "trace each unmatched intent and read the exact target state before retry",
+                    "does_not_establish": [
+                        "effect_absence_outside_the_audit_chain",
+                        "causality",
+                        "safe_retry",
+                    ],
+                },
+                {
                     "id": "repeated_blockade",
                     "status": "observed",
                     "severity": "medium",
@@ -213,6 +248,8 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         finding_ids = {item["id"] for item in result["findings"]}
         self.assertTrue(
             {
+                "uncertain_outcome",
+                "transition_gap",
                 "repeated_bureau_contract_failures",
                 "repeated_resource_reclamation",
                 "repeated_blockade",
@@ -256,6 +293,79 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         self.assertIn("operator_productivity", result["does_not_establish"])
         self.assertIn("repository_scoped_findings", result["does_not_establish"])
         self.assertTrue(result["report_sha256"])
+        self.assertEqual(result["findings"][0]["id"], "uncertain_outcome")
+        self.assertEqual(result["findings"][0]["severity"], "critical")
+        self.assertEqual(result["recommendations"][0]["priority"], "critical")
+        self.assertEqual(
+            result["recommended_next_action"],
+            "read the exact target state and recovery evidence before any retry",
+        )
+        uncertain = next(
+            item for item in result["findings"] if item["id"] == "uncertain_outcome"
+        )
+        self.assertEqual(
+            uncertain["evidence_refs"], ["audit-record-sha256:uncertain"]
+        )
+        self.assertIn("safe_retry", uncertain["does_not_establish"])
+        transition = next(
+            item for item in result["findings"] if item["id"] == "transition_gap"
+        )
+        self.assertEqual(transition["severity"], "high")
+        self.assertIn("unmatched transition intents", transition["observation"])
+        self.assertEqual(
+            transition["recommended_action"],
+            "trace each unmatched intent and read the exact target state before retry",
+        )
+
+    def test_observed_contract_contradiction_becomes_ranked_finding(self) -> None:
+        def contradiction_audit_provider(**_kwargs) -> dict:
+            payload = audit_provider()
+            contradiction = next(
+                item
+                for item in payload["signal_projection"]["signals"]
+                if item["id"] == "contract_contradiction"
+            )
+            contradiction.update(
+                {
+                    "status": "observed",
+                    "severity": "high",
+                    "count": 3,
+                    "evidence_refs": ["audit-record-sha256:contradiction"],
+                    "recommended_action": "bind both surfaces before repair",
+                    "does_not_establish": [
+                        "root_cause",
+                        "automatic_contract_change_authority",
+                    ],
+                }
+            )
+            return payload
+
+        result = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            health_provider=health_provider,
+            audit_provider=contradiction_audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+        contradiction = next(
+            item
+            for item in result["findings"]
+            if item["id"] == "contract_contradiction"
+        )
+        self.assertEqual(contradiction["severity"], "high")
+        self.assertEqual(
+            contradiction["evidence_refs"],
+            ["audit-record-sha256:contradiction"],
+        )
+        self.assertEqual(
+            contradiction["recommended_action"], "bind both surfaces before repair"
+        )
+        self.assertIn(
+            "automatic_contract_change_authority",
+            contradiction["does_not_establish"],
+        )
 
     def test_report_uses_bounded_reclamation_and_retryability_attribution(self) -> None:
         def attributed_audit_provider(**_kwargs) -> dict:
