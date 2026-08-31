@@ -38,6 +38,7 @@ from mcp.types import ToolAnnotations
 import grabowski_mcp as base
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_executor
 import grabowski_job_origin as job_origin
 import grabowski_decision_reviews as decision_reviews
 import grabowski_merge_authority as merge_authority
@@ -4587,6 +4588,9 @@ def grabowski_terminal_run(
         opaque_command=True,
     )
     command = _validate_argv(argv, cwd=working_directory)
+    bureau_runtime_refresh_executor.reject_generic_runtime_refresh_execution(
+        command, surface="grabowski_terminal_run"
+    )
     timeout = SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
     output_limit = SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES
     _enforce_synchronous_call_shape(
@@ -4643,6 +4647,9 @@ def _start_job(
     """Start an already-authorized durable job."""
     working_directory = _resolve_cwd(cwd)
     command = _validate_argv(argv, cwd=working_directory)
+    bureau_runtime_refresh_executor.reject_generic_runtime_refresh_execution(
+        command, surface="grabowski_job_start"
+    )
     if (
         _reserved_runtime_deploy_command(command, working_directory)
         and not allow_reserved_runtime_deploy

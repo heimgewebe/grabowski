@@ -30,6 +30,7 @@ import grabowski_resources as resources
 import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_executor
 import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
 import grabowski_terminal_convergence as terminal_convergence
@@ -6958,9 +6959,36 @@ def grabowski_task_start(
     another process, even when no explicit operation identity was supplied.
     """
     target = fleet.fleet_host(host)
-    command = _validate_command(argv)
+    executor_request: dict[str, str] | None = None
+    executor_intent: dict[str, Any] | None = None
+    executor_authority_contract: dict[str, Any] | None = None
+    if bureau_runtime_refresh_executor.is_reserved_task_request(argv):
+        if target.get("transport") != "local" or target.get("target") != "local":
+            raise PermissionError("Bureau runtime-refresh executor requires the local fleet host")
+        if resume_policy != "never":
+            raise ValueError("Bureau runtime-refresh executor requires resume_policy=never")
+        if operation_identity is not None:
+            raise ValueError("Bureau runtime-refresh executor operation_identity is server-owned")
+        executor_request = bureau_runtime_refresh_executor.parse_reserved_task_request(argv)
+        executor_intent = bureau_runtime_refresh_executor.load_bound_intent(executor_request)
+        executor_authority_contract = (
+            bureau_runtime_refresh_executor.validate_authority_execution_contract(
+                executor_intent
+            )
+        )
+        command = bureau_runtime_refresh_executor.build_executor_command(
+            executor_request, runtime_python=GRABOWSKI_RUNTIME_PYTHON
+        )
+        command = _validate_command(command)
+    else:
+        command = _validate_command(argv)
+        bureau_runtime_refresh_executor.reject_generic_runtime_refresh_execution(
+            command, surface="grabowski_task_start"
+        )
     recovery_gate = _require_recovery_gate(command)
     working_directory = _validate_cwd(host, cwd)
+    if executor_request is not None and working_directory != str(operator.HOME):
+        raise ValueError("Bureau runtime-refresh executor requires cwd=/home/alex")
     command = _bind_grabowski_runtime_python(
         command,
         target=target,
@@ -6998,7 +7026,17 @@ def grabowski_task_start(
         )
     )
     normalized_operation_identity = _normalize_task_operation_identity(
-        operation_identity,
+        (
+            bureau_runtime_refresh_executor.operation_identity(
+                executor_request, executor_intent, executor_authority_contract
+            )
+            if (
+                executor_request is not None
+                and executor_intent is not None
+                and executor_authority_contract is not None
+            )
+            else operation_identity
+        ),
         cwd=working_directory,
     )
     task_id = uuid.uuid4().hex[:24]
