@@ -11,6 +11,8 @@ import shutil
 import stat
 from typing import Any, Sequence
 
+import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_executor
+
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -487,6 +489,9 @@ def run_public_fleet_host(
 ) -> dict[str, Any]:
     """Gate one generic fleet call with fixed server-owned sync limits."""
     command = _safe_argv(argv)
+    bureau_runtime_refresh_executor.reject_generic_runtime_refresh_execution(
+        command, surface=surface
+    )
     timeout = operator.SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
     output_limit = operator.SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES
     operator._enforce_synchronous_call_shape(

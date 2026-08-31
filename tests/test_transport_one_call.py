@@ -677,6 +677,216 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
         self.assertEqual(evidence["client_scope_kind"], "connector_capability")
 
+    def test_mcp_preserves_typed_signed_one_call_replay(self) -> None:
+        arguments = {"argv": ["true"]}
+        body = _tool_body(arguments)
+        signed = ingress.signed_tool_headers(
+            token=SECRET,
+            body=body,
+            session_id="session-typed-replay",
+            runtime_binding_sha256=_runtime_sha256(),
+            now_unix=int(__import__("time").time()),
+        )
+        headers = {
+            base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
+            base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+            base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+            base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                ingress.REQUEST_TIMESTAMP_HEADER
+            ],
+            base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                ingress.REQUEST_AUDIENCE_HEADER
+            ],
+            base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                ingress.REQUEST_BODY_SHA256_HEADER
+            ],
+            base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                ingress.RUNTIME_BINDING_SHA256_HEADER
+            ],
+            base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+        }
+        arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+        first = base._transport_signed_one_call_evidence(
+            _ctx(headers),
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=arguments_sha256,
+            runtime_binding=BINDING,
+        )
+        self.assertEqual(first["transport_mode"], assertion.ASSERTION_VERSION)
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            base._transport_signed_one_call_evidence(
+                _ctx(headers),
+                tool_name="grabowski_terminal_run",
+                arguments_sha256=arguments_sha256,
+                runtime_binding=BINDING,
+            )
+
+    def test_publisher_replay_recovery_preflight_requires_safe_state_store_preview(
+        self,
+    ) -> None:
+        preview = {
+            "kind": "bureau_task_publication_preview",
+            "status": "ready",
+            "effect_started": False,
+            "ambiguity": False,
+            "retryable": False,
+            "publication_mode": "state_store",
+            "task_id": "RAB-V1-T002K",
+            "proposal_sha256": "9" * 64,
+            "approval": {"allowed": True},
+        }
+        fake_intake = SimpleNamespace(
+            grabowski_bureau_task_publish_preview=mock.Mock(return_value=preview)
+        )
+        with mock.patch.dict(sys.modules, {"grabowski_bureau_intake": fake_intake}):
+            evidence = operator._signed_replay_recovery_preflight(
+                tool_name="grabowski_bureau_task_publish",
+                arguments={"proposal_id": "proposal-1"},
+            )
+        self.assertEqual(evidence["task_id"], "RAB-V1-T002K")
+        self.assertEqual(evidence["proposal_sha256"], "9" * 64)
+        self.assertRegex(evidence["preview_sha256"], r"^[0-9a-f]{64}$")
+
+        unsafe = dict(preview)
+        unsafe["ambiguity"] = True
+        fake_intake.grabowski_bureau_task_publish_preview.return_value = unsafe
+        with mock.patch.dict(sys.modules, {"grabowski_bureau_intake": fake_intake}):
+            self.assertIsNone(
+                operator._signed_replay_recovery_preflight(
+                    tool_name="grabowski_bureau_task_publish",
+                    arguments={"proposal_id": "proposal-1"},
+                )
+            )
+
+    def test_operator_recovers_publisher_replay_only_after_domain_preflight_and_exact_roundtrip(
+        self,
+    ) -> None:
+        arguments = {"proposal_id": "proposal-1"}
+        expected_arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        recovery = {
+            "transport_mode": "roundtrip-test",
+            "consumption_receipt_sha256": "a" * 64,
+        }
+        preflight = {
+            "kind": "grabowski_signed_replay_recovery_preflight",
+            "schema_version": 1,
+            "tool_name": "grabowski_bureau_task_publish",
+            "task_id": "RAB-V1-T002K",
+            "proposal_sha256": "9" * 64,
+            "publication_mode": "state_store",
+            "preview_sha256": "8" * 64,
+        }
+        with (
+            mock.patch.object(
+                base,
+                "_transport_signed_one_call_evidence",
+                side_effect=assertion.TransportAssertionReplay(
+                    "signed one-call transport request was already consumed"
+                ),
+            ),
+            mock.patch.object(
+                operator, "_signed_replay_recovery_preflight", return_value=preflight
+            ) as domain_preflight,
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SCOPE
+            ),
+            mock.patch.object(
+                roundtrip, "consume_verified", return_value=recovery
+            ) as consume_verified,
+            mock.patch.object(roundtrip, "begin") as begin,
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_bureau_task_publish",
+                arguments=arguments,
+                context=_ctx({}),
+                tool=tool,
+            )
+        domain_preflight.assert_called_once_with(
+            tool_name="grabowski_bureau_task_publish", arguments=arguments
+        )
+        consume_verified.assert_called_once_with(
+            client_scope=SCOPE,
+            runtime_binding=BINDING,
+            tool_name="grabowski_bureau_task_publish",
+            arguments_sha256=expected_arguments_sha256,
+        )
+        begin.assert_not_called()
+        self.assertTrue(evidence["signed_one_call_replay_recovery"])
+        self.assertEqual(
+            evidence["recovery_basis"],
+            "domain_reconciled_preverified_exact_roundtrip",
+        )
+        self.assertEqual(evidence["recovery_preflight"], preflight)
+
+    def test_operator_generic_signed_replay_cannot_use_roundtrip_recovery(self) -> None:
+        arguments = {"argv": ["true"]}
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        replay_message = "signed one-call transport request was already consumed"
+        with (
+            mock.patch.object(
+                base,
+                "_transport_signed_one_call_evidence",
+                side_effect=assertion.TransportAssertionReplay(replay_message),
+            ),
+            mock.patch.object(
+                operator, "_signed_replay_recovery_preflight", return_value=None
+            ) as domain_preflight,
+            mock.patch.object(roundtrip, "consume_verified") as consume_verified,
+            mock.patch.object(roundtrip, "begin") as begin,
+        ):
+            with self.assertRaisesRegex(RuntimeError, replay_message):
+                operator._require_transport_roundtrip_for_tool(
+                    tool_name="grabowski_terminal_run",
+                    arguments=arguments,
+                    context=_ctx({}),
+                    tool=tool,
+                )
+        domain_preflight.assert_called_once_with(
+            tool_name="grabowski_terminal_run", arguments=arguments
+        )
+        consume_verified.assert_not_called()
+        begin.assert_not_called()
+
+    def test_operator_publisher_replay_remains_blocked_without_preverified_roundtrip(
+        self,
+    ) -> None:
+        arguments = {"proposal_id": "proposal-1"}
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        replay_message = "signed one-call transport request was already consumed"
+        with (
+            mock.patch.object(
+                base,
+                "_transport_signed_one_call_evidence",
+                side_effect=assertion.TransportAssertionReplay(replay_message),
+            ),
+            mock.patch.object(
+                operator,
+                "_signed_replay_recovery_preflight",
+                return_value={"kind": "safe-domain-preview"},
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SCOPE
+            ),
+            mock.patch.object(
+                roundtrip,
+                "consume_verified",
+                side_effect=roundtrip.TransportRoundtripRequired(
+                    "fresh verification required"
+                ),
+            ) as consume_verified,
+            mock.patch.object(roundtrip, "begin") as begin,
+        ):
+            with self.assertRaisesRegex(RuntimeError, replay_message):
+                operator._require_transport_roundtrip_for_tool(
+                    tool_name="grabowski_bureau_task_publish",
+                    arguments=arguments,
+                    context=_ctx({}),
+                    tool=tool,
+                )
+        consume_verified.assert_called_once()
+        begin.assert_not_called()
+
     def test_stale_serving_process_blocks_before_signed_assertion_consumption(
         self,
     ) -> None:
