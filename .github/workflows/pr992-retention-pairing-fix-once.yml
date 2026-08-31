@@ -1,0 +1,48 @@
+name: pr992 retention pairing fix once
+
+on:
+  push:
+    branches:
+      - 'bureau/grabowski-operator-surface-v1-fu-retention-completion-audit-reconciliation-20260829/5a178685ce'
+    paths:
+      - '.github/workflows/pr992-retention-pairing-fix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact bootstrap commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Apply exact preimage-bound fix and regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "12de66cbecee1578dd8034208036d54182645086"
+          test "$(git hash-object src/grabowski_audit_signal.py)" = "188fc3c4b0d5212257cd813da68ae237fea8f9c2"
+          test "$(git hash-object tools/maintain_runtime_state.py)" = "965f3388819c55dbcd6073576e90d1ffa29227e8"
+          test ! -e tests/test_pr992_retention_receipt_pairing.py
+
+          python .github/pr992_retention_pairing_fix.py
+          python -m unittest discover -s tests -p 'test_pr992_retention_receipt_pairing.py'
+          python -m unittest discover -s tests -p 'test_audit_signal_retention_identity.py'
+          python -m unittest discover -s tests -p 'test_runtime_retention.py'
+          git diff --check
+
+          git rm .github/pr992_retention_pairing_fix.py .github/workflows/pr992-retention-pairing-fix-once.yml
+          git config user.name "grabowski-pr992-fix"
+          git config user.email "grabowski-pr992-fix@users.noreply.github.com"
+          git add src/grabowski_audit_signal.py tools/maintain_runtime_state.py tests/test_pr992_retention_receipt_pairing.py
+          git commit -m "fix(audit): bind one retention receipt to one intent"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
