@@ -542,6 +542,7 @@ PLAN_KIND = "OperatorSagaPlan.v1"
 RUN_KIND = "OperatorSagaRunReceipt.v1"
 SETTLEMENT_KIND = "OperatorSagaSettlementReceipt.v1"
 CAPTAIN_AUDIT_BINDING_KIND = "VerifiedCaptainAuditBinding.v1"
+CAPTAIN_AUDIT_RESULT_REF_KIND = "VerifiedCaptainAuditResultRef.v1"
 SAGA_KINDS = frozenset({"pr-settlement", "runtime-deployment"})
 PHASES = ("prepare", "plan", "apply", "readback", "settle")
 SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -1060,6 +1061,163 @@ def _child_semantically_ready(
     )
 
 
+def is_captain_audit_result_ref(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("kind") == CAPTAIN_AUDIT_RESULT_REF_KIND
+    )
+
+
+def validate_captain_audit_result_ref(value: Any) -> dict[str, Any]:
+    ref = _bounded_mapping(value, "captain_result")
+    required = {
+        "schema_version",
+        "kind",
+        "completion_record_sha256",
+    }
+    if set(ref) != required:
+        raise SagaError("captain_result audit reference shape is not canonical")
+    if ref.get("schema_version") != SCHEMA_VERSION:
+        raise SagaError("captain_result audit reference schema is unsupported")
+    if ref.get("kind") != CAPTAIN_AUDIT_RESULT_REF_KIND:
+        raise SagaError("captain_result audit reference kind is invalid")
+    _sha256(
+        ref.get("completion_record_sha256"),
+        "captain_result.completion_record_sha256",
+    )
+    return ref
+
+
+def _verified_captain_audit_record(
+    record_sha256: str,
+    *,
+    snapshot: Any,
+    audit_query_module: Any,
+) -> dict[str, Any]:
+    wanted = _sha256(record_sha256, "Captain audit record SHA-256")
+    needle = f'"record_sha256":"{wanted}"'.encode("ascii")
+    for segment in reversed(snapshot.segments):
+        try:
+            data = (
+                segment.captured_data
+                if segment.captured_data is not None
+                else audit_query_module._load_snapshot_segment(segment)
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise SagaError(
+                f"verified Captain audit segment unavailable: {type(exc).__name__}"
+            ) from exc
+        if needle not in data:
+            continue
+        for raw_line in reversed(data.splitlines()):
+            if needle not in raw_line:
+                continue
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise SagaError("verified Captain audit record is not valid JSON") from exc
+            if isinstance(record, dict) and record.get("record_sha256") == wanted:
+                return record
+    raise SagaError(
+        f"Captain audit record is absent from the verified audit chain: {wanted}"
+    )
+
+
+def _verified_captain_audit_reference_identity(
+    plan: dict[str, Any], audit_ref: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        import grabowski_audit_query
+
+        snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        raise SagaError(
+            f"verified Captain audit snapshot unavailable: {type(exc).__name__}"
+        ) from exc
+
+    completion_sha = _sha256(
+        audit_ref.get("completion_record_sha256"),
+        "captain_result.completion_record_sha256",
+    )
+    completion = _verified_captain_audit_record(
+        completion_sha, snapshot=snapshot, audit_query_module=grabowski_audit_query
+    )
+    intent_sha = _sha256(
+        completion.get("intent_audit_sha256"),
+        "Captain audit completion.intent_audit_sha256",
+    )
+    intent = _verified_captain_audit_record(
+        intent_sha, snapshot=snapshot, audit_query_module=grabowski_audit_query
+    )
+
+    expected_identity = plan["expected_identity"]
+    expected_base = (
+        expected_identity.get("base") if plan["saga_kind"] == "pr-settlement" else None
+    )
+    expected_base_sha = (
+        expected_identity.get("expected_base_sha")
+        if plan["saga_kind"] == "pr-settlement"
+        else None
+    )
+    expected_common = {
+        "kind": "grabowski_captain_run_audit",
+        "action": plan["captain_handoff"]["action"],
+        "target_sha256": sha256_json(plan["captain_handoff"]["target"]),
+        "expected_head": expected_identity["expected_head"],
+        "expected_base": expected_base,
+        "expected_base_sha": expected_base_sha,
+    }
+    for phase, record in (("intent", intent), ("completion", completion)):
+        if (
+            record.get("operation") != f"captain-run-audit-{phase}"
+            or record.get("phase") != phase
+        ):
+            raise SagaError(f"Captain audit {phase} record has the wrong operation")
+        drift = [
+            key for key, expected in expected_common.items()
+            if record.get(key) != expected
+        ]
+        if drift:
+            raise SagaError(
+                f"Captain audit {phase} differs from saga plan: " + ", ".join(drift)
+            )
+    if completion.get("intent_audit_sha256") != intent_sha:
+        raise SagaError("Captain audit completion is not bound to its intent")
+    for field in ("actor_id", "context_sha256", "request_sha256"):
+        if completion.get(field) != intent.get(field):
+            raise SagaError(f"Captain audit {field} changed between intent and completion")
+
+    execution_result = completion.get("execution_result")
+    if not isinstance(execution_result, dict):
+        raise SagaError("Captain audit completion lacks execution result binding")
+    if completion.get("execution_result_sha256") != sha256_json(execution_result):
+        raise SagaError("Captain audit execution result digest mismatch")
+    if set(execution_result) != {"status", "receipt_sha256", "output_sha256"}:
+        raise SagaError("Captain audit reference execution result shape is not canonical")
+    if execution_result.get("status") != "passed":
+        raise SagaError("Captain audit reference requires a passed Captain result")
+    receipt_sha = _sha256(
+        execution_result.get("receipt_sha256"),
+        "Captain audit execution_result.receipt_sha256",
+    )
+    output_sha = _sha256(
+        execution_result.get("output_sha256"),
+        "Captain audit execution_result.output_sha256",
+    )
+    return {
+        "intent_record_sha256": intent_sha,
+        "completion_record_sha256": completion_sha,
+        "action": expected_common["action"],
+        "target_sha256": expected_common["target_sha256"],
+        "expected_head": expected_common["expected_head"],
+        "expected_base": expected_base,
+        "expected_base_sha": expected_base_sha,
+        "receipt_sha256": receipt_sha,
+        "output_sha256": output_sha,
+        "status": "passed",
+    }
+
+
 def _validate_mechanic_result(
     plan: dict[str, Any],
     mechanic_result: Any,
@@ -1312,12 +1470,25 @@ def validate_captain_audit_binding(
     plan = validate_plan(plan_value)
     captain = _bounded_mapping(captain_result_value, "captain_result")
     receipt_hasher = receipt_sha256_json or sha256_json
-    receipt, _output = _validate_grip_result(
-        captain,
-        expected_grip="captain-run",
-        field="captain_result",
-        receipt_sha256_json=receipt_hasher,
+    audit_ref = (
+        validate_captain_audit_result_ref(captain)
+        if is_captain_audit_result_ref(captain)
+        else None
     )
+    receipt = None
+    trusted_audit_identity = None
+    if audit_ref is None:
+        receipt, _output = _validate_grip_result(
+            captain,
+            expected_grip="captain-run",
+            field="captain_result",
+            receipt_sha256_json=receipt_hasher,
+        )
+    else:
+        trusted_audit_identity = _verified_captain_audit_reference_identity(
+            plan, audit_ref
+        )
+
     binding = _bounded_mapping(value, "captain_audit_binding")
     required = {
         "schema_version", "kind", "authority", "intent_record_sha256",
@@ -1333,29 +1504,54 @@ def validate_captain_audit_binding(
         or binding.get("authority") != "verified_grabowski_audit_chain"
     ):
         raise SagaError("captain_audit_binding authority is invalid")
+
     binding_sha = _sha256(
         binding.get("binding_sha256"), "captain_audit_binding.binding_sha256"
     )
-    if binding_sha != receipt_hasher(
+    binding_hasher = sha256_json if audit_ref is not None else receipt_hasher
+    if binding_sha != binding_hasher(
         {key: item for key, item in binding.items() if key != "binding_sha256"}
     ):
         raise SagaError("captain_audit_binding digest mismatch")
-    _sha256(binding.get("intent_record_sha256"), "captain_audit_binding.intent_record_sha256")
-    _sha256(binding.get("completion_record_sha256"), "captain_audit_binding.completion_record_sha256")
-    expected_identity = plan["expected_identity"]
-    expected_base = expected_identity.get("base") if plan["saga_kind"] == "pr-settlement" else None
-    expected_base_sha = expected_identity.get("expected_base_sha") if plan["saga_kind"] == "pr-settlement" else None
-    expected_values = {
-        "action": plan["captain_handoff"]["action"],
-        "target_sha256": receipt_hasher(plan["captain_handoff"]["target"]),
-        "expected_head": expected_identity["expected_head"],
-        "expected_base": expected_base,
-        "expected_base_sha": expected_base_sha,
-        "receipt_sha256": receipt["receipt_sha256"],
-        "output_sha256": receipt["output_sha256"],
-        "status": receipt["status"],
-    }
-    drift = [key for key, expected in expected_values.items() if binding.get(key) != expected]
+    _sha256(
+        binding.get("intent_record_sha256"),
+        "captain_audit_binding.intent_record_sha256",
+    )
+    _sha256(
+        binding.get("completion_record_sha256"),
+        "captain_audit_binding.completion_record_sha256",
+    )
+
+    if trusted_audit_identity is not None:
+        expected_values = trusted_audit_identity
+    else:
+        assert receipt is not None
+        expected_identity = plan["expected_identity"]
+        expected_base = (
+            expected_identity.get("base")
+            if plan["saga_kind"] == "pr-settlement"
+            else None
+        )
+        expected_base_sha = (
+            expected_identity.get("expected_base_sha")
+            if plan["saga_kind"] == "pr-settlement"
+            else None
+        )
+        expected_values = {
+            "action": plan["captain_handoff"]["action"],
+            "target_sha256": receipt_hasher(plan["captain_handoff"]["target"]),
+            "expected_head": expected_identity["expected_head"],
+            "expected_base": expected_base,
+            "expected_base_sha": expected_base_sha,
+            "receipt_sha256": receipt["receipt_sha256"],
+            "output_sha256": receipt["output_sha256"],
+            "status": receipt["status"],
+        }
+
+    drift = [
+        key for key, expected in expected_values.items()
+        if binding.get(key) != expected
+    ]
     if drift:
         raise SagaError(
             "captain_audit_binding differs from saga/Captain evidence: "
@@ -1424,11 +1620,25 @@ def settle(
     readback = _bounded_mapping(readback_value, "readback")
     if run.get("captain_ready") is not True or run.get("state") != "captain_required":
         raise SagaError("blocked saga run cannot be settled as an applied saga")
-    captain_state, execution, captain_reason, captain_receipt_sha256 = _captain_outcome(
-        captain,
-        plan=plan,
-        receipt_sha256_json=receipt_sha256_json,
-    )
+    if is_captain_audit_result_ref(captain):
+        captain_state = "verified"
+        execution = {
+            "source": "verified_grabowski_audit_chain",
+            "completion_record_sha256": captain_audit_binding[
+                "completion_record_sha256"
+            ],
+            "receipt_sha256": captain_audit_binding["receipt_sha256"],
+            "output_sha256": captain_audit_binding["output_sha256"],
+            "status": captain_audit_binding["status"],
+        }
+        captain_reason = None
+        captain_receipt_sha256 = captain_audit_binding["receipt_sha256"]
+    else:
+        captain_state, execution, captain_reason, captain_receipt_sha256 = _captain_outcome(
+            captain,
+            plan=plan,
+            receipt_sha256_json=receipt_sha256_json,
+        )
     if captain_state == "blocked":
         state = "apply_blocked"
         reasons = [f"captain_blocked:{captain_reason}"]
