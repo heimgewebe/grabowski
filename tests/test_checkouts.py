@@ -1316,8 +1316,8 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(linked["hygiene_mark"], "archived")
         self.assertFalse(linked["cleanup_candidate"])
         decision = linked["lifecycle_decision"]
-        self.assertEqual(decision["archive_grace_seconds"], 24 * 60 * 60)
-        self.assertFalse(decision["archive_grace_elapsed"])
+        self.assertEqual(decision["archive_grace_seconds"], 0)
+        self.assertTrue(decision["archive_grace_elapsed"])
         self.assertFalse(decision["requires_cleanup_dry_run"])
         self.assertEqual(
             linked["lifecycle"]["latest_archive"]["archive_id"],
@@ -1337,13 +1337,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
             expected_branch="topic",
         )
         self.assertFalse(dry_run["plan"]["safe_to_apply"])
-        self.assertEqual(
-            dry_run["plan"]["archive_grace_seconds"],
-            24 * 60 * 60,
-        )
-        self.assertFalse(dry_run["plan"]["archive_grace_elapsed"])
+        self.assertEqual(dry_run["plan"]["archive_grace_seconds"], 0)
+        self.assertTrue(dry_run["plan"]["archive_grace_elapsed"])
         self.assertIn("active_retention_not_elapsed", dry_run["plan"]["cleanup_blockers"])
-        self.assertIn("archive_grace_not_elapsed", dry_run["plan"]["cleanup_blockers"])
+        self.assertNotIn("archive_grace_not_elapsed", dry_run["plan"]["cleanup_blockers"])
 
     def test_cleanup_accepts_exact_merged_github_pull_head_ref(self) -> None:
         self._git(
@@ -2272,8 +2269,8 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(linked["lifecycle_state"], "archived_retained")
         self.assertEqual(decision["binding_phase"], "archived")
         self.assertTrue(decision["binding_consistent"])
-        self.assertFalse(decision["archive_grace_elapsed"])
-        self.assertEqual(decision["archive_grace_seconds"], 24 * 60 * 60)
+        self.assertTrue(decision["archive_grace_elapsed"])
+        self.assertEqual(decision["archive_grace_seconds"], 0)
         self.assertFalse(linked["cleanup_candidate"])
 
     def test_unknown_managed_phase_is_lifecycle_drift(self) -> None:
