@@ -32,6 +32,7 @@ INTENT_MUTATION_ROOT_FIELDS = (
     "runtime_user_unit_dir",
     "state_root",
 )
+ABSENCE_TOLERANT_INTENT_MUTATION_ROOT_FIELDS = frozenset({"runtime_user_unit_dir"})
 AUTHORITY_MUTATION_ROOT_FIELD = "authority_state_store.state_root"
 EXECUTOR_TASK_ID_ENV = "GRABOWSKI_BUREAU_RUNTIME_REFRESH_TASK_ID"
 EXECUTOR_TASK_UNIT_ENV = "GRABOWSKI_BUREAU_RUNTIME_REFRESH_TASK_UNIT"
@@ -52,9 +53,19 @@ EXPECTED_RUNTIME_EXECUTION_CONTEXT = {
     "resume_policy": "never",
     "writability_evidence": ["findmnt", "statvfs", "os.access"],
     "required_writable_intent_roots": [
-        *INTENT_MUTATION_ROOT_FIELDS,
+        *[
+            field
+            for field in INTENT_MUTATION_ROOT_FIELDS
+            if field not in ABSENCE_TOLERANT_INTENT_MUTATION_ROOT_FIELDS
+        ],
         AUTHORITY_MUTATION_ROOT_FIELD,
     ],
+    "absence_tolerant_intent_roots": {
+        "runtime_user_unit_dir": {
+            "when_present": "writable-searchable-rw-directory",
+            "when_absent": "writable-searchable-rw-direct-parent",
+        }
+    },
     "directory_access": ["W_OK", "X_OK"],
     "task_identity_evidence": "server-injected-task-id-and-systemd-unit-v1",
     "forbid_generic_surfaces": [
@@ -607,13 +618,49 @@ def _probe_writable_directory(field: str, path: Path) -> dict[str, Any]:
     return evidence
 
 
+def _probe_mutation_root(field: str, path: Path) -> dict[str, Any]:
+    if field not in ABSENCE_TOLERANT_INTENT_MUTATION_ROOT_FIELDS:
+        return _probe_writable_directory(field, path)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        parent = path.parent
+        parent_evidence = _probe_writable_directory(f"{field}.parent", parent)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return {
+                "field": field,
+                "path": str(path),
+                "is_directory": False,
+                "absent": True,
+                "absence_allowed": True,
+                "writability_basis": "direct_parent",
+                "parent": parent_evidence,
+                "writable": parent_evidence["writable"] is True,
+            }
+        except OSError as exc:
+            raise BureauRuntimeRefreshExecutorError(
+                f"runtime mutation root {field} writability is unobservable"
+            ) from exc
+    except OSError as exc:
+        raise BureauRuntimeRefreshExecutorError(
+            f"runtime mutation root {field} writability is unobservable"
+        ) from exc
+    evidence = _probe_writable_directory(field, path)
+    evidence["absent"] = False
+    evidence["absence_allowed"] = True
+    evidence["writability_basis"] = "self"
+    return evidence
+
+
 def execution_context_preflight(
     request: dict[str, str], intent: dict[str, Any], authority_contract: dict[str, Any]
 ) -> dict[str, Any]:
     task_identity = current_task_identity()
     roots = _intent_mutation_roots(intent)
     root_evidence = {
-        field: _probe_writable_directory(field, path)
+        field: _probe_mutation_root(field, path)
         for field, path in roots.items()
     }
     evidence = {
