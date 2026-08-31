@@ -2653,6 +2653,8 @@ class GripFoundationTests(unittest.TestCase):
             grips._saga_captain_audit_binding(plan, ref)
 
     def test_saga_settle_accepts_verified_captain_audit_reference(self) -> None:
+        import grabowski_audit_query
+
         target = {
             "repository_path": str(Path(__file__).resolve().parents[1]),
             "repository": "heimgewebe/grabowski",
@@ -2662,7 +2664,16 @@ class GripFoundationTests(unittest.TestCase):
         }
         plan = sagas.build_plan("runtime-deployment", target, "t121-audit-ref-settle")
         run = _saga_run_stub(plan)
-        _intent_sha, completion_sha, _intent, _completion, ref = _saga_audit_records(plan)
+        intent_sha, completion_sha, intent, completion, ref = _saga_audit_records(plan)
+        payload = (
+            json.dumps(intent, separators=(",", ":"))
+            + "\n"
+            + json.dumps(completion, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        snapshot = types.SimpleNamespace(
+            segments=(types.SimpleNamespace(captured_data=payload),)
+        )
         readback = {
             "identity": {"repo_head": "a" * 40, "completion_status": "complete"},
             "integrity": {"manifest_schema_valid": True},
@@ -2671,15 +2682,21 @@ class GripFoundationTests(unittest.TestCase):
                 "serves_deployed_release": True,
             },
         }
-        settlement = sagas.settle(
-            plan_value=plan,
-            run_receipt_value=run,
-            captain_result_value=ref,
-            captain_audit_binding_value=_saga_audit_binding_stub(plan, completion_sha),
-            readback_value=readback,
-            receipt_sha256_json=grips.sha256_json,
-        )
+        with patch.object(
+            grabowski_audit_query,
+            "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ):
+            settlement = sagas.settle(
+                plan_value=plan,
+                run_receipt_value=run,
+                captain_result_value=ref,
+                captain_audit_binding_value=_saga_audit_binding_stub(plan, completion_sha),
+                readback_value=readback,
+                receipt_sha256_json=grips.sha256_json,
+            )
         self.assertEqual("settled", settlement["state"])
+        self.assertEqual(intent_sha, settlement["captain_audit_intent_record_sha256"])
         self.assertEqual("1" * 64, settlement["captain_receipt_sha256"])
         self.assertEqual(
             "verified_grabowski_audit_chain",
