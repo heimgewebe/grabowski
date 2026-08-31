@@ -261,6 +261,7 @@ def _audit_transition_gap_signal(
     historical_unmatched: dict[
         tuple[str, int, str], tuple[str, dict[str, Any], int]
     ] = {}
+    consumed_retention_receipts: dict[str, tuple[str, int, str]] = {}
     completed_counts: Counter[str] = Counter()
     reconciled_counts: Counter[str] = Counter()
     reconciled_records: list[dict[str, Any]] = []
@@ -296,18 +297,21 @@ def _audit_transition_gap_signal(
             historical_open_keys_by_identity.pop(key[:2], None)
         return True
 
-    def _pop_latest_historical_open(
+    def _peek_latest_historical_open(
         identity: tuple[str, int],
     ) -> tuple[str, int, str] | None:
         keys = historical_open_keys_by_identity.get(identity)
-        if not keys:
-            return None
-        # Dict insertion order is the verified audit order of the intent records,
-        # so a completion consumes exactly the latest still-open historical intent.
-        key = next(reversed(keys))
-        if not _pop_historical_open(key):
-            raise RuntimeError("historical retention open-index drift")
-        return key
+        return next(reversed(keys)) if keys else None
+
+    def _latest_open_retention_key(
+        identity: tuple[str, int],
+    ) -> tuple[str, int, str] | None:
+        # In-window intents necessarily follow historical intents in verified
+        # audit order, so prefer their ordered index when one exists.
+        pending_keys = pending_retention_keys_by_identity.get(identity)
+        if pending_keys:
+            return next(reversed(pending_keys))
+        return _peek_latest_historical_open(identity)
 
     def _remember_historical_unmatched(
         key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
@@ -322,6 +326,25 @@ def _audit_transition_gap_signal(
         key: tuple[str, int, str]
     ) -> tuple[str, dict[str, Any], int] | None:
         return historical_unmatched.pop(key, None)
+
+    def _receipt_consumed(record: dict[str, Any]) -> bool:
+        receipt_sha256 = record.get("receipt_sha256")
+        return bool(
+            _audit_sha256_valid(receipt_sha256)
+            and receipt_sha256 in consumed_retention_receipts
+        )
+
+    def _claim_receipt(
+        record: dict[str, Any], key: tuple[str, int, str]
+    ) -> bool:
+        receipt_sha256 = record.get("receipt_sha256")
+        if not _audit_sha256_valid(receipt_sha256):
+            return True
+        existing = consumed_retention_receipts.get(receipt_sha256)
+        if existing is not None:
+            return existing == key
+        consumed_retention_receipts[receipt_sha256] = key
+        return True
 
     for record, timestamp_unix in prepared_records:
         if timestamp_unix is None or timestamp_unix > end_unix:
@@ -339,9 +362,13 @@ def _audit_transition_gap_signal(
                     _remember_historical_open(key)
             elif operation == retention_pair[1]:
                 identity = _retention_transition_identity(record)
-                if identity is not None:
-                    completed_key = _pop_latest_historical_open(identity)
-                    if completed_key is not None:
+                if identity is not None and not _receipt_consumed(record):
+                    completed_key = _peek_latest_historical_open(identity)
+                    if completed_key is not None and _claim_receipt(
+                        record, completed_key
+                    ):
+                        _pop_historical_open(completed_key)
+                        _pop_historical_unmatched(completed_key)
                         historical_completed_keys.add(completed_key)
             elif operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
                 target_key = _retention_reconciliation_target_key(record)
@@ -349,6 +376,10 @@ def _audit_transition_gap_signal(
                     target_key in historical_retention_intents
                     and _retention_reconciliation_record_valid(record)
                     and target_key not in historical_completed_keys
+                    and target_key
+                    == _latest_open_retention_key(target_key[:2])
+                    and not _receipt_consumed(record)
+                    and _claim_receipt(record, target_key)
                     and _pop_historical_open(target_key)
                 ):
                     historical_reconciled_keys.add(target_key)
@@ -366,11 +397,18 @@ def _audit_transition_gap_signal(
         if operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
             target_key = _retention_reconciliation_target_key(record)
             if target_key is not None and target_key in pending_retention:
-                if _retention_reconciliation_record_valid(record):
+                if (
+                    _retention_reconciliation_record_valid(record)
+                    and target_key
+                    == _latest_open_retention_key(target_key[:2])
+                    and not _receipt_consumed(record)
+                    and _claim_receipt(record, target_key)
+                ):
                     _pop_pending_retention(target_key)
                     reconciled_counts[retention_pair[0]] += 1
                     reconciled_records.append(record)
-                # Invalid evidence leaves the indexed in-window intent pending/HIGH.
+                # Invalid or ambiguously ordered evidence leaves the exact
+                # in-window intent pending/HIGH.
                 continue
 
             intent_record_sha256 = record.get("intent_record_sha256")
@@ -390,6 +428,10 @@ def _audit_transition_gap_signal(
             if (
                 target_key == historical_key
                 and _retention_reconciliation_record_valid(record)
+                and historical_key
+                == _latest_open_retention_key(historical_key[:2])
+                and not _receipt_consumed(record)
+                and _claim_receipt(record, historical_key)
             ):
                 _pop_historical_unmatched(historical_key)
                 _pop_historical_open(historical_key)
@@ -398,8 +440,9 @@ def _audit_transition_gap_signal(
                 reconciled_records.append(record)
             else:
                 # Resolve the referenced historical intent by its immutable digest
-                # before trusting the reconciliation's claimed plan/attempt.  A
-                # mismatched or malformed identity therefore stays visible as HIGH.
+                # before trusting the reconciliation's claimed plan/attempt or
+                # receipt. Ambiguous identity order and receipt reuse therefore
+                # remain visible as HIGH execution gaps.
                 _remember_historical_unmatched(
                     historical_key,
                     historical_record,
@@ -414,14 +457,15 @@ def _audit_transition_gap_signal(
             identity = _retention_transition_identity(record)
             matched = False
             if completion_fields_present:
-                if identity is not None:
-                    keys = pending_retention_keys_by_identity.get(identity, {})
-                    if keys:
-                        # Dict insertion order is verified audit order. Membership and
-                        # exact removal stay O(1), while reversed(keys) selects the
-                        # most recent preceding duplicate deterministically.
-                        latest_key = next(reversed(keys))
-                        _pop_pending_retention(latest_key)
+                if identity is not None and not _receipt_consumed(record):
+                    latest_key = _latest_open_retention_key(identity)
+                    if latest_key is not None and _claim_receipt(record, latest_key):
+                        if latest_key in pending_retention:
+                            _pop_pending_retention(latest_key)
+                        else:
+                            _pop_historical_open(latest_key)
+                            _pop_historical_unmatched(latest_key)
+                            historical_completed_keys.add(latest_key)
                         matched = True
             else:
                 match_index = _audit_transition_match_index(
@@ -432,15 +476,6 @@ def _audit_transition_gap_signal(
                     matched = True
             if matched:
                 completed_counts[retention_pair[0]] += 1
-            if identity is not None and not matched:
-                # One completion can resolve at most one intent.  Prefer a matching
-                # in-window pending intent; only when none matched may it close one
-                # still-open historical intent of the same identity.
-                historical_key = _pop_latest_historical_open(identity)
-                if historical_key is not None:
-                    _pop_historical_unmatched(historical_key)
-                    historical_completed_keys.add(historical_key)
-                    completed_counts[retention_pair[0]] += 1
             continue
 
         for intent, completion in AUDIT_TRANSITION_PAIRS:
@@ -540,13 +575,14 @@ def _audit_transition_gap_signal(
             ),
             "pairing_semantics": (
                 "retention identities are indexed by (plan_sha256, attempt, "
-                "intent_record_sha256); append-only reconciliations resolve only that "
-                "exact indexed intent; an in-window reconciliation may reference an "
-                "older verified intent outside the reporting window only while that "
-                "exact intent remains open after preceding completions and reconciliations; "
-                "invalid current reconciliation evidence keeps that exact historical intent "
-                "visible as an execution_gap; records with both identity fields absent "
-                "retain legacy FIFO behavior; other transition families use FIFO"
+                "intent_record_sha256); completions and reconciliations consume "
+                "exactly the latest still-open intent in verified audit order; "
+                "a valid terminal receipt may be consumed at most once; "
+                "append-only reconciliations still bind the exact indexed intent; "
+                "invalid, ambiguously ordered, or receipt-reusing reconciliation "
+                "evidence keeps the affected intent visible as an execution_gap; "
+                "records with both identity fields absent retain legacy FIFO behavior; "
+                "other transition families use FIFO"
             ),
         },
         does_not_establish=[
