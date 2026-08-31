@@ -27,6 +27,8 @@ MAIN_SHA = "c" * 40
 TASK_ID = "BUREAU-RUNTIME-REFRESH-TEST"
 LEASE_OWNER = "runtime-refresh:test-executor"
 AUTH_SHA = "e" * 64
+GRABOWSKI_TASK_ID = "1" * 24
+GRABOWSKI_TASK_UNIT = f"grabowski-task-{GRABOWSKI_TASK_ID}-a1.service"
 
 
 def _intent_payload() -> dict[str, object]:
@@ -54,7 +56,14 @@ def _preflight_intent(root: str) -> dict[str, object]:
     intent = _intent_payload()
     for field in executor.INTENT_MUTATION_ROOT_FIELDS:
         intent[field] = root
+    authority = dict(intent["authority_state_store"])
+    authority["state_root"] = root
+    intent["authority_state_store"] = authority
     return intent
+
+
+def _task_environment() -> dict[str, str]:
+    return executor.task_identity_environment(GRABOWSKI_TASK_ID, GRABOWSKI_TASK_UNIT)
 
 
 def _authority_contract() -> dict[str, object]:
@@ -271,6 +280,7 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             intent = _preflight_intent(directory)
             with (
+                patch.dict(os.environ, _task_environment(), clear=False),
                 patch.object(
                     executor.os, "statvfs", lambda _path: SimpleNamespace(f_flag=os.ST_RDONLY)
                 ),
@@ -311,6 +321,7 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
                 return mode == os.W_OK
 
             with (
+                patch.dict(os.environ, _task_environment(), clear=False),
                 patch.object(executor.os, "statvfs", lambda _path: SimpleNamespace(f_flag=0)),
                 patch.object(executor.os, "access", access),
                 patch.object(
@@ -341,6 +352,7 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             intent = _preflight_intent(directory)
             with (
+                patch.dict(os.environ, _task_environment(), clear=False),
                 patch.object(executor.os, "statvfs", lambda _path: SimpleNamespace(f_flag=0)),
                 patch.object(executor.os, "access", lambda _path, _mode: True),
                 patch.object(
@@ -368,10 +380,12 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
                 )
         self.assertTrue(evidence["writable"])
         self.assertEqual(
-            set(executor.INTENT_MUTATION_ROOT_FIELDS),
+            {*executor.INTENT_MUTATION_ROOT_FIELDS, executor.AUTHORITY_MUTATION_ROOT_FIELD},
             set(evidence["mutation_roots"]),
         )
-        for field in executor.INTENT_MUTATION_ROOT_FIELDS:
+        self.assertEqual(GRABOWSKI_TASK_ID, evidence["task_identity"]["task_id"])
+        self.assertEqual(GRABOWSKI_TASK_UNIT, evidence["task_identity"]["systemd_unit"])
+        for field in (*executor.INTENT_MUTATION_ROOT_FIELDS, executor.AUTHORITY_MUTATION_ROOT_FIELD):
             item = evidence["mutation_roots"][field]
             self.assertTrue(item["is_directory"])
             self.assertTrue(item["mount_rw"])
@@ -422,6 +436,45 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
                     "SHA-256 does not match payload",
                 ):
                     executor.load_bound_intent(request)
+
+    def test_task_identity_is_server_injected_and_bound_into_launch(self) -> None:
+        environment = _task_environment()
+        self.assertEqual(GRABOWSKI_TASK_ID, environment[executor.EXECUTOR_TASK_ID_ENV])
+        self.assertEqual(GRABOWSKI_TASK_UNIT, environment[executor.EXECUTOR_TASK_UNIT_ENV])
+        with patch.dict(os.environ, environment, clear=False):
+            identity = executor.current_task_identity()
+        self.assertEqual(GRABOWSKI_TASK_ID, identity["task_id"])
+        self.assertEqual(GRABOWSKI_TASK_UNIT, identity["systemd_unit"])
+        self.assertEqual(64, len(identity["task_identity_sha256"]))
+        with self.assertRaisesRegex(
+            executor.BureauRuntimeRefreshExecutorError, "systemd unit is invalid"
+        ):
+            executor.task_identity_environment(
+                GRABOWSKI_TASK_ID, "grabowski-task-deadbeef-a1.service"
+            )
+
+        record = {
+            "task_id": GRABOWSKI_TASK_ID,
+            "unit": GRABOWSKI_TASK_UNIT,
+            "authoritative_unit": GRABOWSKI_TASK_UNIT,
+            "argv_sha256": "a" * 64,
+            "runtime_seconds": 60,
+            "cwd": "/home/alex",
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "argv_json": json.dumps(
+                ["/runtime/python", "-m", executor.EXECUTOR_MODULE, "--intent", "/x"]
+            ),
+        }
+        with patch.object(tasks, "_task_output_capture_argv", lambda _record: ["capture"]):
+            launch = tasks._launch_argv(record, include_managed_runtime=False)
+        self.assertIn(
+            f"--setenv={executor.EXECUTOR_TASK_ID_ENV}={GRABOWSKI_TASK_ID}", launch
+        )
+        self.assertIn(
+            f"--setenv={executor.EXECUTOR_TASK_UNIT_ENV}={GRABOWSKI_TASK_UNIT}", launch
+        )
 
     def test_authority_execution_contract_is_state_store_and_digest_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

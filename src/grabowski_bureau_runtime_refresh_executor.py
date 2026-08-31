@@ -32,6 +32,10 @@ INTENT_MUTATION_ROOT_FIELDS = (
     "runtime_user_unit_dir",
     "state_root",
 )
+AUTHORITY_MUTATION_ROOT_FIELD = "authority_state_store.state_root"
+EXECUTOR_TASK_ID_ENV = "GRABOWSKI_BUREAU_RUNTIME_REFRESH_TASK_ID"
+EXECUTOR_TASK_UNIT_ENV = "GRABOWSKI_BUREAU_RUNTIME_REFRESH_TASK_UNIT"
+TASK_ID_RE = re.compile(r"^[0-9a-f]{24}$")
 EXPECTED_RUNTIME_EXECUTION_CONTEXT = {
     "schema_version": 1,
     "kind": "grabowski_bureau_runtime_refresh_execution_context",
@@ -42,8 +46,12 @@ EXPECTED_RUNTIME_EXECUTION_CONTEXT = {
     "execution_backend": "systemd-user",
     "resume_policy": "never",
     "writability_evidence": ["findmnt", "statvfs", "os.access"],
-    "required_writable_intent_roots": list(INTENT_MUTATION_ROOT_FIELDS),
+    "required_writable_intent_roots": [
+        *INTENT_MUTATION_ROOT_FIELDS,
+        AUTHORITY_MUTATION_ROOT_FIELD,
+    ],
     "directory_access": ["W_OK", "X_OK"],
+    "task_identity_evidence": "server-injected-task-id-and-systemd-unit-v1",
     "forbid_generic_surfaces": [
         "grabowski_terminal_run",
         "grabowski_job_start",
@@ -253,6 +261,8 @@ def validate_authority_execution_contract(intent: dict[str, Any]) -> dict[str, A
         raise BureauRuntimeRefreshExecutorError("intent authority binding is missing")
     if authority_state.get("state_db") != str(CANONICAL_BUREAU_STATE_DB):
         raise BureauRuntimeRefreshExecutorError("intent authority StateStore path is noncanonical")
+    if authority_state.get("state_root") != str(CANONICAL_BUREAU_STATE_DB.parent):
+        raise BureauRuntimeRefreshExecutorError("intent authority StateStore root is noncanonical")
     expected_revision = authority_task.get("revision")
     expected_sha = authority_task.get("spec_sha256")
     task_id = intent.get("approval_task_id")
@@ -326,6 +336,31 @@ def validate_authority_execution_contract(intent: dict[str, Any]) -> dict[str, A
     }
 
 
+def task_identity_environment(task_id: str, unit: str) -> dict[str, str]:
+    if TASK_ID_RE.fullmatch(task_id) is None:
+        raise BureauRuntimeRefreshExecutorError("Grabowski executor task id is invalid")
+    expected_unit = f"grabowski-task-{task_id}-a1.service"
+    if unit != expected_unit:
+        raise BureauRuntimeRefreshExecutorError("Grabowski executor systemd unit is invalid")
+    return {
+        EXECUTOR_TASK_ID_ENV: task_id,
+        EXECUTOR_TASK_UNIT_ENV: unit,
+    }
+
+
+def current_task_identity() -> dict[str, str]:
+    task_id = os.environ.get(EXECUTOR_TASK_ID_ENV, "")
+    unit = os.environ.get(EXECUTOR_TASK_UNIT_ENV, "")
+    task_identity_environment(task_id, unit)
+    material = {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": task_id,
+        "systemd_unit": unit,
+        "execution_backend": "systemd-user",
+    }
+    return {**material, "task_identity_sha256": _sha256_json(material)}
+
+
 def build_executor_command(request: dict[str, str], *, runtime_python: Path) -> list[str]:
     if not runtime_python.is_file() or not os.access(runtime_python, os.X_OK):
         raise BureauRuntimeRefreshExecutorError("installed Grabowski runtime Python is unavailable")
@@ -379,6 +414,18 @@ def _intent_mutation_roots(intent: dict[str, Any]) -> dict[str, Path]:
                 f"intent mutation root {field} is not absolute and normalized"
             )
         roots[field] = path.resolve(strict=False)
+    authority = intent.get("authority_state_store")
+    authority_root = authority.get("state_root") if isinstance(authority, dict) else None
+    if not isinstance(authority_root, str) or not authority_root or "\x00" in authority_root:
+        raise BureauRuntimeRefreshExecutorError(
+            "intent mutation root authority_state_store.state_root is missing or invalid"
+        )
+    authority_path = Path(authority_root).expanduser()
+    if not authority_path.is_absolute() or ".." in authority_path.parts:
+        raise BureauRuntimeRefreshExecutorError(
+            "intent mutation root authority_state_store.state_root is not absolute and normalized"
+        )
+    roots[AUTHORITY_MUTATION_ROOT_FIELD] = authority_path.resolve(strict=False)
     return roots
 
 
@@ -443,6 +490,7 @@ def _probe_writable_directory(field: str, path: Path) -> dict[str, Any]:
 def execution_context_preflight(
     request: dict[str, str], intent: dict[str, Any], authority_contract: dict[str, Any]
 ) -> dict[str, Any]:
+    task_identity = current_task_identity()
     roots = _intent_mutation_roots(intent)
     root_evidence = {
         field: _probe_writable_directory(field, path)
@@ -457,6 +505,7 @@ def execution_context_preflight(
         "authority_revision": authority_contract["revision"],
         "authority_spec_sha256": authority_contract["spec_sha256"],
         "execution_contract_sha256": authority_contract["execution_contract_sha256"],
+        "task_identity": task_identity,
         "mutation_roots": root_evidence,
         "writable": all(item["writable"] is True for item in root_evidence.values()),
     }

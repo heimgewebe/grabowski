@@ -5298,6 +5298,21 @@ def _launch_argv(
     ]
     if record["memory_max_bytes"] is not None:
         argv.append(f"--property=MemoryMax={record['memory_max_bytes']}")
+    try:
+        persisted_command = json.loads(record["argv_json"])
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("stored task argv is invalid") from exc
+    if (
+        isinstance(persisted_command, list)
+        and all(isinstance(item, str) for item in persisted_command)
+        and bureau_runtime_refresh_executor.is_executor_module_command(persisted_command)
+    ):
+        executor_environment = bureau_runtime_refresh_executor.task_identity_environment(
+            str(record["task_id"]), unit
+        )
+        argv.extend(
+            f"--setenv={key}={value}" for key, value in executor_environment.items()
+        )
     if include_managed_runtime:
         argv.extend(
             f"--setenv={key}={value}"
@@ -7154,6 +7169,12 @@ def grabowski_task_start(
         ):
             raise ValueError("direct task route evidence must be complete and verified")
     execution_backend, systemd_scope = _execution_contract(target, command)
+    if executor_request is not None and (
+        execution_backend != "systemd-user" or systemd_scope != "user"
+    ):
+        raise PermissionError(
+            "Bureau runtime-refresh executor requires the systemd-user execution backend"
+        )
     if (
         execution_backend == "systemd-root-broker"
         and runtime + 300 > resources.MAX_TTL_SECONDS
