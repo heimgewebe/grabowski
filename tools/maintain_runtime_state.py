@@ -1587,6 +1587,8 @@ def _retention_audit_reconciliation_state(
         operation = record.get("operation")
         same_identity = (
             record.get("plan_sha256") == plan_sha256
+            and not isinstance(record.get("attempt"), bool)
+            and isinstance(record.get("attempt"), int)
             and record.get("attempt") == attempt
         )
         if (
