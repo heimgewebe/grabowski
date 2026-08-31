@@ -9551,9 +9551,8 @@ def _saga_verified_audit_records(
     pending = set(record_sha256s)
     needles = {item: f'"record_sha256":"{item}"'.encode("ascii") for item in pending}
     found: dict[str, dict[str, Any]] = {}
-    remaining = 100_000
     for segment in reversed(snapshot.segments):
-        if remaining <= 0 or not pending:
+        if not pending:
             break
         try:
             data = (
@@ -9565,10 +9564,9 @@ def _saga_verified_audit_records(
             raise GripPreflightError(
                 f"verified Captain audit segment unavailable: {type(exc).__name__}"
             ) from exc
-        lines = data.splitlines()
-        selected = lines[-min(len(lines), remaining):]
-        remaining -= len(selected)
-        for raw_line in reversed(selected):
+        if not any(needles[item] in data for item in pending):
+            continue
+        for raw_line in reversed(data.splitlines()):
             candidates = [item for item in pending if needles[item] in raw_line]
             if not candidates:
                 continue
@@ -9586,7 +9584,7 @@ def _saga_verified_audit_records(
                     break
     if pending:
         raise GripPreflightError(
-            "Captain audit record is absent from the bounded verified audit window: "
+            "Captain audit record is absent from the verified audit chain: "
             + ",".join(sorted(pending))
         )
     return found
@@ -9602,31 +9600,41 @@ def _saga_captain_audit_binding(
     if not isinstance(captain_result_value, dict):
         raise GripPreflightError("captain_result must be an object")
     captain_result = dict(captain_result_value)
+    receipt = None
+    audit_ref = None
     try:
-        receipt, _output = grabowski_grip_orchestration._validate_grip_result(
-            captain_result,
-            expected_grip="captain-run",
-            field="captain_result",
-            receipt_sha256_json=sha256_json,
-        )
+        if grabowski_grip_orchestration.is_captain_audit_result_ref(captain_result):
+            audit_ref = grabowski_grip_orchestration.validate_captain_audit_result_ref(
+                captain_result
+            )
+            completion_sha = str(audit_ref["completion_record_sha256"])
+            completion = _saga_verified_audit_record(completion_sha)
+            intent_sha = completion.get("intent_audit_sha256")
+            if not _is_sha256_hex(intent_sha):
+                raise GripPreflightError("Captain audit completion lacks a valid intent binding")
+        else:
+            receipt, _output = grabowski_grip_orchestration._validate_grip_result(
+                captain_result,
+                expected_grip="captain-run",
+                field="captain_result",
+                receipt_sha256_json=sha256_json,
+            )
+            audit = captain_result.get("captain_audit")
+            if not isinstance(audit, dict) or audit.get("status") != "complete":
+                raise GripPreflightError("captain_result lacks a complete server Captain audit")
+            intent_meta = audit.get("intent")
+            completion_meta = audit.get("completion")
+            if not isinstance(intent_meta, dict) or not isinstance(completion_meta, dict):
+                raise GripPreflightError("captain_result Captain audit metadata is incomplete")
+            if intent_meta.get("audit_chain_valid") is not True or completion_meta.get("audit_chain_valid") is not True:
+                raise GripPreflightError("captain_result Captain audit chain was not verified")
+            intent_sha = intent_meta.get("audit_record_sha256")
+            completion_sha = completion_meta.get("audit_record_sha256")
+            if not _is_sha256_hex(intent_sha) or not _is_sha256_hex(completion_sha):
+                raise GripPreflightError("captain_result Captain audit record identity is invalid")
     except grabowski_grip_orchestration.SagaError as exc:
         raise GripPreflightError(str(exc)) from exc
-    audit = captain_result.get("captain_audit")
-    if not isinstance(audit, dict) or audit.get("status") != "complete":
-        raise GripPreflightError("captain_result lacks a complete server Captain audit")
-    intent_meta = audit.get("intent")
-    completion_meta = audit.get("completion")
-    if not isinstance(intent_meta, dict) or not isinstance(completion_meta, dict):
-        raise GripPreflightError("captain_result Captain audit metadata is incomplete")
-    if intent_meta.get("audit_chain_valid") is not True or completion_meta.get("audit_chain_valid") is not True:
-        raise GripPreflightError("captain_result Captain audit chain was not verified")
-    intent_sha = intent_meta.get("audit_record_sha256")
-    completion_sha = completion_meta.get("audit_record_sha256")
-    if not _is_sha256_hex(intent_sha) or not _is_sha256_hex(completion_sha):
-        raise GripPreflightError("captain_result Captain audit record identity is invalid")
-    verified_records = _saga_verified_audit_records(
-        [str(intent_sha), str(completion_sha)]
-    )
+    verified_records = _saga_verified_audit_records([str(intent_sha), str(completion_sha)])
     intent = verified_records[str(intent_sha)]
     completion = verified_records[str(completion_sha)]
     expected_identity = plan["expected_identity"]
@@ -9656,15 +9664,25 @@ def _saga_captain_audit_binding(
     execution_result = completion.get("execution_result")
     if not isinstance(execution_result, dict):
         raise GripPreflightError("Captain audit completion lacks execution result binding")
-    expected_execution = {
-        "status": receipt["status"],
-        "receipt_sha256": receipt["receipt_sha256"],
-        "output_sha256": receipt["output_sha256"],
-    }
-    if execution_result != expected_execution:
-        raise GripPreflightError("Captain audit completion differs from Captain receipt")
     if completion.get("execution_result_sha256") != sha256_json(execution_result):
         raise GripPreflightError("Captain audit execution result digest mismatch")
+    if audit_ref is not None:
+        if set(execution_result) != {"status", "receipt_sha256", "output_sha256"}:
+            raise GripPreflightError("Captain audit reference execution result shape is not canonical")
+        if execution_result.get("status") != "passed":
+            raise GripPreflightError("Captain audit reference requires a passed Captain result")
+        if not _is_sha256_hex(execution_result.get("receipt_sha256")) or not _is_sha256_hex(execution_result.get("output_sha256")):
+            raise GripPreflightError("Captain audit reference result identity is invalid")
+        result_identity = execution_result
+    else:
+        assert receipt is not None
+        result_identity = {
+            "status": receipt["status"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "output_sha256": receipt["output_sha256"],
+        }
+        if execution_result != result_identity:
+            raise GripPreflightError("Captain audit completion differs from Captain receipt")
     body = {
         "schema_version": 1,
         "kind": grabowski_grip_orchestration.CAPTAIN_AUDIT_BINDING_KIND,
@@ -9676,9 +9694,9 @@ def _saga_captain_audit_binding(
         "expected_head": expected_common["expected_head"],
         "expected_base": expected_base,
         "expected_base_sha": expected_base_sha,
-        "receipt_sha256": receipt["receipt_sha256"],
-        "output_sha256": receipt["output_sha256"],
-        "status": receipt["status"],
+        "receipt_sha256": result_identity["receipt_sha256"],
+        "output_sha256": result_identity["output_sha256"],
+        "status": result_identity["status"],
     }
     return {**body, "binding_sha256": sha256_json(body)}
 
