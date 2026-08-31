@@ -103,6 +103,7 @@ def audit_provider(**_kwargs) -> dict:
                     "severity": "critical",
                     "count": 2,
                     "evidence_refs": ["audit-record-sha256:uncertain"],
+                    "evidence_refs_truncated": True,
                     "recommended_action": "read the exact target state and recovery evidence before any retry",
                     "does_not_establish": [
                         "mutation_failure",
@@ -125,7 +126,9 @@ def audit_provider(**_kwargs) -> dict:
                     "severity": "high",
                     "count": 1,
                     "evidence_refs": ["audit-record-sha256:transition"],
+                    "evidence_refs_truncated": False,
                     "recommended_action": "trace each unmatched intent and read the exact target state before retry",
+                    "details": {"count_semantics": "lower_bound"},
                     "does_not_establish": [
                         "effect_absence_outside_the_audit_chain",
                         "causality",
@@ -307,15 +310,51 @@ class OperatorOptimizationReportTests(unittest.TestCase):
             uncertain["evidence_refs"], ["audit-record-sha256:uncertain"]
         )
         self.assertIn("safe_retry", uncertain["does_not_establish"])
+        self.assertTrue(uncertain["evidence_refs_truncated"])
         transition = next(
             item for item in result["findings"] if item["id"] == "transition_gap"
         )
         self.assertEqual(transition["severity"], "high")
+        self.assertFalse(transition["evidence_refs_truncated"])
+        self.assertEqual(transition["count_semantics"], "lower_bound")
         self.assertIn("unmatched transition intents", transition["observation"])
         self.assertEqual(
             transition["recommended_action"],
             "trace each unmatched intent and read the exact target state before retry",
         )
+
+    def test_observed_signal_severity_cannot_fall_below_fail_safe_floor(self) -> None:
+        def contradictory_severity_audit_provider(**_kwargs) -> dict:
+            payload = audit_provider()
+            signals = {
+                item["id"]: item for item in payload["signal_projection"]["signals"]
+            }
+            signals["uncertain_outcome"]["severity"] = "none"
+            signals["transition_gap"]["severity"] = "medium"
+            signals["contract_contradiction"].update(
+                {
+                    "status": "observed",
+                    "severity": "critical",
+                    "count": 1,
+                    "recommended_action": "reconcile contract truth",
+                }
+            )
+            return payload
+
+        result = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            health_provider=health_provider,
+            audit_provider=contradictory_severity_audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+        findings = {item["id"]: item for item in result["findings"]}
+        self.assertEqual(findings["uncertain_outcome"]["severity"], "critical")
+        self.assertEqual(findings["transition_gap"]["severity"], "high")
+        self.assertEqual(findings["contract_contradiction"]["severity"], "critical")
+        self.assertEqual(result["findings"][0]["id"], "uncertain_outcome")
 
     def test_observed_contract_contradiction_becomes_ranked_finding(self) -> None:
         def contradiction_audit_provider(**_kwargs) -> dict:

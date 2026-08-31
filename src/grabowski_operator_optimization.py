@@ -687,9 +687,13 @@ def _observed_audit_signal_finding(
         return None
     count = _count(signal, "count")
     severity_value = signal.get("severity")
+    fallback_weight = SEVERITY_WEIGHT[fallback_severity]
     severity = (
         severity_value
-        if isinstance(severity_value, str) and severity_value in SEVERITY_WEIGHT
+        if (
+            isinstance(severity_value, str)
+            and SEVERITY_WEIGHT.get(severity_value, -1) >= fallback_weight
+        )
         else fallback_severity
     )
     action_value = signal.get("recommended_action")
@@ -710,7 +714,7 @@ def _observed_audit_signal_finding(
         if isinstance(refs_value, list)
         else []
     )
-    return _finding(
+    finding = _finding(
         finding_id=signal_id,
         severity=severity,
         evidence_scope="7d_audit_signal",
@@ -723,6 +727,15 @@ def _observed_audit_signal_finding(
         recommended_action=action,
         does_not_establish=limits,
     )
+    refs_truncated = signal.get("evidence_refs_truncated")
+    if isinstance(refs_truncated, bool):
+        finding["evidence_refs_truncated"] = refs_truncated
+    details = signal.get("details")
+    if isinstance(details, dict):
+        count_semantics = details.get("count_semantics")
+        if isinstance(count_semantics, str) and count_semantics:
+            finding["count_semantics"] = count_semantics
+    return finding
 
 
 def _audit_signal_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
