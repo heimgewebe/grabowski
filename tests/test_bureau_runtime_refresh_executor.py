@@ -218,11 +218,11 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(PermissionError, "direct bureau-runtime-refresh apply"):
-                operator.grabowski_terminal_run(raw, cwd="/home/alex")
+                operator.grabowski_terminal_run(raw, cwd=str(ROOT))
             with self.assertRaisesRegex(PermissionError, "direct bureau-runtime-refresh apply"):
                 fleet.grabowski_fleet_run("heim-pc", raw)
             with self.assertRaisesRegex(PermissionError, "direct bureau-runtime-refresh apply"):
-                operator.grabowski_job_start(raw, cwd="/home/alex")
+                operator.grabowski_job_start(raw, cwd=str(ROOT))
         self.assertFalse(terminal_started)
         self.assertFalse(fleet_started)
 
@@ -552,6 +552,10 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
             os.chmod(state_db, 0o600)
             with patch.object(executor, "CANONICAL_BUREAU_STATE_DB", state_db):
                 intent = _intent_payload()
+                intent["authority_state_store"] = {
+                    "state_db": str(state_db),
+                    "state_root": str(state_db.parent),
+                }
                 intent["authority_task_spec"] = {
                     "revision": 1,
                     "spec_sha256": spec_sha,
@@ -588,6 +592,10 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
             os.chmod(state_db, 0o600)
             with patch.object(executor, "CANONICAL_BUREAU_STATE_DB", state_db):
                 intent = _intent_payload()
+                intent["authority_state_store"] = {
+                    "state_db": str(state_db),
+                    "state_root": str(state_db.parent),
+                }
                 intent["authority_task_spec"] = {
                     "revision": 1,
                     "spec_sha256": spec_sha,
