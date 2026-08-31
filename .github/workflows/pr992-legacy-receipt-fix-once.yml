@@ -1,0 +1,48 @@
+name: pr992 legacy receipt fix once
+
+on:
+  push:
+    branches:
+      - 'bureau/grabowski-operator-surface-v1-fu-retention-completion-audit-reconciliation-20260829/5a178685ce'
+    paths:
+      - '.github/workflows/pr992-legacy-receipt-fix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact bootstrap commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Apply exact legacy receipt hardening and regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "d5380aa9eb77911a20471d4a3587f3357b002490"
+          test "$(git hash-object src/grabowski_audit_signal.py)" = "25cadceb6d6f6abc8ae137fed53f13138c2261f7"
+          test "$(git hash-object tools/maintain_runtime_state.py)" = "382c6fa878a37466c07f9c89fae8dab3f09ab330"
+          test "$(git hash-object tests/test_pr992_retention_receipt_pairing.py)" = "39358e2e20ca987e4412d4223f73c37fb0450330"
+
+          python .github/pr992_legacy_receipt_fix.py
+          python -m unittest discover -s tests -p 'test_pr992_retention_receipt_pairing.py'
+          python -m unittest discover -s tests -p 'test_audit_signal_retention_identity.py'
+          python -m unittest discover -s tests -p 'test_runtime_retention.py'
+          git diff --check
+
+          git rm .github/pr992_legacy_receipt_fix.py .github/workflows/pr992-legacy-receipt-fix-once.yml
+          git config user.name "grabowski-pr992-fix"
+          git config user.email "grabowski-pr992-fix@users.noreply.github.com"
+          git add src/grabowski_audit_signal.py tools/maintain_runtime_state.py tests/test_pr992_retention_receipt_pairing.py
+          git commit -m "fix(audit): include legacy retention receipt consumers"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
