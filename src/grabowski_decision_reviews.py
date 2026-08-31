@@ -356,6 +356,7 @@ def reconcile(
     head_sha: str,
     base_sha: str,
     diff_sha256: str,
+    equivalent_diff_sha256s: list[str] | tuple[str, ...] | None = None,
     jobs_root: Path | None = None,
 ) -> dict[str, Any]:
     expected = normalize_binding(
@@ -371,6 +372,18 @@ def reconcile(
         }
     )
     expected.pop("slot")
+    aliases = [] if equivalent_diff_sha256s is None else equivalent_diff_sha256s
+    if not isinstance(aliases, (list, tuple)):
+        raise ValueError("decision review equivalent diff digests must be a list or tuple")
+    accepted_diff_sha256s = {expected["diff_sha256"]}
+    for alias in aliases:
+        if (
+            not isinstance(alias, str)
+            or _SHA256_RE.fullmatch(alias.strip().lower()) is None
+        ):
+            raise ValueError("decision review equivalent diff digest must be SHA-256")
+        accepted_diff_sha256s.add(alias.strip().lower())
+    accepted_diff_sha256s_projection = sorted(accepted_diff_sha256s)
     root = JOBS_ROOT if jobs_root is None else Path(jobs_root)
     errors: list[str] = []
     attempts: list[dict[str, Any]] = []
@@ -381,6 +394,8 @@ def reconcile(
             "status": "not_applicable",
             "binding": expected,
             "binding_sha256": sha256_json(expected),
+            "accepted_diff_sha256s": accepted_diff_sha256s_projection,
+            "accepted_diff_sha256s_sha256": sha256_json(accepted_diff_sha256s_projection),
             "attempt_count": 0,
             "slot_count": 0,
             "slots": [],
@@ -450,7 +465,7 @@ def reconcile(
             attempt["classification"] = "binding_drift"
             attempts.append(attempt)
             continue
-        if binding["diff_sha256"] != expected["diff_sha256"]:
+        if binding["diff_sha256"] not in accepted_diff_sha256s:
             errors.append(f"decision_review_diff_sha256_drift:{directory.name}")
             attempt["classification"] = "binding_drift"
             attempts.append(attempt)
@@ -564,6 +579,8 @@ def reconcile(
         "status": status,
         "binding": expected,
         "binding_sha256": sha256_json(expected),
+        "accepted_diff_sha256s": accepted_diff_sha256s_projection,
+        "accepted_diff_sha256s_sha256": sha256_json(accepted_diff_sha256s_projection),
         "attempt_count": len(attempts_projection),
         "slot_count": len(slots),
         "slots": slots,

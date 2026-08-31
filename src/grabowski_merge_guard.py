@@ -4211,12 +4211,23 @@ class CaptainMergeGuardRunner:
         # TOCTOU: a reviewer cannot become decision-bound between reconciliation
         # and the merge call and then be omitted from this decision.
         with decision_reviews.decision_review_lock(decision_binding):
+            equivalent_review_diff_sha256s = None
+            if bindings.get("diff_identity_mode") == "raw-current-provider-compat":
+                # The live-binding phase has already proven these two digests
+                # identify the same exact provider bytes. Keep the legacy raw
+                # merge-evidence binding while allowing independently started
+                # decision reviews to retain the canonical identity.
+                equivalent_review_diff_sha256s = [
+                    str(bindings["canonical_diff_sha256"]),
+                    str(bindings["raw_diff_sha256"]),
+                ]
             decision_reconciliation = decision_reviews.reconcile(
                 repo=str(bindings["repository"]),
                 pr=int(bindings["pull_request"]),
                 head_sha=str(bindings["head_sha"]),
                 base_sha=str(bindings["base_sha"]),
                 diff_sha256=str(bindings["diff_sha256"]),
+                equivalent_diff_sha256s=equivalent_review_diff_sha256s,
             )
             self.receipt["decision_bound_review_reconciliation"] = (
                 decision_reconciliation
