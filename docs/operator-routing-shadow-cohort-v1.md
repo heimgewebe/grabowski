@@ -150,13 +150,16 @@ Die Schnittstelle leitet kein Outcome aus Lifecycle-Status ab. Das Outcome-Input
 - Freeze nach finaler argv-Bindung und Operator-Mutationsprüfung, aber vor Lease, Task-DB und Prozessstart;
 - ein Capture-Fehler bleibt im Taskstart-Beleg sichtbar, darf den Task aber nicht blockieren;
 - die unveränderliche `operator-routing-shadow-direct-task-binding.v1` speichert keine rohen Host-, argv-, cwd- oder Ressourcenwerte, sondern ausschließlich ihre SHA-256-Identitäten;
-- vor jeder Versiegelung werden Host, `argv_sha256`, Arbeitsverzeichnis, normalisierte Ressourcenmenge und Laufzeit aus dem autoritativen terminalen Taskdatensatz erneut in dieselbe Identität überführt und exakt mit der create-only Bindung verglichen; jede Abweichung blockiert vor Eligibility- und Record-Publikation;
+- neue Direct-Task-Prestart-Fälle verwenden `operator-routing-shadow-prospective-eligibility.v3`: dessen `source_commitment` bindet bereits vor Taskstart ausschließlich Task-ID, Workspace-/Plan-ID, die privacy-minimierte Taskidentität und den Hash der kanonischen Route. Das Commitment hängt weder von einer späteren Binding-ID noch von einer Eligibility-/Record-ID ab;
+- vor jeder Versiegelung werden Host, `argv_sha256`, Arbeitsverzeichnis, normalisierte Ressourcenmenge und Laufzeit aus dem autoritativen terminalen Taskdatensatz erneut in dieselbe Identität überführt und exakt mit der create-only Bindung verglichen. Zusätzlich wird aus der gültigen Binding-v1-Payload das Prestart-Commitment neu berechnet und gegen den unveränderlichen v3-Freeze geprüft; jede Abweichung blockiert vor Eligibility- und Record-Publikation;
 - wiederholte identische Starts konvergieren auf dieselbe Bindung; wechselnde Attempt-IDs sind nicht Teil ihrer Identität;
 - ein späterer Taskfehler bleibt als prospektiver unversiegelter Fall sichtbar und darf nicht aus der Kohorte verschwinden.
 
 Die mutierende Schnittstelle `grabowski_task_routing_shadow_seal` versiegelt einen direkten Fall erst nach terminalem Task-Readback. Ein abgeschlossener Task erfordert `execution_provenance.status = completed`; andere terminale Zustände müssen als `execution_aborted` oder `infrastructure_failure` belegt werden. Auch danach entsteht kein fachliches Erfolgslabel: Ohne unabhängige semantische Bewertung muss das Outcome ausdrücklich `abstained` bleiben.
 
-Der direkte Produktionspfad verwendet die kanonische Quellidentität `direct-task-start` und die Provenienz `direct_task_prestart`. Öffentliche oder synthetische Capture-Aufrufe besitzen diese interne Attestierung nicht; ein Produktionsanspruch wird dort weiterhin auf `quarantined` herabgestuft.
+Der direkte Produktionspfad verwendet die kanonische Quellidentität `direct-task-start` und die Provenienz `direct_task_prestart`. Neue Direct-Task-Fälle propagieren das unveränderte `source_commitment` weiter in `operator-routing-shadow-eligibility.v4` und `operator-routing-shadow-record.v4`, sodass die prospektive Source-Bindung auch ohne nachträgliche Interpretation des Binding-Zeitstempels nachrechenbar bleibt. Öffentliche oder synthetische Capture-Aufrufe besitzen diese interne Attestierung nicht; ein Produktionsanspruch wird dort weiterhin auf `quarantined` herabgestuft.
+
+Historische Prospective-v1/v2-, Eligibility-v2/v3- und Record-v2/v3-Artefakte bleiben unverändert gültig. Insbesondere wird einem alten v2-Direct-Task-Freeze niemals nachträglich ein `source_commitment` zugeschrieben; solche Fälle bleiben für diesen Aspekt ausdrücklich unbeobachtbar.
 
 ## Nicht etabliert
 
