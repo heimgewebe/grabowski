@@ -179,11 +179,29 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
             },
             prospective["case_provenance"],
         )
+        self.assertEqual(
+            capture.PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+            prospective["schema_version"],
+        )
+        self.assertEqual(
+            capture.build_direct_task_source_commitment(
+                task_id=self.task_id,
+                workspace_id=binding["workspace_id"],
+                plan_sha256=binding["plan_sha256"],
+                task_identity=binding["task_identity"],
+                route_evidence=binding["route_evidence"],
+            ),
+            prospective["source_commitment"],
+        )
         serialized = json.dumps(binding, sort_keys=True)
+        prospective_serialized = json.dumps(prospective, sort_keys=True)
         self.assertNotIn("heim-pc", serialized)
         self.assertNotIn("/private/operator/worktree", serialized)
         self.assertNotIn("repo:/private/operator/worktree", serialized)
         self.assertNotIn("argv", serialized.replace("argv_sha256", ""))
+        self.assertNotIn("heim-pc", prospective_serialized)
+        self.assertNotIn("/private/operator/worktree", prospective_serialized)
+        self.assertNotIn("repo:/private/operator/worktree", prospective_serialized)
         self.assertEqual(capture.NO_EFFECT, binding["no_effect"])
 
     def test_untrusted_direct_capture_cannot_claim_production(self) -> None:
@@ -261,9 +279,9 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
         )
         samples = {
             "operator-routing-shadow-direct-task-binding.v1.schema.json": binding,
-            "operator-routing-shadow-prospective-eligibility.v2.schema.json": prospective,
-            "operator-routing-shadow-eligibility.v3.schema.json": eligibility,
-            "operator-routing-shadow-record.v3.schema.json": record,
+            "operator-routing-shadow-prospective-eligibility.v3.schema.json": prospective,
+            "operator-routing-shadow-eligibility.v4.schema.json": eligibility,
+            "operator-routing-shadow-record.v4.schema.json": record,
         }
         format_checker = FormatChecker()
         for filename, sample in samples.items():
@@ -338,6 +356,70 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
                 self.assertEqual([], list((self.root / "eligibility").iterdir()))
                 self.assertEqual([], list((self.root / "records").iterdir()))
 
+    def test_direct_task_binding_must_match_prestart_source_commitment(self) -> None:
+        self._capture()
+        binding_path = self.root / "direct-task-bindings" / f"{self.task_id}.json"
+        binding = json.loads(binding_path.read_text())
+        tampered_identity = self._authoritative_identity(host="other-host")
+        tampered_plan = capture._direct_task_plan_sha256(
+            self.task_id, tampered_identity, binding["route_evidence"]
+        )
+        tampered = dict(binding)
+        tampered["task_identity"] = tampered_identity
+        tampered["plan_sha256"] = tampered_plan
+        payload = {key: value for key, value in tampered.items() if key != "binding_id"}
+        tampered["binding_id"] = capture._sha256_json(payload)
+        capture.validate_direct_task_binding(tampered)
+        binding_path.write_text(json.dumps(tampered, indent=2, sort_keys=True) + "\n")
+        with self.assertRaisesRegex(
+            capture.ShadowCaptureError,
+            "does not match prospective source commitment",
+        ):
+            capture.seal_direct_task_case(
+                task_id=self.task_id,
+                outcome={
+                    "status": "abstained",
+                    "reason_code": "no_semantic_review",
+                    "observed_at": "2026-07-24T17:31:00Z",
+                },
+                primary_evidence_refs=[],
+                execution_provenance={
+                    "status": "completed",
+                    "observed_at": "2026-07-24T17:30:30Z",
+                    "evidence_refs": ["artifact:task-finalization"],
+                },
+                semantic_assessments=[],
+                authoritative_task_identity=tampered_identity,
+                root=self.root,
+                captured_at="2026-07-24T17:32:00Z",
+            )
+        self.assertEqual([], list((self.root / "eligibility").iterdir()))
+        self.assertEqual([], list((self.root / "records").iterdir()))
+
+    def test_legacy_v2_prospective_remains_valid_without_source_commitment(self) -> None:
+        route = capture._validated_route_evidence(
+            self.route, execution_surface="direct_task"
+        )
+        identity = self._authoritative_identity()
+        plan_sha256 = capture._direct_task_plan_sha256(self.task_id, identity, route)
+        manifest = capture._direct_task_manifest(
+            task_id=self.task_id,
+            plan_sha256=plan_sha256,
+            route=route,
+            writer_bound=False,
+        )
+        legacy = capture.build_prospective_eligibility_v2(
+            manifest,
+            frozen_at=self.frozen_at,
+            case_origin="production",
+            capture_path="direct_task_prestart",
+        )
+        self.assertEqual(
+            capture.PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+            capture._validate_any_prospective(legacy)["schema_version"],
+        )
+        self.assertNotIn("source_commitment", legacy)
+
     def test_direct_task_case_seals_only_explicit_outcome(self) -> None:
         self._capture()
         sealed = capture.seal_direct_task_case(
@@ -360,7 +442,7 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
         )
         self.assertEqual("created", sealed["status"])
         self.assertEqual(
-            capture.RECORD_V3_SCHEMA_VERSION, sealed["record_schema_version"]
+            capture.RECORD_V4_SCHEMA_VERSION, sealed["record_schema_version"]
         )
         record = json.loads(
             (self.root / "records" / f"{sealed['case_id']}.json").read_text()

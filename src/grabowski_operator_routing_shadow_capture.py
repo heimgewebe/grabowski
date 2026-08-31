@@ -872,10 +872,15 @@ PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION = (
 PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION = (
     "operator-routing-shadow-prospective-eligibility.v2"
 )
+PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION = (
+    "operator-routing-shadow-prospective-eligibility.v3"
+)
 ELIGIBILITY_V2_SCHEMA_VERSION = "operator-routing-shadow-eligibility.v2"
 ELIGIBILITY_V3_SCHEMA_VERSION = "operator-routing-shadow-eligibility.v3"
+ELIGIBILITY_V4_SCHEMA_VERSION = "operator-routing-shadow-eligibility.v4"
 RECORD_V2_SCHEMA_VERSION = "operator-routing-shadow-record.v2"
 RECORD_V3_SCHEMA_VERSION = "operator-routing-shadow-record.v3"
+RECORD_V4_SCHEMA_VERSION = "operator-routing-shadow-record.v4"
 CAPTURE_ATTEMPT_SCHEMA_VERSION = "operator-routing-shadow-capture-attempt.v1"
 CASE_ORIGINS = {"production", "test", "synthetic", "quarantined"}
 WORKSPACE_PRESTART_CAPTURE_PATH = "agent_workspace_prestart"
@@ -887,6 +892,9 @@ CAPTURE_PATHS = {
     DIRECT_TASK_PRESTART_CAPTURE_PATH,
 }
 DIRECT_TASK_BINDING_SCHEMA_VERSION = "operator-routing-shadow-direct-task-binding.v1"
+DIRECT_TASK_SOURCE_COMMITMENT_SCHEMA_VERSION = (
+    "operator-routing-shadow-direct-task-source-commitment.v1"
+)
 _WORKSPACE_PRESTART_ATTESTATION = object()
 _DIRECT_TASK_PRESTART_ATTESTATION = object()
 _UNSET = object()
@@ -902,6 +910,7 @@ PROSPECTIVE_FIELDS = {
     "no_effect",
 }
 PROSPECTIVE_V2_FIELDS = PROSPECTIVE_FIELDS | {"case_provenance"}
+PROSPECTIVE_V3_FIELDS = PROSPECTIVE_V2_FIELDS | {"source_commitment"}
 ELIGIBILITY_V2_FIELDS = {
     "schema_version",
     "eligibility_id",
@@ -913,6 +922,7 @@ ELIGIBILITY_V2_FIELDS = {
     "no_effect",
 }
 ELIGIBILITY_V3_FIELDS = ELIGIBILITY_V2_FIELDS | {"case_provenance"}
+ELIGIBILITY_V4_FIELDS = ELIGIBILITY_V3_FIELDS | {"source_commitment"}
 RECORD_V2_FIELDS = {
     "schema_version",
     "record_id",
@@ -930,6 +940,7 @@ RECORD_V3_FIELDS = RECORD_V2_FIELDS | {
     "execution_provenance",
     "semantic_assessments",
 }
+RECORD_V4_FIELDS = RECORD_V3_FIELDS | {"source_commitment"}
 ATTEMPT_STATUSES = {"created", "duplicate", "rejected", "error"}
 
 
@@ -971,6 +982,7 @@ def _prove_prospective_binding(
     no_effect: dict[str, Any],
     prospective_schema_version: str = PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
     case_provenance: dict[str, Any] | None = None,
+    source_commitment: dict[str, Any] | None = None,
 ) -> None:
     """Reconstruct the full prospective payload and prove its self-consistency.
 
@@ -1016,9 +1028,22 @@ def _prove_prospective_binding(
         "frozen_at": frozen_at,
         "no_effect": no_effect,
     }
-    if prospective_schema_version == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
+    if prospective_schema_version in {
+        PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+    }:
         reconstructed["case_provenance"] = _normalize_case_provenance(case_provenance)
-    elif prospective_schema_version != PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION:
+    if prospective_schema_version == PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION:
+        reconstructed["source_commitment"] = _validate_direct_task_source_commitment_lineage(
+            source_commitment,
+            workspace_id=workspace_id,
+            plan_sha256=plan_sha256,
+            route_evidence_sha256=route_ref["route_evidence_sha256"],
+        )
+    elif prospective_schema_version not in {
+        PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+        PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+    }:
         raise ShadowCaptureError("prospective schema version is unsupported")
     if _sha256_json(reconstructed) != prospective_eligibility_id:
         raise ShadowCaptureError(
@@ -1338,12 +1363,95 @@ def validate_prospective_eligibility_v2(receipt: Any) -> dict[str, Any]:
     return receipt
 
 
+def build_prospective_eligibility_v3(
+    manifest: dict[str, Any],
+    *,
+    frozen_at: str,
+    case_origin: str,
+    capture_path: str,
+    source_commitment: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze an explicit direct-task source commitment before task launch."""
+    if capture_path != DIRECT_TASK_PRESTART_CAPTURE_PATH:
+        raise ShadowCaptureError(
+            "prospective eligibility v3 is reserved for direct-task prestart capture"
+        )
+    legacy = build_prospective_eligibility_v2(
+        manifest,
+        frozen_at=frozen_at,
+        case_origin=case_origin,
+        capture_path=capture_path,
+    )
+    workspace_case = legacy["workspace_case"]
+    commitment = _validate_direct_task_source_commitment_lineage(
+        source_commitment,
+        workspace_id=workspace_case["workspace_id"],
+        plan_sha256=workspace_case["plan_sha256"],
+        route_evidence_sha256=legacy["canonical_route_evidence"]["route_evidence_sha256"],
+    )
+    payload = {
+        "schema_version": PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+        "workspace_case": dict(workspace_case),
+        "canonical_route_evidence": dict(legacy["canonical_route_evidence"]),
+        "features": dict(legacy["features"]),
+        "case_provenance": dict(legacy["case_provenance"]),
+        "source_commitment": dict(commitment),
+        "frozen_at": legacy["frozen_at"],
+        "no_effect": dict(NO_EFFECT),
+    }
+    receipt = {"prospective_eligibility_id": _sha256_json(payload), **payload}
+    validate_prospective_eligibility_v3(receipt)
+    return receipt
+
+
+def validate_prospective_eligibility_v3(receipt: Any) -> dict[str, Any]:
+    if not isinstance(receipt, dict) or set(receipt) != PROSPECTIVE_V3_FIELDS:
+        raise ShadowCaptureError("prospective eligibility v3 receipt shape is invalid")
+    if receipt.get("schema_version") != PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION:
+        raise ShadowCaptureError("prospective eligibility v3 schema_version is invalid")
+    receipt_id = receipt.get("prospective_eligibility_id")
+    if not isinstance(receipt_id, str) or SHA256_RE.fullmatch(receipt_id) is None:
+        raise ShadowCaptureError("prospective_eligibility_id is invalid")
+    legacy_payload = {
+        "schema_version": PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        "workspace_case": receipt.get("workspace_case"),
+        "canonical_route_evidence": receipt.get("canonical_route_evidence"),
+        "features": receipt.get("features"),
+        "case_provenance": receipt.get("case_provenance"),
+        "frozen_at": receipt.get("frozen_at"),
+        "no_effect": receipt.get("no_effect"),
+    }
+    validate_prospective_eligibility_v2(
+        {"prospective_eligibility_id": _sha256_json(legacy_payload), **legacy_payload}
+    )
+    provenance = _normalize_case_provenance(receipt.get("case_provenance"))
+    if provenance["capture_path"] != DIRECT_TASK_PRESTART_CAPTURE_PATH:
+        raise ShadowCaptureError(
+            "prospective eligibility v3 requires direct_task_prestart provenance"
+        )
+    workspace_case = receipt["workspace_case"]
+    _validate_direct_task_source_commitment_lineage(
+        receipt.get("source_commitment"),
+        workspace_id=workspace_case["workspace_id"],
+        plan_sha256=workspace_case["plan_sha256"],
+        route_evidence_sha256=receipt["canonical_route_evidence"]["route_evidence_sha256"],
+    )
+    payload = {key: receipt[key] for key in receipt if key != "prospective_eligibility_id"}
+    if _sha256_json(payload) != receipt_id:
+        raise ShadowCaptureError(
+            "prospective_eligibility_id does not match the canonical v3 payload"
+        )
+    return receipt
+
+
 def _validate_any_prospective(receipt: Any) -> dict[str, Any]:
     schema_version = receipt.get("schema_version") if isinstance(receipt, dict) else None
     if schema_version == PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION:
         return validate_prospective_eligibility(receipt)
     if schema_version == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
         return validate_prospective_eligibility_v2(receipt)
+    if schema_version == PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION:
+        return validate_prospective_eligibility_v3(receipt)
     raise ShadowCaptureError("unsupported prospective eligibility schema")
 
 
@@ -1354,6 +1462,20 @@ def _legacy_projection_from_prospective_v2(receipt: dict[str, Any]) -> dict[str,
         "workspace_case": dict(current["workspace_case"]),
         "canonical_route_evidence": dict(current["canonical_route_evidence"]),
         "features": dict(current["features"]),
+        "frozen_at": current["frozen_at"],
+        "no_effect": dict(current["no_effect"]),
+    }
+    return {"prospective_eligibility_id": _sha256_json(payload), **payload}
+
+
+def _v2_projection_from_prospective_v3(receipt: dict[str, Any]) -> dict[str, Any]:
+    current = validate_prospective_eligibility_v3(receipt)
+    payload = {
+        "schema_version": PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        "workspace_case": dict(current["workspace_case"]),
+        "canonical_route_evidence": dict(current["canonical_route_evidence"]),
+        "features": dict(current["features"]),
+        "case_provenance": dict(current["case_provenance"]),
         "frozen_at": current["frozen_at"],
         "no_effect": dict(current["no_effect"]),
     }
@@ -1602,6 +1724,131 @@ def validate_bound_eligibility_v3(receipt: Any) -> dict[str, Any]:
     payload = {key: receipt[key] for key in receipt if key != "eligibility_id"}
     if _sha256_json(payload) != eligibility_id:
         raise ShadowCaptureError("eligibility_id does not match the canonical eligibility v3 payload")
+    return receipt
+
+
+def build_bound_eligibility_v4(
+    prospective_receipt: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    eligible_task_id: str,
+) -> dict[str, Any]:
+    prospective = validate_prospective_eligibility_v3(prospective_receipt)
+    legacy = _v2_projection_from_prospective_v3(prospective)
+    legacy_eligibility = build_bound_eligibility_v3(
+        legacy, manifest, eligible_task_id=eligible_task_id
+    )
+    workspace_case = prospective["workspace_case"]
+    commitment = _validate_direct_task_source_commitment_lineage(
+        prospective["source_commitment"],
+        workspace_id=workspace_case["workspace_id"],
+        plan_sha256=workspace_case["plan_sha256"],
+        route_evidence_sha256=prospective["canonical_route_evidence"]["route_evidence_sha256"],
+    )
+    if commitment["task_id"] != eligible_task_id:
+        raise ShadowCaptureError(
+            "direct task source commitment task does not match eligible task"
+        )
+    payload = {
+        "schema_version": ELIGIBILITY_V4_SCHEMA_VERSION,
+        "prospective_eligibility": {
+            "schema_version": PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+            "prospective_eligibility_id": prospective["prospective_eligibility_id"],
+            "workspace_id": workspace_case["workspace_id"],
+            "plan_sha256": workspace_case["plan_sha256"],
+            "workspace_case_id": workspace_case["case_id"],
+            "frozen_at": prospective["frozen_at"],
+        },
+        "eligible_case": dict(legacy_eligibility["eligible_case"]),
+        "canonical_route_evidence": dict(legacy_eligibility["canonical_route_evidence"]),
+        "features": dict(legacy_eligibility["features"]),
+        "case_provenance": dict(prospective["case_provenance"]),
+        "source_commitment": dict(commitment),
+        "frozen_at": prospective["frozen_at"],
+        "no_effect": dict(NO_EFFECT),
+    }
+    receipt = {"eligibility_id": _sha256_json(payload), **payload}
+    validate_bound_eligibility_v4(receipt)
+    return receipt
+
+
+def validate_bound_eligibility_v4(receipt: Any) -> dict[str, Any]:
+    if not isinstance(receipt, dict) or set(receipt) != ELIGIBILITY_V4_FIELDS:
+        raise ShadowCaptureError("eligibility v4 receipt shape is invalid")
+    if receipt.get("schema_version") != ELIGIBILITY_V4_SCHEMA_VERSION:
+        raise ShadowCaptureError("eligibility v4 schema_version is invalid")
+    eligibility_id = receipt.get("eligibility_id")
+    if not isinstance(eligibility_id, str) or SHA256_RE.fullmatch(eligibility_id) is None:
+        raise ShadowCaptureError("eligibility_id is invalid")
+    eligible_case, _, route_schema_version = _validate_case_and_route(
+        receipt.get("eligible_case"),
+        receipt.get("canonical_route_evidence"),
+        manifest_field="manifest_identity_sha256",
+    )
+    _validate_features(receipt.get("features"), route_schema_version=route_schema_version)
+    provenance = _normalize_case_provenance(receipt.get("case_provenance"))
+    if provenance != receipt.get("case_provenance"):
+        raise ShadowCaptureError("case_provenance is not normalized")
+    if provenance["capture_path"] != DIRECT_TASK_PRESTART_CAPTURE_PATH:
+        raise ShadowCaptureError("eligibility v4 requires direct_task_prestart provenance")
+    prospective = receipt.get("prospective_eligibility")
+    expected_ref = {
+        "schema_version",
+        "prospective_eligibility_id",
+        "workspace_id",
+        "plan_sha256",
+        "workspace_case_id",
+        "frozen_at",
+    }
+    if not isinstance(prospective, dict) or set(prospective) != expected_ref:
+        raise ShadowCaptureError("prospective eligibility v3 reference shape is invalid")
+    if prospective.get("schema_version") != PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION:
+        raise ShadowCaptureError("prospective eligibility v3 reference schema is invalid")
+    for field in ("prospective_eligibility_id", "plan_sha256", "workspace_case_id"):
+        value = prospective.get(field)
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise ShadowCaptureError(f"prospective eligibility v3 reference {field} is invalid")
+    workspace_id = prospective.get("workspace_id")
+    if not isinstance(workspace_id, str) or workspace.WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
+        raise ShadowCaptureError("prospective eligibility v3 workspace_id is invalid")
+    frozen_at = _parse_timestamp(receipt.get("frozen_at"), "frozen_at")
+    prospective_frozen_at = _parse_timestamp(
+        prospective.get("frozen_at"), "prospective_eligibility.frozen_at"
+    )
+    if frozen_at != receipt.get("frozen_at") or prospective_frozen_at != prospective.get("frozen_at"):
+        raise ShadowCaptureError("eligibility v4 timestamps are not normalized")
+    if frozen_at != prospective_frozen_at:
+        raise ShadowCaptureError("eligibility v4 must preserve prospective frozen_at")
+    if receipt.get("no_effect") != NO_EFFECT:
+        raise ShadowCaptureError("no_effect boundary is invalid")
+    commitment = _validate_direct_task_source_commitment_lineage(
+        receipt.get("source_commitment"),
+        workspace_id=workspace_id,
+        plan_sha256=prospective["plan_sha256"],
+        route_evidence_sha256=receipt["canonical_route_evidence"]["route_evidence_sha256"],
+    )
+    if commitment["task_id"] != eligible_case:
+        raise ShadowCaptureError(
+            "direct task source commitment task does not match eligible task"
+        )
+    _prove_prospective_binding(
+        workspace_id=workspace_id,
+        plan_sha256=prospective["plan_sha256"],
+        workspace_case_id=prospective["workspace_case_id"],
+        prospective_eligibility_id=prospective["prospective_eligibility_id"],
+        route_ref=receipt["canonical_route_evidence"],
+        features=receipt["features"],
+        frozen_at=frozen_at,
+        no_effect=receipt["no_effect"],
+        prospective_schema_version=PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+        case_provenance=receipt["case_provenance"],
+        source_commitment=commitment,
+    )
+    payload = {key: receipt[key] for key in receipt if key != "eligibility_id"}
+    if _sha256_json(payload) != eligibility_id:
+        raise ShadowCaptureError(
+            "eligibility_id does not match the canonical eligibility v4 payload"
+        )
     return receipt
 
 
@@ -1948,12 +2195,208 @@ def validate_shadow_record_v3(record: Any) -> dict[str, Any]:
     return record
 
 
+def build_shadow_record_v4(
+    eligibility_receipt: dict[str, Any],
+    *,
+    outcome: dict[str, Any],
+    primary_evidence_refs: list[str],
+    execution_provenance: dict[str, Any] | None,
+    semantic_assessments: list[dict[str, Any]] | None,
+    captured_at: str,
+) -> dict[str, Any]:
+    eligibility = validate_bound_eligibility_v4(eligibility_receipt)
+    normalized_outcome = _normalize_outcome(outcome)
+    refs = _normalize_evidence_refs(
+        primary_evidence_refs,
+        reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
+    )
+    execution = _normalize_execution_provenance(execution_provenance)
+    assessments = _normalize_semantic_assessments(semantic_assessments)
+    if assessments:
+        if normalized_outcome.get("status") != "reviewed":
+            raise ShadowCaptureError(
+                "semantic assessments require a reviewed primary outcome"
+            )
+        if assessments[0]["kind"] != normalized_outcome["kind"]:
+            raise ShadowCaptureError(
+                "semantic assessments must address the reviewed outcome kind"
+            )
+    normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
+    frozen_at = eligibility["frozen_at"]
+    _validate_v3_timeline(
+        frozen_at=frozen_at,
+        outcome=normalized_outcome,
+        execution=execution,
+        assessments=assessments,
+        captured_at=normalized_captured_at,
+    )
+    prospective = eligibility["prospective_eligibility"]
+    payload = {
+        "schema_version": RECORD_V4_SCHEMA_VERSION,
+        "eligibility": {
+            "schema_version": ELIGIBILITY_V4_SCHEMA_VERSION,
+            "eligibility_id": eligibility["eligibility_id"],
+            "prospective_eligibility_id": prospective["prospective_eligibility_id"],
+            "workspace_id": prospective["workspace_id"],
+            "plan_sha256": prospective["plan_sha256"],
+            "workspace_case_id": prospective["workspace_case_id"],
+            "frozen_at": frozen_at,
+        },
+        "eligible_case": dict(eligibility["eligible_case"]),
+        "canonical_route_evidence": dict(eligibility["canonical_route_evidence"]),
+        "features": dict(eligibility["features"]),
+        "case_provenance": dict(eligibility["case_provenance"]),
+        "source_commitment": dict(eligibility["source_commitment"]),
+        "outcome": normalized_outcome,
+        "primary_evidence_refs": refs,
+        "execution_provenance": execution,
+        "semantic_assessments": assessments,
+        "captured_at": normalized_captured_at,
+        "no_effect": dict(NO_EFFECT),
+    }
+    record = {"record_id": _sha256_json(payload), **payload}
+    validate_shadow_record_v4(record)
+    return record
+
+
+def validate_shadow_record_v4(record: Any) -> dict[str, Any]:
+    if not isinstance(record, dict) or set(record) != RECORD_V4_FIELDS:
+        raise ShadowCaptureError("shadow record v4 shape is invalid")
+    if record.get("schema_version") != RECORD_V4_SCHEMA_VERSION:
+        raise ShadowCaptureError("shadow record v4 schema_version is invalid")
+    record_id = record.get("record_id")
+    if not isinstance(record_id, str) or SHA256_RE.fullmatch(record_id) is None:
+        raise ShadowCaptureError("record_id is invalid")
+    eligible_case, _, route_schema_version = _validate_case_and_route(
+        record.get("eligible_case"),
+        record.get("canonical_route_evidence"),
+        manifest_field="manifest_identity_sha256",
+    )
+    _validate_features(record.get("features"), route_schema_version=route_schema_version)
+    provenance = _normalize_case_provenance(record.get("case_provenance"))
+    if provenance != record.get("case_provenance"):
+        raise ShadowCaptureError("case_provenance is not normalized")
+    if provenance["capture_path"] != DIRECT_TASK_PRESTART_CAPTURE_PATH:
+        raise ShadowCaptureError("record v4 requires direct_task_prestart provenance")
+    normalized_outcome = _normalize_outcome(record.get("outcome"))
+    if normalized_outcome != record.get("outcome"):
+        raise ShadowCaptureError("outcome is not normalized")
+    refs = _normalize_evidence_refs(
+        record.get("primary_evidence_refs"),
+        reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
+    )
+    if refs != record.get("primary_evidence_refs"):
+        raise ShadowCaptureError("primary_evidence_refs is not normalized")
+    execution = _normalize_execution_provenance(record.get("execution_provenance"))
+    if execution != record.get("execution_provenance"):
+        raise ShadowCaptureError("execution_provenance is not normalized")
+    assessments = _normalize_semantic_assessments(record.get("semantic_assessments"))
+    if assessments != record.get("semantic_assessments"):
+        raise ShadowCaptureError("semantic_assessments are not normalized")
+    if assessments:
+        if normalized_outcome.get("status") != "reviewed":
+            raise ShadowCaptureError(
+                "semantic assessments require a reviewed primary outcome"
+            )
+        if assessments[0]["kind"] != normalized_outcome["kind"]:
+            raise ShadowCaptureError(
+                "semantic assessments must address the reviewed outcome kind"
+            )
+    eligibility = record.get("eligibility")
+    expected_ref = {
+        "schema_version",
+        "eligibility_id",
+        "prospective_eligibility_id",
+        "workspace_id",
+        "plan_sha256",
+        "workspace_case_id",
+        "frozen_at",
+    }
+    if not isinstance(eligibility, dict) or set(eligibility) != expected_ref:
+        raise ShadowCaptureError("eligibility v4 reference shape is invalid")
+    if eligibility.get("schema_version") != ELIGIBILITY_V4_SCHEMA_VERSION:
+        raise ShadowCaptureError("eligibility v4 reference schema is invalid")
+    for field in ("eligibility_id", "prospective_eligibility_id", "plan_sha256", "workspace_case_id"):
+        value = eligibility.get(field)
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise ShadowCaptureError(f"eligibility v4 reference {field} is invalid")
+    workspace_id = eligibility.get("workspace_id")
+    if not isinstance(workspace_id, str) or workspace.WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
+        raise ShadowCaptureError("eligibility v4 reference workspace_id is invalid")
+    frozen_at = _parse_timestamp(eligibility.get("frozen_at"), "eligibility.frozen_at")
+    captured_at = _parse_timestamp(record.get("captured_at"), "captured_at")
+    if frozen_at != eligibility.get("frozen_at") or captured_at != record.get("captured_at"):
+        raise ShadowCaptureError("record v4 timestamps are not normalized")
+    _validate_v3_timeline(
+        frozen_at=frozen_at,
+        outcome=normalized_outcome,
+        execution=execution,
+        assessments=assessments,
+        captured_at=captured_at,
+    )
+    if record.get("no_effect") != NO_EFFECT:
+        raise ShadowCaptureError("no_effect boundary is invalid")
+    commitment = _validate_direct_task_source_commitment_lineage(
+        record.get("source_commitment"),
+        workspace_id=workspace_id,
+        plan_sha256=eligibility["plan_sha256"],
+        route_evidence_sha256=record["canonical_route_evidence"]["route_evidence_sha256"],
+    )
+    if commitment["task_id"] != eligible_case:
+        raise ShadowCaptureError(
+            "direct task source commitment task does not match eligible task"
+        )
+    _prove_prospective_binding(
+        workspace_id=workspace_id,
+        plan_sha256=eligibility["plan_sha256"],
+        workspace_case_id=eligibility["workspace_case_id"],
+        prospective_eligibility_id=eligibility["prospective_eligibility_id"],
+        route_ref=record["canonical_route_evidence"],
+        features=record["features"],
+        frozen_at=frozen_at,
+        no_effect=record["no_effect"],
+        prospective_schema_version=PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+        case_provenance=record["case_provenance"],
+        source_commitment=commitment,
+    )
+    reconstructed_eligibility = {
+        "schema_version": ELIGIBILITY_V4_SCHEMA_VERSION,
+        "prospective_eligibility": {
+            "schema_version": PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+            "prospective_eligibility_id": eligibility["prospective_eligibility_id"],
+            "workspace_id": workspace_id,
+            "plan_sha256": eligibility["plan_sha256"],
+            "workspace_case_id": eligibility["workspace_case_id"],
+            "frozen_at": frozen_at,
+        },
+        "eligible_case": record["eligible_case"],
+        "canonical_route_evidence": record["canonical_route_evidence"],
+        "features": record["features"],
+        "case_provenance": record["case_provenance"],
+        "source_commitment": commitment,
+        "frozen_at": frozen_at,
+        "no_effect": record["no_effect"],
+    }
+    if _sha256_json(reconstructed_eligibility) != eligibility["eligibility_id"]:
+        raise ShadowCaptureError(
+            "eligibility reference does not match reconstructed eligibility v4 payload"
+        )
+    payload = {key: record[key] for key in record if key != "record_id"}
+    if _sha256_json(payload) != record_id:
+        raise ShadowCaptureError("record_id does not match the canonical record v4 payload")
+    return record
+
+
 def _validate_any_record(record: Any) -> dict[str, Any]:
     schema_version = record.get("schema_version") if isinstance(record, dict) else None
     if schema_version == RECORD_V2_SCHEMA_VERSION:
         return validate_shadow_record_v2(record)
     if schema_version == RECORD_V3_SCHEMA_VERSION:
         return validate_shadow_record_v3(record)
+    if schema_version == RECORD_V4_SCHEMA_VERSION:
+        return validate_shadow_record_v4(record)
     raise ShadowCaptureError("unsupported sealed shadow record schema")
 
 
@@ -1963,14 +2406,20 @@ def _validate_new_capture_payload(record: dict[str, Any]) -> None:
         validate_prospective_eligibility(record)
     elif schema_version == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
         validate_prospective_eligibility_v2(record)
+    elif schema_version == PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION:
+        validate_prospective_eligibility_v3(record)
     elif schema_version == ELIGIBILITY_V2_SCHEMA_VERSION:
         validate_bound_eligibility_v2(record)
     elif schema_version == ELIGIBILITY_V3_SCHEMA_VERSION:
         validate_bound_eligibility_v3(record)
+    elif schema_version == ELIGIBILITY_V4_SCHEMA_VERSION:
+        validate_bound_eligibility_v4(record)
     elif schema_version == RECORD_V2_SCHEMA_VERSION:
         validate_shadow_record_v2(record)
     elif schema_version == RECORD_V3_SCHEMA_VERSION:
         validate_shadow_record_v3(record)
+    elif schema_version == RECORD_V4_SCHEMA_VERSION:
+        validate_shadow_record_v4(record)
     elif schema_version == CAPTURE_ATTEMPT_SCHEMA_VERSION:
         _validate_capture_attempt(record)
     else:
@@ -2050,15 +2499,29 @@ def write_prospective_identity_idempotent(
             "existing prospective eligibility conflicts with deterministic case features"
         )
     if (
-        existing.get("schema_version") == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
-        and receipt.get("schema_version") == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
+        existing.get("schema_version") in {
+            PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+            PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+        }
+        and receipt.get("schema_version") in {
+            PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+            PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+        }
         and existing["case_provenance"] != receipt["case_provenance"]
     ):
         raise ShadowCaptureError(
             "existing prospective eligibility conflicts with frozen case provenance"
         )
-    # A pre-upgrade v1 freeze wins unchanged. Its missing provenance remains
-    # explicitly unobservable rather than being backfilled after the fact.
+    if (
+        existing.get("schema_version") == PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION
+        and receipt.get("schema_version") == PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION
+        and existing["source_commitment"] != receipt["source_commitment"]
+    ):
+        raise ShadowCaptureError(
+            "existing prospective eligibility conflicts with frozen source commitment"
+        )
+    # A pre-upgrade v1/v2 freeze wins unchanged. Missing provenance or source
+    # commitment remains explicitly unobservable rather than being backfilled.
     return existing, False
 
 
@@ -2281,13 +2744,21 @@ def seal_prospective_case(
         raise ShadowCaptureError(
             "prospective eligibility does not match the create-only stored freeze"
         )
-    latest_contract = (
+    source_commitment_contract = (
         stored_prospective["schema_version"]
-        == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
+        == PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION
     )
+    latest_contract = stored_prospective["schema_version"] in {
+        PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
+    }
     execution_provided = execution_provenance is not _UNSET
     assessments_provided = semantic_assessments is not _UNSET
-    if latest_contract:
+    if source_commitment_contract:
+        eligibility = build_bound_eligibility_v4(
+            stored_prospective, manifest, eligible_task_id=eligible_task_id
+        )
+    elif latest_contract:
         eligibility = build_bound_eligibility_v3(
             stored_prospective, manifest, eligible_task_id=eligible_task_id
         )
@@ -2335,10 +2806,20 @@ def seal_prospective_case(
             or existing["primary_evidence_refs"] != refs
         )
         if latest_contract:
+            expected_record_schema = (
+                RECORD_V4_SCHEMA_VERSION
+                if source_commitment_contract
+                else RECORD_V3_SCHEMA_VERSION
+            )
             conflicts = conflicts or (
-                existing.get("schema_version") != RECORD_V3_SCHEMA_VERSION
+                existing.get("schema_version") != expected_record_schema
                 or existing.get("case_provenance") != eligibility["case_provenance"]
             )
+            if source_commitment_contract:
+                conflicts = conflicts or (
+                    existing.get("source_commitment")
+                    != eligibility["source_commitment"]
+                )
             if execution_provided:
                 conflicts = conflicts or (
                     existing.get("execution_provenance") != normalized_execution
@@ -2365,7 +2846,16 @@ def seal_prospective_case(
             "no_effect": dict(NO_EFFECT),
         }
 
-    if latest_contract:
+    if source_commitment_contract:
+        record = build_shadow_record_v4(
+            eligibility,
+            outcome=normalized_outcome,
+            primary_evidence_refs=refs,
+            execution_provenance=normalized_execution,
+            semantic_assessments=normalized_assessments,
+            captured_at=captured_at or _utc_now(),
+        )
+    elif latest_contract:
         record = build_shadow_record_v3(
             eligibility,
             outcome=normalized_outcome,
@@ -2415,6 +2905,7 @@ def capture_workspace_eligibility_best_effort(
     frozen_at: str | None = None,
     case_origin: str | None = None,
     prestart_attestation: object | None = None,
+    source_commitment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Best-effort pre-start freeze. Never raises into workspace execution."""
     enabled = (
@@ -2461,12 +2952,29 @@ def capture_workspace_eligibility_best_effort(
         )
         if not trusted_prestart and resolved_case_origin == "production":
             resolved_case_origin = "quarantined"
-        receipt = build_prospective_eligibility_v2(
-            manifest,
-            frozen_at=attempted_at,
-            case_origin=resolved_case_origin,
-            capture_path=resolved_capture_path,
-        )
+        if direct_task_prestart:
+            if source_commitment is None:
+                raise ShadowCaptureError(
+                    "direct task prestart capture requires source commitment"
+                )
+            receipt = build_prospective_eligibility_v3(
+                manifest,
+                frozen_at=attempted_at,
+                case_origin=resolved_case_origin,
+                capture_path=resolved_capture_path,
+                source_commitment=source_commitment,
+            )
+        else:
+            if source_commitment is not None:
+                raise ShadowCaptureError(
+                    "source commitment is valid only for direct task prestart capture"
+                )
+            receipt = build_prospective_eligibility_v2(
+                manifest,
+                frozen_at=attempted_at,
+                case_origin=resolved_case_origin,
+                capture_path=resolved_capture_path,
+            )
         case_id = receipt["workspace_case"]["case_id"]
         receipt, created = write_prospective_identity_idempotent(
             prospective_dir / f"{case_id}.json", receipt
@@ -2554,6 +3062,49 @@ def _direct_task_workspace_id(task_id: str) -> str:
         raise ShadowCaptureError("direct task workspace identity is invalid")
     return workspace_id
 
+DIRECT_TASK_IDENTITY_FIELDS = {
+    "host_sha256",
+    "argv_sha256",
+    "cwd_sha256",
+    "resource_keys_sha256",
+    "runtime_seconds",
+}
+DIRECT_TASK_SOURCE_COMMITMENT_FIELDS = {
+    "schema_version",
+    "source_commitment_sha256",
+    "task_id",
+    "workspace_id",
+    "plan_sha256",
+    "task_identity",
+    "route_evidence_sha256",
+}
+
+
+def _validated_direct_task_identity(
+    value: Any, *, label: str = "direct task identity"
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != DIRECT_TASK_IDENTITY_FIELDS:
+        raise ShadowCaptureError(f"{label} shape is invalid")
+    for field in DIRECT_TASK_IDENTITY_FIELDS - {"runtime_seconds"}:
+        item = value.get(field)
+        if not isinstance(item, str) or SHA256_RE.fullmatch(item) is None:
+            raise ShadowCaptureError(f"{label} {field} is invalid")
+    runtime_seconds = value.get("runtime_seconds")
+    if (
+        isinstance(runtime_seconds, bool)
+        or not isinstance(runtime_seconds, int)
+        or not 1 <= runtime_seconds <= 604800
+    ):
+        raise ShadowCaptureError(f"{label} runtime_seconds is invalid")
+    return {
+        "host_sha256": value["host_sha256"],
+        "argv_sha256": value["argv_sha256"],
+        "cwd_sha256": value["cwd_sha256"],
+        "resource_keys_sha256": value["resource_keys_sha256"],
+        "runtime_seconds": runtime_seconds,
+    }
+
+
 def build_direct_task_identity(
     *,
     host: str,
@@ -2578,31 +3129,122 @@ def build_direct_task_identity(
         )
     ):
         raise ShadowCaptureError("direct task resource keys are invalid")
-    if (
-        isinstance(runtime_seconds, bool)
-        or not isinstance(runtime_seconds, int)
-        or not 1 <= runtime_seconds <= 604800
-    ):
-        raise ShadowCaptureError("direct task runtime_seconds is invalid")
-    return {
-        "host_sha256": hashlib.sha256(host.encode("utf-8")).hexdigest(),
-        "argv_sha256": argv_sha256,
-        "cwd_sha256": hashlib.sha256(cwd.encode("utf-8")).hexdigest(),
-        "resource_keys_sha256": _sha256_json(sorted(set(resource_keys))),
-        "runtime_seconds": runtime_seconds,
-    }
+    return _validated_direct_task_identity(
+        {
+            "host_sha256": hashlib.sha256(host.encode("utf-8")).hexdigest(),
+            "argv_sha256": argv_sha256,
+            "cwd_sha256": hashlib.sha256(cwd.encode("utf-8")).hexdigest(),
+            "resource_keys_sha256": _sha256_json(sorted(set(resource_keys))),
+            "runtime_seconds": runtime_seconds,
+        }
+    )
 
-def _direct_task_plan_sha256(
-    task_id: str, task_identity: dict[str, Any], route: dict[str, Any]
+
+def _direct_task_plan_sha256_from_route_sha256(
+    task_id: str, task_identity: dict[str, Any], route_evidence_sha256: str
 ) -> str:
+    if not isinstance(task_id, str) or TASK_ID_RE.fullmatch(task_id) is None:
+        raise ShadowCaptureError("direct task id is invalid")
+    identity = _validated_direct_task_identity(task_identity)
+    if (
+        not isinstance(route_evidence_sha256, str)
+        or SHA256_RE.fullmatch(route_evidence_sha256) is None
+    ):
+        raise ShadowCaptureError("direct task route evidence sha256 is invalid")
     return _sha256_json(
         {
             "schema_version": "operator-routing-shadow-direct-task-plan.v1",
             "task_id": task_id,
-            "task_identity": task_identity,
-            "route_evidence_sha256": _sha256_json(route),
+            "task_identity": identity,
+            "route_evidence_sha256": route_evidence_sha256,
         }
     )
+
+
+def _direct_task_plan_sha256(
+    task_id: str, task_identity: dict[str, Any], route: dict[str, Any]
+) -> str:
+    return _direct_task_plan_sha256_from_route_sha256(
+        task_id, task_identity, _sha256_json(route)
+    )
+
+
+def build_direct_task_source_commitment(
+    *,
+    task_id: str,
+    workspace_id: str,
+    plan_sha256: str,
+    task_identity: dict[str, Any],
+    route_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Commit privacy-minimized direct-task source material before task launch."""
+    if workspace_id != _direct_task_workspace_id(task_id):
+        raise ShadowCaptureError("direct task source commitment workspace is invalid")
+    identity = _validated_direct_task_identity(task_identity)
+    route = _validated_route_evidence(route_evidence, execution_surface="direct_task")
+    route_sha256 = _sha256_json(route)
+    expected_plan = _direct_task_plan_sha256_from_route_sha256(
+        task_id, identity, route_sha256
+    )
+    if plan_sha256 != expected_plan:
+        raise ShadowCaptureError("direct task source commitment plan identity is invalid")
+    payload = {
+        "schema_version": DIRECT_TASK_SOURCE_COMMITMENT_SCHEMA_VERSION,
+        "task_id": task_id,
+        "workspace_id": workspace_id,
+        "plan_sha256": plan_sha256,
+        "task_identity": identity,
+        "route_evidence_sha256": route_sha256,
+    }
+    return {"source_commitment_sha256": _sha256_json(payload), **payload}
+
+
+def validate_direct_task_source_commitment(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != DIRECT_TASK_SOURCE_COMMITMENT_FIELDS:
+        raise ShadowCaptureError("direct task source commitment shape is invalid")
+    if value.get("schema_version") != DIRECT_TASK_SOURCE_COMMITMENT_SCHEMA_VERSION:
+        raise ShadowCaptureError("direct task source commitment schema_version is invalid")
+    task_id = value.get("task_id")
+    if not isinstance(task_id, str) or TASK_ID_RE.fullmatch(task_id) is None:
+        raise ShadowCaptureError("direct task source commitment task_id is invalid")
+    if value.get("workspace_id") != _direct_task_workspace_id(task_id):
+        raise ShadowCaptureError("direct task source commitment workspace_id is invalid")
+    plan_sha256 = value.get("plan_sha256")
+    route_sha256 = value.get("route_evidence_sha256")
+    if not isinstance(plan_sha256, str) or SHA256_RE.fullmatch(plan_sha256) is None:
+        raise ShadowCaptureError("direct task source commitment plan_sha256 is invalid")
+    if not isinstance(route_sha256, str) or SHA256_RE.fullmatch(route_sha256) is None:
+        raise ShadowCaptureError("direct task source commitment route_evidence_sha256 is invalid")
+    identity = _validated_direct_task_identity(
+        value.get("task_identity"), label="direct task source commitment task_identity"
+    )
+    if plan_sha256 != _direct_task_plan_sha256_from_route_sha256(
+        task_id, identity, route_sha256
+    ):
+        raise ShadowCaptureError("direct task source commitment plan identity is invalid")
+    payload = {key: value[key] for key in value if key != "source_commitment_sha256"}
+    digest = value.get("source_commitment_sha256")
+    if not isinstance(digest, str) or digest != _sha256_json(payload):
+        raise ShadowCaptureError("direct task source commitment digest is invalid")
+    return value
+
+
+def _validate_direct_task_source_commitment_lineage(
+    value: Any,
+    *,
+    workspace_id: str,
+    plan_sha256: str,
+    route_evidence_sha256: str,
+) -> dict[str, Any]:
+    commitment = validate_direct_task_source_commitment(value)
+    if commitment["workspace_id"] != workspace_id:
+        raise ShadowCaptureError("direct task source commitment workspace drifted")
+    if commitment["plan_sha256"] != plan_sha256:
+        raise ShadowCaptureError("direct task source commitment plan drifted")
+    if commitment["route_evidence_sha256"] != route_evidence_sha256:
+        raise ShadowCaptureError("direct task source commitment route drifted")
+    return commitment
+
 
 def _direct_task_manifest(
     *,
@@ -2798,12 +3440,20 @@ def capture_direct_task_start_best_effort(
             route=route,
             writer_bound=False,
         )
+        source_commitment = build_direct_task_source_commitment(
+            task_id=task_id,
+            workspace_id=manifest["workspace_id"],
+            plan_sha256=plan_sha256,
+            task_identity=identity,
+            route_evidence=route,
+        )
         capture = capture_workspace_eligibility_best_effort(
             manifest,
             root=cohort_root,
             frozen_at=attempted_at,
             case_origin="production",
             prestart_attestation=_DIRECT_TASK_PRESTART_ATTESTATION,
+            source_commitment=source_commitment,
         )
         if capture.get("status") not in {"created", "duplicate"}:
             return {**capture, "binding_status": "not_created"}
@@ -2893,6 +3543,18 @@ def seal_direct_task_case(
         label="direct task prospective eligibility",
     )
     _validate_any_prospective(prospective)
+    if prospective.get("schema_version") == PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION:
+        expected_commitment = build_direct_task_source_commitment(
+            task_id=task_id,
+            workspace_id=binding["workspace_id"],
+            plan_sha256=binding["plan_sha256"],
+            task_identity=binding["task_identity"],
+            route_evidence=binding["route_evidence"],
+        )
+        if prospective.get("source_commitment") != expected_commitment:
+            raise ShadowCaptureError(
+                "direct task binding does not match prospective source commitment"
+            )
     manifest = _direct_task_manifest(
         task_id=task_id,
         plan_sha256=binding["plan_sha256"],
