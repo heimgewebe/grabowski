@@ -242,20 +242,27 @@ def _systemd_unit_states(units: list[str]) -> dict[str, dict[str, str]]:
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "systemd job-state inventory failed")
         if len(result.stdout.encode("utf-8", errors="replace")) > 2 * 1024 * 1024:
-            raise RuntimeError("systemd show returned too much output")
+            raise RuntimeError("systemd job-state inventory exceeded its output bound")
         states.update(_parse_systemd_show(result.stdout))
+    missing = sorted(set(normalized) - set(states))
+    if missing:
+        raise RuntimeError(f"systemd job-state inventory omitted units: {', '.join(missing[:5])}")
     return states
 
 
-def _read_json_file(path: Path, *, max_bytes: int) -> tuple[dict[str, Any], str]:
+def _read_json_file(
+    path: Path,
+    *,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> tuple[dict[str, Any], str]:
     raw = _read_private_bytes(path, max_bytes=max_bytes)
     try:
-        value = json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"private JSON file is invalid: {path}") from exc
-    if not isinstance(value, dict):
-        raise RuntimeError(f"private JSON file must be an object: {path}")
-    return value, hashlib.sha256(raw).hexdigest()
+        raise RuntimeError(f"invalid JSON file: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"JSON file is not an object: {path}")
+    return payload, hashlib.sha256(raw).hexdigest()
 
 
 def _task_state(unit: str, task_db: Path) -> str | None:
@@ -278,6 +285,7 @@ def _task_state(unit: str, task_db: Path) -> str | None:
     finally:
         connection.close()
     return row[0] if row and isinstance(row[0], str) else None
+
 
 
 def _private_sqlite_file(path: Path) -> Path:
@@ -462,7 +470,7 @@ def _validate_legacy_self_deploy_collection(
     collection_match = LEGACY_SELF_DEPLOY_COLLECTION.fullmatch(directory.name)
     if collection_match is None:
         raise RuntimeError("legacy collection name is outside the typed contract")
-    manifest, manifest_file_sha256 = _read_json_file(directory / "manifest.json", max_bytes=MAX_JSON_BYTES)
+    manifest, manifest_file_sha256 = _read_json_file(directory / "manifest.json")
     expected_manifest_keys = {
         "schema_version",
         "created_at_unix",
@@ -536,7 +544,7 @@ def _validate_legacy_self_deploy_collection(
         }
         if tuple(actual_files) not in allowed_file_sets:
             raise RuntimeError(f"legacy collection child file set is invalid: {unit}")
-        metadata, metadata_file_sha256 = _read_json_file(child / "metadata.json", max_bytes=MAX_JSON_BYTES)
+        metadata, metadata_file_sha256 = _read_json_file(child / "metadata.json")
         metadata_size = (child / "metadata.json").stat().st_size
         stdout_size, stdout_sha256 = _private_file_digest(
             child / "stdout.log", max_bytes=MAX_ARCHIVE_FILE_BYTES
@@ -578,7 +586,7 @@ def _validate_legacy_self_deploy_collection(
         finalization_projection: dict[str, Any] | None = None
         if "finalization.json" in actual_files:
             finalization, finalization_file_sha256 = _read_json_file(
-                child / "finalization.json", max_bytes=MAX_JSON_BYTES
+                child / "finalization.json"
             )
             observed_collection_bytes += (child / "finalization.json").stat().st_size
             if observed_collection_bytes > MAX_LEGACY_COLLECTION_BYTES:
@@ -778,7 +786,7 @@ def _job_record(
     directory = _private_directory(jobs_root / job_name)
     if directory.parent != jobs_root:
         raise RuntimeError(f"job directory escaped jobs root: {job_name}")
-    metadata, metadata_sha256 = _read_json_file(directory / "metadata.json", max_bytes=MAX_JSON_BYTES)
+    metadata, metadata_sha256 = _read_json_file(directory / "metadata.json")
     if metadata.get("unit") != job_name:
         raise RuntimeError(f"job metadata is not bound to its unit: {job_name}")
     created = metadata.get("created_at_unix")
@@ -829,7 +837,7 @@ def _job_record(
                 "ExecMainStatus",
             )
         },
-        "archive": terminal and age >= minimum_job_age_seconds,
+        "archive": terminal and age >= minimum_age_seconds,
     }
 
 
@@ -850,7 +858,7 @@ def _archived_job_receipt(
     resolved_root = _private_directory(archive_root)
     if directory.parent != resolved_root:
         raise RuntimeError(f"archived job escaped archive root: {job_name}")
-    manifest, _ = _read_json_file(directory / "archive-manifest.json", max_bytes=MAX_JSON_BYTES)
+    manifest, _ = _read_json_file(directory / "archive-manifest.json")
     expected_keys = {
         "schema_version",
         "unit",
@@ -1313,6 +1321,7 @@ def _validated_plan(plan: dict[str, Any], expected_plan_sha256: str) -> dict[str
     return plan
 
 
+
 def _prepare_worker_resets(
     plan: dict[str, Any],
     *,
@@ -1338,7 +1347,6 @@ def _prepare_worker_resets(
         )
         if current != prior:
             raise RuntimeError(f"worker reset evidence drifted before apply: {unit}")
-
 
 def _prepare_archives(plan: dict[str, Any]) -> tuple[Path, Path, Path, list[dict[str, Any]]]:
     jobs_root = _private_directory(Path(plan["jobs_root"]))
@@ -1454,6 +1462,7 @@ def _append_completion_audit(receipt: dict[str, Any]) -> dict[str, Any]:
         "archived_job_count": len(receipt["archived_jobs"]),
         "completed": receipt["completed"],
     })
+
 
 
 RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION = (
@@ -1578,8 +1587,6 @@ def _retention_audit_reconciliation_state(
         operation = record.get("operation")
         same_identity = (
             record.get("plan_sha256") == plan_sha256
-            and not isinstance(record.get("attempt"), bool)
-            and isinstance(record.get("attempt"), int)
             and record.get("attempt") == attempt
         )
         if (
@@ -1901,7 +1908,6 @@ def _select_receipt_target(
             expected_previous_receipt_sha256=previous_receipt_sha256,
         )
     raise RuntimeError("retention receipt retry bound exhausted")
-
 
 def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, Any]:
     plan = _validated_plan(plan, expected_plan_sha256)
