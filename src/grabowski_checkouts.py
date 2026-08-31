@@ -54,8 +54,8 @@ OWNER_HANDOFF_CONFIRMATION = "align-checkout-owner-bindings"
 BINDING_IDENTITY_REBIND_PREVIEW_TTL_SECONDS = 5 * 60
 BINDING_IDENTITY_REBIND_CONFIRMATION = "rebind-checkout-lifecycle-identity"
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
-# Cleanup is deliberately delayed so recovery evidence has one full day to surface.
-CHECKOUT_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
+# Compatibility telemetry remains in schema 2; cleanup itself is immediately eligible.
+CHECKOUT_CLEANUP_GRACE_SECONDS = 0
 CLEANUP_PLAN_SCHEMA_VERSION = 2
 CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = ("archive_age_seconds",)
 ACTIVE_CHECKOUT_LIMIT_ENV = "GRABOWSKI_MAX_ACTIVE_CHECKOUTS_PER_REPO"
