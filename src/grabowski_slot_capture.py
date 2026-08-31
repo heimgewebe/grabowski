@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import threading
 import time
 from typing import Any, Iterator, Protocol
 
@@ -32,6 +33,8 @@ TERMINAL_COLUMNS = (
     "elapsed_clock",
     "terminal_evidence_sha256",
 )
+_SQLITE_CONNECT_LOCK = threading.Lock()
+
 EXPECTED_SLOT_COLUMNS = (
     "slot_id",
     "state",
@@ -256,6 +259,13 @@ def _public_nonclaims() -> list[str]:
     ]
 
 
+def _lost_session_terminal_payload() -> dict[str, str]:
+    return {
+        "state": "indeterminate",
+        "reason": "capture_session_lost",
+    }
+
+
 class SlotCaptureProvider:
     """Durable evidence-only absent -> begun -> terminal state machine.
 
@@ -416,21 +426,176 @@ class SlotCaptureProvider:
             return
         raise SlotCaptureIntegrityError("stored slot state is invalid")
 
+    @staticmethod
+    def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+        return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+    @staticmethod
+    def _private_database_metadata(metadata: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and not (stat.S_IMODE(metadata.st_mode) & 0o077)
+            and metadata.st_nlink == 1
+        )
+
+    def _open_database_anchor(self) -> tuple[int, os.stat_result]:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow or not Path("/proc/self/fd").is_dir():
+            raise SlotCaptureIntegrityError(
+                "slot capture database cannot establish a no-follow file identity"
+            )
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | nofollow
+        try:
+            descriptor = os.open(self.database, flags)
+        except OSError as exc:
+            raise SlotCaptureIntegrityError(
+                "slot capture database cannot be opened without following links"
+            ) from exc
+        try:
+            anchored = os.fstat(descriptor)
+            current = os.stat(self.database, follow_symlinks=False)
+            if (
+                not self._private_database_metadata(anchored)
+                or not self._private_database_metadata(current)
+                or not self._same_file_identity(anchored, current)
+            ):
+                raise SlotCaptureIntegrityError(
+                    "slot capture database changed before identity binding"
+                )
+            return descriptor, anchored
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _assert_database_anchor(
+        self, descriptor: int, anchored: os.stat_result
+    ) -> None:
+        try:
+            descriptor_metadata = os.fstat(descriptor)
+            current = os.stat(self.database, follow_symlinks=False)
+        except OSError as exc:
+            raise SlotCaptureIntegrityError(
+                "slot capture database identity became unavailable"
+            ) from exc
+        if (
+            not self._private_database_metadata(descriptor_metadata)
+            or not self._private_database_metadata(current)
+            or not self._same_file_identity(anchored, descriptor_metadata)
+            or not self._same_file_identity(anchored, current)
+        ):
+            raise SlotCaptureIntegrityError(
+                "slot capture database identity changed during the operation"
+            )
+
+    @staticmethod
+    def _open_fd_identities() -> dict[int, tuple[int, int]]:
+        identities: dict[int, tuple[int, int]] = {}
+        try:
+            entries = os.listdir("/proc/self/fd")
+        except OSError as exc:
+            raise SlotCaptureIntegrityError(
+                "slot capture cannot inspect process file identities"
+            ) from exc
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            descriptor = int(entry)
+            try:
+                metadata = os.fstat(descriptor)
+            except OSError:
+                continue
+            identities[descriptor] = (metadata.st_dev, metadata.st_ino)
+        return identities
+
+    def _connect_anchored_database(
+        self, descriptor: int, anchored: os.stat_result
+    ) -> tuple[sqlite3.Connection, int]:
+        anchor_identity = (anchored.st_dev, anchored.st_ino)
+        before = self._open_fd_identities()
+        try:
+            connection = sqlite3.connect(
+                f"/proc/self/fd/{descriptor}", timeout=5, isolation_level=None
+            )
+        except sqlite3.Error as exc:
+            raise SlotCaptureIntegrityError(
+                "slot capture database could not open through its bound identity"
+            ) from exc
+        try:
+            after = self._open_fd_identities()
+            sqlite_descriptors = [
+                candidate
+                for candidate, identity in after.items()
+                if candidate != descriptor
+                and identity == anchor_identity
+                and before.get(candidate) != identity
+            ]
+            if len(sqlite_descriptors) != 1:
+                raise SlotCaptureIntegrityError(
+                    "SQLite connection is not bound to the validated database identity"
+                )
+            sqlite_descriptor = sqlite_descriptors[0]
+        except BaseException:
+            connection.close()
+            raise
+        return connection, sqlite_descriptor
+
+    def _assert_database_binding(
+        self,
+        descriptor: int,
+        sqlite_descriptor: int,
+        anchored: os.stat_result,
+    ) -> None:
+        self._assert_database_anchor(descriptor, anchored)
+        try:
+            sqlite_metadata = os.fstat(sqlite_descriptor)
+        except OSError as exc:
+            raise SlotCaptureIntegrityError(
+                "SQLite database identity became unavailable"
+            ) from exc
+        if not self._same_file_identity(anchored, sqlite_metadata):
+            raise SlotCaptureIntegrityError(
+                "SQLite connection changed database identity during the operation"
+            )
+
     @contextmanager
     def _database(self) -> Iterator[sqlite3.Connection]:
         self._ensure_parent()
         self._ensure_database_file()
         self._ensure_parent()
-        connection = sqlite3.connect(self.database, timeout=5, isolation_level=None)
-        connection.row_factory = sqlite3.Row
+        connection: sqlite3.Connection | None = None
+        sqlite_descriptor: int | None = None
+        descriptor: int | None = None
+        anchored: os.stat_result | None = None
         try:
+            with _SQLITE_CONNECT_LOCK:
+                descriptor, anchored = self._open_database_anchor()
+                connection, sqlite_descriptor = self._connect_anchored_database(
+                    descriptor, anchored
+                )
+            self._assert_database_binding(descriptor, sqlite_descriptor, anchored)
+            connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA trusted_schema=OFF")
             connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("PRAGMA synchronous=FULL")
-            yield connection
+            try:
+                yield connection
+            except sqlite3.Error as exc:
+                try:
+                    self._assert_database_binding(
+                        descriptor, sqlite_descriptor, anchored
+                    )
+                except SlotCaptureIntegrityError as integrity_exc:
+                    raise integrity_exc from exc
+                raise
+            self._assert_database_binding(descriptor, sqlite_descriptor, anchored)
         finally:
-            connection.close()
+            if connection is not None:
+                with _SQLITE_CONNECT_LOCK:
+                    connection.close()
+            if descriptor is not None:
+                os.close(descriptor)
         self._ensure_parent()
 
     def _initialize(self) -> None:
@@ -796,6 +961,10 @@ class SlotCaptureProvider:
         payload, payload_json, payload_sha = _normalize_object(
             terminal_payload, field="terminal_payload"
         )
+        if payload == _lost_session_terminal_payload():
+            raise ValueError(
+                "terminal_payload is reserved for provider-owned lost-session terminalization"
+            )
         terminal_readback: dict[str, Any] | None = None
         with self._database() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -845,10 +1014,7 @@ class SlotCaptureProvider:
 
     def terminalize_lost_session(self, slot_id: str) -> dict[str, Any]:
         identifier = _validate_slot_id(slot_id)
-        payload = {
-            "state": "indeterminate",
-            "reason": "capture_session_lost",
-        }
+        payload = _lost_session_terminal_payload()
         payload_json = canonical_json_bytes(payload).decode("utf-8")
         payload_sha = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
         terminal_readback: dict[str, Any] | None = None

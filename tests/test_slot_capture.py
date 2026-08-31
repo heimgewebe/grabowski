@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import sys
 import tempfile
 import threading
@@ -242,6 +243,16 @@ class SlotCaptureProviderTests(unittest.TestCase):
 
         self.assertEqual(store.read(SLOT_A)["terminal_payload"], {"state": "frozen"})
 
+    def test_finalize_rejects_provider_reserved_lost_session_payload(self) -> None:
+        store = self.provider()
+        store.begin(SLOT_A, {"event_id": 54})
+        reserved = {"state": "indeterminate", "reason": "capture_session_lost"}
+
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            store.finalize(SLOT_A, reserved)
+
+        self.assertEqual(store.read(SLOT_A)["state"], "begun")
+
     def test_lost_session_terminalization_is_provider_owned_and_fail_closed(self) -> None:
         authority = FakeAuthority(SESSION_A)
         store = self.provider(authority)
@@ -262,6 +273,8 @@ class SlotCaptureProviderTests(unittest.TestCase):
         replay = store.terminalize_lost_session(SLOT_A)
         self.assertTrue(replay["replayed"])
         self.assertEqual(replay["evidence_sha256"], result["evidence_sha256"])
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            store.finalize(SLOT_A, result["terminal_payload"])
 
     def test_lost_session_terminalization_refuses_live_or_unknown_session(self) -> None:
         authority = FakeAuthority(SESSION_A)
@@ -500,11 +513,14 @@ class SlotCaptureProviderTests(unittest.TestCase):
         database = self.root / "precreated.sqlite3"
         original_connect = capture.sqlite3.connect
         observed_modes: list[int] = []
+        observed_paths: list[str] = []
 
         def observing_connect(*args, **kwargs):
             path = Path(args[0])
-            if path == database:
-                observed_modes.append(stat_mode(path))
+            observed_paths.append(str(path))
+            resolved = path.resolve(strict=True)
+            if resolved == database:
+                observed_modes.append(stat_mode(resolved))
             return original_connect(*args, **kwargs)
 
         with mock.patch.object(capture.sqlite3, "connect", side_effect=observing_connect):
@@ -516,6 +532,108 @@ class SlotCaptureProviderTests(unittest.TestCase):
 
         self.assertTrue(observed_modes)
         self.assertEqual(set(observed_modes), {0o600})
+        self.assertTrue(observed_paths)
+        self.assertTrue(
+            all(path.startswith("/proc/self/fd/") for path in observed_paths)
+        )
+
+    def test_database_swap_between_anchor_and_sqlite_open_is_rejected(self) -> None:
+        store = self.provider()
+        store.begin(SLOT_A, {"event_id": 498})
+        replacement = self.root / "preconnect-replacement.sqlite3"
+        displaced = self.root / "preconnect-displaced.sqlite3"
+        shutil.copy2(store.database, replacement)
+        os.chmod(replacement, 0o600)
+        original_connect = capture.sqlite3.connect
+        swapped = False
+
+        def swapping_connect(*args, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                os.replace(store.database, displaced)
+                os.replace(replacement, store.database)
+            return original_connect(*args, **kwargs)
+
+        with mock.patch.object(capture.sqlite3, "connect", side_effect=swapping_connect):
+            with self.assertRaisesRegex(
+                capture.SlotCaptureIntegrityError, "identity changed"
+            ):
+                store.read(SLOT_A)
+
+        self.assertTrue(swapped)
+        canonical_connection = sqlite3.connect(store.database)
+        displaced_connection = sqlite3.connect(displaced)
+        try:
+            canonical_state = canonical_connection.execute(
+                "SELECT state FROM slots WHERE slot_id=?", (SLOT_A,)
+            ).fetchone()[0]
+            displaced_state = displaced_connection.execute(
+                "SELECT state FROM slots WHERE slot_id=?", (SLOT_A,)
+            ).fetchone()[0]
+        finally:
+            canonical_connection.close()
+            displaced_connection.close()
+        self.assertEqual(canonical_state, "begun")
+        self.assertEqual(displaced_state, "begun")
+
+    def test_sqlite_connection_must_match_anchored_inode(self) -> None:
+        store = self.provider()
+        store.begin(SLOT_A, {"event_id": 499})
+        target = self.root / "redirected.sqlite3"
+        shutil.copy2(store.database, target)
+        os.chmod(target, 0o600)
+        original_connect = capture.sqlite3.connect
+
+        def redirected_connect(*args, **kwargs):
+            return original_connect(target, **kwargs)
+
+        with mock.patch.object(
+            capture.sqlite3, "connect", side_effect=redirected_connect
+        ):
+            with self.assertRaisesRegex(
+                capture.SlotCaptureIntegrityError, "not bound"
+            ):
+                store.read(SLOT_A)
+
+    def test_database_identity_swap_while_active_fails_closed(self) -> None:
+        authority = FakeAuthority(SESSION_A)
+        store = self.provider(authority)
+        store.begin(SLOT_A, {"event_id": 500})
+        target = self.root / "replacement.sqlite3"
+        displaced = self.root / "displaced.sqlite3"
+        shutil.copy2(store.database, target)
+        os.chmod(target, 0o600)
+
+        def swap_database() -> capture.ClockSample:
+            os.replace(store.database, displaced)
+            store.database.symlink_to(target)
+            return capture.ClockSample(
+                boot_id="boot-a",
+                monotonic_ns=2_000_000_000,
+                unix_ns=1_800_000_001_000_000_000,
+            )
+
+        store.clock = mock.Mock(sample=mock.Mock(side_effect=swap_database))
+        with self.assertRaisesRegex(
+            capture.SlotCaptureIntegrityError, "identity changed"
+        ):
+            store.finalize(SLOT_A, {"state": "frozen"})
+
+        target_connection = sqlite3.connect(target)
+        displaced_connection = sqlite3.connect(displaced)
+        try:
+            target_state = target_connection.execute(
+                "SELECT state FROM slots WHERE slot_id=?", (SLOT_A,)
+            ).fetchone()[0]
+            displaced_state = displaced_connection.execute(
+                "SELECT state FROM slots WHERE slot_id=?", (SLOT_A,)
+            ).fetchone()[0]
+        finally:
+            target_connection.close()
+            displaced_connection.close()
+        self.assertEqual(target_state, "begun")
+        self.assertEqual(displaced_state, "begun")
 
     def test_symlinked_state_root_is_rejected_before_database_creation(self) -> None:
         real_root = self.root / "real-root"
