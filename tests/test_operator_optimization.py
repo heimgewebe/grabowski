@@ -356,6 +356,59 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         self.assertEqual(findings["contract_contradiction"]["severity"], "critical")
         self.assertEqual(result["findings"][0]["id"], "uncertain_outcome")
 
+    def test_reconciliation_only_transition_gap_preserves_completed_effect_semantics(self) -> None:
+        def reconciliation_audit_provider(**_kwargs) -> dict:
+            payload = audit_provider()
+            transition = next(
+                item
+                for item in payload["signal_projection"]["signals"]
+                if item["id"] == "transition_gap"
+            )
+            transition.update(
+                {
+                    "severity": "medium",
+                    "count": 2,
+                    "evidence_refs": ["audit-record-sha256:reconciliation"],
+                    "recommended_action": (
+                        "review append-only completion-audit reconciliation evidence; "
+                        "do not retry the retention effect"
+                    ),
+                    "details": {
+                        "execution_gap_count": 0,
+                        "completion_audit_gap_count": 2,
+                        "count_semantics": (
+                            "execution_gaps_when_present_else_completion_audit_gaps"
+                        ),
+                    },
+                }
+            )
+            return payload
+
+        result = optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            health_provider=health_provider,
+            audit_provider=reconciliation_audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+        transition = next(
+            item for item in result["findings"] if item["id"] == "transition_gap"
+        )
+        self.assertEqual(transition["severity"], "medium")
+        self.assertIn("reconciled append-only", transition["title"])
+        self.assertIn("already recorded as completed", transition["observation"])
+        self.assertNotIn("unmatched transition intents", transition["observation"])
+        self.assertEqual(
+            transition["recommended_action"],
+            "review append-only completion-audit reconciliation evidence; do not retry the retention effect",
+        )
+        self.assertEqual(
+            transition["count_semantics"],
+            "execution_gaps_when_present_else_completion_audit_gaps",
+        )
+
     def test_observed_contract_contradiction_becomes_ranked_finding(self) -> None:
         def contradiction_audit_provider(**_kwargs) -> dict:
             payload = audit_provider()

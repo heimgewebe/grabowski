@@ -738,6 +738,79 @@ def _observed_audit_signal_finding(
     return finding
 
 
+def _transition_gap_finding(evidence: ReportEvidence) -> dict[str, Any] | None:
+    signal = _audit_signal(evidence.audit, "transition_gap")
+    if not isinstance(signal, dict) or signal.get("status") != "observed":
+        return None
+    details = signal.get("details")
+    reconciliation_only = False
+    if isinstance(details, dict):
+        execution_gap_count = details.get("execution_gap_count")
+        completion_audit_gap_count = details.get("completion_audit_gap_count")
+        reconciliation_only = (
+            isinstance(execution_gap_count, int)
+            and not isinstance(execution_gap_count, bool)
+            and execution_gap_count == 0
+            and isinstance(completion_audit_gap_count, int)
+            and not isinstance(completion_audit_gap_count, bool)
+            and completion_audit_gap_count > 0
+        )
+    if reconciliation_only:
+        return _observed_audit_signal_finding(
+            evidence,
+            signal_id="transition_gap",
+            fallback_severity="medium",
+            title="Retention completion audit was reconciled append-only",
+            observation=(
+                "The seven-day audit signal projection reports {count} completion-audit "
+                "reconciliation records for retention effects already recorded as completed."
+            ),
+            interpretation=(
+                "The retention effect is already completed; append-only reconciliation "
+                "repairs audit completeness without authorizing or requiring another effect."
+            ),
+            alternative_interpretation=(
+                "The reconciliation proves the bounded audit closeout, not why the original "
+                "completion audit record was absent."
+            ),
+            fallback_action=(
+                "Review append-only completion-audit reconciliation evidence; do not retry "
+                "the retention effect."
+            ),
+            fallback_limits=[
+                "cause_of_the_completion_audit_gap",
+                "that_the_original_completion_audit_record_existed",
+                "safe_retry",
+            ],
+        )
+    return _observed_audit_signal_finding(
+        evidence,
+        signal_id="transition_gap",
+        fallback_severity="high",
+        title="Audited transition is missing its completion",
+        observation=(
+            "The seven-day audit signal projection reports {count} unmatched "
+            "transition intents after the grace period."
+        ),
+        interpretation=(
+            "An expected completion record is absent; before retry, the operator "
+            "must distinguish an incomplete effect from a missing audit closeout."
+        ),
+        alternative_interpretation=(
+            "The target effect may have completed even though no matching completion "
+            "record is present in the audited transition family."
+        ),
+        fallback_action=(
+            "Trace each unmatched intent and read the exact target state before retry."
+        ),
+        fallback_limits=[
+            "effect_absence_outside_the_audit_chain",
+            "causality",
+            "safe_retry",
+        ],
+    )
+
+
 def _audit_signal_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for item in (
@@ -790,32 +863,7 @@ def _audit_signal_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
                 "automatic_contract_change_authority",
             ],
         ),
-        _observed_audit_signal_finding(
-            evidence,
-            signal_id="transition_gap",
-            fallback_severity="high",
-            title="Audited transition is missing its completion",
-            observation=(
-                "The seven-day audit signal projection reports {count} unmatched "
-                "transition intents after the grace period."
-            ),
-            interpretation=(
-                "An expected completion record is absent; before retry, the operator "
-                "must distinguish an incomplete effect from a missing audit closeout."
-            ),
-            alternative_interpretation=(
-                "The target effect may have completed even though no matching completion "
-                "record is present in the audited transition family."
-            ),
-            fallback_action=(
-                "Trace each unmatched intent and read the exact target state before retry."
-            ),
-            fallback_limits=[
-                "effect_absence_outside_the_audit_chain",
-                "causality",
-                "safe_retry",
-            ],
-        ),
+        _transition_gap_finding(evidence),
     ):
         if item is not None:
             findings.append(item)
