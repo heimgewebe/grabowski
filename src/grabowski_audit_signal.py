@@ -346,6 +346,23 @@ def _audit_transition_gap_signal(
         consumed_retention_receipts[receipt_sha256] = key
         return True
 
+    def _reserve_unbound_completion_receipt(record: dict[str, Any]) -> None:
+        receipt_sha256 = record.get("receipt_sha256")
+        if (
+            not _audit_sha256_valid(receipt_sha256)
+            or receipt_sha256 in consumed_retention_receipts
+        ):
+            return
+        record_digest = _audit_record_evidence_sha256(record)
+        _claim_receipt(
+            record,
+            (
+                "__unbound_retention_completion__",
+                0,
+                record_digest if record_digest is not None else receipt_sha256,
+            ),
+        )
+
     for record, timestamp_unix in prepared_records:
         if timestamp_unix is None or timestamp_unix > end_unix:
             continue
@@ -362,6 +379,7 @@ def _audit_transition_gap_signal(
                     _remember_historical_open(key)
             elif operation == retention_pair[1]:
                 identity = _retention_transition_identity(record)
+                historical_matched = False
                 if identity is not None and not _receipt_consumed(record):
                     completed_key = _peek_latest_historical_open(identity)
                     if completed_key is not None and _claim_receipt(
@@ -370,6 +388,12 @@ def _audit_transition_gap_signal(
                         _pop_historical_open(completed_key)
                         _pop_historical_unmatched(completed_key)
                         historical_completed_keys.add(completed_key)
+                        historical_matched = True
+                if not historical_matched:
+                    # Even when no report-window intent can be paired, a verified
+                    # completion carrying a valid terminal receipt proves that the
+                    # receipt is already occupied by an earlier/unknown execution.
+                    _reserve_unbound_completion_receipt(record)
             elif operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
                 target_key = _retention_reconciliation_target_key(record)
                 if (
@@ -494,6 +518,10 @@ def _audit_transition_gap_signal(
                     ):
                         pending[retention_pair].pop(match_index)
                         matched = True
+            if not matched:
+                # Preserve receipt uniqueness even when audit ordering or legacy
+                # evidence prevents this completion from matching a visible intent.
+                _reserve_unbound_completion_receipt(record)
             if matched:
                 completed_counts[retention_pair[0]] += 1
             continue

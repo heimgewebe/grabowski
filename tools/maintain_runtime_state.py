@@ -1630,7 +1630,12 @@ def _retention_audit_reconciliation_state(
             # Once that execution has already been bound by a prior completion or
             # reconciliation, later audit repair evidence must not consume another
             # duplicate intent.
-            if receipt_consumer_digest is not None or not open_intents:
+            if receipt_consumer_digest is not None:
+                continue
+            if not open_intents:
+                # A completion that precedes every eligible intent still occupies
+                # this terminal receipt. It cannot later be rebound to a newer intent.
+                receipt_conflict = True
                 continue
             consumed_digest = next(reversed(open_intents))
             open_intents.pop(consumed_digest)

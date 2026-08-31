@@ -145,6 +145,11 @@ class RetentionReconciliationAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "already bound to another intent"):
             self._state(items, target=self.INTENT_B)
 
+    def test_completion_before_target_intent_occupies_receipt(self) -> None:
+        items = [self._completion(), self._intent(self.INTENT_B)]
+        with self.assertRaisesRegex(RuntimeError, "already bound to another intent"):
+            self._state(items, target=self.INTENT_B)
+
 
 class RetentionSignalReceiptConsumptionTests(unittest.TestCase):
     def _intent(self, digest: str, now: int) -> tuple[dict[str, object], int]:
@@ -378,6 +383,76 @@ class RetentionSignalReceiptConsumptionTests(unittest.TestCase):
         self.assertEqual(
             result["details"]["execution_gap_evidence_refs"],
             ["audit-record-sha256:" + legacy_intent],
+        )
+
+    def test_historical_unmatched_legacy_completion_reserves_receipt(self) -> None:
+        now = 1_800_000_000
+        receipt = "4" * 64
+        modern_intent = "a" * 64
+        historical = now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 10
+        result = self._signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": "e" * 64,
+                    },
+                    historical - 1,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-complete",
+                        "record_sha256": "f" * 64,
+                        "receipt_sha256": receipt,
+                        "completed": True,
+                    },
+                    historical,
+                ),
+                self._intent(modern_intent, now - 1_000),
+                self._reconciliation(
+                    digest="c" * 64,
+                    intent_digest=modern_intent,
+                    receipt_digest=receipt,
+                    now=now - 999,
+                ),
+            ],
+            now,
+        )
+        self.assertEqual(result["severity"], "high")
+        self.assertEqual(result["details"]["execution_gap_count"], 1)
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
+        self.assertEqual(
+            result["details"]["execution_gap_evidence_refs"],
+            ["audit-record-sha256:" + modern_intent],
+        )
+
+    def test_unmatched_completion_before_intent_reserves_receipt(self) -> None:
+        now = 1_800_000_000
+        receipt = "3" * 64
+        modern_intent = "a" * 64
+        result = self._signal(
+            [
+                self._completion(
+                    digest="f" * 64,
+                    receipt_digest=receipt,
+                    now=now - 1_000,
+                ),
+                self._intent(modern_intent, now - 999),
+                self._reconciliation(
+                    digest="c" * 64,
+                    intent_digest=modern_intent,
+                    receipt_digest=receipt,
+                    now=now - 998,
+                ),
+            ],
+            now,
+        )
+        self.assertEqual(result["severity"], "high")
+        self.assertEqual(result["details"]["execution_gap_count"], 1)
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
+        self.assertEqual(
+            result["details"]["execution_gap_evidence_refs"],
+            ["audit-record-sha256:" + modern_intent],
         )
 
 
