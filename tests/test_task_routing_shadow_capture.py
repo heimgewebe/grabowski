@@ -241,7 +241,7 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
 
     def test_direct_task_artifacts_validate_against_current_schemas(self) -> None:
         try:
-            from jsonschema import Draft202012Validator, FormatChecker
+            from jsonschema import Draft202012Validator, FormatChecker, ValidationError
         except ModuleNotFoundError:
             self.skipTest("optional jsonschema runtime dependency is unavailable")
         self._capture()
@@ -288,6 +288,40 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
             schema = json.loads((ROOT / "contracts" / filename).read_text())
             Draft202012Validator.check_schema(schema)
             Draft202012Validator(schema, format_checker=format_checker).validate(sample)
+
+        direct_contracts = {
+            "operator-routing-shadow-prospective-eligibility.v3.schema.json": (
+                prospective,
+                "workspace_case",
+            ),
+            "operator-routing-shadow-eligibility.v4.schema.json": (
+                eligibility,
+                "prospective_eligibility",
+            ),
+            "operator-routing-shadow-record.v4.schema.json": (record, "eligibility"),
+        }
+        for filename, (sample, workspace_key) in direct_contracts.items():
+            schema = json.loads((ROOT / "contracts" / filename).read_text())
+            validator = Draft202012Validator(schema, format_checker=format_checker)
+
+            invalid_source = json.loads(json.dumps(sample))
+            invalid_source["canonical_route_evidence"]["source"] = (
+                capture.AGENT_WORKSPACE_ROUTE_SOURCE
+            )
+            with self.assertRaises(ValidationError):
+                validator.validate(invalid_source)
+
+            invalid_capture = json.loads(json.dumps(sample))
+            invalid_capture["case_provenance"]["capture_path"] = (
+                capture.WORKSPACE_PRESTART_CAPTURE_PATH
+            )
+            with self.assertRaises(ValidationError):
+                validator.validate(invalid_capture)
+
+            invalid_workspace = json.loads(json.dumps(sample))
+            invalid_workspace[workspace_key]["workspace_id"] = "gaw-workspace-12345678"
+            with self.assertRaises(ValidationError):
+                validator.validate(invalid_workspace)
 
     def test_reviewed_direct_task_case_requires_independent_assessments(self) -> None:
         self._capture()
@@ -395,6 +429,38 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
             )
         self.assertEqual([], list((self.root / "eligibility").iterdir()))
         self.assertEqual([], list((self.root / "records").iterdir()))
+
+    def test_direct_task_prospective_rejects_workspace_route_source(self) -> None:
+        self._capture()
+        prospective_path = next((self.root / "prospective").iterdir())
+        prospective = json.loads(prospective_path.read_text())
+        route_ref = prospective["canonical_route_evidence"]
+        route_ref["source"] = capture.AGENT_WORKSPACE_ROUTE_SOURCE
+        workspace_case = prospective["workspace_case"]
+        route_ref["manifest_identity_sha256"] = capture._manifest_identity_sha256(
+            workspace_case["workspace_id"],
+            workspace_case["plan_sha256"],
+            route_ref["route_evidence_sha256"],
+            route_source=route_ref["source"],
+        )
+        workspace_case["case_id"] = capture._workspace_case_id(
+            workspace_case["workspace_id"],
+            workspace_case["plan_sha256"],
+            route_ref["route_evidence_sha256"],
+            route_source=route_ref["source"],
+        )
+        payload = {
+            key: value
+            for key, value in prospective.items()
+            if key != "prospective_eligibility_id"
+        }
+        prospective["prospective_eligibility_id"] = capture._sha256_json(payload)
+
+        with self.assertRaisesRegex(
+            capture.ShadowCaptureError,
+            "route source is invalid",
+        ):
+            capture.validate_prospective_eligibility_v3(prospective)
 
     def test_legacy_v2_prospective_remains_valid_without_source_commitment(self) -> None:
         route = capture._validated_route_evidence(

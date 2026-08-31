@@ -26,10 +26,7 @@
           "type": "integer"
         },
         "source": {
-          "enum": [
-            "agent-workspace-manifest",
-            "direct-task-start"
-          ],
+          "const": "direct-task-start",
           "type": "string"
         }
       },
@@ -44,31 +41,10 @@
     },
     "case_provenance": {
       "additionalProperties": false,
-      "allOf": [
-        {
-          "not": {
-            "properties": {
-              "capture_path": {
-                "const": "direct_capture"
-              },
-              "case_origin": {
-                "const": "production"
-              }
-            },
-            "required": [
-              "case_origin",
-              "capture_path"
-            ]
-          }
-        }
-      ],
       "properties": {
         "capture_path": {
-          "enum": [
-            "agent_workspace_prestart",
-            "direct_capture",
-            "direct_task_prestart"
-          ]
+          "const": "direct_task_prestart",
+          "type": "string"
         },
         "case_origin": {
           "enum": [
@@ -296,7 +272,7 @@
           "type": "string"
         },
         "workspace_id": {
-          "pattern": "^gaw-[a-z0-9][a-z0-9-]{7,79}$",
+          "pattern": "^gaw-direct-task-[0-9a-f]{24}$",
           "type": "string"
         }
       },

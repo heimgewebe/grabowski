@@ -1039,6 +1039,7 @@ def _prove_prospective_binding(
             workspace_id=workspace_id,
             plan_sha256=plan_sha256,
             route_evidence_sha256=route_ref["route_evidence_sha256"],
+            route_source=route_ref["source"],
         )
     elif prospective_schema_version not in {
         PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
@@ -1388,6 +1389,7 @@ def build_prospective_eligibility_v3(
         workspace_id=workspace_case["workspace_id"],
         plan_sha256=workspace_case["plan_sha256"],
         route_evidence_sha256=legacy["canonical_route_evidence"]["route_evidence_sha256"],
+        route_source=legacy["canonical_route_evidence"]["source"],
     )
     payload = {
         "schema_version": PROSPECTIVE_ELIGIBILITY_V3_SCHEMA_VERSION,
@@ -1435,6 +1437,7 @@ def validate_prospective_eligibility_v3(receipt: Any) -> dict[str, Any]:
         workspace_id=workspace_case["workspace_id"],
         plan_sha256=workspace_case["plan_sha256"],
         route_evidence_sha256=receipt["canonical_route_evidence"]["route_evidence_sha256"],
+        route_source=receipt["canonical_route_evidence"]["source"],
     )
     payload = {key: receipt[key] for key in receipt if key != "prospective_eligibility_id"}
     if _sha256_json(payload) != receipt_id:
@@ -1744,6 +1747,7 @@ def build_bound_eligibility_v4(
         workspace_id=workspace_case["workspace_id"],
         plan_sha256=workspace_case["plan_sha256"],
         route_evidence_sha256=prospective["canonical_route_evidence"]["route_evidence_sha256"],
+        route_source=prospective["canonical_route_evidence"]["source"],
     )
     if commitment["task_id"] != eligible_task_id:
         raise ShadowCaptureError(
@@ -1826,6 +1830,7 @@ def validate_bound_eligibility_v4(receipt: Any) -> dict[str, Any]:
         workspace_id=workspace_id,
         plan_sha256=prospective["plan_sha256"],
         route_evidence_sha256=receipt["canonical_route_evidence"]["route_evidence_sha256"],
+        route_source=receipt["canonical_route_evidence"]["source"],
     )
     if commitment["task_id"] != eligible_case:
         raise ShadowCaptureError(
@@ -2343,6 +2348,7 @@ def validate_shadow_record_v4(record: Any) -> dict[str, Any]:
         workspace_id=workspace_id,
         plan_sha256=eligibility["plan_sha256"],
         route_evidence_sha256=record["canonical_route_evidence"]["route_evidence_sha256"],
+        route_source=record["canonical_route_evidence"]["source"],
     )
     if commitment["task_id"] != eligible_case:
         raise ShadowCaptureError(
@@ -3235,7 +3241,12 @@ def _validate_direct_task_source_commitment_lineage(
     workspace_id: str,
     plan_sha256: str,
     route_evidence_sha256: str,
+    route_source: str,
 ) -> dict[str, Any]:
+    if route_source != DIRECT_TASK_ROUTE_SOURCE:
+        raise ShadowCaptureError(
+            "direct task source commitment route source is invalid"
+        )
     commitment = validate_direct_task_source_commitment(value)
     if commitment["workspace_id"] != workspace_id:
         raise ShadowCaptureError("direct task source commitment workspace drifted")
