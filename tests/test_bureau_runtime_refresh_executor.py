@@ -151,6 +151,47 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
                     argv, surface="grabowski_task_start"
                 )
 
+    def test_python_options_before_module_do_not_bypass_executor_guard(self) -> None:
+        request = _request()
+        argv = [
+            "python3",
+            "-u",
+            "-X",
+            "faulthandler",
+            "-m",
+            executor.EXECUTOR_MODULE,
+            "--intent",
+            request["intent"],
+            "--expected-intent-sha256",
+            INTENT_SHA,
+            "--lease-owner",
+            LEASE_OWNER,
+            "--lease-task-id",
+            TASK_ID,
+        ]
+        self.assertTrue(executor.is_executor_module_command(argv))
+        self.assertEqual(request, executor.parse_executor_module_request(argv))
+        with self.assertRaisesRegex(PermissionError, "reserved for grabowski_task_start"):
+            executor.reject_generic_runtime_refresh_execution(
+                argv, surface="grabowski_terminal_run"
+            )
+        self.assertTrue(
+            executor.is_direct_bureau_runtime_refresh_apply(
+                ["python3", "-I", "-m", "bureau.runtime_refresh", "apply"]
+            )
+        )
+
+    def test_unrelated_runtime_refresh_search_terms_are_not_blocked(self) -> None:
+        harmless = [
+            ["rg", "apply", "docs/runtime_refresh.md"],
+            ["grep", "apply", "notes/bureau-runtime-refresh.txt"],
+            ["cat", "apply_runtime_refresh.py"],
+        ]
+        for argv in harmless:
+            executor.reject_generic_runtime_refresh_execution(
+                argv, surface="grabowski_terminal_run"
+            )
+
     def test_terminal_and_fleet_guards_run_before_process_start(self) -> None:
         raw = ["/home/alex/.local/bin/bureau-runtime-refresh", "apply"]
         terminal_started = False

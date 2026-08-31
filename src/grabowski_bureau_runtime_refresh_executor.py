@@ -36,6 +36,11 @@ AUTHORITY_MUTATION_ROOT_FIELD = "authority_state_store.state_root"
 EXECUTOR_TASK_ID_ENV = "GRABOWSKI_BUREAU_RUNTIME_REFRESH_TASK_ID"
 EXECUTOR_TASK_UNIT_ENV = "GRABOWSKI_BUREAU_RUNTIME_REFRESH_TASK_UNIT"
 TASK_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+SHELL_EXECUTABLES = frozenset({"bash", "dash", "fish", "ksh", "sh", "zsh"})
+EXECUTION_WRAPPERS = frozenset({
+    "command", "env", "nice", "nohup", "setsid", "stdbuf", "timeout"
+})
 EXPECTED_RUNTIME_EXECUTION_CONTEXT = {
     "schema_version": 1,
     "kind": "grabowski_bureau_runtime_refresh_execution_context",
@@ -85,10 +90,41 @@ def is_reserved_task_request(argv: list[str]) -> bool:
     return bool(argv) and argv[0] == RESERVED_TASK_COMMAND
 
 
-def _python_module_command(argv: list[str], module: str) -> bool:
+def _python_module_position(argv: list[str]) -> int | None:
     if len(argv) < 3 or Path(argv[0]).name not in {"python", "python3"}:
-        return False
-    return argv[1:3] == ["-m", module]
+        return None
+    index = 1
+    while index < len(argv):
+        item = argv[index]
+        if item == "-m":
+            return index if index + 1 < len(argv) else None
+        if item in {"-c", "--"}:
+            return None
+        if item in PYTHON_VALUE_OPTIONS:
+            if index + 1 >= len(argv):
+                return None
+            index += 2
+            continue
+        if (item.startswith("-W") or item.startswith("-X")) and len(item) > 2:
+            index += 1
+            continue
+        if item.startswith("-"):
+            index += 1
+            continue
+        return None
+    return None
+
+
+def _python_module_command(argv: list[str], module: str) -> bool:
+    position = _python_module_position(argv)
+    return position is not None and argv[position + 1] == module
+
+
+def _python_module_arguments(argv: list[str], module: str) -> list[str] | None:
+    position = _python_module_position(argv)
+    if position is None or argv[position + 1] != module:
+        return None
+    return argv[position + 2 :]
 
 
 def is_executor_module_command(argv: list[str]) -> bool:
@@ -100,23 +136,106 @@ def is_direct_bureau_runtime_refresh_apply(argv: list[str]) -> bool:
         return False
     if Path(argv[0]).name == "bureau-runtime-refresh":
         return "apply" in argv[1:]
-    if _python_module_command(argv, "bureau.runtime_refresh"):
-        return "apply" in argv[3:]
-    return False
+    module_args = _python_module_arguments(argv, "bureau.runtime_refresh")
+    return module_args is not None and "apply" in module_args
+
+
+def _execution_text_looks_like_runtime_refresh(code: str) -> bool:
+    if EXECUTOR_MODULE in code:
+        return True
+    direct = re.search(
+        r"(?:^|[\s;&|()])(?:[^\s;&|()]*/)?bureau-runtime-refresh(?:\s+[^;&|()]*)?\s+apply(?:$|[\s;&|()])",
+        code,
+    )
+    if direct is not None:
+        return True
+    module = re.search(
+        r"(?:python|python3)(?:\s+-[^\s]+)*\s+-m\s+bureau\.runtime_refresh(?:\s+[^;&|()]*)?\s+apply(?:$|[\s;&|()])",
+        code,
+    )
+    if module is not None:
+        return True
+    return "apply_runtime_refresh" in code and "runtime_refresh" in code
+
+
+def _python_inline_code(argv: list[str]) -> str | None:
+    if not argv or Path(argv[0]).name not in {"python", "python3"}:
+        return None
+    try:
+        index = argv.index("-c", 1)
+    except ValueError:
+        return None
+    return argv[index + 1] if index + 1 < len(argv) else None
+
+
+def _wrapped_child_command(argv: list[str]) -> list[str] | None:
+    if not argv:
+        return None
+    name = Path(argv[0]).name
+    if name not in EXECUTION_WRAPPERS:
+        return None
+    index = 1
+    if name == "env":
+        while index < len(argv):
+            item = argv[index]
+            if item == "--":
+                index += 1
+                break
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", item):
+                index += 1
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+    elif name == "command":
+        while index < len(argv) and (argv[index] == "--" or argv[index].startswith("-")):
+            index += 1
+    elif name == "nice":
+        while index < len(argv):
+            item = argv[index]
+            if item in {"-n", "--adjustment"}:
+                index += 2
+                continue
+            if item.startswith("--adjustment="):
+                index += 1
+                continue
+            if item.startswith("-"):
+                index += 1
+                continue
+            break
+    elif name == "timeout":
+        while index < len(argv) and argv[index].startswith("-"):
+            index += 1
+        if index < len(argv):
+            index += 1
+    else:
+        while index < len(argv) and argv[index].startswith("-"):
+            index += 1
+    return argv[index:] if index < len(argv) else None
 
 
 def _looks_like_wrapped_bureau_runtime_refresh_apply(argv: list[str]) -> bool:
     if not argv:
         return False
-    material = "\n".join(argv)
-    if not any(
-        marker in material
-        for marker in ("bureau-runtime-refresh", "bureau.runtime_refresh", "runtime_refresh")
-    ):
+    name = Path(argv[0]).name
+    if name in SHELL_EXECUTABLES:
+        for flag in ("-c", "-lc", "-cl"):
+            if flag in argv:
+                index = argv.index(flag)
+                if index + 1 < len(argv):
+                    return _execution_text_looks_like_runtime_refresh(argv[index + 1])
+        return False
+    if name in {"python", "python3"}:
+        inline = _python_inline_code(argv)
+        return inline is not None and _execution_text_looks_like_runtime_refresh(inline)
+    child = _wrapped_child_command(argv)
+    if child is None:
         return False
     return (
-        re.search(r"(?<![A-Za-z0-9_-])apply(?![A-Za-z0-9_-])", material) is not None
-        or "apply_runtime_refresh" in material
+        is_executor_module_command(child)
+        or is_direct_bureau_runtime_refresh_apply(child)
+        or _looks_like_wrapped_bureau_runtime_refresh_apply(child)
     )
 
 
@@ -164,10 +283,11 @@ def parse_reserved_task_request(argv: list[str]) -> dict[str, str]:
 
 
 def parse_executor_module_request(argv: list[str]) -> dict[str, str]:
-    if not is_executor_module_command(argv):
+    module_args = _python_module_arguments(argv, EXECUTOR_MODULE)
+    if module_args is None:
         raise BureauRuntimeRefreshExecutorError("executor module command is required")
     try:
-        parsed = _executor_parser(prog=EXECUTOR_MODULE).parse_args(argv[3:])
+        parsed = _executor_parser(prog=EXECUTOR_MODULE).parse_args(module_args)
     except SystemExit as exc:
         raise BureauRuntimeRefreshExecutorError("executor module arguments are invalid") from exc
     return _validate_request_values(
