@@ -38,7 +38,7 @@ The runtime implementation lives in the already deployed `grabowski_grip_orchest
 
 A self-consistent caller-supplied Captain JSON object is **not** sufficient settlement evidence. `saga-settle` requires the exact `captain-run-audit-intent` and `captain-run-audit-completion` records that the server emitted for the real Captain call. It reads both records from one verified immutable audit snapshot, checks their hash-chain identities, actor/context/request continuity and exact action/target/head/base/receipt/output/status bindings, then derives `VerifiedCaptainAuditBinding.v1`. A missing or mismatching audit record fails closed.
 
-The audit lookup is intentionally bounded to the newest 100,000 verified records. If a Captain result is so old that its records are outside that window, the saga does not infer authenticity and does not gain retry authority; the caller must obtain fresh authoritative evidence or use the normal recovery path.
+The Captain-result recovery path accepts only `VerifiedCaptainAuditResultRef.v1` pointing at an exact verified completion record. Resolution scans the verified immutable audit segments backward and may cheaply skip segments that cannot contain the requested record; it is not limited to the newest 100,000 records. The referenced completion and its paired intent must still satisfy the exact Saga binding, otherwise settlement fails closed and gains no retry authority.
 
 ## Saga: PR settlement
 
@@ -183,7 +183,17 @@ PR #980 merged at `2026-08-30T07:27:17Z` with final PR head `eb7702363febb0a9164
 
 This follow-up documentation change is the next PR-settlement pilot target because it records the newly established live truth rather than fabricating a retrospective settlement. Before its merge effect, execution must create a fresh PR-settlement `saga-plan` and receipt-bound `saga-run` for the exact new PR/head/base identity. The existing Captain path must then pass its normal review, CI and merge gates. Only an authoritative GitHub readback plus `saga-settle == settled` may establish pilot 1.
 
-Only the exact merge commit proven by that settlement may become the runtime-deployment pilot target. Pilot 2 must independently create a fresh runtime-deployment `saga-plan` and receipt-bound `saga-run`, execute the existing Captain deployment action, read the deployed identity to exact convergence, verify the Captain audit pair, and require `saga-settle == settled`. No merge, scheduled deployment or historical receipt is promoted to acceptance evidence without those bindings.
+Only the exact merge commit proven by that settlement may become the runtime-deployment pilot target. Pilot 2 must independently create a fresh runtime-deployment `saga-plan`, receipt-bound `saga-run`, execute the existing Captain deployment action, read the deployed identity to exact convergence, verify the Captain audit pair, and require `saga-settle == settled`. No merge, scheduled deployment or historical receipt is promoted to acceptance evidence without those bindings.
+
+### Final live acceptance reset — 2026-08-31
+
+PR #997 merged as `4dd58cf9ec0320296affcd800375eabaaf0de3f1` and the currently serving Grabowski runtime is on protected `main` head `225bed296d08c87ef557b954059a8de754b1639e`, so the durable Captain-result recovery fix is now active in production. The deployment that established that runtime was a normal `grabowski_runtime_deploy_schedule` execution, not a runtime-deployment Saga, and is not promoted to pilot evidence.
+
+PR #995 remains useful historical effect evidence: its Captain merge and exact verified Captain audit completion are still recoverable. However, the full historical `OperatorSagaRunReceipt.v1` body required for a fresh settlement replay has not been recovered from durable operator state. Its known run digest is not substituted for that missing structured receipt, and no historical effect is replayed solely to manufacture acceptance.
+
+This documentation-only change is therefore the new PR-settlement pilot target, bound to protected baseline `225bed296d08c87ef557b954059a8de754b1639e`. Before any merge effect, the exact PR head/base/diff must receive a fresh `saga-plan` and receipt-bound `saga-run`; the existing Captain path must then pass its normal gates, GitHub must be read back authoritatively, and `saga-settle` must reach `settled` using the verified Captain audit chain. Only the exact merge commit established by that settlement becomes pilot 2's runtime-deployment target.
+
+Pilot 2 must then start fresh from that exact merge commit: new runtime-deployment plan and run receipt, normal Captain deployment, exact deployment-identity convergence, verified Captain audit binding and `saga-settle == settled`. A concurrent `main` advance may not be silently substituted for the bound merge identity; any identity drift requires a new plan rather than retrospective rebinding.
 
 ## Non-claims
 
