@@ -44,6 +44,13 @@ _SCALAR_RECORD_FIELDS = (
     "commit",
     "release_id",
     "returncode",
+    "plan_sha256",
+    "receipt_sha256",
+    "intent_record_sha256",
+    "attempt",
+    "reconciliation_kind",
+    "completed",
+    "retention_effect_retried",
     "launcher_returncode",
     "launcher_outcome_unknown",
     "recovery_required",
@@ -59,6 +66,8 @@ _STRING_LIST_RECORD_FIELDS = (
     "resource_keys",
     "requested_resource_keys",
 )
+_SHA256_RECORD_FIELDS = frozenset({"plan_sha256", "receipt_sha256", "intent_record_sha256"})
+_BOOLEAN_RECORD_FIELDS = frozenset({"completed", "retention_effect_retried"})
 _EXACT_FILTER_FIELDS = {
     "operation",
     "task_id",
@@ -71,6 +80,9 @@ _EXACT_FILTER_FIELDS = {
     "repo",
     "service",
     "branch",
+    "plan_sha256",
+    "receipt_sha256",
+    "intent_record_sha256",
 }
 _TRACE_SCALAR_FIELDS = (
     "task_id",
@@ -81,6 +93,9 @@ _TRACE_SCALAR_FIELDS = (
     "path",
     "repo",
     "branch",
+    "plan_sha256",
+    "receipt_sha256",
+    "intent_record_sha256",
 )
 _TRACE_ANCHOR_KINDS = {
     "record_sha256",
@@ -92,6 +107,9 @@ _TRACE_ANCHOR_KINDS = {
     "requested_resource_key",
     "unit",
     "path",
+    "plan_sha256",
+    "receipt_sha256",
+    "intent_record_sha256",
 }
 
 
@@ -226,7 +244,10 @@ def _sha256_text(value: Any, *, label: str) -> str:
 def _validate_filters(filters: dict[str, Any]) -> None:
     for key, expected in filters.items():
         if key in _EXACT_FILTER_FIELDS:
-            _bounded_nonempty_text(expected, label=f"filters.{key}")
+            if key in _SHA256_RECORD_FIELDS:
+                _sha256_text(expected, label=f"filters.{key}")
+            else:
+                _bounded_nonempty_text(expected, label=f"filters.{key}")
         elif key == "operation_prefix":
             _bounded_nonempty_text(expected, label="filters.operation_prefix", maximum=256)
         elif key in {"resource_key", "held_resource_key", "requested_resource_key"}:
@@ -305,6 +326,34 @@ def _project_record(record: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         if key not in record:
             continue
         value = record[key]
+        if key in _SHA256_RECORD_FIELDS:
+            if (
+                isinstance(value, str)
+                and len(value) == 64
+                and all(character in "0123456789abcdef" for character in value)
+            ):
+                projected[key] = value
+            else:
+                omitted.append(key)
+            continue
+        if key == "attempt":
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+                projected[key] = value
+            else:
+                omitted.append(key)
+            continue
+        if key == "reconciliation_kind":
+            if value == "completion_audit_gap":
+                projected[key] = value
+            else:
+                omitted.append(key)
+            continue
+        if key in _BOOLEAN_RECORD_FIELDS:
+            if type(value) is bool:
+                projected[key] = value
+            else:
+                omitted.append(key)
+            continue
         if value is None or isinstance(value, (str, int, float, bool)):
             projected[key] = value
         else:
@@ -736,6 +785,19 @@ def _anchor_matches(item: dict[str, Any], kind: str, value: str) -> bool:
     return record.get(kind) == value
 
 
+def _trace_scalar_value(record: dict[str, Any], field: str) -> str | None:
+    value = record.get(field)
+    if field in _SHA256_RECORD_FIELDS:
+        if (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        ):
+            return value
+        return None
+    return value if isinstance(value, str) and value else None
+
+
 def _correlation_tokens(
     items: list[dict[str, Any]],
 ) -> tuple[dict[str, list[str]], dict[str, int]]:
@@ -745,8 +807,8 @@ def _correlation_tokens(
     for item in items:
         record = item["record"]
         for field in _TRACE_SCALAR_FIELDS:
-            value = record.get(field)
-            if isinstance(value, str) and value:
+            value = _trace_scalar_value(record, field)
+            if value is not None:
                 values[field].add(value)
         values["held_resource_key"].update(_held_resource_values(record))
         values["requested_resource_key"].update(_requested_resource_values(record))
@@ -767,8 +829,8 @@ def _shared_correlations(item: dict[str, Any], tokens: dict[str, list[str]]) -> 
     record = item["record"]
     matches: list[str] = []
     for field in _TRACE_SCALAR_FIELDS:
-        value = record.get(field)
-        if isinstance(value, str) and value in tokens.get(field, []):
+        value = _trace_scalar_value(record, field)
+        if value is not None and value in tokens.get(field, []):
             matches.append(f"{field}:{value}")
     held = _held_resource_values(record)
     for resource in tokens.get("held_resource_key", []):
@@ -1090,7 +1152,7 @@ def trace_audit(
     )
     value = (
         _sha256_text(anchor_value, label="anchor_value")
-        if anchor_kind == "record_sha256"
+        if anchor_kind == "record_sha256" or anchor_kind in _SHA256_RECORD_FIELDS
         else _bounded_nonempty_text(anchor_value, label="anchor_value")
     )
     selected_limit = _bounded_positive_int(limit, label="limit", maximum=MAX_TRACE_LIMIT)

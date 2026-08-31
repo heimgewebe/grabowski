@@ -78,6 +78,41 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
             patch.object(grabowski_mcp, "AUDIT_ROTATION_RESERVE_BYTES", 512),
         )
 
+    def test_snapshot_parser_propagates_exact_legacy_raw_line_digest(self) -> None:
+        legacy_line = (
+            b'{"operation": "legacy-evidence", "plan_sha256": "'
+            + b"a" * 64
+            + b'", "attempt": 1}'
+        )
+        v2_line = json.dumps(
+            {
+                "operation": "v2-evidence",
+                "record_sha256": "b" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        records = grabowski_mcp._audit_records_from_components(
+            [
+                (
+                    Path("/tmp/verified-audit-component.jsonl"),
+                    legacy_line + b"\n" + v2_line + b"\n",
+                    {},
+                )
+            ]
+        )
+        self.assertEqual(len(records), 2)
+        self.assertNotIn("record_sha256", records[0])
+        self.assertEqual(
+            records[0][grabowski_mcp._AUDIT_EVIDENCE_RECORD_SHA256_FIELD],
+            hashlib.sha256(legacy_line).hexdigest(),
+        )
+        self.assertNotIn(
+            grabowski_mcp._AUDIT_EVIDENCE_RECORD_SHA256_FIELD,
+            records[1],
+        )
+        self.assertEqual(records[1]["record_sha256"], "b" * 64)
+
     def test_rotation_preserves_complete_chain_and_historical_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
