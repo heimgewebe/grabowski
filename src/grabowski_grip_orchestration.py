@@ -1147,7 +1147,10 @@ def _verified_captain_audit_record(
 
 
 def _verified_captain_audit_reference_identity(
-    plan: dict[str, Any], audit_ref: dict[str, Any]
+    plan: dict[str, Any],
+    audit_ref: dict[str, Any],
+    *,
+    receipt_sha256_json: ReceiptHasher | None = None,
 ) -> dict[str, Any]:
     try:
         import grabowski_audit_query
@@ -1173,6 +1176,7 @@ def _verified_captain_audit_reference_identity(
         intent_sha, snapshot=snapshot, audit_query_module=grabowski_audit_query
     )
 
+    receipt_hasher = receipt_sha256_json or sha256_json
     expected_identity = plan["expected_identity"]
     expected_base = (
         expected_identity.get("base") if plan["saga_kind"] == "pr-settlement" else None
@@ -1185,7 +1189,7 @@ def _verified_captain_audit_reference_identity(
     expected_common = {
         "kind": "grabowski_captain_run_audit",
         "action": plan["captain_handoff"]["action"],
-        "target_sha256": sha256_json(plan["captain_handoff"]["target"]),
+        "target_sha256": receipt_hasher(plan["captain_handoff"]["target"]),
         "expected_head": expected_identity["expected_head"],
         "expected_base": expected_base,
         "expected_base_sha": expected_base_sha,
@@ -1213,7 +1217,7 @@ def _verified_captain_audit_reference_identity(
     execution_result = completion.get("execution_result")
     if not isinstance(execution_result, dict):
         raise SagaError("Captain audit completion lacks execution result binding")
-    if completion.get("execution_result_sha256") != sha256_json(execution_result):
+    if completion.get("execution_result_sha256") != receipt_hasher(execution_result):
         raise SagaError("Captain audit execution result digest mismatch")
     if set(execution_result) != {"status", "receipt_sha256", "output_sha256"}:
         raise SagaError("Captain audit reference execution result shape is not canonical")
@@ -1553,7 +1557,7 @@ def validate_captain_audit_binding(
         )
     else:
         trusted_audit_identity = _verified_captain_audit_reference_identity(
-            plan, audit_ref
+            plan, audit_ref, receipt_sha256_json=receipt_hasher
         )
 
     binding = _bounded_mapping(value, "captain_audit_binding")
@@ -1575,7 +1579,7 @@ def validate_captain_audit_binding(
     binding_sha = _sha256(
         binding.get("binding_sha256"), "captain_audit_binding.binding_sha256"
     )
-    binding_hasher = sha256_json if audit_ref is not None else receipt_hasher
+    binding_hasher = receipt_hasher
     if binding_sha != binding_hasher(
         {key: item for key, item in binding.items() if key != "binding_sha256"}
     ):

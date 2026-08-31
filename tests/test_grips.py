@@ -148,7 +148,7 @@ def _saga_run_stub(plan: dict[str, object]) -> dict[str, object]:
         "kind": grip_orchestration.RUN_KIND,
         "saga_kind": plan["saga_kind"],
         "plan_sha256": plan["plan_sha256"],
-        "mechanic_plan_sha256": grips.sha256_json(plan["mechanic_actions"]),
+        "mechanic_plan_sha256": grip_orchestration.sha256_json(plan["mechanic_actions"]),
         "idempotency_key": plan["idempotency_key"],
         "state": "captain_required",
         "captain_ready": True,
@@ -162,7 +162,7 @@ def _saga_run_stub(plan: dict[str, object]) -> dict[str, object]:
         "mechanic_receipt_sha256": "3" * 64,
         "child_receipt_sha256s": ["4" * 64],
         "captain_handoff": deepcopy(plan["captain_handoff"]),
-        "captain_handoff_sha256": grips.sha256_json(plan["captain_handoff"]),
+        "captain_handoff_sha256": grip_orchestration.sha256_json(plan["captain_handoff"]),
         "required_readback": deepcopy(plan["readback_contract"]),
         "recovery": "invoke captain-run only with fresh evidence and this exact handoff; after ambiguous apply, read back before retry",
         "does_not_establish": [
@@ -172,7 +172,7 @@ def _saga_run_stub(plan: dict[str, object]) -> dict[str, object]:
             "deployment-completion",
         ],
     }
-    return {**body, "run_sha256": grips.sha256_json(body), "receipt_status": "passed"}
+    return {**body, "run_sha256": grip_orchestration.sha256_json(body), "receipt_status": "passed"}
 
 
 def _saga_run_audit_record(
@@ -189,7 +189,7 @@ def _saga_run_audit_record(
         "saga_kind": plan["saga_kind"],
         "plan_sha256": plan["plan_sha256"],
         "run_sha256": run_receipt["run_sha256"],
-        "run_receipt_sha256": grips.sha256_json(run_receipt),
+        "run_receipt_sha256": grip_orchestration.sha256_json(run_receipt),
         "run_receipt": run_receipt,
         "record_sha256": record_sha,
     }
@@ -2488,6 +2488,8 @@ class GripFoundationTests(unittest.TestCase):
                 "adapter": "grabowski-self",
                 "runtime_target": "heim-pc",
                 "expected_head": "a" * 40,
+                "source_repository": "/tmp/über",
+                "source_lease_owner_id": "lane:test",
             },
             "t121-run-durable-audit",
         )
@@ -2507,7 +2509,12 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(grip_orchestration.SAGA_RUN_AUDIT_KIND, record["kind"])
         self.assertEqual(plan["plan_sha256"], record["plan_sha256"])
         self.assertEqual(run["run_sha256"], record["run_sha256"])
-        self.assertEqual(grips.sha256_json(run), record["run_receipt_sha256"])
+        self.assertNotEqual(
+            grips.sha256_json(run), grip_orchestration.sha256_json(run)
+        )
+        self.assertEqual(
+            grip_orchestration.sha256_json(run), record["run_receipt_sha256"]
+        )
         self.assertEqual(run, record["run_receipt"])
 
     def test_saga_run_fails_closed_when_durable_receipt_append_fails(self) -> None:
@@ -2875,6 +2882,65 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(run["run_sha256"], settlement["run_sha256"])
         self.assertEqual(intent_sha, settlement["captain_audit_intent_record_sha256"])
         self.assertEqual(inline_settlement, settlement)
+
+    def test_saga_settle_unicode_target_uses_runtime_audit_canonicalizer(self) -> None:
+        import grabowski_audit_query
+
+        target = {
+            "repository_path": str(Path(__file__).resolve().parents[1]),
+            "repository": "heimgewebe/grabowski",
+            "adapter": "grabowski-self",
+            "runtime_target": "heim-pc",
+            "expected_head": "a" * 40,
+            "source_repository": "/tmp/über",
+            "source_lease_owner_id": "lane:test",
+        }
+        plan = grip_orchestration.build_plan(
+            "runtime-deployment", target, "t121-unicode-captain-audit"
+        )
+        run = _saga_run_stub(plan)
+        run_record, run_ref = _saga_run_audit_record(plan, run=run)
+        intent_sha, completion_sha, intent, completion, captain_ref = _saga_audit_records(plan)
+        self.assertNotEqual(
+            grips.sha256_json(plan["captain_handoff"]["target"]),
+            grip_orchestration.sha256_json(plan["captain_handoff"]["target"]),
+        )
+        payload = (
+            json.dumps(run_record, separators=(",", ":"))
+            + "\n"
+            + json.dumps(intent, separators=(",", ":"))
+            + "\n"
+            + json.dumps(completion, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        snapshot = types.SimpleNamespace(
+            segments=(types.SimpleNamespace(captured_data=payload),)
+        )
+        readback = {
+            "identity": {"repo_head": "a" * 40, "completion_status": "complete"},
+            "integrity": {"manifest_schema_valid": True},
+            "serving_process": {
+                "matches_deployed_manifest": True,
+                "serves_deployed_release": True,
+            },
+        }
+        with patch.object(
+            grabowski_audit_query,
+            "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ):
+            settlement = grip_orchestration.settle(
+                plan_value=plan,
+                run_receipt_value=run_ref,
+                captain_result_value=captain_ref,
+                captain_audit_binding_value=_saga_audit_binding_stub(
+                    plan, completion_sha
+                ),
+                readback_value=readback,
+                receipt_sha256_json=grips.sha256_json,
+            )
+        self.assertEqual("settled", settlement["state"])
+        self.assertEqual(intent_sha, settlement["captain_audit_intent_record_sha256"])
 
     def test_saga_settle_rejects_run_reference_bound_to_another_plan(self) -> None:
         import grabowski_audit_query

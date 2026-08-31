@@ -9486,7 +9486,7 @@ def _saga_persist_run_receipt(
                 "saga_kind": plan["saga_kind"],
                 "plan_sha256": plan["plan_sha256"],
                 "run_sha256": validated["run_sha256"],
-                "run_receipt_sha256": sha256_json(validated),
+                "run_receipt_sha256": grabowski_grip_orchestration.sha256_json(validated),
                 "run_receipt": validated,
             }
         )
