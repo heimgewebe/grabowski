@@ -47,6 +47,7 @@ import grabowski_private_io as private_io
 import grabowski_effect_interceptor
 import grabowski_grips
 import grabowski_git_preimage
+import grabowski_transport_assertion
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 
@@ -672,12 +673,34 @@ def _require_transport_roundtrip_for_tool(
         tool_name_text = str(tool_name)
         signed_transport = getattr(base, "_transport_signed_one_call_evidence", None)
         if callable(signed_transport):
-            signed_evidence = signed_transport(
-                context,
-                tool_name=tool_name_text,
-                arguments_sha256=arguments_sha256,
-                runtime_binding=runtime_binding,
-            )
+            try:
+                signed_evidence = signed_transport(
+                    context,
+                    tool_name=tool_name_text,
+                    arguments_sha256=arguments_sha256,
+                    runtime_binding=runtime_binding,
+                )
+            except grabowski_transport_assertion.TransportAssertionReplay as replay_exc:
+                # The durable one-call filter has already admitted this request
+                # identity once.  Recovery is allowed only when a separate,
+                # already-existing roundtrip receipt is fresh and exact for the
+                # same tool + canonical argument digest.  Never create a fresh
+                # handshake from this replay path.
+                client_scope = base._transport_roundtrip_client_scope(context)
+                try:
+                    recovery_evidence = grabowski_transport_roundtrip.consume_verified(
+                        client_scope=client_scope,
+                        runtime_binding=runtime_binding,
+                        tool_name=tool_name_text,
+                        arguments_sha256=arguments_sha256,
+                    )
+                except grabowski_transport_roundtrip.TransportRoundtripError:
+                    raise RuntimeError(str(replay_exc)) from replay_exc
+                return {
+                    **recovery_evidence,
+                    "signed_one_call_replay_recovery": True,
+                    "recovery_basis": "preverified_exact_transport_roundtrip",
+                }
             if signed_evidence is not None:
                 return signed_evidence
         client_scope = base._transport_roundtrip_client_scope(context)

@@ -677,6 +677,132 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
         self.assertEqual(evidence["client_scope_kind"], "connector_capability")
 
+    def test_mcp_preserves_typed_signed_one_call_replay(self) -> None:
+        arguments = {"argv": ["true"]}
+        body = _tool_body(arguments)
+        signed = ingress.signed_tool_headers(
+            token=SECRET,
+            body=body,
+            session_id="session-typed-replay",
+            runtime_binding_sha256=_runtime_sha256(),
+            now_unix=int(__import__("time").time()),
+        )
+        headers = {
+            base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
+            base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+            base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+            base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                ingress.REQUEST_TIMESTAMP_HEADER
+            ],
+            base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                ingress.REQUEST_AUDIENCE_HEADER
+            ],
+            base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                ingress.REQUEST_BODY_SHA256_HEADER
+            ],
+            base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                ingress.RUNTIME_BINDING_SHA256_HEADER
+            ],
+            base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+        }
+        arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+        first = base._transport_signed_one_call_evidence(
+            _ctx(headers),
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=arguments_sha256,
+            runtime_binding=BINDING,
+        )
+        self.assertEqual(first["transport_mode"], assertion.ASSERTION_VERSION)
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            base._transport_signed_one_call_evidence(
+                _ctx(headers),
+                tool_name="grabowski_terminal_run",
+                arguments_sha256=arguments_sha256,
+                runtime_binding=BINDING,
+            )
+
+    def test_operator_recovers_signed_replay_only_from_preverified_exact_roundtrip(
+        self,
+    ) -> None:
+        arguments = {"argv": ["true"]}
+        expected_arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        recovery = {
+            "transport_mode": "roundtrip-test",
+            "consumption_receipt_sha256": "a" * 64,
+        }
+        with (
+            mock.patch.object(
+                base,
+                "_transport_signed_one_call_evidence",
+                side_effect=assertion.TransportAssertionReplay(
+                    "signed one-call transport request was already consumed"
+                ),
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SCOPE
+            ),
+            mock.patch.object(
+                roundtrip, "consume_verified", return_value=recovery
+            ) as consume_verified,
+            mock.patch.object(roundtrip, "begin") as begin,
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=arguments,
+                context=_ctx({}),
+                tool=tool,
+            )
+        consume_verified.assert_called_once_with(
+            client_scope=SCOPE,
+            runtime_binding=BINDING,
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=expected_arguments_sha256,
+        )
+        begin.assert_not_called()
+        self.assertTrue(evidence["signed_one_call_replay_recovery"])
+        self.assertEqual(
+            evidence["recovery_basis"], "preverified_exact_transport_roundtrip"
+        )
+        self.assertEqual(
+            evidence["consumption_receipt_sha256"],
+            recovery["consumption_receipt_sha256"],
+        )
+
+    def test_operator_signed_replay_remains_blocked_without_preverified_roundtrip(
+        self,
+    ) -> None:
+        arguments = {"argv": ["true"]}
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        replay_message = "signed one-call transport request was already consumed"
+        with (
+            mock.patch.object(
+                base,
+                "_transport_signed_one_call_evidence",
+                side_effect=assertion.TransportAssertionReplay(replay_message),
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SCOPE
+            ),
+            mock.patch.object(
+                roundtrip,
+                "consume_verified",
+                side_effect=roundtrip.TransportRoundtripRequired(
+                    "fresh verification required"
+                ),
+            ) as consume_verified,
+            mock.patch.object(roundtrip, "begin") as begin,
+        ):
+            with self.assertRaisesRegex(RuntimeError, replay_message):
+                operator._require_transport_roundtrip_for_tool(
+                    tool_name="grabowski_terminal_run",
+                    arguments=arguments,
+                    context=_ctx({}),
+                    tool=tool,
+                )
+        consume_verified.assert_called_once()
+        begin.assert_not_called()
+
     def test_stale_serving_process_blocks_before_signed_assertion_consumption(
         self,
     ) -> None:

@@ -5179,6 +5179,12 @@ def _transport_signed_one_call_evidence(
             body_sha256=str(body_sha256),
             mac_sha256=str(mac_sha256),
         )
+    except grabowski_transport_assertion.TransportAssertionReplay:
+        # A durable replay is materially different from a malformed or invalid
+        # signed assertion.  The operator may recover it only by consuming an
+        # already-existing exact transport-roundtrip verification; do not erase
+        # the type here.
+        raise
     except grabowski_transport_assertion.TransportAssertionError as exc:
         raise RuntimeError(str(exc)) from exc
     return {**evidence, "client_scope_kind": scope["kind"]}
