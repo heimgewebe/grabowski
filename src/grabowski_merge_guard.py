@@ -3823,7 +3823,28 @@ class CaptainMergeGuardRunner:
                     diff_source = "local-bound-git-diff-after-github-too-large"
                     selected_diff_returncode = 0
         live_diff_bytes = canonicalize_github_pr_diff_identity(raw_live_diff_bytes)
-        live_diff_sha256 = github_pr_diff_identity_sha256(raw_live_diff_bytes)
+        canonical_live_diff_sha256 = github_pr_diff_identity_sha256(raw_live_diff_bytes)
+        raw_live_diff_sha256 = hashlib.sha256(raw_live_diff_bytes).hexdigest()
+        provider_raw_identity_available = (
+            selected_diff_returncode == 0
+            and diff_source in {
+                "raw-command-bytes",
+                "utf8-runner-text-exact-fallback",
+            }
+        )
+        if expected_diff == canonical_live_diff_sha256:
+            binding_diff_sha256 = canonical_live_diff_sha256
+            diff_identity_mode = "canonical"
+        elif provider_raw_identity_available and expected_diff == raw_live_diff_sha256:
+            # Compatibility for immutable review evidence created before the
+            # GitHub index-OID canonicalization contract.  This is deliberately
+            # narrower than the canonical identity: the expected digest must
+            # match the exact provider bytes read by this guard invocation.
+            binding_diff_sha256 = raw_live_diff_sha256
+            diff_identity_mode = "raw-current-provider-compat"
+        else:
+            binding_diff_sha256 = canonical_live_diff_sha256
+            diff_identity_mode = "unmatched"
         diff_canonicalization = diff_source
         if live_diff_bytes != raw_live_diff_bytes:
             diff_canonicalization += "+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
@@ -3835,15 +3856,17 @@ class CaptainMergeGuardRunner:
             "source_bytes": len(raw_live_diff_bytes),
             "bytes": len(live_diff_bytes),
             "canonicalization": diff_canonicalization,
-            "raw_sha256": hashlib.sha256(raw_live_diff_bytes).hexdigest(),
-            "sha256": live_diff_sha256,
+            "raw_sha256": raw_live_diff_sha256,
+            "sha256": canonical_live_diff_sha256,
+            "binding_sha256": binding_diff_sha256,
+            "identity_mode": diff_identity_mode,
             "stderr_sha256": hashlib.sha256(diff_info["stderr"].encode()).hexdigest(),
         }
         if selected_diff_returncode != 0:
             errors.append("merge_guard_live_diff_failed")
         elif not live_diff_bytes:
             errors.append("merge_guard_live_diff_empty")
-        elif live_diff_sha256 != expected_diff:
+        elif binding_diff_sha256 != expected_diff:
             errors.append("merge_guard_diff_drift")
         bindings = {
             "repository": repo_slug,
@@ -3855,7 +3878,10 @@ class CaptainMergeGuardRunner:
             "head_sha": expected_head,
             "is_cross_repository": viewed.get("isCrossRepository"),
             "merge_state_status": merge_state_status,
-            "diff_sha256": live_diff_sha256,
+            "diff_sha256": binding_diff_sha256,
+            "canonical_diff_sha256": canonical_live_diff_sha256,
+            "raw_diff_sha256": raw_live_diff_sha256,
+            "diff_identity_mode": diff_identity_mode,
             "execution_intent_sha256": self.execution_intent_sha256,
             "changed_paths": changed_paths,
             "changed_paths_sha256": _sha256_json(changed_paths),
@@ -4185,12 +4211,23 @@ class CaptainMergeGuardRunner:
         # TOCTOU: a reviewer cannot become decision-bound between reconciliation
         # and the merge call and then be omitted from this decision.
         with decision_reviews.decision_review_lock(decision_binding):
+            equivalent_review_diff_sha256s = None
+            if bindings.get("diff_identity_mode") == "raw-current-provider-compat":
+                # The live-binding phase has already proven these two digests
+                # identify the same exact provider bytes. Keep the legacy raw
+                # merge-evidence binding while allowing independently started
+                # decision reviews to retain the canonical identity.
+                equivalent_review_diff_sha256s = [
+                    str(bindings["canonical_diff_sha256"]),
+                    str(bindings["raw_diff_sha256"]),
+                ]
             decision_reconciliation = decision_reviews.reconcile(
                 repo=str(bindings["repository"]),
                 pr=int(bindings["pull_request"]),
                 head_sha=str(bindings["head_sha"]),
                 base_sha=str(bindings["base_sha"]),
                 diff_sha256=str(bindings["diff_sha256"]),
+                equivalent_diff_sha256s=equivalent_review_diff_sha256s,
             )
             self.receipt["decision_bound_review_reconciliation"] = (
                 decision_reconciliation

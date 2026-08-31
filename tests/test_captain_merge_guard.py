@@ -267,6 +267,149 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                     any(call[:2] == ("api", "--paginate") for call in gh.calls)
                 )
 
+    def test_live_bindings_accepts_exact_current_raw_provider_diff_identity(self) -> None:
+        gh = _RenamePrGh()
+        gh.diff_text = (
+            "diff --git a/new-name.txt b/new-name.txt\n"
+            "index 123456789abcdef..abcdef0123456789 100644\n"
+            "--- a/new-name.txt\n"
+            "+++ b/new-name.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        raw_diff_sha256 = hashlib.sha256(gh.diff_text.encode("utf-8")).hexdigest()
+        canonical_diff_sha256 = merge_guard.github_pr_diff_identity_sha256(
+            gh.diff_text.encode("utf-8")
+        )
+        self.assertNotEqual(raw_diff_sha256, canonical_diff_sha256)
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {
+            "target": {
+                "repo": "heimgewebe/commonworld",
+                "pr": 212,
+                "base": "main",
+            }
+        }
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": raw_diff_sha256,
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+
+        bindings, errors = runner._live_bindings()
+
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual(bindings["diff_sha256"], raw_diff_sha256)
+        self.assertEqual(bindings["raw_diff_sha256"], raw_diff_sha256)
+        self.assertEqual(bindings["canonical_diff_sha256"], canonical_diff_sha256)
+        self.assertEqual(bindings["diff_identity_mode"], "raw-current-provider-compat")
+        self.assertEqual(runner.receipt["live_diff"]["raw_sha256"], raw_diff_sha256)
+        self.assertEqual(runner.receipt["live_diff"]["sha256"], canonical_diff_sha256)
+        self.assertEqual(runner.receipt["live_diff"]["binding_sha256"], raw_diff_sha256)
+        self.assertEqual(
+            runner.receipt["live_diff"]["identity_mode"],
+            "raw-current-provider-compat",
+        )
+
+    def test_live_bindings_prefers_canonical_provider_diff_identity(self) -> None:
+        gh = _RenamePrGh()
+        gh.diff_text = (
+            "diff --git a/new-name.txt b/new-name.txt\n"
+            "index 123456789abcdef..abcdef0123456789 100644\n"
+            "--- a/new-name.txt\n"
+            "+++ b/new-name.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        raw_diff_sha256 = hashlib.sha256(gh.diff_text.encode("utf-8")).hexdigest()
+        canonical_diff_sha256 = merge_guard.github_pr_diff_identity_sha256(
+            gh.diff_text.encode("utf-8")
+        )
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {
+            "target": {
+                "repo": "heimgewebe/commonworld",
+                "pr": 212,
+                "base": "main",
+            }
+        }
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": canonical_diff_sha256,
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+
+        bindings, errors = runner._live_bindings()
+
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual(bindings["diff_sha256"], canonical_diff_sha256)
+        self.assertEqual(bindings["raw_diff_sha256"], raw_diff_sha256)
+        self.assertEqual(bindings["canonical_diff_sha256"], canonical_diff_sha256)
+        self.assertEqual(bindings["diff_identity_mode"], "canonical")
+        self.assertEqual(
+            runner.receipt["live_diff"]["binding_sha256"],
+            canonical_diff_sha256,
+        )
+        self.assertEqual(runner.receipt["live_diff"]["identity_mode"], "canonical")
+
+    def test_live_bindings_rejects_unrelated_diff_identity(self) -> None:
+        gh = _RenamePrGh()
+        gh.diff_text = (
+            "diff --git a/new-name.txt b/new-name.txt\n"
+            "index 123456789abcdef..abcdef0123456789 100644\n"
+            "--- a/new-name.txt\n"
+            "+++ b/new-name.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {
+            "target": {
+                "repo": "heimgewebe/commonworld",
+                "pr": 212,
+                "base": "main",
+            }
+        }
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": "f" * 64,
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+
+        bindings, errors = runner._live_bindings()
+
+        self.assertIn("merge_guard_diff_drift", errors)
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertNotEqual(bindings["diff_sha256"], "f" * 64)
+        self.assertEqual(bindings["diff_identity_mode"], "unmatched")
+        self.assertEqual(runner.receipt["live_diff"]["identity_mode"], "unmatched")
+
     def test_live_bindings_rejects_missing_or_invalid_previous_path(self) -> None:
         for previous_path in (None, "../old-name.txt", "new-name.txt"):
             with self.subTest(previous_path=previous_path):
