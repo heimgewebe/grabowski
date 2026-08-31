@@ -24,6 +24,10 @@ AUDIT_TRANSITION_PAIRS = (
     ("runtime-state-retention-intent", "runtime-state-retention-complete"),
     ("runtime-deploy-schedule-intent", "runtime-deploy-scheduled"),
 )
+RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION = (
+    "runtime-state-retention-completion-audit-reconciled"
+)
+AUDIT_EVIDENCE_RECORD_SHA256_FIELD = "__grabowski_audit_evidence_record_sha256"
 AUDIT_CONTRADICTION_OPERATION_TERMS = (
     "contract",
     "envelope",
@@ -63,15 +67,17 @@ def _runtime_snapshot_timestamp_valid(value: Any, *, end_unix: int) -> bool:
     )
 
 
+def _audit_record_evidence_sha256(record: dict[str, Any]) -> str | None:
+    stored = record.get("record_sha256")
+    if _audit_sha256_valid(stored):
+        return stored
+    derived = record.get(AUDIT_EVIDENCE_RECORD_SHA256_FIELD)
+    return derived if _audit_sha256_valid(derived) else None
+
+
 def _audit_record_ref(record: dict[str, Any]) -> str | None:
-    value = record.get("record_sha256")
-    if (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    ):
-        return f"audit-record-sha256:{value}"
-    return None
+    value = _audit_record_evidence_sha256(record)
+    return f"audit-record-sha256:{value}" if value is not None else None
 
 
 def _audit_signal_refs(values: list[str]) -> tuple[list[str], bool]:
@@ -163,26 +169,367 @@ def _audit_transition_match_index(
     return None
 
 
+def _retention_intent_index_key(
+    record: dict[str, Any],
+) -> tuple[str, int, str] | None:
+    identity = _retention_transition_identity(record)
+    record_sha256 = _audit_record_evidence_sha256(record)
+    if identity is None or record_sha256 is None:
+        return None
+    return identity[0], identity[1], record_sha256
+
+
+def _retention_reconciliation_target_key(
+    reconciliation_record: dict[str, Any],
+) -> tuple[str, int, str] | None:
+    identity = _retention_transition_identity(reconciliation_record)
+    intent_record_sha256 = reconciliation_record.get("intent_record_sha256")
+    if (
+        reconciliation_record.get("operation")
+        != RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION
+        or identity is None
+        or not _audit_sha256_valid(intent_record_sha256)
+    ):
+        return None
+    return identity[0], identity[1], intent_record_sha256
+
+
+def _retention_reconciliation_record_valid(
+    reconciliation_record: dict[str, Any],
+) -> bool:
+    return bool(
+        _retention_reconciliation_target_key(reconciliation_record) is not None
+        and reconciliation_record.get("reconciliation_kind") == "completion_audit_gap"
+        and reconciliation_record.get("completed") is True
+        and reconciliation_record.get("retention_effect_retried") is False
+        and _audit_sha256_valid(reconciliation_record.get("receipt_sha256"))
+    )
+
+
+def _retention_reconciliation_target_index(
+    entries: list[tuple[dict[str, Any], int]],
+    reconciliation_record: dict[str, Any],
+) -> int | None:
+    target_key = _retention_reconciliation_target_key(reconciliation_record)
+    if target_key is None:
+        return None
+    for index, (candidate, _timestamp_unix) in enumerate(entries):
+        if _retention_intent_index_key(candidate) == target_key:
+            return index
+    return None
+
+
+def _retention_reconciliation_match_index(
+    entries: list[tuple[dict[str, Any], int]],
+    reconciliation_record: dict[str, Any],
+) -> int | None:
+    if not _retention_reconciliation_record_valid(reconciliation_record):
+        return None
+    return _retention_reconciliation_target_index(entries, reconciliation_record)
+
+
 def _audit_transition_gap_signal(
     prepared_records: list[tuple[dict[str, Any], int | None]],
     *,
     start_unix: int,
     end_unix: int,
 ) -> dict[str, Any]:
+    retention_pair = (
+        "runtime-state-retention-intent",
+        "runtime-state-retention-complete",
+    )
     pending: dict[tuple[str, str], list[tuple[dict[str, Any], int]]] = {
         pair: [] for pair in AUDIT_TRANSITION_PAIRS
     }
+    pending_retention: dict[
+        tuple[str, int, str], tuple[dict[str, Any], int]
+    ] = {}
+    pending_retention_keys_by_identity: dict[
+        tuple[str, int], dict[tuple[str, int, str], None]
+    ] = {}
+    historical_retention_intents: dict[
+        tuple[str, int, str], tuple[dict[str, Any], int]
+    ] = {}
+    historical_retention_intents_by_digest: dict[
+        str, tuple[tuple[str, int, str], dict[str, Any], int]
+    ] = {}
+    historical_reconciled_keys: set[tuple[str, int, str]] = set()
+    historical_completed_keys: set[tuple[str, int, str]] = set()
+    historical_open_keys_by_identity: dict[
+        tuple[str, int], dict[tuple[str, int, str], None]
+    ] = {}
+    historical_unmatched: dict[
+        tuple[str, int, str], tuple[str, dict[str, Any], int]
+    ] = {}
+    consumed_retention_receipts: dict[str, tuple[str, int, str]] = {}
     completed_counts: Counter[str] = Counter()
-    for record, timestamp_unix in prepared_records:
+    reconciled_counts: Counter[str] = Counter()
+    reconciled_records: list[dict[str, Any]] = []
+
+    def _remember_pending_retention(
+        key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
+    ) -> None:
+        pending_retention[key] = (record, timestamp_unix)
+        keys = pending_retention_keys_by_identity.setdefault(key[:2], {})
+        keys.setdefault(key, None)
+
+    def _pop_pending_retention(
+        key: tuple[str, int, str]
+    ) -> tuple[dict[str, Any], int] | None:
+        item = pending_retention.pop(key, None)
+        keys = pending_retention_keys_by_identity.get(key[:2])
+        if keys is not None:
+            keys.pop(key, None)
+            if not keys:
+                pending_retention_keys_by_identity.pop(key[:2], None)
+        return item
+
+    def _remember_historical_open(key: tuple[str, int, str]) -> None:
+        keys = historical_open_keys_by_identity.setdefault(key[:2], {})
+        keys.setdefault(key, None)
+
+    def _pop_historical_open(key: tuple[str, int, str]) -> bool:
+        keys = historical_open_keys_by_identity.get(key[:2])
+        if keys is None or key not in keys:
+            return False
+        keys.pop(key, None)
+        if not keys:
+            historical_open_keys_by_identity.pop(key[:2], None)
+        return True
+
+    def _peek_latest_historical_open(
+        identity: tuple[str, int],
+    ) -> tuple[str, int, str] | None:
+        keys = historical_open_keys_by_identity.get(identity)
+        return next(reversed(keys)) if keys else None
+
+    def _latest_open_retention_key(
+        identity: tuple[str, int],
+    ) -> tuple[str, int, str] | None:
+        # In-window intents necessarily follow historical intents in verified
+        # audit order, so prefer their ordered index when one exists.
+        pending_keys = pending_retention_keys_by_identity.get(identity)
+        if pending_keys:
+            return next(reversed(pending_keys))
+        return _peek_latest_historical_open(identity)
+
+    def _remember_historical_unmatched(
+        key: tuple[str, int, str], record: dict[str, Any], timestamp_unix: int
+    ) -> None:
+        historical_unmatched[key] = (
+            retention_pair[0],
+            record,
+            timestamp_unix,
+        )
+
+    def _pop_historical_unmatched(
+        key: tuple[str, int, str]
+    ) -> tuple[str, dict[str, Any], int] | None:
+        return historical_unmatched.pop(key, None)
+
+    def _receipt_consumed(record: dict[str, Any]) -> bool:
+        receipt_sha256 = record.get("receipt_sha256")
+        return bool(
+            _audit_sha256_valid(receipt_sha256)
+            and receipt_sha256 in consumed_retention_receipts
+        )
+
+    def _claim_receipt(
+        record: dict[str, Any], key: tuple[str, int, str]
+    ) -> bool:
+        receipt_sha256 = record.get("receipt_sha256")
+        if not _audit_sha256_valid(receipt_sha256):
+            return True
+        existing = consumed_retention_receipts.get(receipt_sha256)
+        if existing is not None:
+            return existing == key
+        consumed_retention_receipts[receipt_sha256] = key
+        return True
+
+    def _reserve_unbound_completion_receipt(record: dict[str, Any]) -> None:
+        receipt_sha256 = record.get("receipt_sha256")
         if (
-            timestamp_unix is None
-            or timestamp_unix < start_unix
-            or timestamp_unix > end_unix
+            not _audit_sha256_valid(receipt_sha256)
+            or receipt_sha256 in consumed_retention_receipts
         ):
+            return
+        record_digest = _audit_record_evidence_sha256(record)
+        _claim_receipt(
+            record,
+            (
+                "__unbound_retention_completion__",
+                0,
+                record_digest if record_digest is not None else receipt_sha256,
+            ),
+        )
+
+    for record, timestamp_unix in prepared_records:
+        if timestamp_unix is None or timestamp_unix > end_unix:
             continue
         operation = record.get("operation")
+
+        if timestamp_unix < start_unix:
+            if operation == retention_pair[0]:
+                key = _retention_intent_index_key(record)
+                if key is not None:
+                    historical_retention_intents[key] = (record, timestamp_unix)
+                    historical_retention_intents_by_digest[key[2]] = (
+                        key, record, timestamp_unix
+                    )
+                    _remember_historical_open(key)
+            elif operation == retention_pair[1]:
+                identity = _retention_transition_identity(record)
+                historical_matched = False
+                if identity is not None and not _receipt_consumed(record):
+                    completed_key = _peek_latest_historical_open(identity)
+                    if completed_key is not None and _claim_receipt(
+                        record, completed_key
+                    ):
+                        _pop_historical_open(completed_key)
+                        _pop_historical_unmatched(completed_key)
+                        historical_completed_keys.add(completed_key)
+                        historical_matched = True
+                if not historical_matched:
+                    # Even when no report-window intent can be paired, a verified
+                    # completion carrying a valid terminal receipt proves that the
+                    # receipt is already occupied by an earlier/unknown execution.
+                    _reserve_unbound_completion_receipt(record)
+            elif operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
+                target_key = _retention_reconciliation_target_key(record)
+                if (
+                    target_key in historical_retention_intents
+                    and _retention_reconciliation_record_valid(record)
+                    and target_key not in historical_completed_keys
+                    and target_key
+                    == _latest_open_retention_key(target_key[:2])
+                    and not _receipt_consumed(record)
+                    and _claim_receipt(record, target_key)
+                    and _pop_historical_open(target_key)
+                ):
+                    historical_reconciled_keys.add(target_key)
+            continue
+
+        if operation == retention_pair[0]:
+            key = _retention_intent_index_key(record)
+            if key is None:
+                # Preserve legacy/malformed fail-closed FIFO behavior separately.
+                pending[retention_pair].append((record, timestamp_unix))
+            else:
+                _remember_pending_retention(key, record, timestamp_unix)
+            continue
+
+        if operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION:
+            target_key = _retention_reconciliation_target_key(record)
+            if target_key is not None and target_key in pending_retention:
+                if (
+                    _retention_reconciliation_record_valid(record)
+                    and target_key
+                    == _latest_open_retention_key(target_key[:2])
+                    and not _receipt_consumed(record)
+                    and _claim_receipt(record, target_key)
+                ):
+                    _pop_pending_retention(target_key)
+                    reconciled_counts[retention_pair[0]] += 1
+                    reconciled_records.append(record)
+                # Invalid or ambiguously ordered evidence leaves the exact
+                # in-window intent pending/HIGH.
+                continue
+
+            intent_record_sha256 = record.get("intent_record_sha256")
+            historical_target = (
+                historical_retention_intents_by_digest.get(intent_record_sha256)
+                if _audit_sha256_valid(intent_record_sha256)
+                else None
+            )
+            if historical_target is None:
+                continue
+            historical_key, historical_record, historical_timestamp = historical_target
+            if (
+                historical_key in historical_reconciled_keys
+                or historical_key in historical_completed_keys
+            ):
+                continue
+            if (
+                target_key == historical_key
+                and _retention_reconciliation_record_valid(record)
+                and historical_key
+                == _latest_open_retention_key(historical_key[:2])
+                and not _receipt_consumed(record)
+                and _claim_receipt(record, historical_key)
+            ):
+                _pop_historical_unmatched(historical_key)
+                _pop_historical_open(historical_key)
+                historical_reconciled_keys.add(historical_key)
+                reconciled_counts[retention_pair[0]] += 1
+                reconciled_records.append(record)
+            else:
+                # Resolve the referenced historical intent by its immutable digest
+                # before trusting the reconciliation's claimed plan/attempt or
+                # receipt. Ambiguous identity order and receipt reuse therefore
+                # remain visible as HIGH execution gaps.
+                _remember_historical_unmatched(
+                    historical_key,
+                    historical_record,
+                    historical_timestamp,
+                )
+            continue
+
+        if operation == retention_pair[1]:
+            completion_fields_present = _audit_transition_identity_fields_present(
+                retention_pair[0], record
+            )
+            identity = _retention_transition_identity(record)
+            matched = False
+            if completion_fields_present:
+                if identity is not None and not _receipt_consumed(record):
+                    latest_key = _latest_open_retention_key(identity)
+                    if latest_key is not None and _claim_receipt(record, latest_key):
+                        if latest_key in pending_retention:
+                            _pop_pending_retention(latest_key)
+                        else:
+                            _pop_historical_open(latest_key)
+                            _pop_historical_unmatched(latest_key)
+                            historical_completed_keys.add(latest_key)
+                        matched = True
+            else:
+                match_index = _audit_transition_match_index(
+                    retention_pair[0], pending[retention_pair], record
+                )
+                if match_index is not None:
+                    legacy_record, _legacy_timestamp = pending[retention_pair][
+                        match_index
+                    ]
+                    legacy_digest = _audit_record_evidence_sha256(legacy_record)
+                    receipt_sha256 = record.get("receipt_sha256")
+                    legacy_consumer_key = (
+                        "__legacy_retention_intent__",
+                        0,
+                        legacy_digest
+                        if legacy_digest is not None
+                        else (
+                            receipt_sha256
+                            if _audit_sha256_valid(receipt_sha256)
+                            else "unbound"
+                        ),
+                    )
+                    if (
+                        not _receipt_consumed(record)
+                        and _claim_receipt(record, legacy_consumer_key)
+                    ):
+                        pending[retention_pair].pop(match_index)
+                        matched = True
+            if not matched:
+                # Preserve receipt uniqueness even when audit ordering or legacy
+                # evidence prevents this completion from matching a visible intent.
+                _reserve_unbound_completion_receipt(record)
+            if matched:
+                completed_counts[retention_pair[0]] += 1
+            continue
+
         for intent, completion in AUDIT_TRANSITION_PAIRS:
             key = (intent, completion)
+            if key == retention_pair:
+                continue
             if operation == intent:
                 pending[key].append((record, timestamp_unix))
                 break
@@ -194,37 +541,95 @@ def _audit_transition_gap_signal(
                     pending[key].pop(match_index)
                     completed_counts[intent] += 1
                 break
-    gaps: list[tuple[str, dict[str, Any], int]] = []
+
+    gaps: list[tuple[str, dict[str, Any], int]] = list(
+        historical_unmatched.values()
+    )
+    for record, timestamp_unix in pending_retention.values():
+        if timestamp_unix <= end_unix - AUDIT_SIGNAL_GRACE_SECONDS:
+            gaps.append((retention_pair[0], record, timestamp_unix))
     for (intent, _completion), entries in pending.items():
         for record, timestamp_unix in entries:
             if timestamp_unix <= end_unix - AUDIT_SIGNAL_GRACE_SECONDS:
                 gaps.append((intent, record, timestamp_unix))
+
     by_transition = Counter(intent for intent, _record, _timestamp in gaps)
-    refs = [
+    execution_refs = [
         ref
         for _intent, record, _timestamp in gaps
         if (ref := _audit_record_ref(record))
     ]
+    execution_gap_refs, execution_gap_refs_truncated = _audit_signal_refs(
+        execution_refs
+    )
+    unique_execution_ref_count = len(set(ref for ref in execution_refs if ref))
+    reconciliation_refs_all = [
+        ref for record in reconciled_records if (ref := _audit_record_ref(record))
+    ]
+    reconciliation_refs, reconciliation_refs_truncated = _audit_signal_refs(
+        reconciliation_refs_all
+    )
+    unique_reconciliation_ref_count = len(
+        set(ref for ref in reconciliation_refs_all if ref)
+    )
+    observed_count = len(gaps) + len(reconciled_records)
+    if gaps:
+        severity = "high"
+        count = len(gaps)
+        primary_evidence_refs = execution_refs
+        recommended_action = "trace each unmatched intent and read the exact target state before retry"
+    elif reconciled_records:
+        severity = "medium"
+        count = len(reconciled_records)
+        primary_evidence_refs = reconciliation_refs_all
+        recommended_action = (
+            "review append-only completion-audit reconciliation evidence; "
+            "do not retry the retention effect"
+        )
+    else:
+        severity = "none"
+        count = 0
+        primary_evidence_refs = []
+        recommended_action = "none"
     return _audit_signal_entry(
         "transition_gap",
-        status="observed" if gaps else "clear",
-        severity="high" if gaps else "none",
-        count=len(gaps),
-        observed_count=len(gaps),
-        evidence_refs=refs,
-        evidence_quality="explicit_identity_with_legacy_fifo_fallback",
-        recommended_action=(
-            "trace each unmatched intent and read the exact target state before retry"
-            if gaps
-            else "none"
+        status="observed" if observed_count else "clear",
+        severity=severity,
+        count=count,
+        observed_count=observed_count,
+        evidence_refs=primary_evidence_refs,
+        evidence_quality=(
+            "explicit_identity_with_terminal_receipt_reconciliation_and_legacy_fifo_fallback"
         ),
+        recommended_action=recommended_action,
         details={
             "grace_seconds": AUDIT_SIGNAL_GRACE_SECONDS,
+            "execution_gap_count": len(gaps),
+            "completion_audit_gap_count": len(reconciled_records),
+            "count_semantics": "execution_gaps_when_present_else_completion_audit_gaps",
+            "observed_count_semantics": "execution_gaps_plus_completion_audit_gaps",
+            "execution_gap_evidence_refs": execution_gap_refs,
+            "execution_gap_evidence_refs_truncated": execution_gap_refs_truncated,
+            "execution_gap_evidence_refs_omitted_count": max(
+                0, unique_execution_ref_count - len(execution_gap_refs)
+            ),
             "unmatched_intents_by_transition": dict(sorted(by_transition.items())),
             "completed_pairs_by_transition": dict(sorted(completed_counts.items())),
+            "completion_audit_gaps_by_transition": dict(sorted(reconciled_counts.items())),
+            "completion_audit_gap_evidence_refs": reconciliation_refs,
+            "completion_audit_gap_evidence_refs_truncated": reconciliation_refs_truncated,
+            "completion_audit_gap_evidence_refs_omitted_count": max(
+                0, unique_reconciliation_ref_count - len(reconciliation_refs)
+            ),
             "pairing_semantics": (
-                "retention pairs by (plan_sha256, attempt) when present and valid; "
-                "only records with both identity fields absent use legacy FIFO; "
+                "retention identities are indexed by (plan_sha256, attempt, "
+                "intent_record_sha256); completions and reconciliations consume "
+                "exactly the latest still-open intent in verified audit order; "
+                "a valid terminal receipt may be consumed at most once; "
+                "append-only reconciliations still bind the exact indexed intent; "
+                "invalid, ambiguously ordered, or receipt-reusing reconciliation "
+                "evidence keeps the affected intent visible as an execution_gap; "
+                "records with both identity fields absent retain legacy FIFO behavior; "
                 "other transition families use FIFO"
             ),
         },
@@ -233,6 +638,8 @@ def _audit_transition_gap_signal(
             "causality",
             "safe_retry",
             "exact_cross-operation_identity_when_no_transaction_id_is_logged",
+            "that_the_original_completion_audit_record_existed",
+            "cause_of_the_completion_audit_gap",
         ],
     )
 

@@ -4316,6 +4316,9 @@ def _append_audit(record: dict[str, Any]) -> None:
     _append_audit_with_digest(record)
 
 
+_AUDIT_EVIDENCE_RECORD_SHA256_FIELD = "__grabowski_audit_evidence_record_sha256"
+
+
 def _audit_records_from_components(
     components: list[tuple[Path, bytes, dict[str, Any]]],
 ) -> list[dict[str, Any]]:
@@ -4324,6 +4327,20 @@ def _audit_records_from_components(
         for line in data.splitlines():
             parsed = json.loads(line.decode("utf-8"))
             if isinstance(parsed, dict):
+                # This metadata is derived from already-verified bytes and is never
+                # appended to the audit chain.  It lets downstream read-only
+                # projections reference legacy records that predate record_sha256
+                # with the exact same sha256(raw_line) identity used by Audit Query.
+                parsed.pop(_AUDIT_EVIDENCE_RECORD_SHA256_FIELD, None)
+                stored = parsed.get("record_sha256")
+                if not (
+                    isinstance(stored, str)
+                    and len(stored) == 64
+                    and all(char in "0123456789abcdef" for char in stored)
+                ):
+                    parsed[_AUDIT_EVIDENCE_RECORD_SHA256_FIELD] = hashlib.sha256(
+                        line
+                    ).hexdigest()
                 records.append(parsed)
     return records
 

@@ -1465,6 +1465,390 @@ def _append_completion_audit(receipt: dict[str, Any]) -> dict[str, Any]:
 
 
 
+RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION = (
+    "runtime-state-retention-completion-audit-reconciled"
+)
+
+
+def _canonical_retention_receipt_path(
+    *,
+    plan_sha256: str,
+    attempt: int,
+    receipt_root: Path | None = None,
+) -> Path:
+    if re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
+        raise RuntimeError("retention reconciliation plan hash is invalid")
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+        or attempt > MAX_RETENTION_RECEIPT_ATTEMPTS
+    ):
+        raise RuntimeError("retention reconciliation attempt is invalid")
+    root = _private_directory(
+        RECEIPT_ROOT if receipt_root is None else receipt_root
+    )
+    name = (
+        f"{plan_sha256}.json"
+        if attempt == 1
+        else f"{plan_sha256}.retry-{attempt:02d}.json"
+    )
+    return root / name
+
+
+def _verified_terminal_retention_receipt(
+    path: Path,
+    *,
+    plan_sha256: str,
+    attempt: int,
+    expected_receipt_sha256: str,
+) -> dict[str, Any]:
+    canonical_path = _canonical_retention_receipt_path(
+        plan_sha256=plan_sha256,
+        attempt=attempt,
+    )
+    if path != canonical_path:
+        raise RuntimeError(
+            "retention reconciliation receipt path is not the canonical receipt target"
+        )
+    if re.fullmatch(r"[0-9a-f]{64}", expected_receipt_sha256) is None:
+        raise RuntimeError("retention reconciliation receipt hash is invalid")
+    payload, _ = _read_json_file(path, max_bytes=MAX_RETENTION_RECEIPT_BYTES)
+    receipt_sha256 = payload.get("receipt_sha256")
+    if (
+        receipt_sha256 != expected_receipt_sha256
+        or _sha256(
+            {key: value for key, value in payload.items() if key != "receipt_sha256"}
+        )
+        != receipt_sha256
+    ):
+        raise RuntimeError(f"retention terminal receipt integrity is invalid: {path}")
+    expected_previous_receipt_sha256: str | None = None
+    for previous_attempt in range(1, attempt):
+        previous_path = _canonical_retention_receipt_path(
+            plan_sha256=plan_sha256,
+            attempt=previous_attempt,
+            receipt_root=canonical_path.parent,
+        )
+        expected_previous_receipt_sha256 = _verified_partial_receipt(
+            previous_path,
+            plan_sha256=plan_sha256,
+            expected_attempt=previous_attempt,
+            expected_previous_receipt_sha256=expected_previous_receipt_sha256,
+        )
+    retry = payload.get("retry")
+    if (
+        payload.get("schema_version") != 3
+        or payload.get("operation") != "grabowski-runtime-state-retention"
+        or payload.get("plan_sha256") != plan_sha256
+        or payload.get("attempt") != attempt
+        or payload.get("previous_receipt_sha256")
+        != expected_previous_receipt_sha256
+        or payload.get("completed") is not True
+        or not isinstance(retry, dict)
+        or retry.get("required") is not False
+        or not isinstance(payload.get("reset_failed"), list)
+        or not isinstance(payload.get("reset_failures"), list)
+        or not isinstance(payload.get("archived_jobs"), list)
+    ):
+        raise RuntimeError(f"retention terminal receipt binding is invalid: {path}")
+    return payload
+
+
+def _retention_audit_reconciliation_state(
+    *,
+    intent_record_sha256: str,
+    plan_sha256: str,
+    attempt: int,
+    receipt_sha256: str,
+) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{64}", intent_record_sha256) is None:
+        raise RuntimeError("retention reconciliation intent hash is invalid")
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import grabowski_audit_query as audit_query
+
+    snapshot = audit_query.capture_verified_audit_snapshot()
+    open_intents: dict[str, dict[str, Any]] = {}
+    target_seen = False
+    receipt_consumer_digest: str | None = None
+    receipt_consumer_kind: str | None = None
+    receipt_conflict = False
+    original_completion: dict[str, Any] | None = None
+    existing_reconciliation: dict[str, Any] | None = None
+
+    for item in audit_query._iter_snapshot_items(snapshot, order="asc"):
+        evidence = item.get("evidence", {})
+        record = item.get("record", {})
+        if not isinstance(evidence, dict) or not isinstance(record, dict):
+            continue
+        record_digest = evidence.get("record_sha256")
+        operation = record.get("operation")
+        same_identity = (
+            record.get("plan_sha256") == plan_sha256
+            and not isinstance(record.get("attempt"), bool)
+            and isinstance(record.get("attempt"), int)
+            and record.get("attempt") == attempt
+        )
+        if (
+            record.get("receipt_sha256") == receipt_sha256
+            and operation
+            in (
+                "runtime-state-retention-complete",
+                RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+            )
+            and not same_identity
+        ):
+            # Receipt occupancy is global, not identity-version-specific. A
+            # verified legacy or foreign completion/reconciliation that already
+            # cites this terminal receipt prevents a second completion claim.
+            receipt_conflict = True
+            continue
+        if record_digest == intent_record_sha256 and (
+            operation != "runtime-state-retention-intent" or not same_identity
+        ):
+            raise RuntimeError("retention reconciliation intent binding is invalid")
+
+        if operation == "runtime-state-retention-intent" and same_identity:
+            if (
+                not isinstance(record_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", record_digest) is None
+            ):
+                raise RuntimeError(
+                    "retention reconciliation intent evidence digest is invalid"
+                )
+            open_intents.setdefault(record_digest, record)
+            if record_digest == intent_record_sha256:
+                target_seen = True
+            continue
+
+        if operation == "runtime-state-retention-complete" and same_identity:
+            if record.get("receipt_sha256") != receipt_sha256:
+                raise RuntimeError(
+                    "retention completion audit receipt binding conflicts"
+                )
+            # The canonical terminal receipt represents one retention execution.
+            # Once that execution has already been bound by a prior completion or
+            # reconciliation, later audit repair evidence must not consume another
+            # duplicate intent.
+            if receipt_consumer_digest is not None:
+                continue
+            if not open_intents:
+                # A completion that precedes every eligible intent still occupies
+                # this terminal receipt. It cannot later be rebound to a newer intent.
+                receipt_conflict = True
+                continue
+            consumed_digest = next(reversed(open_intents))
+            open_intents.pop(consumed_digest)
+            receipt_consumer_digest = consumed_digest
+            receipt_consumer_kind = "completion"
+            if consumed_digest == intent_record_sha256:
+                original_completion = {
+                    "record_sha256": record_digest,
+                    "record": record,
+                }
+            continue
+
+        if (
+            operation == RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION
+            and same_identity
+        ):
+            claimed_intent_digest = record.get("intent_record_sha256")
+            if (
+                not isinstance(claimed_intent_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", claimed_intent_digest) is None
+                or record.get("receipt_sha256") != receipt_sha256
+                or record.get("reconciliation_kind") != "completion_audit_gap"
+                or record.get("completed") is not True
+                or record.get("retention_effect_retried") is not False
+            ):
+                raise RuntimeError(
+                    "retention completion reconciliation binding conflicts"
+                )
+
+            if receipt_consumer_digest is not None:
+                if receipt_consumer_digest != claimed_intent_digest:
+                    raise RuntimeError(
+                        "retention terminal receipt is already bound to another intent"
+                    )
+                # A completion appended after reconciliation is redundant repair
+                # evidence for the same execution. It must not change which intent
+                # the terminal receipt consumed.
+                if (
+                    receipt_consumer_kind == "reconciliation"
+                    and claimed_intent_digest == intent_record_sha256
+                    and existing_reconciliation is None
+                ):
+                    existing_reconciliation = {
+                        "record_sha256": record_digest,
+                        "record": record,
+                    }
+                continue
+
+            if not open_intents:
+                raise RuntimeError(
+                    "retention reconciliation has no eligible open intent"
+                )
+            eligible_intent_digest = next(reversed(open_intents))
+            if claimed_intent_digest != eligible_intent_digest:
+                raise RuntimeError(
+                    "retention reconciliation intent is ambiguous among duplicate intents"
+                )
+            open_intents.pop(claimed_intent_digest)
+            receipt_consumer_digest = claimed_intent_digest
+            receipt_consumer_kind = "reconciliation"
+            if claimed_intent_digest == intent_record_sha256:
+                existing_reconciliation = {
+                    "record_sha256": record_digest,
+                    "record": record,
+                }
+
+    if not target_seen:
+        raise RuntimeError(
+            "retention reconciliation intent record was not found in verified audit"
+        )
+    if receipt_conflict:
+        raise RuntimeError(
+            "retention terminal receipt is already bound to another intent"
+        )
+    if original_completion is not None or existing_reconciliation is not None:
+        return {
+            "original_completion": original_completion,
+            "existing_reconciliation": existing_reconciliation,
+        }
+
+    if receipt_consumer_digest is not None:
+        raise RuntimeError(
+            "retention terminal receipt is already bound to another intent"
+        )
+    if intent_record_sha256 not in open_intents:
+        raise RuntimeError("retention reconciliation intent is no longer open")
+    if next(reversed(open_intents)) != intent_record_sha256:
+        raise RuntimeError(
+            "retention reconciliation intent is ambiguous among duplicate intents"
+        )
+    return {
+        "original_completion": None,
+        "existing_reconciliation": None,
+    }
+
+
+def _require_reconciliation_mutation_authority() -> None:
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import grabowski_mcp as base
+
+    base._require_mutations_enabled(
+        "file_write",
+        path=str(base.AUDIT_LOG),
+        fresh_preflight=True,
+    )
+
+
+def _retention_coordination_lock():
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    import grabowski_self_deploy as self_deploy
+
+    return self_deploy._deploy_schedule_lock()
+
+
+def reconcile_retention_completion_audit(
+    *,
+    intent_record_sha256: str,
+    plan_sha256: str,
+    attempt: int,
+    receipt_path: Path,
+    expected_receipt_sha256: str,
+) -> dict[str, Any]:
+    _require_reconciliation_mutation_authority()
+    with _retention_coordination_lock():
+        return _reconcile_retention_completion_audit_locked(
+            intent_record_sha256=intent_record_sha256,
+            plan_sha256=plan_sha256,
+            attempt=attempt,
+            receipt_path=receipt_path,
+            expected_receipt_sha256=expected_receipt_sha256,
+        )
+
+
+def _reconcile_retention_completion_audit_locked(
+    *,
+    intent_record_sha256: str,
+    plan_sha256: str,
+    attempt: int,
+    receipt_path: Path,
+    expected_receipt_sha256: str,
+) -> dict[str, Any]:
+    receipt = _verified_terminal_retention_receipt(
+        receipt_path,
+        plan_sha256=plan_sha256,
+        attempt=attempt,
+        expected_receipt_sha256=expected_receipt_sha256,
+    )
+    state = _retention_audit_reconciliation_state(
+        intent_record_sha256=intent_record_sha256,
+        plan_sha256=plan_sha256,
+        attempt=attempt,
+        receipt_sha256=expected_receipt_sha256,
+    )
+    if state["original_completion"] is not None:
+        return {
+            "schema_version": 1,
+            "operation": RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+            "status": "already-complete",
+            "idempotent": True,
+            "plan_sha256": plan_sha256,
+            "attempt": attempt,
+            "receipt_sha256": expected_receipt_sha256,
+            "intent_record_sha256": intent_record_sha256,
+            "completion_record_sha256": state["original_completion"]["record_sha256"],
+            "retention_effect_retried": False,
+        }
+    if state["existing_reconciliation"] is not None:
+        return {
+            "schema_version": 1,
+            "operation": RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+            "status": "already-reconciled",
+            "idempotent": True,
+            "plan_sha256": plan_sha256,
+            "attempt": attempt,
+            "receipt_sha256": expected_receipt_sha256,
+            "intent_record_sha256": intent_record_sha256,
+            "reconciliation_record_sha256": state["existing_reconciliation"]["record_sha256"],
+            "retention_effect_retried": False,
+        }
+    reconciliation = _append_audit_record({
+        "timestamp_unix": int(time.time()),
+        "operation": RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+        "reconciliation_kind": "completion_audit_gap",
+        "plan_sha256": plan_sha256,
+        "attempt": attempt,
+        "receipt_sha256": expected_receipt_sha256,
+        "intent_record_sha256": intent_record_sha256,
+        "completed": True,
+        "reset_failed_count": len(receipt["reset_failed"]),
+        "reset_failure_count": len(receipt["reset_failures"]),
+        "archived_job_count": len(receipt["archived_jobs"]),
+        "retention_effect_retried": False,
+    })
+    return {
+        "schema_version": 1,
+        "operation": RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+        "status": "reconciled",
+        "idempotent": False,
+        "plan_sha256": plan_sha256,
+        "attempt": attempt,
+        "receipt_sha256": expected_receipt_sha256,
+        "intent_record_sha256": intent_record_sha256,
+        "retention_effect_retried": False,
+        "audit": reconciliation,
+    }
+
+
 def _verified_partial_receipt(
     path: Path,
     *,
@@ -1923,8 +2307,48 @@ def main() -> int:
         default=2,
     )
     parser.add_argument("--legacy-archive-status", action="store_true")
+    parser.add_argument("--reconcile-completion-audit", action="store_true")
+    parser.add_argument("--intent-record-sha256")
+    parser.add_argument("--receipt-path")
+    parser.add_argument("--expected-receipt-sha256")
+    parser.add_argument("--attempt", type=int)
     args = parser.parse_args()
     try:
+        if args.reconcile_completion_audit:
+            if (
+                args.apply
+                or args.periodic_apply
+                or args.legacy_archive_status
+                or args.worktree_hygiene_repo
+                or args.worktree_hygiene_allowed_root
+            ):
+                raise ValueError(
+                    "--reconcile-completion-audit is incompatible with retention apply/status arguments"
+                )
+            missing = [
+                name
+                for name, value in (
+                    ("--expected-plan-sha256", args.expected_plan_sha256),
+                    ("--intent-record-sha256", args.intent_record_sha256),
+                    ("--receipt-path", args.receipt_path),
+                    ("--expected-receipt-sha256", args.expected_receipt_sha256),
+                    ("--attempt", args.attempt),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "--reconcile-completion-audit requires " + ", ".join(missing)
+                )
+            result = reconcile_retention_completion_audit(
+                intent_record_sha256=args.intent_record_sha256,
+                plan_sha256=args.expected_plan_sha256,
+                attempt=args.attempt,
+                receipt_path=Path(args.receipt_path),
+                expected_receipt_sha256=args.expected_receipt_sha256,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+            return 0
         if args.legacy_archive_status:
             if args.apply or args.periodic_apply or args.expected_plan_sha256:
                 raise ValueError(
