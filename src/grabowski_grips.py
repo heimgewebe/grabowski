@@ -9469,6 +9469,46 @@ def _run_saga_plan(
     return {**plan, "receipt_status": "passed"}
 
 
+def _saga_persist_run_receipt(
+    plan: dict[str, Any], run_receipt: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        validated = grabowski_grip_orchestration.validate_run_receipt(
+            run_receipt, plan_value=plan
+        )
+        work_acquire = __import__("grabowski_work_acquire")
+        append_audit = work_acquire.operator.base._append_audit_with_digest
+        record_sha256 = append_audit(
+            {
+                "operation": grabowski_grip_orchestration.SAGA_RUN_AUDIT_OPERATION,
+                "kind": grabowski_grip_orchestration.SAGA_RUN_AUDIT_KIND,
+                "schema_version": grabowski_grip_orchestration.SCHEMA_VERSION,
+                "saga_kind": plan["saga_kind"],
+                "plan_sha256": plan["plan_sha256"],
+                "run_sha256": validated["run_sha256"],
+                "run_receipt_sha256": sha256_json(validated),
+                "run_receipt": validated,
+            }
+        )
+    except (
+        ImportError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        grabowski_grip_orchestration.SagaError,
+    ) as exc:
+        raise GripActionError(
+            f"Saga run receipt durability append failed: {type(exc).__name__}"
+        ) from exc
+    if not _is_sha256_hex(record_sha256):
+        raise GripActionError("Saga run receipt durability append returned no record SHA-256")
+    return {
+        "schema_version": grabowski_grip_orchestration.SCHEMA_VERSION,
+        "kind": grabowski_grip_orchestration.SAGA_RUN_RECEIPT_REF_KIND,
+        "record_sha256": record_sha256,
+    }
+
+
 def _run_saga_run(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -9521,11 +9561,19 @@ def _run_saga_run(
         "pass",
         "captain is never invoked by saga-run; ambiguous apply requires typed readback before any new Captain intent",
     )
+    run_receipt_ref = _saga_persist_run_receipt(plan, run_receipt)
+    _check(
+        receipt,
+        "durable-run-receipt",
+        "pass",
+        str(run_receipt_ref["record_sha256"]),
+    )
     return {
         "schema_version": 1,
         "kind": "operator_saga_run",
         "plan": plan,
         "run_receipt": run_receipt,
+        "run_receipt_ref": run_receipt_ref,
         "mechanic": mechanic,
         "state": run_receipt["state"],
         "captain_handoff": run_receipt.get("captain_handoff"),

@@ -543,6 +543,9 @@ RUN_KIND = "OperatorSagaRunReceipt.v1"
 SETTLEMENT_KIND = "OperatorSagaSettlementReceipt.v1"
 CAPTAIN_AUDIT_BINDING_KIND = "VerifiedCaptainAuditBinding.v1"
 CAPTAIN_AUDIT_RESULT_REF_KIND = "VerifiedCaptainAuditResultRef.v1"
+SAGA_RUN_RECEIPT_REF_KIND = "VerifiedSagaRunReceiptRef.v1"
+SAGA_RUN_AUDIT_KIND = "grabowski_operator_saga_run_receipt_audit"
+SAGA_RUN_AUDIT_OPERATION = "operator-saga-run-receipt"
 SAGA_KINDS = frozenset({"pr-settlement", "runtime-deployment"})
 PHASES = ("prepare", "plan", "apply", "readback", "settle")
 SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -1061,6 +1064,26 @@ def _child_semantically_ready(
     )
 
 
+def is_saga_run_receipt_ref(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("kind") == SAGA_RUN_RECEIPT_REF_KIND
+    )
+
+
+def validate_saga_run_receipt_ref(value: Any) -> dict[str, Any]:
+    ref = _bounded_mapping(value, "run_receipt")
+    required = {"schema_version", "kind", "record_sha256"}
+    if set(ref) != required:
+        raise SagaError("run_receipt audit reference shape is not canonical")
+    if ref.get("schema_version") != SCHEMA_VERSION:
+        raise SagaError("run_receipt audit reference schema is unsupported")
+    if ref.get("kind") != SAGA_RUN_RECEIPT_REF_KIND:
+        raise SagaError("run_receipt audit reference kind is invalid")
+    _sha256(ref.get("record_sha256"), "run_receipt.record_sha256")
+    return ref
+
+
 def is_captain_audit_result_ref(value: Any) -> bool:
     return (
         isinstance(value, Mapping)
@@ -1412,6 +1435,50 @@ def validate_run_receipt(value: Any, *, plan_value: Any) -> dict[str, Any]:
     return run
 
 
+def _verified_saga_run_receipt_reference(
+    plan: dict[str, Any], audit_ref: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        import grabowski_audit_query
+
+        snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        raise SagaError(
+            f"verified Saga run audit snapshot unavailable: {type(exc).__name__}"
+        ) from exc
+
+    record_sha = _sha256(
+        audit_ref.get("record_sha256"), "run_receipt.record_sha256"
+    )
+    try:
+        record = _verified_captain_audit_record(
+            record_sha, snapshot=snapshot, audit_query_module=grabowski_audit_query
+        )
+    except SagaError as exc:
+        raise SagaError(
+            f"verified Saga run audit record unavailable: {record_sha}"
+        ) from exc
+    if (
+        record.get("schema_version") != SCHEMA_VERSION
+        or record.get("kind") != SAGA_RUN_AUDIT_KIND
+        or record.get("operation") != SAGA_RUN_AUDIT_OPERATION
+    ):
+        raise SagaError("verified Saga run audit record contract is invalid")
+    if record.get("plan_sha256") != plan["plan_sha256"]:
+        raise SagaError("verified Saga run audit record is bound to another saga plan")
+    if record.get("saga_kind") != plan["saga_kind"]:
+        raise SagaError("verified Saga run audit record saga kind drifted")
+    run_value = _bounded_mapping(
+        record.get("run_receipt"), "verified Saga run audit.run_receipt"
+    )
+    if record.get("run_receipt_sha256") != sha256_json(run_value):
+        raise SagaError("verified Saga run audit receipt digest mismatch")
+    run = validate_run_receipt(run_value, plan_value=plan)
+    if record.get("run_sha256") != run["run_sha256"]:
+        raise SagaError("verified Saga run audit run digest mismatch")
+    return run
+
+
 def _captain_outcome(
     captain_result: dict[str, Any],
     *,
@@ -1609,7 +1676,11 @@ def settle(
     receipt_sha256_json: ReceiptHasher | None = None,
 ) -> dict[str, Any]:
     plan = validate_plan(plan_value)
-    run = validate_run_receipt(run_receipt_value, plan_value=plan)
+    if is_saga_run_receipt_ref(run_receipt_value):
+        run_ref = validate_saga_run_receipt_ref(run_receipt_value)
+        run = _verified_saga_run_receipt_reference(plan, run_ref)
+    else:
+        run = validate_run_receipt(run_receipt_value, plan_value=plan)
     captain = _bounded_mapping(captain_result_value, "captain_result")
     captain_audit_binding = validate_captain_audit_binding(
         captain_audit_binding_value,
