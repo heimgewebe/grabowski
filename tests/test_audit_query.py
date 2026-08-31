@@ -360,6 +360,55 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["record"]["task_id"], "task-2")
         self.assertEqual(result["items"][1]["record"]["task_id"], "task-1")
 
+    def test_query_and_trace_support_retention_intent_digest(self) -> None:
+        intent_sha = "a" * 64
+        plan_sha = "b" * 64
+        records = [
+            {
+                "audit_schema_version": 2,
+                "operation": "runtime-state-retention-intent",
+                "plan_sha256": plan_sha,
+                "attempt": 1,
+                "record_sha256": intent_sha,
+            },
+            {
+                "audit_schema_version": 2,
+                "operation": "runtime-state-retention-completion-audit-reconciled",
+                "plan_sha256": plan_sha,
+                "attempt": 1,
+                "receipt_sha256": "c" * 64,
+                "intent_record_sha256": intent_sha,
+                "reconciliation_kind": "completion_audit_gap",
+                "completed": True,
+                "retention_effect_retried": False,
+                "record_sha256": "d" * 64,
+            },
+        ]
+        module = self._load_module(
+            [_component("/tmp/grabowski-audit-test/write-audit.jsonl", records)]
+        )
+
+        query = module.query_audit({"intent_record_sha256": intent_sha})
+        self.assertEqual(query["matched"], 1)
+        self.assertEqual(
+            query["items"][0]["record"]["intent_record_sha256"], intent_sha
+        )
+
+        trace = module.trace_audit("intent_record_sha256", intent_sha)
+        self.assertEqual(trace["seed_count"], 1)
+        self.assertEqual(trace["matched"], 2)
+        self.assertEqual(
+            trace["correlation_tokens"]["intent_record_sha256"], [intent_sha]
+        )
+        self.assertTrue(trace["items"][1]["trace"]["direct_anchor_match"])
+
+        for invalid in ("e" * 63, "E" * 64):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "64 lowercase hexadecimal"):
+                    module.query_audit({"intent_record_sha256": invalid})
+                with self.assertRaisesRegex(ValueError, "64 lowercase hexadecimal"):
+                    module.trace_audit("intent_record_sha256", invalid)
+
     def test_query_separates_held_and_requested_resource_semantics(self) -> None:
         module = self._load_module(self._components())
         compatibility = module.query_audit({"resource_key": "repo:/srv/example"})
