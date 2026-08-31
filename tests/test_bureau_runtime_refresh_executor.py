@@ -79,6 +79,24 @@ def _authority_contract() -> dict[str, object]:
     }
 
 
+def _rw_findmnt(*_args: object, **_kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "filesystems": [
+                    {
+                        "target": "/",
+                        "fstype": "ext4",
+                        "options": "rw,noatime,errors=remount-ro",
+                    }
+                ]
+            }
+        ),
+        stderr="",
+    )
+
+
 def _request() -> dict[str, str]:
     return {
         "intent": str(executor.CANONICAL_INTENTS_ROOT / f"{INTENT_SHA}.json"),
@@ -438,6 +456,100 @@ class BureauRuntimeRefreshExecutorTests(unittest.TestCase):
         self.assertEqual(TARGET_SHA, evidence["target_sha256"])
         digest = str(evidence.pop("execution_context_sha256"))
         self.assertEqual(digest, executor._sha256_json(evidence))
+
+    def test_execution_context_preflight_allows_absent_runtime_user_unit_dir_with_writable_parent(self) -> None:
+        request = _request()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_parent = Path(directory) / "runtime" / "systemd"
+            runtime_parent.mkdir(parents=True)
+            runtime_user_unit_dir = runtime_parent / "user"
+            intent = _preflight_intent(directory)
+            intent["runtime_user_unit_dir"] = str(runtime_user_unit_dir)
+            with (
+                patch.dict(os.environ, _task_environment(), clear=False),
+                patch.object(executor.os, "statvfs", lambda _path: SimpleNamespace(f_flag=0)),
+                patch.object(executor.os, "access", lambda _path, _mode: True),
+                patch.object(executor.subprocess, "run", _rw_findmnt),
+            ):
+                evidence = executor.execution_context_preflight(
+                    request, intent, _authority_contract()
+                )
+        item = evidence["mutation_roots"]["runtime_user_unit_dir"]
+        self.assertTrue(evidence["writable"])
+        self.assertTrue(item["absent"])
+        self.assertTrue(item["absence_allowed"])
+        self.assertEqual("direct_parent", item["writability_basis"])
+        self.assertEqual(str(runtime_parent), item["parent"]["path"])
+        self.assertTrue(item["parent"]["writable"])
+        self.assertTrue(item["writable"])
+
+    def test_execution_context_preflight_rejects_absent_runtime_user_unit_dir_with_unwritable_parent(self) -> None:
+        request = _request()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_parent = Path(directory) / "runtime" / "systemd"
+            runtime_parent.mkdir(parents=True)
+            intent = _preflight_intent(directory)
+            intent["runtime_user_unit_dir"] = str(runtime_parent / "user")
+
+            def access(path: object, _mode: int) -> bool:
+                return Path(path) != runtime_parent
+
+            with (
+                patch.dict(os.environ, _task_environment(), clear=False),
+                patch.object(executor.os, "statvfs", lambda _path: SimpleNamespace(f_flag=0)),
+                patch.object(executor.os, "access", access),
+                patch.object(executor.subprocess, "run", _rw_findmnt),
+            ):
+                with self.assertRaisesRegex(
+                    executor.BureauRuntimeRefreshExecutorError, "not writable"
+                ):
+                    executor.execution_context_preflight(
+                        request, intent, _authority_contract()
+                    )
+
+    def test_execution_context_preflight_rejects_runtime_user_unit_dir_that_is_not_directory(self) -> None:
+        request = _request()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime_user_unit_dir = Path(directory) / "runtime-user-unit-dir"
+            runtime_user_unit_dir.write_text("not-a-directory", encoding="utf-8")
+            intent = _preflight_intent(directory)
+            intent["runtime_user_unit_dir"] = str(runtime_user_unit_dir)
+            with (
+                patch.dict(os.environ, _task_environment(), clear=False),
+                patch.object(executor.os, "statvfs", lambda _path: SimpleNamespace(f_flag=0)),
+                patch.object(executor.os, "access", lambda _path, _mode: True),
+                patch.object(executor.subprocess, "run", _rw_findmnt),
+            ):
+                with self.assertRaisesRegex(
+                    executor.BureauRuntimeRefreshExecutorError, "not writable"
+                ):
+                    executor.execution_context_preflight(
+                        request, intent, _authority_contract()
+                    )
+
+    def test_execution_context_contract_requires_fresh_absence_tolerant_authority(self) -> None:
+        contract = executor.EXPECTED_RUNTIME_EXECUTION_CONTEXT
+        self.assertNotIn(
+            "runtime_user_unit_dir", contract["required_writable_intent_roots"]
+        )
+        self.assertEqual(
+            {
+                "runtime_user_unit_dir": {
+                    "when_present": "writable-searchable-rw-directory",
+                    "when_absent": "writable-searchable-rw-direct-parent",
+                }
+            },
+            contract["absence_tolerant_intent_roots"],
+        )
+        legacy = dict(contract)
+        legacy.pop("absence_tolerant_intent_roots")
+        legacy["required_writable_intent_roots"] = [
+            *executor.INTENT_MUTATION_ROOT_FIELDS,
+            executor.AUTHORITY_MUTATION_ROOT_FIELD,
+        ]
+        self.assertNotEqual(
+            executor._sha256_json(legacy), executor._sha256_json(contract)
+        )
 
     def test_load_bound_intent_verifies_payload_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
