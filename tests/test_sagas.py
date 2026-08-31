@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 import sys
+import types
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+import grabowski_grip_orchestration as grip_orchestration
 import grabowski_sagas as sagas
 
 
@@ -412,6 +416,127 @@ class SagaContractTests(unittest.TestCase):
         self.assertEqual("recovery_required", mismatch["state"])
         self.assertIn("pr_head_mismatch", mismatch["reasons"])
         self.assertFalse(mismatch["retry_allowed"])
+
+    def test_audit_reference_settlement_binds_verified_completion_digests(self) -> None:
+        plan = sagas.build_plan(
+            "runtime-deployment", self.runtime_target(), "t121-audit-ref-trusted-digests"
+        )
+        run = sagas.build_run_receipt(plan, self.mechanic_result(plan))
+        intent_sha = "c" * 64
+        completion_sha = "d" * 64
+        expected = plan["expected_identity"]
+        handoff = plan["captain_handoff"]
+        common = {
+            "kind": "grabowski_captain_run_audit",
+            "action": handoff["action"],
+            "target_sha256": sagas.sha256_json(handoff["target"]),
+            "expected_head": expected["expected_head"],
+            "expected_base": None,
+            "expected_base_sha": None,
+            "actor_id": "runtime-actor:test",
+            "context_sha256": "e" * 64,
+            "request_sha256": "f" * 64,
+        }
+        intent = {
+            **common,
+            "operation": "captain-run-audit-intent",
+            "phase": "intent",
+            "record_sha256": intent_sha,
+        }
+        execution_result = {
+            "status": "passed",
+            "receipt_sha256": "1" * 64,
+            "output_sha256": "2" * 64,
+        }
+        completion = {
+            **common,
+            "operation": "captain-run-audit-completion",
+            "phase": "completion",
+            "record_sha256": completion_sha,
+            "intent_audit_sha256": intent_sha,
+            "execution_result": execution_result,
+            "execution_result_sha256": sagas.sha256_json(execution_result),
+        }
+        payload = (
+            json.dumps(intent, separators=(",", ":"))
+            + "\n"
+            + json.dumps(completion, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        snapshot = types.SimpleNamespace(
+            segments=(types.SimpleNamespace(captured_data=payload),)
+        )
+        ref = {
+            "schema_version": 1,
+            "kind": grip_orchestration.CAPTAIN_AUDIT_RESULT_REF_KIND,
+            "completion_record_sha256": completion_sha,
+        }
+        binding_body = {
+            "schema_version": 1,
+            "kind": sagas.CAPTAIN_AUDIT_BINDING_KIND,
+            "authority": "verified_grabowski_audit_chain",
+            "intent_record_sha256": intent_sha,
+            "completion_record_sha256": completion_sha,
+            "action": handoff["action"],
+            "target_sha256": common["target_sha256"],
+            "expected_head": expected["expected_head"],
+            "expected_base": None,
+            "expected_base_sha": None,
+            "receipt_sha256": execution_result["receipt_sha256"],
+            "output_sha256": execution_result["output_sha256"],
+            "status": "passed",
+        }
+        binding = {
+            **binding_body,
+            "binding_sha256": sagas.sha256_json(binding_body),
+        }
+        readback = {
+            "identity": {
+                "repo_head": HEAD,
+                "completion_status": "complete",
+            },
+            "integrity": {"manifest_schema_valid": True},
+            "serving_process": {
+                "matches_deployed_manifest": True,
+                "serves_deployed_release": True,
+            },
+        }
+
+        audit_query_module = types.SimpleNamespace(
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _load_snapshot_segment=lambda segment: segment.captured_data,
+        )
+        with patch.dict(
+            sys.modules, {"grabowski_audit_query": audit_query_module}
+        ):
+            settled = sagas.settle(
+                plan_value=plan,
+                run_receipt_value=run,
+                captain_result_value=ref,
+                captain_audit_binding_value=binding,
+                readback_value=readback,
+            )
+            self.assertEqual("settled", settled["state"])
+            self.assertEqual(
+                execution_result["receipt_sha256"],
+                settled["captain_receipt_sha256"],
+            )
+
+            forged = copy.deepcopy(binding)
+            forged["receipt_sha256"] = "9" * 64
+            forged["binding_sha256"] = sagas.sha256_json(
+                {key: value for key, value in forged.items() if key != "binding_sha256"}
+            )
+            with self.assertRaisesRegex(
+                sagas.SagaError, "receipt_sha256"
+            ):
+                sagas.settle(
+                    plan_value=plan,
+                    run_receipt_value=run,
+                    captain_result_value=ref,
+                    captain_audit_binding_value=forged,
+                    readback_value=readback,
+                )
 
     def test_captain_block_is_known_but_invoked_failure_requires_recovery(self) -> None:
         plan = sagas.build_plan("pr-settlement", self.pr_target(), "t121-pr-pilot")
