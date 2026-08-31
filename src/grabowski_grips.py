@@ -4943,10 +4943,11 @@ def _run_worktree_hygiene_reconcile(
             adopted_unowned_count += 1
         retention = lifecycle.get("retention") if isinstance(lifecycle.get("retention"), dict) else {}
         existing_until = retention.get("retention_until_unix")
+        archive_now = int(time.time())
         retention_until = (
             existing_until
-            if isinstance(existing_until, int) and existing_until > now
-            else now + WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
+            if isinstance(existing_until, int) and existing_until > archive_now
+            else archive_now + WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
         )
         result = grabowski_checkouts.grabowski_checkout_archive(
             repo=str(repo),

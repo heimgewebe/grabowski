@@ -15732,6 +15732,7 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
 
     def test_archive_without_active_retention_uses_only_short_handoff(self) -> None:
         now = 10_000
+        archive_now = now + 120
         with tempfile.TemporaryDirectory() as tmp:
             checkout = str(Path(tmp) / "worktree")
             item = self._owned_item(checkout, state="unclassified_clean")
@@ -15762,9 +15763,9 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                     "stderr": "",
                 }
 
-            deadline = now + grips.WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
+            deadline = archive_now + grips.WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
             with (
-                patch("grabowski_grips.time.time", return_value=now),
+                patch("grabowski_grips.time.time", side_effect=[now, archive_now]),
                 patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
                 patch(
                     "grabowski_checkouts.grabowski_checkout_archive",
