@@ -472,8 +472,28 @@ def _audit_transition_gap_signal(
                     retention_pair[0], pending[retention_pair], record
                 )
                 if match_index is not None:
-                    pending[retention_pair].pop(match_index)
-                    matched = True
+                    legacy_record, _legacy_timestamp = pending[retention_pair][
+                        match_index
+                    ]
+                    legacy_digest = _audit_record_evidence_sha256(legacy_record)
+                    receipt_sha256 = record.get("receipt_sha256")
+                    legacy_consumer_key = (
+                        "__legacy_retention_intent__",
+                        0,
+                        legacy_digest
+                        if legacy_digest is not None
+                        else (
+                            receipt_sha256
+                            if _audit_sha256_valid(receipt_sha256)
+                            else "unbound"
+                        ),
+                    )
+                    if (
+                        not _receipt_consumed(record)
+                        and _claim_receipt(record, legacy_consumer_key)
+                    ):
+                        pending[retention_pair].pop(match_index)
+                        matched = True
             if matched:
                 completed_counts[retention_pair[0]] += 1
             continue

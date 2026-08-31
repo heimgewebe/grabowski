@@ -126,6 +126,25 @@ class RetentionReconciliationAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ambiguous among duplicate intents"):
             self._state(items, target=self.INTENT_A)
 
+    def test_legacy_completion_receipt_blocks_indexed_reconciliation(self) -> None:
+        items = [
+            self._item(
+                "e" * 64,
+                {"operation": "runtime-state-retention-intent"},
+            ),
+            self._item(
+                "f" * 64,
+                {
+                    "operation": "runtime-state-retention-complete",
+                    "receipt_sha256": self.RECEIPT,
+                    "completed": True,
+                },
+            ),
+            self._intent(self.INTENT_B),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "already bound to another intent"):
+            self._state(items, target=self.INTENT_B)
+
 
 class RetentionSignalReceiptConsumptionTests(unittest.TestCase):
     def _intent(self, digest: str, now: int) -> tuple[dict[str, object], int]:
@@ -275,6 +294,91 @@ class RetentionSignalReceiptConsumptionTests(unittest.TestCase):
         self.assertEqual(result["severity"], "high")
         self.assertEqual(result["details"]["execution_gap_count"], 2)
         self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
+
+    def test_legacy_completion_claims_receipt_before_modern_reconciliation(self) -> None:
+        now = 1_800_000_000
+        receipt = "6" * 64
+        modern_intent = "a" * 64
+        result = self._signal(
+            [
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": "e" * 64,
+                    },
+                    now - 1_000,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-complete",
+                        "record_sha256": "f" * 64,
+                        "receipt_sha256": receipt,
+                        "completed": True,
+                    },
+                    now - 999,
+                ),
+                self._intent(modern_intent, now - 998),
+                self._reconciliation(
+                    digest="c" * 64,
+                    intent_digest=modern_intent,
+                    receipt_digest=receipt,
+                    now=now - 997,
+                ),
+            ],
+            now,
+        )
+        self.assertEqual(result["severity"], "high")
+        self.assertEqual(result["details"]["execution_gap_count"], 1)
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 0)
+        self.assertEqual(
+            result["details"]["completed_pairs_by_transition"],
+            {"runtime-state-retention-intent": 1},
+        )
+        self.assertEqual(
+            result["details"]["execution_gap_evidence_refs"],
+            ["audit-record-sha256:" + modern_intent],
+        )
+
+    def test_modern_reconciliation_receipt_cannot_close_later_legacy_intent(self) -> None:
+        now = 1_800_000_000
+        receipt = "5" * 64
+        modern_intent = "a" * 64
+        legacy_intent = "e" * 64
+        result = self._signal(
+            [
+                self._intent(modern_intent, now - 1_000),
+                self._reconciliation(
+                    digest="c" * 64,
+                    intent_digest=modern_intent,
+                    receipt_digest=receipt,
+                    now=now - 999,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-intent",
+                        "record_sha256": legacy_intent,
+                    },
+                    now - 998,
+                ),
+                (
+                    {
+                        "operation": "runtime-state-retention-complete",
+                        "record_sha256": "f" * 64,
+                        "receipt_sha256": receipt,
+                        "completed": True,
+                    },
+                    now - 997,
+                ),
+            ],
+            now,
+        )
+        self.assertEqual(result["severity"], "high")
+        self.assertEqual(result["details"]["execution_gap_count"], 1)
+        self.assertEqual(result["details"]["completion_audit_gap_count"], 1)
+        self.assertEqual(
+            result["details"]["execution_gap_evidence_refs"],
+            ["audit-record-sha256:" + legacy_intent],
+        )
 
 
 if __name__ == "__main__":

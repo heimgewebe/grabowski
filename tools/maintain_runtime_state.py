@@ -1574,6 +1574,7 @@ def _retention_audit_reconciliation_state(
     target_seen = False
     receipt_consumer_digest: str | None = None
     receipt_consumer_kind: str | None = None
+    receipt_conflict = False
     original_completion: dict[str, Any] | None = None
     existing_reconciliation: dict[str, Any] | None = None
 
@@ -1588,6 +1589,20 @@ def _retention_audit_reconciliation_state(
             record.get("plan_sha256") == plan_sha256
             and record.get("attempt") == attempt
         )
+        if (
+            record.get("receipt_sha256") == receipt_sha256
+            and operation
+            in (
+                "runtime-state-retention-complete",
+                RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+            )
+            and not same_identity
+        ):
+            # Receipt occupancy is global, not identity-version-specific. A
+            # verified legacy or foreign completion/reconciliation that already
+            # cites this terminal receipt prevents a second completion claim.
+            receipt_conflict = True
+            continue
         if record_digest == intent_record_sha256 and (
             operation != "runtime-state-retention-intent" or not same_identity
         ):
@@ -1685,6 +1700,10 @@ def _retention_audit_reconciliation_state(
     if not target_seen:
         raise RuntimeError(
             "retention reconciliation intent record was not found in verified audit"
+        )
+    if receipt_conflict:
+        raise RuntimeError(
+            "retention terminal receipt is already bound to another intent"
         )
     if original_completion is not None or existing_reconciliation is not None:
         return {
