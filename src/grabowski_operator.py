@@ -47,6 +47,7 @@ import grabowski_private_io as private_io
 import grabowski_effect_interceptor
 import grabowski_grips
 import grabowski_git_preimage
+import grabowski_transport_assertion
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 
@@ -642,6 +643,89 @@ def _require_current_serving_process() -> None:
     )
 
 
+def _signed_replay_recovery_preflight(
+    *, tool_name: str, arguments: Any
+) -> dict[str, Any] | None:
+    """Prove one domain-safe replay recovery without granting generic retry."""
+
+    if tool_name != "grabowski_bureau_task_publish" or not isinstance(arguments, dict):
+        return None
+    allowed = {"proposal_id", "registry_root", "lease_ttl_seconds"}
+    if set(arguments) - allowed:
+        return None
+    proposal_id = arguments.get("proposal_id")
+    if not isinstance(proposal_id, str) or not proposal_id.strip():
+        return None
+    registry_root = arguments.get("registry_root")
+    if registry_root is not None and (
+        not isinstance(registry_root, str) or not registry_root.strip()
+    ):
+        return None
+    lease_ttl_seconds = arguments.get("lease_ttl_seconds")
+    if lease_ttl_seconds is not None and (
+        type(lease_ttl_seconds) is not int
+        or lease_ttl_seconds < 90
+        or lease_ttl_seconds > 300
+    ):
+        return None
+
+    # Import lazily so the central operator does not create a module cycle at
+    # startup.  The preview is the Bureau domain's own reconciliation gate: for
+    # a register it proves either that publication is still admissible or that
+    # an existing revision is the exact idempotent mutation of this proposal.
+    import grabowski_bureau_intake as bureau_intake
+
+    preview = (
+        bureau_intake.grabowski_bureau_task_publish_preview(
+            proposal_id, registry_root
+        )
+        if registry_root is not None
+        else bureau_intake.grabowski_bureau_task_publish_preview(proposal_id)
+    )
+    if not isinstance(preview, dict):
+        return None
+    approval = preview.get("approval")
+    safe = (
+        preview.get("kind") == "bureau_task_publication_preview"
+        and preview.get("status") == "ready"
+        and preview.get("effect_started") is False
+        and preview.get("ambiguity") is False
+        and preview.get("retryable") is False
+        and preview.get("publication_mode") == "state_store"
+        and isinstance(preview.get("task_id"), str)
+        and bool(preview.get("task_id"))
+        and isinstance(preview.get("proposal_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", str(preview.get("proposal_sha256")))
+        is not None
+        and isinstance(approval, dict)
+        and approval.get("allowed") is True
+    )
+    if not safe:
+        return None
+    preview_sha256 = hashlib.sha256(
+        json.dumps(
+            preview,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "kind": "grabowski_signed_replay_recovery_preflight",
+        "schema_version": 1,
+        "tool_name": tool_name,
+        "task_id": preview["task_id"],
+        "proposal_sha256": preview["proposal_sha256"],
+        "publication_mode": "state_store",
+        "preview_sha256": preview_sha256,
+        "does_not_establish": [
+            "generic replay retry authority",
+            "authorization for another tool or argument digest",
+            "future StateStore stability",
+        ],
+    }
+
+
 def _require_transport_roundtrip_for_tool(
     *,
     tool_name: Any,
@@ -672,12 +756,39 @@ def _require_transport_roundtrip_for_tool(
         tool_name_text = str(tool_name)
         signed_transport = getattr(base, "_transport_signed_one_call_evidence", None)
         if callable(signed_transport):
-            signed_evidence = signed_transport(
-                context,
-                tool_name=tool_name_text,
-                arguments_sha256=arguments_sha256,
-                runtime_binding=runtime_binding,
-            )
+            try:
+                signed_evidence = signed_transport(
+                    context,
+                    tool_name=tool_name_text,
+                    arguments_sha256=arguments_sha256,
+                    runtime_binding=runtime_binding,
+                )
+            except grabowski_transport_assertion.TransportAssertionReplay as replay_exc:
+                # Never turn a generic signed replay into retry authority.  Only
+                # a domain-specific reconciliation gate may prove that this exact
+                # target is safe to re-enter, and the already-existing roundtrip
+                # receipt must independently bind the same tool + argument digest.
+                recovery_preflight = _signed_replay_recovery_preflight(
+                    tool_name=tool_name_text, arguments=arguments
+                )
+                if recovery_preflight is None:
+                    raise RuntimeError(str(replay_exc)) from replay_exc
+                client_scope = base._transport_roundtrip_client_scope(context)
+                try:
+                    recovery_evidence = grabowski_transport_roundtrip.consume_verified(
+                        client_scope=client_scope,
+                        runtime_binding=runtime_binding,
+                        tool_name=tool_name_text,
+                        arguments_sha256=arguments_sha256,
+                    )
+                except grabowski_transport_roundtrip.TransportRoundtripError:
+                    raise RuntimeError(str(replay_exc)) from replay_exc
+                return {
+                    **recovery_evidence,
+                    "signed_one_call_replay_recovery": True,
+                    "recovery_basis": "domain_reconciled_preverified_exact_roundtrip",
+                    "recovery_preflight": recovery_preflight,
+                }
             if signed_evidence is not None:
                 return signed_evidence
         client_scope = base._transport_roundtrip_client_scope(context)
