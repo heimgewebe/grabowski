@@ -105,11 +105,15 @@ Die Phasen werden read-only wie folgt projiziert:
   weder Archiv noch Cleanup-Kandidat. Ein wieder erschienener
   Worktree wird erneut blockierende Identitätsdrift.
 - `archived` gelangt mit passendem offenem Recovery-Archiv in
-  `archived_blocked` oder `cleanup_candidate`; Apply bleibt jedoch für mindestens
-  24 Stunden nach der Archivierung gesperrt. Auch Retention desselben Owners muss
-  vollständig abgelaufen sein.
+  `archived_blocked` oder `cleanup_candidate`; eine zeitbasierte Archiv-Gnadenfrist
+  existiert nicht. Aktive Retention desselben Owners muss weiterhin vollständig
+  abgelaufen sein.
 - Agent-Workspace-Cleanup archiviert und entfernt nie im selben Top-Level-Aufruf:
   Nach `archived_ready_for_cleanup` folgt ohne Wartezeit ein frischer Plan und ein zweiter Aufruf.
+- `worktree-hygiene-reconcile` bewahrt eine bereits aktive Retention unverändert.
+  Fehlt sie oder ist sie abgelaufen, setzt die Archivierung nur eine kurze technische
+  Future-Retention bis zum zwingend separaten Cleanup-Aufruf; sie ist keine
+  zusätzliche Cleanup-Gnadenfrist.
 - Unbekannte Phase oder widersprüchliche Path-, Repository-, Branch-, Owner-,
   Head-, Retention- oder Archivdaten werden `managed_lifecycle_drift`.
 

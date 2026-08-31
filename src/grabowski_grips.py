@@ -54,6 +54,7 @@ INTRINSIC_PROTECTED_BRANCHES = frozenset({"main", "master"})
 REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 WORKTREE_HYGIENE_CONFIRMATION = "reconcile-terminal-worktrees"
 WORKTREE_HYGIENE_MAX_ACTIONS = 8
+WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS = 60
 WORKTREE_HYGIENE_MAX_CANDIDATES = 32
 
 SITUATION_ACCEPTANCE_IDS = (
@@ -4942,9 +4943,10 @@ def _run_worktree_hygiene_reconcile(
             adopted_unowned_count += 1
         retention = lifecycle.get("retention") if isinstance(lifecycle.get("retention"), dict) else {}
         existing_until = retention.get("retention_until_unix")
-        retention_until = max(
-            now + 3600,
-            existing_until if isinstance(existing_until, int) else 0,
+        retention_until = (
+            existing_until
+            if isinstance(existing_until, int) and existing_until > now
+            else now + WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
         )
         result = grabowski_checkouts.grabowski_checkout_archive(
             repo=str(repo),

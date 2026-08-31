@@ -15507,6 +15507,128 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
         )
         self.assertEqual(self.OWNER, archive.call_args.kwargs["owner_id"])
 
+    def test_archive_without_active_retention_uses_only_short_handoff(self) -> None:
+        now = 10_000
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "worktree")
+            item = self._owned_item(checkout, state="unclassified_clean")
+            item["lifecycle"]["retention"] = None
+            inventory = {
+                "inventory_sha256": "d" * 64,
+                "worktrees": [item],
+            }
+
+            def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv[:2] == ["repo", "view"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": json.dumps({"defaultBranchRef": {"name": "main"}}),
+                        "stderr": "",
+                    }
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps([{
+                        "number": 82,
+                        "url": "https://github.com/heimgewebe/grabowski/pull/82",
+                        "state": "MERGED",
+                        "baseRefName": "main",
+                        "headRefName": self.BRANCH,
+                        "headRefOid": self.HEAD,
+                        "mergedAt": "2026-07-22T01:00:00Z",
+                    }]),
+                    "stderr": "",
+                }
+
+            deadline = now + grips.WORKTREE_HYGIENE_ARCHIVE_HANDOFF_SECONDS
+            with (
+                patch("grabowski_grips.time.time", return_value=now),
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch(
+                    "grabowski_checkouts.grabowski_checkout_archive",
+                    return_value={
+                        "archive": {
+                            "archive_id": "20260722T010000Z-121212121212",
+                            "created_at_unix": now,
+                            "retention_until_unix": deadline,
+                        }
+                    },
+                ) as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=github_runner,
+                )
+
+        self.assertEqual(deadline, archive.call_args.kwargs["retention_until_unix"])
+        self.assertEqual(
+            deadline, result["output"]["archived"][0]["cleanup_available_at_unix"]
+        )
+
+    def test_archive_preserves_existing_active_retention(self) -> None:
+        now = 20_000
+        existing_deadline = now + 7_200
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = str(Path(tmp) / "worktree")
+            item = self._owned_item(checkout)
+            item["lifecycle"]["retention"] = {
+                "owner_id": self.OWNER,
+                "retention_until_unix": existing_deadline,
+            }
+            inventory = {
+                "inventory_sha256": "e" * 64,
+                "worktrees": [item],
+            }
+
+            def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+                if argv[:2] == ["repo", "view"]:
+                    return {
+                        "returncode": 0,
+                        "stdout": json.dumps({"defaultBranchRef": {"name": "main"}}),
+                        "stderr": "",
+                    }
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps([{
+                        "number": 83,
+                        "url": "https://github.com/heimgewebe/grabowski/pull/83",
+                        "state": "MERGED",
+                        "baseRefName": "main",
+                        "headRefName": self.BRANCH,
+                        "headRefOid": self.HEAD,
+                        "mergedAt": "2026-07-22T01:00:00Z",
+                    }]),
+                    "stderr": "",
+                }
+
+            with (
+                patch("grabowski_grips.time.time", return_value=now),
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch(
+                    "grabowski_checkouts.grabowski_checkout_archive",
+                    return_value={
+                        "archive": {
+                            "archive_id": "20260722T010000Z-343434343434",
+                            "created_at_unix": now,
+                            "retention_until_unix": existing_deadline,
+                        }
+                    },
+                ) as archive,
+            ):
+                grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    self._parameters(tmp),
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=github_runner,
+                )
+
+        self.assertEqual(
+            existing_deadline, archive.call_args.kwargs["retention_until_unix"]
+        )
+
     def test_default_branch_lookup_failure_blocks_archival(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             checkout = str(Path(tmp) / "worktree")
