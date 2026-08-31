@@ -209,6 +209,10 @@
       "source": "src/grabowski_operator.py"
     },
     {
+      "module": "grabowski_bureau_runtime_refresh_executor",
+      "source": "src/grabowski_bureau_runtime_refresh_executor.py"
+    },
+    {
       "module": "grabowski_effect_receipt",
       "source": "src/grabowski_effect_receipt.py"
     },
