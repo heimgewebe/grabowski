@@ -1,0 +1,234 @@
+# Trajectory shadow pilot (experimental)
+
+Status: **STOP / do not promote** (historical v1 snapshot finalized 2026-08-29; parser/evidence semantics hardened 2026-08-30).
+
+This directory contains a read-only, post-hoc pilot owned by the existing Bureau scope
+`GRABOWSKI-OPERATOR-SURFACE-V1-T047`. It is not a public runtime contract, does not
+intervene in live work, and does not replace `attention_trace_v1`.
+
+## Question
+
+Does provider-session trajectory evidence add actionable information beyond existing
+Grabowski evidence early enough to improve diagnosis or recovery?
+
+The pilot deliberately does **not** measure code quality, agent understanding, merge
+readiness, review completeness, deployment readiness, task success, or a global agent
+score. Outcome evidence remains authoritative for those questions.
+
+## Live source audit
+
+The initial source audit used local live state on 2026-08-28. The final adapter and cohort
+were recalibrated against the then-current local sources on 2026-08-29.
+
+- `attention_trace_v1` reproduced the historical inventory: 59 Agent Workspaces,
+  57 event logs, 552 events, 129 lifecycle events mappable to attention categories, and
+  48 workspaces with any attention signal. It still has no direct search/read/edit/discover
+  observation and was not changed by this pilot.
+- Claude session logs were present under `~/.claude/projects`; Codex session logs were
+  present under `~/.codex/sessions`; Pi was not present locally.
+- Mindwalk was neither installed as an executable nor importable as a Python module. No
+  dependency was added solely for this pilot because local adapters were sufficient for
+  the utility test.
+
+## Attribution gate
+
+Direct `Agent Workspace writer_worktree -> provider session cwd` attribution produced no
+matches. The pilot therefore does not use repository+time-window guesses.
+
+Accepted attribution requires:
+
+1. exact Work Lane `target_path == session cwd`;
+2. the target path must identify exactly one Work Lane;
+3. if both a session base revision and Work Lane base revision are known, they must agree;
+4. branch equality and/or exact base-revision equality must reinforce the target match.
+
+A known base-revision mismatch rejects attribution even when the branch name matches.
+Target-only and ambiguous matches are excluded. All exactly bound provider sessions for
+a lane are merged chronologically rather than selecting only the largest session.
+
+Recorded historical v1 rerun inventory (2026-08-29):
+
+- 1,424 Work Lane receipts indexed;
+- 141 Claude sessions indexed;
+- 813 Codex sessions indexed;
+- 39 exactly attributable Work Lanes;
+- 73 exact session bindings across those lanes;
+- 31 Work Lanes with actual tool actions, used as the pilot cohort.
+
+The 31-run cohort contains 10 baseline-success runs, 4 blocked runs, and 17 runs whose
+local Work Lane closeout baseline is incomplete/unknown. It includes 3 runs with observed
+tool failures and 2 runs with delegation/handoff events. The lower cohort size versus an
+earlier run is the expected result of rejecting known base-revision contradictions.
+
+## Normalized trace
+
+Only minimized metadata is persisted:
+
+- sequence/time;
+- actor;
+- operation;
+- repo-relative target when it can be established;
+- outcome;
+- source adapter;
+- hashed evidence reference;
+- attribution/confidence;
+- state epoch;
+- mutation/result digests where required for equality checks.
+
+The pilot does not persist Chain-of-Thought, prompts, commands, file contents, credentials,
+secret values, or raw tool outputs. Raw result material is consumed transiently only to
+produce SHA-256 equality digests or establish bounded explicit status metadata.
+
+## Exactly four detectors
+
+1. `repeated_failure_without_state_delta`
+   - same action fingerprint + same failure-result fingerprint;
+   - same state epoch;
+   - no successful read/search/discover/context evidence between attempts.
+
+2. `verification_gap`
+   - only considered at a successful evidenced Work Lane closeout boundary;
+   - a successful repo mutation occurs after the last successful verification.
+
+3. `mutation_without_evidenced_localization`
+   - target-bound mutation without prior read/search/discover/context evidence;
+   - intentionally advisory at confidence 0.55 because task-supplied prompt context is
+     not read and therefore cannot be disproved.
+
+4. `action_oscillation_without_progress`
+   - either A-B-A-B with equal repeated results and no state delta, or the stricter
+     successful edit -> failed verify -> successful inverse edit -> same successful edit
+     -> same failed verify pattern.
+
+## Calibration findings
+
+The first implementation produced one apparent high-confidence `verification_gap` with
+about 28,861 seconds of apparent lead time. Manual baseline validation showed that this
+was a false positive:
+
+- the final "mutation" was actually a Claude `Write` to `~/.claude/plans/...`, outside
+  the repository worktree;
+- the corresponding Grabowski PR #951 was merged at exact terminal head
+  `2cd16612a9dd6eb9f91577bad9efd778ac149896`;
+- repository validation and CodeQL completed successfully, and the Codex review
+  settlement was green.
+
+The adapter was hardened so external Read/Grep/Glob/Edit/Write targets cannot establish
+repo localization or repo mutation.
+
+A later Codex review exposed two additional material adapter gaps plus one attribution
+gap. A live local schema audit then showed:
+
+- 11,252 `exec_command` calls, with commands carried in `cmd`;
+- 2,080 `shell` calls, all observed as `bash` wrappers and 2,077 in the common
+  `bash -lc <inner command>` three-element form;
+- 16,690 free-form `exec` calls;
+- `exec_command` outputs commonly carry an explicit `Process exited with code N` wrapper.
+
+The final adapter recognizes only these live-validated command shapes. Explicit exit status
+establishes success/failure; absence of explicit process status remains `unknown` rather
+than being promoted to success. Generic free-text such as `exit code: 1` is not trusted as
+process status because it can be quoted command output.
+
+Direct mutation tools such as Codex `apply_patch` are deliberately not reconstructed from
+raw patch payloads. Closing that remaining visibility gap would require more raw-data
+processing and adapter complexity before this pilot has demonstrated any actionable
+benefit; under the pilot's usefulness gate, that is a reason to stop rather than to build
+more telemetry.
+
+A final critical self-review found that verification classification was still too broad:
+test-related substrings anywhere in a shell command could be counted as a verification.
+An aggregate audit of the exact cohort showed 236 such classifications, including 206
+free-form commands beginning with `const` and additional reads/searches/wrappers. The
+classifier now requires a structurally known test/check runner invocation (including
+bounded shell/env/timeout wrappers and common Python/build-tool forms). Incidental words
+in reads, searches, scripts, and free text no longer count. The historical v1 cohort
+contains 15 verification actions.
+
+A further exact-head review on 2026-08-30 found one remaining shell-control-flow gap:
+a test/check segment could still be treated as verification even when `||` could skip or
+mask it, or when a later `;`/`|` could replace its exit status. Schema v2 now fails closed
+on those shapes while retaining safe `&&` composition. A live v2 rerun surfaces one
+`verification_gap` promotion candidate in the already-known PR #951 lane. That candidate
+is not counted as actionable: external baseline validation confirms terminal head
+`2cd16612a9dd6eb9f91577bad9efd778ac149896`, successful Python 3.10/3.12 validation,
+CodeQL, and Codex review settlement before merge. The promotion decision therefore remains
+STOP after manual validation.
+
+## Historical v1 pilot result
+
+The final hardened 31-run cohort produced:
+
+- 2,393 normalized tool events;
+- 150 reads, 70 searches, 15 discovers, 15 repo edits, 1 other repo mutation, 15 verifies,
+  35 delegates, and 2,092 other executions;
+- outcomes: 345 explicit successes, 9 explicit failures, and 2,039 unknown outcomes;
+- `repeated_failure_without_state_delta`: **0**;
+- `verification_gap`: **0**;
+- `action_oscillation_without_progress`: **0**;
+- `mutation_without_evidenced_localization`: **11**, all advisory/non-promotable;
+- promotion-grade high-confidence findings: **0**;
+- actionable incremental findings: **0**;
+- recoverable cases made earlier/better by trajectory evidence: **0**;
+- evidence-supported redundant actions saved: **0**;
+- evidence-supported runtime saved: **0 seconds**;
+- measurable lead time: **none**;
+- token/compute savings: **not determinable**.
+
+The large unknown-outcome count is intentional evidence conservatism, not hidden success.
+It weakens any claim that the pilot proves trajectories can never help; it does not create
+positive evidence for building more machinery. Correcting Codex command extraction first
+raised candidate verifies from 30 to 236; the later structural verification audit then
+rejected 221 incidental substring matches and left 15 evidenced verification invocations.
+Even after both corrections there is still no promotion-grade A, B, or D finding.
+
+The success-cohort "any finding" rate is 1/10 (10%). This is only a conservative
+false-positive proxy, not empirical precision: the remaining finding is detector C, for
+which task-supplied localization evidence is intentionally unobservable. The cohort has no
+labeled ground truth from which a defensible precision percentage could be computed.
+
+## Baseline limitation
+
+Local Work Lane closeout receipts provide lane state, terminal closeout class, reason codes
+and terminal observation time. They do not by themselves reconstruct every historical
+diff/test/review/acceptance fact. Schema v2 therefore labels structurally eligible matches
+only as `promotion_candidates`; the generated report records zero externally validated
+actionable findings until a separate PR/CI/review/outcome validation is performed.
+
+That broader baseline join is intentionally not built into this pilot. The single candidate
+surfaced by the 2026-08-30 shell hardening was manually validated against existing PR #951
+evidence and did not demonstrate added recovery value. Building a general join still has no
+demonstrated path to changing the STOP decision.
+
+## Decision
+
+Do **not** create `trajectory_evidence_v1`, an online shadow path, a recovery advisory, a
+Mindwalk runtime dependency, a visualization, or a merge gate from this pilot.
+
+The evidence does **not** say that trajectory information is universally useless. It says
+that this bounded real-run pilot, after material schema and attribution corrections, did
+not demonstrate incremental actionable information over existing outcome/control-plane
+evidence. More telemetry by itself is not a product improvement.
+
+Revisit only if new real failure cases appear whose existing Grabowski evidence is too late
+or insufficient, and use those cases as labeled counterexamples. T047 remains the existing
+owner for any such future behavior-observability work; do not open a parallel Bureau task.
+
+## Reproduce
+
+```bash
+python3 experimental/trajectory_shadow/trajectory_shadow.py \
+  --limit 48 \
+  --report /tmp/trajectory-shadow-current-v2.json
+
+python3 -m pytest -q \
+  tests/test_trajectory_shadow.py \
+  tests/test_trajectory_shadow_wrapper_options.py
+```
+
+The checked-in `pilot_report_2026-08-28.json` is retained as the historical schema-v1
+snapshot behind the documented 2026-08-29 decision. Current live inputs are not frozen,
+so reproduction should write a new schema-v2 report rather than overwrite that artifact.
+
+The CLI is read-only with respect to Grabowski runtime/workspaces/sessions. `--report` and
+optional `--output-root` only write sanitized experimental artifacts chosen by the caller.
