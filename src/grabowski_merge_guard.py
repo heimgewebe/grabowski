@@ -3823,7 +3823,28 @@ class CaptainMergeGuardRunner:
                     diff_source = "local-bound-git-diff-after-github-too-large"
                     selected_diff_returncode = 0
         live_diff_bytes = canonicalize_github_pr_diff_identity(raw_live_diff_bytes)
-        live_diff_sha256 = github_pr_diff_identity_sha256(raw_live_diff_bytes)
+        canonical_live_diff_sha256 = github_pr_diff_identity_sha256(raw_live_diff_bytes)
+        raw_live_diff_sha256 = hashlib.sha256(raw_live_diff_bytes).hexdigest()
+        provider_raw_identity_available = (
+            selected_diff_returncode == 0
+            and diff_source in {
+                "raw-command-bytes",
+                "utf8-runner-text-exact-fallback",
+            }
+        )
+        if expected_diff == canonical_live_diff_sha256:
+            binding_diff_sha256 = canonical_live_diff_sha256
+            diff_identity_mode = "canonical"
+        elif provider_raw_identity_available and expected_diff == raw_live_diff_sha256:
+            # Compatibility for immutable review evidence created before the
+            # GitHub index-OID canonicalization contract.  This is deliberately
+            # narrower than the canonical identity: the expected digest must
+            # match the exact provider bytes read by this guard invocation.
+            binding_diff_sha256 = raw_live_diff_sha256
+            diff_identity_mode = "raw-current-provider-compat"
+        else:
+            binding_diff_sha256 = canonical_live_diff_sha256
+            diff_identity_mode = "unmatched"
         diff_canonicalization = diff_source
         if live_diff_bytes != raw_live_diff_bytes:
             diff_canonicalization += "+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
@@ -3835,15 +3856,17 @@ class CaptainMergeGuardRunner:
             "source_bytes": len(raw_live_diff_bytes),
             "bytes": len(live_diff_bytes),
             "canonicalization": diff_canonicalization,
-            "raw_sha256": hashlib.sha256(raw_live_diff_bytes).hexdigest(),
-            "sha256": live_diff_sha256,
+            "raw_sha256": raw_live_diff_sha256,
+            "sha256": canonical_live_diff_sha256,
+            "binding_sha256": binding_diff_sha256,
+            "identity_mode": diff_identity_mode,
             "stderr_sha256": hashlib.sha256(diff_info["stderr"].encode()).hexdigest(),
         }
         if selected_diff_returncode != 0:
             errors.append("merge_guard_live_diff_failed")
         elif not live_diff_bytes:
             errors.append("merge_guard_live_diff_empty")
-        elif live_diff_sha256 != expected_diff:
+        elif binding_diff_sha256 != expected_diff:
             errors.append("merge_guard_diff_drift")
         bindings = {
             "repository": repo_slug,
@@ -3855,7 +3878,10 @@ class CaptainMergeGuardRunner:
             "head_sha": expected_head,
             "is_cross_repository": viewed.get("isCrossRepository"),
             "merge_state_status": merge_state_status,
-            "diff_sha256": live_diff_sha256,
+            "diff_sha256": binding_diff_sha256,
+            "canonical_diff_sha256": canonical_live_diff_sha256,
+            "raw_diff_sha256": raw_live_diff_sha256,
+            "diff_identity_mode": diff_identity_mode,
             "execution_intent_sha256": self.execution_intent_sha256,
             "changed_paths": changed_paths,
             "changed_paths_sha256": _sha256_json(changed_paths),
