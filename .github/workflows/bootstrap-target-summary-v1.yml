@@ -1,0 +1,223 @@
+name: Bootstrap target summary v1
+
+on:
+  push:
+    branches:
+      - fix/run-outcome-taxonomy-v1-20260901
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bootstrap-target-summary-v1-20260901
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    if: github.repository == 'heimgewebe/grabowski'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: fix/run-outcome-taxonomy-v1-20260901
+          fetch-depth: 2
+
+      - name: Verify exact preimage
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "ff8e010d2d19e9851818b1515ea3759c4b24cac7"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/bootstrap-target-summary-v1.yml"
+
+      - name: Add coarse target aggregation without inventing goal identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace_once(
+              "src/grabowski_recall.py",
+              "MAX_HISTORICAL_GOAL_SUMMARY = 50\n",
+              "MAX_HISTORICAL_GOAL_SUMMARY = 50\nMAX_HISTORICAL_TARGET_SUMMARY = 50\n",
+          )
+
+          marker = "\n\ndef _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:\n"
+          target_summary_function = '''
+
+def _historical_target_summary(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Aggregate coarse repo/host targets without treating them as goal identity."""
+    targets: dict[str, dict[str, Any]] = {}
+    for item in items:
+        context = item.get("historical_context")
+        if not isinstance(context, dict):
+            continue
+        subject = context.get("subject")
+        run_id = context.get("run_id")
+        if not isinstance(subject, dict) or not isinstance(run_id, str):
+            continue
+        scope = subject.get("scope")
+        target = subject.get("target")
+        if scope not in {"repository", "host"} or not isinstance(target, str) or not target:
+            continue
+        target_key = f"{scope}:{target}"
+        bucket = targets.setdefault(
+            target_key,
+            {
+                "target_key": target_key,
+                "identity": {"source": "target", "scope": scope, "target": target},
+                "event_count": 0,
+                "subruns": set(),
+                "completed": set(),
+                "execution_failures": set(),
+                "true_blocks": set(),
+                "outcome_unknown": set(),
+                "legacy_blocked_failures": set(),
+                "operations": set(),
+            },
+        )
+        bucket["event_count"] += 1
+        bucket["subruns"].add(run_id)
+        operation = context.get("operation")
+        if isinstance(operation, str):
+            bucket["operations"].add(operation)
+        outcome_class = context.get("outcome_class")
+        effective_outcome = context.get("effective_outcome")
+        if outcome_class == "completed":
+            bucket["completed"].add(run_id)
+        elif outcome_class == "execution_failure":
+            bucket["execution_failures"].add(run_id)
+        elif outcome_class == "safety_block":
+            bucket["true_blocks"].add(run_id)
+        if effective_outcome == "outcome_unknown":
+            bucket["outcome_unknown"].add(run_id)
+        if context.get("legacy_blocked_execution_failure") is True:
+            bucket["legacy_blocked_failures"].add(run_id)
+
+    summaries = [
+        {
+            "target_key": bucket["target_key"],
+            "identity": dict(bucket["identity"]),
+            "event_count": bucket["event_count"],
+            "subrun_count": len(bucket["subruns"]),
+            "completed_subruns": len(bucket["completed"]),
+            "execution_failure_subruns": len(bucket["execution_failures"]),
+            "true_block_subruns": len(bucket["true_blocks"]),
+            "outcome_unknown_subruns": len(bucket["outcome_unknown"]),
+            "legacy_blocked_failure_subruns": len(bucket["legacy_blocked_failures"]),
+            "operations": sorted(bucket["operations"]),
+            "scope": "bounded_query_result",
+            "semantic_role": "coarse_target_aggregation_not_goal_identity",
+        }
+        for bucket in targets.values()
+    ]
+    summaries.sort(key=lambda entry: (-entry["subrun_count"], entry["target_key"]))
+    return summaries[:MAX_HISTORICAL_TARGET_SUMMARY], len(summaries)
+'''
+          replace_once(
+              "src/grabowski_recall.py",
+              marker,
+              target_summary_function + marker,
+          )
+
+          replace_once(
+              "src/grabowski_recall.py",
+              "    goal_summary, goal_count, unbound_goal_subrun_count = _historical_goal_summary(items)\n",
+              "    goal_summary, goal_count, unbound_goal_subrun_count = _historical_goal_summary(items)\n    target_summary, target_count = _historical_target_summary(items)\n",
+          )
+          replace_once(
+              "src/grabowski_recall.py",
+              '''        "unbound_goal_subrun_count": unbound_goal_subrun_count,
+        "measurement_limitations": [
+            "subrun counts are bounded to this query result",
+            "self_block_minutes requires bound start/unblock intervals and is not inferred from event counts",
+        ],
+''',
+              '''        "unbound_goal_subrun_count": unbound_goal_subrun_count,
+        "target_count": target_count,
+        "target_summary": target_summary,
+        "target_summary_truncated": target_count > len(target_summary),
+        "measurement_limitations": [
+            "subrun counts are bounded to this query result",
+            "self_block_minutes requires bound start/unblock intervals and is not inferred from event counts",
+            "target summaries are coarse repo/host aggregates and do not establish a Bureau task or PR goal identity",
+        ],
+''',
+          )
+
+          replace_once(
+              "tests/test_recall.py",
+              '''        result = module.export_chronik_history_recall(history)
+        self.assertEqual(result["goal_count"], 0)
+        self.assertEqual(result["unbound_goal_subrun_count"], 1)
+
+    def test_v1_execution_failure_is_accepted_without_blocker_code(self) -> None:
+''',
+              '''        result = module.export_chronik_history_recall(history)
+        self.assertEqual(result["goal_count"], 0)
+        self.assertEqual(result["unbound_goal_subrun_count"], 1)
+        self.assertEqual(result["target_count"], 1)
+        target = result["target_summary"][0]
+        self.assertEqual(target["target_key"], "host:heim-pc")
+        self.assertEqual(
+            target["identity"],
+            {"source": "target", "scope": "host", "target": "heim-pc"},
+        )
+        self.assertEqual(target["subrun_count"], 1)
+        self.assertEqual(
+            target["semantic_role"],
+            "coarse_target_aggregation_not_goal_identity",
+        )
+
+    def test_v1_execution_failure_is_accepted_without_blocker_code(self) -> None:
+''',
+          )
+          replace_once(
+              "tests/test_recall.py",
+              '''        self.assertEqual(goal["completed_subruns"], 2)
+        self.assertEqual(result["unbound_goal_subrun_count"], 0)
+        self.assertTrue(any("self_block_minutes" in item for item in result["measurement_limitations"]))
+''',
+              '''        self.assertEqual(goal["completed_subruns"], 2)
+        self.assertEqual(result["unbound_goal_subrun_count"], 0)
+        target = result["target_summary"][0]
+        self.assertEqual(target["event_count"], 3)
+        self.assertEqual(target["subrun_count"], 2)
+        self.assertTrue(any("self_block_minutes" in item for item in result["measurement_limitations"]))
+        self.assertTrue(any("coarse repo/host" in item for item in result["measurement_limitations"]))
+''',
+          )
+          PY
+
+      - name: Verify recall and producer compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile src/grabowski_recall.py tests/test_recall.py
+          python -m unittest -q tests.test_recall tests.test_chronik_agent_outbox
+          git diff --check
+          git diff --name-only | sort | diff -u - <(printf '%s\n' 'src/grabowski_recall.py' 'tests/test_recall.py')
+
+      - name: Commit verified target summary and remove bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/bootstrap-target-summary-v1.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/grabowski_recall.py tests/test_recall.py .github/workflows/bootstrap-target-summary-v1.yml
+          git diff --cached --check
+          git commit -m "fix: expose coarse target outcome summary"
+          git push origin HEAD:fix/run-outcome-taxonomy-v1-20260901
