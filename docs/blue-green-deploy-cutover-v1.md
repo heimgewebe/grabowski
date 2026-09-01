@@ -60,24 +60,32 @@ lock. The sequence is:
 3. Probe green through real MCP `initialize`, paginated `tools/list`, and
    read-only `grabowski_status`. Bind release, head, tool names, complete
    schemas, required sentinels, and agent instructions.
-4. Engage the current operator's deployment admission marker. The cross-process
+4. If the Green agent-instruction hash differs from Blue, build a read-only
+   instruction-transition preflight before any drain or selector mutation. The
+   transition binds the exact Blue and Green release/head/instruction identities
+   to independently verified Green readiness and to the scheduled deployment
+   source-identity hash. A missing or mismatched source identity fails while Blue
+   is still authoritative. The historical Blue client declaration is not
+   rewritten and is never treated as evidence that a client observed Green.
+5. Engage the current operator's deployment admission marker. The cross-process
    status endpoint reads the live registry in `grabowski_operator.py`. New
    normal calls are rejected while promotion is in progress; only previously
    admitted effect-bearing calls block settlement. Previously admitted read-only
    calls remain non-blocking. The marker stays active until routing is back on
    canonical and transient Green is confirmed stopped.
-5. CAS-switch ingress to green and verify selector-file plus live ingress
+6. CAS-switch ingress to green and verify selector-file plus live ingress
    readback. Probe green again through 18180.
-6. Rebind the connector snapshot using the exact declaration and hashes from a
-   fresh, previously observed external-client receipt. The transition binds
-   blue to green readiness without claiming that the external client already
-   refreshed against green.
-7. Activate the stable runtime pointer, replace the canonical operator behind
+7. Rebind the connector snapshot using the exact declaration and hashes from a
+   fresh, previously observed external-client receipt. Tool/schema transitions
+   retain their Publication-v2 authorization. An agent-instruction transition
+   must reproduce the exact pre-switch transition record and source-identity
+   binding; the preserved Blue declaration remains historical evidence only.
+8. Activate the stable runtime pointer, replace the canonical operator behind
    still-authoritative green, verify it, CAS-switch ingress to canonical, and
    complete MCP initialize/tools-list/minimal-status readiness through 18180 while
    Green is still live and mutation admission remains closed. Only then retire
    transient Green and reopen normal admission.
-8. Persist the blue-green receipt and expose its SHA in scheduled logs and job
+9. Persist the blue-green receipt and expose its SHA in scheduled logs and job
    finalization.
 
 ## Call-registry truth
@@ -99,13 +107,24 @@ Production rebind requires all of the following:
 - a hash-valid, unexpired receipt with external-client observation scope;
 - schema probe evidence that matched the declared server surface;
 - the observed blue release and repository head;
-- unchanged tool count, names, one compact normalized schema identity over every
-  registered tool, the structured sentinel schema fingerprints, and instruction
-  identity across blue and green; legacy snapshots without the complete schema
-  identity remain readable but cannot authorize this cutover;
-- non-degenerate declaration, receipt, artifact, names, and instruction
-  hashes;
+- a complete Blue tool/schema declaration. Tool-count/name/schema changes require
+  the existing Publication-v2 transition contract; legacy snapshots without the
+  complete schema identity remain readable but cannot authorize such a cutover;
+- for a changed agent-instruction hash, a separate self-hashed transition bound
+  to the exact deployment source identity, Blue release/head/instruction hash,
+  Green release/head/instruction hash, and independently observed Green readiness;
+- non-degenerate declaration, receipt, artifact, names, instruction, and
+  deployment-source hashes;
 - independently observed green readiness.
+
+The instruction transition is deliberately not a client observation. After a
+successful transition the runtime binding may be `matched`, but the preserved
+Blue declaration remains historical: external-client observability for the new
+Green instructions is false and `fresh_client_observation_required` remains true
+until a real client observation is bound. Mid-cutover recovery obtains the exact
+deployment source identity from the durable cutover receipt and must satisfy the
+same canonical snapshot inspector; recovery does not receive a weaker transition
+rule.
 
 Missing or stale evidence, server-loopback-only evidence, and zero or other
 single-character synthetic hashes fail closed. A preflight failure still
@@ -136,7 +155,8 @@ The durable `grabowski_blue_green_deployment_receipt` binds:
 - green readiness;
 - admission marker and live operator drain evidence;
 - selector switch and its authoritative readback;
-- authentic snapshot source and transition receipt hashes;
+- authentic snapshot source and transition receipt hashes, including the
+  self-hashed agent-instruction transition when instruction identity changes;
 - stable promotion, final routing, final MCP readiness, and green retirement;
 - ordered, individually hashed observations, outcome, and recovery action.
 

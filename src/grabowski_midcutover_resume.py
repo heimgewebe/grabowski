@@ -118,6 +118,7 @@ def observe_client_snapshot_binding(
     registered_names_sha256: str,
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
+    source_identity_sha256: str,
     snapshot_inspector: Any,
     path: Path = DEFAULT_CLIENT_SNAPSHOT_PATH,
 ) -> dict[str, Any]:
@@ -144,6 +145,7 @@ def observe_client_snapshot_binding(
         registered_names_sha256=registered_names_sha256,
         agent_instructions_sha256=agent_instructions_sha256,
         green_readiness=green_readiness,
+        deployment_source_identity_sha256=source_identity_sha256,
         path=path,
     )
     if not isinstance(observed, dict):
@@ -842,6 +844,9 @@ def collect_classification_inputs(
                     cutover.get("agent_instructions_sha256") or ""
                 ),
                 green_readiness=readiness,
+                source_identity_sha256=str(
+                    cutover.get("source_identity_sha256") or ""
+                ),
                 snapshot_inspector=snapshot_inspector,
                 path=client_snapshot_path,
             )

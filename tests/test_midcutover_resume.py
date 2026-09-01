@@ -704,10 +704,14 @@ class SnapshotInspectorDependencyTests(unittest.TestCase):
             registered_names_sha256="b" * 64,
             agent_instructions_sha256="c" * 64,
             green_readiness={},
+            source_identity_sha256="d" * 64,
             snapshot_inspector=inspect,
         )
 
         self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["deployment_source_identity_sha256"], "d" * 64
+        )
         self.assertEqual(observed["state"], midcutover.SNAPSHOT_BINDING_UNREADABLE)
         self.assertEqual(observed["transition_sha256"], "a" * 64)
 
@@ -729,6 +733,7 @@ class SnapshotInspectorDependencyTests(unittest.TestCase):
                 registered_names_sha256="b" * 64,
                 agent_instructions_sha256="c" * 64,
                 green_readiness={},
+                source_identity_sha256="d" * 64,
                 snapshot_inspector=None,
             )
 

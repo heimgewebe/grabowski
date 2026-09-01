@@ -39,6 +39,8 @@ HEAD_GREEN = "b" * 40
 NAMES_SHA256 = "12" * 32
 GREEN_NAMES_SHA256 = "13" * 32
 INSTRUCTIONS_SHA256 = "34" * 32
+GREEN_INSTRUCTIONS_SHA256 = "35" * 32
+SOURCE_IDENTITY_SHA256 = "78" * 32
 ARTIFACT_SHA256 = "56" * 32
 BLUE_SCHEMA_BY_TOOL = {
     name: f"{index + 16:02x}" * 32
@@ -115,13 +117,14 @@ def _green_readiness(
     complete_schema_sha256: str,
     tool_count: int = TOOL_COUNT,
     names_sha256: str = NAMES_SHA256,
+    agent_instructions_sha256: str = INSTRUCTIONS_SHA256,
 ) -> dict[str, object]:
     return {
         "ready": True,
         "release_id": "green",
         "repo_head": HEAD_GREEN,
         "names_sha256": names_sha256,
-        "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+        "agent_instructions_sha256": agent_instructions_sha256,
         "schema_sha256_by_tool": dict(schema_by_tool),
         "schema_identity_sha256": client_snapshot._sha256_json(schema_by_tool),
         "complete_schema_count": tool_count,
@@ -197,12 +200,15 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
         source_evidence_time: int | None = None,
         publication_request_id: str | None = None,
         now_unix: int | None = None,
+        agent_instructions_sha256: str = INSTRUCTIONS_SHA256,
+        deployment_source_identity_sha256: str | None = None,
     ) -> dict[str, object]:
         readiness = _green_readiness(
             schema_by_tool=schema_by_tool,
             complete_schema_sha256=complete_schema_sha256,
             tool_count=tool_count,
             names_sha256=names_sha256,
+            agent_instructions_sha256=agent_instructions_sha256,
         )
         parameters = {
             "cutover_id": cutover_id,
@@ -213,8 +219,9 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             "green_repo_head": HEAD_GREEN,
             "registered_tool_count": tool_count,
             "registered_names_sha256": names_sha256,
-            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "agent_instructions_sha256": agent_instructions_sha256,
             "green_readiness": readiness,
+            "deployment_source_identity_sha256": deployment_source_identity_sha256,
         }
         if source_evidence_time is None and publication_request_id is None:
             return client_snapshot.rebind_authentic_snapshot_for_cutover(
@@ -245,10 +252,12 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             "green_release_id": "green",
             "expected_head": HEAD_GREEN,
             "names_sha256": names_sha256,
-            "agent_instructions_sha256": INSTRUCTIONS_SHA256,
+            "agent_instructions_sha256": agent_instructions_sha256,
             "green_readiness": readiness,
             "observations": [activation],
         }
+        if deployment_source_identity_sha256 is not None:
+            cutover["source_identity_sha256"] = deployment_source_identity_sha256
         cutover["receipt_sha256"] = midcutover.canonical_json_sha256(cutover)
         client_snapshot._write_private_json(
             self.receipt_root / f"{cutover_id}.json", cutover
@@ -258,8 +267,10 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
             "time",
             return_value=self.now_unix if now_unix is None else now_unix,
         ):
+            recovery_parameters = dict(parameters)
+            recovery_parameters.pop("deployment_source_identity_sha256", None)
             return client_snapshot.rebind_snapshot_for_midcutover_recovery(
-                **parameters,
+                **recovery_parameters,
                 observation_scope=client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
                 source_snapshot_receipt_sha256=self.source["receipt_sha256"],
                 source_client_declaration_sha256=self.source[
@@ -1038,6 +1049,88 @@ class PublicationSchemaTransitionTests(unittest.TestCase):
                 self.assertNotEqual(
                     observed["state"], client_snapshot.SNAPSHOT_BINDING_REBOUND
                 )
+
+    # ---- agent-instruction transition honesty and binding ----------------
+
+    def test_instruction_only_change_rebinds_with_exact_source_identity_and_stays_historical(self) -> None:
+        result = self._rebind(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+            deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+        )
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["instructions_changed"])
+        self.assertFalse(result["surface_changed"])
+        transition = result["agent_instructions_transition"]
+        self.assertEqual(
+            transition["source_agent_instructions_sha256"], INSTRUCTIONS_SHA256
+        )
+        self.assertEqual(
+            transition["target_agent_instructions_sha256"],
+            GREEN_INSTRUCTIONS_SHA256,
+        )
+        self.assertEqual(
+            transition["deployment_source_identity_sha256"],
+            SOURCE_IDENTITY_SHA256,
+        )
+        stored = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            stored["client_declaration"]["observed_agent_instructions_sha256"],
+            INSTRUCTIONS_SHA256,
+        )
+        self.assertEqual(
+            stored["server_binding"]["agent_instructions_sha256"],
+            GREEN_INSTRUCTIONS_SHA256,
+        )
+        status = client_snapshot.snapshot_status(
+            expected_tool_count=TOOL_COUNT,
+            expected_names_sha256=NAMES_SHA256,
+            expected_release_id="green",
+            expected_repo_head=HEAD_GREEN,
+            expected_agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+            now_unix=self.now_unix,
+        )
+        self.assertEqual(status["state"], "matched")
+        self.assertTrue(status["historical_agent_instructions_only"])
+        self.assertTrue(status["fresh_client_observation_required"])
+        self.assertFalse(status["external_client_snapshot_observable"])
+        self.assertFalse(status["runtime_fault_indicated"])
+
+    def test_instruction_change_without_deployment_source_identity_fails_before_write(self) -> None:
+        with self.assertRaisesRegex(
+            client_snapshot.ClientSnapshotError,
+            "deployment source identity sha256",
+        ):
+            self._rebind(
+                schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+                complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+                agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+            )
+        self._assert_snapshot_untouched()
+
+    def test_instruction_transition_refuses_green_readiness_for_another_instruction_hash(self) -> None:
+        readiness = _green_readiness(
+            schema_by_tool=BLUE_SCHEMA_BY_TOOL,
+            complete_schema_sha256=BLUE_COMPLETE_SCHEMA,
+            agent_instructions_sha256=INSTRUCTIONS_SHA256,
+        )
+        with self.assertRaisesRegex(
+            client_snapshot.ClientSnapshotError,
+            "green readiness does not bind",
+        ):
+            client_snapshot.prepare_agent_instructions_transition_for_cutover(
+                cutover_id=CUTOVER_ID,
+                source_release_id="blue",
+                source_repo_head=HEAD_BLUE,
+                target_release_id="green",
+                target_repo_head=HEAD_GREEN,
+                source_agent_instructions_sha256=INSTRUCTIONS_SHA256,
+                target_agent_instructions_sha256=GREEN_INSTRUCTIONS_SHA256,
+                deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+                green_readiness=readiness,
+            )
+
 
 
 if __name__ == "__main__":
