@@ -20,6 +20,22 @@ MAX_REJECTED_SOURCES = 20
 MAX_REJECTION_DETAIL_CHARS = 160
 MAX_HISTORICAL_SUPPORT_REFS = 6
 MAX_HISTORICAL_PATTERN_SUMMARY = 50
+MAX_HISTORICAL_GOAL_SUMMARY = 50
+LEGACY_V0_EXECUTION_BLOCKERS = {
+    "task-failed": "failed",
+    "task-cancelled": "cancelled",
+    "task-timed-out": "timed_out",
+    "task-signalled": "signalled",
+}
+V1_EVENT_RESULTS = {
+    "agent.run.started": "started",
+    "agent.run.completed": "completed",
+    "agent.run.failed": "failed",
+    "agent.run.cancelled": "cancelled",
+    "agent.run.timed_out": "timed_out",
+    "agent.run.signalled": "signalled",
+    "agent.run.blocked": "blocked",
+}
 SOURCE_TRUST = "caller_supplied_unverified"
 EVIDENCE_BINDING = "requires_concrete_ref_but_does_not_verify_source"
 LEARNED_RULE_TRUST = "caller_supplied_unverified"
@@ -466,6 +482,122 @@ def _historical_pattern_summary(
     return summaries[:MAX_HISTORICAL_PATTERN_SUMMARY], total_patterns
 
 
+def _historical_outcome_semantics(
+    schema_version: str, outcome: str, blocker: str | None
+) -> dict[str, Any]:
+    effective_outcome = outcome
+    legacy_blocked_execution_failure = False
+    if (
+        schema_version == "agent-run-event.v0"
+        and outcome == "blocked"
+        and blocker in LEGACY_V0_EXECUTION_BLOCKERS
+    ):
+        effective_outcome = LEGACY_V0_EXECUTION_BLOCKERS[blocker]
+        legacy_blocked_execution_failure = True
+    elif outcome == "blocked" and blocker == "task-outcome-unknown":
+        effective_outcome = "outcome_unknown"
+
+    if effective_outcome in {"failed", "cancelled", "timed_out", "signalled"}:
+        outcome_class = "execution_failure"
+    elif outcome == "blocked":
+        outcome_class = "safety_block"
+    elif effective_outcome == "completed":
+        outcome_class = "completed"
+    elif effective_outcome == "started":
+        outcome_class = "started"
+    else:
+        outcome_class = "other"
+    return {
+        "effective_outcome": effective_outcome,
+        "outcome_class": outcome_class,
+        "legacy_blocked_execution_failure": legacy_blocked_execution_failure,
+    }
+
+
+def _historical_goal_summary(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    goals: dict[str, dict[str, Any]] = {}
+    unbound_subruns: set[str] = set()
+    for item in items:
+        context = item.get("historical_context")
+        if not isinstance(context, dict):
+            continue
+        subject = context.get("subject")
+        run_id = context.get("run_id")
+        if not isinstance(subject, dict) or not isinstance(run_id, str):
+            continue
+        bureau_task_id = subject.get("bureau_task_id")
+        pr_number = subject.get("pr_number")
+        repo = subject.get("repo")
+        if isinstance(bureau_task_id, str) and bureau_task_id:
+            goal_key = f"bureau_task:{bureau_task_id}"
+            identity = {"source": "bureau_task", "bureau_task_id": bureau_task_id}
+        elif type(pr_number) is int and pr_number > 0 and isinstance(repo, str) and repo:
+            goal_key = f"pr:{repo}#{pr_number}"
+            identity = {"source": "pull_request", "repo": repo, "pr_number": pr_number}
+        else:
+            unbound_subruns.add(run_id)
+            continue
+
+        goal = goals.setdefault(
+            goal_key,
+            {
+                "goal_key": goal_key,
+                "identity": identity,
+                "event_count": 0,
+                "subruns": set(),
+                "completed": set(),
+                "execution_failures": set(),
+                "true_blocks": set(),
+                "outcome_unknown": set(),
+                "legacy_blocked_failures": set(),
+                "operations": set(),
+            },
+        )
+        goal["event_count"] += 1
+        goal["subruns"].add(run_id)
+        operation = context.get("operation")
+        if isinstance(operation, str):
+            goal["operations"].add(operation)
+        outcome_class = context.get("outcome_class")
+        effective_outcome = context.get("effective_outcome")
+        if outcome_class == "completed":
+            goal["completed"].add(run_id)
+        elif outcome_class == "execution_failure":
+            goal["execution_failures"].add(run_id)
+        elif outcome_class == "safety_block":
+            goal["true_blocks"].add(run_id)
+        if effective_outcome == "outcome_unknown":
+            goal["outcome_unknown"].add(run_id)
+        if context.get("legacy_blocked_execution_failure") is True:
+            goal["legacy_blocked_failures"].add(run_id)
+
+    summaries: list[dict[str, Any]] = []
+    for goal in goals.values():
+        summaries.append(
+            {
+                "goal_key": goal["goal_key"],
+                "identity": dict(goal["identity"]),
+                "event_count": goal["event_count"],
+                "subrun_count": len(goal["subruns"]),
+                "completed_subruns": len(goal["completed"]),
+                "execution_failure_subruns": len(goal["execution_failures"]),
+                "true_block_subruns": len(goal["true_blocks"]),
+                "outcome_unknown_subruns": len(goal["outcome_unknown"]),
+                "legacy_blocked_failure_subruns": len(goal["legacy_blocked_failures"]),
+                "operations": sorted(goal["operations"]),
+                "scope": "bounded_query_result",
+            }
+        )
+    summaries.sort(key=lambda entry: (-entry["subrun_count"], entry["goal_key"]))
+    return (
+        summaries[:MAX_HISTORICAL_GOAL_SUMMARY],
+        len(summaries),
+        len(unbound_subruns),
+    )
+
+
 def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(event, dict):
         raise ValueError("Chronik history event must be an object")
@@ -478,7 +610,8 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
         or event_id != _chronik_event_id(event)
     ):
         raise ValueError("Chronik history event digest is invalid")
-    if event.get("schema_version") != "agent-run-event.v0":
+    schema_version = event.get("schema_version")
+    if schema_version not in {"agent-run-event.v0", "agent-run-event.v1"}:
         raise ValueError("Chronik history event schema is invalid")
     source = event.get("source")
     if (
@@ -487,11 +620,15 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
         or source.get("component") != "grabowski"
     ):
         raise ValueError("Chronik history event source is invalid")
-    expected_results = {
-        "agent.run.started": "started",
-        "agent.run.completed": "completed",
-        "agent.run.blocked": "blocked",
-    }
+    expected_results = (
+        {
+            "agent.run.started": "started",
+            "agent.run.completed": "completed",
+            "agent.run.blocked": "blocked",
+        }
+        if schema_version == "agent-run-event.v0"
+        else V1_EVENT_RESULTS
+    )
     kind = event.get("kind")
     if kind not in expected_results:
         raise ValueError("Chronik history event kind is invalid")
@@ -528,12 +665,26 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     }
     if subject_component:
         subject_context["component"] = subject_component
+    repo = _optional_bounded_text(subject.get("repo"), max_chars=240)
+    if repo:
+        subject_context["repo"] = repo
     pr_number = subject.get("pr_number")
     if type(pr_number) is int and pr_number > 0:
         subject_context["pr_number"] = pr_number
+    bureau_task_id = _optional_bounded_text(subject.get("bureau_task_id"), max_chars=160)
+    if bureau_task_id:
+        subject_context["bureau_task_id"] = bureau_task_id
 
     outcome = data["result"]
     blocker = _optional_bounded_text(data.get("blocker_code"), max_chars=120)
+    if schema_version == "agent-run-event.v1":
+        if outcome == "blocked" and not blocker:
+            raise ValueError("Chronik v1 blocked history event requires blocker_code")
+        if outcome != "blocked" and data.get("blocker_code") is not None:
+            raise ValueError("Chronik v1 non-blocked history event carries blocker_code")
+    semantics = _historical_outcome_semantics(schema_version, outcome, blocker)
+    effective_outcome = semantics["effective_outcome"]
+    outcome_class = semantics["outcome_class"]
     support_refs, support_refs_truncated = _historical_support_refs(event)
 
     historical_pattern: dict[str, Any] = {
@@ -543,6 +694,9 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
         "operation": operation,
         "task_class": task_class,
         "outcome": outcome,
+        "effective_outcome": effective_outcome,
+        "outcome_class": outcome_class,
+        "legacy_blocked_execution_failure": semantics["legacy_blocked_execution_failure"],
         "blocker_code": blocker,
     }
     pattern_fingerprint = "sha256:" + _sha256_json(historical_pattern)
@@ -555,10 +709,13 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     if subject_component:
         reuse_match["component"] = subject_component
     terminal_signature: dict[str, Any] | None = None
-    if outcome != "started":
-        terminal_signature = {"outcome": outcome}
+    if effective_outcome != "started":
+        terminal_signature = {
+            "outcome": effective_outcome,
+            "outcome_class": outcome_class,
+        }
         if blocker:
-            terminal_signature["blocker_code"] = blocker
+            terminal_signature["historical_blocker_code"] = blocker
 
     reuse_condition: dict[str, Any] = {
         "match": reuse_match,
@@ -567,9 +724,11 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     if terminal_signature is not None:
         reuse_condition["terminal_signature"] = terminal_signature
 
-    result_text = f"Historical outcome: {outcome}."
+    result_text = f"Historical recorded outcome: {outcome}."
+    if effective_outcome != outcome:
+        result_text += f" Effective outcome: {effective_outcome}."
     if blocker:
-        result_text += f" Blocker: {blocker}."
+        result_text += f" Historical blocker code: {blocker}."
     topic = f"historical run: {target} / {operation}"[:120]
     target_detail = f" for component {subject_component}" if subject_component else ""
     pr_detail = f" (PR {pr_number})" if type(pr_number) is int and pr_number > 0 else ""
@@ -578,15 +737,26 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
             "Start event alone is not outcome evidence; correlate it with a terminal event "
             "and re-check current live state before acting."
         )
-    elif outcome == "blocked" and blocker:
-        learned_rule = (
-            f"Historical warning only: this matching pattern ended blocked with {blocker}; "
-            "re-check current live state and authorization before acting."
+    elif outcome_class == "execution_failure":
+        legacy_note = (
+            " Legacy v0 encoded this execution failure as blocked."
+            if semantics["legacy_blocked_execution_failure"]
+            else ""
         )
-    elif outcome == "blocked":
+        blocker_detail = f"; historical code {blocker}" if blocker else ""
         learned_rule = (
-            "Historical warning only: this matching pattern ended blocked; re-check current "
-            "live state and authorization before acting."
+            f"Historical execution failure ({effective_outcome}{blocker_detail}), not evidence "
+            f"of a coordination or policy block.{legacy_note} Re-check current live state before retry."
+        )
+    elif outcome_class == "safety_block" and blocker:
+        learned_rule = (
+            f"Historical safety/authority stop with {blocker}; re-check current live state and "
+            "authorization before acting."
+        )
+    elif outcome_class == "safety_block":
+        learned_rule = (
+            "Historical safety/authority stop; re-check current live state and authorization "
+            "before acting."
         )
     else:
         learned_rule = (
@@ -615,7 +785,11 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
             "run_id": run_id,
             "operation": operation,
             "task_class": task_class,
+            "schema_version": schema_version,
             "outcome": outcome,
+            "effective_outcome": effective_outcome,
+            "outcome_class": outcome_class,
+            "legacy_blocked_execution_failure": semantics["legacy_blocked_execution_failure"],
             "blocker_code": blocker,
             "subject": subject_context,
             "support_refs": support_refs,
@@ -715,6 +889,7 @@ def export_chronik_history_recall(
     }
     items = [_validated_chronik_event_recall(event) for event in raw_events[:limit]]
     pattern_summary, pattern_count = _historical_pattern_summary(items)
+    goal_summary, goal_count, unbound_goal_subrun_count = _historical_goal_summary(items)
     return {
         "schema_version": 1,
         "kind": "grabowski_operator_historical_recall",
@@ -732,6 +907,14 @@ def export_chronik_history_recall(
         "pattern_summary": pattern_summary,
         "pattern_summary_truncated": pattern_count > len(pattern_summary),
         "pattern_scope": "bounded_query_result",
+        "goal_count": goal_count,
+        "goal_summary": goal_summary,
+        "goal_summary_truncated": goal_count > len(goal_summary),
+        "unbound_goal_subrun_count": unbound_goal_subrun_count,
+        "measurement_limitations": [
+            "subrun counts are bounded to this query result",
+            "self_block_minutes requires bound start/unblock intervals and is not inferred from event counts",
+        ],
         "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
     }
 

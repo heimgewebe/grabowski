@@ -454,6 +454,153 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(result["items"][1]["pattern_occurrence_count"], 2)
         self.assertIn("task-failed", result["items"][0]["learned_rule"])
 
+
+    def test_legacy_v0_task_failed_is_execution_failure_not_true_block(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["kind"] = "agent.run.blocked"
+        event["data"]["result"] = "blocked"
+        event["data"]["blocker_code"] = "task-failed"
+        event["subject"]["bureau_task_id"] = "BUREAU-GOAL-T001"
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        item = result["items"][0]
+        self.assertEqual(item["historical_context"]["outcome"], "blocked")
+        self.assertEqual(item["historical_context"]["effective_outcome"], "failed")
+        self.assertEqual(item["historical_context"]["outcome_class"], "execution_failure")
+        self.assertTrue(item["historical_context"]["legacy_blocked_execution_failure"])
+        self.assertIn("not evidence of a coordination or policy block", item["learned_rule"])
+        self.assertEqual(result["goal_count"], 1)
+        goal = result["goal_summary"][0]
+        self.assertEqual(goal["goal_key"], "bureau_task:BUREAU-GOAL-T001")
+        self.assertEqual(goal["subrun_count"], 1)
+        self.assertEqual(goal["execution_failure_subruns"], 1)
+        self.assertEqual(goal["true_block_subruns"], 0)
+        self.assertEqual(goal["legacy_blocked_failure_subruns"], 1)
+
+    def test_legacy_outcome_unknown_remains_a_true_safety_block(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["kind"] = "agent.run.blocked"
+        event["data"]["result"] = "blocked"
+        event["data"]["blocker_code"] = "task-outcome-unknown"
+        event["subject"]["repo"] = "heimgewebe/grabowski"
+        event["subject"]["pr_number"] = 1008
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        item = result["items"][0]
+        self.assertEqual(item["historical_context"]["effective_outcome"], "outcome_unknown")
+        self.assertEqual(item["historical_context"]["outcome_class"], "safety_block")
+        self.assertEqual(result["goal_summary"][0]["goal_key"], "pr:heimgewebe/grabowski#1008")
+        self.assertEqual(result["goal_summary"][0]["true_block_subruns"], 1)
+        self.assertEqual(result["goal_summary"][0]["outcome_unknown_subruns"], 1)
+
+    def test_v1_outcome_unknown_counts_as_true_safety_block(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["schema_version"] = "agent-run-event.v1"
+        event["kind"] = "agent.run.blocked"
+        event["data"]["result"] = "blocked"
+        event["data"]["blocker_code"] = "task-outcome-unknown"
+        event["subject"]["pr_number"] = 1009
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        item = result["items"][0]
+        self.assertEqual(item["historical_context"]["effective_outcome"], "outcome_unknown")
+        self.assertEqual(item["historical_context"]["outcome_class"], "safety_block")
+        goal = result["goal_summary"][0]
+        self.assertEqual(goal["true_block_subruns"], 1)
+        self.assertEqual(goal["outcome_unknown_subruns"], 1)
+
+    def test_pr_number_without_repository_identity_is_not_aggregated(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["subject"] = {
+            "scope": "host",
+            "host": "heim-pc",
+            "component": "chronik",
+            "pr_number": 1008,
+        }
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        self.assertEqual(result["goal_count"], 0)
+        self.assertEqual(result["unbound_goal_subrun_count"], 1)
+
+    def test_v1_execution_failure_is_accepted_without_blocker_code(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["schema_version"] = "agent-run-event.v1"
+        event["kind"] = "agent.run.timed_out"
+        event["data"]["result"] = "timed_out"
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        item = result["items"][0]
+        self.assertEqual(item["historical_context"]["schema_version"], "agent-run-event.v1")
+        self.assertEqual(item["historical_context"]["outcome_class"], "execution_failure")
+        self.assertEqual(item["historical_context"]["effective_outcome"], "timed_out")
+
+    def test_goal_summary_counts_unique_subruns_not_events(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        first = history["events"][0]
+        first["subject"]["bureau_task_id"] = "BUREAU-GOAL-T002"
+        first["event_id"] = module._chronik_event_id(first)
+        started = {
+            **first,
+            "kind": "agent.run.started",
+            "data": {**first["data"], "result": "started"},
+        }
+        started["event_id"] = module._chronik_event_id(started)
+        second = {
+            **first,
+            "source": {**first["source"], "run_id": "task-fedcba9876543210fedcba98-a1"},
+            "ts": "2026-07-23T13:00:00Z",
+        }
+        second["event_id"] = module._chronik_event_id(second)
+        history["events"] = [started, first, second]
+        history["history"]["event_ids"] = [event["event_id"] for event in history["events"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        goal = result["goal_summary"][0]
+        self.assertEqual(goal["event_count"], 3)
+        self.assertEqual(goal["subrun_count"], 2)
+        self.assertEqual(goal["completed_subruns"], 2)
+        self.assertEqual(result["unbound_goal_subrun_count"], 0)
+        self.assertTrue(any("self_block_minutes" in item for item in result["measurement_limitations"]))
+
     def test_chronik_history_recall_bounds_support_refs(self) -> None:
         module = self._load_module()
         history = self._chronik_history_result(module)
