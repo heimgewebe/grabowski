@@ -529,6 +529,10 @@ class RecallTests(unittest.TestCase):
         goal = result["goal_summary"][0]
         self.assertEqual(goal["true_block_subruns"], 1)
         self.assertEqual(goal["outcome_unknown_subruns"], 1)
+        self.assertEqual(
+            item["reuse_condition"]["terminal_signature"]["blocker_code"],
+            "task-outcome-unknown",
+        )
 
     def test_pr_number_without_repository_identity_is_not_aggregated(self) -> None:
         module = self._load_module()

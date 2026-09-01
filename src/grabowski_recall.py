@@ -715,7 +715,7 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
             "outcome_class": outcome_class,
         }
         if blocker:
-            terminal_signature["historical_blocker_code"] = blocker
+            terminal_signature["blocker_code"] = blocker
 
     reuse_condition: dict[str, Any] = {
         "match": reuse_match,
