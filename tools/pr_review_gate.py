@@ -308,6 +308,7 @@ PR_FIELDS = (
     "mergeable",
     "headRefName",
     "headRefOid",
+    "headRepository",
     "baseRefName",
     "baseRefOid",
     "url",
@@ -678,10 +679,17 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
             pr_diff_error = f"current PR diff is not valid UTF-8: {exc}"
     except RuntimeError as exc:
         pr_diff_error = _brief_error(str(exc))
+    head_repository = view.get("headRepository") if isinstance(view, dict) else None
+    head_repo_name = (
+        _canonical_repo_slug(head_repository.get("nameWithOwner"))
+        if isinstance(head_repository, dict)
+        else None
+    )
     return {
         "pr": view,
         "checks": checks,
         "repoName": target_name,
+        "headRepoName": head_repo_name,
         "checkoutRepoName": _canonical_repo_slug(checkout_name),
         "pr_diff_sha256": pr_diff_sha256,
         "pr_diff_text": pr_diff_text,
@@ -3037,6 +3045,39 @@ REQUIRED_CHECK_CATALOG_PATH = ".github/grabowski-required-checks.json"
 REQUIRED_CHECK_CATALOG_FIELDS = {"schema_version", "required_checks"}
 
 
+def _github_api_included_response(
+    repo: Path, *, endpoint: str, context: str
+) -> tuple[int, Any]:
+    response = _run_text(repo, ["gh", "api", "--include", endpoint], allow_nonzero=True)
+    status_match = re.match(r"HTTP/\S+ (?P<status>[0-9]{3})(?: [^\n]*)?\n", response)
+    if status_match is None:
+        raise RuntimeError(f"{context} did not expose an HTTP status")
+    status = int(status_match.group("status"))
+    parts = response.split("\n\n", 1)
+    body = parts[1] if len(parts) == 2 else ""
+    if not body.strip():
+        return status, None
+    try:
+        return status, json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{context} did not return JSON") from exc
+
+
+def _github_revision_exists(repo: Path, *, repo_name: str, revision: str) -> bool:
+    status, payload = _github_api_included_response(
+        repo,
+        endpoint=f"repos/{repo_name}/git/commits/{revision}",
+        context="GitHub revision verification",
+    )
+    if status == 404:
+        return False
+    if status != 200:
+        raise RuntimeError(f"GitHub revision verification failed with HTTP {status}")
+    if not isinstance(payload, dict) or payload.get("sha") != revision:
+        raise RuntimeError("GitHub revision verification returned another commit")
+    return True
+
+
 def _github_tracked_text_at_revision(
     repo: Path, *, repo_name: str, revision: str, path: str
 ) -> str | None:
@@ -3053,23 +3094,15 @@ def _github_tracked_text_at_revision(
     ):
         raise GateInputError("tracked-file path is invalid for GitHub fallback")
     endpoint = f"repos/{repo_slug}/contents/{quote(path, safe='/')}?ref={revision}"
-    response = _run_text(
-        repo, ["gh", "api", "--include", endpoint], allow_nonzero=True
+    status, payload = _github_api_included_response(
+        repo, endpoint=endpoint, context="GitHub tracked-file fallback"
     )
-    status_match = re.match(r"HTTP/\S+ (?P<status>[0-9]{3})(?: [^\n]*)?\n", response)
-    if status_match is None:
-        raise RuntimeError("GitHub tracked-file fallback did not expose an HTTP status")
-    status = int(status_match.group("status"))
-    header_body = response.split("\n\n", 1)
-    body = header_body[1] if len(header_body) == 2 else ""
     if status == 404:
+        if not _github_revision_exists(repo, repo_name=repo_slug, revision=revision):
+            raise RuntimeError("GitHub tracked-file fallback revision is not resolvable")
         return None
     if status != 200:
         raise RuntimeError(f"GitHub tracked-file fallback failed with HTTP {status}")
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("GitHub tracked-file fallback did not return JSON") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("GitHub tracked-file fallback returned an invalid payload")
     content = payload.get("content")
@@ -3345,12 +3378,16 @@ def expected_check_names_for_repo(
     repo: Path,
     *,
     repo_name: str | None = None,
+    head_repo_name: str | None = None,
     head_sha: str | None = None,
     base_sha: str | None = None,
 ) -> tuple[str, ...]:
     policy_sha = base_sha or head_sha
+    head_policy_repo = head_repo_name or repo_name
     head_catalog = (
-        _required_check_catalog_text_at_revision(repo, head_sha, repo_name=repo_name)
+        _required_check_catalog_text_at_revision(
+            repo, head_sha, repo_name=head_policy_repo
+        )
         if head_sha is not None
         else None
     )
@@ -3932,6 +3969,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_check_names=expected_check_names_for_repo(
                 repo,
                 repo_name=state.get("repoName"),
+                head_repo_name=state.get("headRepoName"),
                 head_sha=state.get("pr", {}).get("headRefOid"),
                 base_sha=state.get("pr", {}).get("baseRefOid"),
             ),

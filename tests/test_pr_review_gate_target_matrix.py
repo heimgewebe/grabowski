@@ -42,6 +42,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
                 result = pr_review_gate.expected_check_names_for_repo(
                     repo,
                     repo_name="heimgewebe/weltgewebe",
+                    head_repo_name="contributor/weltgewebe",
                     head_sha="a" * 40,
                     base_sha="b" * 40,
                 )
@@ -49,7 +50,7 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             self.assertEqual(
                 read_catalog.call_args_list,
                 [
-                    mock.call(repo, "a" * 40, repo_name="heimgewebe/weltgewebe"),
+                    mock.call(repo, "a" * 40, repo_name="contributor/weltgewebe"),
                     mock.call(repo, "b" * 40, repo_name="heimgewebe/weltgewebe"),
                 ],
             )
@@ -327,6 +328,7 @@ jobs:
                 result = pr_review_gate.expected_check_names_for_repo(
                     repo,
                     repo_name="heimgewebe/weltgewebe",
+                    head_repo_name="contributor/weltgewebe",
                     head_sha="a" * 40,
                     base_sha="b" * 40,
                 )
@@ -336,7 +338,7 @@ jobs:
                 [
                     mock.call(
                         repo,
-                        repo_name="heimgewebe/weltgewebe",
+                        repo_name="contributor/weltgewebe",
                         revision="a" * 40,
                         path=pr_review_gate.REQUIRED_CHECK_CATALOG_PATH,
                     ),
@@ -398,7 +400,13 @@ jobs:
                 )
 
             not_found = "HTTP/2.0 404 Not Found\n\n{\"message\":\"Not Found\"}"
-            with mock.patch.object(pr_review_gate, "_run_text", return_value=not_found):
+            commit_ok = (
+                "HTTP/2.0 200 OK\nContent-Type: application/json\n\n"
+                + json.dumps({"sha": revision})
+            )
+            with mock.patch.object(
+                pr_review_gate, "_run_text", side_effect=[not_found, commit_ok]
+            ):
                 self.assertIsNone(
                     pr_review_gate._github_tracked_text_at_revision(
                         repo,
@@ -407,6 +415,15 @@ jobs:
                         path=path,
                     )
                 )
+
+            with mock.patch.object(pr_review_gate, "_run_text", return_value=not_found):
+                with self.assertRaisesRegex(RuntimeError, "revision is not resolvable"):
+                    pr_review_gate._github_tracked_text_at_revision(
+                        repo,
+                        repo_name="heimgewebe/grabowski",
+                        revision=revision,
+                        path=path,
+                    )
 
             server_error = "HTTP/2.0 500 Internal Server Error\n\n{}"
             with mock.patch.object(pr_review_gate, "_run_text", return_value=server_error):
