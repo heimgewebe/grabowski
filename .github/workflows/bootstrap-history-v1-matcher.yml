@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: fix/run-outcome-taxonomy-v1-20260901
-          fetch-depth: 5
+          fetch-depth: 6
 
       - name: Verify exact lineage and isolation
         shell: bash
@@ -39,6 +39,7 @@ jobs:
           python - <<'PY'
           import ast
           from pathlib import Path
+          import textwrap
 
           tasks_path = Path("src/grabowski_tasks.py")
           tasks_text = tasks_path.read_text(encoding="utf-8")
@@ -138,7 +139,10 @@ jobs:
           ):
               raise SystemExit("v1 history matcher regression test already exists")
 
-          new_test = '''    def test_history_matcher_supports_v1_execution_outcomes(self) -> None:
+          new_test = textwrap.indent(
+              textwrap.dedent(
+                  '''\
+          def test_history_matcher_supports_v1_execution_outcomes(self) -> None:
               event = json.loads(self.source.read_text(encoding="utf-8"))
               normalized = {
                   "repo": "heimgewebe/grabowski",
@@ -195,6 +199,9 @@ jobs:
               )
 
           '''
+              ),
+              "    ",
+          )
           test_lines = test_text.splitlines(keepends=True)
           test_lines[insertion.lineno - 1:insertion.lineno - 1] = new_test.splitlines(keepends=True)
           test_path.write_text("".join(test_lines), encoding="utf-8")
