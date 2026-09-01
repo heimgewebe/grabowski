@@ -92,6 +92,24 @@ class RunOutcomeTaxonomyContractTests(unittest.TestCase):
                 else:
                     self.assertIsNone(context["blocker_code"])
 
+    def test_v1_producer_event_projects_coarse_target_summary(self) -> None:
+        recall = self._load_recall()
+        event = chronik.build_event(self._record(), "failed")
+
+        result = recall.export_chronik_history_recall([event])
+
+        self.assertEqual(result["target_count"], 1)
+        target = result["target_summary"][0]
+        self.assertEqual(target["target_key"], "repository:heimgewebe/grabowski")
+        self.assertEqual(target["event_count"], 1)
+        self.assertEqual(target["subrun_count"], 1)
+        self.assertEqual(target["execution_failure_subruns"], 1)
+        self.assertEqual(target["true_block_subruns"], 0)
+        self.assertEqual(
+            target["semantic_role"],
+            "coarse_target_aggregation_not_goal_identity",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
