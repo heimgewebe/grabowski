@@ -9844,6 +9844,347 @@ class TaskTests(unittest.TestCase):
             binding["source_operation_identity_sha256"],
         )
 
+    def _runtime_refresh_prelaunch_fixture(
+        self, resource_keys: list[str] | None = None
+    ) -> dict[str, object]:
+        keys = resource_keys or [
+            "component:runtime-refresh-task-a",
+            "component:runtime-refresh-task-b",
+        ]
+        keys = list(keys)
+        approval_task_id = "BUREAU-RUNTIME-REFRESH-TEST"
+        lease_owner = "runtime-refresh:test-task-start"
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "bureau_runtime_refresh_intent",
+            "approval_task_id": approval_task_id,
+            "required_resource_keys": keys,
+            "target_sha256": "a" * 64,
+        }
+        intent_sha256 = hashlib.sha256(
+            (tasks._canonical_json(payload) + "\n").encode("utf-8")
+        ).hexdigest()
+        intent = {**payload, "intent_sha256": intent_sha256}
+        request = {
+            "intent": str(self.root / "runtime-refresh-intent.json"),
+            "expected_intent_sha256": intent_sha256,
+            "lease_owner": lease_owner,
+            "lease_task_id": approval_task_id,
+        }
+        return {
+            "argv": [tasks.bureau_runtime_refresh_executor.RESERVED_TASK_COMMAND],
+            "request": request,
+            "intent": intent,
+            "intent_sha256": intent_sha256,
+            "lease_owner": lease_owner,
+            "approval_task_id": approval_task_id,
+            "resource_keys": keys,
+            "authority": {
+                "task_id": approval_task_id,
+                "task_revision": 1,
+                "task_sha256": "b" * 64,
+            },
+        }
+
+    def _runtime_refresh_lease_metadata(
+        self, resource_keys: list[str]
+    ) -> dict[str, dict[str, object]]:
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in resource_keys)
+            rows = connection.execute(
+                f"SELECT resource_key, metadata_json FROM leases "
+                f"WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                resource_keys,
+            ).fetchall()
+        return {
+            row["resource_key"]: json.loads(row["metadata_json"]) for row in rows
+        }
+
+    @contextmanager
+    def _runtime_refresh_start_environment(
+        self, fixture: dict[str, object], *, dispatch_effect=None
+    ):
+        managed_runtime = {
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "HEIM_NODE_RUNTIME_ENV_DIR": "/run/user/1000/grabowski-node-runtime-env",
+            "UV_CACHE_DIR": "/run/user/1000/grabowski-uv-cache",
+        }
+
+        def dispatch(*args, **kwargs):
+            if dispatch_effect is not None:
+                return dispatch_effect(*args, **kwargs)
+            return _launcher()
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "GRABOWSKI_RUNTIME_PYTHON", Path(sys.executable)),
+            patch.object(
+                tasks.bureau_runtime_refresh_executor,
+                "parse_reserved_task_request",
+                return_value=fixture["request"],
+            ),
+            patch.object(
+                tasks.bureau_runtime_refresh_executor,
+                "load_bound_intent",
+                return_value=fixture["intent"],
+            ),
+            patch.object(
+                tasks.bureau_runtime_refresh_executor,
+                "validate_authority_execution_contract",
+                return_value=fixture["authority"],
+            ),
+            patch.object(
+                tasks.bureau_runtime_refresh_executor,
+                "operation_identity",
+                return_value=None,
+            ),
+            patch.object(
+                tasks, "_validate_cwd", return_value=str(tasks.operator.HOME)
+            ),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+            patch.object(
+                tasks.operator, "_managed_runtime_environment", return_value=managed_runtime
+            ),
+            patch.object(tasks, "_dispatch", side_effect=dispatch) as dispatch_mock,
+            patch.object(tasks.base, "_append_audit") as audit_mock,
+        ):
+            yield dispatch_mock, audit_mock
+
+    def test_runtime_refresh_prelaunch_request_binds_real_task_identity(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        task_id = "7" * 24
+        unit = f"grabowski-task-{task_id}-a1.service"
+        request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"], fixture["intent"], task_id, unit
+        )
+        self.assertEqual(task_id, request["task_id"])
+        self.assertEqual(unit, request["executor_unit"])
+        self.assertEqual(fixture["resource_keys"], request["resource_keys"])
+        self.assertEqual(600, request["minimum_remaining_seconds"])
+        material = {key: value for key, value in request.items() if key != "request_sha256"}
+        self.assertEqual(tasks._sha256_json(material), request["request_sha256"])
+
+        for keys in (
+            list(reversed(fixture["resource_keys"])),
+            [fixture["resource_keys"][0], fixture["resource_keys"][0]],
+        ):
+            payload = {
+                key: value
+                for key, value in fixture["intent"].items()
+                if key != "intent_sha256"
+            }
+            payload["required_resource_keys"] = keys
+            digest = hashlib.sha256(
+                (tasks._canonical_json(payload) + "\n").encode("utf-8")
+            ).hexdigest()
+            bad_intent = {**payload, "intent_sha256": digest}
+            bad_request = {**fixture["request"], "expected_intent_sha256": digest}
+            with self.assertRaisesRegex(ValueError, "not canonical"):
+                tasks._runtime_refresh_prelaunch_lease_binding_request(
+                    bad_request, bad_intent, task_id, unit
+                )
+
+        bad_unit = "grabowski-task-" + "8" * 24 + "-a1.service"
+        with self.assertRaises(
+            tasks.bureau_runtime_refresh_executor.BureauRuntimeRefreshExecutorError
+        ):
+            tasks._runtime_refresh_prelaunch_lease_binding_request(
+                fixture["request"], fixture["intent"], task_id, bad_unit
+            )
+
+    def test_runtime_refresh_reserved_task_rejects_caller_resource_keys(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(ValueError, "server-owned by the bound"):
+                tasks.grabowski_task_start(
+                    "local",
+                    fixture["argv"],
+                    cwd=str(tasks.operator.HOME),
+                    resume_policy="never",
+                    resource_keys=[],
+                )
+
+    def test_runtime_refresh_task_binds_actual_unit_before_dispatch(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+        }
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh task start",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        observed: dict[str, object] = {}
+
+        def dispatch(*args, **kwargs):
+            launch = args[1]
+            persisted = self._runtime_refresh_lease_metadata(fixture["resource_keys"])
+            units = {item["executor_unit"] for item in persisted.values()}
+            self.assertEqual(1, len(units))
+            unit = next(iter(units))
+            self.assertTrue(
+                any(item == unit or item == f"--unit={unit}" for item in launch)
+            )
+            observed["unit"] = unit
+            observed["metadata"] = persisted
+            return _launcher()
+
+        with self._runtime_refresh_start_environment(
+            fixture, dispatch_effect=dispatch
+        ) as (dispatch_mock, audit_mock):
+            result = tasks.grabowski_task_start(
+                "local",
+                fixture["argv"],
+                cwd=str(tasks.operator.HOME),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+
+        self.assertEqual(1, dispatch_mock.call_count)
+        self.assertEqual(result["task"]["unit"], observed["unit"])
+        evidence = result["runtime_refresh_executor_lease_binding"]
+        self.assertEqual(result["task"]["unit"], evidence["executor_unit"])
+        self.assertEqual(len(fixture["resource_keys"]), evidence["resource_count"])
+        self.assertEqual(
+            evidence,
+            result["task"]["launcher"]["runtime_refresh_executor_lease_binding"],
+        )
+        audit_records = [
+            call.args[0]
+            for call in audit_mock.call_args_list
+            if call.args and isinstance(call.args[0], dict)
+            and call.args[0].get("operation") == "task-start"
+        ]
+        self.assertEqual(1, len(audit_records))
+        self.assertEqual(
+            evidence, audit_records[0]["runtime_refresh_executor_lease_binding"]
+        )
+
+    def test_runtime_refresh_task_precommit_failure_restores_external_leases(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {"marker": "original"}
+        acquired = tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh compensation",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        original = acquired["leases"]
+        with self._runtime_refresh_start_environment(fixture) as (dispatch_mock, _audit_mock):
+            with patch.object(
+                tasks,
+                "_register_task_reconcile_sequence",
+                side_effect=RuntimeError("forced precommit failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "forced precommit failure"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        self.assertEqual(0, dispatch_mock.call_count)
+        self.assertEqual(
+            original,
+            [tasks.resources.inspect_resource(key) for key in fixture["resource_keys"]],
+        )
+        self.assertEqual(
+            {key: metadata for key in fixture["resource_keys"]},
+            self._runtime_refresh_lease_metadata(fixture["resource_keys"]),
+        )
+
+    def test_runtime_refresh_task_ambiguous_commit_retains_binding_for_reconcile(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh ambiguous commit",
+            ttl_seconds=1200,
+            metadata={"marker": "ambiguous"},
+        )
+        real_database_connection = tasks._database_connection
+
+        class AmbiguousCommitConnection:
+            def __init__(self, connection):
+                self.connection = connection
+                self.task_insert_seen = False
+
+            def execute(self, sql, parameters=()):
+                result = self.connection.execute(sql, parameters)
+                if "INSERT INTO tasks(" in sql:
+                    self.task_insert_seen = True
+                return result
+
+            def commit(self):
+                self.connection.commit()
+                if self.task_insert_seen:
+                    raise RuntimeError("forced ambiguous task commit")
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        @contextmanager
+        def ambiguous_database_connection():
+            with real_database_connection() as connection:
+                yield AmbiguousCommitConnection(connection)
+
+        with self._runtime_refresh_start_environment(fixture) as (dispatch_mock, _audit_mock):
+            with patch.object(tasks, "_database_connection", ambiguous_database_connection):
+                with self.assertRaisesRegex(
+                    RuntimeError, "persistence requires reconciliation"
+                ):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        self.assertEqual(0, dispatch_mock.call_count)
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT task_id, unit FROM tasks ORDER BY created_at_unix LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        metadata_by_key = self._runtime_refresh_lease_metadata(fixture["resource_keys"])
+        self.assertEqual({row[1]}, {item["executor_unit"] for item in metadata_by_key.values()})
+
+    def test_runtime_refresh_task_launch_failure_retains_committed_binding(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh launch failure",
+            ttl_seconds=1200,
+            metadata={"marker": "launch"},
+        )
+        with self._runtime_refresh_start_environment(fixture):
+            with patch.object(tasks, "_launch", side_effect=RuntimeError("forced launch failure")):
+                with self.assertRaisesRegex(RuntimeError, "forced launch failure"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT task_id, unit FROM tasks ORDER BY created_at_unix LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        metadata_by_key = self._runtime_refresh_lease_metadata(fixture["resource_keys"])
+        self.assertEqual({row[1]}, {item["executor_unit"] for item in metadata_by_key.values()})
+
+
 
 class RuntimeContractTests(unittest.TestCase):
     def test_task_output_root_is_managed_state_with_explicit_legacy_home(self) -> None:
@@ -9943,6 +10284,8 @@ class RuntimeContractTests(unittest.TestCase):
         )
         self.assertIn('name="grabowski_agent_workspace_adopt"', workspace_source)
         self.assertIn("manager.remove_tool(tool_name)", source)
+
+
 
 
 class ChronikCodingMemoryToolTests(unittest.TestCase):
