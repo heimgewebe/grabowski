@@ -11481,6 +11481,62 @@ else:
         self.assertEqual({"scope": "repository", "repo": "heimgewebe/grabowski"}, result["history"]["target"])
         self.assertTrue(result["history"]["ledger_snapshot"]["integrity_valid"])
 
+    def test_history_matcher_supports_v1_execution_outcomes(self) -> None:
+        event = json.loads(self.source.read_text(encoding="utf-8"))
+        normalized = {
+            "repo": "heimgewebe/grabowski",
+            "host": "",
+            "component": "",
+            "subject_component": "",
+            "operation": "",
+            "task_class": "",
+            "outcome": "",
+        }
+        for kind in {
+            "agent.run.started",
+            "agent.run.completed",
+            "agent.run.failed",
+            "agent.run.cancelled",
+            "agent.run.timed_out",
+            "agent.run.signalled",
+            "agent.run.blocked",
+        }:
+            with self.subTest(kind=kind):
+                candidate = json.loads(json.dumps(event))
+                candidate["schema_version"] = "agent-run-event.v1"
+                candidate["kind"] = kind
+                candidate["data"]["result"] = kind.removeprefix("agent.run.")
+                if kind == "agent.run.blocked":
+                    candidate["data"]["blocker_code"] = "task-outcome-unknown"
+                else:
+                    candidate["data"].pop("blocker_code", None)
+                candidate["event_id"] = tasks.chronik.event_id(candidate)
+                self.assertTrue(
+                    tasks._chronik_history_event_matches_query(
+                        candidate, normalized, since_timestamp=None
+                    )
+                )
+
+        legacy = json.loads(json.dumps(event))
+        legacy["schema_version"] = "agent-run-event.v0"
+        legacy["kind"] = "agent.run.completed"
+        legacy["data"]["result"] = "completed"
+        legacy["data"].pop("blocker_code", None)
+        legacy["event_id"] = tasks.chronik.event_id(legacy)
+        self.assertTrue(
+            tasks._chronik_history_event_matches_query(
+                legacy, normalized, since_timestamp=None
+            )
+        )
+        legacy["kind"] = "agent.run.failed"
+        legacy["data"]["result"] = "failed"
+        legacy["event_id"] = tasks.chronik.event_id(legacy)
+        self.assertFalse(
+            tasks._chronik_history_event_matches_query(
+                legacy, normalized, since_timestamp=None
+            )
+        )
+
     def test_history_component_filter_uses_chronik_source_component(self) -> None:
         event = json.loads(self.source.read_text(encoding="utf-8"))
         self.assertEqual("task-runner", event["subject"]["component"])
