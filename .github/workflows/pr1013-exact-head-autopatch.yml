@@ -1,0 +1,515 @@
+name: PR 1013 exact-head autopatch
+
+on:
+  push:
+    branches:
+      - operator/pr1013-autopatch-20260901-1428
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout bootstrap branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify exact remote preimage
+        env:
+          EXPECTED_HEAD: 86c85125b8ac0230112860cf494a3ac4f8509b7c
+          TARGET_BRANCH: fix/runtime-refresh-executor-lease-recovery-v5-20260901
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$EXPECTED_HEAD"
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$EXPECTED_HEAD"
+
+      - name: Apply narrow review fix
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one preimage, found {count}")
+              return text.replace(old, new, 1)
+
+          tasks_path = Path("src/grabowski_tasks.py")
+          tasks = tasks_path.read_text()
+
+          tasks = replace_once(
+              tasks,
+              '''    executor_prelaunch_recovery: dict[str, Any] | None = None
+    if executor_request is not None:
+        if executor_lease_binding_request is None:
+            raise RuntimeError(
+                "Bureau runtime-refresh executor lost validated prelaunch authority"
+            )
+        executor_prelaunch_recovery = (
+            _reconcile_runtime_refresh_prelaunch_binding_journals(
+                executor_lease_binding_request["resource_keys"]
+            )
+        )
+''',
+              '''    executor_prelaunch_recovery: dict[str, Any] | None = None
+    if executor_request is not None:
+        if (
+            executor_lease_binding_request is None
+            or executor_intent is None
+            or executor_authority_contract is None
+        ):
+            raise RuntimeError(
+                "Bureau runtime-refresh executor lost validated prelaunch authority"
+            )
+        recovery_executor_intent = (
+            bureau_runtime_refresh_executor.load_bound_intent(executor_request)
+        )
+        recovery_executor_authority_contract = (
+            bureau_runtime_refresh_executor.validate_authority_execution_contract(
+                recovery_executor_intent
+            )
+        )
+        recovery_executor_lease_binding_request = (
+            _runtime_refresh_prelaunch_lease_binding_request(
+                executor_request,
+                recovery_executor_intent,
+                recovery_executor_authority_contract,
+                task_id,
+                _task_unit(task_id, 1),
+            )
+        )
+        if recovery_executor_lease_binding_request != executor_lease_binding_request:
+            raise RuntimeError(
+                "Bureau runtime-refresh prelaunch authority changed before journal recovery"
+            )
+        executor_intent = recovery_executor_intent
+        executor_authority_contract = recovery_executor_authority_contract
+        executor_lease_binding_request = recovery_executor_lease_binding_request
+        executor_prelaunch_recovery = (
+            _reconcile_runtime_refresh_prelaunch_binding_journals(
+                executor_lease_binding_request["resource_keys"]
+            )
+        )
+''',
+              "pre-recovery authority revalidation",
+          )
+
+          tasks = replace_once(
+              tasks,
+              '''            task_row = connection.execute(
+                "SELECT task_id, unit, argv_sha256 FROM tasks WHERE task_id=?",
+                (journal["task_id"],),
+            ).fetchone()
+            if task_row is not None:
+                if (
+                    task_row["task_id"] != journal["task_id"]
+                    or task_row["unit"] != journal["executor_unit"]
+                    or task_row["argv_sha256"] != journal["argv_sha256"]
+                ):
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch recovery task identity mismatched"
+                    )
+                _delete_runtime_refresh_prelaunch_binding_journal(
+                    connection, journal
+                )
+                retained.append(journal["task_id"])
+                continue
+            recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(
+                journal["binding_plan"]
+            )
+''',
+              '''            task_row = connection.execute(
+                "SELECT task_id, unit, argv_sha256, launcher_json FROM tasks WHERE task_id=?",
+                (journal["task_id"],),
+            ).fetchone()
+            if task_row is not None:
+                if (
+                    task_row["task_id"] != journal["task_id"]
+                    or task_row["unit"] != journal["executor_unit"]
+                    or task_row["argv_sha256"] != journal["argv_sha256"]
+                ):
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch recovery task identity mismatched"
+                    )
+                try:
+                    task_launcher = json.loads(task_row["launcher_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch recovery task launcher is invalid"
+                    ) from exc
+                if not isinstance(task_launcher, dict):
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch recovery task launcher is invalid"
+                    )
+                outcome_unknown = task_launcher.get("outcome_unknown")
+                if outcome_unknown not in (None, False, True):
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch recovery task launch outcome is invalid"
+                    )
+                launch_returncode = task_launcher.get("returncode")
+                if launch_returncode is None or outcome_unknown is True:
+                    retained.append(journal["task_id"])
+                    continue
+                if isinstance(launch_returncode, bool) or not isinstance(
+                    launch_returncode, int
+                ):
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch recovery task returncode is invalid"
+                    )
+                if launch_returncode == 0:
+                    _delete_runtime_refresh_prelaunch_binding_journal(
+                        connection, journal
+                    )
+                    retained.append(journal["task_id"])
+                    continue
+            recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(
+                journal["binding_plan"]
+            )
+''',
+              "journal recovery launch-state classification",
+          )
+
+          tasks = replace_once(
+              tasks,
+              '''            _register_task_reconcile_sequence(connection, task_id)
+            if executor_lease_binding_journal is not None:
+                _delete_runtime_refresh_prelaunch_binding_journal(
+                    connection, executor_lease_binding_journal
+                )
+            connection.commit()
+''',
+              '''            _register_task_reconcile_sequence(connection, task_id)
+            connection.commit()
+''',
+              "retain journal through task-row persistence",
+          )
+
+          tasks = replace_once(
+              tasks,
+              '''    state = _launch_state(launcher)
+    stored = _set_state(task_id, state, launcher=launcher)
+    lease_maintenance = _maintain_record_resources(stored, state)
+''',
+              '''    state = _launch_state(launcher)
+    stored = _set_state(task_id, state, launcher=launcher)
+    if (
+        executor_lease_binding_journal is not None
+        and executor_lease_binding is not None
+    ):
+        if state == "running":
+            with _database_connection() as connection:
+                _delete_runtime_refresh_prelaunch_binding_journal(
+                    connection, executor_lease_binding_journal
+                )
+                connection.commit()
+        elif state == "failed" and launcher.get("outcome_unknown") is not True:
+            executor_prelaunch_compensation = (
+                resources.unbind_runtime_refresh_executor_leases(
+                    executor_lease_binding
+                )
+            )
+            with _database_connection() as connection:
+                _delete_runtime_refresh_prelaunch_binding_journal(
+                    connection, executor_lease_binding_journal
+                )
+                connection.commit()
+            launcher = {
+                **launcher,
+                "runtime_refresh_executor_prelaunch_compensation": (
+                    executor_prelaunch_compensation
+                ),
+            }
+            stored = _set_state(task_id, state, launcher=launcher)
+    lease_maintenance = _maintain_record_resources(stored, state)
+''',
+              "post-dispatch journal settlement",
+          )
+          tasks_path.write_text(tasks)
+
+          tests_path = Path("tests/test_tasks.py")
+          tests = tests_path.read_text()
+          tests = replace_once(
+              tests,
+              '''    def test_runtime_refresh_task_launch_failure_retains_committed_binding(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh launch failure",
+            ttl_seconds=1200,
+            metadata={
+                "approval_task_id": fixture["approval_task_id"],
+                "intent_sha256": fixture["intent_sha256"],
+                "marker": "launch",
+            },
+        )
+        with self._runtime_refresh_start_environment(fixture):
+            with patch.object(tasks, "_launch", side_effect=RuntimeError("forced launch failure")):
+                with self.assertRaisesRegex(RuntimeError, "forced launch failure"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT task_id, unit FROM tasks ORDER BY created_at_unix LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        metadata_by_key = self._runtime_refresh_lease_metadata(fixture["resource_keys"])
+        self.assertEqual({row[1]}, {item["executor_unit"] for item in metadata_by_key.values()})
+
+
+''',
+              '''    def test_runtime_refresh_task_launch_failure_compensates_committed_binding(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        original = tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh launch failure",
+            ttl_seconds=1200,
+            metadata={
+                "approval_task_id": fixture["approval_task_id"],
+                "intent_sha256": fixture["intent_sha256"],
+                "marker": "launch",
+            },
+        )["leases"]
+        with self._runtime_refresh_start_environment(
+            fixture, dispatch_effect=lambda *_args, **_kwargs: _launcher(1)
+        ) as (dispatch_mock, _audit_mock):
+            started = tasks.grabowski_task_start(
+                "local",
+                fixture["argv"],
+                cwd=str(tasks.operator.HOME),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+        self.assertEqual(1, dispatch_mock.call_count)
+        self.assertEqual("failed", started["task"]["state"])
+        self.assertEqual(
+            original,
+            [
+                tasks.resources.inspect_resource(key)
+                for key in fixture["resource_keys"]
+            ],
+        )
+        self.assertTrue(
+            all(
+                "executor_unit" not in item
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            )
+        )
+        with sqlite3.connect(self.database) as connection:
+            remaining = connection.execute(
+                "SELECT key FROM metadata WHERE key LIKE ?",
+                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+            ).fetchall()
+        self.assertEqual([], remaining)
+
+    def test_runtime_refresh_task_launch_outcome_unknown_retains_binding_journal(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh ambiguous launch",
+            ttl_seconds=1200,
+            metadata={
+                "approval_task_id": fixture["approval_task_id"],
+                "intent_sha256": fixture["intent_sha256"],
+                "marker": "ambiguous-launch",
+            },
+        )
+        ambiguous = _launcher(1)
+        ambiguous["outcome_unknown"] = True
+        with self._runtime_refresh_start_environment(
+            fixture, dispatch_effect=lambda *_args, **_kwargs: ambiguous
+        ) as (dispatch_mock, _audit_mock):
+            started = tasks.grabowski_task_start(
+                "local",
+                fixture["argv"],
+                cwd=str(tasks.operator.HOME),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+        self.assertEqual(1, dispatch_mock.call_count)
+        self.assertEqual("outcome_unknown", started["task"]["state"])
+        self.assertEqual(
+            {started["task"]["unit"]},
+            {
+                item["executor_unit"]
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            },
+        )
+        with sqlite3.connect(self.database) as connection:
+            remaining = connection.execute(
+                "SELECT key FROM metadata WHERE key LIKE ?",
+                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+            ).fetchall()
+        self.assertEqual(1, len(remaining))
+
+
+''',
+              "definitive and ambiguous launch regression",
+          )
+
+          tests = replace_once(
+              tests,
+              '''        original = tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh live authority drift",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )["leases"]
+        real_prepare = tasks.resources.prepare_runtime_refresh_executor_lease_binding
+''',
+              '''        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh live authority drift",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        old_task_id = "c" * 24
+        old_unit = f"grabowski-task-{old_task_id}-a1.service"
+        old_request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"],
+            fixture["intent"],
+            fixture["authority"],
+            old_task_id,
+            old_unit,
+        )
+        old_plan = tasks.resources.prepare_runtime_refresh_executor_lease_binding(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            expected_approval_task_id=fixture["approval_task_id"],
+            expected_intent_sha256=fixture["intent_sha256"],
+        )
+        old_journal = tasks._runtime_refresh_prelaunch_binding_journal(
+            old_request,
+            argv_sha256="c" * 64,
+            binding_plan=old_plan,
+        )
+        tasks._persist_runtime_refresh_prelaunch_binding_journal(old_journal)
+        tasks.resources.bind_runtime_refresh_executor_leases(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            prepared_binding=old_plan,
+        )
+        real_prepare = tasks.resources.prepare_runtime_refresh_executor_lease_binding
+''',
+              "authority drift fixture gains pending journal",
+          )
+
+          tests = replace_once(
+              tests,
+              '''                patch.object(
+                    tasks.resources,
+                    "prepare_runtime_refresh_executor_lease_binding",
+                    wraps=real_prepare,
+                ) as prepare_binding,
+            ):
+''',
+              '''                patch.object(
+                    tasks.resources,
+                    "prepare_runtime_refresh_executor_lease_binding",
+                    wraps=real_prepare,
+                ) as prepare_binding,
+                patch.object(
+                    tasks,
+                    "_reconcile_runtime_refresh_prelaunch_binding_journals",
+                    side_effect=AssertionError("journal recovery must not run after authority drift"),
+                ) as reconcile,
+            ):
+''',
+              "authority drift forbids recovery call",
+          )
+
+          tests = replace_once(
+              tests,
+              '''        prepare_binding.assert_not_called()
+        dispatch_mock.assert_not_called()
+        self.assertEqual(
+            original,
+            [
+                tasks.resources.inspect_resource(key)
+                for key in fixture["resource_keys"]
+            ],
+        )
+        self.assertEqual(
+            {key: metadata for key in fixture["resource_keys"]},
+            self._runtime_refresh_lease_metadata(fixture["resource_keys"]),
+        )
+        with sqlite3.connect(self.database) as connection:
+            journals = connection.execute(
+                "SELECT key FROM metadata WHERE key LIKE ?",
+                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+            ).fetchall()
+        self.assertEqual([], journals)
+''',
+              '''        prepare_binding.assert_not_called()
+        reconcile.assert_not_called()
+        dispatch_mock.assert_not_called()
+        self.assertEqual(
+            {old_unit},
+            {
+                item["executor_unit"]
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            },
+        )
+        with sqlite3.connect(self.database) as connection:
+            journal_row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks._runtime_refresh_prelaunch_journal_key(old_task_id),),
+            ).fetchone()
+        self.assertIsNotNone(journal_row)
+''',
+              "authority drift preserves pending journal and binding",
+          )
+          tests_path.write_text(tests)
+          PY
+          git diff --check
+          git diff -- src/grabowski_tasks.py tests/test_tasks.py
+
+      - name: Focused runtime-refresh tests
+        run: python3 -m pytest -q tests/test_resources.py tests/test_tasks.py -k runtime_refresh
+
+      - name: Full repository validation
+        run: make validate
+
+      - name: Commit and CAS-publish to PR branch
+        env:
+          EXPECTED_HEAD: 86c85125b8ac0230112860cf494a3ac4f8509b7c
+          TARGET_BRANCH: fix/runtime-refresh-executor-lease-recovery-v5-20260901
+        run: |
+          set -euo pipefail
+          remote_head="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | awk '{print $1}')"
+          test "$remote_head" = "$EXPECTED_HEAD"
+          rm .github/workflows/pr1013-exact-head-autopatch.yml
+          git diff --check
+          git config user.name "heimgewebe-operator"
+          git config user.email "operator@localhost"
+          git add -A
+          git commit -m "fix: preserve runtime-refresh prelaunch rollback authority"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
