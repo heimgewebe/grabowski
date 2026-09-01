@@ -149,6 +149,8 @@ PROCESS_REFERENCE_ALLOWED_ROOTS = (
     Path("/home/alex/.cache/ms-playwright"),
     Path("/home/alex/.local/share/Trash"),
     Path("/home/alex/.local/share/grabowski-mcp-releases"),
+    Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
+    Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
 )
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_SYSTEMD_ACTION = "operator_root_task_systemd_unit"

@@ -60,6 +60,8 @@ class ProcessReferenceObserverTests(unittest.TestCase):
             Path("/home/alex/.cache/ms-playwright"),
             Path("/home/alex/.local/share/Trash"),
             Path("/home/alex/.local/share/grabowski-mcp-releases"),
+            Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
+            Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
         }
         self.assertEqual(set(observer.ALLOWED_ROOTS), expected)
 

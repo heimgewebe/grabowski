@@ -105,6 +105,8 @@ PROCESS_OBSERVER_BIND_PATHS = (
     "/home/alex/.cache/ms-playwright",
     "/home/alex/.local/share/Trash",
     "/home/alex/.local/share/grabowski-mcp-releases",
+    "/home/alex/.local/state/heim-pc/cache-maintenance/plans",
+    "/home/alex/.local/state/heim-pc/cache-maintenance/receipts",
 )
 
 
