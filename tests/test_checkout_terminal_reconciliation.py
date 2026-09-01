@@ -1292,14 +1292,26 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             ]
         )
 
+    def test_github_issue_url_accepts_one_trailing_slash_only(self) -> None:
+        self.assertEqual(
+            ("heimgewebe/chronik", 299),
+            sources._parse_github_issue_source_id(
+                "https://github.com/heimgewebe/chronik/issues/299/"
+            ),
+        )
+
     def test_github_issue_url_rejects_ambiguous_variants(self) -> None:
         invalid = (
             "http://github.com/heimgewebe/chronik/issues/299",
             "https://github.com.evil/heimgewebe/chronik/issues/299",
             "https://user@github.com/heimgewebe/chronik/issues/299",
             "https://github.com:443/heimgewebe/chronik/issues/299",
+            "https://github.com:/heimgewebe/chronik/issues/299",
+            "https://github.com/heimgewebe/chronik/issues/299?",
+            "https://github.com/heimgewebe/chronik/issues/299#",
             "https://github.com/heimgewebe/chronik/issues/299?state=closed",
             "https://github.com/heimgewebe/chronik/issues/299#fragment",
+            "https://github.com/heimgewebe/chronik/issues/299//",
             "https://github.com/heimgewebe/chronik/issues/299/comments",
             "https://github.com/heimgewebe/chronik/issues/0",
         )

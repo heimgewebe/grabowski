@@ -415,10 +415,14 @@ def _parse_github_issue_source_id(source_id: str) -> tuple[str, int]:
         raise ValueError(
             "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
         )
-    return (
-        f"{path_match.group('owner')}/{path_match.group('repo')}",
-        int(path_match.group("number")),
-    )
+    repository = f"{path_match.group('owner')}/{path_match.group('repo')}"
+    number = int(path_match.group("number"))
+    canonical_url = f"https://github.com/{repository}/issues/{number}"
+    if source_id not in {canonical_url, canonical_url + "/"}:
+        raise ValueError(
+            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+        )
+    return repository, number
 
 
 def github_issue_terminal_evidence(source_id: str) -> dict[str, Any]:
