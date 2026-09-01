@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -46,7 +48,10 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             self.assertEqual(result, ("ci", "Web E2E"))
             self.assertEqual(
                 read_catalog.call_args_list,
-                [mock.call(repo, "a" * 40), mock.call(repo, "b" * 40)],
+                [
+                    mock.call(repo, "a" * 40, repo_name="heimgewebe/weltgewebe"),
+                    mock.call(repo, "b" * 40, repo_name="heimgewebe/weltgewebe"),
+                ],
             )
 
     def test_invalid_head_catalog_blocks_even_when_base_policy_is_valid(self) -> None:
@@ -277,9 +282,14 @@ jobs:
             self.assertEqual(result, ("validate (3.11)", "validate (3.12)"))
             self.assertEqual(
                 read_catalog.call_args_list,
-                [mock.call(repo, "a" * 40), mock.call(repo, "b" * 40)],
+                [
+                    mock.call(repo, "a" * 40, repo_name="heimgewebe/schauwerk"),
+                    mock.call(repo, "b" * 40, repo_name="heimgewebe/schauwerk"),
+                ],
             )
-            read_workflow.assert_called_once_with(repo, "b" * 40)
+            read_workflow.assert_called_once_with(
+                repo, "b" * 40, repo_name="heimgewebe/schauwerk"
+            )
 
     def test_tracked_text_distinguishes_missing_file_from_read_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -298,6 +308,129 @@ jobs:
                 with self.assertRaisesRegex(RuntimeError, "git read failed"):
                     pr_review_gate._tracked_text_at_revision(
                         repo, "a" * 40, ".github/example.json"
+                    )
+
+    def test_remote_sha_fallback_preserves_base_policy_when_local_objects_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            head_catalog = '{"schema_version":1,"required_checks":["weak"]}'
+            base_catalog = '{"schema_version":1,"required_checks":["ci","Web E2E"]}'
+            with mock.patch.object(
+                pr_review_gate,
+                "_run_bytes",
+                side_effect=RuntimeError("local object missing"),
+            ), mock.patch.object(
+                pr_review_gate,
+                "_github_tracked_text_at_revision",
+                side_effect=[head_catalog, base_catalog],
+            ) as remote_read:
+                result = pr_review_gate.expected_check_names_for_repo(
+                    repo,
+                    repo_name="heimgewebe/weltgewebe",
+                    head_sha="a" * 40,
+                    base_sha="b" * 40,
+                )
+            self.assertEqual(result, ("ci", "Web E2E"))
+            self.assertEqual(
+                remote_read.call_args_list,
+                [
+                    mock.call(
+                        repo,
+                        repo_name="heimgewebe/weltgewebe",
+                        revision="a" * 40,
+                        path=pr_review_gate.REQUIRED_CHECK_CATALOG_PATH,
+                    ),
+                    mock.call(
+                        repo,
+                        repo_name="heimgewebe/weltgewebe",
+                        revision="b" * 40,
+                        path=pr_review_gate.REQUIRED_CHECK_CATALOG_PATH,
+                    ),
+                ],
+            )
+
+    def test_local_missing_file_does_not_consult_github_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(
+                pr_review_gate, "_run_bytes", return_value=b""
+            ), mock.patch.object(
+                pr_review_gate, "_github_tracked_text_at_revision"
+            ) as remote_read:
+                self.assertIsNone(
+                    pr_review_gate._tracked_text_at_revision(
+                        repo,
+                        "a" * 40,
+                        ".github/example.json",
+                        repo_name="heimgewebe/grabowski",
+                    )
+                )
+            remote_read.assert_not_called()
+
+    def test_github_tracked_file_fallback_is_exact_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            path = ".github/example.json"
+            revision = "a" * 40
+            text = '{"ok":true}\n'
+            payload_bytes = text.encode("utf-8")
+            blob_sha = hashlib.sha1(
+                f"blob {len(payload_bytes)}\0".encode("ascii") + payload_bytes
+            ).hexdigest()
+            payload = {
+                "type": "file",
+                "path": path,
+                "encoding": "base64",
+                "content": base64.b64encode(payload_bytes).decode("ascii"),
+                "size": len(payload_bytes),
+                "sha": blob_sha,
+            }
+            ok = "HTTP/2.0 200 OK\nContent-Type: application/json\n\n" + json.dumps(payload)
+            with mock.patch.object(pr_review_gate, "_run_text", return_value=ok):
+                self.assertEqual(
+                    pr_review_gate._github_tracked_text_at_revision(
+                        repo,
+                        repo_name="heimgewebe/grabowski",
+                        revision=revision,
+                        path=path,
+                    ),
+                    text,
+                )
+
+            not_found = "HTTP/2.0 404 Not Found\n\n{\"message\":\"Not Found\"}"
+            with mock.patch.object(pr_review_gate, "_run_text", return_value=not_found):
+                self.assertIsNone(
+                    pr_review_gate._github_tracked_text_at_revision(
+                        repo,
+                        repo_name="heimgewebe/grabowski",
+                        revision=revision,
+                        path=path,
+                    )
+                )
+
+            server_error = "HTTP/2.0 500 Internal Server Error\n\n{}"
+            with mock.patch.object(pr_review_gate, "_run_text", return_value=server_error):
+                with self.assertRaisesRegex(RuntimeError, "HTTP 500"):
+                    pr_review_gate._github_tracked_text_at_revision(
+                        repo,
+                        repo_name="heimgewebe/grabowski",
+                        revision=revision,
+                        path=path,
+                    )
+
+            mismatched = dict(payload)
+            mismatched["path"] = ".github/other.json"
+            bad_path = (
+                "HTTP/2.0 200 OK\nContent-Type: application/json\n\n"
+                + json.dumps(mismatched)
+            )
+            with mock.patch.object(pr_review_gate, "_run_text", return_value=bad_path):
+                with self.assertRaisesRegex(RuntimeError, "exact file"):
+                    pr_review_gate._github_tracked_text_at_revision(
+                        repo,
+                        repo_name="heimgewebe/grabowski",
+                        revision=revision,
+                        path=path,
                     )
 
     def test_evaluation_uses_supplied_target_check_names(self) -> None:

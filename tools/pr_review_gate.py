@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -14,7 +16,7 @@ import stat
 import subprocess
 import sys
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 _SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC_DIR) not in sys.path:
@@ -3035,17 +3037,99 @@ REQUIRED_CHECK_CATALOG_PATH = ".github/grabowski-required-checks.json"
 REQUIRED_CHECK_CATALOG_FIELDS = {"schema_version", "required_checks"}
 
 
-def _tracked_text_at_revision(repo: Path, revision: str, path: str) -> str | None:
+def _github_tracked_text_at_revision(
+    repo: Path, *, repo_name: str, revision: str, path: str
+) -> str | None:
+    repo_slug = _canonical_repo_slug(repo_name)
+    if repo_slug is None:
+        raise GateInputError("GitHub repository identity is invalid for tracked-file fallback")
+    if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        raise GateInputError("revision SHA is invalid for GitHub tracked-file fallback")
+    if (
+        not path
+        or path.startswith("/")
+        or "\x00" in path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise GateInputError("tracked-file path is invalid for GitHub fallback")
+    endpoint = f"repos/{repo_slug}/contents/{quote(path, safe='/')}?ref={revision}"
+    response = _run_text(
+        repo, ["gh", "api", "--include", endpoint], allow_nonzero=True
+    )
+    status_match = re.match(r"HTTP/\S+ (?P<status>[0-9]{3})(?: [^\n]*)?\n", response)
+    if status_match is None:
+        raise RuntimeError("GitHub tracked-file fallback did not expose an HTTP status")
+    status = int(status_match.group("status"))
+    header_body = response.split("\n\n", 1)
+    body = header_body[1] if len(header_body) == 2 else ""
+    if status == 404:
+        return None
+    if status != 200:
+        raise RuntimeError(f"GitHub tracked-file fallback failed with HTTP {status}")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GitHub tracked-file fallback did not return JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub tracked-file fallback returned an invalid payload")
+    content = payload.get("content")
+    size = payload.get("size")
+    blob_sha = payload.get("sha")
+    if (
+        payload.get("type") != "file"
+        or payload.get("path") != path
+        or payload.get("encoding") != "base64"
+        or not isinstance(content, str)
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size < 0
+        or not isinstance(blob_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", blob_sha) is None
+    ):
+        raise RuntimeError("GitHub tracked-file fallback payload is not an exact file")
+    try:
+        decoded = base64.b64decode("".join(content.split()), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise RuntimeError("GitHub tracked-file fallback content is not valid base64") from exc
+    if len(decoded) != size:
+        raise RuntimeError("GitHub tracked-file fallback size mismatch")
+    expected_blob_sha = hashlib.sha1(
+        f"blob {len(decoded)}\0".encode("ascii") + decoded
+    ).hexdigest()
+    if blob_sha != expected_blob_sha:
+        raise RuntimeError("GitHub tracked-file fallback blob hash mismatch")
+    if payload.get("target") is not None or payload.get("submodule_git_url") is not None:
+        raise RuntimeError("GitHub tracked-file fallback payload is not a regular file")
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GateInputError("GitHub tracked-file fallback is not UTF-8") from exc
+
+
+def _tracked_text_at_revision(
+    repo: Path, revision: str, path: str, *, repo_name: str | None = None
+) -> str | None:
     if re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None:
         raise GateInputError("revision SHA is invalid for tracked-file inspection")
-    listing = _run_bytes(repo, ["git", "ls-tree", "-z", revision, "--", path])
-    if not listing:
-        return None
-    return _run_text(repo, ["git", "show", f"{revision}:{path}"])
+    try:
+        listing = _run_bytes(repo, ["git", "ls-tree", "-z", revision, "--", path])
+        if not listing:
+            return None
+        return _run_text(repo, ["git", "show", f"{revision}:{path}"])
+    except RuntimeError:
+        if repo_name is None:
+            raise
+        return _github_tracked_text_at_revision(
+            repo, repo_name=repo_name, revision=revision.lower(), path=path
+        )
 
 
-def _required_check_catalog_text_at_revision(repo: Path, revision: str) -> str | None:
-    return _tracked_text_at_revision(repo, revision, REQUIRED_CHECK_CATALOG_PATH)
+def _required_check_catalog_text_at_revision(
+    repo: Path, revision: str, *, repo_name: str | None = None
+) -> str | None:
+    return _tracked_text_at_revision(
+        repo, revision, REQUIRED_CHECK_CATALOG_PATH, repo_name=repo_name
+    )
 
 
 def _required_check_names_from_catalog(text: str) -> tuple[str, ...]:
@@ -3096,12 +3180,16 @@ def _required_check_names_from_catalog(text: str) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _workflow_text_at_revision(repo: Path, revision: str) -> str | None:
+def _workflow_text_at_revision(
+    repo: Path, revision: str, *, repo_name: str | None = None
+) -> str | None:
     for path in (
         ".github/workflows/validate.yml",
         ".github/workflows/validate.yaml",
     ):
-        text = _tracked_text_at_revision(repo, revision, path)
+        text = _tracked_text_at_revision(
+            repo, revision, path, repo_name=repo_name
+        )
         if text is not None:
             return text
     return None
@@ -3262,7 +3350,7 @@ def expected_check_names_for_repo(
 ) -> tuple[str, ...]:
     policy_sha = base_sha or head_sha
     head_catalog = (
-        _required_check_catalog_text_at_revision(repo, head_sha)
+        _required_check_catalog_text_at_revision(repo, head_sha, repo_name=repo_name)
         if head_sha is not None
         else None
     )
@@ -3270,7 +3358,7 @@ def expected_check_names_for_repo(
         # Validate proposed policy now, but do not let a PR authorize itself.
         _required_check_names_from_catalog(head_catalog)
     policy_catalog = (
-        _required_check_catalog_text_at_revision(repo, policy_sha)
+        _required_check_catalog_text_at_revision(repo, policy_sha, repo_name=repo_name)
         if policy_sha is not None and policy_sha != head_sha
         else head_catalog
     )
@@ -3279,7 +3367,7 @@ def expected_check_names_for_repo(
     bootstrap = BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO.get((repo_name or "").casefold())
     if bootstrap is not None:
         return bootstrap
-    workflow = _workflow_text_at_revision(repo, policy_sha) if policy_sha is not None else None
+    workflow = _workflow_text_at_revision(repo, policy_sha, repo_name=repo_name) if policy_sha is not None else None
     python_job = "validate"
     versions = (
         _python_versions_from_validate_workflow(workflow, job_key=python_job)
