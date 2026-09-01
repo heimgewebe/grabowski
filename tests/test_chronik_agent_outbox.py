@@ -166,7 +166,7 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         result = chronik.record_task_state(record(), "running")
         self.assertTrue(result["written"])
         event = json.loads(self.lines()[0])
-        self.assertEqual(event["schema_version"], "agent-run-event.v0")
+        self.assertEqual(event["schema_version"], "agent-run-event.v1")
         self.assertEqual(event["kind"], "agent.run.started")
         self.assertEqual(event["source"]["repo"], "heimgewebe/grabowski")
         self.assertEqual(event["subject"], {"scope": "host", "host": "unknown"})
@@ -174,21 +174,30 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         self.assertLessEqual(len(event["caused_by"]), 3)
         self.assertLessEqual(len(event["evidence_refs"]), 5)
 
-    def test_completed_and_blocked_events(self):
-        self.enable()
-        chronik.record_task_state(record(), "completed")
-        event = json.loads(self.lines()[0])
-        self.assertEqual(event["kind"], "agent.run.completed")
-        self.assertEqual(event["data"], {"result": "completed", "operation": "other", "task_class": "other"})
-        self.tmp.cleanup()
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
-        os.environ[chronik.STATE_ROOT_ENV] = str(self.root)
-        chronik.record_task_state(record(), "failed")
-        event = json.loads(self.lines()[0])
-        self.assertEqual(event["kind"], "agent.run.blocked")
-        self.assertEqual(event["data"], {"result": "blocked", "blocker_code": "task-failed", "operation": "other", "task_class": "other"})
-
+    def test_terminal_events_distinguish_execution_failure_from_safety_block(self):
+        cases = [
+            ("completed", "agent.run.completed", "completed", None),
+            ("failed", "agent.run.failed", "failed", None),
+            ("cancelled", "agent.run.cancelled", "cancelled", None),
+            ("timed_out", "agent.run.timed_out", "timed_out", None),
+            ("signalled", "agent.run.signalled", "signalled", None),
+            ("outcome_unknown", "agent.run.blocked", "blocked", "task-outcome-unknown"),
+        ]
+        for state, kind, result, blocker_code in cases:
+            with self.subTest(state=state):
+                self.tmp.cleanup()
+                self.tmp = tempfile.TemporaryDirectory()
+                self.root = Path(self.tmp.name)
+                self.enable()
+                chronik.record_task_state(record(), state)
+                event = json.loads(self.lines()[0])
+                self.assertEqual(event["schema_version"], "agent-run-event.v1")
+                self.assertEqual(event["kind"], kind)
+                self.assertEqual(event["data"]["result"], result)
+                if blocker_code is None:
+                    self.assertNotIn("blocker_code", event["data"])
+                else:
+                    self.assertEqual(event["data"]["blocker_code"], blocker_code)
     def test_repository_context_is_projected_without_raw_execution_data(self):
         self.enable()
         context = {
@@ -247,6 +256,21 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         self.assertEqual(event["data"]["operation"], "recovery")
         self.assertEqual(event["data"]["task_class"], "recovery")
 
+    def test_legacy_v0_execution_failure_event_remains_readable(self):
+        event = chronik.build_event(record(), "outcome_unknown")
+        event["schema_version"] = "agent-run-event.v0"
+        event["kind"] = "agent.run.blocked"
+        event["data"]["result"] = "blocked"
+        event["data"]["blocker_code"] = "task-failed"
+        event["event_id"] = chronik.event_id(event)
+        chronik._validate_agent_run_event_shape(event, label="legacy event")
+
+    def test_v1_nonblocked_event_rejects_legacy_blocker_code(self):
+        event = chronik.build_event(record(), "failed")
+        event["data"]["blocker_code"] = "task-failed"
+        event["event_id"] = chronik.event_id(event)
+        with self.assertRaisesRegex(ValueError, "unexpected blocker code"):
+            chronik._validate_agent_run_event_shape(event, label="v1 event")
     def test_deduplicates_same_event(self):
         self.enable()
         chronik.record_task_state(record(), "running")
