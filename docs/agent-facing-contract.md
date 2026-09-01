@@ -31,7 +31,8 @@ The rendered contract requires the agent to:
 
 1. treat live runtime state and concrete receipts as higher-authority than prose;
 2. use the narrowest typed read tool that can answer the question before broader
-   surfaces;
+   surfaces, without adding a connectivity-only health ping when that required
+   read can serve as the probe;
 3. for a host-local capability intent, resolve the installed host contract first
    through `grabowski_host_capability_resolve`, follow its canonical authority and
    reread that authority's policy at execution time; Grabowski must not duplicate
@@ -40,23 +41,46 @@ The rendered contract requires the agent to:
    rollback before changing state;
 5. verify target state after transport, platform-filter or policy failures and
    avoid unchanged retries without state evidence;
-6. after readback proves an upstream platform filter caused no effect, continue
+6. when ChatGPT or another upstream platform refuses a call before host dispatch
+   and no Grabowski receipt exists, classify it as `platform_filter`, do not
+   attribute it to the Grabowski runtime, do not retry the blocked call unchanged,
+   and resume from existing lane or task receipts in a supported conversation when
+   present;
+7. after readback proves an upstream platform filter caused no effect, continue
    the authorized goal through an existing semantically narrower typed operation
    when available; never weaken, disguise, bypass or repackage the platform
    safeguard;
-7. prefer typed operations to generic terminal, Git or GitHub calls when both can
-   express the effect;
-8. for nontrivial operator work, first call `operator-obligation-list` through
-   `grip_run` to find matching interrupted work, then call
-   `operator-obligation-open` or resume the matching obligation, read
-   `operator-obligation-status` before ending the response, and end only after
-   `operator-obligation-close` records `completed`, explicitly `blocked`, or
-   durably `delegated`;
-9. treat the instructions as non-authoritative: they grant no action, merge,
-   deploy, secret or retry authority.
+8. treat `platform_publication_pending` as nonblocking by default and fail closed
+   only the operation whose required tool or schema field is not visible in the
+   active client catalog; seek fresh request-bound catalog evidence instead of
+   blocking unrelated Grabowski work;
+9. use the normal mutating MCP call path and the server-owned transport-roundtrip
+   continuation when a fresh challenge is returned; ambiguous mutation outcomes
+   still require target readback before any retry;
+10. prefer typed operations to generic terminal, Git or GitHub calls when both can
+    express the effect;
+11. for nontrivial operator work, use the durable operator-obligation lifecycle to
+    resume matching unfinished work and close only with completed, explicitly
+    blocked or durably delegated evidence;
+12. bind and assess risk-adaptive convergence evidence before claiming systemic
+    convergence when the convergence plan requires it; ordinary work completion is
+    not itself a systemic-convergence claim;
+13. treat the instructions as non-authoritative: they grant no action, merge,
+    deploy, secret or retry authority.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if
 this explanatory list drifts.
+
+A refusal that occurs before host dispatch cannot be observed or recorded by the
+Grabowski server itself. The client/controller must therefore keep that boundary
+explicit: absence of a Grabowski receipt plus an upstream refusal is evidence of a
+pre-runtime platform filter, not evidence that the Grabowski runtime rejected the
+operation.
+
+Likewise, platform publication is an operation-local compatibility concern. A
+pending platform publication does not globally disable an otherwise healthy
+runtime; only an operation that depends on a tool or schema field missing from the
+active client catalog must stop until fresh catalog evidence exists.
 
 The obligation lifecycle is durable server-side state, not proof that a client
 actually followed the rule. An open obligation reports `response_may_end=false`;
