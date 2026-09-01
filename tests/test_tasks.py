@@ -10685,6 +10685,225 @@ class TaskTests(unittest.TestCase):
             },
         )
 
+    def test_runtime_refresh_precommit_compensation_failure_preserves_primary_cause(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh compensation cause",
+            ttl_seconds=1200,
+            metadata={
+                "approval_task_id": fixture["approval_task_id"],
+                "intent_sha256": fixture["intent_sha256"],
+                "marker": "compensation-cause",
+            },
+        )
+        primary = sqlite3.OperationalError("forced primary persistence failure")
+        secondary = RuntimeError("forced compensation failure")
+        with self._runtime_refresh_start_environment(fixture):
+            with (
+                patch.object(
+                    tasks,
+                    "_register_task_reconcile_sequence",
+                    side_effect=primary,
+                ),
+                patch.object(
+                    tasks.resources,
+                    "unbind_runtime_refresh_executor_leases",
+                    side_effect=secondary,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "compensation failed"
+                ) as raised:
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        self.assertIs(primary, raised.exception.__cause__)
+        self.assertIn(
+            "RuntimeError: forced compensation failure", str(raised.exception)
+        )
+
+    def test_runtime_refresh_recovery_retains_journal_on_unbound_drift(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+            "marker": "recovery-drift",
+        }
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh recovery drift",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        old_task_id = "8" * 24
+        old_unit = f"grabowski-task-{old_task_id}-a1.service"
+        request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"], fixture["intent"], fixture["authority"], old_task_id, old_unit
+        )
+        plan = tasks.resources.prepare_runtime_refresh_executor_lease_binding(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            expected_approval_task_id=fixture["approval_task_id"],
+            expected_intent_sha256=fixture["intent_sha256"],
+        )
+        journal = tasks._runtime_refresh_prelaunch_binding_journal(
+            request, argv_sha256="8" * 64, binding_plan=plan
+        )
+        tasks._persist_runtime_refresh_prelaunch_binding_journal(journal)
+        tasks.resources.renew_resources(
+            fixture["lease_owner"],
+            [fixture["resource_keys"][0]],
+            ttl_seconds=1800,
+        )
+        with self.assertRaisesRegex(RuntimeError, "journal retained"):
+            tasks._reconcile_runtime_refresh_prelaunch_binding_journals(
+                fixture["resource_keys"]
+            )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks._runtime_refresh_prelaunch_journal_key(old_task_id),),
+            ).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_runtime_refresh_undispatched_task_recovers_before_operation_identity(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+            "marker": "undispatched-crash",
+        }
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh undispatched crash",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        operation_identity = {
+            "repository_head": "1" * 40,
+            "source_fingerprint_sha256": "2" * 64,
+            "purpose": "runtime refresh undispatched recovery test",
+            "scope_sha256": "3" * 64,
+        }
+        with self._runtime_refresh_start_environment(fixture):
+            with (
+                patch.object(
+                    tasks.bureau_runtime_refresh_executor,
+                    "operation_identity",
+                    return_value=operation_identity,
+                ),
+                patch.object(
+                    tasks,
+                    "_launch",
+                    side_effect=RuntimeError("simulated process death before dispatch"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "before dispatch"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT task_id, state, unit FROM tasks ORDER BY created_at_unix LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        old_task_id, old_state, old_unit = row
+        self.assertEqual("launching", old_state)
+        self.assertEqual(
+            {old_unit},
+            {
+                item["executor_unit"]
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            },
+        )
+
+        missing_observation = {
+            "state": "outcome_unknown",
+            "properties": {
+                "LoadState": "not-found",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+            },
+            "probe": {
+                "returncode": 4,
+                "stdout": "LoadState=not-found\nActiveState=inactive\nSubState=dead\n",
+                "stderr": "",
+                "timed_out": False,
+                "outcome_unknown": False,
+            },
+            "observer": {"kind": "test"},
+            "observed_at_unix": 123,
+        }
+        with self._runtime_refresh_start_environment(fixture):
+            with (
+                patch.object(
+                    tasks.bureau_runtime_refresh_executor,
+                    "operation_identity",
+                    return_value=operation_identity,
+                ),
+                patch.object(
+                    tasks,
+                    "_read_local_task_output_files",
+                    return_value=None,
+                ) as read_output,
+                patch.object(
+                    tasks,
+                    "_observe",
+                    return_value=missing_observation,
+                ) as observe,
+            ):
+                restarted = tasks.grabowski_task_start(
+                    "local",
+                    fixture["argv"],
+                    cwd=str(tasks.operator.HOME),
+                    runtime_seconds=60,
+                    resume_policy="never",
+                )
+        read_output.assert_called_once()
+        observe.assert_called_once()
+        self.assertNotEqual(old_task_id, restarted["task"]["task_id"])
+        old_record = tasks._row_raw(old_task_id)
+        self.assertEqual("cancelled", old_record["state"])
+        self.assertRegex(
+            str(old_record["lifecycle_receipt_sha256"]), r"[0-9a-f]{64}\Z"
+        )
+        recovery = restarted["runtime_refresh_executor_prelaunch_recovery"]
+        recovered = [
+            item for item in recovery["recovered"] if item["task_id"] == old_task_id
+        ]
+        self.assertEqual(1, len(recovered))
+        self.assertEqual("undispatched_cancelled", recovered[0]["action"])
+        with sqlite3.connect(self.database) as connection:
+            journal_row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks._runtime_refresh_prelaunch_journal_key(old_task_id),),
+            ).fetchone()
+        self.assertIsNone(journal_row)
+        self.assertEqual(
+            {restarted["task"]["unit"]},
+            {
+                item["executor_unit"]
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            },
+        )
+
     def test_runtime_refresh_orphan_binding_journal_recovers_after_hard_crash(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
         metadata = {

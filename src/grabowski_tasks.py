@@ -2189,6 +2189,86 @@ def _delete_runtime_refresh_prelaunch_binding_journal(
         raise RuntimeError("runtime-refresh prelaunch journal changed before deletion")
 
 
+def _runtime_refresh_prelaunch_recovery_action(
+    recovery: dict[str, Any],
+) -> str:
+    action = recovery.get("action") if isinstance(recovery, dict) else None
+    if action == "not_applied_or_superseded":
+        raise RuntimeError(
+            "runtime-refresh prelaunch recovery observed superseded lease state; "
+            "journal retained for explicit reconciliation"
+        )
+    if action not in {"restored", "already_original"}:
+        raise RuntimeError(
+            "runtime-refresh prelaunch recovery returned an unsupported action; "
+            "journal retained for explicit reconciliation"
+        )
+    return str(action)
+
+
+def _runtime_refresh_prelaunch_undispatched_task_evidence(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    if (
+        str(record.get("host")) != "local"
+        or _execution_backend(record) != "systemd-user"
+        or _systemd_scope(record) != "user"
+        or int(record.get("attempt") or 0) != 1
+    ):
+        return None
+    raw_launcher = record.get("launcher_json")
+    try:
+        launcher = json.loads(str(raw_launcher))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(launcher, dict)
+        or launcher.get(TASK_OUTPUT_LAUNCHER_BINDING_KEY) != 1
+    ):
+        return None
+    paths = _task_output_paths(record)
+    output_root = paths["directory"].parent
+    if not output_root.exists():
+        return None
+    try:
+        output = _read_local_task_output_files(record, 1)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if output is not None:
+        return None
+    try:
+        observation = _observe(record)
+    except Exception:
+        return None
+    properties = observation.get("properties")
+    probe = observation.get("probe")
+    if not isinstance(properties, dict) or not isinstance(probe, dict):
+        return None
+    returncode = probe.get("returncode")
+    if (
+        properties.get("LoadState") != "not-found"
+        or isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or returncode not in {0, 1, 3, 4}
+        or bool(probe.get("timed_out"))
+        or bool(probe.get("outcome_unknown"))
+    ):
+        return None
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_refresh_undispatched_task_evidence",
+        "task_id": str(record["task_id"]),
+        "executor_unit": _authoritative_unit(record),
+        "output_directory_sha256": hashlib.sha256(
+            str(paths["directory"]).encode("utf-8")
+        ).hexdigest(),
+        "output_directory_absent": True,
+        "systemd_load_state": "not-found",
+        "probe_returncode": returncode,
+    }
+    return {**material, "evidence_sha256": _sha256_json(material)}
+
+
 def _reconcile_runtime_refresh_prelaunch_binding_journals(
     resource_keys: list[str],
 ) -> dict[str, Any]:
@@ -2196,6 +2276,7 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
     selected = set(keys)
     recovered: list[dict[str, Any]] = []
     retained: list[str] = []
+    undispatched_pending: list[dict[str, Any]] = []
     connection = _database()
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -2215,30 +2296,53 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
             if not selected.intersection(journal["resource_keys"]):
                 continue
             task_row = connection.execute(
-                "SELECT task_id, unit, argv_sha256, state FROM tasks WHERE task_id=?",
+                "SELECT * FROM tasks WHERE task_id=?",
                 (journal["task_id"],),
             ).fetchone()
             if task_row is not None:
+                task_record = dict(task_row)
                 if (
-                    task_row["task_id"] != journal["task_id"]
-                    or task_row["unit"] != journal["executor_unit"]
-                    or task_row["argv_sha256"] != journal["argv_sha256"]
+                    task_record["task_id"] != journal["task_id"]
+                    or task_record["unit"] != journal["executor_unit"]
+                    or task_record["argv_sha256"] != journal["argv_sha256"]
                 ):
                     raise RuntimeError(
                         "runtime-refresh prelaunch recovery task identity mismatched"
                     )
-                task_state = str(task_row["state"])
+                task_state = str(task_record["state"])
                 if task_state in {"launching", "outcome_unknown"}:
-                    raise RuntimeError(
-                        "runtime-refresh prelaunch recovery found an unresolved "
-                        "task launch; journal retained for reconciliation"
+                    dispatch_evidence = (
+                        _runtime_refresh_prelaunch_undispatched_task_evidence(
+                            task_record
+                        )
                     )
+                    if dispatch_evidence is None:
+                        raise RuntimeError(
+                            "runtime-refresh prelaunch recovery found an unresolved "
+                            "task launch; journal retained for reconciliation"
+                        )
+                    recovery = (
+                        resources.restore_runtime_refresh_executor_lease_binding_plan(
+                            journal["binding_plan"]
+                        )
+                    )
+                    action = _runtime_refresh_prelaunch_recovery_action(recovery)
+                    undispatched_pending.append(
+                        {
+                            "task_id": journal["task_id"],
+                            "journal": journal,
+                            "lease_recovery_action": action,
+                            "dispatch_evidence": dispatch_evidence,
+                        }
+                    )
+                    continue
                 if task_state == "failed":
                     recovery = (
                         resources.restore_runtime_refresh_executor_lease_binding_plan(
                             journal["binding_plan"]
                         )
                     )
+                    action = _runtime_refresh_prelaunch_recovery_action(recovery)
                     _delete_runtime_refresh_prelaunch_binding_journal(
                         connection, journal
                     )
@@ -2247,7 +2351,7 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
                             "task_id": journal["task_id"],
                             "journal_sha256": journal["journal_sha256"],
                             "plan_sha256": journal["binding_plan"]["plan_sha256"],
-                            "action": recovery["action"],
+                            "action": action,
                         }
                     )
                     continue
@@ -2259,13 +2363,14 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
             recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(
                 journal["binding_plan"]
             )
+            action = _runtime_refresh_prelaunch_recovery_action(recovery)
             _delete_runtime_refresh_prelaunch_binding_journal(connection, journal)
             recovered.append(
                 {
                     "task_id": journal["task_id"],
                     "journal_sha256": journal["journal_sha256"],
                     "plan_sha256": journal["binding_plan"]["plan_sha256"],
-                    "action": recovery["action"],
+                    "action": action,
                 }
             )
         connection.commit()
@@ -2275,6 +2380,108 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
         raise
     finally:
         connection.close()
+
+    for pending in undispatched_pending:
+        task_id = str(pending["task_id"])
+        journal = pending["journal"]
+        dispatch_evidence = pending["dispatch_evidence"]
+        marker_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_refresh_undispatched_recovery",
+            "task_id": task_id,
+            "journal_sha256": journal["journal_sha256"],
+            "plan_sha256": journal["binding_plan"]["plan_sha256"],
+            "lease_recovery_action": pending["lease_recovery_action"],
+            "dispatch_evidence_sha256": dispatch_evidence["evidence_sha256"],
+        }
+        marker = {
+            **marker_material,
+            "recovery_sha256": _sha256_json(marker_material),
+        }
+        current = _row_raw(task_id)
+        try:
+            launcher = json.loads(str(current["launcher_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "runtime-refresh undispatched recovery launcher is invalid; "
+                "journal retained"
+            ) from exc
+        if not isinstance(launcher, dict):
+            raise RuntimeError(
+                "runtime-refresh undispatched recovery launcher is invalid; "
+                "journal retained"
+            )
+        launcher["runtime_refresh_prelaunch_undispatched_recovery"] = marker
+        terminalized = _set_state(
+            task_id,
+            "cancelled",
+            launcher=launcher,
+            observation={
+                "state": "cancelled",
+                "observed_at_unix": _now(),
+                "reason": "runtime_refresh_prelaunch_undispatched_recovery",
+                "dispatch_evidence_sha256": dispatch_evidence["evidence_sha256"],
+            },
+        )
+        if terminalized.get("state") != "cancelled":
+            raise RuntimeError(
+                "runtime-refresh undispatched task did not terminalize; journal retained"
+            )
+        with _database_connection() as final_connection:
+            final_connection.execute("BEGIN IMMEDIATE")
+            row = final_connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (_runtime_refresh_prelaunch_journal_key(task_id),),
+            ).fetchone()
+            if row is None:
+                final_connection.rollback()
+                raise RuntimeError(
+                    "runtime-refresh undispatched recovery journal disappeared"
+                )
+            try:
+                observed_journal = _normalize_runtime_refresh_prelaunch_binding_journal(
+                    json.loads(row["value"])
+                )
+            except (json.JSONDecodeError, TypeError, RuntimeError, ValueError) as exc:
+                final_connection.rollback()
+                raise RuntimeError(
+                    "runtime-refresh undispatched recovery journal changed"
+                ) from exc
+            current_row = final_connection.execute(
+                "SELECT task_id, unit, argv_sha256, state FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if (
+                observed_journal["journal_sha256"] != journal["journal_sha256"]
+                or current_row is None
+                or current_row["task_id"] != journal["task_id"]
+                or current_row["unit"] != journal["executor_unit"]
+                or current_row["argv_sha256"] != journal["argv_sha256"]
+                or current_row["state"] != "cancelled"
+            ):
+                final_connection.rollback()
+                raise RuntimeError(
+                    "runtime-refresh undispatched recovery identity drifted; "
+                    "journal retained"
+                )
+            _delete_runtime_refresh_prelaunch_binding_journal(
+                final_connection, observed_journal
+            )
+            final_connection.commit()
+        recovered.append(
+            {
+                "task_id": task_id,
+                "journal_sha256": journal["journal_sha256"],
+                "plan_sha256": journal["binding_plan"]["plan_sha256"],
+                "action": "undispatched_cancelled",
+                "lease_recovery_action": pending["lease_recovery_action"],
+                "dispatch_evidence_sha256": dispatch_evidence["evidence_sha256"],
+                "lifecycle_receipt_sha256": terminalized.get(
+                    "lifecycle_receipt_sha256"
+                ),
+            }
+        )
+
     material = {
         "schema_version": 1,
         "kind": "grabowski_bureau_runtime_refresh_prelaunch_recovery",
@@ -2283,7 +2490,6 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
         "retained_task_ids": retained,
     }
     return {**material, "recovery_sha256": _sha256_json(material)}
-
 
 def _validate_cwd(host: str, raw: str | None) -> str:
     candidate = str(operator.HOME) if raw is None else raw
@@ -7498,6 +7704,50 @@ def grabowski_task_start(
                 _task_unit(task_id, 1),
             )
         )
+    executor_prelaunch_recovery: dict[str, Any] | None = None
+    if executor_request is not None:
+        operator._require_operator_mutation(
+            "durable_job",
+            path=working_directory,
+            repo=working_directory,
+            task_id=task_id,
+            owner_id=_lease_owner(task_id),
+            host=host,
+            opaque_command=True,
+        )
+        if executor_lease_binding_request is None:
+            raise RuntimeError(
+                "Bureau runtime-refresh executor lost validated prelaunch authority"
+            )
+        recovery_executor_intent = (
+            bureau_runtime_refresh_executor.load_bound_intent(executor_request)
+        )
+        recovery_executor_authority_contract = (
+            bureau_runtime_refresh_executor.validate_authority_execution_contract(
+                recovery_executor_intent
+            )
+        )
+        recovery_executor_lease_binding_request = (
+            _runtime_refresh_prelaunch_lease_binding_request(
+                executor_request,
+                recovery_executor_intent,
+                recovery_executor_authority_contract,
+                task_id,
+                _task_unit(task_id, 1),
+            )
+        )
+        if recovery_executor_lease_binding_request != executor_lease_binding_request:
+            raise RuntimeError(
+                "Bureau runtime-refresh prelaunch authority changed before recovery"
+            )
+        executor_intent = recovery_executor_intent
+        executor_authority_contract = recovery_executor_authority_contract
+        executor_lease_binding_request = recovery_executor_lease_binding_request
+        executor_prelaunch_recovery = (
+            _reconcile_runtime_refresh_prelaunch_binding_journals(
+                executor_lease_binding_request["resource_keys"]
+            )
+        )
     normalized_operation_identity = _normalize_task_operation_identity(
         (
             bureau_runtime_refresh_executor.operation_identity(
@@ -7648,41 +7898,6 @@ def grabowski_task_start(
         host=host,
         opaque_command=True,
     )
-    executor_prelaunch_recovery: dict[str, Any] | None = None
-    if executor_request is not None:
-        if executor_lease_binding_request is None:
-            raise RuntimeError(
-                "Bureau runtime-refresh executor lost validated prelaunch authority"
-            )
-        recovery_executor_intent = (
-            bureau_runtime_refresh_executor.load_bound_intent(executor_request)
-        )
-        recovery_executor_authority_contract = (
-            bureau_runtime_refresh_executor.validate_authority_execution_contract(
-                recovery_executor_intent
-            )
-        )
-        recovery_executor_lease_binding_request = (
-            _runtime_refresh_prelaunch_lease_binding_request(
-                executor_request,
-                recovery_executor_intent,
-                recovery_executor_authority_contract,
-                task_id,
-                _task_unit(task_id, 1),
-            )
-        )
-        if recovery_executor_lease_binding_request != executor_lease_binding_request:
-            raise RuntimeError(
-                "Bureau runtime-refresh prelaunch authority changed before recovery"
-            )
-        executor_intent = recovery_executor_intent
-        executor_authority_contract = recovery_executor_authority_contract
-        executor_lease_binding_request = recovery_executor_lease_binding_request
-        executor_prelaunch_recovery = (
-            _reconcile_runtime_refresh_prelaunch_binding_journals(
-                executor_lease_binding_request["resource_keys"]
-            )
-        )
     unprepared_identity = _task_execution_identity(
         host=host,
         argv_sha256=command_identity.argv_sha256(command),
@@ -8546,10 +8761,21 @@ def grabowski_task_start(
                     f"executor lease binding retained ({executor_record_state})"
                 ) from exc
             if executor_compensation_error is not None:
-                raise RuntimeError(
+                compensation_detail = (
+                    f"{type(executor_compensation_error).__name__}: "
+                    f"{_redact_reason(str(executor_compensation_error))[:512]}"
+                )
+                failure = RuntimeError(
                     "Bureau runtime-refresh task start failed before persistence and exact "
-                    "executor lease compensation failed; reconciliation is required"
-                ) from executor_compensation_error
+                    "executor lease compensation failed; reconciliation is required; "
+                    f"compensation_error={compensation_detail}"
+                )
+                if hasattr(failure, "add_note"):
+                    failure.add_note(
+                        "secondary executor lease compensation failure: "
+                        + compensation_detail
+                    )
+                raise failure from exc
         raise
     launcher = {
         **_launch(record),

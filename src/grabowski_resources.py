@@ -5773,7 +5773,18 @@ def _runtime_refresh_executor_unit(value: Any) -> str:
 def _runtime_refresh_executor_lease_snapshot(
     row: sqlite3.Row | dict[str, Any],
 ) -> dict[str, Any]:
-    return _public(row)
+    # Keep durable crash-recovery evidence independent from future additions
+    # to the general public lease projection.
+    return {
+        "resource_key": row["resource_key"],
+        "owner_id": row["owner_id"],
+        "purpose": row["purpose"],
+        "acquired_at_unix": row["acquired_at_unix"],
+        "updated_at_unix": row["updated_at_unix"],
+        "expires_at_unix": row["expires_at_unix"],
+        "metadata_sha256": row["metadata_sha256"],
+        "reclaimed_from_owner": row["reclaimed_from_owner"],
+    }
 
 
 def _normalize_runtime_refresh_executor_snapshots(
@@ -6122,11 +6133,15 @@ def restore_runtime_refresh_executor_lease_binding_plan(plan: dict[str, Any]) ->
             for key in keys:
                 metadata_json, metadata_sha256 = restored_metadata_by_key[key]
                 original = original_by_key[key]
+                expected_current = bound_by_key[key]
                 updated = connection.execute(
                     """
                     UPDATE leases
                     SET updated_at_unix=?, metadata_sha256=?, metadata_json=?
                     WHERE resource_key=? AND owner_id=?
+                      AND purpose=? AND acquired_at_unix=? AND updated_at_unix=?
+                      AND expires_at_unix=? AND metadata_sha256=?
+                      AND reclaimed_from_owner IS ?
                     """,
                     (
                         original["updated_at_unix"],
@@ -6134,6 +6149,12 @@ def restore_runtime_refresh_executor_lease_binding_plan(plan: dict[str, Any]) ->
                         metadata_json,
                         key,
                         owner,
+                        expected_current["purpose"],
+                        expected_current["acquired_at_unix"],
+                        expected_current["updated_at_unix"],
+                        expected_current["expires_at_unix"],
+                        expected_current["metadata_sha256"],
+                        expected_current["reclaimed_from_owner"],
                     ),
                 )
                 if updated.rowcount != 1:
@@ -6279,16 +6300,33 @@ def bind_runtime_refresh_executor_leases(
                 originals.append(original)
                 metadata_by_key[key] = metadata
 
+            original_by_key = {item["resource_key"]: item for item in originals}
             for key in keys:
                 overlaid = {**metadata_by_key[key], "executor_unit": unit}
                 metadata_json, metadata_sha256 = _metadata(overlaid)
+                expected_current = original_by_key[key]
                 updated = connection.execute(
                     """
                     UPDATE leases
                     SET updated_at_unix=?, metadata_sha256=?, metadata_json=?
                     WHERE resource_key=? AND owner_id=?
+                      AND purpose=? AND acquired_at_unix=? AND updated_at_unix=?
+                      AND expires_at_unix=? AND metadata_sha256=?
+                      AND reclaimed_from_owner IS ?
                     """,
-                    (now, metadata_sha256, metadata_json, key, owner),
+                    (
+                        now,
+                        metadata_sha256,
+                        metadata_json,
+                        key,
+                        owner,
+                        expected_current["purpose"],
+                        expected_current["acquired_at_unix"],
+                        expected_current["updated_at_unix"],
+                        expected_current["expires_at_unix"],
+                        expected_current["metadata_sha256"],
+                        expected_current["reclaimed_from_owner"],
+                    ),
                 )
                 if updated.rowcount != 1:
                     raise RuntimeError(
@@ -6299,7 +6337,6 @@ def bind_runtime_refresh_executor_leases(
                 keys,
             ).fetchall()
             bound = [_runtime_refresh_executor_lease_snapshot(row) for row in bound_rows]
-            original_by_key = {item["resource_key"]: item for item in originals}
             for row, snapshot in zip(bound_rows, bound, strict=True):
                 key = snapshot["resource_key"]
                 original = original_by_key[key]
@@ -6346,6 +6383,7 @@ def bind_runtime_refresh_executor_leases(
         **material,
         "binding_sha256": _runtime_refresh_executor_binding_sha256(material),
     }
+
 
 def unbind_runtime_refresh_executor_leases(binding: dict[str, Any]) -> dict[str, Any]:
     """Undo one exact pre-taskrecord executor binding and nothing else."""
@@ -6435,11 +6473,15 @@ def unbind_runtime_refresh_executor_leases(binding: dict[str, Any]) -> dict[str,
             for key in keys:
                 metadata_json, metadata_sha256 = restored_metadata_by_key[key]
                 original = original_by_key[key]
+                expected_current = bound_by_key[key]
                 updated = connection.execute(
                     """
                     UPDATE leases
                     SET updated_at_unix=?, metadata_sha256=?, metadata_json=?
                     WHERE resource_key=? AND owner_id=?
+                      AND purpose=? AND acquired_at_unix=? AND updated_at_unix=?
+                      AND expires_at_unix=? AND metadata_sha256=?
+                      AND reclaimed_from_owner IS ?
                     """,
                     (
                         original["updated_at_unix"],
@@ -6447,6 +6489,12 @@ def unbind_runtime_refresh_executor_leases(binding: dict[str, Any]) -> dict[str,
                         metadata_json,
                         key,
                         owner,
+                        expected_current["purpose"],
+                        expected_current["acquired_at_unix"],
+                        expected_current["updated_at_unix"],
+                        expected_current["expires_at_unix"],
+                        expected_current["metadata_sha256"],
+                        expected_current["reclaimed_from_owner"],
                     ),
                 )
                 if updated.rowcount != 1:
