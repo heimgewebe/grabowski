@@ -1621,18 +1621,38 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             service_unit,
         )
         self.assertNotIn("BindReadOnlyPaths=-/home/alex/repos\n", service_unit)
+        lexical_only = set(privileged.PROCESS_REFERENCE_LEXICAL_ROOTS)
         for path in privileged.PROCESS_REFERENCE_ALLOWED_ROOTS:
-            self.assertIn(f"BindReadOnlyPaths=-{path}", service_unit)
-            self.assertIn(f"BindReadOnlyPaths=-{path}", recovery_dropin)
+            if path in lexical_only:
+                self.assertNotIn(f"BindReadOnlyPaths=-{path}", service_unit)
+                self.assertNotIn(f"BindReadOnlyPaths=-{path}", recovery_dropin)
+            else:
+                self.assertIn(f"BindReadOnlyPaths=-{path}", service_unit)
+                self.assertIn(f"BindReadOnlyPaths=-{path}", recovery_dropin)
         self.assertIn("BindReadOnlyPaths=\n", recovery_dropin)
         self.assertNotIn("BindReadOnlyPaths=-/home/alex/repos\n", recovery_dropin)
         self.assertNotIn("BindPaths=/home/alex", service_unit)
+        other_path_directives = (
+            "BindPaths=",
+            "ReadOnlyPaths=",
+            "ReadWritePaths=",
+            "InaccessiblePaths=",
+            "ExecPaths=",
+            "NoExecPaths=",
+            "TemporaryFileSystem=",
+        )
+        for artifact in (service_unit, recovery_dropin):
+            for line in artifact.splitlines():
+                if line.startswith(other_path_directives) and "/home/alex" in line:
+                    self.fail(f"unexpected home path-widening directive: {line}")
         self.assertNotIn("ProtectHome=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
         self.assertNotIn("SuccessExitStatus=", service_unit)
 
     def test_process_reference_root_contract_stays_synchronized(self) -> None:
         expected = tuple(str(path) for path in privileged.PROCESS_REFERENCE_ALLOWED_ROOTS)
+        lexical_only = tuple(str(path) for path in privileged.PROCESS_REFERENCE_LEXICAL_ROOTS)
+        mounted = tuple(root for root in expected if root not in lexical_only)
 
         def string_tuple(path: Path, name: str, *, wrapped_in_path: bool = False) -> tuple[str, ...]:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -1666,33 +1686,72 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             "ALLOWED_ROOTS",
             wrapped_in_path=True,
         )
+        observer_lexical_roots = string_tuple(
+            ROOT / "tools" / "grabowski_process_reference_observer.py",
+            "LEXICAL_ONLY_ROOTS",
+            wrapped_in_path=True,
+        )
         cutover_roots = string_tuple(
             ROOT / "tools" / "grabowski_rootbroker_cutover.py",
             "PROCESS_OBSERVER_BIND_PATHS",
         )
+        service_text = (ROOT / "systemd" / "grabowski-privileged-broker@.service").read_text(encoding="utf-8")
+        recovery_text = (
+            ROOT / "systemd" / "grabowski-privileged-broker@.service.d" / "recovery-source.conf"
+        ).read_text(encoding="utf-8")
         service_bind_roots = tuple(
             line.removeprefix("BindReadOnlyPaths=-")
-            for line in (ROOT / "systemd" / "grabowski-privileged-broker@.service")
-            .read_text(encoding="utf-8")
-            .splitlines()
-            if line.startswith("BindReadOnlyPaths=-/home/alex/repos/")
-            or line == "BindReadOnlyPaths=-/home/alex/worktrees"
+            for line in service_text.splitlines()
+            if line.startswith("BindReadOnlyPaths=-/home/alex/")
+        )
+        recovery_optional_bind_roots = tuple(
+            line.removeprefix("BindReadOnlyPaths=-")
+            for line in recovery_text.splitlines()
+            if line.startswith("BindReadOnlyPaths=-/home/alex/")
+        )
+        recovery_mandatory_bind_roots = tuple(
+            line.removeprefix("BindReadOnlyPaths=")
+            for line in recovery_text.splitlines()
+            if line.startswith("BindReadOnlyPaths=/home/alex/")
         )
         automatic_cutover_roots = string_tuple(
             ROOT / "tools" / "grabowski_rootbroker_cutover.py",
             "AUTOMATIC_CUTOVER_BIND_PATHS",
         )
-        service_process_observer_roots = tuple(
-            root for root in service_bind_roots if root not in automatic_cutover_roots
-        )
+        recovery_source = "/home/alex/.local/state/grabowski/recovery/last-server-recovery.json"
+        legacy_kill_switch = "/home/alex/.local/state/grabowski/operator-kill-switch"
+        automatic_repo = "/home/alex/repos/grabowski"
+        expected_service_binds = tuple(sorted((recovery_source, legacy_kill_switch, automatic_repo, *mounted)))
+        expected_recovery_optional = tuple(sorted((legacy_kill_switch, automatic_repo, *mounted)))
 
         self.assertEqual(observer_roots, expected)
-        self.assertEqual(cutover_roots, expected)
-        self.assertEqual(service_process_observer_roots, expected)
-        self.assertEqual(automatic_cutover_roots, ("/home/alex/repos/grabowski",))
-        self.assertIn("/home/alex/repos/grabowski", service_bind_roots)
-        self.assertNotIn("/home/alex/repos/grabowski", expected)
+        self.assertEqual(observer_lexical_roots, lexical_only)
+        self.assertEqual(cutover_roots, mounted)
+        self.assertEqual(tuple(sorted(service_bind_roots)), expected_service_binds)
+        self.assertEqual(tuple(sorted(recovery_optional_bind_roots)), expected_recovery_optional)
+        self.assertEqual(recovery_mandatory_bind_roots, (recovery_source,))
+        self.assertEqual(automatic_cutover_roots, (automatic_repo,))
+        self.assertTrue(set(lexical_only).isdisjoint(service_bind_roots))
+        self.assertTrue(set(lexical_only).isdisjoint(recovery_optional_bind_roots))
+        self.assertNotIn(automatic_repo, expected)
         self.assertNotIn("/home/alex/repos", expected)
+
+    def test_process_reference_lexical_root_is_exact_on_client_side(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="privileged-lexical-root-") as directory:
+            root = Path(directory)
+            child = root / "child"
+            child.mkdir()
+            with patch.object(
+                privileged, "PROCESS_REFERENCE_ALLOWED_ROOTS", (root,)
+            ), patch.object(
+                privileged, "PROCESS_REFERENCE_LEXICAL_ROOTS", (root,)
+            ):
+                self.assertEqual(
+                    privileged._normalize_process_reference_roots([str(root)]),
+                    [str(root)],
+                )
+                with self.assertRaisesRegex(ValueError, "outside the allowed prefixes"):
+                    privileged._normalize_process_reference_roots([str(child)])
 
     def test_broker_script_uses_utf8_audit_hash_and_process_group_timeout(self) -> None:
         broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
