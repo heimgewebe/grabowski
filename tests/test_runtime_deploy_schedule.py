@@ -439,6 +439,9 @@ class _FakeProductionRuntime:
     def verify_green(self):
         return self._step("verify_green", {"ready": True})
 
+    def prepare_agent_instruction_transition(self):
+        return self._step("instruction_transition", None)
+
     def prepare_platform_publication(self):
         return self._step(
             "platform_publication",
@@ -568,6 +571,13 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
     def test_platform_publication_failure_is_pre_switch_and_rolls_back(self) -> None:
         runtime = _FakeProductionRuntime(fail_phase="platform_publication")
+        result = self._run(runtime)
+        self.assertEqual(result["outcome"], "rolled_back")
+        self.assertEqual(runtime.rollback_calls, 1)
+        self.assertFalse(runtime.connector_switched)
+
+    def test_instruction_transition_failure_is_pre_switch_and_rolls_back(self) -> None:
+        runtime = _FakeProductionRuntime(fail_phase="instruction_transition")
         result = self._run(runtime)
         self.assertEqual(result["outcome"], "rolled_back")
         self.assertEqual(runtime.rollback_calls, 1)
@@ -983,7 +993,7 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
         self.assertEqual(runtime.snapshot_rebind_mode, "external_client")
         self.assertEqual(runtime.source_complete_schema_sha256, COMPLETE_SCHEMA_SHA256)
 
-    def test_changed_agent_instructions_still_block_before_snapshot_selection(self) -> None:
+    def test_changed_agent_instructions_defer_to_green_bound_transition_preflight(self) -> None:
         snapshot = mock.Mock()
         snapshot.repo_head = HEAD_GREEN
         snapshot.contract = mock.Mock(expected_tools=["grabowski_status"])
@@ -1003,6 +1013,24 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             "selector_sha256": "8a" * 32,
             "runtime_binding": blue_binding,
             "runtime_binding_sha256": "8b" * 32,
+        }
+        blue_status = {
+            "state": "matched",
+            "external_client_snapshot_observable": True,
+            "external_client_schema_observable": True,
+            "external_client_complete_schema_observable": True,
+            "external_client_complete_schema_count": 1,
+            "external_client_complete_schema_sha256": COMPLETE_SCHEMA_SHA256,
+            "server_loopback_observable": False,
+            "server_loopback_schema_observable": False,
+            "server_loopback_schema_contract_matches": False,
+            "server_loopback_complete_schema_observable": False,
+            "server_loopback_complete_schema_count": None,
+            "server_loopback_complete_schema_sha256": None,
+            "client_observed_release_id": "blue",
+            "receipt_sha256": "9c" * 32,
+            "client_declaration_sha256": "9d" * 32,
+            "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
         }
         with (
             mock.patch.object(
@@ -1032,20 +1060,67 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             mock.patch.object(dual.core, "build_release", return_value=build),
             mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
             mock.patch.object(dual.core, "verify_manifest"),
-            mock.patch.object(dual.client_snapshot, "snapshot_status") as status,
+            mock.patch.object(
+                dual.client_snapshot, "snapshot_status", return_value=blue_status
+            ) as status,
+        ):
+            runtime = dual.prepare_production_blue_green_runtime(
+                ROOT,
+                Path("/runtime"),
+                Path("/profile.json"),
+                expected_head=HEAD_GREEN,
+                cutover_id="cutover-instruction-drift",
+                timeout_seconds=10,
+                deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+            )
+        status.assert_called_once_with(
+            expected_tool_count=1,
+            expected_names_sha256=blue_binding["registered_names_sha256"],
+            expected_release_id=blue_binding["release_id"],
+            expected_repo_head=blue_binding["repo_head"],
+            expected_agent_instructions_sha256=blue_binding["agent_instructions_sha256"],
+        )
+        self.assertEqual(runtime.green_binding, green_binding)
+        self.assertEqual(
+            runtime.deployment_source_identity_sha256, SOURCE_IDENTITY_SHA256
+        )
+
+    def test_instruction_transition_preflight_rejects_deployment_source_identity_drift(self) -> None:
+        snapshot = mock.Mock()
+        build = mock.Mock(release_id="green")
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(steps=[]),
+            blue_manifest={"entrypoint_contract": {"expected_tools": ["grabowski_status"]}},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding={
+                **runtime_binding("green", HEAD_GREEN),
+                "agent_instructions_sha256": "7c" * 32,
+            },
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-source-drift",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
+        )
+        runtime.green_readiness = {
+            "ready": True,
+            "release_id": "green",
+            "repo_head": HEAD_GREEN,
+            "agent_instructions_sha256": "7c" * 32,
+        }
+        with mock.patch.object(
+            dual, "_deployment_source_identity_sha256", return_value="79" * 32
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "changed green agent instructions"
+                RuntimeError, "Deployment source identity does not bind"
             ):
-                dual.prepare_production_blue_green_runtime(
-                    ROOT,
-                    Path("/runtime"),
-                    Path("/profile.json"),
-                    expected_head=HEAD_GREEN,
-                    cutover_id="cutover-instruction-drift",
-                    timeout_seconds=10,
-                )
-        status.assert_not_called()
+                runtime.prepare_agent_instruction_transition()
+        self.assertFalse(runtime.connector_switched)
+        self.assertIsNone(runtime.agent_instruction_transition)
 
     def test_publication_rollback_reconstructs_blue_contract_with_blue_tool_count(self) -> None:
         snapshot = mock.Mock()
