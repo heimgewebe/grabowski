@@ -1847,6 +1847,76 @@ def _task_unit(task_id: str, attempt: int) -> str:
     return f"grabowski-task-{task_id}-a{attempt}.service"
 
 
+BUREAU_RUNTIME_REFRESH_PRELAUNCH_MIN_REMAINING_SECONDS = 600
+
+
+def _runtime_refresh_prelaunch_lease_binding_request(
+    request: dict[str, str],
+    intent: dict[str, Any],
+    task_id: str,
+    unit: str,
+) -> dict[str, Any]:
+    bureau_runtime_refresh_executor.task_identity_environment(task_id, unit)
+    expected_intent = request.get("expected_intent_sha256")
+    if (
+        not isinstance(expected_intent, str)
+        or bureau_runtime_refresh_executor.SHA256_RE.fullmatch(expected_intent) is None
+        or intent.get("intent_sha256") != expected_intent
+    ):
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch intent identity differs from the request"
+        )
+    observed_intent = bureau_runtime_refresh_executor._bureau_payload_digest(
+        intent, "intent_sha256"
+    )
+    if observed_intent != expected_intent:
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch intent digest no longer matches its payload"
+        )
+    lease_task_id = request.get("lease_task_id")
+    if not isinstance(lease_task_id, str) or intent.get("approval_task_id") != lease_task_id:
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch authority task differs from the intent"
+        )
+    lease_owner = request.get("lease_owner")
+    if (
+        not isinstance(lease_owner, str)
+        or bureau_runtime_refresh_executor.OWNER_RE.fullmatch(lease_owner) is None
+    ):
+        raise ValueError("Bureau runtime-refresh prelaunch lease owner is invalid")
+    raw_keys = intent.get("required_resource_keys")
+    if (
+        not isinstance(raw_keys, list)
+        or not raw_keys
+        or not all(isinstance(item, str) for item in raw_keys)
+    ):
+        raise ValueError("Bureau runtime-refresh prelaunch resource keys are invalid")
+    try:
+        canonical_keys = resources.normalize_resource_keys(raw_keys)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch resource keys are invalid"
+        ) from exc
+    if raw_keys != canonical_keys:
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch resource keys are not canonical"
+        )
+    material: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_runtime_refresh_prelaunch_lease_binding_request",
+        "intent_sha256": expected_intent,
+        "lease_owner": lease_owner,
+        "lease_task_id": lease_task_id,
+        "task_id": task_id,
+        "executor_unit": unit,
+        "resource_keys": canonical_keys,
+        "minimum_remaining_seconds": (
+            BUREAU_RUNTIME_REFRESH_PRELAUNCH_MIN_REMAINING_SECONDS
+        ),
+    }
+    return {**material, "request_sha256": _sha256_json(material)}
+
+
 def _validate_cwd(host: str, raw: str | None) -> str:
     candidate = str(operator.HOME) if raw is None else raw
     if not isinstance(candidate, str) or not candidate.startswith("/"):
@@ -6984,6 +7054,10 @@ def grabowski_task_start(
             raise ValueError("Bureau runtime-refresh executor requires resume_policy=never")
         if operation_identity is not None:
             raise ValueError("Bureau runtime-refresh executor operation_identity is server-owned")
+        if resource_keys is not None:
+            raise ValueError(
+                "resource_keys are server-owned by the bound Bureau runtime-refresh intent"
+            )
         executor_request = bureau_runtime_refresh_executor.parse_reserved_task_request(argv)
         executor_intent = bureau_runtime_refresh_executor.load_bound_intent(executor_request)
         executor_authority_contract = (
@@ -7804,6 +7878,9 @@ def grabowski_task_start(
         if target["transport"] == "local" and execution_backend == "systemd-user"
         else None
     )
+    executor_lease_binding_request: dict[str, Any] | None = None
+    executor_lease_binding: dict[str, Any] | None = None
+    executor_lease_binding_evidence: dict[str, Any] | None = None
     record = {
         "task_id": task_id,
         "host": host,
@@ -7882,6 +7959,48 @@ def grabowski_task_start(
         ),
     }
     try:
+        if executor_request is not None:
+            if executor_intent is None:
+                raise RuntimeError(
+                    "Bureau runtime-refresh executor intent vanished before prelaunch binding"
+                )
+            executor_lease_binding_request = (
+                _runtime_refresh_prelaunch_lease_binding_request(
+                    executor_request, executor_intent, task_id, unit
+                )
+            )
+            executor_lease_binding = resources.bind_runtime_refresh_executor_leases(
+                executor_lease_binding_request["lease_owner"],
+                executor_lease_binding_request["resource_keys"],
+                executor_lease_binding_request["executor_unit"],
+                minimum_remaining_seconds=executor_lease_binding_request[
+                    "minimum_remaining_seconds"
+                ],
+            )
+            binding_evidence_material = {
+                "schema_version": 1,
+                "kind": "grabowski_bureau_runtime_refresh_prelaunch_lease_binding",
+                "intent_sha256": executor_lease_binding_request["intent_sha256"],
+                "request_sha256": executor_lease_binding_request["request_sha256"],
+                "binding_sha256": executor_lease_binding["binding_sha256"],
+                "executor_unit": unit,
+                "resource_count": len(executor_lease_binding_request["resource_keys"]),
+                "resource_keys_sha256": _sha256_json(
+                    executor_lease_binding_request["resource_keys"]
+                ),
+                "minimum_remaining_seconds": executor_lease_binding_request[
+                    "minimum_remaining_seconds"
+                ],
+            }
+            executor_lease_binding_evidence = {
+                **binding_evidence_material,
+                "evidence_sha256": _sha256_json(binding_evidence_material),
+            }
+            initial_launcher = json.loads(record["launcher_json"])
+            initial_launcher["runtime_refresh_executor_lease_binding"] = dict(
+                executor_lease_binding_evidence
+            )
+            record["launcher_json"] = _canonical_json(initial_launcher)
         if task_output_managed_from_attempt is not None:
             _ensure_local_task_output_root()
         with _database_connection() as connection:
@@ -7911,7 +8030,35 @@ def grabowski_task_start(
             )
             _register_task_reconcile_sequence(connection, task_id)
             connection.commit()
-    except Exception:
+    except Exception as exc:
+        executor_record_state = "not_applicable"
+        executor_compensation_error: Exception | None = None
+        if executor_lease_binding is not None:
+            try:
+                observed_record = _row_raw(task_id)
+            except ValueError as readback_error:
+                if str(readback_error) == f"Unknown task: {task_id}":
+                    executor_record_state = "absent"
+                else:
+                    executor_record_state = "readback_unknown"
+            except Exception:
+                executor_record_state = "readback_unknown"
+            else:
+                if (
+                    observed_record.get("task_id") == task_id
+                    and observed_record.get("unit") == unit
+                    and observed_record.get("argv_sha256") == record["argv_sha256"]
+                ):
+                    executor_record_state = "present_exact"
+                else:
+                    executor_record_state = "present_mismatch"
+            if executor_record_state == "absent":
+                try:
+                    resources.unbind_runtime_refresh_executor_leases(
+                        executor_lease_binding
+                    )
+                except Exception as compensation_error:
+                    executor_compensation_error = compensation_error
         if task_resources and lease_result is not None:
             resources.release_resources(
                 lease_owner,
@@ -7921,6 +8068,17 @@ def grabowski_task_start(
                     for item in lease_result["leases"]
                 ],
             )
+        if executor_lease_binding is not None:
+            if executor_record_state != "absent":
+                raise RuntimeError(
+                    "Bureau runtime-refresh task record persistence requires reconciliation; "
+                    f"executor lease binding retained ({executor_record_state})"
+                ) from exc
+            if executor_compensation_error is not None:
+                raise RuntimeError(
+                    "Bureau runtime-refresh task start failed before persistence and exact "
+                    "executor lease compensation failed; reconciliation is required"
+                ) from executor_compensation_error
         raise
     launcher = {
         **_launch(record),
@@ -7931,6 +8089,13 @@ def grabowski_task_start(
             else {}
         ),
     }
+    if executor_lease_binding_evidence is not None:
+        launcher = {
+            **launcher,
+            "runtime_refresh_executor_lease_binding": dict(
+                executor_lease_binding_evidence
+            ),
+        }
     if retry_binding is not None:
         launcher = {**launcher, "retry_binding": dict(retry_binding)}
     if normalized_operation_identity is not None:
@@ -7998,6 +8163,7 @@ def grabowski_task_start(
             lease_result["expires_at_unix"] if lease_result else None
         ),
         "resource_lease_maintenance": lease_maintenance,
+        "runtime_refresh_executor_lease_binding": executor_lease_binding_evidence,
         "routing_shadow_capture": routing_shadow_capture,
         "effect_profile": task_effect_classification["effect_profile"],
         "reposkop_policy": task_effect_classification["reposkop_policy"],
@@ -8061,6 +8227,7 @@ def grabowski_task_start(
         "reposkop_execution_attestation": reposkop_execution_attestation,
         "reposkop_checkout_shadow_before": reposkop_checkout_shadow_before,
         "task_effect_classification": task_effect_classification,
+        "runtime_refresh_executor_lease_binding": executor_lease_binding_evidence,
         "deduplicated_reuse": None,
     }
 

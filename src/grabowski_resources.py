@@ -5761,6 +5761,363 @@ def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str,
     }
 
 
+def _runtime_refresh_executor_unit(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"grabowski-task-[0-9a-f]{24}-a1\.service", value) is None
+    ):
+        raise ValueError("executor_unit must be the canonical Grabowski task unit")
+    return value
+
+
+def _runtime_refresh_executor_lease_snapshot(
+    row: sqlite3.Row | dict[str, Any],
+) -> dict[str, Any]:
+    return _public(row)
+
+
+def _normalize_runtime_refresh_executor_snapshots(
+    value: Any, *, owner_id: str, resource_keys: list[str]
+) -> list[dict[str, Any]]:
+    expected_fields = {
+        "resource_key",
+        "owner_id",
+        "purpose",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+        "reclaimed_from_owner",
+    }
+    if not isinstance(value, list) or len(value) != len(resource_keys):
+        raise ValueError("runtime-refresh lease snapshots do not match resource_keys")
+    snapshots: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != expected_fields:
+            raise ValueError("runtime-refresh lease snapshot is malformed")
+        key = normalize_resource_key(item["resource_key"])
+        if item["owner_id"] != owner_id:
+            raise PermissionError("runtime-refresh lease snapshot belongs to another owner")
+        if not isinstance(item["purpose"], str) or not item["purpose"]:
+            raise ValueError("runtime-refresh lease snapshot purpose is invalid")
+        for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+            if type(item[field]) is not int:
+                raise ValueError(f"runtime-refresh lease snapshot {field} is invalid")
+        if not (
+            item["acquired_at_unix"] <= item["updated_at_unix"]
+            < item["expires_at_unix"]
+        ):
+            raise ValueError("runtime-refresh lease snapshot timestamps are inconsistent")
+        if (
+            not isinstance(item["metadata_sha256"], str)
+            or SHA256_RE.fullmatch(item["metadata_sha256"]) is None
+        ):
+            raise ValueError("runtime-refresh lease snapshot metadata digest is invalid")
+        reclaimed = item["reclaimed_from_owner"]
+        if reclaimed is not None and not isinstance(reclaimed, str):
+            raise ValueError("runtime-refresh lease snapshot reclaim owner is invalid")
+        snapshots.append({**item, "resource_key": key})
+    snapshots.sort(key=lambda item: item["resource_key"])
+    if [item["resource_key"] for item in snapshots] != resource_keys:
+        raise ValueError("runtime-refresh lease snapshots do not match resource_keys")
+    return snapshots
+
+
+def _runtime_refresh_executor_binding_sha256(value: Mapping[str, Any]) -> str:
+    material = dict(value)
+    material.pop("binding_sha256", None)
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def bind_runtime_refresh_executor_leases(
+    owner_id: str,
+    resource_keys: Iterable[str],
+    executor_unit: str,
+    *,
+    minimum_remaining_seconds: int = 600,
+) -> dict[str, Any]:
+    """Bind exact live external refresh leases to one real Grabowski task unit.
+
+    This is a private pre-launch CAS. It never creates, renews, releases or changes
+    ownership of a lease; the only metadata addition is ``executor_unit``.
+    """
+    owner = _owner(owner_id)
+    if isinstance(resource_keys, (str, bytes)):
+        raise ValueError("resource_keys must be a canonical list")
+    raw_keys = list(resource_keys)
+    if not raw_keys:
+        raise ValueError("runtime-refresh executor resource_keys must not be empty")
+    keys = normalize_resource_keys(raw_keys)
+    if raw_keys != keys:
+        raise ValueError("runtime-refresh executor resource_keys are not canonical")
+    unit = _runtime_refresh_executor_unit(executor_unit)
+    if (
+        isinstance(minimum_remaining_seconds, bool)
+        or not isinstance(minimum_remaining_seconds, int)
+        or not MIN_TTL_SECONDS <= minimum_remaining_seconds <= MAX_TTL_SECONDS
+    ):
+        raise ValueError(
+            f"minimum_remaining_seconds must be between {MIN_TTL_SECONDS} and {MAX_TTL_SECONDS}"
+        )
+    now = _now()
+    threshold = now + minimum_remaining_seconds
+    originals: list[dict[str, Any]] = []
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                keys,
+            ).fetchall()
+            existing = {row["resource_key"]: row for row in rows}
+            metadata_by_key: dict[str, dict[str, Any]] = {}
+            for key in keys:
+                row = existing.get(key)
+                if row is None:
+                    raise ResourceLeaseMissing(f"Unknown resource lease: {key}")
+                if row["owner_id"] != owner:
+                    raise PermissionError(f"Resource lease is owned by another owner: {key}")
+                if not isinstance(row["purpose"], str) or not row["purpose"]:
+                    raise RuntimeError(f"Resource lease purpose is invalid: {key}")
+                acquired_at = row["acquired_at_unix"]
+                updated_at = row["updated_at_unix"]
+                expires_at = row["expires_at_unix"]
+                if (
+                    type(acquired_at) is not int
+                    or type(updated_at) is not int
+                    or type(expires_at) is not int
+                    or not acquired_at <= updated_at < expires_at
+                ):
+                    raise RuntimeError(f"Resource lease timestamps are inconsistent: {key}")
+                if expires_at <= threshold:
+                    raise ResourceLeaseExpired(
+                        f"Resource lease expires too soon for runtime refresh: {key}"
+                    )
+                metadata = _row_metadata(row)
+                _, observed_sha256 = _metadata(metadata)
+                if row["metadata_sha256"] != observed_sha256:
+                    raise RuntimeError(
+                        f"Resource lease metadata integrity mismatch: {key}"
+                    )
+                if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in metadata:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor cannot bind a branch-attempt lease: {key}"
+                    )
+                if "executor_unit" in metadata:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor lease is already unit-bound: {key}"
+                    )
+                originals.append(_runtime_refresh_executor_lease_snapshot(row))
+                metadata_by_key[key] = metadata
+
+            for key in keys:
+                overlaid = {**metadata_by_key[key], "executor_unit": unit}
+                metadata_json, metadata_sha256 = _metadata(overlaid)
+                updated = connection.execute(
+                    """
+                    UPDATE leases
+                    SET updated_at_unix=?, metadata_sha256=?, metadata_json=?
+                    WHERE resource_key=? AND owner_id=?
+                    """,
+                    (now, metadata_sha256, metadata_json, key, owner),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor lease bind lost its exact row: {key}"
+                    )
+            bound_rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                keys,
+            ).fetchall()
+            bound = [
+                _runtime_refresh_executor_lease_snapshot(row) for row in bound_rows
+            ]
+            original_by_key = {item["resource_key"]: item for item in originals}
+            for row, snapshot in zip(bound_rows, bound, strict=True):
+                key = snapshot["resource_key"]
+                original = original_by_key[key]
+                if (
+                    snapshot["owner_id"] != original["owner_id"]
+                    or snapshot["purpose"] != original["purpose"]
+                    or snapshot["acquired_at_unix"] != original["acquired_at_unix"]
+                    or snapshot["expires_at_unix"] != original["expires_at_unix"]
+                    or snapshot["reclaimed_from_owner"]
+                    != original["reclaimed_from_owner"]
+                    or snapshot["updated_at_unix"] != now
+                ):
+                    raise RuntimeError(
+                        f"Runtime-refresh executor lease identity drifted during bind: {key}"
+                    )
+                metadata = _row_metadata(row)
+                _, observed_sha256 = _metadata(metadata)
+                if (
+                    row["metadata_sha256"] != observed_sha256
+                    or metadata.get("executor_unit") != unit
+                ):
+                    raise RuntimeError(
+                        f"Runtime-refresh executor lease bind readback failed: {key}"
+                    )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    material: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_refresh_executor_lease_binding",
+        "owner_id": owner,
+        "executor_unit": unit,
+        "resource_keys": keys,
+        "minimum_remaining_seconds": minimum_remaining_seconds,
+        "bound_at_unix": now,
+        "original_leases": originals,
+        "bound_leases": bound,
+    }
+    return {
+        **material,
+        "binding_sha256": _runtime_refresh_executor_binding_sha256(material),
+    }
+
+
+def unbind_runtime_refresh_executor_leases(binding: dict[str, Any]) -> dict[str, Any]:
+    """Undo one exact pre-taskrecord executor binding and nothing else."""
+    if not isinstance(binding, dict):
+        raise ValueError("runtime-refresh executor binding must be an object")
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "owner_id",
+        "executor_unit",
+        "resource_keys",
+        "minimum_remaining_seconds",
+        "bound_at_unix",
+        "original_leases",
+        "bound_leases",
+        "binding_sha256",
+    }
+    if set(binding) != expected_fields:
+        raise ValueError("runtime-refresh executor binding shape is invalid")
+    if (
+        binding.get("schema_version") != 1
+        or binding.get("kind") != "grabowski_runtime_refresh_executor_lease_binding"
+    ):
+        raise ValueError("runtime-refresh executor binding contract is unsupported")
+    observed_digest = binding.get("binding_sha256")
+    if (
+        not isinstance(observed_digest, str)
+        or SHA256_RE.fullmatch(observed_digest) is None
+        or observed_digest != _runtime_refresh_executor_binding_sha256(binding)
+    ):
+        raise ValueError("runtime-refresh executor binding digest is invalid")
+    owner = _owner(binding.get("owner_id"))
+    unit = _runtime_refresh_executor_unit(binding.get("executor_unit"))
+    raw_keys = binding.get("resource_keys")
+    if not isinstance(raw_keys, list) or any(not isinstance(item, str) for item in raw_keys):
+        raise ValueError("runtime-refresh executor binding resource_keys are invalid")
+    keys = normalize_resource_keys(raw_keys)
+    if raw_keys != keys:
+        raise ValueError("runtime-refresh executor binding resource_keys are not canonical")
+    originals = _normalize_runtime_refresh_executor_snapshots(
+        binding.get("original_leases"), owner_id=owner, resource_keys=keys
+    )
+    bound = _normalize_runtime_refresh_executor_snapshots(
+        binding.get("bound_leases"), owner_id=owner, resource_keys=keys
+    )
+    original_by_key = {item["resource_key"]: item for item in originals}
+    bound_by_key = {item["resource_key"]: item for item in bound}
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            placeholders = ",".join("?" for _ in keys)
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                keys,
+            ).fetchall()
+            existing = {row["resource_key"]: row for row in rows}
+            restored_metadata_by_key: dict[str, tuple[str, str]] = {}
+            for key in keys:
+                row = existing.get(key)
+                if row is None:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor lease disappeared before compensation: {key}"
+                    )
+                if _runtime_refresh_executor_lease_snapshot(row) != bound_by_key[key]:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor lease changed before compensation: {key}"
+                    )
+                metadata = _row_metadata(row)
+                _, observed_sha256 = _metadata(metadata)
+                if row["metadata_sha256"] != observed_sha256:
+                    raise RuntimeError(
+                        f"Resource lease metadata integrity mismatch: {key}"
+                    )
+                if metadata.get("executor_unit") != unit:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor unit binding changed before compensation: {key}"
+                    )
+                restored_metadata = dict(metadata)
+                restored_metadata.pop("executor_unit")
+                metadata_json, metadata_sha256 = _metadata(restored_metadata)
+                if metadata_sha256 != original_by_key[key]["metadata_sha256"]:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor lease metadata drifted before compensation: {key}"
+                    )
+                restored_metadata_by_key[key] = (metadata_json, metadata_sha256)
+
+            for key in keys:
+                metadata_json, metadata_sha256 = restored_metadata_by_key[key]
+                original = original_by_key[key]
+                updated = connection.execute(
+                    """
+                    UPDATE leases
+                    SET updated_at_unix=?, metadata_sha256=?, metadata_json=?
+                    WHERE resource_key=? AND owner_id=?
+                    """,
+                    (
+                        original["updated_at_unix"],
+                        metadata_sha256,
+                        metadata_json,
+                        key,
+                        owner,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        f"Runtime-refresh executor compensation lost its exact row: {key}"
+                    )
+            restored_rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                keys,
+            ).fetchall()
+            restored = [
+                _runtime_refresh_executor_lease_snapshot(row) for row in restored_rows
+            ]
+            if restored != originals:
+                raise RuntimeError(
+                    "Runtime-refresh executor lease compensation did not restore the exact snapshots"
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_refresh_executor_lease_compensation",
+        "binding_sha256": observed_digest,
+        "owner_id": owner,
+        "executor_unit": unit,
+        "resource_keys": keys,
+        "restored_leases": restored,
+        "snapshot_guarded": True,
+    }
+    return {
+        **material,
+        "compensation_sha256": hashlib.sha256(
+            _canonical_json(material).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def rebind_same_owner_resources(
     owner_id: str,
     resource_keys: Iterable[str],
