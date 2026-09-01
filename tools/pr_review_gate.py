@@ -100,6 +100,7 @@ DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 # Bootstrap policies are sticky code-owned defaults until a base-side catalog exists.
 BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "heimgewebe/audio": ("safety",),
+    "heimgewebe/chronik": ("repo-root", "templates"),
     "heimgewebe/hauski": ("Detect changes",),
     "heimgewebe/hauski-audio": ("scan",),
     "hall-of-memory/hall-of-memory": ("verify",),
