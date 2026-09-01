@@ -17,11 +17,12 @@ import grabowski_job_origin as job_origin
 HEAD = "a" * 40
 BASE = "b" * 40
 DIFF = "c" * 64
+ALIAS_DIFF = "d" * 64
 REPO = "heimgewebe/vibe-lab"
 PR = 350
 
 
-def binding(slot: str) -> dict:
+def binding(slot: str, *, diff_sha256: str = DIFF) -> dict:
     return {
         "schema_version": 1,
         "kind": reviews.BINDING_KIND,
@@ -29,12 +30,12 @@ def binding(slot: str) -> dict:
         "pr": PR,
         "head_sha": HEAD,
         "base_sha": BASE,
-        "diff_sha256": DIFF,
+        "diff_sha256": diff_sha256,
         "slot": slot,
     }
 
 
-def result(slot: str, verdict: str, findings: int) -> dict:
+def result(slot: str, verdict: str, findings: int, *, diff_sha256: str = DIFF) -> dict:
     return {
         "schema_version": 1,
         "kind": reviews.RESULT_KIND,
@@ -42,7 +43,7 @@ def result(slot: str, verdict: str, findings: int) -> dict:
         "pr": PR,
         "head_sha": HEAD,
         "base_sha": BASE,
-        "diff_sha256": DIFF,
+        "diff_sha256": diff_sha256,
         "slot": slot,
         "verdict": verdict,
         "material_findings": findings,
@@ -61,6 +62,7 @@ def make_job(
     slot: str,
     terminal_status: str | None,
     review_result: dict | None,
+    diff_sha256: str = DIFF,
 ) -> Path:
     unit = f"grabowski-job-{suffix}"
     directory = jobs / unit
@@ -71,7 +73,9 @@ def make_job(
         "cwd": "/tmp/review",
         "argv_sha256": argv_sha,
         "runtime_seconds": 60,
-        "decision_bound_review": reviews.normalize_binding(binding(slot)),
+        "decision_bound_review": reviews.normalize_binding(
+            binding(slot, diff_sha256=diff_sha256)
+        ),
     }
     origin, origin_sha = job_origin.build_origin(
         unit=unit,
@@ -163,6 +167,71 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(reconciled["slot_count"], 2)
         self.assertTrue(reconciled["read_by_merge_guard"])
         self.assertEqual(reconciled["errors"], [])
+
+    def test_unproven_diff_alias_still_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000011",
+                slot="A",
+                terminal_status="succeeded",
+                review_result=result(
+                    "A",
+                    "PASS_THIS_REVISION",
+                    0,
+                    diff_sha256=ALIAS_DIFF,
+                ),
+                diff_sha256=ALIAS_DIFF,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertTrue(
+            any(
+                error.startswith("decision_review_diff_sha256_drift:")
+                for error in reconciled["errors"]
+            )
+        )
+
+    def test_explicit_equivalent_diff_alias_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp)
+            make_job(
+                jobs,
+                suffix="a00000000012",
+                slot="A",
+                terminal_status="succeeded",
+                review_result=result(
+                    "A",
+                    "PASS_THIS_REVISION",
+                    0,
+                    diff_sha256=ALIAS_DIFF,
+                ),
+                diff_sha256=ALIAS_DIFF,
+            )
+            make_job(
+                jobs,
+                suffix="b00000000013",
+                slot="B",
+                terminal_status="succeeded",
+                review_result=result("B", "PASS_THIS_REVISION", 0),
+            )
+            reconciled = reviews.reconcile(
+                repo=REPO,
+                pr=PR,
+                head_sha=HEAD,
+                base_sha=BASE,
+                diff_sha256=DIFF,
+                equivalent_diff_sha256s=[ALIAS_DIFF],
+                jobs_root=jobs,
+            )
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["errors"], [])
+        self.assertEqual(
+            reconciled["accepted_diff_sha256s"],
+            sorted([DIFF, ALIAS_DIFF]),
+        )
+        self.assertEqual(reconciled["slot_count"], 2)
 
     def test_material_reject_blocks_even_when_other_slot_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
