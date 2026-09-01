@@ -5909,5 +5909,397 @@ class ResourceTests(unittest.TestCase):
             resources.inspect_resource(foreign_key)["owner_id"],
         )
 
+    def test_runtime_refresh_executor_bind_and_unbind_restore_exact_leases(self) -> None:
+        owner = "runtime-refresh:test-prelaunch"
+        keys = ["component:runtime-refresh-a", "component:runtime-refresh-b"]
+        metadata = {"approval_task_id": "TASK-RUNTIME", "target_sha256": "a" * 64}
+        acquired = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="runtime refresh prelaunch",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        original = acquired["leases"]
+        unit = "grabowski-task-" + "1" * 24 + "-a1.service"
+
+        binding = resources.bind_runtime_refresh_executor_leases(
+            owner, keys, unit, minimum_remaining_seconds=600
+        )
+
+        self.assertEqual(original, binding["original_leases"])
+        self.assertEqual(unit, binding["executor_unit"])
+        self.assertEqual(sorted(keys), binding["resource_keys"])
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT * FROM leases ORDER BY resource_key"
+            ).fetchall()
+        self.assertEqual(2, len(rows))
+        original_by_key = {item["resource_key"]: item for item in original}
+        for row in rows:
+            before = original_by_key[row["resource_key"]]
+            persisted = json.loads(row["metadata_json"])
+            self.assertEqual({**metadata, "executor_unit": unit}, persisted)
+            self.assertEqual(before["owner_id"], row["owner_id"])
+            self.assertEqual(before["purpose"], row["purpose"])
+            self.assertEqual(before["acquired_at_unix"], row["acquired_at_unix"])
+            self.assertEqual(before["expires_at_unix"], row["expires_at_unix"])
+
+        compensation = resources.unbind_runtime_refresh_executor_leases(binding)
+
+        self.assertTrue(compensation["snapshot_guarded"])
+        self.assertEqual(original, compensation["restored_leases"])
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            restored_rows = connection.execute(
+                "SELECT * FROM leases ORDER BY resource_key"
+            ).fetchall()
+        self.assertEqual(original, [resources._public(row) for row in restored_rows])
+        self.assertEqual(
+            [metadata, metadata],
+            [json.loads(row["metadata_json"]) for row in restored_rows],
+        )
+
+    def test_runtime_refresh_executor_bind_is_atomic_for_missing_owner_and_ttl(self) -> None:
+        owner = "runtime-refresh:test-prelaunch"
+        first = "component:runtime-refresh-first"
+        second = "component:runtime-refresh-second"
+        unit = "grabowski-task-" + "2" * 24 + "-a1.service"
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            resources.bind_runtime_refresh_executor_leases(owner, [], unit)
+        acquired = resources.acquire_resources(
+            owner,
+            [first],
+            purpose="runtime refresh prelaunch",
+            ttl_seconds=1200,
+            metadata={"marker": "original"},
+        )
+        original = acquired["leases"][0]
+        with self.assertRaises(resources.ResourceLeaseMissing):
+            resources.bind_runtime_refresh_executor_leases(owner, [first, second], unit)
+        self.assertEqual(original, resources.inspect_resource(first))
+
+        resources.acquire_resources(
+            "runtime-refresh:foreign",
+            [second],
+            purpose="foreign runtime refresh",
+            ttl_seconds=1200,
+        )
+        with self.assertRaises(PermissionError):
+            resources.bind_runtime_refresh_executor_leases(owner, [first, second], unit)
+        self.assertEqual(original, resources.inspect_resource(first))
+
+        short = "component:runtime-refresh-short"
+        short_acquired = resources.acquire_resources(
+            owner,
+            [short],
+            purpose="short runtime refresh",
+            ttl_seconds=120,
+            metadata={"marker": "short"},
+        )["leases"][0]
+        with self.assertRaises(resources.ResourceLeaseExpired):
+            resources.bind_runtime_refresh_executor_leases(
+                owner, [short], unit, minimum_remaining_seconds=600
+            )
+        self.assertEqual(short_acquired, resources.inspect_resource(short))
+
+    def test_runtime_refresh_executor_bind_rejects_existing_unit_and_branch_attempt(self) -> None:
+        owner = "runtime-refresh:test-prelaunch"
+        unit = "grabowski-task-" + "3" * 24 + "-a1.service"
+        already = "component:runtime-refresh-already-bound"
+        resources.acquire_resources(
+            owner,
+            [already],
+            purpose="already bound runtime refresh",
+            ttl_seconds=1200,
+            metadata={"executor_unit": unit},
+        )
+        with self.assertRaisesRegex(RuntimeError, "already unit-bound"):
+            resources.bind_runtime_refresh_executor_leases(owner, [already], unit)
+
+        branch_key = "component:runtime-refresh-branch-attempt"
+        resources.acquire_resources(
+            owner,
+            [branch_key],
+            purpose="branch attempt shaped lease",
+            ttl_seconds=1200,
+            metadata={resources.BRANCH_MUTATION_ATTEMPT_METADATA_KEY: {"marker": True}},
+        )
+        with self.assertRaisesRegex(RuntimeError, "branch-attempt lease"):
+            resources.bind_runtime_refresh_executor_leases(owner, [branch_key], unit)
+
+    def test_runtime_refresh_executor_unbind_rejects_snapshot_drift(self) -> None:
+        owner = "runtime-refresh:test-prelaunch"
+        key = "component:runtime-refresh-drift"
+        unit = "grabowski-task-" + "4" * 24 + "-a1.service"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh drift",
+            ttl_seconds=1200,
+            metadata={"marker": "stable"},
+        )
+        binding = resources.bind_runtime_refresh_executor_leases(owner, [key], unit)
+        resources.renew_resources(owner, [key], ttl_seconds=1800)
+        with self.assertRaisesRegex(RuntimeError, "changed before compensation"):
+            resources.unbind_runtime_refresh_executor_leases(binding)
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertEqual(unit, json.loads(row[0])["executor_unit"])
+
+    def test_runtime_refresh_executor_bind_has_single_concurrent_winner(self) -> None:
+        owner = "runtime-refresh:test-prelaunch"
+        key = "component:runtime-refresh-race"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh race",
+            ttl_seconds=1200,
+            metadata={"marker": "race"},
+        )
+        units = [
+            "grabowski-task-" + "5" * 24 + "-a1.service",
+            "grabowski-task-" + "6" * 24 + "-a1.service",
+        ]
+        barrier = threading.Barrier(2)
+        outcomes: list[tuple[str, str]] = []
+        lock = threading.Lock()
+
+        def bind(unit: str) -> None:
+            barrier.wait()
+            try:
+                result = resources.bind_runtime_refresh_executor_leases(owner, [key], unit)
+            except Exception as exc:
+                outcome = ("blocked", type(exc).__name__)
+            else:
+                outcome = ("bound", result["executor_unit"])
+            with lock:
+                outcomes.append(outcome)
+
+        threads = [threading.Thread(target=bind, args=(unit,)) for unit in units]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(1, sum(item[0] == "bound" for item in outcomes))
+        self.assertEqual(1, sum(item[0] == "blocked" for item in outcomes))
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIn(json.loads(row[0])["executor_unit"], units)
+
+
+    def test_runtime_refresh_executor_bind_rejects_corrupt_lease_integrity(self) -> None:
+        owner = "runtime-refresh:test-prelaunch"
+        key = "component:runtime-refresh-corrupt"
+        unit = "grabowski-task-" + "7" * 24 + "-a1.service"
+        original = resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh corrupt lease",
+            ttl_seconds=1200,
+            metadata={"marker": "stable"},
+        )["leases"][0]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE leases SET metadata_json=? WHERE resource_key=?",
+                (json.dumps({"marker": "tampered"}), key),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "metadata integrity mismatch"):
+            resources.bind_runtime_refresh_executor_leases(owner, [key], unit)
+        current = resources.inspect_resource(key)
+        self.assertEqual(original["metadata_sha256"], current["metadata_sha256"])
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertEqual({"marker": "tampered"}, json.loads(row[0]))
+
+        with sqlite3.connect(self.database) as connection:
+            metadata_json, metadata_sha256 = resources._metadata({"marker": "stable"})
+            connection.execute(
+                "UPDATE leases SET metadata_json=?, metadata_sha256=?, updated_at_unix=expires_at_unix "
+                "WHERE resource_key=?",
+                (metadata_json, metadata_sha256, key),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "timestamps are inconsistent"):
+            resources.bind_runtime_refresh_executor_leases(owner, [key], unit)
+
+    def test_runtime_refresh_executor_unbind_rejects_tampered_binding_receipt(self) -> None:
+        owner = "runtime-refresh:test-prelaunch"
+        key = "component:runtime-refresh-receipt-tamper"
+        unit = "grabowski-task-" + "8" * 24 + "-a1.service"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh receipt tamper",
+            ttl_seconds=1200,
+            metadata={"marker": "bound"},
+        )
+        binding = resources.bind_runtime_refresh_executor_leases(owner, [key], unit)
+        tampered = dict(binding)
+        tampered["minimum_remaining_seconds"] = 601
+        with self.assertRaisesRegex(ValueError, "binding digest is invalid"):
+            resources.unbind_runtime_refresh_executor_leases(tampered)
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertEqual(unit, json.loads(row[0])["executor_unit"])
+
+
+    def test_runtime_refresh_executor_prepared_binding_is_cas_and_recoverable(self) -> None:
+        owner = "runtime-refresh:test-prepared"
+        keys = ["component:runtime-refresh-prepared-a", "component:runtime-refresh-prepared-b"]
+        unit = "grabowski-task-" + "9" * 24 + "-a1.service"
+        original = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="runtime refresh prepared",
+            ttl_seconds=1200,
+            metadata={"marker": "prepared"},
+        )["leases"]
+
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(
+            owner, keys, unit, minimum_remaining_seconds=600
+        )
+        self.assertEqual(original, plan["original_leases"])
+        self.assertEqual(unit, plan["executor_unit"])
+        self.assertEqual(keys, plan["resource_keys"])
+
+        binding = resources.bind_runtime_refresh_executor_leases(
+            owner,
+            keys,
+            unit,
+            minimum_remaining_seconds=600,
+            prepared_binding=plan,
+        )
+        self.assertEqual(plan["bound_leases"], binding["bound_leases"])
+        self.assertEqual(plan["bind_at_unix"], binding["bound_at_unix"])
+
+        recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(plan)
+        self.assertEqual("restored", recovery["action"])
+        self.assertTrue(recovery["snapshot_guarded"])
+        self.assertEqual(keys, recovery["restored_keys"])
+        self.assertEqual(
+            original,
+            [resources.inspect_resource(key) for key in keys],
+        )
+
+    def test_runtime_refresh_executor_prepared_binding_rejects_prebind_drift(self) -> None:
+        owner = "runtime-refresh:test-prepared-drift"
+        key = "component:runtime-refresh-prepared-drift"
+        unit = "grabowski-task-" + "a" * 24 + "-a1.service"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh prepared drift",
+            ttl_seconds=1200,
+            metadata={"marker": "stable"},
+        )
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(owner, [key], unit)
+        resources.renew_resources(owner, [key], ttl_seconds=1800)
+
+        with self.assertRaisesRegex(RuntimeError, "changed after durable prepare"):
+            resources.bind_runtime_refresh_executor_leases(
+                owner, [key], unit, prepared_binding=plan
+            )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertNotIn("executor_unit", json.loads(row[0]))
+
+    def test_runtime_refresh_executor_prepare_rejects_authority_metadata_mismatch(self) -> None:
+        owner = "runtime-refresh:test-authority-metadata"
+        approval_task_id = "BUREAU-RUNTIME-REFRESH-TEST"
+        intent_sha256 = "d" * 64
+        unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+        cases = (
+            ({"intent_sha256": intent_sha256}, "missing-approval"),
+            (
+                {
+                    "approval_task_id": approval_task_id,
+                    "intent_sha256": "e" * 64,
+                },
+                "wrong-intent",
+            ),
+        )
+        for metadata, suffix in cases:
+            key = f"component:runtime-refresh-authority-{suffix}"
+            original = resources.acquire_resources(
+                owner,
+                [key],
+                purpose="runtime refresh authority metadata",
+                ttl_seconds=1200,
+                metadata=metadata,
+            )["leases"][0]
+            with self.assertRaisesRegex(PermissionError, "authority metadata mismatch"):
+                resources.prepare_runtime_refresh_executor_lease_binding(
+                    owner,
+                    [key],
+                    unit,
+                    expected_approval_task_id=approval_task_id,
+                    expected_intent_sha256=intent_sha256,
+                )
+            self.assertEqual(original, resources.inspect_resource(key))
+            with sqlite3.connect(self.database) as connection:
+                row = connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?",
+                    (key,),
+                ).fetchone()
+            self.assertNotIn("executor_unit", json.loads(row[0]))
+
+    def test_runtime_refresh_executor_plan_recovery_rejects_bound_drift(self) -> None:
+        owner = "runtime-refresh:test-plan-drift"
+        key = "component:runtime-refresh-plan-drift"
+        unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh plan drift",
+            ttl_seconds=1200,
+            metadata={"marker": "stable"},
+        )
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(owner, [key], unit)
+        resources.bind_runtime_refresh_executor_leases(
+            owner, [key], unit, prepared_binding=plan
+        )
+        resources.renew_resources(owner, [key], ttl_seconds=1800)
+
+        with self.assertRaisesRegex(RuntimeError, "changed while still unit-bound"):
+            resources.restore_runtime_refresh_executor_lease_binding_plan(plan)
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertEqual(unit, json.loads(row[0])["executor_unit"])
+
+    def test_runtime_refresh_executor_plan_recovery_is_noop_before_bind(self) -> None:
+        owner = "runtime-refresh:test-plan-noop"
+        key = "component:runtime-refresh-plan-noop"
+        unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+        original = resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh plan noop",
+            ttl_seconds=1200,
+            metadata={"marker": "original"},
+        )["leases"][0]
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(owner, [key], unit)
+
+        recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(plan)
+        self.assertEqual("already_original", recovery["action"])
+        self.assertEqual([], recovery["restored_keys"])
+        self.assertEqual(original, resources.inspect_resource(key))
+
+
 if __name__ == "__main__":
     unittest.main()
