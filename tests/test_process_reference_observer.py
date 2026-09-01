@@ -54,6 +54,12 @@ class ProcessReferenceObserverTests(unittest.TestCase):
             Path("/home/alex/repos/.commonworld-worktrees"),
             Path("/home/alex/repos/.plexer-worktrees"),
             Path("/home/alex/repos/.worktree-target-quarantine"),
+            Path("/home/alex/.cache/heim-pc/managed-builds"),
+            Path("/home/alex/.cache/pip"),
+            Path("/home/alex/.cache/uv"),
+            Path("/home/alex/.cache/ms-playwright"),
+            Path("/home/alex/.local/share/Trash"),
+            Path("/home/alex/.local/share/grabowski-mcp-releases"),
         }
         self.assertEqual(set(observer.ALLOWED_ROOTS), expected)
 

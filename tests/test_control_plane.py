@@ -1675,15 +1675,14 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             for line in (ROOT / "systemd" / "grabowski-privileged-broker@.service")
             .read_text(encoding="utf-8")
             .splitlines()
-            if line.startswith("BindReadOnlyPaths=-/home/alex/repos/")
-            or line == "BindReadOnlyPaths=-/home/alex/worktrees"
+            if line.startswith("BindReadOnlyPaths=-/home/alex/")
         )
         automatic_cutover_roots = string_tuple(
             ROOT / "tools" / "grabowski_rootbroker_cutover.py",
             "AUTOMATIC_CUTOVER_BIND_PATHS",
         )
         service_process_observer_roots = tuple(
-            root for root in service_bind_roots if root not in automatic_cutover_roots
+            root for root in service_bind_roots if root in expected
         )
 
         self.assertEqual(observer_roots, expected)

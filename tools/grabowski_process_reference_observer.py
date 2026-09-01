@@ -45,6 +45,12 @@ ALLOWED_ROOTS = (
     Path("/home/alex/repos/.commonworld-worktrees"),
     Path("/home/alex/repos/.plexer-worktrees"),
     Path("/home/alex/repos/.worktree-target-quarantine"),
+    Path("/home/alex/.cache/heim-pc/managed-builds"),
+    Path("/home/alex/.cache/pip"),
+    Path("/home/alex/.cache/uv"),
+    Path("/home/alex/.cache/ms-playwright"),
+    Path("/home/alex/.local/share/Trash"),
+    Path("/home/alex/.local/share/grabowski-mcp-releases"),
 )
 MAX_ROOTS = 256
 EXPECTED_TARGET_UID = 1000
