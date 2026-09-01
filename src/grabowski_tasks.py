@@ -1853,6 +1853,7 @@ BUREAU_RUNTIME_REFRESH_PRELAUNCH_MIN_REMAINING_SECONDS = 600
 def _runtime_refresh_prelaunch_lease_binding_request(
     request: dict[str, str],
     intent: dict[str, Any],
+    authority_contract: dict[str, Any],
     task_id: str,
     unit: str,
 ) -> dict[str, Any]:
@@ -1878,12 +1879,67 @@ def _runtime_refresh_prelaunch_lease_binding_request(
         raise ValueError(
             "Bureau runtime-refresh prelaunch authority task differs from the intent"
         )
+    intent_authority = intent.get("authority_task_spec")
+    authority_task_id = authority_contract.get("task_id")
+    authority_revision = authority_contract.get("revision")
+    authority_spec_sha256 = authority_contract.get("spec_sha256")
+    if (
+        not isinstance(intent_authority, dict)
+        or authority_task_id != lease_task_id
+        or intent_authority.get("task_id") != lease_task_id
+        or isinstance(authority_revision, bool)
+        or not isinstance(authority_revision, int)
+        or authority_revision < 1
+        or intent_authority.get("revision") != authority_revision
+        or not isinstance(authority_spec_sha256, str)
+        or bureau_runtime_refresh_executor.SHA256_RE.fullmatch(authority_spec_sha256) is None
+        or intent_authority.get("spec_sha256") != authority_spec_sha256
+        or intent_authority.get("state") not in {"ready", "active"}
+    ):
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch authority binding is invalid"
+        )
+    target_sha256 = intent.get("target_sha256")
+    runtime_approval = intent.get("runtime_approval")
+    approval_evidence = (
+        runtime_approval.get("evidence") if isinstance(runtime_approval, dict) else None
+    )
+    approval_scope = (
+        approval_evidence.get("scope") if isinstance(approval_evidence, dict) else None
+    )
+    if (
+        not isinstance(target_sha256, str)
+        or bureau_runtime_refresh_executor.SHA256_RE.fullmatch(target_sha256) is None
+        or not isinstance(runtime_approval, dict)
+        or runtime_approval.get("schema_version") != 1
+        or runtime_approval.get("action_class") != "runtime_mutation"
+        or runtime_approval.get("allowed") is not True
+        or runtime_approval.get("required") is not True
+        or runtime_approval.get("required_level") != "break_glass"
+        or runtime_approval.get("expected_task_id") != lease_task_id
+        or runtime_approval.get("expected_reference") != target_sha256
+        or not isinstance(approval_evidence, dict)
+        or approval_evidence.get("schema_version") != 1
+        or approval_evidence.get("approved") is not True
+        or approval_evidence.get("level") != "break_glass"
+        or approval_evidence.get("task_id") != lease_task_id
+        or approval_evidence.get("reference") != target_sha256
+        or not isinstance(approval_scope, list)
+        or "runtime_mutation" not in approval_scope
+    ):
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch approval binding is invalid"
+        )
     lease_owner = request.get("lease_owner")
+    expected_lease_owner = f"runtime-refresh:{expected_intent[:16]}"
     if (
         not isinstance(lease_owner, str)
         or bureau_runtime_refresh_executor.OWNER_RE.fullmatch(lease_owner) is None
+        or lease_owner != expected_lease_owner
     ):
-        raise ValueError("Bureau runtime-refresh prelaunch lease owner is invalid")
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch lease owner is not intent-bound"
+        )
     raw_keys = intent.get("required_resource_keys")
     if (
         not isinstance(raw_keys, list)
@@ -1901,12 +1957,22 @@ def _runtime_refresh_prelaunch_lease_binding_request(
         raise ValueError(
             "Bureau runtime-refresh prelaunch resource keys are not canonical"
         )
+    if any(
+        key.split(":", 1)[0] not in {"path", "service"}
+        for key in canonical_keys
+    ):
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch contains an unsupported resource kind"
+        )
     material: dict[str, Any] = {
         "schema_version": 1,
         "kind": "grabowski_bureau_runtime_refresh_prelaunch_lease_binding_request",
         "intent_sha256": expected_intent,
+        "target_sha256": target_sha256,
         "lease_owner": lease_owner,
         "lease_task_id": lease_task_id,
+        "authority_revision": authority_revision,
+        "authority_spec_sha256": authority_spec_sha256,
         "task_id": task_id,
         "executor_unit": unit,
         "resource_keys": canonical_keys,
@@ -8203,13 +8269,17 @@ def grabowski_task_start(
     }
     try:
         if executor_request is not None:
-            if executor_intent is None:
+            if executor_intent is None or executor_authority_contract is None:
                 raise RuntimeError(
-                    "Bureau runtime-refresh executor intent vanished before prelaunch binding"
+                    "Bureau runtime-refresh executor authority vanished before prelaunch binding"
                 )
             executor_lease_binding_request = (
                 _runtime_refresh_prelaunch_lease_binding_request(
-                    executor_request, executor_intent, task_id, unit
+                    executor_request,
+                    executor_intent,
+                    executor_authority_contract,
+                    task_id,
+                    unit,
                 )
             )
             executor_lease_binding_plan = (

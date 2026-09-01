@@ -9848,23 +9848,49 @@ class TaskTests(unittest.TestCase):
         self, resource_keys: list[str] | None = None
     ) -> dict[str, object]:
         keys = resource_keys or [
-            "component:runtime-refresh-task-a",
-            "component:runtime-refresh-task-b",
+            f"path:{self.root / 'runtime-refresh-task-a'}",
+            "service:bureau-runtime-refresh-test.service",
         ]
         keys = list(keys)
         approval_task_id = "BUREAU-RUNTIME-REFRESH-TEST"
-        lease_owner = "runtime-refresh:test-task-start"
+        target_sha256 = "a" * 64
+        authority_revision = 1
+        authority_spec_sha256 = "b" * 64
         payload: dict[str, object] = {
             "schema_version": 1,
             "kind": "bureau_runtime_refresh_intent",
             "approval_task_id": approval_task_id,
+            "authority_task_spec": {
+                "task_id": approval_task_id,
+                "revision": authority_revision,
+                "spec_sha256": authority_spec_sha256,
+                "state": "ready",
+            },
+            "runtime_approval": {
+                "schema_version": 1,
+                "action_class": "runtime_mutation",
+                "allowed": True,
+                "required": True,
+                "required_level": "break_glass",
+                "expected_task_id": approval_task_id,
+                "expected_reference": target_sha256,
+                "evidence": {
+                    "schema_version": 1,
+                    "approved": True,
+                    "level": "break_glass",
+                    "task_id": approval_task_id,
+                    "reference": target_sha256,
+                    "scope": ["runtime_mutation"],
+                },
+            },
             "required_resource_keys": keys,
-            "target_sha256": "a" * 64,
+            "target_sha256": target_sha256,
         }
         intent_sha256 = hashlib.sha256(
             (tasks._canonical_json(payload) + "\n").encode("utf-8")
         ).hexdigest()
         intent = {**payload, "intent_sha256": intent_sha256}
+        lease_owner = f"runtime-refresh:{intent_sha256[:16]}"
         request = {
             "intent": str(self.root / "runtime-refresh-intent.json"),
             "expected_intent_sha256": intent_sha256,
@@ -9881,8 +9907,8 @@ class TaskTests(unittest.TestCase):
             "resource_keys": keys,
             "authority": {
                 "task_id": approval_task_id,
-                "task_revision": 1,
-                "task_sha256": "b" * 64,
+                "revision": authority_revision,
+                "spec_sha256": authority_spec_sha256,
             },
         }
 
@@ -9958,7 +9984,7 @@ class TaskTests(unittest.TestCase):
         task_id = "7" * 24
         unit = f"grabowski-task-{task_id}-a1.service"
         request = tasks._runtime_refresh_prelaunch_lease_binding_request(
-            fixture["request"], fixture["intent"], task_id, unit
+            fixture["request"], fixture["intent"], fixture["authority"], task_id, unit
         )
         self.assertEqual(task_id, request["task_id"])
         self.assertEqual(unit, request["executor_unit"])
@@ -9981,10 +10007,14 @@ class TaskTests(unittest.TestCase):
                 (tasks._canonical_json(payload) + "\n").encode("utf-8")
             ).hexdigest()
             bad_intent = {**payload, "intent_sha256": digest}
-            bad_request = {**fixture["request"], "expected_intent_sha256": digest}
+            bad_request = {
+                **fixture["request"],
+                "expected_intent_sha256": digest,
+                "lease_owner": f"runtime-refresh:{digest[:16]}",
+            }
             with self.assertRaisesRegex(ValueError, "not canonical"):
                 tasks._runtime_refresh_prelaunch_lease_binding_request(
-                    bad_request, bad_intent, task_id, unit
+                    bad_request, bad_intent, fixture["authority"], task_id, unit
                 )
 
         bad_unit = "grabowski-task-" + "8" * 24 + "-a1.service"
@@ -9992,8 +10022,109 @@ class TaskTests(unittest.TestCase):
             tasks.bureau_runtime_refresh_executor.BureauRuntimeRefreshExecutorError
         ):
             tasks._runtime_refresh_prelaunch_lease_binding_request(
-                fixture["request"], fixture["intent"], task_id, bad_unit
+                fixture["request"], fixture["intent"], fixture["authority"], task_id, bad_unit
             )
+
+    def test_runtime_refresh_prelaunch_rejects_unbound_owner_approval_and_resource_kind(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        task_id = "9" * 24
+        unit = f"grabowski-task-{task_id}-a1.service"
+
+        foreign_owner = {**fixture["request"], "lease_owner": "runtime-refresh:foreign"}
+        with self.assertRaisesRegex(ValueError, "lease owner is not intent-bound"):
+            tasks._runtime_refresh_prelaunch_lease_binding_request(
+                foreign_owner,
+                fixture["intent"],
+                fixture["authority"],
+                task_id,
+                unit,
+            )
+
+        bad_approval_payload = {
+            key: value
+            for key, value in fixture["intent"].items()
+            if key != "intent_sha256"
+        }
+        bad_approval_payload["runtime_approval"] = {
+            **bad_approval_payload["runtime_approval"],
+            "allowed": False,
+        }
+        bad_approval_digest = hashlib.sha256(
+            (tasks._canonical_json(bad_approval_payload) + "\n").encode("utf-8")
+        ).hexdigest()
+        bad_approval_intent = {
+            **bad_approval_payload,
+            "intent_sha256": bad_approval_digest,
+        }
+        bad_approval_request = {
+            **fixture["request"],
+            "expected_intent_sha256": bad_approval_digest,
+            "lease_owner": f"runtime-refresh:{bad_approval_digest[:16]}",
+        }
+        with self.assertRaisesRegex(ValueError, "approval binding is invalid"):
+            tasks._runtime_refresh_prelaunch_lease_binding_request(
+                bad_approval_request,
+                bad_approval_intent,
+                fixture["authority"],
+                task_id,
+                unit,
+            )
+
+        bad_kind_payload = {
+            key: value
+            for key, value in fixture["intent"].items()
+            if key != "intent_sha256"
+        }
+        bad_kind_payload["required_resource_keys"] = ["component:unrelated-live-lease"]
+        bad_kind_digest = hashlib.sha256(
+            (tasks._canonical_json(bad_kind_payload) + "\n").encode("utf-8")
+        ).hexdigest()
+        bad_kind_intent = {**bad_kind_payload, "intent_sha256": bad_kind_digest}
+        bad_kind_request = {
+            **fixture["request"],
+            "expected_intent_sha256": bad_kind_digest,
+            "lease_owner": f"runtime-refresh:{bad_kind_digest[:16]}",
+        }
+        with self.assertRaisesRegex(ValueError, "unsupported resource kind"):
+            tasks._runtime_refresh_prelaunch_lease_binding_request(
+                bad_kind_request,
+                bad_kind_intent,
+                fixture["authority"],
+                task_id,
+                unit,
+            )
+
+    def test_runtime_refresh_invalid_prelaunch_contract_never_prepares_lease_mutation(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture(
+            ["component:unrelated-live-lease"]
+        )
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="unrelated live lease",
+            ttl_seconds=1200,
+            metadata={"marker": "must-remain-unbound"},
+        )
+        original = tasks.resources.inspect_resource(fixture["resource_keys"][0])
+        with self._runtime_refresh_start_environment(fixture):
+            with patch.object(
+                tasks.resources,
+                "prepare_runtime_refresh_executor_lease_binding",
+                side_effect=AssertionError("prelaunch mutation preparation must not run"),
+            ) as prepare:
+                with self.assertRaisesRegex(ValueError, "unsupported resource kind"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        prepare.assert_not_called()
+        self.assertEqual(
+            original,
+            tasks.resources.inspect_resource(fixture["resource_keys"][0]),
+        )
 
     def test_runtime_refresh_reserved_task_rejects_caller_resource_keys(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
@@ -10198,7 +10329,7 @@ class TaskTests(unittest.TestCase):
         old_task_id = "d" * 24
         old_unit = f"grabowski-task-{old_task_id}-a1.service"
         request = tasks._runtime_refresh_prelaunch_lease_binding_request(
-            fixture["request"], fixture["intent"], old_task_id, old_unit
+            fixture["request"], fixture["intent"], fixture["authority"], old_task_id, old_unit
         )
         plan = tasks.resources.prepare_runtime_refresh_executor_lease_binding(
             fixture["lease_owner"], fixture["resource_keys"], old_unit
