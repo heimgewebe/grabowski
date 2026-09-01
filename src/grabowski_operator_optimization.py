@@ -25,7 +25,7 @@ MAX_FRICTION_LIMIT = 100
 MAX_OUTCOME_LIMIT = 500
 MAX_CURRENT_WORK_LIMIT = current_work_core.PAGE_LIMIT_MAX
 MAX_FINDINGS = 12
-SEVERITY_WEIGHT = {"high": 3, "medium": 2, "low": 1, "none": 0}
+SEVERITY_WEIGHT = {"critical": 4, "high": 3, "medium": 2, "low": 1, "none": 0}
 
 Provider = Callable[..., dict[str, Any]]
 
@@ -670,8 +670,203 @@ def _resource_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
     ]
 
 
+def _observed_audit_signal_finding(
+    evidence: ReportEvidence,
+    *,
+    signal_id: str,
+    fallback_severity: str,
+    title: str,
+    observation: str,
+    interpretation: str,
+    alternative_interpretation: str,
+    fallback_action: str,
+    fallback_limits: list[str],
+) -> dict[str, Any] | None:
+    signal = _audit_signal(evidence.audit, signal_id)
+    if not isinstance(signal, dict) or signal.get("status") != "observed":
+        return None
+    count = _count(signal, "count")
+    severity_value = signal.get("severity")
+    fallback_weight = SEVERITY_WEIGHT[fallback_severity]
+    severity = (
+        severity_value
+        if (
+            isinstance(severity_value, str)
+            and SEVERITY_WEIGHT.get(severity_value, -1) >= fallback_weight
+        )
+        else fallback_severity
+    )
+    action_value = signal.get("recommended_action")
+    action = (
+        action_value
+        if isinstance(action_value, str) and action_value
+        else fallback_action
+    )
+    limits_value = signal.get("does_not_establish")
+    limits = (
+        [item for item in limits_value if isinstance(item, str)]
+        if isinstance(limits_value, list)
+        else fallback_limits
+    )
+    refs_value = signal.get("evidence_refs")
+    refs = (
+        [item for item in refs_value if isinstance(item, str)]
+        if isinstance(refs_value, list)
+        else []
+    )
+    finding = _finding(
+        finding_id=signal_id,
+        severity=severity,
+        evidence_scope="7d_audit_signal",
+        title=title,
+        observation=observation.format(count=count),
+        evidence_count=count,
+        evidence_refs=refs,
+        interpretation=interpretation,
+        alternative_interpretation=alternative_interpretation,
+        recommended_action=action,
+        does_not_establish=limits,
+    )
+    refs_truncated = signal.get("evidence_refs_truncated")
+    if isinstance(refs_truncated, bool):
+        finding["evidence_refs_truncated"] = refs_truncated
+    details = signal.get("details")
+    if isinstance(details, dict):
+        count_semantics = details.get("count_semantics")
+        if isinstance(count_semantics, str) and count_semantics:
+            finding["count_semantics"] = count_semantics
+    return finding
+
+
+def _transition_gap_finding(evidence: ReportEvidence) -> dict[str, Any] | None:
+    signal = _audit_signal(evidence.audit, "transition_gap")
+    if not isinstance(signal, dict) or signal.get("status") != "observed":
+        return None
+    details = signal.get("details")
+    reconciliation_only = False
+    if isinstance(details, dict):
+        execution_gap_count = details.get("execution_gap_count")
+        completion_audit_gap_count = details.get("completion_audit_gap_count")
+        reconciliation_only = (
+            isinstance(execution_gap_count, int)
+            and not isinstance(execution_gap_count, bool)
+            and execution_gap_count == 0
+            and isinstance(completion_audit_gap_count, int)
+            and not isinstance(completion_audit_gap_count, bool)
+            and completion_audit_gap_count > 0
+        )
+    if reconciliation_only:
+        return _observed_audit_signal_finding(
+            evidence,
+            signal_id="transition_gap",
+            fallback_severity="medium",
+            title="Retention completion audit was reconciled append-only",
+            observation=(
+                "The seven-day audit signal projection reports {count} completion-audit "
+                "reconciliation records for retention effects already recorded as completed."
+            ),
+            interpretation=(
+                "The retention effect is already completed; append-only reconciliation "
+                "repairs audit completeness without authorizing or requiring another effect."
+            ),
+            alternative_interpretation=(
+                "The reconciliation proves the bounded audit closeout, not why the original "
+                "completion audit record was absent."
+            ),
+            fallback_action=(
+                "Review append-only completion-audit reconciliation evidence; do not retry "
+                "the retention effect."
+            ),
+            fallback_limits=[
+                "cause_of_the_completion_audit_gap",
+                "that_the_original_completion_audit_record_existed",
+                "safe_retry",
+            ],
+        )
+    return _observed_audit_signal_finding(
+        evidence,
+        signal_id="transition_gap",
+        fallback_severity="high",
+        title="Audited transition is missing its completion",
+        observation=(
+            "The seven-day audit signal projection reports {count} unmatched "
+            "transition intents after the grace period."
+        ),
+        interpretation=(
+            "An expected completion record is absent; before retry, the operator "
+            "must distinguish an incomplete effect from a missing audit closeout."
+        ),
+        alternative_interpretation=(
+            "The target effect may have completed even though no matching completion "
+            "record is present in the audited transition family."
+        ),
+        fallback_action=(
+            "Trace each unmatched intent and read the exact target state before retry."
+        ),
+        fallback_limits=[
+            "effect_absence_outside_the_audit_chain",
+            "causality",
+            "safe_retry",
+        ],
+    )
+
+
 def _audit_signal_findings(evidence: ReportEvidence) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+    for item in (
+        _observed_audit_signal_finding(
+            evidence,
+            signal_id="uncertain_outcome",
+            fallback_severity="critical",
+            title="Mutation outcome is uncertain",
+            observation=(
+                "The seven-day audit signal projection reports {count} operations "
+                "whose terminal mutation outcome is uncertain."
+            ),
+            interpretation=(
+                "A mutation may have started without a trustworthy terminal receipt; "
+                "an unchanged retry can duplicate or compound an already-started effect."
+            ),
+            alternative_interpretation=(
+                "The target may already be in the requested state even though the "
+                "caller did not receive terminal evidence."
+            ),
+            fallback_action=(
+                "Read the exact target state and recovery evidence before any retry."
+            ),
+            fallback_limits=["mutation_failure", "safe_retry", "root_cause"],
+        ),
+        _observed_audit_signal_finding(
+            evidence,
+            signal_id="contract_contradiction",
+            fallback_severity="high",
+            title="Authoritative contract surfaces contradict each other",
+            observation=(
+                "The seven-day audit signal projection reports {count} active "
+                "contract contradictions."
+            ),
+            interpretation=(
+                "Structured operator surfaces disagree about the same contract-bound "
+                "state, so downstream optimization can otherwise act on inconsistent truth."
+            ),
+            alternative_interpretation=(
+                "A bounded version transition can temporarily expose different but "
+                "individually valid contract views."
+            ),
+            fallback_action=(
+                "Bind both surfaces to the same identity and reconcile the contradiction "
+                "before mutation."
+            ),
+            fallback_limits=[
+                "root_cause",
+                "which_side_of_the_contract_is_wrong",
+                "automatic_contract_change_authority",
+            ],
+        ),
+        _transition_gap_finding(evidence),
+    ):
+        if item is not None:
+            findings.append(item)
     blockade = _audit_signal(evidence.audit, "repeated_blockade")
     if isinstance(blockade, dict) and blockade.get("status") == "observed":
         count = _count(blockade, "count")
