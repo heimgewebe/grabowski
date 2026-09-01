@@ -1,0 +1,85 @@
+---
+name: PR1013 postreview authority fix v2
+
+on:
+  push:
+    branches:
+      - fix/pr1013-postreview-authority-20260901-1340-v2
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr1013-postreview-authority-fix-v2
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: fix/pr1013-postreview-authority-20260901-1340-v2
+
+      - name: Recover and apply exact patch script
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          source = subprocess.check_output(
+              [
+                  "git", "show",
+                  "c88bfb6ae3dc2b91ecbfb059b3ccc838aee395ba:.github/workflows/pr1013-postreview-authority-fix.yml",
+              ],
+              text=True,
+          )
+          start_marker = "      - name: Apply exact review fixes\n"
+          end_marker = "\n      - name: Validate focused and full suite"
+          start = source.index(start_marker)
+          run_start = source.index("        run: |\n", start) + len("        run: |\n")
+          end = source.index(end_marker, run_start)
+          block = source[run_start:end]
+          lines = []
+          for line in block.splitlines():
+              if line.startswith("          "):
+                  lines.append(line[10:])
+              else:
+                  lines.append(line)
+          Path("/tmp/pr1013-apply.sh").write_text("\n".join(lines) + "\n")
+          PY
+          bash /tmp/pr1013-apply.sh
+          git diff --check
+
+      - name: Validate repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          make validate
+          git diff --check
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          while IFS= read -r p; do
+            case "$p" in
+              src/grabowski_resources.py|src/grabowski_tasks.py|tests/test_resources.py|tests/test_tasks.py) ;;
+              '') ;;
+              *) echo "forbidden source/test change: $p" >&2; exit 65;;
+            esac
+          done <<< "$changed"
+
+      - name: Commit validated source fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr1013-postreview-authority-fix-v2.yml
+          git add src/grabowski_resources.py src/grabowski_tasks.py tests/test_resources.py tests/test_tasks.py
+          git diff --cached --check
+          git commit -m "fix: validate runtime refresh authority before mutation"
+          git push origin HEAD:fix/pr1013-postreview-authority-20260901-1340-v2
