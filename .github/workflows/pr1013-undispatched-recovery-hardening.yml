@@ -47,7 +47,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git rm .github/workflows/pr1013-undispatched-recovery-hardening.yml .github/pr1013_undispatched_patch.py
+          git rm .github/workflows/pr1013-undispatched-recovery-hardening.yml .github/pr1013_undispatched_patch.py .github/pr1013_validation_trigger.txt
           git diff --check
           git diff --cached --check
           git config user.name 'github-actions[bot]'
