@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import grabowski_bureau_leases as bureau_leases
 import grabowski_checkouts as checkouts
@@ -378,12 +379,54 @@ def thread_focus_terminal_evidence(source_id: str) -> dict[str, Any]:
     )
 
 
-def github_issue_terminal_evidence(source_id: str) -> dict[str, Any]:
+def _parse_github_issue_source_id(source_id: str) -> tuple[str, int]:
+    if not isinstance(source_id, str) or not source_id or source_id != source_id.strip():
+        raise ValueError(
+            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+        )
     match = GITHUB_ISSUE_SOURCE_RE.fullmatch(source_id)
-    if match is None:
-        raise ValueError("GitHub issue source id must be repository#number:suffix")
-    repository = match.group("repo")
-    number = int(match.group("number"))
+    if match is not None:
+        return match.group("repo"), int(match.group("number"))
+
+    try:
+        parsed = urlsplit(source_id)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+        ) from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+        )
+    path_match = re.fullmatch(
+        r"/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>[1-9][0-9]*)/?",
+        parsed.path,
+    )
+    if path_match is None:
+        raise ValueError(
+            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+        )
+    repository = f"{path_match.group('owner')}/{path_match.group('repo')}"
+    number = int(path_match.group("number"))
+    canonical_url = f"https://github.com/{repository}/issues/{number}"
+    if source_id not in {canonical_url, canonical_url + "/"}:
+        raise ValueError(
+            "GitHub issue source id must be repository#number:suffix or a strict github.com issue URL"
+        )
+    return repository, number
+
+
+def github_issue_terminal_evidence(source_id: str) -> dict[str, Any]:
+    repository, number = _parse_github_issue_source_id(source_id)
     issue = _github_json(
         [
             "issue",
@@ -399,6 +442,13 @@ def github_issue_terminal_evidence(source_id: str) -> dict[str, Any]:
         raise RuntimeError("GitHub issue source identity differs")
     if issue.get("state") != "CLOSED" or not issue.get("closedAt"):
         raise RuntimeError("GitHub issue source is not closed")
+    expected_url = f"https://github.com/{repository}/issues/{number}"
+    issue_url = issue.get("url")
+    if (
+        not isinstance(issue_url, str)
+        or issue_url.rstrip("/").casefold() != expected_url.casefold()
+    ):
+        raise RuntimeError("GitHub issue source identity differs")
     return _terminal_evidence(
         {
             "schema_version": SCHEMA_VERSION,
