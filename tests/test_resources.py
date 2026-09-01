@@ -6300,6 +6300,36 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual([], recovery["restored_keys"])
         self.assertEqual(original, resources.inspect_resource(key))
 
+    def test_runtime_refresh_executor_snapshot_ignores_future_public_fields(self) -> None:
+        row = {
+            "resource_key": "component:runtime-refresh-snapshot",
+            "owner_id": "runtime-refresh:snapshot",
+            "purpose": "snapshot contract",
+            "acquired_at_unix": 1,
+            "updated_at_unix": 2,
+            "expires_at_unix": 3,
+            "metadata_sha256": "a" * 64,
+            "reclaimed_from_owner": None,
+            "metadata_json": "{}",
+            "future_public_field": "must-not-enter-durable-plan",
+        }
+        snapshot = resources._runtime_refresh_executor_lease_snapshot(row)
+        self.assertEqual(
+            {
+                "resource_key",
+                "owner_id",
+                "purpose",
+                "acquired_at_unix",
+                "updated_at_unix",
+                "expires_at_unix",
+                "metadata_sha256",
+                "reclaimed_from_owner",
+            },
+            set(snapshot),
+        )
+        self.assertNotIn("future_public_field", snapshot)
+
+
 
 if __name__ == "__main__":
     unittest.main()
