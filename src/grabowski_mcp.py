@@ -71,7 +71,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Use the narrowest typed read tool that can answer the question before broader surfaces.",
+        "Use the narrowest typed read tool that can answer the question before broader surfaces; do not add a connectivity-only health ping when that required read can serve as the probe.",
     ),
     (
         "host-capability-resolution",
@@ -86,8 +86,16 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
         "After a transport, platform-filter, or policy failure, verify target state; do not repeat an unchanged call without state evidence.",
     ),
     (
+        "pre-runtime-platform-denial",
+        "If ChatGPT or another upstream platform refuses a call before host dispatch and no Grabowski receipt exists, classify it as platform_filter and do not attribute it to the Grabowski runtime; do not retry the blocked call unchanged, and resume from existing lane or task receipts in a supported conversation when present.",
+    ),
+    (
         "platform-filter-narrowing",
         "After readback proves an upstream platform filter caused no effect, continue the authorized goal through an existing semantically narrower typed operation when available; do not weaken, disguise, bypass, or repackage the platform safeguard.",
+    ),
+    (
+        "publication-pending-is-local",
+        "Treat platform_publication_pending as nonblocking by default; fail closed only the operation whose required tool or schema field is not visible in the active client catalog, and seek fresh request-bound catalog evidence rather than blocking unrelated Grabowski work.",
     ),
     (
         "transport-roundtrip-before-mutation",
