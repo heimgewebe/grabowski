@@ -5919,6 +5919,8 @@ def prepare_runtime_refresh_executor_lease_binding(
     executor_unit: str,
     *,
     minimum_remaining_seconds: int = 600,
+    expected_approval_task_id: str | None = None,
+    expected_intent_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Prepare exact preimages and postimages before a runtime-refresh lease mutation."""
     owner = _owner(owner_id)
@@ -5939,6 +5941,23 @@ def prepare_runtime_refresh_executor_lease_binding(
         raise ValueError(
             f"minimum_remaining_seconds must be between {MIN_TTL_SECONDS} and {MAX_TTL_SECONDS}"
         )
+    authority_binding_required = (
+        expected_approval_task_id is not None or expected_intent_sha256 is not None
+    )
+    if authority_binding_required:
+        if (
+            not isinstance(expected_approval_task_id, str)
+            or not expected_approval_task_id
+            or expected_approval_task_id != expected_approval_task_id.strip()
+        ):
+            raise ValueError(
+                "expected_approval_task_id must be a nonempty canonical string"
+            )
+        if (
+            not isinstance(expected_intent_sha256, str)
+            or SHA256_RE.fullmatch(expected_intent_sha256) is None
+        ):
+            raise ValueError("expected_intent_sha256 must be a SHA-256 digest")
     now = _now()
     threshold = now + minimum_remaining_seconds
     originals: list[dict[str, Any]] = []
@@ -5976,6 +5995,13 @@ def prepare_runtime_refresh_executor_lease_binding(
         _, observed_sha256 = _metadata(metadata)
         if row["metadata_sha256"] != observed_sha256:
             raise RuntimeError(f"Resource lease metadata integrity mismatch: {key}")
+        if authority_binding_required and (
+            metadata.get("approval_task_id") != expected_approval_task_id
+            or metadata.get("intent_sha256") != expected_intent_sha256
+        ):
+            raise PermissionError(
+                f"Runtime-refresh executor lease authority metadata mismatch: {key}"
+            )
         if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in metadata:
             raise RuntimeError(
                 f"Runtime-refresh executor cannot bind a branch-attempt lease: {key}"

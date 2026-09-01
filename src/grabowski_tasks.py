@@ -7391,6 +7391,7 @@ def grabowski_task_start(
     executor_request: dict[str, str] | None = None
     executor_intent: dict[str, Any] | None = None
     executor_authority_contract: dict[str, Any] | None = None
+    executor_lease_binding_request: dict[str, Any] | None = None
     if bureau_runtime_refresh_executor.is_reserved_task_request(argv):
         if target.get("transport") != "local" or target.get("target") != "local":
             raise PermissionError("Bureau runtime-refresh executor requires the local fleet host")
@@ -7458,6 +7459,21 @@ def grabowski_task_start(
             enabled=bool(chronik_enabled),
         )
     )
+    task_id = uuid.uuid4().hex[:24]
+    if executor_request is not None:
+        if executor_intent is None or executor_authority_contract is None:
+            raise RuntimeError(
+                "Bureau runtime-refresh executor authority vanished before prelaunch validation"
+            )
+        executor_lease_binding_request = (
+            _runtime_refresh_prelaunch_lease_binding_request(
+                executor_request,
+                executor_intent,
+                executor_authority_contract,
+                task_id,
+                _task_unit(task_id, 1),
+            )
+        )
     normalized_operation_identity = _normalize_task_operation_identity(
         (
             bureau_runtime_refresh_executor.operation_identity(
@@ -7472,7 +7488,6 @@ def grabowski_task_start(
         ),
         cwd=working_directory,
     )
-    task_id = uuid.uuid4().hex[:24]
     operation_resolution = _resolve_task_operation_identity(
         normalized_operation_identity,
         supersedes_task_id=supersedes_task_id,
@@ -7610,12 +7625,15 @@ def grabowski_task_start(
         opaque_command=True,
     )
     executor_prelaunch_recovery: dict[str, Any] | None = None
-    if executor_request is not None and executor_intent is not None:
-        recovery_keys = executor_intent.get("required_resource_keys")
-        if not isinstance(recovery_keys, list):
-            raise ValueError("Bureau runtime-refresh prelaunch resource keys are invalid")
+    if executor_request is not None:
+        if executor_lease_binding_request is None:
+            raise RuntimeError(
+                "Bureau runtime-refresh executor lost validated prelaunch authority"
+            )
         executor_prelaunch_recovery = (
-            _reconcile_runtime_refresh_prelaunch_binding_journals(recovery_keys)
+            _reconcile_runtime_refresh_prelaunch_binding_journals(
+                executor_lease_binding_request["resource_keys"]
+            )
         )
     unprepared_identity = _task_execution_identity(
         host=host,
@@ -8230,7 +8248,6 @@ def grabowski_task_start(
         if target["transport"] == "local" and execution_backend == "systemd-user"
         else None
     )
-    executor_lease_binding_request: dict[str, Any] | None = None
     executor_lease_binding_plan: dict[str, Any] | None = None
     executor_lease_binding_journal: dict[str, Any] | None = None
     executor_lease_binding: dict[str, Any] | None = None
@@ -8318,7 +8335,7 @@ def grabowski_task_start(
                 raise RuntimeError(
                     "Bureau runtime-refresh executor authority vanished before prelaunch binding"
                 )
-            executor_lease_binding_request = (
+            revalidated_executor_lease_binding_request = (
                 _runtime_refresh_prelaunch_lease_binding_request(
                     executor_request,
                     executor_intent,
@@ -8327,6 +8344,15 @@ def grabowski_task_start(
                     unit,
                 )
             )
+            if (
+                executor_lease_binding_request is None
+                or revalidated_executor_lease_binding_request
+                != executor_lease_binding_request
+            ):
+                raise RuntimeError(
+                    "Bureau runtime-refresh prelaunch authority changed before mutation"
+                )
+            executor_lease_binding_request = revalidated_executor_lease_binding_request
             executor_lease_binding_plan = (
                 resources.prepare_runtime_refresh_executor_lease_binding(
                     executor_lease_binding_request["lease_owner"],
@@ -8334,6 +8360,12 @@ def grabowski_task_start(
                     executor_lease_binding_request["executor_unit"],
                     minimum_remaining_seconds=executor_lease_binding_request[
                         "minimum_remaining_seconds"
+                    ],
+                    expected_approval_task_id=executor_lease_binding_request[
+                        "lease_task_id"
+                    ],
+                    expected_intent_sha256=executor_lease_binding_request[
+                        "intent_sha256"
                     ],
                 )
             )
