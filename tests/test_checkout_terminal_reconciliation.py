@@ -1261,6 +1261,70 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             )
         self.assertEqual("superseded", observed["effective_state"])
 
+    def test_github_issue_accepts_historical_github_url_source(self) -> None:
+        source_id = "https://github.com/heimgewebe/chronik/issues/299"
+        with patch.object(
+            sources,
+            "_github_json",
+            return_value={
+                "number": 299,
+                "state": "CLOSED",
+                "url": source_id,
+                "closedAt": "2026-09-01T05:41:54Z",
+                "updatedAt": "2026-09-01T05:41:54Z",
+            },
+        ) as github_read:
+            evidence = sources.source_terminal_evidence(
+                {"source": {"kind": "github_issue", "id": source_id}}
+            )
+        self.assertEqual(source_id, evidence["source_id"])
+        self.assertEqual("heimgewebe/chronik", evidence["repository"])
+        self.assertEqual(299, evidence["issue_number"])
+        github_read.assert_called_once_with(
+            [
+                "issue",
+                "view",
+                "299",
+                "--repo",
+                "heimgewebe/chronik",
+                "--json",
+                "number,state,url,closedAt,updatedAt",
+            ]
+        )
+
+    def test_github_issue_url_rejects_ambiguous_variants(self) -> None:
+        invalid = (
+            "http://github.com/heimgewebe/chronik/issues/299",
+            "https://github.com.evil/heimgewebe/chronik/issues/299",
+            "https://user@github.com/heimgewebe/chronik/issues/299",
+            "https://github.com:443/heimgewebe/chronik/issues/299",
+            "https://github.com/heimgewebe/chronik/issues/299?state=closed",
+            "https://github.com/heimgewebe/chronik/issues/299#fragment",
+            "https://github.com/heimgewebe/chronik/issues/299/comments",
+            "https://github.com/heimgewebe/chronik/issues/0",
+        )
+        for source_id in invalid:
+            with self.subTest(source_id=source_id):
+                with self.assertRaisesRegex(ValueError, "strict github.com issue URL"):
+                    sources._parse_github_issue_source_id(source_id)
+
+    def test_github_issue_closed_state_rejects_repository_identity_mismatch(self) -> None:
+        with patch.object(
+            sources,
+            "_github_json",
+            return_value={
+                "number": 215,
+                "state": "CLOSED",
+                "url": "https://github.com/heimgewebe/other/issues/215",
+                "closedAt": "2026-07-18T00:00:00Z",
+                "updatedAt": "2026-07-18T00:00:00Z",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity differs"):
+                sources.github_issue_terminal_evidence(
+                    "heimgewebe/grabowski#215:T002"
+                )
+
     def test_github_issue_requires_closed_state(self) -> None:
         with patch.object(
             sources,
