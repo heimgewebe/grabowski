@@ -10361,6 +10361,72 @@ class TaskTests(unittest.TestCase):
         self.assertEqual({row[1]}, {item["executor_unit"] for item in metadata_by_key.values()})
 
 
+    def test_runtime_refresh_live_authority_drift_blocks_before_lease_prepare(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+            "marker": "live-authority-drift",
+        }
+        original = tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh live authority drift",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )["leases"]
+        real_prepare = tasks.resources.prepare_runtime_refresh_executor_lease_binding
+        with self._runtime_refresh_start_environment(fixture) as (dispatch_mock, _audit_mock):
+            with (
+                patch.object(
+                    tasks.bureau_runtime_refresh_executor,
+                    "load_bound_intent",
+                    side_effect=[fixture["intent"], fixture["intent"]],
+                ) as load_intent,
+                patch.object(
+                    tasks.bureau_runtime_refresh_executor,
+                    "validate_authority_execution_contract",
+                    side_effect=[
+                        fixture["authority"],
+                        PermissionError("simulated live authority drift"),
+                    ],
+                ) as validate_authority,
+                patch.object(
+                    tasks.resources,
+                    "prepare_runtime_refresh_executor_lease_binding",
+                    wraps=real_prepare,
+                ) as prepare_binding,
+            ):
+                with self.assertRaisesRegex(PermissionError, "live authority drift"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        self.assertEqual(2, load_intent.call_count)
+        self.assertEqual(2, validate_authority.call_count)
+        prepare_binding.assert_not_called()
+        dispatch_mock.assert_not_called()
+        self.assertEqual(
+            original,
+            [
+                tasks.resources.inspect_resource(key)
+                for key in fixture["resource_keys"]
+            ],
+        )
+        self.assertEqual(
+            {key: metadata for key in fixture["resource_keys"]},
+            self._runtime_refresh_lease_metadata(fixture["resource_keys"]),
+        )
+        with sqlite3.connect(self.database) as connection:
+            journals = connection.execute(
+                "SELECT key FROM metadata WHERE key LIKE ?",
+                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+            ).fetchall()
+        self.assertEqual([], journals)
+
     def test_runtime_refresh_invalid_authority_precedes_dedup_and_journal_recovery(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
         metadata = {
