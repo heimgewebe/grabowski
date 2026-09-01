@@ -22,14 +22,15 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: fix/run-outcome-taxonomy-v1-20260901
-          fetch-depth: 2
+          fetch-depth: 4
 
-      - name: Verify exact preimage
+      - name: Verify exact lineage and isolation
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "3c9b275e3563d9aa39bafd62ca06d401d18c17ef"
-          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/bootstrap-history-v1-matcher.yml"
+          BASE=3c9b275e3563d9aa39bafd62ca06d401d18c17ef
+          git merge-base --is-ancestor "$BASE" HEAD
+          test "$(git diff --name-only "$BASE" HEAD)" = ".github/workflows/bootstrap-history-v1-matcher.yml"
 
       - name: Patch history matcher and regression test
         shell: bash
@@ -50,32 +51,35 @@ jobs:
               "src/grabowski_tasks.py",
               '''    if event.get("schema_version") != "agent-run-event.v0":
               return False
-          if event.get("kind") not in {
+          ''',
+              '''    schema_version = event.get("schema_version")
+          if schema_version not in {"agent-run-event.v0", "agent-run-event.v1"}:
+              return False
+          ''',
+          )
+          replace_once(
+              "src/grabowski_tasks.py",
+              '''    if event.get("kind") not in {
               "agent.run.started",
               "agent.run.completed",
               "agent.run.blocked",
           }:
               return False
           ''',
-              '''    schema_version = event.get("schema_version")
-          if schema_version == "agent-run-event.v0":
-              allowed_kinds = {
-                  "agent.run.started",
-                  "agent.run.completed",
-                  "agent.run.blocked",
-              }
-          elif schema_version == "agent-run-event.v1":
-              allowed_kinds = {
-                  "agent.run.started",
-                  "agent.run.completed",
-                  "agent.run.failed",
-                  "agent.run.cancelled",
-                  "agent.run.timed_out",
-                  "agent.run.signalled",
-                  "agent.run.blocked",
-              }
-          else:
-              return False
+              '''    allowed_kinds = {
+              "agent.run.started",
+              "agent.run.completed",
+              "agent.run.blocked",
+          }
+          if schema_version == "agent-run-event.v1":
+              allowed_kinds.update(
+                  {
+                      "agent.run.failed",
+                      "agent.run.cancelled",
+                      "agent.run.timed_out",
+                      "agent.run.signalled",
+                  }
+              )
           if event.get("kind") not in allowed_kinds:
               return False
           ''',
@@ -111,6 +115,7 @@ jobs:
                           candidate["data"]["blocker_code"] = "task-outcome-unknown"
                       else:
                           candidate["data"].pop("blocker_code", None)
+                      candidate["event_id"] = tasks.chronik.event_id(candidate)
                       self.assertTrue(
                           tasks._chronik_history_event_matches_query(
                               candidate, normalized, since_timestamp=None
@@ -122,6 +127,7 @@ jobs:
               legacy["kind"] = "agent.run.completed"
               legacy["data"]["result"] = "completed"
               legacy["data"].pop("blocker_code", None)
+              legacy["event_id"] = tasks.chronik.event_id(legacy)
               self.assertTrue(
                   tasks._chronik_history_event_matches_query(
                       legacy, normalized, since_timestamp=None
@@ -129,6 +135,7 @@ jobs:
               )
               legacy["kind"] = "agent.run.failed"
               legacy["data"]["result"] = "failed"
+              legacy["event_id"] = tasks.chronik.event_id(legacy)
               self.assertFalse(
                   tasks._chronik_history_event_matches_query(
                       legacy, normalized, since_timestamp=None
