@@ -84,7 +84,10 @@ class AgentInstructionsTests(unittest.TestCase):
         rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
-        self.assertIn("narrowest typed read", rules["narrowest-typed-read-first"].lower())
+        narrow = rules["narrowest-typed-read-first"].lower()
+        self.assertIn("narrowest typed read", narrow)
+        self.assertIn("connectivity-only health ping", narrow)
+        self.assertIn("serve as the probe", narrow)
         host_resolution = rules["host-capability-resolution"].lower()
         for phrase in (
             "grabowski_host_capability_resolve",
@@ -107,6 +110,17 @@ class AgentInstructionsTests(unittest.TestCase):
         retry = rules["state-check-before-retry"].lower()
         self.assertIn("verify target state", retry)
         self.assertIn("do not repeat an unchanged call", retry)
+        pre_runtime = rules["pre-runtime-platform-denial"].lower()
+        for phrase in (
+            "before host dispatch",
+            "no grabowski receipt",
+            "platform_filter",
+            "do not attribute it to the grabowski runtime",
+            "do not retry the blocked call unchanged",
+            "lane or task receipts",
+            "supported conversation",
+        ):
+            self.assertIn(phrase, pre_runtime)
         narrowing = rules["platform-filter-narrowing"].lower()
         for phrase in (
             "readback",
