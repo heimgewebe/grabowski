@@ -569,6 +569,18 @@ class RecallTests(unittest.TestCase):
         result = module.export_chronik_history_recall(history)
         self.assertEqual(result["goal_count"], 0)
         self.assertEqual(result["unbound_goal_subrun_count"], 1)
+        self.assertEqual(result["target_count"], 1)
+        target = result["target_summary"][0]
+        self.assertEqual(target["target_key"], "host:heim-pc")
+        self.assertEqual(
+            target["identity"],
+            {"source": "target", "scope": "host", "target": "heim-pc"},
+        )
+        self.assertEqual(target["subrun_count"], 1)
+        self.assertEqual(
+            target["semantic_role"],
+            "coarse_target_aggregation_not_goal_identity",
+        )
 
     def test_v1_execution_failure_is_accepted_without_blocker_code(self) -> None:
         module = self._load_module()
@@ -619,7 +631,11 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(goal["subrun_count"], 2)
         self.assertEqual(goal["completed_subruns"], 2)
         self.assertEqual(result["unbound_goal_subrun_count"], 0)
+        target = result["target_summary"][0]
+        self.assertEqual(target["event_count"], 3)
+        self.assertEqual(target["subrun_count"], 2)
         self.assertTrue(any("self_block_minutes" in item for item in result["measurement_limitations"]))
+        self.assertTrue(any("coarse repo/host" in item for item in result["measurement_limitations"]))
 
     def test_chronik_history_recall_bounds_support_refs(self) -> None:
         module = self._load_module()

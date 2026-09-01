@@ -21,6 +21,7 @@ MAX_REJECTION_DETAIL_CHARS = 160
 MAX_HISTORICAL_SUPPORT_REFS = 6
 MAX_HISTORICAL_PATTERN_SUMMARY = 50
 MAX_HISTORICAL_GOAL_SUMMARY = 50
+MAX_HISTORICAL_TARGET_SUMMARY = 50
 LEGACY_V0_EXECUTION_BLOCKERS = {
     "task-failed": "failed",
     "task-cancelled": "cancelled",
@@ -598,6 +599,77 @@ def _historical_goal_summary(
     )
 
 
+def _historical_target_summary(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Aggregate coarse repo/host targets without treating them as goal identity."""
+    targets: dict[str, dict[str, Any]] = {}
+    for item in items:
+        context = item.get("historical_context")
+        if not isinstance(context, dict):
+            continue
+        subject = context.get("subject")
+        run_id = context.get("run_id")
+        if not isinstance(subject, dict) or not isinstance(run_id, str):
+            continue
+        scope = subject.get("scope")
+        target = subject.get("target")
+        if scope not in {"repository", "host"} or not isinstance(target, str) or not target:
+            continue
+        target_key = f"{scope}:{target}"
+        bucket = targets.setdefault(
+            target_key,
+            {
+                "target_key": target_key,
+                "identity": {"source": "target", "scope": scope, "target": target},
+                "event_count": 0,
+                "subruns": set(),
+                "completed": set(),
+                "execution_failures": set(),
+                "true_blocks": set(),
+                "outcome_unknown": set(),
+                "legacy_blocked_failures": set(),
+                "operations": set(),
+            },
+        )
+        bucket["event_count"] += 1
+        bucket["subruns"].add(run_id)
+        operation = context.get("operation")
+        if isinstance(operation, str):
+            bucket["operations"].add(operation)
+        outcome_class = context.get("outcome_class")
+        effective_outcome = context.get("effective_outcome")
+        if outcome_class == "completed":
+            bucket["completed"].add(run_id)
+        elif outcome_class == "execution_failure":
+            bucket["execution_failures"].add(run_id)
+        elif outcome_class == "safety_block":
+            bucket["true_blocks"].add(run_id)
+        if effective_outcome == "outcome_unknown":
+            bucket["outcome_unknown"].add(run_id)
+        if context.get("legacy_blocked_execution_failure") is True:
+            bucket["legacy_blocked_failures"].add(run_id)
+
+    summaries = [
+        {
+            "target_key": bucket["target_key"],
+            "identity": dict(bucket["identity"]),
+            "event_count": bucket["event_count"],
+            "subrun_count": len(bucket["subruns"]),
+            "completed_subruns": len(bucket["completed"]),
+            "execution_failure_subruns": len(bucket["execution_failures"]),
+            "true_block_subruns": len(bucket["true_blocks"]),
+            "outcome_unknown_subruns": len(bucket["outcome_unknown"]),
+            "legacy_blocked_failure_subruns": len(bucket["legacy_blocked_failures"]),
+            "operations": sorted(bucket["operations"]),
+            "scope": "bounded_query_result",
+            "semantic_role": "coarse_target_aggregation_not_goal_identity",
+        }
+        for bucket in targets.values()
+    ]
+    summaries.sort(key=lambda entry: (-entry["subrun_count"], entry["target_key"]))
+    return summaries[:MAX_HISTORICAL_TARGET_SUMMARY], len(summaries)
+
 def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(event, dict):
         raise ValueError("Chronik history event must be an object")
@@ -890,6 +962,7 @@ def export_chronik_history_recall(
     items = [_validated_chronik_event_recall(event) for event in raw_events[:limit]]
     pattern_summary, pattern_count = _historical_pattern_summary(items)
     goal_summary, goal_count, unbound_goal_subrun_count = _historical_goal_summary(items)
+    target_summary, target_count = _historical_target_summary(items)
     return {
         "schema_version": 1,
         "kind": "grabowski_operator_historical_recall",
@@ -911,9 +984,13 @@ def export_chronik_history_recall(
         "goal_summary": goal_summary,
         "goal_summary_truncated": goal_count > len(goal_summary),
         "unbound_goal_subrun_count": unbound_goal_subrun_count,
+        "target_count": target_count,
+        "target_summary": target_summary,
+        "target_summary_truncated": target_count > len(target_summary),
         "measurement_limitations": [
             "subrun counts are bounded to this query result",
             "self_block_minutes requires bound start/unblock intervals and is not inferred from event counts",
+            "target summaries are coarse repo/host aggregates and do not establish a Bureau task or PR goal identity",
         ],
         "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
     }
