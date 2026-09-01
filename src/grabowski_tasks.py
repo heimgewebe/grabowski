@@ -8335,11 +8335,19 @@ def grabowski_task_start(
                 raise RuntimeError(
                     "Bureau runtime-refresh executor authority vanished before prelaunch binding"
                 )
+            live_executor_intent = (
+                bureau_runtime_refresh_executor.load_bound_intent(executor_request)
+            )
+            live_executor_authority_contract = (
+                bureau_runtime_refresh_executor.validate_authority_execution_contract(
+                    live_executor_intent
+                )
+            )
             revalidated_executor_lease_binding_request = (
                 _runtime_refresh_prelaunch_lease_binding_request(
                     executor_request,
-                    executor_intent,
-                    executor_authority_contract,
+                    live_executor_intent,
+                    live_executor_authority_contract,
                     task_id,
                     unit,
                 )
@@ -8352,6 +8360,8 @@ def grabowski_task_start(
                 raise RuntimeError(
                     "Bureau runtime-refresh prelaunch authority changed before mutation"
                 )
+            executor_intent = live_executor_intent
+            executor_authority_contract = live_executor_authority_contract
             executor_lease_binding_request = revalidated_executor_lease_binding_request
             executor_lease_binding_plan = (
                 resources.prepare_runtime_refresh_executor_lease_binding(
