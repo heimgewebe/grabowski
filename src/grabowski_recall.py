@@ -680,7 +680,7 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     if schema_version == "agent-run-event.v1":
         if outcome == "blocked" and not blocker:
             raise ValueError("Chronik v1 blocked history event requires blocker_code")
-        if outcome != "blocked" and data.get("blocker_code") is not None:
+        if outcome != "blocked" and "blocker_code" in data:
             raise ValueError("Chronik v1 non-blocked history event carries blocker_code")
     semantics = _historical_outcome_semantics(schema_version, outcome, blocker)
     effective_outcome = semantics["effective_outcome"]

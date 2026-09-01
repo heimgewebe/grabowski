@@ -507,6 +507,22 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(result["goal_summary"][0]["true_block_subruns"], 1)
         self.assertEqual(result["goal_summary"][0]["outcome_unknown_subruns"], 1)
 
+    def test_v1_execution_failure_rejects_null_blocker_field(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["schema_version"] = "agent-run-event.v1"
+        event["kind"] = "agent.run.failed"
+        event["data"]["result"] = "failed"
+        event["data"]["blocker_code"] = None
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+        with self.assertRaisesRegex(ValueError, "non-blocked history event carries blocker_code"):
+            module.export_chronik_history_recall(history)
+
     def test_v1_outcome_unknown_counts_as_true_safety_block(self) -> None:
         module = self._load_module()
         history = self._chronik_history_result(module)
