@@ -1,0 +1,179 @@
+---
+name: PR1013 postreview authority fix
+
+on:
+  push:
+    branches:
+      - fix/pr1013-postreview-authority-20260901-1340
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr1013-postreview-authority-fix
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: fix/pr1013-postreview-authority-20260901-1340
+
+      - name: Apply exact review fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "1b94d4eee72b14263ccba8a83af56fc11278d14d"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, got {count}")
+              return text.replace(old, new, 1)
+
+          resources_path = Path("src/grabowski_resources.py")
+          resources = resources_path.read_text()
+          resources = replace_once(
+              resources,
+              '''def prepare_runtime_refresh_executor_lease_binding(\n    owner_id: str,\n    resource_keys: Iterable[str],\n    executor_unit: str,\n    *,\n    minimum_remaining_seconds: int = 600,\n) -> dict[str, Any]:\n''',
+              '''def prepare_runtime_refresh_executor_lease_binding(\n    owner_id: str,\n    resource_keys: Iterable[str],\n    executor_unit: str,\n    *,\n    minimum_remaining_seconds: int = 600,\n    expected_approval_task_id: str | None = None,\n    expected_intent_sha256: str | None = None,\n) -> dict[str, Any]:\n''',
+              "resource prepare signature",
+          )
+          resources = replace_once(
+              resources,
+              '''        raise ValueError(\n            f"minimum_remaining_seconds must be between {MIN_TTL_SECONDS} and {MAX_TTL_SECONDS}"\n        )\n    now = _now()\n''',
+              '''        raise ValueError(\n            f"minimum_remaining_seconds must be between {MIN_TTL_SECONDS} and {MAX_TTL_SECONDS}"\n        )\n    authority_binding_required = (\n        expected_approval_task_id is not None or expected_intent_sha256 is not None\n    )\n    if authority_binding_required:\n        if (\n            not isinstance(expected_approval_task_id, str)\n            or not expected_approval_task_id\n            or expected_approval_task_id != expected_approval_task_id.strip()\n        ):\n            raise ValueError(\n                "expected_approval_task_id must be a nonempty canonical string"\n            )\n        if (\n            not isinstance(expected_intent_sha256, str)\n            or SHA256_RE.fullmatch(expected_intent_sha256) is None\n        ):\n            raise ValueError("expected_intent_sha256 must be a SHA-256 digest")\n    now = _now()\n''',
+              "resource authority args",
+          )
+          resources = replace_once(
+              resources,
+              '''        if row["metadata_sha256"] != observed_sha256:\n            raise RuntimeError(f"Resource lease metadata integrity mismatch: {key}")\n        if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in metadata:\n''',
+              '''        if row["metadata_sha256"] != observed_sha256:\n            raise RuntimeError(f"Resource lease metadata integrity mismatch: {key}")\n        if authority_binding_required and (\n            metadata.get("approval_task_id") != expected_approval_task_id\n            or metadata.get("intent_sha256") != expected_intent_sha256\n        ):\n            raise PermissionError(\n                f"Runtime-refresh executor lease authority metadata mismatch: {key}"\n            )\n        if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in metadata:\n''',
+              "resource authority metadata guard",
+          )
+          resources_path.write_text(resources)
+
+          tasks_path = Path("src/grabowski_tasks.py")
+          tasks = tasks_path.read_text()
+          tasks = replace_once(
+              tasks,
+              '''    executor_request: dict[str, str] | None = None\n    executor_intent: dict[str, Any] | None = None\n    executor_authority_contract: dict[str, Any] | None = None\n''',
+              '''    executor_request: dict[str, str] | None = None\n    executor_intent: dict[str, Any] | None = None\n    executor_authority_contract: dict[str, Any] | None = None\n    executor_lease_binding_request: dict[str, Any] | None = None\n''',
+              "task prelaunch variable",
+          )
+          tasks = replace_once(
+              tasks,
+              '''    normalized_operation_identity = _normalize_task_operation_identity(\n''',
+              '''    task_id = uuid.uuid4().hex[:24]\n    if executor_request is not None:\n        if executor_intent is None or executor_authority_contract is None:\n            raise RuntimeError(\n                "Bureau runtime-refresh executor authority vanished before prelaunch validation"\n            )\n        executor_lease_binding_request = (\n            _runtime_refresh_prelaunch_lease_binding_request(\n                executor_request,\n                executor_intent,\n                executor_authority_contract,\n                task_id,\n                _task_unit(task_id, 1),\n            )\n        )\n    normalized_operation_identity = _normalize_task_operation_identity(\n''',
+              "task early authority validation",
+          )
+          tasks = replace_once(
+              tasks,
+              '''    task_id = uuid.uuid4().hex[:24]\n    operation_resolution = _resolve_task_operation_identity(\n''',
+              '''    operation_resolution = _resolve_task_operation_identity(\n''',
+              "task duplicate task id",
+          )
+          tasks = replace_once(
+              tasks,
+              '''    executor_prelaunch_recovery: dict[str, Any] | None = None\n    if executor_request is not None and executor_intent is not None:\n        recovery_keys = executor_intent.get("required_resource_keys")\n        if not isinstance(recovery_keys, list):\n            raise ValueError("Bureau runtime-refresh prelaunch resource keys are invalid")\n        executor_prelaunch_recovery = (\n            _reconcile_runtime_refresh_prelaunch_binding_journals(recovery_keys)\n        )\n''',
+              '''    executor_prelaunch_recovery: dict[str, Any] | None = None\n    if executor_request is not None:\n        if executor_lease_binding_request is None:\n            raise RuntimeError(\n                "Bureau runtime-refresh executor lost validated prelaunch authority"\n            )\n        executor_prelaunch_recovery = (\n            _reconcile_runtime_refresh_prelaunch_binding_journals(\n                executor_lease_binding_request["resource_keys"]\n            )\n        )\n''',
+              "task validated recovery keys",
+          )
+          tasks = replace_once(
+              tasks,
+              '''    executor_lease_binding_request: dict[str, Any] | None = None\n    executor_lease_binding_plan: dict[str, Any] | None = None\n''',
+              '''    executor_lease_binding_plan: dict[str, Any] | None = None\n''',
+              "task late request reset",
+          )
+          tasks = replace_once(
+              tasks,
+              '''            executor_lease_binding_request = (\n                _runtime_refresh_prelaunch_lease_binding_request(\n                    executor_request,\n                    executor_intent,\n                    executor_authority_contract,\n                    task_id,\n                    unit,\n                )\n            )\n            executor_lease_binding_plan = (\n                resources.prepare_runtime_refresh_executor_lease_binding(\n                    executor_lease_binding_request["lease_owner"],\n                    executor_lease_binding_request["resource_keys"],\n                    executor_lease_binding_request["executor_unit"],\n                    minimum_remaining_seconds=executor_lease_binding_request[\n                        "minimum_remaining_seconds"\n                    ],\n                )\n            )\n''',
+              '''            revalidated_executor_lease_binding_request = (\n                _runtime_refresh_prelaunch_lease_binding_request(\n                    executor_request,\n                    executor_intent,\n                    executor_authority_contract,\n                    task_id,\n                    unit,\n                )\n            )\n            if (\n                executor_lease_binding_request is None\n                or revalidated_executor_lease_binding_request\n                != executor_lease_binding_request\n            ):\n                raise RuntimeError(\n                    "Bureau runtime-refresh prelaunch authority changed before mutation"\n                )\n            executor_lease_binding_request = revalidated_executor_lease_binding_request\n            executor_lease_binding_plan = (\n                resources.prepare_runtime_refresh_executor_lease_binding(\n                    executor_lease_binding_request["lease_owner"],\n                    executor_lease_binding_request["resource_keys"],\n                    executor_lease_binding_request["executor_unit"],\n                    minimum_remaining_seconds=executor_lease_binding_request[\n                        "minimum_remaining_seconds"\n                    ],\n                    expected_approval_task_id=executor_lease_binding_request[\n                        "lease_task_id"\n                    ],\n                    expected_intent_sha256=executor_lease_binding_request[\n                        "intent_sha256"\n                    ],\n                )\n            )\n''',
+              "task revalidation and prepare binding",
+          )
+          tasks_path.write_text(tasks)
+
+          test_resources_path = Path("tests/test_resources.py")
+          test_resources = test_resources_path.read_text()
+          marker = '''    def test_runtime_refresh_executor_plan_recovery_rejects_bound_drift(self) -> None:\n'''
+          addition = '''    def test_runtime_refresh_executor_prepare_rejects_authority_metadata_mismatch(self) -> None:\n        owner = "runtime-refresh:test-authority-metadata"\n        approval_task_id = "BUREAU-RUNTIME-REFRESH-TEST"\n        intent_sha256 = "d" * 64\n        unit = "grabowski-task-" + "d" * 24 + "-a1.service"\n        cases = (\n            ({"intent_sha256": intent_sha256}, "missing-approval"),\n            (\n                {\n                    "approval_task_id": approval_task_id,\n                    "intent_sha256": "e" * 64,\n                },\n                "wrong-intent",\n            ),\n        )\n        for metadata, suffix in cases:\n            key = f"component:runtime-refresh-authority-{suffix}"\n            original = resources.acquire_resources(\n                owner,\n                [key],\n                purpose="runtime refresh authority metadata",\n                ttl_seconds=1200,\n                metadata=metadata,\n            )["leases"][0]\n            with self.assertRaisesRegex(PermissionError, "authority metadata mismatch"):\n                resources.prepare_runtime_refresh_executor_lease_binding(\n                    owner,\n                    [key],\n                    unit,\n                    expected_approval_task_id=approval_task_id,\n                    expected_intent_sha256=intent_sha256,\n                )\n            self.assertEqual(original, resources.inspect_resource(key))\n            with sqlite3.connect(self.database) as connection:\n                row = connection.execute(\n                    "SELECT metadata_json FROM leases WHERE resource_key=?",\n                    (key,),\n                ).fetchone()\n            self.assertNotIn("executor_unit", json.loads(row[0]))\n\n'''
+          test_resources = replace_once(
+              test_resources,
+              marker,
+              addition + marker,
+              "resource authority regression test",
+          )
+          test_resources_path.write_text(test_resources)
+
+          test_tasks_path = Path("tests/test_tasks.py")
+          test_tasks = test_tasks_path.read_text()
+          replacements = [
+              (
+                  '''        metadata = {"marker": "original"}\n''',
+                  '''        metadata = {\n            "approval_task_id": fixture["approval_task_id"],\n            "intent_sha256": fixture["intent_sha256"],\n            "marker": "original",\n        }\n''',
+                  "precommit valid authority metadata",
+              ),
+              (
+                  '''            metadata={"marker": "ambiguous"},\n''',
+                  '''            metadata={\n                "approval_task_id": fixture["approval_task_id"],\n                "intent_sha256": fixture["intent_sha256"],\n                "marker": "ambiguous",\n            },\n''',
+                  "ambiguous valid authority metadata",
+              ),
+              (
+                  '''            metadata={"marker": "launch"},\n''',
+                  '''            metadata={\n                "approval_task_id": fixture["approval_task_id"],\n                "intent_sha256": fixture["intent_sha256"],\n                "marker": "launch",\n            },\n''',
+                  "launch valid authority metadata",
+              ),
+              (
+                  '''        metadata = {"marker": "orphan-prelaunch"}\n''',
+                  '''        metadata = {\n            "approval_task_id": fixture["approval_task_id"],\n            "intent_sha256": fixture["intent_sha256"],\n            "marker": "orphan-prelaunch",\n        }\n''',
+                  "orphan valid authority metadata",
+              ),
+          ]
+          for old, new, label in replacements:
+              test_tasks = replace_once(test_tasks, old, new, label)
+
+          marker = '''    def test_runtime_refresh_orphan_binding_journal_recovers_after_hard_crash(self) -> None:\n'''
+          addition = '''    def test_runtime_refresh_invalid_authority_precedes_dedup_and_journal_recovery(self) -> None:\n        fixture = self._runtime_refresh_prelaunch_fixture()\n        metadata = {\n            "approval_task_id": fixture["approval_task_id"],\n            "intent_sha256": fixture["intent_sha256"],\n            "marker": "pending-journal",\n        }\n        tasks.resources.acquire_resources(\n            fixture["lease_owner"],\n            fixture["resource_keys"],\n            purpose="runtime refresh pending journal",\n            ttl_seconds=1200,\n            metadata=metadata,\n        )\n        old_task_id = "f" * 24\n        old_unit = f"grabowski-task-{old_task_id}-a1.service"\n        request = tasks._runtime_refresh_prelaunch_lease_binding_request(\n            fixture["request"],\n            fixture["intent"],\n            fixture["authority"],\n            old_task_id,\n            old_unit,\n        )\n        plan = tasks.resources.prepare_runtime_refresh_executor_lease_binding(\n            fixture["lease_owner"],\n            fixture["resource_keys"],\n            old_unit,\n            expected_approval_task_id=fixture["approval_task_id"],\n            expected_intent_sha256=fixture["intent_sha256"],\n        )\n        journal = tasks._runtime_refresh_prelaunch_binding_journal(\n            request,\n            argv_sha256="f" * 64,\n            binding_plan=plan,\n        )\n        tasks._persist_runtime_refresh_prelaunch_binding_journal(journal)\n        tasks.resources.bind_runtime_refresh_executor_leases(\n            fixture["lease_owner"],\n            fixture["resource_keys"],\n            old_unit,\n            prepared_binding=plan,\n        )\n\n        expired_payload = {\n            key: value\n            for key, value in fixture["intent"].items()\n            if key != "intent_sha256"\n        }\n        expired_payload["expires_at"] = "2000-01-01T00:00:00Z"\n        expired_digest = hashlib.sha256(\n            (tasks._canonical_json(expired_payload) + "\\n").encode("utf-8")\n        ).hexdigest()\n        expired_fixture = {\n            **fixture,\n            "intent": {**expired_payload, "intent_sha256": expired_digest},\n            "intent_sha256": expired_digest,\n            "lease_owner": f"runtime-refresh:{expired_digest[:16]}",\n            "request": {\n                **fixture["request"],\n                "expected_intent_sha256": expired_digest,\n                "lease_owner": f"runtime-refresh:{expired_digest[:16]}",\n            },\n        }\n\n        with self._runtime_refresh_start_environment(expired_fixture):\n            with (\n                patch.object(\n                    tasks,\n                    "_resolve_task_operation_identity",\n                    side_effect=AssertionError("dedup resolution must not run"),\n                ) as resolve_operation,\n                patch.object(\n                    tasks,\n                    "_reconcile_runtime_refresh_prelaunch_binding_journals",\n                    side_effect=AssertionError("journal recovery must not run"),\n                ) as reconcile,\n            ):\n                with self.assertRaisesRegex(ValueError, "approval expires too soon"):\n                    tasks.grabowski_task_start(\n                        "local",\n                        expired_fixture["argv"],\n                        cwd=str(tasks.operator.HOME),\n                        runtime_seconds=60,\n                        resume_policy="never",\n                    )\n        resolve_operation.assert_not_called()\n        reconcile.assert_not_called()\n        with sqlite3.connect(self.database) as connection:\n            journal_row = connection.execute(\n                "SELECT value FROM metadata WHERE key=?",\n                (tasks._runtime_refresh_prelaunch_journal_key(old_task_id),),\n            ).fetchone()\n        self.assertIsNotNone(journal_row)\n        self.assertEqual(\n            {old_unit},\n            {\n                item["executor_unit"]\n                for item in self._runtime_refresh_lease_metadata(\n                    fixture["resource_keys"]\n                ).values()\n            },\n        )\n\n'''
+          test_tasks = replace_once(
+              test_tasks,
+              marker,
+              addition + marker,
+              "task invalid authority regression test",
+          )
+          test_tasks_path.write_text(test_tasks)
+          PY
+
+      - name: Validate focused and full suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pytest -q tests/test_resources.py tests/test_tasks.py -k runtime_refresh
+          make validate
+          git diff --check
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          while IFS= read -r p; do
+            case "$p" in
+              src/grabowski_resources.py|src/grabowski_tasks.py|tests/test_resources.py|tests/test_tasks.py) ;;
+              .github/workflows/pr1013-postreview-authority-fix.yml) ;;
+              '') ;;
+              *) echo "forbidden changed path: $p" >&2; exit 65;;
+            esac
+          done <<< "$changed"
+
+      - name: Commit validated fix and remove helper workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr1013-postreview-authority-fix.yml
+          git add src/grabowski_resources.py src/grabowski_tasks.py tests/test_resources.py tests/test_tasks.py
+          git diff --cached --check
+          git commit -m "fix: validate runtime refresh authority before mutation"
+          git push origin HEAD:fix/pr1013-postreview-authority-20260901-1340
