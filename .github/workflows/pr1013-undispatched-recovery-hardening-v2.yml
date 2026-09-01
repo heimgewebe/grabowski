@@ -1,0 +1,61 @@
+---
+name: PR1013 undispatched recovery hardening v2
+
+on:
+  push:
+    branches:
+      - fix/pr1013-undispatched-recovery-hardening-v2-20260901-1755
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr1013-undispatched-recovery-hardening-v2
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: fix/pr1013-undispatched-recovery-hardening-v2-20260901-1755
+
+      - name: Apply verified review hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "4b583d6610888da4bb469356f9960ae55dc6c09e"
+          git fetch --no-tags origin fix/pr1013-undispatched-recovery-hardening-20260901-1732
+          git cat-file -e 7394cbfe16432305166b8c6808e5d0c416c5bd3c^{commit}
+          git show 7394cbfe16432305166b8c6808e5d0c416c5bd3c:.github/pr1013_undispatched_patch.py > /tmp/pr1013_patch.py
+          python3 /tmp/pr1013_patch.py
+          python3 -c 'from pathlib import Path; p=Path("src/grabowski_tasks.py"); s=p.read_text(); old="        not isinstance(launcher, dict)\n        or launcher.get(TASK_OUTPUT_LAUNCHER_BINDING_KEY) != 1\n"; new="        not isinstance(launcher, dict)\n        or launcher.get(\"pending\") is not True\n        or launcher.get(TASK_OUTPUT_LAUNCHER_BINDING_KEY) != 1\n"; assert s.count(old) == 1, s.count(old); p.write_text(s.replace(old, new, 1))'
+          git diff --check
+          changed="$(git diff --name-only)"
+          while IFS= read -r path; do
+            case "$path" in
+              src/grabowski_resources.py|src/grabowski_tasks.py|tests/test_resources.py|tests/test_tasks.py) ;;
+              "") ;;
+              *) echo "unexpected patch path: $path" >&2; exit 65 ;;
+            esac
+          done <<< "$changed"
+
+      - name: Validate repository
+        run: make validate
+
+      - name: Commit validated hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/pr1013-undispatched-recovery-hardening-v2.yml
+          git diff --check
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/grabowski_resources.py src/grabowski_tasks.py tests/test_resources.py tests/test_tasks.py
+          git diff --cached --check
+          git commit -m 'fix: recover undispatched runtime refresh tasks safely'
+          git push origin HEAD:fix/pr1013-undispatched-recovery-hardening-v2-20260901-1755
