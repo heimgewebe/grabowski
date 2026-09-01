@@ -5725,6 +5725,7 @@ class ProductionBlueGreenRuntime:
     connector_switched: bool = False
     current_selector: dict[str, Any] | None = None
     green_readiness: dict[str, Any] | None = None
+    agent_instruction_transition: dict[str, Any] | None = None
     platform_publication: dict[str, Any] | None = None
     source_complete_schema_sha256: str | None = None
     snapshot_rebind_mode: str = "external_client"
@@ -5795,6 +5796,47 @@ class ProductionBlueGreenRuntime:
             )
         self.green_readiness = readiness
         return readiness
+
+    def prepare_agent_instruction_transition(self) -> dict[str, Any] | None:
+        """Preflight one instruction change before Blue drain or selector switch."""
+        if self.green_readiness is None:
+            core.fail(
+                "Green readiness is unavailable for agent-instruction transition",
+                phase="snapshot-authenticity-preflight",
+            )
+        expected_source_identity = _deployment_source_identity_sha256(self.snapshot)
+        if self.deployment_source_identity_sha256 != expected_source_identity:
+            core.fail(
+                "Deployment source identity does not bind the agent-instruction transition",
+                phase="snapshot-authenticity-preflight",
+                details={
+                    "expected_source_identity_sha256": expected_source_identity,
+                    "provided_source_identity_sha256": self.deployment_source_identity_sha256,
+                },
+            )
+        try:
+            transition = client_snapshot.prepare_agent_instructions_transition_for_cutover(
+                cutover_id=self.cutover_id,
+                source_release_id=self.blue_binding["release_id"],
+                source_repo_head=self.blue_binding["repo_head"],
+                target_release_id=self.green_binding["release_id"],
+                target_repo_head=self.green_binding["repo_head"],
+                source_agent_instructions_sha256=self.blue_binding[
+                    "agent_instructions_sha256"
+                ],
+                target_agent_instructions_sha256=self.green_binding[
+                    "agent_instructions_sha256"
+                ],
+                deployment_source_identity_sha256=expected_source_identity,
+                green_readiness=self.green_readiness,
+            )
+        except client_snapshot.ClientSnapshotError as exc:
+            core.fail(
+                str(exc),
+                phase="snapshot-authenticity-preflight",
+            )
+        self.agent_instruction_transition = transition
+        return transition
 
     def _blue_platform_publication_contract(self) -> dict[str, Any]:
         if self.source_complete_schema_sha256 is None:
@@ -6030,7 +6072,15 @@ class ProductionBlueGreenRuntime:
                 "agent_instructions_sha256"
             ],
             green_readiness=self.green_readiness,
+            deployment_source_identity_sha256=(
+                self.deployment_source_identity_sha256
+            ),
         )
+        if result.get("agent_instructions_transition") != self.agent_instruction_transition:
+            core.fail(
+                "Snapshot rebind agent-instruction transition differs from preflight",
+                phase="snapshot-rebind",
+            )
         return {**result, "platform_publication": self.platform_publication}
 
     def retire_blue(self) -> dict[str, Any]:
@@ -6168,18 +6218,10 @@ def prepare_production_blue_green_runtime(
     green_binding, _ = transport_ingress._read_runtime_binding(
         build.release_path / core.MANIFEST_NAME
     )
-    # Tool count/name/schema changes are authorized later by the existing
-    # Publication-v2 request after Green is independently verified.  Agent
-    # instructions are not part of that contract and therefore remain strict
-    # continuity here.
-    if (
-        blue_binding["agent_instructions_sha256"]
-        != green_binding["agent_instructions_sha256"]
-    ):
-        core.fail(
-            "No authentic prior connector declaration covers changed green agent instructions",
-            phase="snapshot-authenticity-preflight",
-        )
+    # Tool/schema and agent-instruction changes are both evaluated only after
+    # Green is independently verified.  The latter uses a separate deployment-
+    # source-bound transition and never upgrades the historical Blue client
+    # declaration into evidence that a client already observed Green instructions.
     blue_entrypoint = blue_manifest.get("entrypoint_contract")
     blue_tools = (
         blue_entrypoint.get("expected_tools")
@@ -6501,6 +6543,7 @@ def _production_blue_green_receipt(
         "phase": phase,
         "outcome": outcome,
         "green_readiness": green_readiness,
+        "agent_instruction_transition": runtime.agent_instruction_transition,
         "selector_switch": selector_switch,
         "snapshot_rebind": snapshot_rebind,
         "effect_terminalization": drain,
@@ -6557,6 +6600,7 @@ def _production_blue_green_preflight_failure_receipt(
         "phase": "failed_pre_cutover",
         "outcome": "failed_pre_cutover",
         "green_readiness": None,
+        "agent_instruction_transition": None,
         "selector_switch": None,
         "snapshot_rebind": None,
         "effect_terminalization": None,
@@ -6667,6 +6711,20 @@ def run_production_blue_green_cutover(
                 details={
                     "ready": True,
                     "readiness_sha256": _json_sha256(green_readiness),
+                },
+            )
+            phase = "agent_instruction_transition_preflight"
+            instruction_transition = context.prepare_agent_instruction_transition()
+            _blue_green_observation(
+                observations,
+                phase=phase,
+                details={
+                    "instructions_changed": instruction_transition is not None,
+                    "transition_sha256": (
+                        instruction_transition.get("transition_sha256")
+                        if isinstance(instruction_transition, dict)
+                        else None
+                    ),
                 },
             )
             phase = "platform_publication_preflight"
@@ -7435,6 +7493,9 @@ class MidCutoverResumeRuntime:
                 self.resume_binding["agent_instructions_sha256"]
             ),
             green_readiness=readiness,
+            deployment_source_identity_sha256=str(
+                self.resume_binding["source_identity_sha256"]
+            ),
             expected_state=canonical_state,
             source_snapshot_receipt_sha256=str(
                 self.resume_binding["source_snapshot_receipt_sha256"]
@@ -7675,6 +7736,9 @@ class MidCutoverResumeRuntime:
                 "agent_instructions_sha256"
             ],
             green_readiness=self.green_readiness,
+            source_identity_sha256=str(
+                self.resume_binding["source_identity_sha256"]
+            ),
             snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
         )
         if (
@@ -7788,6 +7852,9 @@ class MidCutoverResumeRuntime:
                 self.resume_binding["agent_instructions_sha256"]
             ),
             green_readiness=readiness,
+            source_identity_sha256=str(
+                self.resume_binding["source_identity_sha256"]
+            ),
             snapshot_inspector=client_snapshot.inspect_cutover_snapshot_binding,
         )
 

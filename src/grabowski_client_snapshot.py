@@ -1031,6 +1031,78 @@ def _authorized_publication_schema_transition(
     return {**material, "transition_sha256": _sha256_json(material)}
 
 
+def prepare_agent_instructions_transition_for_cutover(
+    *,
+    cutover_id: str,
+    source_release_id: str,
+    source_repo_head: str,
+    target_release_id: str,
+    target_repo_head: str,
+    source_agent_instructions_sha256: str,
+    target_agent_instructions_sha256: str,
+    deployment_source_identity_sha256: str | None,
+    green_readiness: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Bind changed agent instructions to exact deployment and Green evidence."""
+    _validate_identifier(cutover_id, label="cutover_id")
+    source_instructions = _require_authentic_digest(
+        source_agent_instructions_sha256,
+        label="source agent_instructions_sha256",
+    )
+    target_instructions = _require_authentic_digest(
+        target_agent_instructions_sha256,
+        label="target agent_instructions_sha256",
+    )
+    if source_instructions == target_instructions:
+        return None
+    source_identity = _require_authentic_digest(
+        deployment_source_identity_sha256,
+        label="deployment source identity sha256",
+    )
+    source_release = _validate_release_id(
+        source_release_id, label="source release id"
+    )
+    target_release = _validate_release_id(
+        target_release_id, label="target release id"
+    )
+    for label, head in (
+        ("source repository head", source_repo_head),
+        ("target repository head", target_repo_head),
+    ):
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40,64}", head) is None:
+            raise ClientSnapshotError(f"{label} is invalid")
+    if (
+        not isinstance(green_readiness, dict)
+        or green_readiness.get("ready") is not True
+        or green_readiness.get("release_id") != target_release
+        or green_readiness.get("repo_head") != target_repo_head
+        or green_readiness.get("agent_instructions_sha256") != target_instructions
+    ):
+        raise ClientSnapshotError(
+            "green readiness does not bind the agent-instructions transition target"
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_agent_instructions_transition",
+        "cutover_id": cutover_id,
+        "source_release_id": source_release,
+        "source_repo_head": source_repo_head,
+        "target_release_id": target_release,
+        "target_repo_head": target_repo_head,
+        "source_agent_instructions_sha256": source_instructions,
+        "target_agent_instructions_sha256": target_instructions,
+        "deployment_source_identity_sha256": source_identity,
+        "green_readiness_sha256": _sha256_json(green_readiness),
+        "evidence_model": "exact-deployment-source+green-runtime-readiness-v1",
+        "does_not_establish": [
+            "that any client has observed the changed green agent instructions",
+            "client instruction compliance",
+            "platform connector catalog publication",
+        ],
+    }
+    return {**material, "transition_sha256": _sha256_json(material)}
+
+
 def _rebind_snapshot_for_cutover(
     *,
     cutover_id: str,
@@ -1054,6 +1126,7 @@ def _rebind_snapshot_for_cutover(
     expected_source_snapshot_receipt_sha256: str | None = None,
     expected_source_client_declaration_sha256: str | None = None,
     expected_classified_snapshot_receipt_sha256: str | None = None,
+    deployment_source_identity_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Rebind one prior blue declaration to independently verified Green.
 
@@ -1208,13 +1281,18 @@ def _rebind_snapshot_for_cutover(
             raise ClientSnapshotError(
                 "authentic connector snapshot source binding is internally inconsistent"
             )
-        # Publication-v2 binds the target tool contract (count, names and schemas),
-        # but it does not bind agent instructions.  Keep that dimension on strict
-        # historical continuity instead of silently widening publication authority.
-        if source_instructions_sha256 != instructions_sha256:
-            raise ClientSnapshotError(
-                "green agent instructions differ from the authentic blue declaration"
-            )
+        instruction_transition = prepare_agent_instructions_transition_for_cutover(
+            cutover_id=cutover_binding["cutover_id"],
+            source_release_id=current_release,
+            source_repo_head=current_repo_head,
+            target_release_id=green_release,
+            target_repo_head=green_repo_head,
+            source_agent_instructions_sha256=source_instructions_sha256,
+            target_agent_instructions_sha256=instructions_sha256,
+            deployment_source_identity_sha256=deployment_source_identity_sha256,
+            green_readiness=green_readiness,
+        )
+        instructions_changed = instruction_transition is not None
         for label, value in (
             ("observed names hash", declaration.get("observed_names_sha256")),
             (
@@ -1327,6 +1405,8 @@ def _rebind_snapshot_for_cutover(
             "target_complete_schema_sha256": green_complete_schema_sha256,
             "schema_changed": schema_changed,
             "surface_changed": surface_changed,
+            "instructions_changed": instructions_changed,
+            "agent_instructions_transition": instruction_transition,
             "surface_continuity_sha256": _sha256_json(
                 {
                     "registered_tool_count": source_tool_count,
@@ -1340,16 +1420,23 @@ def _rebind_snapshot_for_cutover(
             "publication_schema_transition": schema_transition,
         }
         nonclaims = list(additional_nonclaims)
+        model = verification_model
         if surface_changed:
-            model = f"{verification_model}+publication-v2-schema-transition-v1"
+            model += "+publication-v2-schema-transition-v1"
             for limitation in (
                 "that any client has observed the changed green tool surface",
                 "current green schema observability from the preserved historical evidence",
             ):
                 if limitation not in nonclaims:
                     nonclaims.append(limitation)
-        else:
-            model = verification_model
+        if instructions_changed:
+            model += "+agent-instructions-transition-v1"
+            for limitation in (
+                "that any client has observed the changed green agent instructions",
+                "client instruction compliance after the transition",
+            ):
+                if limitation not in nonclaims:
+                    nonclaims.append(limitation)
         receipt = {
             "schema_version": SNAPSHOT_SCHEMA_VERSION,
             "kind": SNAPSHOT_KIND,
@@ -1397,11 +1484,17 @@ def _rebind_snapshot_for_cutover(
         "schema_contract_matches": not surface_changed,
         "schema_changed": schema_changed,
         "surface_changed": surface_changed,
+        "instructions_changed": instructions_changed,
+        "agent_instructions_transition": instruction_transition,
         "publication_schema_transition": schema_transition,
         "recommended_next_action": (
-            "capture a fresh client observation of the changed green surface"
-            if surface_changed
-            else recommended_next_action
+            "capture a fresh client observation of the changed green agent instructions"
+            if instructions_changed
+            else (
+                "capture a fresh client observation of the changed green surface"
+                if surface_changed
+                else recommended_next_action
+            )
         ),
         "does_not_establish": list(receipt["does_not_establish"]),
     }
@@ -2835,6 +2928,7 @@ def rebind_authentic_snapshot_for_cutover(
     registered_names_sha256: str,
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
+    deployment_source_identity_sha256: str | None = None,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     """Preserve a fresh external-client Blue declaration across cutover."""
@@ -2862,6 +2956,7 @@ def rebind_authentic_snapshot_for_cutover(
             "application success of any tool call",
             "resistance to compromised same-uid code",
         ),
+        deployment_source_identity_sha256=deployment_source_identity_sha256,
         now_unix=now_unix,
     )
 
@@ -2878,6 +2973,7 @@ def rebind_server_loopback_snapshot_for_cutover(
     registered_names_sha256: str,
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
+    deployment_source_identity_sha256: str | None = None,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     """Preserve verified server-loopback continuity without claiming platform refresh."""
@@ -2906,6 +3002,7 @@ def rebind_server_loopback_snapshot_for_cutover(
             "application success of any tool call",
             "resistance to compromised same-uid code",
         ),
+        deployment_source_identity_sha256=deployment_source_identity_sha256,
         now_unix=now_unix,
     )
 
@@ -3068,6 +3165,7 @@ def rebind_snapshot_for_midcutover_recovery(
         expected_classified_snapshot_receipt_sha256=(
             classified_snapshot_receipt_sha256
         ),
+        deployment_source_identity_sha256=receipt.get("source_identity_sha256"),
     )
 
 
@@ -3102,6 +3200,7 @@ def inspect_cutover_snapshot_binding(
     registered_names_sha256: str,
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
+    deployment_source_identity_sha256: str | None = None,
     path: Path = SNAPSHOT_PATH,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
@@ -3131,7 +3230,9 @@ def inspect_cutover_snapshot_binding(
         "source_evidence_time": source_evidence_time,
         "publication_request_id": publication_request_id,
         "publication_transition_sha256": None,
+        "agent_instructions_transition_sha256": None,
         "schema_changed": None,
+        "instructions_changed": None,
         "error": None,
     }
     try:
@@ -3255,10 +3356,18 @@ def inspect_cutover_snapshot_binding(
             observation["state"] = SNAPSHOT_BINDING_FOREIGN
             observation["error"] = "client snapshot server binding names another surface"
             return observation
-        if source_instructions_sha256 != instructions_sha256:
-            observation["state"] = SNAPSHOT_BINDING_FOREIGN
-            observation["error"] = "green agent instructions differ from the blue declaration"
-            return observation
+        instruction_transition = prepare_agent_instructions_transition_for_cutover(
+            cutover_id=cutover_id,
+            source_release_id=source_release,
+            source_repo_head=source_repo_head,
+            target_release_id=target_release,
+            target_repo_head=target_repo_head,
+            source_agent_instructions_sha256=source_instructions_sha256,
+            target_agent_instructions_sha256=instructions_sha256,
+            deployment_source_identity_sha256=deployment_source_identity_sha256,
+            green_readiness=green_readiness,
+        )
+        instructions_changed = instruction_transition is not None
 
         observed_artifact = schema_evidence.get("observed_artifact")
         if not isinstance(observed_artifact, dict):
@@ -3326,6 +3435,7 @@ def inspect_cutover_snapshot_binding(
                 ),
                 "schema_changed": schema_changed,
                 "surface_changed": surface_changed,
+                "instructions_changed": instructions_changed,
                 "current_publication_authorized": current_authorization is not None
                 if surface_changed
                 else True,
@@ -3383,6 +3493,8 @@ def inspect_cutover_snapshot_binding(
                 transition.get("surface_changed", transition.get("schema_changed"))
                 is not surface_changed
             )
+            or transition.get("instructions_changed", False) is not instructions_changed
+            or transition.get("agent_instructions_transition") != instruction_transition
             or transition.get("green_readiness_sha256") != _sha256_json(green_readiness)
             or transition.get("surface_continuity_sha256")
             != _sha256_json(
@@ -3527,6 +3639,10 @@ def inspect_cutover_snapshot_binding(
             observation["error"] = "unchanged schema carries a publication transition"
             return observation
         observation["state"] = SNAPSHOT_BINDING_REBOUND
+        if instruction_transition is not None:
+            observation["agent_instructions_transition_sha256"] = (
+                instruction_transition["transition_sha256"]
+            )
         observation["source_receipt_sha256"] = source_receipt_sha256
         observation["source_snapshot_receipt_sha256"] = source_receipt_sha256
         observation["source_client_declaration_sha256"] = (
@@ -3558,6 +3674,7 @@ def cutover_snapshot_effect_guard(
     registered_names_sha256: str,
     agent_instructions_sha256: str,
     green_readiness: dict[str, Any],
+    deployment_source_identity_sha256: str | None = None,
     expected_state: str,
     source_snapshot_receipt_sha256: str,
     source_client_declaration_sha256: str,
@@ -3602,6 +3719,7 @@ def cutover_snapshot_effect_guard(
             registered_names_sha256=registered_names_sha256,
             agent_instructions_sha256=agent_instructions_sha256,
             green_readiness=green_readiness,
+            deployment_source_identity_sha256=deployment_source_identity_sha256,
             path=path,
         )
         if (
@@ -4158,6 +4276,25 @@ def snapshot_status(
         and isinstance(transition.get("publication_schema_transition"), dict)
         else None
     )
+    agent_instructions_transition = (
+        transition.get("agent_instructions_transition")
+        if isinstance(transition, dict)
+        and isinstance(transition.get("agent_instructions_transition"), dict)
+        else None
+    )
+    agent_instructions_transition_hash_valid = False
+    if isinstance(agent_instructions_transition, dict):
+        declared_instruction_transition_sha256 = agent_instructions_transition.get(
+            "transition_sha256"
+        )
+        unsigned_instruction_transition = dict(agent_instructions_transition)
+        unsigned_instruction_transition.pop("transition_sha256", None)
+        agent_instructions_transition_hash_valid = (
+            isinstance(declared_instruction_transition_sha256, str)
+            and _SHA256_RE.fullmatch(declared_instruction_transition_sha256) is not None
+            and _sha256_json(unsigned_instruction_transition)
+            == declared_instruction_transition_sha256
+        )
     publication_transition_hash_valid = False
     if isinstance(publication_transition, dict):
         declared_transition_sha256 = publication_transition.get("transition_sha256")
@@ -4179,9 +4316,27 @@ def snapshot_status(
         and publication_transition.get("target_tool_count") == expected_tool_count
         and publication_transition.get("target_names_sha256") == expected_names_sha256
     )
-    declaration_matches = (
-        declaration.get("observed_agent_instructions_sha256")
+    historical_agent_instructions_match = (
+        transition_matches
+        and transition.get("instructions_changed", False) is True
+        and agent_instructions_transition_hash_valid
+        and agent_instructions_transition.get("source_release_id")
+        == declaration.get("observed_release_id")
+        and agent_instructions_transition.get("target_release_id")
+        == expected_release_id
+        and agent_instructions_transition.get("target_repo_head")
+        == expected_repo_head
+        and agent_instructions_transition.get("source_agent_instructions_sha256")
+        == declaration.get("observed_agent_instructions_sha256")
+        and agent_instructions_transition.get("target_agent_instructions_sha256")
         == expected_agent_instructions_sha256
+    )
+    declaration_matches = (
+        (
+            declaration.get("observed_agent_instructions_sha256")
+            == expected_agent_instructions_sha256
+            or historical_agent_instructions_match
+        )
         and (
             (
                 declaration.get("observed_tool_count") == expected_tool_count
@@ -4210,13 +4365,16 @@ def snapshot_status(
         and declaration_matches
     )
     historical_surface_identity_changed = (
-        historical_surface_matches
-        and (
-            publication_transition.get("source_tool_count")
-            != publication_transition.get("target_tool_count")
-            or publication_transition.get("source_names_sha256")
-            != publication_transition.get("target_names_sha256")
+        (
+            historical_surface_matches
+            and (
+                publication_transition.get("source_tool_count")
+                != publication_transition.get("target_tool_count")
+                or publication_transition.get("source_names_sha256")
+                != publication_transition.get("target_names_sha256")
+            )
         )
+        or historical_agent_instructions_match
     )
     # Publication-v2 authorizes the target surface; it never upgrades a Blue
     # declaration into evidence that a client observed different Green tool
@@ -4290,16 +4448,21 @@ def snapshot_status(
     elif not matched:
         state = "mismatch"
         next_action = "refresh the connector tool snapshot and bind it again"
-    elif historical_schema_evidence_only:
-        # The runtime is fine and the binding holds; what is missing is a look at
-        # the new surface.  Saying that plainly matters: an operator who reads
-        # this as a runtime fault will start debugging a healthy deployment.
+    elif historical_schema_evidence_only or historical_agent_instructions_match:
+        # The runtime is fine and the binding holds; what is missing is a fresh
+        # observation of whichever Green identity dimension changed.
         state = "matched"
-        next_action = (
-            "capture a fresh client observation of the changed green tool schema, "
-            "bind it, then reconcile the platform publication; the runtime itself "
-            "is bound and healthy and needs no repair"
-        )
+        if historical_schema_evidence_only:
+            next_action = (
+                "capture a fresh client observation of the changed green tool schema, "
+                "bind it, then reconcile the platform publication; the runtime itself "
+                "is bound and healthy and needs no repair"
+            )
+        else:
+            next_action = (
+                "capture a fresh client observation of the changed green agent instructions "
+                "and bind it; the runtime itself is bound and healthy and needs no repair"
+            )
     else:
         state = "matched"
         next_action = (
@@ -4330,7 +4493,13 @@ def snapshot_status(
         "schema_observable": external_client_schema_observable,
         "schema_evidence_observed": schema_evidence_observed,
         "historical_schema_evidence_only": historical_schema_evidence_only,
-        "fresh_client_observation_required": historical_schema_evidence_only,
+        "historical_agent_instructions_only": historical_agent_instructions_match,
+        "fresh_client_observation_required": (
+            historical_schema_evidence_only or historical_agent_instructions_match
+        ),
+        "connector_agent_instructions_transition": (
+            agent_instructions_transition if historical_agent_instructions_match else None
+        ),
         "runtime_fault_indicated": False,
         "connector_schema_transition": (
             transition.get("publication_schema_transition")
