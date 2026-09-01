@@ -10232,7 +10232,11 @@ class TaskTests(unittest.TestCase):
 
     def test_runtime_refresh_task_precommit_failure_restores_external_leases(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
-        metadata = {"marker": "original"}
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+            "marker": "original",
+        }
         acquired = tasks.resources.acquire_resources(
             fixture["lease_owner"],
             fixture["resource_keys"],
@@ -10272,7 +10276,11 @@ class TaskTests(unittest.TestCase):
             fixture["resource_keys"],
             purpose="runtime refresh ambiguous commit",
             ttl_seconds=1200,
-            metadata={"marker": "ambiguous"},
+            metadata={
+                "approval_task_id": fixture["approval_task_id"],
+                "intent_sha256": fixture["intent_sha256"],
+                "marker": "ambiguous",
+            },
         )
         real_database_connection = tasks._database_connection
 
@@ -10328,7 +10336,11 @@ class TaskTests(unittest.TestCase):
             fixture["resource_keys"],
             purpose="runtime refresh launch failure",
             ttl_seconds=1200,
-            metadata={"marker": "launch"},
+            metadata={
+                "approval_task_id": fixture["approval_task_id"],
+                "intent_sha256": fixture["intent_sha256"],
+                "marker": "launch",
+            },
         )
         with self._runtime_refresh_start_environment(fixture):
             with patch.object(tasks, "_launch", side_effect=RuntimeError("forced launch failure")):
@@ -10349,9 +10361,116 @@ class TaskTests(unittest.TestCase):
         self.assertEqual({row[1]}, {item["executor_unit"] for item in metadata_by_key.values()})
 
 
+    def test_runtime_refresh_invalid_authority_precedes_dedup_and_journal_recovery(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+            "marker": "pending-journal",
+        }
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh pending journal",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        old_task_id = "f" * 24
+        old_unit = f"grabowski-task-{old_task_id}-a1.service"
+        request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"],
+            fixture["intent"],
+            fixture["authority"],
+            old_task_id,
+            old_unit,
+        )
+        plan = tasks.resources.prepare_runtime_refresh_executor_lease_binding(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            expected_approval_task_id=fixture["approval_task_id"],
+            expected_intent_sha256=fixture["intent_sha256"],
+        )
+        journal = tasks._runtime_refresh_prelaunch_binding_journal(
+            request,
+            argv_sha256="f" * 64,
+            binding_plan=plan,
+        )
+        tasks._persist_runtime_refresh_prelaunch_binding_journal(journal)
+        tasks.resources.bind_runtime_refresh_executor_leases(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            prepared_binding=plan,
+        )
+
+        expired_payload = {
+            key: value
+            for key, value in fixture["intent"].items()
+            if key != "intent_sha256"
+        }
+        expired_payload["expires_at"] = "2000-01-01T00:00:00Z"
+        expired_digest = hashlib.sha256(
+            (tasks._canonical_json(expired_payload) + "\n").encode("utf-8")
+        ).hexdigest()
+        expired_fixture = {
+            **fixture,
+            "intent": {**expired_payload, "intent_sha256": expired_digest},
+            "intent_sha256": expired_digest,
+            "lease_owner": f"runtime-refresh:{expired_digest[:16]}",
+            "request": {
+                **fixture["request"],
+                "expected_intent_sha256": expired_digest,
+                "lease_owner": f"runtime-refresh:{expired_digest[:16]}",
+            },
+        }
+
+        with self._runtime_refresh_start_environment(expired_fixture):
+            with (
+                patch.object(
+                    tasks,
+                    "_resolve_task_operation_identity",
+                    side_effect=AssertionError("dedup resolution must not run"),
+                ) as resolve_operation,
+                patch.object(
+                    tasks,
+                    "_reconcile_runtime_refresh_prelaunch_binding_journals",
+                    side_effect=AssertionError("journal recovery must not run"),
+                ) as reconcile,
+            ):
+                with self.assertRaisesRegex(ValueError, "approval expires too soon"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        expired_fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        resolve_operation.assert_not_called()
+        reconcile.assert_not_called()
+        with sqlite3.connect(self.database) as connection:
+            journal_row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks._runtime_refresh_prelaunch_journal_key(old_task_id),),
+            ).fetchone()
+        self.assertIsNotNone(journal_row)
+        self.assertEqual(
+            {old_unit},
+            {
+                item["executor_unit"]
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            },
+        )
+
     def test_runtime_refresh_orphan_binding_journal_recovers_after_hard_crash(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
-        metadata = {"marker": "orphan-prelaunch"}
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+            "marker": "orphan-prelaunch",
+        }
         original = tasks.resources.acquire_resources(
             fixture["lease_owner"],
             fixture["resource_keys"],

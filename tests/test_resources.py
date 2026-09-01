@@ -6217,6 +6217,46 @@ class ResourceTests(unittest.TestCase):
             ).fetchone()
         self.assertNotIn("executor_unit", json.loads(row[0]))
 
+    def test_runtime_refresh_executor_prepare_rejects_authority_metadata_mismatch(self) -> None:
+        owner = "runtime-refresh:test-authority-metadata"
+        approval_task_id = "BUREAU-RUNTIME-REFRESH-TEST"
+        intent_sha256 = "d" * 64
+        unit = "grabowski-task-" + "d" * 24 + "-a1.service"
+        cases = (
+            ({"intent_sha256": intent_sha256}, "missing-approval"),
+            (
+                {
+                    "approval_task_id": approval_task_id,
+                    "intent_sha256": "e" * 64,
+                },
+                "wrong-intent",
+            ),
+        )
+        for metadata, suffix in cases:
+            key = f"component:runtime-refresh-authority-{suffix}"
+            original = resources.acquire_resources(
+                owner,
+                [key],
+                purpose="runtime refresh authority metadata",
+                ttl_seconds=1200,
+                metadata=metadata,
+            )["leases"][0]
+            with self.assertRaisesRegex(PermissionError, "authority metadata mismatch"):
+                resources.prepare_runtime_refresh_executor_lease_binding(
+                    owner,
+                    [key],
+                    unit,
+                    expected_approval_task_id=approval_task_id,
+                    expected_intent_sha256=intent_sha256,
+                )
+            self.assertEqual(original, resources.inspect_resource(key))
+            with sqlite3.connect(self.database) as connection:
+                row = connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?",
+                    (key,),
+                ).fetchone()
+            self.assertNotIn("executor_unit", json.loads(row[0]))
+
     def test_runtime_refresh_executor_plan_recovery_rejects_bound_drift(self) -> None:
         owner = "runtime-refresh:test-plan-drift"
         key = "component:runtime-refresh-plan-drift"
