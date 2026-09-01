@@ -205,6 +205,14 @@ This documentation change is the first prospective acceptance target under the d
 
 Pilot 2 must then produce its own fresh runtime-deployment plan, durable run reference, Captain deployment result, exact deployment-identity convergence and reference-based `saga-settle == settled`. Historical merges, prerequisite deployments, inline-only receipts and later `main` identities are not substitutes for those prospective proofs.
 
+### Prospective identity-freeze retry — 2026-09-01
+
+PR #1014 proved that durable run-receipt recovery alone is insufficient when the PR identity changes after `saga-run`. Its verified durable Saga run was bound to head `329e245fc97ead824ffe7b15ef5c09c044f2570b` on base `a06790d1e48fe45aa43e13738af458498357be8f`, while the eventual merge used head `a1e54222e9ffe0c192d09ac433eb77b837b7f27a` on base `ec705f2d44b525c23cb6da2ad4ec3aa55628945c`. No later verified Saga run in the inspected audit material targets that final #1014 identity, so #1014 is not promoted to pilot success.
+
+The next prospective attempt changes the order of operations. The PR must first converge to current `main`, complete its required CI/review gates, and reach a mergeable exact head/base/diff. Only then may `saga-plan` and `saga-run` be created. Once `saga-run` returns its verified durable run reference, the PR head and base are frozen: no update-branch, rebase, force-push, new commit, or other identity-changing action is permitted. Any later base drift invalidates that attempt and requires a new plan/run before Captain rather than rebinding the existing receipt.
+
+Captain execution must therefore occur in the same stable identity window as the post-CI Saga run. Settlement must use the resulting `VerifiedSagaRunReceiptRef.v1` plus the exact verified Captain completion reference and authoritative GitHub readback. Only `saga-settle == settled` for that unchanged identity establishes pilot 1 and releases its exact merge commit as the sole deployment target for pilot 2.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
