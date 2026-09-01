@@ -54,8 +54,58 @@ class ProcessReferenceObserverTests(unittest.TestCase):
             Path("/home/alex/repos/.commonworld-worktrees"),
             Path("/home/alex/repos/.plexer-worktrees"),
             Path("/home/alex/repos/.worktree-target-quarantine"),
+            Path("/home/alex/.cache/heim-pc/managed-builds"),
+            Path("/home/alex/.cache/pip"),
+            Path("/home/alex/.cache/uv"),
+            Path("/home/alex/.cache/ms-playwright"),
+            Path("/home/alex/.local/share/Trash"),
+            Path("/home/alex/.local/share/grabowski-mcp-releases"),
+            Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
+            Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
         }
+        lexical_expected = (
+            Path("/home/alex/.cache/heim-pc/managed-builds"),
+            Path("/home/alex/.cache/pip"),
+            Path("/home/alex/.cache/uv"),
+            Path("/home/alex/.cache/ms-playwright"),
+            Path("/home/alex/.local/share/Trash"),
+            Path("/home/alex/.local/share/grabowski-mcp-releases"),
+            Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
+            Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
+        )
         self.assertEqual(set(observer.ALLOWED_ROOTS), expected)
+        self.assertEqual(observer.LEXICAL_ONLY_ROOTS, lexical_expected)
+
+    def test_lexical_only_root_needs_no_broker_filesystem_visibility(self) -> None:
+        root = Path("/home/alex/.cache/pip")
+        with patch.object(observer, "ALLOWED_ROOTS", (root,)), patch.object(
+            observer, "LEXICAL_ONLY_ROOTS", (root,)
+        ), patch.object(
+            Path, "lstat", side_effect=AssertionError("lstat must not run")
+        ):
+            self.assertEqual(
+                observer._validate_root(str(root), target_uid=observer.EXPECTED_TARGET_UID),
+                root,
+            )
+
+    def test_lexical_only_root_must_match_exactly(self) -> None:
+        root = Path("/home/alex/.cache/pip")
+        with patch.object(observer, "ALLOWED_ROOTS", (root,)), patch.object(
+            observer, "LEXICAL_ONLY_ROOTS", (root,)
+        ), self.assertRaisesRegex(
+            observer.ObservationError, "must match an exact allowed root"
+        ):
+            observer._validate_root(
+                str(root / "child"), target_uid=observer.EXPECTED_TARGET_UID
+            )
+
+    def test_lexical_only_request_root_still_matches_descendant_reference(self) -> None:
+        root = Path("/home/alex/.cache/pip")
+        descendant = root / "http-v2" / "artifact"
+        self.assertEqual(
+            observer._matching_root(str(descendant), [root]),
+            (root, descendant),
+        )
 
     def make_root(self) -> tempfile.TemporaryDirectory[str]:
         return tempfile.TemporaryDirectory(prefix="observer-root-")
