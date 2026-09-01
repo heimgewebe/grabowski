@@ -1,0 +1,77 @@
+---
+name: PR1013 live authority revalidation fix
+
+on:
+  push:
+    branches:
+      - fix/pr1013-live-authority-revalidation-20260901-1408
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr1013-live-authority-revalidation-fix
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: fix/pr1013-live-authority-revalidation-20260901-1408
+
+      - name: Apply live authority revalidation fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "0712394514333169e3c9d7ee2add07752e2b2177"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, got {count}")
+              return text.replace(old, new, 1)
+
+          tasks_path = Path("src/grabowski_tasks.py")
+          tasks = tasks_path.read_text()
+          old = '''            revalidated_executor_lease_binding_request = (\n                _runtime_refresh_prelaunch_lease_binding_request(\n                    executor_request,\n                    executor_intent,\n                    executor_authority_contract,\n                    task_id,\n                    unit,\n                )\n            )\n            if (\n                executor_lease_binding_request is None\n                or revalidated_executor_lease_binding_request\n                != executor_lease_binding_request\n            ):\n                raise RuntimeError(\n                    "Bureau runtime-refresh prelaunch authority changed before mutation"\n                )\n            executor_lease_binding_request = revalidated_executor_lease_binding_request\n'''
+          new = '''            live_executor_intent = (\n                bureau_runtime_refresh_executor.load_bound_intent(executor_request)\n            )\n            live_executor_authority_contract = (\n                bureau_runtime_refresh_executor.validate_authority_execution_contract(\n                    live_executor_intent\n                )\n            )\n            revalidated_executor_lease_binding_request = (\n                _runtime_refresh_prelaunch_lease_binding_request(\n                    executor_request,\n                    live_executor_intent,\n                    live_executor_authority_contract,\n                    task_id,\n                    unit,\n                )\n            )\n            if (\n                executor_lease_binding_request is None\n                or revalidated_executor_lease_binding_request\n                != executor_lease_binding_request\n            ):\n                raise RuntimeError(\n                    "Bureau runtime-refresh prelaunch authority changed before mutation"\n                )\n            executor_intent = live_executor_intent\n            executor_authority_contract = live_executor_authority_contract\n            executor_lease_binding_request = revalidated_executor_lease_binding_request\n'''
+          tasks = replace_once(tasks, old, new, "live authority revalidation")
+          tasks_path.write_text(tasks)
+
+          tests_path = Path("tests/test_tasks.py")
+          tests = tests_path.read_text()
+          marker = '''    def test_runtime_refresh_invalid_authority_precedes_dedup_and_journal_recovery(self) -> None:\n'''
+          addition = '''    def test_runtime_refresh_live_authority_drift_blocks_before_lease_prepare(self) -> None:\n        fixture = self._runtime_refresh_prelaunch_fixture()\n        metadata = {\n            "approval_task_id": fixture["approval_task_id"],\n            "intent_sha256": fixture["intent_sha256"],\n            "marker": "live-authority-drift",\n        }\n        original = tasks.resources.acquire_resources(\n            fixture["lease_owner"],\n            fixture["resource_keys"],\n            purpose="runtime refresh live authority drift",\n            ttl_seconds=1200,\n            metadata=metadata,\n        )["leases"]\n        real_prepare = tasks.resources.prepare_runtime_refresh_executor_lease_binding\n        with self._runtime_refresh_start_environment(fixture) as (dispatch_mock, _audit_mock):\n            with (\n                patch.object(\n                    tasks.bureau_runtime_refresh_executor,\n                    "load_bound_intent",\n                    side_effect=[fixture["intent"], fixture["intent"]],\n                ) as load_intent,\n                patch.object(\n                    tasks.bureau_runtime_refresh_executor,\n                    "validate_authority_execution_contract",\n                    side_effect=[\n                        fixture["authority"],\n                        PermissionError("simulated live authority drift"),\n                    ],\n                ) as validate_authority,\n                patch.object(\n                    tasks.resources,\n                    "prepare_runtime_refresh_executor_lease_binding",\n                    wraps=real_prepare,\n                ) as prepare_binding,\n            ):\n                with self.assertRaisesRegex(PermissionError, "live authority drift"):\n                    tasks.grabowski_task_start(\n                        "local",\n                        fixture["argv"],\n                        cwd=str(tasks.operator.HOME),\n                        runtime_seconds=60,\n                        resume_policy="never",\n                    )\n        self.assertEqual(2, load_intent.call_count)\n        self.assertEqual(2, validate_authority.call_count)\n        prepare_binding.assert_not_called()\n        dispatch_mock.assert_not_called()\n        self.assertEqual(\n            original,\n            [\n                tasks.resources.inspect_resource(key)\n                for key in fixture["resource_keys"]\n            ],\n        )\n        self.assertEqual(\n            {key: metadata for key in fixture["resource_keys"]},\n            self._runtime_refresh_lease_metadata(fixture["resource_keys"]),\n        )\n        with sqlite3.connect(self.database) as connection:\n            journals = connection.execute(\n                "SELECT key FROM metadata WHERE key LIKE ?",\n                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),\n            ).fetchall()\n        self.assertEqual([], journals)\n\n'''
+          tests = replace_once(tests, marker, addition + marker, "live authority regression test")
+          tests_path.write_text(tests)
+          PY
+          git diff --check
+
+      - name: Validate repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          make validate
+          git diff --check
+          changed="$(git diff --name-only)"
+          printf '%s\n' "$changed"
+          test "$changed" = $'src/grabowski_tasks.py\ntests/test_tasks.py'
+
+      - name: Commit validated source fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr1013-live-authority-fix.yml
+          git add src/grabowski_tasks.py tests/test_tasks.py
+          git diff --cached --check
+          git commit -m "fix: refresh runtime authority before lease binding"
+          git push origin HEAD:fix/pr1013-live-authority-revalidation-20260901-1408
