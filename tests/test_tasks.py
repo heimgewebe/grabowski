@@ -10185,6 +10185,96 @@ class TaskTests(unittest.TestCase):
         self.assertEqual({row[1]}, {item["executor_unit"] for item in metadata_by_key.values()})
 
 
+    def test_runtime_refresh_orphan_binding_journal_recovers_after_hard_crash(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {"marker": "orphan-prelaunch"}
+        original = tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh hard crash",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )["leases"]
+        old_task_id = "d" * 24
+        old_unit = f"grabowski-task-{old_task_id}-a1.service"
+        request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"], fixture["intent"], old_task_id, old_unit
+        )
+        plan = tasks.resources.prepare_runtime_refresh_executor_lease_binding(
+            fixture["lease_owner"], fixture["resource_keys"], old_unit
+        )
+        journal = tasks._runtime_refresh_prelaunch_binding_journal(
+            request,
+            argv_sha256="e" * 64,
+            binding_plan=plan,
+        )
+        tasks._persist_runtime_refresh_prelaunch_binding_journal(journal)
+        tasks.resources.bind_runtime_refresh_executor_leases(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            prepared_binding=plan,
+        )
+
+        # Simulate SIGKILL/process loss here: resource commit and durable journal exist,
+        # but no task row was ever inserted and no Python exception handler ran.
+        with sqlite3.connect(self.database) as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT task_id FROM tasks WHERE task_id=?", (old_task_id,)
+                ).fetchone()
+            )
+            journal_row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks._runtime_refresh_prelaunch_journal_key(old_task_id),),
+            ).fetchone()
+        self.assertIsNotNone(journal_row)
+        self.assertEqual(
+            {old_unit},
+            {
+                item["executor_unit"]
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            },
+        )
+
+        with self._runtime_refresh_start_environment(fixture) as (dispatch_mock, _audit_mock):
+            started = tasks.grabowski_task_start(
+                "local",
+                fixture["argv"],
+                cwd=str(tasks.operator.HOME),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+
+        self.assertEqual(1, dispatch_mock.call_count)
+        self.assertNotEqual(old_unit, started["task"]["unit"])
+        recovery = started["runtime_refresh_executor_prelaunch_recovery"]
+        self.assertEqual(1, len(recovery["recovered"]))
+        self.assertEqual(old_task_id, recovery["recovered"][0]["task_id"])
+        self.assertEqual("restored", recovery["recovered"][0]["action"])
+        self.assertEqual(
+            {started["task"]["unit"]},
+            {
+                item["executor_unit"]
+                for item in self._runtime_refresh_lease_metadata(
+                    fixture["resource_keys"]
+                ).values()
+            },
+        )
+        with sqlite3.connect(self.database) as connection:
+            remaining = connection.execute(
+                "SELECT key FROM metadata WHERE key LIKE ?",
+                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+            ).fetchall()
+        self.assertEqual([], remaining)
+        self.assertNotEqual(
+            original,
+            [tasks.resources.inspect_resource(key) for key in fixture["resource_keys"]],
+        )
+
+
 
 class RuntimeContractTests(unittest.TestCase):
     def test_task_output_root_is_managed_state_with_explicit_legacy_home(self) -> None:

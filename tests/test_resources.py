@@ -6155,5 +6155,111 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(unit, json.loads(row[0])["executor_unit"])
 
 
+    def test_runtime_refresh_executor_prepared_binding_is_cas_and_recoverable(self) -> None:
+        owner = "runtime-refresh:test-prepared"
+        keys = ["component:runtime-refresh-prepared-a", "component:runtime-refresh-prepared-b"]
+        unit = "grabowski-task-" + "9" * 24 + "-a1.service"
+        original = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="runtime refresh prepared",
+            ttl_seconds=1200,
+            metadata={"marker": "prepared"},
+        )["leases"]
+
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(
+            owner, keys, unit, minimum_remaining_seconds=600
+        )
+        self.assertEqual(original, plan["original_leases"])
+        self.assertEqual(unit, plan["executor_unit"])
+        self.assertEqual(keys, plan["resource_keys"])
+
+        binding = resources.bind_runtime_refresh_executor_leases(
+            owner,
+            keys,
+            unit,
+            minimum_remaining_seconds=600,
+            prepared_binding=plan,
+        )
+        self.assertEqual(plan["bound_leases"], binding["bound_leases"])
+        self.assertEqual(plan["bind_at_unix"], binding["bound_at_unix"])
+
+        recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(plan)
+        self.assertEqual("restored", recovery["action"])
+        self.assertTrue(recovery["snapshot_guarded"])
+        self.assertEqual(keys, recovery["restored_keys"])
+        self.assertEqual(
+            original,
+            [resources.inspect_resource(key) for key in keys],
+        )
+
+    def test_runtime_refresh_executor_prepared_binding_rejects_prebind_drift(self) -> None:
+        owner = "runtime-refresh:test-prepared-drift"
+        key = "component:runtime-refresh-prepared-drift"
+        unit = "grabowski-task-" + "a" * 24 + "-a1.service"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh prepared drift",
+            ttl_seconds=1200,
+            metadata={"marker": "stable"},
+        )
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(owner, [key], unit)
+        resources.renew_resources(owner, [key], ttl_seconds=1800)
+
+        with self.assertRaisesRegex(RuntimeError, "changed after durable prepare"):
+            resources.bind_runtime_refresh_executor_leases(
+                owner, [key], unit, prepared_binding=plan
+            )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertNotIn("executor_unit", json.loads(row[0]))
+
+    def test_runtime_refresh_executor_plan_recovery_rejects_bound_drift(self) -> None:
+        owner = "runtime-refresh:test-plan-drift"
+        key = "component:runtime-refresh-plan-drift"
+        unit = "grabowski-task-" + "b" * 24 + "-a1.service"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh plan drift",
+            ttl_seconds=1200,
+            metadata={"marker": "stable"},
+        )
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(owner, [key], unit)
+        resources.bind_runtime_refresh_executor_leases(
+            owner, [key], unit, prepared_binding=plan
+        )
+        resources.renew_resources(owner, [key], ttl_seconds=1800)
+
+        with self.assertRaisesRegex(RuntimeError, "changed while still unit-bound"):
+            resources.restore_runtime_refresh_executor_lease_binding_plan(plan)
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertEqual(unit, json.loads(row[0])["executor_unit"])
+
+    def test_runtime_refresh_executor_plan_recovery_is_noop_before_bind(self) -> None:
+        owner = "runtime-refresh:test-plan-noop"
+        key = "component:runtime-refresh-plan-noop"
+        unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+        original = resources.acquire_resources(
+            owner,
+            [key],
+            purpose="runtime refresh plan noop",
+            ttl_seconds=1200,
+            metadata={"marker": "original"},
+        )["leases"][0]
+        plan = resources.prepare_runtime_refresh_executor_lease_binding(owner, [key], unit)
+
+        recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(plan)
+        self.assertEqual("already_original", recovery["action"])
+        self.assertEqual([], recovery["restored_keys"])
+        self.assertEqual(original, resources.inspect_resource(key))
+
+
 if __name__ == "__main__":
     unittest.main()

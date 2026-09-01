@@ -1917,6 +1917,239 @@ def _runtime_refresh_prelaunch_lease_binding_request(
     return {**material, "request_sha256": _sha256_json(material)}
 
 
+BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX = (
+    "runtime_refresh_executor_prelaunch_v1:"
+)
+
+
+def _runtime_refresh_prelaunch_journal_key(task_id: str) -> str:
+    if not isinstance(task_id, str) or TASK_ID.fullmatch(task_id) is None:
+        raise ValueError("runtime-refresh prelaunch journal task id is invalid")
+    return BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + task_id
+
+
+def _runtime_refresh_prelaunch_binding_journal(
+    request: dict[str, Any],
+    *,
+    argv_sha256: str,
+    binding_plan: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = request.get("task_id")
+    unit = request.get("executor_unit")
+    bureau_runtime_refresh_executor.task_identity_environment(task_id, unit)
+    if not isinstance(argv_sha256, str) or SHA256.fullmatch(argv_sha256) is None:
+        raise ValueError("runtime-refresh prelaunch journal argv digest is invalid")
+    plan = resources._normalize_runtime_refresh_executor_binding_plan(binding_plan)
+    if (
+        plan["owner_id"] != request.get("lease_owner")
+        or plan["executor_unit"] != unit
+        or plan["resource_keys"] != request.get("resource_keys")
+        or plan["minimum_remaining_seconds"]
+        != request.get("minimum_remaining_seconds")
+    ):
+        raise ValueError("runtime-refresh prelaunch journal plan differs from request")
+    intent_sha256 = request.get("intent_sha256")
+    request_sha256 = request.get("request_sha256")
+    for label, value in (
+        ("intent", intent_sha256),
+        ("request", request_sha256),
+    ):
+        if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+            raise ValueError(f"runtime-refresh prelaunch journal {label} digest is invalid")
+    material: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_runtime_refresh_prelaunch_binding_journal",
+        "task_id": task_id,
+        "executor_unit": unit,
+        "argv_sha256": argv_sha256,
+        "intent_sha256": intent_sha256,
+        "request_sha256": request_sha256,
+        "lease_owner": plan["owner_id"],
+        "resource_keys": plan["resource_keys"],
+        "binding_plan": plan,
+    }
+    return {**material, "journal_sha256": _sha256_json(material)}
+
+
+def _normalize_runtime_refresh_prelaunch_binding_journal(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("runtime-refresh prelaunch journal is not an object")
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "task_id",
+        "executor_unit",
+        "argv_sha256",
+        "intent_sha256",
+        "request_sha256",
+        "lease_owner",
+        "resource_keys",
+        "binding_plan",
+        "journal_sha256",
+    }
+    if set(value) != expected_fields:
+        raise RuntimeError("runtime-refresh prelaunch journal shape is invalid")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind")
+        != "grabowski_bureau_runtime_refresh_prelaunch_binding_journal"
+    ):
+        raise RuntimeError("runtime-refresh prelaunch journal contract is unsupported")
+    observed_digest = value.get("journal_sha256")
+    material = {key: item for key, item in value.items() if key != "journal_sha256"}
+    if (
+        not isinstance(observed_digest, str)
+        or SHA256.fullmatch(observed_digest) is None
+        or observed_digest != _sha256_json(material)
+    ):
+        raise RuntimeError("runtime-refresh prelaunch journal digest is invalid")
+    task_id = value.get("task_id")
+    unit = value.get("executor_unit")
+    try:
+        bureau_runtime_refresh_executor.task_identity_environment(task_id, unit)
+    except bureau_runtime_refresh_executor.BureauRuntimeRefreshExecutorError as exc:
+        raise RuntimeError("runtime-refresh prelaunch journal task identity is invalid") from exc
+    for field in ("argv_sha256", "intent_sha256", "request_sha256"):
+        item = value.get(field)
+        if not isinstance(item, str) or SHA256.fullmatch(item) is None:
+            raise RuntimeError(f"runtime-refresh prelaunch journal {field} is invalid")
+    lease_owner = value.get("lease_owner")
+    if (
+        not isinstance(lease_owner, str)
+        or bureau_runtime_refresh_executor.OWNER_RE.fullmatch(lease_owner) is None
+    ):
+        raise RuntimeError("runtime-refresh prelaunch journal lease owner is invalid")
+    raw_keys = value.get("resource_keys")
+    if not isinstance(raw_keys, list) or any(not isinstance(item, str) for item in raw_keys):
+        raise RuntimeError("runtime-refresh prelaunch journal resource keys are invalid")
+    try:
+        keys = resources.normalize_resource_keys(raw_keys)
+        plan = resources._normalize_runtime_refresh_executor_binding_plan(
+            value.get("binding_plan")
+        )
+    except (PermissionError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeError("runtime-refresh prelaunch journal binding plan is invalid") from exc
+    if raw_keys != keys:
+        raise RuntimeError("runtime-refresh prelaunch journal resource keys are not canonical")
+    if (
+        plan["owner_id"] != lease_owner
+        or plan["executor_unit"] != unit
+        or plan["resource_keys"] != keys
+    ):
+        raise RuntimeError("runtime-refresh prelaunch journal binding plan drifted")
+    return {**value, "resource_keys": keys, "binding_plan": plan}
+
+
+def _persist_runtime_refresh_prelaunch_binding_journal(
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = _normalize_runtime_refresh_prelaunch_binding_journal(journal)
+    key = _runtime_refresh_prelaunch_journal_key(normalized["task_id"])
+    payload = _canonical_json(normalized)
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?", (key,)
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)", (key, payload)
+            )
+        elif row["value"] != payload:
+            raise RuntimeError("runtime-refresh prelaunch journal key collision")
+        connection.commit()
+    return {
+        "key": key,
+        "journal_sha256": normalized["journal_sha256"],
+        "persisted": True,
+    }
+
+
+def _delete_runtime_refresh_prelaunch_binding_journal(
+    connection: sqlite3.Connection,
+    journal: dict[str, Any],
+) -> None:
+    normalized = _normalize_runtime_refresh_prelaunch_binding_journal(journal)
+    key = _runtime_refresh_prelaunch_journal_key(normalized["task_id"])
+    payload = _canonical_json(normalized)
+    deleted = connection.execute(
+        "DELETE FROM metadata WHERE key=? AND value=?", (key, payload)
+    )
+    if deleted.rowcount != 1:
+        raise RuntimeError("runtime-refresh prelaunch journal changed before deletion")
+
+
+def _reconcile_runtime_refresh_prelaunch_binding_journals(
+    resource_keys: list[str],
+) -> dict[str, Any]:
+    keys = resources.normalize_resource_keys(resource_keys)
+    selected = set(keys)
+    recovered: list[dict[str, Any]] = []
+    retained: list[str] = []
+    connection = _database()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT key, value FROM metadata WHERE key LIKE ? ORDER BY key",
+            (BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+        ).fetchall()
+        for row in rows:
+            try:
+                journal = _normalize_runtime_refresh_prelaunch_binding_journal(
+                    json.loads(row["value"])
+                )
+            except (json.JSONDecodeError, TypeError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    "runtime-refresh prelaunch recovery journal is malformed"
+                ) from exc
+            if not selected.intersection(journal["resource_keys"]):
+                continue
+            task_row = connection.execute(
+                "SELECT task_id, unit, argv_sha256 FROM tasks WHERE task_id=?",
+                (journal["task_id"],),
+            ).fetchone()
+            if task_row is not None:
+                if (
+                    task_row["task_id"] != journal["task_id"]
+                    or task_row["unit"] != journal["executor_unit"]
+                    or task_row["argv_sha256"] != journal["argv_sha256"]
+                ):
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch recovery task identity mismatched"
+                    )
+                _delete_runtime_refresh_prelaunch_binding_journal(
+                    connection, journal
+                )
+                retained.append(journal["task_id"])
+                continue
+            recovery = resources.restore_runtime_refresh_executor_lease_binding_plan(
+                journal["binding_plan"]
+            )
+            _delete_runtime_refresh_prelaunch_binding_journal(connection, journal)
+            recovered.append(
+                {
+                    "task_id": journal["task_id"],
+                    "journal_sha256": journal["journal_sha256"],
+                    "plan_sha256": journal["binding_plan"]["plan_sha256"],
+                    "action": recovery["action"],
+                }
+            )
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_runtime_refresh_prelaunch_recovery",
+        "resource_keys": keys,
+        "recovered": recovered,
+        "retained_task_ids": retained,
+    }
+    return {**material, "recovery_sha256": _sha256_json(material)}
+
+
 def _validate_cwd(host: str, raw: str | None) -> str:
     candidate = str(operator.HOME) if raw is None else raw
     if not isinstance(candidate, str) or not candidate.startswith("/"):
@@ -7265,6 +7498,14 @@ def grabowski_task_start(
         host=host,
         opaque_command=True,
     )
+    executor_prelaunch_recovery: dict[str, Any] | None = None
+    if executor_request is not None and executor_intent is not None:
+        recovery_keys = executor_intent.get("required_resource_keys")
+        if not isinstance(recovery_keys, list):
+            raise ValueError("Bureau runtime-refresh prelaunch resource keys are invalid")
+        executor_prelaunch_recovery = (
+            _reconcile_runtime_refresh_prelaunch_binding_journals(recovery_keys)
+        )
     unprepared_identity = _task_execution_identity(
         host=host,
         argv_sha256=command_identity.argv_sha256(command),
@@ -7879,6 +8120,8 @@ def grabowski_task_start(
         else None
     )
     executor_lease_binding_request: dict[str, Any] | None = None
+    executor_lease_binding_plan: dict[str, Any] | None = None
+    executor_lease_binding_journal: dict[str, Any] | None = None
     executor_lease_binding: dict[str, Any] | None = None
     executor_lease_binding_evidence: dict[str, Any] | None = None
     record = {
@@ -7969,6 +8212,26 @@ def grabowski_task_start(
                     executor_request, executor_intent, task_id, unit
                 )
             )
+            executor_lease_binding_plan = (
+                resources.prepare_runtime_refresh_executor_lease_binding(
+                    executor_lease_binding_request["lease_owner"],
+                    executor_lease_binding_request["resource_keys"],
+                    executor_lease_binding_request["executor_unit"],
+                    minimum_remaining_seconds=executor_lease_binding_request[
+                        "minimum_remaining_seconds"
+                    ],
+                )
+            )
+            executor_lease_binding_journal = (
+                _runtime_refresh_prelaunch_binding_journal(
+                    executor_lease_binding_request,
+                    argv_sha256=record["argv_sha256"],
+                    binding_plan=executor_lease_binding_plan,
+                )
+            )
+            _persist_runtime_refresh_prelaunch_binding_journal(
+                executor_lease_binding_journal
+            )
             executor_lease_binding = resources.bind_runtime_refresh_executor_leases(
                 executor_lease_binding_request["lease_owner"],
                 executor_lease_binding_request["resource_keys"],
@@ -7976,6 +8239,7 @@ def grabowski_task_start(
                 minimum_remaining_seconds=executor_lease_binding_request[
                     "minimum_remaining_seconds"
                 ],
+                prepared_binding=executor_lease_binding_plan,
             )
             binding_evidence_material = {
                 "schema_version": 1,
@@ -7983,6 +8247,8 @@ def grabowski_task_start(
                 "intent_sha256": executor_lease_binding_request["intent_sha256"],
                 "request_sha256": executor_lease_binding_request["request_sha256"],
                 "binding_sha256": executor_lease_binding["binding_sha256"],
+                "binding_plan_sha256": executor_lease_binding_plan["plan_sha256"],
+                "journal_sha256": executor_lease_binding_journal["journal_sha256"],
                 "executor_unit": unit,
                 "resource_count": len(executor_lease_binding_request["resource_keys"]),
                 "resource_keys_sha256": _sha256_json(
@@ -8029,6 +8295,10 @@ def grabowski_task_start(
                 record,
             )
             _register_task_reconcile_sequence(connection, task_id)
+            if executor_lease_binding_journal is not None:
+                _delete_runtime_refresh_prelaunch_binding_journal(
+                    connection, executor_lease_binding_journal
+                )
             connection.commit()
     except Exception as exc:
         executor_record_state = "not_applicable"
@@ -8164,6 +8434,7 @@ def grabowski_task_start(
         ),
         "resource_lease_maintenance": lease_maintenance,
         "runtime_refresh_executor_lease_binding": executor_lease_binding_evidence,
+        "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
         "routing_shadow_capture": routing_shadow_capture,
         "effect_profile": task_effect_classification["effect_profile"],
         "reposkop_policy": task_effect_classification["reposkop_policy"],
@@ -8228,6 +8499,7 @@ def grabowski_task_start(
         "reposkop_checkout_shadow_before": reposkop_checkout_shadow_before,
         "task_effect_classification": task_effect_classification,
         "runtime_refresh_executor_lease_binding": executor_lease_binding_evidence,
+        "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
         "deduplicated_reuse": None,
     }
 
