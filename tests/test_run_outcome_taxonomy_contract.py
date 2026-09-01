@@ -68,6 +68,32 @@ class RunOutcomeTaxonomyContractTests(unittest.TestCase):
             ),
         }
 
+    @staticmethod
+    def _history_result(recall, event: dict[str, object]) -> dict[str, object]:
+        query = {"repo": "heimgewebe/grabowski", "limit": 20}
+        exclusions = list(recall.CHRONIK_HISTORY_DOES_NOT_ESTABLISH)
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski_chronik_history",
+            "query": query,
+            "cli_present": True,
+            "available": True,
+            "historical_only": True,
+            "events": [event],
+            "does_not_establish": exclusions,
+            "history": {
+                "schema_version": "chronik-coding-history.v1",
+                "query": query,
+                "target": {"scope": "repository", "repo": "heimgewebe/grabowski"},
+                "event_ids": [event["event_id"]],
+                "historical_only": True,
+                "does_not_establish": exclusions,
+                "ledger_snapshot": {"sha256": "b" * 64},
+            },
+        }
+        payload["result_sha256"] = recall._sha256_json(payload)
+        return payload
+
     def test_v1_producer_events_round_trip_through_historical_recall(self) -> None:
         recall = self._load_recall()
         cases = [
@@ -95,8 +121,9 @@ class RunOutcomeTaxonomyContractTests(unittest.TestCase):
     def test_v1_producer_event_projects_coarse_target_summary(self) -> None:
         recall = self._load_recall()
         event = chronik.build_event(self._record(), "failed")
+        history = self._history_result(recall, event)
 
-        result = recall.export_chronik_history_recall([event])
+        result = recall.export_chronik_history_recall(history)
 
         self.assertEqual(result["target_count"], 1)
         target = result["target_summary"][0]
