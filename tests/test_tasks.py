@@ -9860,6 +9860,10 @@ class TaskTests(unittest.TestCase):
             "schema_version": 1,
             "kind": "bureau_runtime_refresh_intent",
             "approval_task_id": approval_task_id,
+            "created_at": "2026-09-01T00:00:00Z",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "authorized_by": "test-reviewer",
+            "authorization": "test-runtime-authorization",
             "authority_task_spec": {
                 "task_id": approval_task_id,
                 "revision": authority_revision,
@@ -9869,18 +9873,23 @@ class TaskTests(unittest.TestCase):
             "runtime_approval": {
                 "schema_version": 1,
                 "action_class": "runtime_mutation",
+                "action_classes": ["runtime_mutation"],
                 "allowed": True,
+                "reason": "approved",
                 "required": True,
                 "required_level": "break_glass",
                 "expected_task_id": approval_task_id,
                 "expected_reference": target_sha256,
                 "evidence": {
                     "schema_version": 1,
+                    "source": "test-runtime-authorization",
                     "approved": True,
                     "level": "break_glass",
+                    "reviewer": "test-reviewer",
                     "task_id": approval_task_id,
                     "reference": target_sha256,
                     "scope": ["runtime_mutation"],
+                    "note": "Bureau immutable runtime refresh",
                 },
             },
             "required_resource_keys": keys,
@@ -10065,6 +10074,30 @@ class TaskTests(unittest.TestCase):
             tasks._runtime_refresh_prelaunch_lease_binding_request(
                 bad_approval_request,
                 bad_approval_intent,
+                fixture["authority"],
+                task_id,
+                unit,
+            )
+
+        expired_payload = {
+            key: value
+            for key, value in fixture["intent"].items()
+            if key != "intent_sha256"
+        }
+        expired_payload["expires_at"] = "2000-01-01T00:00:00Z"
+        expired_digest = hashlib.sha256(
+            (tasks._canonical_json(expired_payload) + "\n").encode("utf-8")
+        ).hexdigest()
+        expired_intent = {**expired_payload, "intent_sha256": expired_digest}
+        expired_request = {
+            **fixture["request"],
+            "expected_intent_sha256": expired_digest,
+            "lease_owner": f"runtime-refresh:{expired_digest[:16]}",
+        }
+        with self.assertRaisesRegex(ValueError, "approval expires too soon"):
+            tasks._runtime_refresh_prelaunch_lease_binding_request(
+                expired_request,
+                expired_intent,
                 fixture["authority"],
                 task_id,
                 unit,

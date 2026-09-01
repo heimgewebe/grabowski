@@ -1900,6 +1900,18 @@ def _runtime_refresh_prelaunch_lease_binding_request(
             "Bureau runtime-refresh prelaunch authority binding is invalid"
         )
     target_sha256 = intent.get("target_sha256")
+    expires_at = intent.get("expires_at")
+    if not isinstance(expires_at, str):
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid")
+    try:
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid") from exc
+    if expires.tzinfo is None or expires.utcoffset() is None:
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid")
+    remaining_seconds = int((expires - datetime.now(timezone.utc)).total_seconds())
+    if remaining_seconds < BUREAU_RUNTIME_REFRESH_PRELAUNCH_MIN_REMAINING_SECONDS:
+        raise ValueError("Bureau runtime-refresh prelaunch approval expires too soon")
     runtime_approval = intent.get("runtime_approval")
     approval_evidence = (
         runtime_approval.get("evidence") if isinstance(runtime_approval, dict) else None
@@ -1907,25 +1919,58 @@ def _runtime_refresh_prelaunch_lease_binding_request(
     approval_scope = (
         approval_evidence.get("scope") if isinstance(approval_evidence, dict) else None
     )
+    approval_fields = {
+        "schema_version",
+        "action_class",
+        "action_classes",
+        "allowed",
+        "evidence",
+        "expected_reference",
+        "expected_task_id",
+        "reason",
+        "required",
+        "required_level",
+    }
+    evidence_fields = {
+        "schema_version",
+        "source",
+        "level",
+        "approved",
+        "reviewer",
+        "reference",
+        "task_id",
+        "scope",
+        "note",
+    }
     if (
         not isinstance(target_sha256, str)
         or bureau_runtime_refresh_executor.SHA256_RE.fullmatch(target_sha256) is None
         or not isinstance(runtime_approval, dict)
+        or set(runtime_approval) != approval_fields
         or runtime_approval.get("schema_version") != 1
         or runtime_approval.get("action_class") != "runtime_mutation"
+        or runtime_approval.get("action_classes") != ["runtime_mutation"]
         or runtime_approval.get("allowed") is not True
+        or runtime_approval.get("reason") != "approved"
         or runtime_approval.get("required") is not True
         or runtime_approval.get("required_level") != "break_glass"
         or runtime_approval.get("expected_task_id") != lease_task_id
         or runtime_approval.get("expected_reference") != target_sha256
         or not isinstance(approval_evidence, dict)
+        or set(approval_evidence) != evidence_fields
         or approval_evidence.get("schema_version") != 1
-        or approval_evidence.get("approved") is not True
+        or not isinstance(approval_evidence.get("source"), str)
+        or not approval_evidence["source"].strip()
         or approval_evidence.get("level") != "break_glass"
-        or approval_evidence.get("task_id") != lease_task_id
+        or approval_evidence.get("approved") is not True
+        or not isinstance(approval_evidence.get("reviewer"), str)
+        or not approval_evidence["reviewer"].strip()
         or approval_evidence.get("reference") != target_sha256
-        or not isinstance(approval_scope, list)
-        or "runtime_mutation" not in approval_scope
+        or approval_evidence.get("task_id") != lease_task_id
+        or approval_scope != ["runtime_mutation"]
+        or approval_evidence.get("note") != "Bureau immutable runtime refresh"
+        or intent.get("authorization") != approval_evidence.get("source")
+        or intent.get("authorized_by") != approval_evidence.get("reviewer")
     ):
         raise ValueError(
             "Bureau runtime-refresh prelaunch approval binding is invalid"
