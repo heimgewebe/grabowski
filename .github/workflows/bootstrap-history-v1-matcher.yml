@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: fix/run-outcome-taxonomy-v1-20260901
-          fetch-depth: 4
+          fetch-depth: 5
 
       - name: Verify exact lineage and isolation
         shell: bash
@@ -32,61 +32,113 @@ jobs:
           git merge-base --is-ancestor "$BASE" HEAD
           test "$(git diff --name-only "$BASE" HEAD)" = ".github/workflows/bootstrap-history-v1-matcher.yml"
 
-      - name: Patch history matcher and regression test
+      - name: Patch history matcher and regression test by AST boundaries
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
+          import ast
           from pathlib import Path
 
-          def replace_once(path: str, old: str, new: str) -> None:
-              target = Path(path)
-              text = target.read_text(encoding="utf-8")
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
-              target.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-          replace_once(
-              "src/grabowski_tasks.py",
-              '''    if event.get("schema_version") != "agent-run-event.v0":
-              return False
-          ''',
-              '''    schema_version = event.get("schema_version")
-          if schema_version not in {"agent-run-event.v0", "agent-run-event.v1"}:
-              return False
-          ''',
+          tasks_path = Path("src/grabowski_tasks.py")
+          tasks_text = tasks_path.read_text(encoding="utf-8")
+          tasks_tree = ast.parse(tasks_text)
+          matcher = next(
+              (
+                  node
+                  for node in ast.walk(tasks_tree)
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name == "_chronik_history_event_matches_query"
+              ),
+              None,
           )
-          replace_once(
-              "src/grabowski_tasks.py",
-              '''    if event.get("kind") not in {
-              "agent.run.started",
-              "agent.run.completed",
-              "agent.run.blocked",
-          }:
-              return False
-          ''',
-              '''    allowed_kinds = {
-              "agent.run.started",
-              "agent.run.completed",
-              "agent.run.blocked",
-          }
-          if schema_version == "agent-run-event.v1":
-              allowed_kinds.update(
-                  {
-                      "agent.run.failed",
-                      "agent.run.cancelled",
-                      "agent.run.timed_out",
-                      "agent.run.signalled",
-                  }
-              )
-          if event.get("kind") not in allowed_kinds:
-              return False
-          ''',
-          )
+          if matcher is None:
+              raise SystemExit("history matcher function not found")
 
-          marker = "    def test_history_component_filter_uses_chronik_source_component(self) -> None:\n"
-          test = '''    def test_history_matcher_supports_v1_execution_outcomes(self) -> None:
+          schema_if = None
+          kind_if = None
+          for node in matcher.body:
+              if not isinstance(node, ast.If):
+                  continue
+              test_source = ast.get_source_segment(tasks_text, node.test) or ""
+              if "schema_version" in test_source and "agent-run-event.v0" in test_source:
+                  schema_if = node
+              if "event.get" in test_source and "kind" in test_source and "agent.run.started" in test_source:
+                  kind_if = node
+          if schema_if is None or kind_if is None:
+              raise SystemExit("expected schema/kind gates not found in history matcher")
+
+          lines = tasks_text.splitlines(keepends=True)
+          replacements = [
+              (
+                  kind_if.lineno - 1,
+                  kind_if.end_lineno,
+                  [
+                      '    allowed_kinds = {\n',
+                      '        "agent.run.started",\n',
+                      '        "agent.run.completed",\n',
+                      '        "agent.run.blocked",\n',
+                      '    }\n',
+                      '    if schema_version == "agent-run-event.v1":\n',
+                      '        allowed_kinds.update(\n',
+                      '            {\n',
+                      '                "agent.run.failed",\n',
+                      '                "agent.run.cancelled",\n',
+                      '                "agent.run.timed_out",\n',
+                      '                "agent.run.signalled",\n',
+                      '            }\n',
+                      '        )\n',
+                      '    if event.get("kind") not in allowed_kinds:\n',
+                      '        return False\n',
+                  ],
+              ),
+              (
+                  schema_if.lineno - 1,
+                  schema_if.end_lineno,
+                  [
+                      '    schema_version = event.get("schema_version")\n',
+                      '    if schema_version not in {"agent-run-event.v0", "agent-run-event.v1"}:\n',
+                      '        return False\n',
+                  ],
+              ),
+          ]
+          for start, end, replacement in sorted(replacements, reverse=True):
+              lines[start:end] = replacement
+          tasks_path.write_text("".join(lines), encoding="utf-8")
+
+          test_path = Path("tests/test_tasks.py")
+          test_text = test_path.read_text(encoding="utf-8")
+          test_tree = ast.parse(test_text)
+          test_class = next(
+              (
+                  node
+                  for node in test_tree.body
+                  if isinstance(node, ast.ClassDef)
+                  and node.name == "ChronikCodingMemoryToolTests"
+              ),
+              None,
+          )
+          if test_class is None:
+              raise SystemExit("ChronikCodingMemoryToolTests not found")
+          insertion = next(
+              (
+                  node
+                  for node in test_class.body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "test_history_component_filter_uses_chronik_source_component"
+              ),
+              None,
+          )
+          if insertion is None:
+              raise SystemExit("history component matcher test anchor not found")
+          if any(
+              isinstance(node, ast.FunctionDef)
+              and node.name == "test_history_matcher_supports_v1_execution_outcomes"
+              for node in test_class.body
+          ):
+              raise SystemExit("v1 history matcher regression test already exists")
+
+          new_test = '''    def test_history_matcher_supports_v1_execution_outcomes(self) -> None:
               event = json.loads(self.source.read_text(encoding="utf-8"))
               normalized = {
                   "repo": "heimgewebe/grabowski",
@@ -143,7 +195,9 @@ jobs:
               )
 
           '''
-          replace_once("tests/test_tasks.py", marker, test + marker)
+          test_lines = test_text.splitlines(keepends=True)
+          test_lines[insertion.lineno - 1:insertion.lineno - 1] = new_test.splitlines(keepends=True)
+          test_path.write_text("".join(test_lines), encoding="utf-8")
           PY
 
       - name: Verify history gate and outcome stack
