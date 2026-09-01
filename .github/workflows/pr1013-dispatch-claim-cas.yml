@@ -1,0 +1,56 @@
+---
+name: PR1013 dispatch claim CAS
+
+on:
+  push:
+    branches:
+      - fix/pr1013-dispatch-claim-cas-20260901-1815
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pr1013-dispatch-claim-cas
+  cancel-in-progress: false
+
+jobs:
+  validate-claim:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: fix/pr1013-dispatch-claim-cas-20260901-1815
+
+      - name: Apply dispatch claim protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor d9ded24c25054f3b389842f52bc8c4c9cebbb040 HEAD
+          test -z "$(git diff --name-only d9ded24c25054f3b389842f52bc8c4c9cebbb040 HEAD -- src/grabowski_tasks.py tests/test_tasks.py)"
+          python3 .github/pr1013_dispatch_claim_patch.py
+          git diff --check
+          changed="$(git diff --name-only)"
+          while IFS= read -r path; do
+            case "$path" in
+              src/grabowski_tasks.py|tests/test_tasks.py) ;;
+              "") ;;
+              *) echo "unexpected source patch path: $path" >&2; exit 65 ;;
+            esac
+          done <<< "$changed"
+
+      - name: Validate repository
+        run: make validate
+
+      - name: Commit validated claim protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/pr1013-dispatch-claim-cas.yml .github/pr1013_dispatch_claim_patch.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/grabowski_tasks.py tests/test_tasks.py
+          git diff --cached --check
+          git commit -m 'fix: claim runtime-refresh dispatch before launch'
+          git push origin HEAD:fix/pr1013-dispatch-claim-cas-20260901-1815
