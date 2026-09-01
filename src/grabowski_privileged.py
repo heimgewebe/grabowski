@@ -152,6 +152,19 @@ PROCESS_REFERENCE_ALLOWED_ROOTS = (
     Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
     Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
 )
+# Fixed Heim-PC cleanup roots are matched lexically only.  They never need
+# filesystem visibility inside the rootbroker namespace, and descendants are
+# deliberately not accepted through these entries.
+PROCESS_REFERENCE_LEXICAL_ROOTS = (
+    Path("/home/alex/.cache/heim-pc/managed-builds"),
+    Path("/home/alex/.cache/pip"),
+    Path("/home/alex/.cache/uv"),
+    Path("/home/alex/.cache/ms-playwright"),
+    Path("/home/alex/.local/share/Trash"),
+    Path("/home/alex/.local/share/grabowski-mcp-releases"),
+    Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
+    Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
+)
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_SYSTEMD_ACTION = "operator_root_task_systemd_unit"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
@@ -853,6 +866,8 @@ def _normalize_process_reference_roots(roots: list[str]) -> list[str]:
     if not isinstance(roots, list) or not 1 <= len(roots) <= 256:
         raise ValueError("roots must be a non-empty bounded list")
     allowed = PROCESS_REFERENCE_ALLOWED_ROOTS
+    lexical_only = PROCESS_REFERENCE_LEXICAL_ROOTS
+    mounted_prefixes = tuple(prefix for prefix in allowed if prefix not in lexical_only)
     normalized: list[str] = []
     for raw in roots:
         if not isinstance(raw, str) or not raw or "\x00" in raw:
@@ -862,7 +877,14 @@ def _normalize_process_reference_roots(roots: list[str]) -> list[str]:
             raise ValueError("root must be canonical and absolute")
         if path.resolve(strict=True) != path or path.is_symlink() or not path.is_dir():
             raise ValueError("root must be a canonical non-symlink directory")
-        if not any(os.path.commonpath((str(path), str(prefix))) == str(prefix) for prefix in allowed):
+        if path in lexical_only:
+            pass
+        elif any(
+            os.path.commonpath((str(path), str(prefix))) == str(prefix)
+            for prefix in mounted_prefixes
+        ):
+            pass
+        else:
             raise ValueError("root is outside the allowed prefixes")
         normalized.append(str(path))
     if len(set(normalized)) != len(normalized):

@@ -28,6 +28,54 @@ SPEC.loader.exec_module(cutover)
 HEAD = "a" * 40
 
 
+EXPECTED_PROCESS_OBSERVER_BIND_PATHS = (
+    '/home/alex/repos/.weltgewebe-audit-implementation',
+    '/home/alex/repos/.weltgewebe-audit-main-20260717',
+    '/home/alex/repos/.weltgewebe-release-worktrees',
+    '/home/alex/repos/.weltgewebe-standalone',
+    '/home/alex/repos/.weltgewebe-worktrees',
+    '/home/alex/worktrees',
+    '/home/alex/repos/.semantah-standalone',
+    '/home/alex/repos/.semantah-worktrees',
+    '/home/alex/repos/.heimlern-worktrees',
+    '/home/alex/repos/.operator-redundancy-worktrees',
+    '/home/alex/repos/.audio-standalone',
+    '/home/alex/repos/.audio-worktrees',
+    '/home/alex/repos/.hauski-worktrees',
+    '/home/alex/repos/.hauski-audio-worktrees',
+    '/home/alex/repos/.grabowski-deploy-worktrees',
+    '/home/alex/repos/.grabowski-standalone',
+    '/home/alex/repos/.grabowski-worktrees',
+    '/home/alex/repos/.heim-pc-standalone',
+    '/home/alex/repos/.heim-pc-worktrees',
+    '/home/alex/repos/.bureau-audit-clones',
+    '/home/alex/repos/.bureau-audits',
+    '/home/alex/repos/.bureau-standalone',
+    '/home/alex/repos/.bureau-task-worktrees',
+    '/home/alex/repos/.bureau-worktrees',
+    '/home/alex/repos/.repoground-audits',
+    '/home/alex/repos/.repoground-standalone',
+    '/home/alex/repos/.repoground-task-worktrees',
+    '/home/alex/repos/.repoground-worktrees',
+    '/home/alex/repos/.commonworld-audits',
+    '/home/alex/repos/.commonworld-standalone',
+    '/home/alex/repos/.commonworld-worktrees',
+    '/home/alex/repos/.plexer-worktrees',
+    '/home/alex/repos/.worktree-target-quarantine',
+)
+
+FIXED_LEXICAL_CLEANUP_ROOTS = (
+    '/home/alex/.cache/heim-pc/managed-builds',
+    '/home/alex/.cache/pip',
+    '/home/alex/.cache/uv',
+    '/home/alex/.cache/ms-playwright',
+    '/home/alex/.local/share/Trash',
+    '/home/alex/.local/share/grabowski-mcp-releases',
+    '/home/alex/.local/state/heim-pc/cache-maintenance/plans',
+    '/home/alex/.local/state/heim-pc/cache-maintenance/receipts',
+)
+
+
 def _publisher() -> dict[str, object]:
     return {
         "enabled": True,
@@ -972,6 +1020,18 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover._expected_recovery_source_dropin(publisher),
         )
 
+    def test_versioned_recovery_dropin_matches_canonical_publisher_contract(self) -> None:
+        source = (
+            ROOT
+            / "systemd"
+            / "grabowski-privileged-broker@.service.d"
+            / "recovery-source.conf"
+        )
+        self.assertEqual(
+            source.read_bytes(),
+            cutover._expected_recovery_source_dropin(_canonical_publisher()),
+        )
+
     def test_automatic_cutover_bind_paths_include_canonical_grabowski_repo(self) -> None:
         self.assertEqual(
             cutover.AUTOMATIC_CUTOVER_BIND_PATHS,
@@ -980,6 +1040,30 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertNotIn(
             "/home/alex/repos/grabowski",
             cutover.PROCESS_OBSERVER_BIND_PATHS,
+        )
+
+    def test_process_observer_bind_paths_are_literal_and_exclude_fixed_cleanup_roots(self) -> None:
+        self.assertEqual(
+            cutover.PROCESS_OBSERVER_BIND_PATHS,
+            EXPECTED_PROCESS_OBSERVER_BIND_PATHS,
+        )
+        all_home_binds = (
+            *cutover.AUTOMATIC_CUTOVER_BIND_PATHS,
+            *cutover.PROCESS_OBSERVER_BIND_PATHS,
+        )
+        for cleanup_root in FIXED_LEXICAL_CLEANUP_ROOTS:
+            for bind_root in all_home_binds:
+                self.assertNotEqual(
+                    os.path.commonpath((cleanup_root, bind_root)),
+                    bind_root,
+                    f"fixed cleanup root is exposed by broad bind {bind_root}",
+                )
+
+    def test_recovery_dropin_directory_has_no_later_namespace_override(self) -> None:
+        dropin_dir = ROOT / "systemd" / "grabowski-privileged-broker@.service.d"
+        self.assertEqual(
+            tuple(sorted(path.name for path in dropin_dir.iterdir())),
+            ("recovery-source.conf",),
         )
 
     def test_process_observer_bind_paths_include_weltgewebe_standalone(self) -> None:

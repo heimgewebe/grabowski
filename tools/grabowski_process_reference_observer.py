@@ -54,6 +54,18 @@ ALLOWED_ROOTS = (
     Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
     Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
 )
+# These fixed cleanup roots are compared only with path strings read from /proc.
+# Exact membership is intentional: no descendant is accepted as a request root.
+LEXICAL_ONLY_ROOTS = (
+    Path("/home/alex/.cache/heim-pc/managed-builds"),
+    Path("/home/alex/.cache/pip"),
+    Path("/home/alex/.cache/uv"),
+    Path("/home/alex/.cache/ms-playwright"),
+    Path("/home/alex/.local/share/Trash"),
+    Path("/home/alex/.local/share/grabowski-mcp-releases"),
+    Path("/home/alex/.local/state/heim-pc/cache-maintenance/plans"),
+    Path("/home/alex/.local/state/heim-pc/cache-maintenance/receipts"),
+)
 MAX_ROOTS = 256
 EXPECTED_TARGET_UID = 1000
 MAX_REFERENCES = 64
@@ -96,6 +108,10 @@ def _validate_root(raw: Any, *, target_uid: int) -> Path:
     path = Path(raw)
     if not path.is_absolute() or os.path.normpath(raw) != raw:
         raise ObservationError("root must be canonical and absolute")
+    if path in LEXICAL_ONLY_ROOTS:
+        return path
+    if any(_path_within(path, root) for root in LEXICAL_ONLY_ROOTS):
+        raise ObservationError("lexical-only root must match an exact allowed root")
     try:
         metadata = path.lstat()
     except OSError as exc:
@@ -110,7 +126,11 @@ def _validate_root(raw: Any, *, target_uid: int) -> Path:
         raise ObservationError(f"root is not canonical: {raw}")
     if metadata.st_uid != target_uid:
         raise ObservationError(f"root owner differs from target_uid: {raw}")
-    if not any(_path_within(path, allowed) for allowed in ALLOWED_ROOTS):
+    if not any(
+        _path_within(path, allowed)
+        for allowed in ALLOWED_ROOTS
+        if allowed not in LEXICAL_ONLY_ROOTS
+    ):
         raise ObservationError(f"root is outside the allowed prefixes: {raw}")
     return path
 

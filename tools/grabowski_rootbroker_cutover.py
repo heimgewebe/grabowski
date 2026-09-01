@@ -99,14 +99,6 @@ PROCESS_OBSERVER_BIND_PATHS = (
     "/home/alex/repos/.commonworld-worktrees",
     "/home/alex/repos/.plexer-worktrees",
     "/home/alex/repos/.worktree-target-quarantine",
-    "/home/alex/.cache/heim-pc/managed-builds",
-    "/home/alex/.cache/pip",
-    "/home/alex/.cache/uv",
-    "/home/alex/.cache/ms-playwright",
-    "/home/alex/.local/share/Trash",
-    "/home/alex/.local/share/grabowski-mcp-releases",
-    "/home/alex/.local/state/heim-pc/cache-maintenance/plans",
-    "/home/alex/.local/state/heim-pc/cache-maintenance/receipts",
 )
 
 
