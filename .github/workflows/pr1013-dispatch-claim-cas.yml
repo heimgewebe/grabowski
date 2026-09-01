@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          {
+          (
             set -euo pipefail
             git merge-base --is-ancestor d9ded24c25054f3b389842f52bc8c4c9cebbb040 HEAD
             test -z "$(git diff --name-only d9ded24c25054f3b389842f52bc8c4c9cebbb040 HEAD -- src/grabowski_tasks.py tests/test_tasks.py)"
@@ -41,7 +41,7 @@ jobs:
                 *) echo "unexpected source patch path: $path" >&2; exit 65 ;;
               esac
             done <<< "$changed"
-          } >/tmp/pr1013-apply.out 2>/tmp/pr1013-apply.err
+          ) >/tmp/pr1013-apply.out 2>/tmp/pr1013-apply.err
           rc=$?
           set -e
           if [ "$rc" -ne 0 ]; then
