@@ -10774,6 +10774,98 @@ class TaskTests(unittest.TestCase):
             ).fetchone()
         self.assertIsNotNone(row)
 
+    def test_runtime_refresh_recovery_cannot_steal_live_dispatch_owner(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        metadata = {
+            "approval_task_id": fixture["approval_task_id"],
+            "intent_sha256": fixture["intent_sha256"],
+            "marker": "live-dispatch-owner",
+        }
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh live dispatch owner",
+            ttl_seconds=1200,
+            metadata=metadata,
+        )
+        operation_identity = {
+            "repository_head": "4" * 40,
+            "source_fingerprint_sha256": "5" * 64,
+            "purpose": "runtime refresh live dispatch owner test",
+            "scope_sha256": "6" * 64,
+        }
+        with self._runtime_refresh_start_environment(fixture):
+            with (
+                patch.object(
+                    tasks.bureau_runtime_refresh_executor,
+                    "operation_identity",
+                    return_value=operation_identity,
+                ),
+                patch.object(
+                    tasks,
+                    "_claim_runtime_refresh_prelaunch_task",
+                    side_effect=RuntimeError("simulated stall before dispatch claim"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stall before dispatch claim"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        with sqlite3.connect(self.database) as connection:
+            row = connection.execute(
+                "SELECT task_id, state, launcher_json FROM tasks ORDER BY created_at_unix LIMIT 1"
+            ).fetchone()
+            journal_count = connection.execute(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE ?",
+                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+            ).fetchone()[0]
+        self.assertIsNotNone(row)
+        self.assertEqual("launching", row[1])
+        launcher = json.loads(row[2])
+        self.assertTrue(launcher["pending"])
+        self.assertIn(
+            tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_DISPATCH_OWNER_KEY, launcher
+        )
+        self.assertNotIn(tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_CLAIM_KEY, launcher)
+        self.assertEqual(1, journal_count)
+
+        with self._runtime_refresh_start_environment(fixture):
+            with (
+                patch.object(
+                    tasks.bureau_runtime_refresh_executor,
+                    "operation_identity",
+                    return_value=operation_identity,
+                ),
+                patch.object(tasks, "_read_local_task_output_files") as read_output,
+                patch.object(tasks, "_observe") as observe,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "claimant is still alive"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        read_output.assert_not_called()
+        observe.assert_not_called()
+        with sqlite3.connect(self.database) as connection:
+            current = connection.execute(
+                "SELECT state, launcher_json FROM tasks WHERE task_id=?",
+                (row[0],),
+            ).fetchone()
+            journal_count = connection.execute(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE ?",
+                (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
+            ).fetchone()[0]
+        self.assertEqual("launching", current[0])
+        self.assertTrue(json.loads(current[1])["pending"])
+        self.assertEqual(1, journal_count)
+
     def test_runtime_refresh_undispatched_task_recovers_before_operation_identity(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
         metadata = {
@@ -10855,6 +10947,11 @@ class TaskTests(unittest.TestCase):
                     tasks.bureau_runtime_refresh_executor,
                     "operation_identity",
                     return_value=operation_identity,
+                ),
+                patch.object(
+                    tasks,
+                    "_runtime_refresh_prelaunch_process_identity_alive",
+                    return_value=False,
                 ),
                 patch.object(
                     tasks,

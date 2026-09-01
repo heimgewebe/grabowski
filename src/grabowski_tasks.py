@@ -2206,8 +2206,300 @@ def _runtime_refresh_prelaunch_recovery_action(
     return str(action)
 
 
+BUREAU_RUNTIME_REFRESH_PRELAUNCH_DISPATCH_OWNER_KEY = (
+    "runtime_refresh_prelaunch_dispatch_owner_v1"
+)
+BUREAU_RUNTIME_REFRESH_PRELAUNCH_CLAIM_KEY = "runtime_refresh_prelaunch_claim_v1"
+
+
+def _runtime_refresh_prelaunch_boot_id() -> str:
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError("runtime-refresh prelaunch boot identity is unavailable") from exc
+    value = value.casefold()
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        value,
+    ) is None:
+        raise RuntimeError("runtime-refresh prelaunch boot identity is invalid")
+    return value
+
+
+def _runtime_refresh_prelaunch_process_start_ticks(pid: int) -> int | None:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+        raise ValueError("runtime-refresh prelaunch process pid is invalid")
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("runtime-refresh prelaunch process identity is unreadable") from exc
+    closing = raw.rfind(")")
+    if closing < 1 or closing + 2 >= len(raw):
+        raise RuntimeError("runtime-refresh prelaunch process stat is malformed")
+    fields = raw[closing + 2 :].split()
+    if len(fields) <= 19:
+        raise RuntimeError("runtime-refresh prelaunch process stat is incomplete")
+    try:
+        start_ticks = int(fields[19])
+    except ValueError as exc:
+        raise RuntimeError("runtime-refresh prelaunch process start time is invalid") from exc
+    if start_ticks < 0:
+        raise RuntimeError("runtime-refresh prelaunch process start time is invalid")
+    return start_ticks
+
+
+def _runtime_refresh_prelaunch_process_identity(
+    pid: int | None = None,
+) -> dict[str, Any]:
+    process_id = os.getpid() if pid is None else pid
+    if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id < 1:
+        raise ValueError("runtime-refresh prelaunch process pid is invalid")
+    start_ticks = _runtime_refresh_prelaunch_process_start_ticks(process_id)
+    if start_ticks is None:
+        raise RuntimeError("runtime-refresh prelaunch process disappeared")
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_refresh_process_identity",
+        "pid": process_id,
+        "boot_id": _runtime_refresh_prelaunch_boot_id(),
+        "start_ticks": start_ticks,
+    }
+    return {**material, "identity_sha256": _sha256_json(material)}
+
+
+def _normalize_runtime_refresh_prelaunch_process_identity(
+    value: Any,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "pid",
+        "boot_id",
+        "start_ticks",
+        "identity_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise RuntimeError("runtime-refresh prelaunch process identity is malformed")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "grabowski_runtime_refresh_process_identity"
+    ):
+        raise RuntimeError("runtime-refresh prelaunch process identity is unsupported")
+    pid = value.get("pid")
+    start_ticks = value.get("start_ticks")
+    boot_id = value.get("boot_id")
+    digest = value.get("identity_sha256")
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid < 1
+        or isinstance(start_ticks, bool)
+        or not isinstance(start_ticks, int)
+        or start_ticks < 0
+        or not isinstance(boot_id, str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            boot_id,
+        ) is None
+        or not isinstance(digest, str)
+        or SHA256.fullmatch(digest) is None
+    ):
+        raise RuntimeError("runtime-refresh prelaunch process identity is invalid")
+    material = {key: value[key] for key in expected_fields if key != "identity_sha256"}
+    if digest != _sha256_json(material):
+        raise RuntimeError("runtime-refresh prelaunch process identity digest is invalid")
+    return dict(value)
+
+
+def _runtime_refresh_prelaunch_process_identity_alive(value: Any) -> bool:
+    identity = _normalize_runtime_refresh_prelaunch_process_identity(value)
+    if identity["boot_id"] != _runtime_refresh_prelaunch_boot_id():
+        return False
+    observed_start_ticks = _runtime_refresh_prelaunch_process_start_ticks(identity["pid"])
+    return (
+        observed_start_ticks is not None
+        and observed_start_ticks == identity["start_ticks"]
+    )
+
+
+def _normalize_runtime_refresh_prelaunch_claim(
+    value: Any,
+    *,
+    task_id: str,
+    executor_unit: str,
+    journal_sha256: str,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "role",
+        "task_id",
+        "executor_unit",
+        "journal_sha256",
+        "claimant_process_identity",
+        "claimed_at_unix",
+        "claim_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise RuntimeError("runtime-refresh prelaunch claim is malformed")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "grabowski_runtime_refresh_prelaunch_claim"
+        or value.get("role") not in {"dispatch", "recovery"}
+        or value.get("task_id") != task_id
+        or value.get("executor_unit") != executor_unit
+        or value.get("journal_sha256") != journal_sha256
+        or not isinstance(value.get("claimed_at_unix"), int)
+        or isinstance(value.get("claimed_at_unix"), bool)
+        or value["claimed_at_unix"] < 0
+        or not isinstance(value.get("claim_sha256"), str)
+        or SHA256.fullmatch(value["claim_sha256"]) is None
+    ):
+        raise RuntimeError("runtime-refresh prelaunch claim is invalid")
+    claimant = _normalize_runtime_refresh_prelaunch_process_identity(
+        value.get("claimant_process_identity")
+    )
+    material = {key: value[key] for key in expected_fields if key != "claim_sha256"}
+    material["claimant_process_identity"] = claimant
+    if value["claim_sha256"] != _sha256_json(material):
+        raise RuntimeError("runtime-refresh prelaunch claim digest is invalid")
+    return {**value, "claimant_process_identity": claimant}
+
+
+def _claim_runtime_refresh_prelaunch_task(
+    connection: sqlite3.Connection,
+    journal: dict[str, Any],
+    *,
+    role: str,
+) -> dict[str, Any]:
+    if role not in {"dispatch", "recovery"}:
+        raise ValueError("runtime-refresh prelaunch claim role is invalid")
+    normalized_journal = _normalize_runtime_refresh_prelaunch_binding_journal(journal)
+    task_id = normalized_journal["task_id"]
+    unit = normalized_journal["executor_unit"]
+    journal_sha256 = normalized_journal["journal_sha256"]
+    current_identity = _runtime_refresh_prelaunch_process_identity()
+    journal_row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (_runtime_refresh_prelaunch_journal_key(task_id),),
+    ).fetchone()
+    if journal_row is None:
+        raise RuntimeError("runtime-refresh prelaunch claim lost its journal")
+    try:
+        observed_journal = _normalize_runtime_refresh_prelaunch_binding_journal(
+            json.loads(journal_row["value"])
+        )
+    except (json.JSONDecodeError, TypeError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("runtime-refresh prelaunch claim journal is invalid") from exc
+    if observed_journal["journal_sha256"] != journal_sha256:
+        raise RuntimeError("runtime-refresh prelaunch claim journal changed")
+    task_row = connection.execute(
+        "SELECT task_id, unit, argv_sha256, state, launcher_json FROM tasks WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    if task_row is None:
+        raise RuntimeError("runtime-refresh prelaunch claim task row is missing")
+    if (
+        task_row["task_id"] != task_id
+        or task_row["unit"] != unit
+        or task_row["argv_sha256"] != normalized_journal["argv_sha256"]
+    ):
+        raise RuntimeError("runtime-refresh prelaunch claim task identity mismatched")
+    state = str(task_row["state"])
+    try:
+        launcher = json.loads(str(task_row["launcher_json"]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("runtime-refresh prelaunch claim launcher is invalid") from exc
+    if not isinstance(launcher, dict):
+        raise RuntimeError("runtime-refresh prelaunch claim launcher is invalid")
+    dispatch_owner = _normalize_runtime_refresh_prelaunch_process_identity(
+        launcher.get(BUREAU_RUNTIME_REFRESH_PRELAUNCH_DISPATCH_OWNER_KEY)
+    )
+    existing_raw = launcher.get(BUREAU_RUNTIME_REFRESH_PRELAUNCH_CLAIM_KEY)
+    existing = (
+        _normalize_runtime_refresh_prelaunch_claim(
+            existing_raw,
+            task_id=task_id,
+            executor_unit=unit,
+            journal_sha256=journal_sha256,
+        )
+        if existing_raw is not None
+        else None
+    )
+    if role == "dispatch":
+        if state != "launching":
+            raise RuntimeError("runtime-refresh dispatch claim requires launching state")
+        if dispatch_owner["identity_sha256"] != current_identity["identity_sha256"]:
+            raise RuntimeError("runtime-refresh dispatch owner process changed")
+        if existing is not None:
+            if (
+                existing["role"] == "dispatch"
+                and existing["claimant_process_identity"]["identity_sha256"]
+                == current_identity["identity_sha256"]
+            ):
+                return existing
+            raise RuntimeError("runtime-refresh dispatch authority was claimed elsewhere")
+        if launcher.get("pending") is not True:
+            raise RuntimeError("runtime-refresh dispatch claim lost pending state")
+    else:
+        if state not in {"launching", "outcome_unknown"}:
+            raise RuntimeError("runtime-refresh recovery claim requires unresolved state")
+        if existing is not None and (
+            existing["role"] == "recovery"
+            and existing["claimant_process_identity"]["identity_sha256"]
+            == current_identity["identity_sha256"]
+        ):
+            return existing
+        blocker = (
+            existing["claimant_process_identity"]
+            if existing is not None
+            else dispatch_owner
+        )
+        if _runtime_refresh_prelaunch_process_identity_alive(blocker):
+            raise RuntimeError(
+                "runtime-refresh prelaunch claimant is still alive; journal retained"
+            )
+        if existing is None and launcher.get("pending") is not True:
+            raise RuntimeError("runtime-refresh recovery claim lost pending state")
+
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_refresh_prelaunch_claim",
+        "role": role,
+        "task_id": task_id,
+        "executor_unit": unit,
+        "journal_sha256": journal_sha256,
+        "claimant_process_identity": current_identity,
+        "claimed_at_unix": _now(),
+    }
+    claim = {**material, "claim_sha256": _sha256_json(material)}
+    updated_launcher = {
+        **launcher,
+        "pending": False,
+        BUREAU_RUNTIME_REFRESH_PRELAUNCH_CLAIM_KEY: claim,
+    }
+    updated = connection.execute(
+        "UPDATE tasks SET launcher_json=?, updated_at_unix=? "
+        "WHERE task_id=? AND state=? AND launcher_json=?",
+        (
+            _canonical_json(updated_launcher),
+            _now(),
+            task_id,
+            state,
+            str(task_row["launcher_json"]),
+        ),
+    )
+    if updated.rowcount != 1:
+        raise RuntimeError("runtime-refresh prelaunch claim lost its exact task row")
+    return claim
+
+
 def _runtime_refresh_prelaunch_undispatched_task_evidence(
     record: dict[str, Any],
+    journal: dict[str, Any],
+    recovery_claim: dict[str, Any],
 ) -> dict[str, Any] | None:
     if (
         str(record.get("host")) != "local"
@@ -2216,6 +2508,15 @@ def _runtime_refresh_prelaunch_undispatched_task_evidence(
         or int(record.get("attempt") or 0) != 1
     ):
         return None
+    normalized_journal = _normalize_runtime_refresh_prelaunch_binding_journal(journal)
+    claim = _normalize_runtime_refresh_prelaunch_claim(
+        recovery_claim,
+        task_id=str(record["task_id"]),
+        executor_unit=_authoritative_unit(record),
+        journal_sha256=normalized_journal["journal_sha256"],
+    )
+    if claim["role"] != "recovery":
+        return None
     raw_launcher = record.get("launcher_json")
     try:
         launcher = json.loads(str(raw_launcher))
@@ -2223,7 +2524,7 @@ def _runtime_refresh_prelaunch_undispatched_task_evidence(
         return None
     if (
         not isinstance(launcher, dict)
-        or launcher.get("pending") is not True
+        or launcher.get(BUREAU_RUNTIME_REFRESH_PRELAUNCH_CLAIM_KEY) != claim
         or launcher.get(TASK_OUTPUT_LAUNCHER_BINDING_KEY) != 1
     ):
         return None
@@ -2260,6 +2561,7 @@ def _runtime_refresh_prelaunch_undispatched_task_evidence(
         "kind": "grabowski_runtime_refresh_undispatched_task_evidence",
         "task_id": str(record["task_id"]),
         "executor_unit": _authoritative_unit(record),
+        "recovery_claim_sha256": claim["claim_sha256"],
         "output_directory_sha256": hashlib.sha256(
             str(paths["directory"]).encode("utf-8")
         ).hexdigest(),
@@ -2268,7 +2570,6 @@ def _runtime_refresh_prelaunch_undispatched_task_evidence(
         "probe_returncode": returncode,
     }
     return {**material, "evidence_sha256": _sha256_json(material)}
-
 
 def _reconcile_runtime_refresh_prelaunch_binding_journals(
     resource_keys: list[str],
@@ -2312,9 +2613,21 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
                     )
                 task_state = str(task_record["state"])
                 if task_state in {"launching", "outcome_unknown"}:
+                    recovery_claim = _claim_runtime_refresh_prelaunch_task(
+                        connection, journal, role="recovery"
+                    )
+                    claimed_row = connection.execute(
+                        "SELECT * FROM tasks WHERE task_id=?",
+                        (journal["task_id"],),
+                    ).fetchone()
+                    if claimed_row is None:
+                        raise RuntimeError(
+                            "runtime-refresh recovery claim lost its task row; journal retained"
+                        )
+                    task_record = dict(claimed_row)
                     dispatch_evidence = (
                         _runtime_refresh_prelaunch_undispatched_task_evidence(
-                            task_record
+                            task_record, journal, recovery_claim
                         )
                     )
                     if dispatch_evidence is None:
@@ -2334,6 +2647,7 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
                             "journal": journal,
                             "lease_recovery_action": action,
                             "dispatch_evidence": dispatch_evidence,
+                            "recovery_claim": recovery_claim,
                         }
                     )
                     continue
@@ -7691,6 +8005,7 @@ def grabowski_task_start(
         )
     )
     task_id = uuid.uuid4().hex[:24]
+    executor_prelaunch_dispatch_owner: dict[str, Any] | None = None
     if executor_request is not None:
         if executor_intent is None or executor_authority_contract is None:
             raise RuntimeError(
@@ -7704,6 +8019,9 @@ def grabowski_task_start(
                 task_id,
                 _task_unit(task_id, 1),
             )
+        )
+        executor_prelaunch_dispatch_owner = (
+            _runtime_refresh_prelaunch_process_identity()
         )
     executor_prelaunch_recovery: dict[str, Any] | None = None
     if executor_request is not None:
@@ -8539,6 +8857,14 @@ def grabowski_task_start(
             {
                 "pending": True,
                 **(
+                    {
+                        BUREAU_RUNTIME_REFRESH_PRELAUNCH_DISPATCH_OWNER_KEY:
+                            dict(executor_prelaunch_dispatch_owner)
+                    }
+                    if executor_prelaunch_dispatch_owner is not None
+                    else {}
+                ),
+                **(
                     {TASK_OUTPUT_LAUNCHER_BINDING_KEY: task_output_managed_from_attempt}
                     if task_output_managed_from_attempt is not None
                     else {}
@@ -8778,6 +9104,28 @@ def grabowski_task_start(
                     )
                 raise failure from exc
         raise
+    executor_prelaunch_dispatch_claim: dict[str, Any] | None = None
+    if executor_lease_binding_journal is not None:
+        with _database_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            executor_prelaunch_dispatch_claim = (
+                _claim_runtime_refresh_prelaunch_task(
+                    connection,
+                    executor_lease_binding_journal,
+                    role="dispatch",
+                )
+            )
+            claimed_row = connection.execute(
+                "SELECT launcher_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if claimed_row is None:
+                connection.rollback()
+                raise RuntimeError(
+                    "Bureau runtime-refresh dispatch claim lost its task row"
+                )
+            record["launcher_json"] = str(claimed_row["launcher_json"])
+            connection.commit()
     launcher = {
         **_launch(record),
         "task_effect_classification": dict(task_effect_classification),
@@ -8787,6 +9135,14 @@ def grabowski_task_start(
             else {}
         ),
     }
+    if executor_prelaunch_dispatch_owner is not None:
+        launcher[BUREAU_RUNTIME_REFRESH_PRELAUNCH_DISPATCH_OWNER_KEY] = dict(
+            executor_prelaunch_dispatch_owner
+        )
+    if executor_prelaunch_dispatch_claim is not None:
+        launcher[BUREAU_RUNTIME_REFRESH_PRELAUNCH_CLAIM_KEY] = dict(
+            executor_prelaunch_dispatch_claim
+        )
     if executor_lease_binding_evidence is not None:
         launcher = {
             **launcher,
