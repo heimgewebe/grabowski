@@ -195,6 +195,16 @@ This documentation-only change is therefore the new PR-settlement pilot target, 
 
 Pilot 2 must then start fresh from that exact merge commit: new runtime-deployment plan and run receipt, normal Captain deployment, exact deployment-identity convergence, verified Captain audit binding and `saga-settle == settled`. A concurrent `main` advance may not be silently substituted for the bound merge identity; any identity drift requires a new plan rather than retrospective rebinding.
 
+### Prospective durability acceptance — 2026-09-01
+
+PR #1004 produced a real pre-effect `saga-run` and a verified Captain merge, but it could not be settled after caller-context loss because the full `OperatorSagaRunReceipt.v1` existed only in the transient caller response. The known run digest was insufficient to reconstruct the structured receipt, so #1004 remains failure/recovery evidence and is not promoted to pilot success.
+
+PR #1007 merged as `a06790d1e48fe45aa43e13738af458498357be8f`, and the serving Grabowski runtime now reports that exact protected commit with complete manifest/integrity convergence. That release persists each validated Saga run receipt into the existing verified Grabowski audit chain before Captain handoff and returns a compact `VerifiedSagaRunReceiptRef.v1`. If the durability append fails, `saga-run` fails before Captain. `saga-settle` may recover the exact run from that verified reference and independently recover Captain evidence from `VerifiedCaptainAuditResultRef.v1`; both references remain bound to the exact plan/action identities. The normal deployment used to activate #1007 is a prerequisite only and is not counted as either T121 pilot.
+
+This documentation change is the first prospective acceptance target under the durable contract. Before any merge effect, its exact PR/head/base/diff must receive a fresh `saga-plan` and `saga-run`, and the returned `run_receipt_ref` must resolve from the verified audit chain. After the normal Captain merge and authoritative GitHub readback, settlement must be executed with that durable run reference rather than relying on the inline caller copy and must reach `settled`. Only the exact merge commit established by that settlement may become the runtime-deployment pilot target.
+
+Pilot 2 must then produce its own fresh runtime-deployment plan, durable run reference, Captain deployment result, exact deployment-identity convergence and reference-based `saga-settle == settled`. Historical merges, prerequisite deployments, inline-only receipts and later `main` identities are not substitutes for those prospective proofs.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
