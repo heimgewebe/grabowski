@@ -113,6 +113,22 @@ class OperationalGuidanceTests(unittest.TestCase):
         self.assertEqual(normalized["applies_to"]["platforms"], ["windows"])
         self.assertIn("root_cause", normalized["does_not_establish"])
 
+    def test_frontmatter_parser_is_dependency_free_and_fail_closed(self) -> None:
+        source = (ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8")
+        self.assertNotIn("import yaml", source)
+        with self.assertRaisesRegex(ValueError, "duplicate key"):
+            mcp._operational_guidance_frontmatter(
+                "---\noperational_runbook:\n  contract: operational-runbook.v1\n  contract: duplicate\n---\n"
+            )
+        with self.assertRaisesRegex(ValueError, "unsupported YAML syntax"):
+            mcp._operational_guidance_frontmatter(
+                "---\noperational_runbook:\n  contract: &anchor operational-runbook.v1\n---\n"
+            )
+        with self.assertRaisesRegex(ValueError, "two-space steps"):
+            mcp._operational_guidance_frontmatter(
+                "---\noperational_runbook:\n   contract: operational-runbook.v1\n---\n"
+            )
+
     def test_runbook_contract_rejects_unknown_fields_and_unbounded_shapes(self) -> None:
         parsed = mcp._operational_guidance_frontmatter(VALID_FRONTMATTER)
         parsed["secret_policy"] = "surprise"
@@ -451,6 +467,146 @@ class OperationalGuidanceTests(unittest.TestCase):
         self.assertEqual(metrics["wrong_platform_matches"], 0)
         self.assertGreater(metrics["context_bytes"], 0)
         self.assertGreaterEqual(metrics["elapsed_ms"], 0)
+
+
+class OperationalGuidanceReviewRegressionTests(unittest.TestCase):
+    def test_exact_specificity_strictly_outranks_wildcard_fallback(self) -> None:
+        specific = metadata(
+            "specific", operation="ssh_diagnostics", platform="windows",
+            component="tailscale", symptom="ssh_timeout",
+        )
+        wildcard = metadata(
+            "wildcard", operation="*", platform="*", component="*", symptom="*",
+        )
+        specific_score = mcp._operational_guidance_match_score(
+            specific, operation="ssh_diagnostics", platforms=["windows"],
+            components=["tailscale"], symptoms=["ssh_timeout"],
+        )
+        wildcard_score = mcp._operational_guidance_match_score(
+            wildcard, operation="ssh_diagnostics", platforms=["windows"],
+            components=["tailscale"], symptoms=["ssh_timeout"],
+        )
+        self.assertIsNotNone(specific_score)
+        self.assertIsNotNone(wildcard_score)
+        self.assertGreater(specific_score, wildcard_score)
+
+    def test_freshness_shape_matches_live_repoground_contract(self) -> None:
+        state, source = mcp._operational_guidance_freshness({
+            "freshness": "fresh_exact",
+            "freshness_status": "fresh",
+            "bundle": {"git_commit": "a" * 40, "manifest_sha256": "b" * 64},
+        })
+        self.assertEqual(state, "current")
+        self.assertEqual(source["status"], "fresh")
+        self.assertEqual(source["bundle_commit"], "a" * 40)
+        state, _ = mcp._operational_guidance_freshness({"freshness_status": "dirty_overlay"})
+        self.assertEqual(state, "stale")
+
+    def test_runbook_result_uses_realistic_repoground_row_shape_and_initial_score(self) -> None:
+        row = {
+            "source_path": "docs/runbooks/windows.md",
+            "start_line": 1,
+            "final_score": 0.875,
+            "range_ref": {"content_sha256": "c" * 64, "start_line": 1, "end_line": 20},
+        }
+        freshness = {
+            "freshness": "fresh_exact", "freshness_status": "fresh",
+            "bundle": {"git_commit": "a" * 40, "manifest_sha256": "b" * 64},
+        }
+        with mock.patch.object(mcp, "_repoground_range_get", return_value={"range": {"text": VALID_FRONTMATTER}}):
+            runbook, error = mcp._operational_guidance_runbook_from_result(
+                repo="heimgewebe/example", path=row["source_path"], raw_result=row,
+                freshness=freshness, stem="fixture", manifest_path=Path("/tmp/manifest.json"),
+            )
+        self.assertIsNone(error)
+        self.assertIsNotNone(runbook)
+        self.assertEqual(runbook["semantic_score"], 0.875)
+        self.assertEqual(runbook["source"]["bundle_commit"], "a" * 40)
+
+    def test_automatic_discovery_enforces_runbooks_boundary_and_candidate_limit(self) -> None:
+        valid = {
+            "source_path": "docs/runbooks/windows.md", "start_line": 1,
+            "final_score": 0.7, "range_ref": {"content_sha256": "c" * 64},
+        }
+        invalid = {
+            "source_path": "scratch/windows.md", "start_line": 1,
+            "final_score": 0.99, "range_ref": {"content_sha256": "d" * 64},
+        }
+        freshness = {
+            "freshness_status": "fresh",
+            "bundle": {"git_commit": "a" * 40, "manifest_sha256": "b" * 64},
+        }
+        with mock.patch.object(
+            mcp, "_repoground_selected_manifest_for_repo",
+            return_value=(freshness, "fixture", Path("/tmp/manifest.json"), None),
+        ), mock.patch.object(
+            mcp, "_repoground_query_existing_index",
+            return_value={"status": "available", "query_result": {"results": [invalid, valid]}},
+        ), mock.patch.object(
+            mcp, "_repoground_range_get", return_value={"range": {"text": VALID_FRONTMATTER}},
+        ) as range_get:
+            result = mcp._operational_guidance_discover_repo("heimgewebe/example", max_candidates=2)
+        self.assertEqual(result["examined_count"], 2)
+        self.assertEqual([item["path"] for item in result["runbooks"]], ["docs/runbooks/windows.md"])
+        range_get.assert_called_once()
+
+    def test_system_scope_matches_live_systemkatalog_envelope(self) -> None:
+        live_shape = {
+            "status": "ok",
+            "systemkatalog": {
+                "catalogCommit": "1" * 40,
+                "result": {"system": {"id": "repo:grabowski"}},
+            },
+        }
+        with mock.patch("grabowski_systemkatalog.query_systemkatalog", return_value=live_shape):
+            result = mcp._operational_guidance_system_scope(["repo:grabowski"])
+        self.assertEqual(result["repositories"], ["grabowski"])
+        self.assertEqual(result["bindings"][0]["catalog_commit"], "1" * 40)
+        self.assertEqual(result["errors"], [])
+
+    def test_semantic_rank_uses_discovery_score_without_repoground_requery(self) -> None:
+        item = candidate("one")
+        item["match_score"] = 20
+        item["semantic_score"] = 0.42
+        with mock.patch.object(mcp, "_repoground_selected_manifest_for_repo") as selected, mock.patch.object(
+            mcp, "_repoground_query_existing_index"
+        ) as query:
+            ranked, ambiguous = mcp._operational_guidance_rank([item], semantic_query="ssh")
+        self.assertFalse(ambiguous)
+        self.assertEqual(ranked[0]["semantic_score"], 0.42)
+        selected.assert_not_called()
+        query.assert_not_called()
+
+    def test_global_automatic_discovery_budget_is_hard_bounded(self) -> None:
+        scope = {
+            "repositories": [f"repo-{i}" for i in range(8)],
+            "bindings": [], "errors": [],
+        }
+        calls: list[int] = []
+        def discover(_repo: str, *, exact_path=None, max_candidates=8):
+            del exact_path
+            calls.append(max_candidates)
+            return {"runbooks": [], "errors": [], "examined_count": max_candidates}
+        with mock.patch.object(mcp, "_operational_guidance_system_scope", return_value=scope), mock.patch.object(
+            mcp, "_operational_guidance_discover_repo", side_effect=discover
+        ):
+            result = mcp.grabowski_operational_guidance(
+                operation="ssh_diagnostics", system_refs=["repo:grabowski"]
+            )
+        self.assertEqual(sum(calls), mcp._OPERATIONAL_GUIDANCE_MAX_TOTAL_CANDIDATES)
+        self.assertLessEqual(max(calls), mcp._OPERATIONAL_GUIDANCE_MAX_RESULTS_PER_REPO)
+        self.assertTrue(any("global 24-candidate budget" in item for item in result["diagnostics"]))
+
+    def test_published_operational_runbook_contract_tracks_validator_surface(self) -> None:
+        contract = json.loads((ROOT / "contracts/operational-runbook.v1.json").read_text(encoding="utf-8"))
+        self.assertEqual(contract["$id"], "operational-runbook.v1")
+        self.assertFalse(contract["additionalProperties"])
+        expected = {
+            "contract", "id", "status", "title", "applies_to", "symptoms",
+            "evidence_refs", "verified_against", "does_not_establish",
+            "known_bad_paths", "rollback", "related_runbooks", "version_constraints", "supersedes",
+        }
+        self.assertEqual(set(contract["properties"]), expected)
 
 
 if __name__ == "__main__":
