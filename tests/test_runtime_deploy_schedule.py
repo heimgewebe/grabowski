@@ -1085,7 +1085,7 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             runtime.deployment_source_identity_sha256, SOURCE_IDENTITY_SHA256
         )
 
-    def test_instruction_transition_preflight_rejects_deployment_source_identity_drift(self) -> None:
+    def test_instruction_transition_preflight_binds_scheduler_source_identity_not_runtime_snapshot_identity(self) -> None:
         snapshot = mock.Mock()
         build = mock.Mock(release_id="green")
         runtime = dual.ProductionBlueGreenRuntime(
@@ -1101,7 +1101,7 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
                 "agent_instructions_sha256": "7c" * 32,
             },
             selector_before={"selector_sha256": "7a" * 32},
-            cutover_id="cutover-source-drift",
+            cutover_id="cutover-source-binding",
             timeout_seconds=10,
             green_unit="grabowski-green-operator-123456789abc.service",
             deployment_source_identity_sha256=SOURCE_IDENTITY_SHA256,
@@ -1112,13 +1112,59 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             "repo_head": HEAD_GREEN,
             "agent_instructions_sha256": "7c" * 32,
         }
-        with mock.patch.object(
-            dual, "_deployment_source_identity_sha256", return_value="79" * 32
+        transition = {
+            "kind": "grabowski_agent_instructions_transition",
+            "deployment_source_identity_sha256": SOURCE_IDENTITY_SHA256,
+        }
+        with (
+            mock.patch.object(
+                dual, "_deployment_source_identity_sha256", return_value="79" * 32
+            ) as runtime_snapshot_identity,
+            mock.patch.object(
+                dual.client_snapshot,
+                "prepare_agent_instructions_transition_for_cutover",
+                return_value=transition,
+            ) as prepare_transition,
         ):
-            with self.assertRaisesRegex(
-                RuntimeError, "Deployment source identity does not bind"
-            ):
-                runtime.prepare_agent_instruction_transition()
+            result = runtime.prepare_agent_instruction_transition()
+        runtime_snapshot_identity.assert_not_called()
+        self.assertEqual(
+            prepare_transition.call_args.kwargs["deployment_source_identity_sha256"],
+            SOURCE_IDENTITY_SHA256,
+        )
+        self.assertIs(result, transition)
+        self.assertIs(runtime.agent_instruction_transition, transition)
+        self.assertFalse(runtime.connector_switched)
+
+    def test_instruction_transition_preflight_rejects_invalid_scheduler_source_identity(self) -> None:
+        snapshot = mock.Mock()
+        build = mock.Mock(release_id="green")
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(steps=[]),
+            blue_manifest={"entrypoint_contract": {"expected_tools": ["grabowski_status"]}},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding={
+                **runtime_binding("green", HEAD_GREEN),
+                "agent_instructions_sha256": "7c" * 32,
+            },
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="cutover-invalid-source-binding",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+            deployment_source_identity_sha256="not-a-digest",
+        )
+        runtime.green_readiness = {
+            "ready": True,
+            "release_id": "green",
+            "repo_head": HEAD_GREEN,
+            "agent_instructions_sha256": "7c" * 32,
+        }
+        with self.assertRaisesRegex(RuntimeError, "deployment source identity sha256"):
+            runtime.prepare_agent_instruction_transition()
         self.assertFalse(runtime.connector_switched)
         self.assertIsNone(runtime.agent_instruction_transition)
 
