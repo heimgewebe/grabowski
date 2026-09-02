@@ -95,6 +95,7 @@ class _FakeGitHub:
         runs_per_post: int = 1,
         run_readback_failures: int = 0,
         run_snapshots: list[list[int]] | None = None,
+        run_created_at: str = "2026-09-02T05:00:00Z",
     ) -> None:
         self.head = head
         self.workflow_state = workflow_state
@@ -107,6 +108,7 @@ class _FakeGitHub:
         self.runs: list[int] = []
         self.run_branches: dict[int, str] = {}
         self.run_snapshots = run_snapshots
+        self.run_created_at = run_created_at
         self.run_readback_count = 0
 
     @staticmethod
@@ -183,8 +185,8 @@ class _FakeGitHub:
                     "status": "queued",
                     "conclusion": None,
                     "html_url": f"https://github.example/runs/{run_id}",
-                    "created_at": "2026-09-02T05:00:00Z",
-                    "updated_at": "2026-09-02T05:00:00Z",
+                    "created_at": self.run_created_at,
+                    "updated_at": self.run_created_at,
                     "run_attempt": 1,
                     "run_number": run_id,
                 }
@@ -229,6 +231,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         expected_head: str | None = "a" * 40,
         inputs: dict[str, str] | None = None,
         poll_attempts: int = 2,
+        time_fn=None,
     ):
         return self.dispatch.dispatch_workflow(
             "heimgewebe/commonthing",
@@ -239,7 +242,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             runner=runner,
             state_root=Path(directory),
             sleep=lambda _seconds: None,
-            time_fn=lambda: NOW,
+            time_fn=time_fn or (lambda: NOW),
             poll_attempts=poll_attempts,
         )
 
@@ -436,6 +439,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             head="a" * 40,
             baseline=set(),
             attempted_at=NOW,
+            observation_deadline=NOW + self.dispatch.RUN_FUTURE_SECONDS,
             attempts=1,
             sleep=lambda _seconds: None,
             time_fn=lambda: NOW,
@@ -488,6 +492,40 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         self.assertEqual(second["effect_state"], "unknown")
         self.assertEqual(runner.post_count, 1)
         self.assertFalse(second["retry_authorized"])
+
+    def test_late_run_cannot_recover_old_ambiguous_attempt(self) -> None:
+        runner = _FakeGitHub(post_mode="timeout", create_run_on_post=False)
+        clock = [NOW]
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._call(runner, directory, time_fn=lambda: clock[0])
+            self.assertEqual(first["result_code"], "dispatch_outcome_unknown")
+            clock[0] = NOW + 3600
+            runner.runs.append(777)
+            runner.run_created_at = "2026-09-02T06:00:00Z"
+            second = self._call(runner, directory, time_fn=lambda: clock[0])
+
+        self.assertEqual(second["result_code"], "prior_ambiguous_outcome_unresolved")
+        self.assertEqual(second["effect_state"], "unknown")
+        self.assertEqual(runner.post_count, 1)
+        self.assertFalse(second["retry_authorized"])
+
+    def test_pre_post_active_journal_failure_is_not_started_and_retryable(self) -> None:
+        runner = _FakeGitHub()
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                self.dispatch,
+                "_write_active_attempt",
+                side_effect=OSError("simulated active journal failure"),
+            ):
+                first = self._call(runner, directory)
+            self.assertEqual(first["result_code"], "dispatch_journal_failed")
+            self.assertEqual(first["effect_state"], "not_started")
+            self.assertEqual(runner.post_count, 0)
+            second = self._call(runner, directory)
+
+        self.assertTrue(second["ok"])
+        self.assertEqual(second["result_code"], "dispatch_accepted")
+        self.assertEqual(runner.post_count, 1)
 
     def test_ambiguous_timeout_can_be_recovered_on_later_readback(self) -> None:
         runner = _FakeGitHub(post_mode="timeout", create_run_on_post=False)
