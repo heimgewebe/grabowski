@@ -928,6 +928,69 @@ class OperatorSignedTransportTests(unittest.TestCase):
             )
         )
 
+    def test_trusted_github_cli_pin_rejects_unsafe_metadata(self) -> None:
+        trusted_file = SimpleNamespace(
+            st_mode=operator.stat.S_IFREG | 0o755, st_uid=0
+        )
+        trusted_dir = SimpleNamespace(
+            st_mode=operator.stat.S_IFDIR | 0o755, st_uid=0
+        )
+
+        def lstat_for(path: object) -> object:
+            value = Path(path)
+            if value == operator.TRUSTED_GITHUB_CLI_PATH:
+                return trusted_file
+            if value in {
+                operator.TRUSTED_GITHUB_CLI_PATH.parent,
+                operator.TRUSTED_GITHUB_CLI_PATH.parent.parent,
+            }:
+                return trusted_dir
+            raise AssertionError(f"unexpected lstat path: {value}")
+
+        with mock.patch.object(operator.os, "lstat", side_effect=lstat_for):
+            self.assertEqual(operator._trusted_github_cli_path(), "/usr/bin/gh")
+
+        unsafe_cases = [
+            SimpleNamespace(st_mode=operator.stat.S_IFREG | 0o755, st_uid=1000),
+            SimpleNamespace(st_mode=operator.stat.S_IFREG | 0o775, st_uid=0),
+            SimpleNamespace(st_mode=operator.stat.S_IFLNK | 0o777, st_uid=0),
+        ]
+        for unsafe_file in unsafe_cases:
+            with self.subTest(mode=unsafe_file.st_mode, uid=unsafe_file.st_uid):
+                def unsafe_lstat(path: object) -> object:
+                    value = Path(path)
+                    if value == operator.TRUSTED_GITHUB_CLI_PATH:
+                        return unsafe_file
+                    return trusted_dir
+
+                with mock.patch.object(operator.os, "lstat", side_effect=unsafe_lstat):
+                    with self.assertRaises(RuntimeError):
+                        operator._trusted_github_cli_path()
+
+    def test_github_wrapper_ignores_path_shim_and_uses_trusted_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            shim = Path(directory) / "gh"
+            shim.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            shim.chmod(0o755)
+            with (
+                mock.patch.dict(operator.os.environ, {"PATH": directory}, clear=False),
+                mock.patch.object(operator, "_require_operator_mutation"),
+                mock.patch.object(
+                    operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+                ) as trusted,
+                mock.patch.object(
+                    operator, "_run", return_value={"returncode": 0}
+                ) as run,
+            ):
+                operator.grabowski_github(
+                    ["pr", "view", "1031", "--json", "number,state"],
+                    cwd=str(ROOT),
+                )
+        trusted.assert_called_once_with()
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/gh")
+        self.assertNotEqual(command[0], str(shim))
+
     def test_github_pr_view_does_not_consume_signed_assertion(self) -> None:
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
         with (
