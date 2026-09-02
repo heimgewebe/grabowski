@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 
@@ -1112,13 +1113,19 @@ class AuditQueryTests(unittest.TestCase):
             "data": {"operation": "implement"},
         }
         fake_chronik._event_should_be_recorded = lambda _event: False
+        fake_chronik.MAX_BUNDLE_BYTES = 1024
+        expected_run_id = f"task-{task_id}-a1"
+        expected_path = Path("/tmp/state/grabowski/chronik-outbox") / f"grabowski_{expected_run_id}.jsonl"
+        source_reads: list[Path] = []
+        fake_chronik.run_id = lambda _record: expected_run_id
+        fake_chronik.state_root = lambda record: Path(record["chronik_outbox_state_root"])
+        fake_chronik.outbox_path = lambda _value, root=None: expected_path
 
-        def unexpected_source_read(*_args, **_kwargs):
-            raise AssertionError("filtered Chronik task must not require an outbox source")
+        def read_missing_source(path, **_kwargs):
+            source_reads.append(path)
+            return None
 
-        fake_chronik.run_id = unexpected_source_read
-        fake_chronik.outbox_path = unexpected_source_read
-        fake_chronik._read_regular_file = unexpected_source_read
+        fake_chronik._read_regular_file = read_missing_source
         previous = {
             name: sys.modules.get(name)
             for name in ("grabowski_tasks", "grabowski_sqlite_store", "grabowski_chronik")
@@ -1135,7 +1142,80 @@ class AuditQueryTests(unittest.TestCase):
                 else:
                     sys.modules[name] = value
 
+        self.assertEqual(source_reads, [expected_path])
         self.assertNotIn("chronik", {item["source"] for item in evidence})
+        self.assertNotIn("chronik", {gap["source"] for gap in gaps})
+
+    def test_chronik_filtered_current_state_still_verifies_prior_retained_event(self) -> None:
+        module = self._load_module([])
+        import grabowski_chronik as real_chronik
+
+        task_id = "task-chronik-retained-block"
+        with tempfile.TemporaryDirectory() as tmp:
+            row = {
+                "task_id": task_id,
+                "attempt": 1,
+                "state": "completed",
+                "unit": "unit",
+                "created_at_unix": 1,
+                "updated_at_unix": 2,
+                "terminalized_at_unix": None,
+                "lifecycle_receipt_sha256": None,
+                "terminalization_sha256": None,
+                "chronik_outbox_enabled": 1,
+                "chronik_outbox_state_root": tmp,
+                "chronik_context_json": {
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": "implement",
+                    "task_class": "coding",
+                },
+            }
+            written = real_chronik.record_task_state(row, "outcome_unknown")
+            self.assertTrue(written["written"])
+
+            class Connection:
+                def execute(self, _query, _parameters):
+                    return self
+
+                def fetchone(self):
+                    return row
+
+            fake_tasks = types.ModuleType("grabowski_tasks")
+            fake_tasks.TASK_DB = Path("/tmp/tasks.sqlite3")
+            fake_tasks.TASK_OUTCOMES_DIR = Path("/tmp/outcomes")
+            fake_tasks._preflight_task_store = lambda: "5"
+            fake_tasks._task_archive_record = lambda value: {
+                "task_id": value["task_id"],
+                "attempt": value["attempt"],
+                "state": value["state"],
+            }
+            fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+            @contextmanager
+            def readonly_sqlite(_path):
+                yield Connection()
+
+            fake_sqlite.readonly_sqlite = readonly_sqlite
+            previous = {
+                name: sys.modules.get(name)
+                for name in ("grabowski_tasks", "grabowski_sqlite_store", "grabowski_chronik")
+            }
+            sys.modules["grabowski_tasks"] = fake_tasks
+            sys.modules["grabowski_sqlite_store"] = fake_sqlite
+            sys.modules["grabowski_chronik"] = real_chronik
+            try:
+                evidence, gaps = module._task_external_evidence(task_id)
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = value
+
+        chronik_evidence = [item for item in evidence if item["source"] == "chronik"]
+        self.assertEqual(len(chronik_evidence), 1)
+        self.assertEqual(chronik_evidence[0]["record"]["event_count"], 1)
         self.assertNotIn("chronik", {gap["source"] for gap in gaps})
 
     def test_chronik_event_source_identity_drift_is_a_gap(self) -> None:
@@ -1178,9 +1258,9 @@ class AuditQueryTests(unittest.TestCase):
         fake_chronik.MAX_BUNDLE_BYTES = 1024
         fake_chronik.build_event = lambda _record, _state: {
             "kind": "agent.run.completed",
-            "data": {"operation": "deploy"},
+            "data": {"operation": "implement"},
         }
-        fake_chronik._event_should_be_recorded = lambda _event: True
+        fake_chronik._event_should_be_recorded = lambda _event: False
         fake_chronik.run_id = lambda record: f"task-{record['task_id']}-a{record['attempt']}"
         fake_chronik.state_root = lambda record: Path(record["chronik_outbox_state_root"])
         fake_chronik.outbox_path = lambda value, root=None: root / "grabowski" / "chronik-outbox" / f"grabowski_{value['source']['run_id']}.jsonl"

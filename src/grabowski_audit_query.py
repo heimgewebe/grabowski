@@ -957,8 +957,6 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 )
             )
             return evidence, gaps
-        if not source_expected:
-            return evidence, gaps
         expected_run_id = chronik.run_id(raw)
         source = chronik.outbox_path(
             {"source": {"run_id": expected_run_id}},
@@ -972,7 +970,9 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 allow_missing=True,
             )
             if loaded is None:
-                raise FileNotFoundError(source)
+                if source_expected:
+                    raise FileNotFoundError(source)
+                return evidence, gaps
             data, _identity = loaded
             events = [json.loads(line) for line in data.decode("utf-8").splitlines() if line]
             if not events:
