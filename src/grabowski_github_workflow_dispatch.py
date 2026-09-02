@@ -310,7 +310,8 @@ def _request_lock(directory: Path) -> Iterator[None]:
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             raise WorkflowDispatchContractError(
-                "receipt_store_invalid", "request lock is not private and owner-controlled"
+                "receipt_store_invalid",
+                "request lock is not private and owner-controlled",
             )
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
@@ -349,7 +350,9 @@ def _write_receipt(directory: Path, receipt: dict[str, Any]) -> dict[str, Any]:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    directory_fd = os.open(
+        directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
     try:
         os.fsync(directory_fd)
     finally:
@@ -532,11 +535,16 @@ def _workflow_preflight(
     workflow_kind: str,
     workflow_selector: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    api_identifier = (
+        workflow_selector
+        if workflow_kind == "id"
+        else workflow_selector.rsplit("/", 1)[-1]
+    )
     payload, error = _gh_json(
         runner,
         [
             "api",
-            f"repos/{repository}/actions/workflows/{quote(workflow_selector, safe='')}",
+            f"repos/{repository}/actions/workflows/{quote(api_identifier, safe='')}",
             "--jq",
             '{"id":.id,"name":.name,"path":.path,"state":.state}',
         ],
@@ -778,7 +786,10 @@ def _dispatch_post(
     temp_path = Path(temp_name)
     try:
         os.fchmod(descriptor, 0o600)
-        os.write(descriptor, _canonical_json_bytes({"ref": ref, "inputs": inputs}))
+        os.write(
+            descriptor,
+            _canonical_json_bytes({"ref": ref, "inputs": inputs}),
+        )
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
