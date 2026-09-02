@@ -1545,6 +1545,112 @@ def _validate_session_escalation(value: Any) -> None:
         )
 
 
+CAPTAIN_TRANSPORT_MAX_EXACT_INTEGER = 2**53
+
+
+def _captain_transport_clone(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_captain_transport_clone(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _captain_transport_clone(item) for key, item in value.items()}
+    return value
+
+
+def _normalize_captain_transport_mapping_integers(
+    mapping: Any, fields: tuple[str, ...]
+) -> None:
+    if not isinstance(mapping, dict):
+        return
+    for field in fields:
+        value = mapping.get(field)
+        if (
+            isinstance(value, float)
+            and value.is_integer()
+            and abs(value) <= CAPTAIN_TRANSPORT_MAX_EXACT_INTEGER
+        ):
+            mapping[field] = int(value)
+
+
+def _normalize_captain_transport_integer_fields(value: Any) -> Any:
+    """Restore only contract-defined Captain integers after JSON float transport.
+
+    The transport may decode nested JSON integers as exact integral floats.
+    Normalize only structural fields whose Captain/MCP contracts require integers;
+    free-form actor/context/status details retain their original numeric semantics.
+    Non-integral, non-finite and out-of-range values remain unchanged and therefore
+    fail the downstream strict contract normally.
+    """
+
+    normalized = _captain_transport_clone(value)
+    if not isinstance(normalized, dict):
+        return normalized
+
+    _normalize_captain_transport_mapping_integers(normalized, ("delay_seconds",))
+
+    actions = normalized.get("actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            _normalize_captain_transport_mapping_integers(action.get("target"), ("pr",))
+            _normalize_captain_transport_mapping_integers(
+                action.get("scope"), ("max_targets",)
+            )
+
+    _normalize_captain_transport_mapping_integers(
+        normalized.get("status_projection"),
+        (
+            "schema_version",
+            "pr",
+            "pull_request",
+            "review_policy_version",
+            "material_findings_remaining",
+            "minimum_review_iterations",
+            "actual_review_iterations",
+            "unresolved_review_threads",
+        ),
+    )
+    _normalize_captain_transport_mapping_integers(
+        normalized.get("review_evidence"),
+        (
+            "schema_version",
+            "pr",
+            "review_policy_version",
+            "actual_review_iterations",
+            "minimum_review_iterations",
+            "finding_count",
+            "material_findings_after_first_review",
+            "material_findings_remaining",
+        ),
+    )
+
+    codex = normalized.get("codex_review_evidence")
+    _normalize_captain_transport_mapping_integers(
+        codex, ("schema_version", "pr", "exit_code", "finding_count")
+    )
+    if isinstance(codex, dict):
+        _normalize_captain_transport_mapping_integers(
+            codex.get("completion"), ("comment_id", "review_id")
+        )
+        _normalize_captain_transport_mapping_integers(
+            codex.get("request"), ("comment_id",)
+        )
+        _normalize_captain_transport_mapping_integers(
+            codex.get("policy"), ("minimum_self_review_iterations",)
+        )
+
+    _normalize_captain_transport_mapping_integers(
+        normalized.get("codex_review_exception"), ("schema_version", "pr")
+    )
+    _normalize_captain_transport_mapping_integers(
+        normalized.get("execution_intent"), ("schema_version",)
+    )
+    _normalize_captain_transport_mapping_integers(
+        normalized.get("session_escalation"), ("expires_at_unix",)
+    )
+    return normalized
+
+
 def _host_candidates_from_token(token: str) -> set[str]:
     candidates: set[str] = set()
     parsed = urllib.parse.urlparse(token)
@@ -11271,6 +11377,8 @@ def _grip_run_core(
     else:
         _require_capability(grip_capability)
     raw_parameters = parameters or {}
+    if name in {"captain-preflight", "captain-run"}:
+        raw_parameters = _normalize_captain_transport_integer_fields(raw_parameters)
     reserved_server_parameters = sorted(
         {
             "_server_runtime_actor_identity",
