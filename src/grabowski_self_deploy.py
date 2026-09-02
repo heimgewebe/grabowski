@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import hashlib
-import http.client
 import json
 import os
 from contextvars import ContextVar
@@ -67,6 +66,33 @@ PUBLIC_GITHUB_MAIN_API_PATH = "/repos/heimgewebe/grabowski/git/ref/heads/main"
 PUBLIC_GITHUB_MAIN_REF = "refs/heads/main"
 PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS = 15
 PUBLIC_GITHUB_LOOKUP_MAX_BYTES = 4096
+PUBLIC_GITHUB_LOOKUP_HELPER = r"""
+import http.client
+import sys
+
+host, path, max_bytes_text, socket_timeout_text = sys.argv[1:]
+max_bytes = int(max_bytes_text)
+socket_timeout = float(socket_timeout_text)
+connection = http.client.HTTPSConnection(host, timeout=socket_timeout)
+try:
+    connection.request(
+        "GET",
+        path,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "grabowski-public-main-probe/1",
+        },
+    )
+    response = connection.getresponse()
+    if response.status != 200:
+        raise RuntimeError(f"unexpected HTTP status {response.status}")
+    payload = response.read(max_bytes + 1)
+finally:
+    connection.close()
+if len(payload) > max_bytes:
+    raise RuntimeError("response exceeded output bound")
+sys.stdout.buffer.write(payload)
+"""
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 RUNNER_RELATIVE_PATH = Path("tools/run_scheduled_deploy.py")
 DEPLOY_SCHEDULE_LOCK = Path.home() / ".local/state/grabowski/runtime-deploy-schedule.lock"
@@ -2593,31 +2619,44 @@ def _fresh_public_github_main(expected_head: str) -> str:
     if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
         raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
 
-    connection = http.client.HTTPSConnection(
+    argv = [
+        "/usr/bin/python3",
+        "-I",
+        "-c",
+        PUBLIC_GITHUB_LOOKUP_HELPER,
         PUBLIC_GITHUB_API_HOST,
-        timeout=PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS,
-    )
+        PUBLIC_GITHUB_MAIN_API_PATH,
+        str(PUBLIC_GITHUB_LOOKUP_MAX_BYTES),
+        str(PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS),
+    ]
     try:
-        connection.request(
-            "GET",
-            PUBLIC_GITHUB_MAIN_API_PATH,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "grabowski-public-main-probe/1",
+        completed = subprocess.run(
+            argv,
+            cwd="/",
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PYTHONNOUSERSITE": "1",
             },
         )
-        response = connection.getresponse()
-        if response.status != 200:
-            raise RuntimeError(
-                "fresh public GitHub main lookup failed: "
-                f"HTTP status {response.status}"
-            )
-        payload = response.read(PUBLIC_GITHUB_LOOKUP_MAX_BYTES + 1)
-    finally:
-        connection.close()
-
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("fresh public GitHub main lookup exceeded wall-clock deadline") from exc
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "fresh public GitHub main lookup failed: "
+            f"helper exit {completed.returncode}"
+        )
+    payload = completed.stdout
     if len(payload) > PUBLIC_GITHUB_LOOKUP_MAX_BYTES:
         raise RuntimeError("fresh public GitHub main lookup exceeded output bound")
+    if len(completed.stderr) > PUBLIC_GITHUB_LOOKUP_MAX_BYTES:
+        raise RuntimeError("fresh public GitHub main lookup stderr exceeded output bound")
     try:
         document = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
