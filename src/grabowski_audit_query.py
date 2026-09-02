@@ -947,6 +947,27 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 current_event is not None
                 and chronik._event_should_be_recorded(current_event)
             )
+            retained_source_expected = getattr(
+                tasks, "_chronik_retained_source_expected", None
+            )
+            if callable(retained_source_expected):
+                source_expected = (
+                    source_expected
+                    or bool(retained_source_expected(raw))
+                )
+            else:
+                # Compatibility for synthetic/legacy task providers: an exact
+                # launcher outcome_unknown flag is itself durable evidence that
+                # the attempt entered the always-retained blocked state.
+                launcher_raw = raw.get("launcher_json")
+                if isinstance(launcher_raw, str):
+                    launcher = json.loads(launcher_raw)
+                    if not isinstance(launcher, dict):
+                        raise ValueError("stored task launcher is invalid")
+                    source_expected = (
+                        source_expected
+                        or launcher.get("outcome_unknown") is True
+                    )
             if current_state == "interrupted":
                 context = chronik._context(raw)
                 source_expected = (

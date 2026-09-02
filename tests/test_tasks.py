@@ -2377,6 +2377,66 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(event["data"]["operation"], "deploy")
         self.assertEqual(event["data"]["task_class"], "deploy")
 
+    def test_chronik_outcome_unknown_persists_private_source_expectation(self) -> None:
+        outbox_root = self.root / "chronik-outcome-unknown-state"
+        launcher = _launcher()
+        launcher["outcome_unknown"] = True
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=launcher
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                chronik_outbox=True,
+                chronik_outbox_state_root=str(outbox_root),
+                chronik_operation="implement",
+            )
+
+        task = result["task"]
+        self.assertEqual(task["state"], "outcome_unknown")
+        self.assertNotIn(
+            tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY, task["launcher"]
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            stored = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
+                ).fetchone()
+            )
+        marker = json.loads(stored["launcher_json"])[
+            tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
+        ]
+        self.assertEqual(
+            marker,
+            {
+                "schema_version": 1,
+                "attempt": 1,
+                "run_id": tasks.chronik.run_id(stored),
+            },
+        )
+        self.assertTrue(tasks._chronik_retained_source_expected(stored))
+
+        tasks._set_state(task["task_id"], "running")
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            later = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
+                ).fetchone()
+            )
+        self.assertEqual(
+            json.loads(later["launcher_json"])[
+                tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
+            ],
+            marker,
+        )
+        self.assertTrue(tasks._chronik_retained_source_expected(later))
+
     def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
         result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(tasks.operator, "_run", return_value=result) as run:
