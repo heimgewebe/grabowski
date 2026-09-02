@@ -776,6 +776,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
     def test_captain_transport_normalizes_only_contract_integer_fields(self) -> None:
         canonical = {
+            "delay_seconds": 8,
             "actions": [
                 {
                     "target": {"repo": "heimgewebe/bureau", "pr": 2237},
@@ -858,6 +859,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(canonical, normalized)
+        self.assertIsInstance(normalized["delay_seconds"], int)
         self.assertIsInstance(normalized["status_projection"]["measurement"], float)
         self.assertIsInstance(normalized["status_projection"]["pr"], int)
         self.assertIsInstance(normalized["status_projection"]["review_policy_version"], int)

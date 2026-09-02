@@ -1585,6 +1585,8 @@ def _normalize_captain_transport_integer_fields(value: Any) -> Any:
     if not isinstance(normalized, dict):
         return normalized
 
+    _normalize_captain_transport_mapping_integers(normalized, ("delay_seconds",))
+
     actions = normalized.get("actions")
     if isinstance(actions, list):
         for action in actions:
