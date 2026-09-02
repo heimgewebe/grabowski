@@ -988,8 +988,25 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 )
         trusted.assert_called_once_with()
         command = run.call_args.args[0]
+        environment = run.call_args.kwargs["environment"]
         self.assertEqual(command[0], "/usr/bin/gh")
         self.assertNotEqual(command[0], str(shim))
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertNotIn(directory, environment["PATH"])
+
+    def test_nonexempt_github_call_keeps_default_child_environment(self) -> None:
+        with (
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                ["issue", "view", "1", "--repo", "heimgewebe/grabowski"],
+                cwd=str(ROOT),
+            )
+        self.assertIsNone(run.call_args.kwargs["environment"])
 
     def test_github_pr_view_does_not_consume_signed_assertion(self) -> None:
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))

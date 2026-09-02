@@ -5713,14 +5713,26 @@ def grabowski_github(
         )
     working_directory = _resolve_cwd(cwd)
     _require_operator_mutation("github_cli", path=str(working_directory))
+    trusted_github_cli = _trusted_github_cli_path()
     command = _validate_argv(
-        [_trusted_github_cli_path(), *arguments], cwd=working_directory
+        [trusted_github_cli, *arguments], cwd=working_directory
     )
+    environment = None
+    if _github_pr_view_transport_read_only(
+        {
+            "arguments": arguments,
+            "cwd": cwd,
+            "timeout_seconds": timeout_seconds,
+        }
+    ):
+        environment = _safe_environment()
+        environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
     return _run(
         command,
         cwd=working_directory,
         timeout_seconds=_timeout(timeout_seconds),
         max_output_bytes=MAX_OUTPUT_BYTES,
+        environment=environment,
     )
 
 
