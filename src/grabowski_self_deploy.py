@@ -61,9 +61,38 @@ SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
 CANONICAL_OPERATOR_MODULE = "grabowski_operator"
 PUBLIC_GITHUB_REPOSITORY_URL = "https://github.com/heimgewebe/grabowski.git"
+PUBLIC_GITHUB_API_HOST = "api.github.com"
+PUBLIC_GITHUB_MAIN_API_PATH = "/repos/heimgewebe/grabowski/git/ref/heads/main"
 PUBLIC_GITHUB_MAIN_REF = "refs/heads/main"
 PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS = 15
 PUBLIC_GITHUB_LOOKUP_MAX_BYTES = 4096
+PUBLIC_GITHUB_LOOKUP_HELPER = r"""
+import http.client
+import sys
+
+host, path, max_bytes_text, socket_timeout_text = sys.argv[1:]
+max_bytes = int(max_bytes_text)
+socket_timeout = float(socket_timeout_text)
+connection = http.client.HTTPSConnection(host, timeout=socket_timeout)
+try:
+    connection.request(
+        "GET",
+        path,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "grabowski-public-main-probe/1",
+        },
+    )
+    response = connection.getresponse()
+    if response.status != 200:
+        raise RuntimeError(f"unexpected HTTP status {response.status}")
+    payload = response.read(max_bytes + 1)
+finally:
+    connection.close()
+if len(payload) > max_bytes:
+    raise RuntimeError("response exceeded output bound")
+sys.stdout.buffer.write(payload)
+"""
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 RUNNER_RELATIVE_PATH = Path("tools/run_scheduled_deploy.py")
 DEPLOY_SCHEDULE_LOCK = Path.home() / ".local/state/grabowski/runtime-deploy-schedule.lock"
@@ -2589,56 +2618,56 @@ def _deployment_source_preflight(
 def _fresh_public_github_main(expected_head: str) -> str:
     if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
         raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
+
     argv = [
-        "/usr/bin/git",
+        "/usr/bin/python3",
+        "-I",
         "-c",
-        "credential.helper=",
-        "-c",
-        "http.followRedirects=false",
-        "ls-remote",
-        "--refs",
-        PUBLIC_GITHUB_REPOSITORY_URL,
-        PUBLIC_GITHUB_MAIN_REF,
+        PUBLIC_GITHUB_LOOKUP_HELPER,
+        PUBLIC_GITHUB_API_HOST,
+        PUBLIC_GITHUB_MAIN_API_PATH,
+        str(PUBLIC_GITHUB_LOOKUP_MAX_BYTES),
+        str(PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS),
     ]
-    completed = subprocess.run(
-        argv,
-        cwd="/",
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ASKPASS": "/bin/false",
-        },
-    )
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd="/",
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PYTHONNOUSERSITE": "1",
+            },
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("fresh public GitHub main lookup exceeded wall-clock deadline") from exc
     if completed.returncode != 0:
         raise RuntimeError(
             "fresh public GitHub main lookup failed: "
-            f"git exit {completed.returncode}"
+            f"helper exit {completed.returncode}"
         )
-    if (
-        len(completed.stdout.encode("utf-8", errors="replace"))
-        > PUBLIC_GITHUB_LOOKUP_MAX_BYTES
-        or len(completed.stderr.encode("utf-8", errors="replace"))
-        > PUBLIC_GITHUB_LOOKUP_MAX_BYTES
-    ):
+    payload = completed.stdout
+    if len(payload) > PUBLIC_GITHUB_LOOKUP_MAX_BYTES:
         raise RuntimeError("fresh public GitHub main lookup exceeded output bound")
-    lines = completed.stdout.splitlines()
-    if len(lines) != 1:
-        raise RuntimeError("fresh public GitHub main lookup returned an ambiguous result")
-    fields = lines[0].split("\t")
-    if len(fields) != 2 or fields[1] != PUBLIC_GITHUB_MAIN_REF:
+    if len(completed.stderr) > PUBLIC_GITHUB_LOOKUP_MAX_BYTES:
+        raise RuntimeError("fresh public GitHub main lookup stderr exceeded output bound")
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("fresh public GitHub main lookup returned invalid JSON") from exc
+    if not isinstance(document, dict) or document.get("ref") != PUBLIC_GITHUB_MAIN_REF:
         raise RuntimeError("fresh public GitHub main lookup returned an invalid ref")
-    head = fields[0]
-    if re.fullmatch(r"[0-9a-f]{40}", head) is None:
+    target = document.get("object")
+    if not isinstance(target, dict) or target.get("type") != "commit":
+        raise RuntimeError("fresh public GitHub main lookup returned an invalid object")
+    head = target.get("sha")
+    if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
         raise RuntimeError("fresh public GitHub main lookup returned an invalid commit")
     return head
 
@@ -2760,7 +2789,7 @@ def grabowski_runtime_deploy_schedule(
                 "ref": PUBLIC_GITHUB_MAIN_REF,
                 "before": public_github_main_before,
                 "after": public_github_main_after,
-                "verification": "fresh-public-https-git-ls-remote-v1",
+                "verification": "fresh-public-github-rest-api-v1",
             },
             "rootbroker_authority": {
                 key: authority.get(key)
