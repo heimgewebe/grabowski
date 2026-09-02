@@ -175,6 +175,71 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             )
         self.assertEqual(observed["expected_head"], self.HEAD)
 
+    def test_bootstrap_compatible_predecessor_attestation_is_accepted(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry) as run,
+            mock.patch.object(dual.core, "git_show", side_effect=lambda _repo, head, path: blobs[path]),
+        ):
+            observed = dual.require_operator_authority_anchored(
+                ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+            )
+        self.assertEqual(observed["expected_head"], predecessor)
+        self.assertIn("merge-base", run.call_args.args[0])
+        self.assertIn("--is-ancestor", run.call_args.args[0])
+
+    def test_bootstrap_compatible_predecessor_rejects_non_ancestor(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry),
+            mock.patch.object(dual.core, "git_show", side_effect=lambda _repo, _head, path: blobs[path]),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+                )
+        self.assertEqual(raised.exception.phase, "operator-authority-attestation")
+        self.assertIn("kein Ancestor", str(raised.exception))
+
+    def test_bootstrap_compatible_predecessor_rejects_authority_contract_drift(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        config_path = Path("config/privileged-actions.example.json")
+        def show(_repo: Path, head: str, path: Path) -> bytes:
+            if head == predecessor and path == config_path:
+                return blobs[path] + b" "
+            return blobs[path]
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry),
+            mock.patch.object(dual.core, "git_show", side_effect=show),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+                )
+        self.assertEqual(raised.exception.phase, "operator-authority-attestation")
+        self.assertIn("Authority-Vertrag driftet", str(raised.exception))
+
     def test_attestation_rejects_head_and_artifact_tamper(self) -> None:
         for mutation in ("head", "artifact"):
             with self.subTest(mutation=mutation):
@@ -3037,6 +3102,29 @@ class DeploymentSequenceTests(unittest.TestCase):
         verify_operator.assert_not_called()
         listener.assert_not_called()
         verify_tunnel.assert_not_called()
+
+    def test_bootstrap_recovery_preflight_requests_compatible_authority_predecessor(self) -> None:
+        snapshot = self.snapshot()
+        topology = dual.ProfileTopology(
+            "url", server_url_count=1, server_url_port=dual.TRANSPORT_INGRESS_LISTENER_PORT
+        )
+        inactive = observation(False)
+        with (
+            mock.patch.object(
+                dual, "_preflight_source_topology", return_value=(snapshot, RUNTIME, topology)
+            ) as source_preflight,
+            mock.patch.object(dual, "observe_service", return_value=inactive),
+        ):
+            dual.preflight_bootstrap_recovery_url(
+                ROOT, RUNTIME, Path("profile.yaml"), expected_head="a" * 40
+            )
+        source_preflight.assert_called_once_with(
+            ROOT,
+            RUNTIME,
+            Path("profile.yaml"),
+            expected_head="a" * 40,
+            allow_compatible_authority_predecessor=True,
+        )
 
     def test_bootstrap_recovery_preflight_rejects_mixed_runtime_state(self) -> None:
         snapshot = self.snapshot()

@@ -4442,11 +4442,69 @@ def _read_root_owned_public_json(
     return value
 
 
+def _require_compatible_operator_authority_predecessor(
+    repo: Path,
+    *,
+    attested_head: str,
+    expected_head: str,
+) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}", attested_head) is None:
+        core.fail(
+            "Operator-Authority-Attestation Vorgänger-Commit ist ungültig",
+            phase="operator-authority-attestation",
+        )
+    ancestry = core.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            attested_head,
+            expected_head,
+        ],
+        cwd=repo,
+        capture=True,
+        check=False,
+        timeout=core.TIMEOUTS["git"],
+    )
+    if ancestry.returncode != 0:
+        core.fail(
+            "Operator-Authority-Attestation Vorgänger ist kein Ancestor des Ziel-Commits",
+            phase="operator-authority-attestation",
+            details={
+                "attested_head": attested_head,
+                "expected_head": expected_head,
+                "merge_base_returncode": ancestry.returncode,
+            },
+        )
+    compatibility_paths = (
+        Path("src/grabowski_privileged_broker.py"),
+        Path("tools/grabowski_privileged_broker.py"),
+        Path("tools/grabowski_rootbroker_cutover.py"),
+        Path("systemd/grabowski-operator.service.example"),
+        Path("config/privileged-actions.example.json"),
+    )
+    for relative in compatibility_paths:
+        if core.git_show(repo, attested_head, relative) != core.git_show(
+            repo, expected_head, relative
+        ):
+            core.fail(
+                "Operator-Authority-Vertrag driftet zwischen Attestation und Bootstrap-Ziel",
+                phase="operator-authority-attestation",
+                details={
+                    "attested_head": attested_head,
+                    "expected_head": expected_head,
+                    "path": relative.as_posix(),
+                },
+            )
+
+
 def require_operator_authority_anchored(
     repo: Path,
     expected_head: str,
     *,
     path: Path = OPERATOR_AUTHORITY_ATTESTATION_PATH,
+    allow_compatible_predecessor: bool = False,
 ) -> dict[str, Any]:
     attestation = _read_root_owned_public_json(path)
     required = {
@@ -4466,7 +4524,6 @@ def require_operator_authority_anchored(
         set(attestation) != required
         or attestation.get("schema_version") != 1
         or attestation.get("kind") != "grabowski_operator_authority_attestation"
-        or attestation.get("expected_head") != expected_head
     ):
         core.fail(
             "Operator-Authority-Attestation passt nicht zum Ziel-Commit",
@@ -4475,6 +4532,22 @@ def require_operator_authority_anchored(
                 "expected_head": expected_head,
                 "observed_head": attestation.get("expected_head"),
             },
+        )
+    attested_head = attestation.get("expected_head")
+    if attested_head != expected_head:
+        if not allow_compatible_predecessor or not isinstance(attested_head, str):
+            core.fail(
+                "Operator-Authority-Attestation passt nicht zum Ziel-Commit",
+                phase="operator-authority-attestation",
+                details={
+                    "expected_head": expected_head,
+                    "observed_head": attested_head,
+                },
+            )
+        _require_compatible_operator_authority_predecessor(
+            repo,
+            attested_head=attested_head,
+            expected_head=expected_head,
         )
     self_hash = attestation.get("attestation_sha256")
     unsigned = dict(attestation)
@@ -4606,6 +4679,7 @@ def _preflight_source_topology(
     profile_path: Path,
     *,
     expected_head: str | None = None,
+    allow_compatible_authority_predecessor: bool = False,
 ) -> tuple[core.Snapshot, Path, ProfileTopology]:
     snapshot = core.snapshot_from_git(repo)
     if expected_head is not None and snapshot.repo_head != expected_head:
@@ -4621,7 +4695,11 @@ def _preflight_source_topology(
     topology = profile_topology(profile_path, runtime)
     require_topology_matches_contract(topology, runtime, snapshot.contract)
     if topology.kind == "url":
-        require_operator_authority_anchored(repo, snapshot.repo_head)
+        require_operator_authority_anchored(
+            repo,
+            snapshot.repo_head,
+            allow_compatible_predecessor=allow_compatible_authority_predecessor,
+        )
     return snapshot, runtime, topology
 
 
@@ -4751,7 +4829,11 @@ def preflight_bootstrap_recovery_url(
     dict[str, dict[str, Any]],
 ]:
     snapshot, runtime, topology = _preflight_source_topology(
-        repo, runtime, profile_path, expected_head=expected_head
+        repo,
+        runtime,
+        profile_path,
+        expected_head=expected_head,
+        allow_compatible_authority_predecessor=True,
     )
     predecessor_state, observations = bootstrap_recovery_predecessor_state(topology)
     if predecessor_state == "active":
