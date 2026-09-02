@@ -223,6 +223,14 @@ Final T121 acceptance therefore requires one fresh post-fix pair. This documenta
 
 Only that newly settled merge commit may become the runtime-deployment target. Pilot 2 must then create its own fresh plan and durable run reference, execute Captain deployment against that exact commit, observe deployment identity to complete manifest/process convergence, and settle from the durable run and Captain references. A prerequisite deployment, an older settled PR, or a later concurrent `main` head is not a substitute for this paired proof.
 
+### Final settlement-recovery reset — 2026-09-02
+
+PR #1026 produced a valid durable PR-settlement Saga run for exact head `c1ddfef27aaca0b4b272304dbc58e8adb0a861bd` and Captain merged that unchanged identity as `49e78e25a6a329959157bfb04bb5dd1078353153`. Its paired runtime-deployment Saga for that exact merge commit subsequently reached reference-based `saga-settle == settled` with complete deployment-identity and serving-process convergence. The runtime half of the pair is therefore valid.
+
+PR #1026 itself is not promoted to the final PR pilot because the historical plan can no longer be reconstructed byte-for-byte from durable state: the run receipt preserves its plan hash, but the dynamic `self_review_audit` value used to build that plan was not persisted as a recoverable plan input. The already completed merge is never replayed and a guessed plan is never substituted. This is recovery evidence, not pilot success.
+
+This documentation-only change is the final fresh PR-settlement target. After CI/review and base convergence, its exact PR head/base/diff receives a new plan and durable run reference; no identity-changing action is allowed afterward. Captain merge and `saga-settle` must complete in that same frozen identity window. Only the resulting settled merge commit may be used for one final runtime-deployment Saga and reference-based settlement. The missing durable reconstruction of historical PR plan inputs is tracked separately and does not weaken the current settlement contract.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
