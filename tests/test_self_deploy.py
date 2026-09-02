@@ -928,30 +928,90 @@ class SelfDeployToolTests(unittest.TestCase):
 
     def test_public_github_main_lookup_is_fixed_and_credential_free(self) -> None:
         expected = "d" * 40
-        completed = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=f"{expected}\trefs/heads/main\n",
-            stderr="",
-        )
-        with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed) as run:
+        payload = json.dumps(
+            {
+                "ref": SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF,
+                "object": {"sha": expected, "type": "commit"},
+            }
+        ).encode("utf-8")
+        response = Mock(status=200)
+        response.read.return_value = payload
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(
+            SELF_DEPLOY.http.client,
+            "HTTPSConnection",
+            return_value=connection,
+        ) as https_connection:
             observed = REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
         self.assertEqual(observed, expected)
-        argv = run.call_args.args[0]
-        self.assertEqual(argv[0], "/usr/bin/git")
-        self.assertIn("credential.helper=", argv)
-        self.assertEqual(argv[-2:], [SELF_DEPLOY.PUBLIC_GITHUB_REPOSITORY_URL, SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF])
-        kwargs = run.call_args.kwargs
-        self.assertEqual(kwargs["cwd"], "/")
-        self.assertEqual(kwargs["timeout"], SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS)
-        env = kwargs["env"]
-        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
-        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
-        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
-        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(env["GIT_ASKPASS"], "/bin/false")
-        self.assertNotIn("HOME", env)
-        self.assertFalse(any("PROXY" in key.upper() for key in env))
+        https_connection.assert_called_once_with(
+            SELF_DEPLOY.PUBLIC_GITHUB_API_HOST,
+            timeout=SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS,
+        )
+        connection.request.assert_called_once_with(
+            "GET",
+            SELF_DEPLOY.PUBLIC_GITHUB_MAIN_API_PATH,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "grabowski-public-main-probe/1",
+            },
+        )
+        headers = connection.request.call_args.kwargs["headers"]
+        self.assertNotIn("Authorization", headers)
+        self.assertNotIn("Proxy-Authorization", headers)
+        response.read.assert_called_once_with(SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_MAX_BYTES + 1)
+        connection.close.assert_called_once_with()
+
+    def test_public_github_main_lookup_rejects_redirect_status_without_following(self) -> None:
+        expected = "d" * 40
+        response = Mock(status=302)
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(
+            SELF_DEPLOY.http.client,
+            "HTTPSConnection",
+            return_value=connection,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP status 302"):
+                REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+        response.read.assert_not_called()
+        connection.close.assert_called_once_with()
+
+    def test_public_github_main_lookup_enforces_response_bound(self) -> None:
+        expected = "d" * 40
+        response = Mock(status=200)
+        response.read.return_value = b"x" * (SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_MAX_BYTES + 1)
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(
+            SELF_DEPLOY.http.client,
+            "HTTPSConnection",
+            return_value=connection,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exceeded output bound"):
+                REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+        connection.close.assert_called_once_with()
+
+    def test_public_github_main_lookup_rejects_non_commit_object(self) -> None:
+        expected = "d" * 40
+        payload = json.dumps(
+            {
+                "ref": SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF,
+                "object": {"sha": expected, "type": "tag"},
+            }
+        ).encode("utf-8")
+        response = Mock(status=200)
+        response.read.return_value = payload
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(
+            SELF_DEPLOY.http.client,
+            "HTTPSConnection",
+            return_value=connection,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid object"):
+                REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
 
     def test_schedule_blocks_when_public_github_main_differs_before_root_effect(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
