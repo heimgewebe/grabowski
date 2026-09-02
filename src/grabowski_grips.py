@@ -12540,7 +12540,7 @@ def _run_captain_pr_merge(
         execution_result.update(
             {
                 "preflight_passed": True,
-                "remote_mutation_observed": True,
+                "remote_mutation_observed": False,
                 "verification_passed": True,
                 "merge_queued": True,
                 "merge_completion_verified": False,

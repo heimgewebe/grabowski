@@ -9817,8 +9817,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         execution = result["output"]["executions"][0]
         self.assertFalse(execution["execution_invoked"])
         self.assertFalse(execution["execution_attempted"])
+        self.assertFalse(execution["remote_mutation_observed"])
         self.assertTrue(execution["duplicate_dispatch_prevented"])
         self.assertEqual("already_queued_before_dispatch", execution["merge_queue_reconciliation"])
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(guard["external_merge_observed"])
+        self.assertNotIn("external_merge_reconciliation", guard)
+        self.assertNotIn("external_merge_reconciliation", execution)
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
         execution_attempt_checks = [
             check for check in result["receipt"]["checks"] if check["id"] == "execution-attempted"

@@ -61,11 +61,33 @@ class _RepoPolicyGh:
 
 
 class _MergeGh:
-    def __init__(self) -> None:
+    def __init__(self, *, head_sha: str, base_sha: str) -> None:
+        self.head_sha = head_sha
+        self.base_sha = base_sha
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, _repo: Path, argv: list[str]) -> dict[str, object]:
         self.calls.append(tuple(argv))
+        if argv[:2] == ["api", "graphql"]:
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "pullRequest": {
+                                    "state": "OPEN",
+                                    "headRefOid": self.head_sha,
+                                    "baseRefName": "main",
+                                    "baseRefOid": self.base_sha,
+                                    "mergeQueueEntry": None,
+                                }
+                            }
+                        }
+                    }
+                ),
+                "stderr": "",
+            }
         return {"returncode": 0, "stdout": "", "stderr": ""}
 
 
@@ -395,7 +417,7 @@ class CaptainMergeMethodTests(unittest.TestCase):
                 [],
             )
 
-        gh = _MergeGh()
+        gh = _MergeGh(head_sha=expected_head, base_sha=expected_base_sha)
         with (
             mock.patch.object(
                 grips,
