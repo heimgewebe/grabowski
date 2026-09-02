@@ -943,16 +943,89 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
             if not isinstance(current_state, str) or not current_state:
                 raise ValueError("stored task state is invalid")
             current_event = chronik.build_event(raw, current_state)
-            source_expected = (
+            current_source_expected = (
                 current_event is not None
                 and chronik._event_should_be_recorded(current_event)
             )
+
+            retained_expectations: list[dict[str, Any]] = []
+            retained_source_expectations = getattr(
+                tasks, "_chronik_retained_source_expectations", None
+            )
+            if callable(retained_source_expectations):
+                retained_expectations = list(retained_source_expectations(raw))
+            else:
+                retained_source_expected = getattr(
+                    tasks, "_chronik_retained_source_expected", None
+                )
+                if callable(retained_source_expected) and bool(
+                    retained_source_expected(raw)
+                ):
+                    retained_expectations = [
+                        {
+                            "attempt": int(raw["attempt"]),
+                            "run_id": chronik.run_id(raw),
+                            "event_kind": "agent.run.blocked",
+                        }
+                    ]
+                elif not callable(retained_source_expected):
+                    # Compatibility for synthetic/legacy task providers: an exact
+                    # launcher outcome_unknown flag is itself durable evidence that
+                    # the attempt entered the always-retained blocked state.
+                    launcher_raw = raw.get("launcher_json")
+                    if isinstance(launcher_raw, str):
+                        launcher = json.loads(launcher_raw)
+                        if not isinstance(launcher, dict):
+                            raise ValueError("stored task launcher is invalid")
+                        if launcher.get("outcome_unknown") is True:
+                            retained_expectations = [
+                                {
+                                    "attempt": int(raw["attempt"]),
+                                    "run_id": chronik.run_id(raw),
+                                    "event_kind": "agent.run.blocked",
+                                }
+                            ]
             if current_state == "interrupted":
                 context = chronik._context(raw)
-                source_expected = (
-                    source_expected
+                current_source_expected = (
+                    current_source_expected
                     or context.get("operation")
                     in chronik.HIGH_VALUE_LIFECYCLE_OPERATIONS
+                )
+
+            source_expectations: dict[str, dict[str, Any]] = {}
+            for retained in retained_expectations:
+                attempt_value = retained.get("attempt")
+                run_id_value = retained.get("run_id")
+                event_kind_value = retained.get("event_kind")
+                if (
+                    isinstance(attempt_value, bool)
+                    or not isinstance(attempt_value, int)
+                    or attempt_value < 1
+                    or not isinstance(run_id_value, str)
+                    or not run_id_value
+                    or event_kind_value != "agent.run.blocked"
+                ):
+                    raise ValueError("stored Chronik retained-source expectation is invalid")
+                source_expectations[run_id_value] = {
+                    "attempt": attempt_value,
+                    "run_id": run_id_value,
+                    "required": True,
+                    "event_kind": event_kind_value,
+                }
+
+            current_run_id = chronik.run_id(raw)
+            current_expectation = source_expectations.get(current_run_id)
+            if current_expectation is None:
+                source_expectations[current_run_id] = {
+                    "attempt": int(raw["attempt"]),
+                    "run_id": current_run_id,
+                    "required": bool(current_source_expected),
+                    "event_kind": None,
+                }
+            else:
+                current_expectation["required"] = bool(
+                    current_expectation["required"] or current_source_expected
                 )
         except Exception as exc:
             gaps.append(
@@ -964,51 +1037,90 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 )
             )
             return evidence, gaps
-        expected_run_id = chronik.run_id(raw)
-        source = chronik.outbox_path(
-            {"source": {"run_id": expected_run_id}},
-            chronik.state_root(raw),
-        )
-        try:
-            loaded = chronik._read_regular_file(
-                source,
-                maximum=chronik.MAX_BUNDLE_BYTES,
-                label="Chronik outbox source",
-                allow_missing=True,
+
+        for expectation in sorted(
+            source_expectations.values(),
+            key=lambda item: (int(item["attempt"]), str(item["run_id"])),
+        ):
+            expected_attempt = int(expectation["attempt"])
+            expected_run_id = str(expectation["run_id"])
+            source = chronik.outbox_path(
+                {"source": {"run_id": expected_run_id}},
+                chronik.state_root(raw),
             )
-            if loaded is None:
-                if source_expected:
-                    raise FileNotFoundError(source)
-                return evidence, gaps
-            data, _identity = loaded
-            events = [json.loads(line) for line in data.decode("utf-8").splitlines() if line]
-            if not events:
-                raise ValueError("empty Chronik source")
-            event_ids: list[str] = []
-            for event in events:
+            try:
+                loaded = chronik._read_regular_file(
+                    source,
+                    maximum=chronik.MAX_BUNDLE_BYTES,
+                    label="Chronik outbox source",
+                    allow_missing=True,
+                )
+                if loaded is None:
+                    if bool(expectation["required"]):
+                        raise FileNotFoundError(source)
+                    continue
+                data, _identity = loaded
+                events = [
+                    json.loads(line)
+                    for line in data.decode("utf-8").splitlines()
+                    if line
+                ]
+                if not events:
+                    raise ValueError("empty Chronik source")
+                event_ids: list[str] = []
+                event_kinds: list[str] = []
+                for event in events:
+                    if (
+                        not isinstance(event, dict)
+                        or not isinstance(event.get("source"), dict)
+                        or event["source"].get("run_id") != expected_run_id
+                    ):
+                        raise ValueError("Chronik source task identity drift")
+                    recomputed_event_id = chronik.event_id(event)
+                    if event.get("event_id") != recomputed_event_id:
+                        raise ValueError("Chronik event identity drift")
+                    event_ids.append(recomputed_event_id)
+                    kind = event.get("kind")
+                    if isinstance(kind, str):
+                        event_kinds.append(kind)
+                retained_event_kind = expectation.get("event_kind")
                 if (
-                    not isinstance(event, dict)
-                    or not isinstance(event.get("source"), dict)
-                    or event["source"].get("run_id") != expected_run_id
+                    retained_event_kind is not None
+                    and retained_event_kind not in event_kinds
                 ):
-                    raise ValueError("Chronik source task identity drift")
-                recomputed_event_id = chronik.event_id(event)
-                if event.get("event_id") != recomputed_event_id:
-                    raise ValueError("Chronik event identity drift")
-                event_ids.append(recomputed_event_id)
-        except Exception as exc:
-            gaps.append(_external_gap("chronik", "chronik_source_unverifiable", task_id=task_id, error=type(exc).__name__))
-        else:
+                    raise ValueError("required retained Chronik event is missing")
+            except Exception as exc:
+                gaps.append(
+                    _external_gap(
+                        "chronik",
+                        "chronik_source_unverifiable",
+                        task_id=task_id,
+                        attempt=expected_attempt,
+                        run_id=expected_run_id,
+                        error=type(exc).__name__,
+                    )
+                )
+                continue
             source_digest = hashlib.sha256(data).hexdigest()
-            evidence.append({
-                "source": "chronik",
-                "status": "verified",
-                "authority": "authoritative_chronik_outbox_source",
-                "relation": "direct_task_identity",
-                "identity": {"task_id": task_id, "attempt": int(raw["attempt"]), "source_sha256": source_digest},
-                "evidence_sha256": source_digest,
-                "record": {"event_count": len(event_ids), "event_ids": event_ids[:8], "event_ids_truncated": len(event_ids) > 8},
-            })
+            evidence.append(
+                {
+                    "source": "chronik",
+                    "status": "verified",
+                    "authority": "authoritative_chronik_outbox_source",
+                    "relation": "direct_task_identity",
+                    "identity": {
+                        "task_id": task_id,
+                        "attempt": expected_attempt,
+                        "source_sha256": source_digest,
+                    },
+                    "evidence_sha256": source_digest,
+                    "record": {
+                        "event_count": len(event_ids),
+                        "event_ids": event_ids[:8],
+                        "event_ids_truncated": len(event_ids) > 8,
+                    },
+                }
+            )
     else:
         gaps.append(_external_gap("chronik", "chronik_not_enabled_for_task", task_id=task_id))
     return evidence, gaps

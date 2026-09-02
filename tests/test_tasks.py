@@ -2377,6 +2377,109 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(event["data"]["operation"], "deploy")
         self.assertEqual(event["data"]["task_class"], "deploy")
 
+    def test_chronik_outcome_unknown_persists_private_source_expectation(self) -> None:
+        outbox_root = self.root / "chronik-outcome-unknown-state"
+        launcher = _launcher()
+        launcher["outcome_unknown"] = True
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=launcher
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 141}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/true"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                chronik_outbox=True,
+                chronik_outbox_state_root=str(outbox_root),
+                chronik_operation="implement",
+            )
+
+        task = result["task"]
+        self.assertEqual(task["state"], "outcome_unknown")
+        self.assertNotIn(
+            tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY, task["launcher"]
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            stored = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
+                ).fetchone()
+            )
+        markers = json.loads(stored["launcher_json"])[
+            tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
+        ]
+        self.assertEqual(len(markers), 1)
+        marker = markers[0]
+        self.assertEqual(
+            marker,
+            {
+                "schema_version": 1,
+                "attempt": 1,
+                "run_id": tasks.chronik.run_id(stored),
+                "event_kind": "agent.run.blocked",
+            },
+        )
+        self.assertEqual(tasks._chronik_retained_source_expectations(stored), [marker])
+
+        fresh_launcher = {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+        }
+        tasks._set_state(
+            task["task_id"],
+            "running",
+            launcher=fresh_launcher,
+            attempt=2,
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            resumed = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
+                ).fetchone()
+            )
+        self.assertEqual(
+            json.loads(resumed["launcher_json"])[
+                tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
+            ],
+            [marker],
+        )
+        self.assertEqual(tasks._chronik_retained_source_expectations(resumed), [marker])
+
+        ambiguous_launcher = {**fresh_launcher, "outcome_unknown": True}
+        tasks._set_state(
+            task["task_id"],
+            "outcome_unknown",
+            launcher=ambiguous_launcher,
+            attempt=2,
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            ambiguous = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
+                ).fetchone()
+            )
+        marker_2 = {
+            "schema_version": 1,
+            "attempt": 2,
+            "run_id": tasks.chronik.run_id(ambiguous),
+            "event_kind": "agent.run.blocked",
+        }
+        self.assertEqual(
+            tasks._chronik_retained_source_expectations(ambiguous),
+            [marker, marker_2],
+        )
+        self.assertNotIn(
+            tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY,
+            tasks._public(ambiguous)["launcher"],
+        )
+
     def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
         result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(tasks.operator, "_run", return_value=result) as run:
