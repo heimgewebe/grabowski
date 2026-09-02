@@ -360,10 +360,15 @@ def run_captain_run(
         verified = execution_result.get("verification_passed") is True
         cleanup_passed = execution_result.get("merge_guard_cleanup_passed") is not False
         operationally_complete = verified and cleanup_passed
-        asynchronously_scheduled = (
-            verified
-            and execution_result.get("deployment_scheduled") is True
-            and execution_result.get("deployment_completion_verified") is False
+        asynchronously_scheduled = verified and (
+            (
+                execution_result.get("deployment_scheduled") is True
+                and execution_result.get("deployment_completion_verified") is False
+            )
+            or (
+                execution_result.get("merge_queued") is True
+                and execution_result.get("merge_completion_verified") is False
+            )
         )
         successful_decision = "scheduled" if asynchronously_scheduled else "executed"
         execution_label = (
@@ -405,8 +410,22 @@ def run_captain_run(
             )
         )
 
+    reconciled_without_dispatch = [
+        result
+        for result in executions
+        if (
+            result.get("execution_invoked") is not True
+            and result.get("verification_passed") is True
+            and result.get("merge_queued") is True
+            and result.get("merge_completion_verified") is False
+            and result.get("duplicate_dispatch_prevented") is True
+        )
+    ]
     pre_execution_failures = [
-        result for result in executions if result.get("execution_invoked") is not True
+        result
+        for result in executions
+        if result.get("execution_invoked") is not True
+        and result not in reconciled_without_dispatch
     ]
     verification_failures = [
         result
@@ -433,8 +452,14 @@ def run_captain_run(
         decision = (
             "scheduled"
             if any(
-                result.get("deployment_scheduled") is True
-                and result.get("deployment_completion_verified") is False
+                (
+                    result.get("deployment_scheduled") is True
+                    and result.get("deployment_completion_verified") is False
+                )
+                or (
+                    result.get("merge_queued") is True
+                    and result.get("merge_completion_verified") is False
+                )
                 for result in executions
             )
             else "executed"
@@ -442,6 +467,7 @@ def run_captain_run(
     invoked_count = sum(1 for result in executions if result.get("execution_invoked") is True)
     command_returned_count = sum(1 for result in executions if result.get("command_returned") is True)
     attempted_count = sum(1 for result in executions if result.get("execution_attempted") is True)
+    reconciled_without_dispatch_count = len(reconciled_without_dispatch)
     verified_count = sum(1 for result in executions if result.get("verification_passed") is True)
     cleanup_failed_count = len(cleanup_failures)
     for gate in gates:
@@ -454,7 +480,15 @@ def run_captain_run(
         f"intent_sha256={intent_info['intent_sha256']} issued_at={intent_info['issued_at']}",
     )
     core._check(receipt, "trusted-owner-autonomy", "pass" if core._captain_trusted_owner_autonomy_ready(parameters, actions) else "warn", str(parameters.get("autonomy_policy") or "manual evidence mode"))
-    core._check(receipt, "receipt-bound-execution", "pass", f"execution_records={len(executions)} invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count} verified={verified_count} cleanup_failed={cleanup_failed_count}")
+    core._check(
+        receipt,
+        "receipt-bound-execution",
+        "pass",
+        f"execution_records={len(executions)} invoked={invoked_count} "
+        f"command_returned={command_returned_count} attempted={attempted_count} "
+        f"reconciled_without_dispatch={reconciled_without_dispatch_count} "
+        f"verified={verified_count} cleanup_failed={cleanup_failed_count}",
+    )
     preflight_reasons = [
         reason
         for result in pre_execution_failures
@@ -475,7 +509,20 @@ def run_captain_run(
         core._check(receipt, "post-execution-verification", "skip", "execution not attempted")
     else:
         core._check(receipt, "execution-preflight", "pass", "execution preflight passed")
-        core._check(receipt, "execution-attempted", "pass", f"invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count}")
+        if invoked_count == 0 and reconciled_without_dispatch_count:
+            core._check(
+                receipt,
+                "execution-attempted",
+                "skip",
+                "exact asynchronous merge-queue state already existed; duplicate dispatch prevented",
+            )
+        else:
+            core._check(
+                receipt,
+                "execution-attempted",
+                "pass",
+                f"invoked={invoked_count} command_returned={command_returned_count} attempted={attempted_count}",
+            )
         if verification_failures:
             core._check(
                 receipt,
