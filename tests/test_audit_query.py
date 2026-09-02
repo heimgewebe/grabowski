@@ -1029,6 +1029,11 @@ class AuditQueryTests(unittest.TestCase):
         fake_sqlite.readonly_sqlite = readonly_sqlite
         fake_chronik = types.ModuleType("grabowski_chronik")
         fake_chronik.MAX_BUNDLE_BYTES = 1024
+        fake_chronik.build_event = lambda _record, _state: {
+            "kind": "agent.run.completed",
+            "data": {"operation": "deploy"},
+        }
+        fake_chronik._event_should_be_recorded = lambda _event: True
         fake_chronik.run_id = lambda record: f"task-{record['task_id']}-a{record['attempt']}"
         fake_chronik.state_root = lambda record: Path(record["chronik_outbox_state_root"])
 
@@ -1060,6 +1065,78 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(seen["path"], expected_path)
         self.assertIn("chronik", {item["source"] for item in evidence})
         self.assertNotIn("chronik_source_unverifiable", {gap["reason"] for gap in gaps})
+
+    def test_chronik_filtered_success_does_not_report_missing_source(self) -> None:
+        module = self._load_module([])
+        from contextlib import contextmanager
+
+        task_id = "task-chronik-filtered-success"
+        row = {
+            "task_id": task_id,
+            "attempt": 1,
+            "state": "completed",
+            "unit": "unit",
+            "updated_at_unix": 1,
+            "lifecycle_receipt_sha256": None,
+            "terminalization_sha256": None,
+            "chronik_outbox_enabled": 1,
+            "chronik_outbox_state_root": "/tmp/state",
+        }
+
+        class Connection:
+            def execute(self, _query, _parameters):
+                return self
+
+            def fetchone(self):
+                return row
+
+        fake_tasks = types.ModuleType("grabowski_tasks")
+        fake_tasks.TASK_DB = Path("/tmp/tasks.sqlite3")
+        fake_tasks.TASK_OUTCOMES_DIR = Path("/tmp/outcomes")
+        fake_tasks._preflight_task_store = lambda: "5"
+        fake_tasks._task_archive_record = lambda value: {
+            "task_id": value["task_id"],
+            "attempt": value["attempt"],
+            "state": value["state"],
+        }
+        fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+        @contextmanager
+        def readonly_sqlite(_path):
+            yield Connection()
+
+        fake_sqlite.readonly_sqlite = readonly_sqlite
+        fake_chronik = types.ModuleType("grabowski_chronik")
+        fake_chronik.build_event = lambda _record, _state: {
+            "kind": "agent.run.completed",
+            "data": {"operation": "implement"},
+        }
+        fake_chronik._event_should_be_recorded = lambda _event: False
+
+        def unexpected_source_read(*_args, **_kwargs):
+            raise AssertionError("filtered Chronik task must not require an outbox source")
+
+        fake_chronik.run_id = unexpected_source_read
+        fake_chronik.outbox_path = unexpected_source_read
+        fake_chronik._read_regular_file = unexpected_source_read
+        previous = {
+            name: sys.modules.get(name)
+            for name in ("grabowski_tasks", "grabowski_sqlite_store", "grabowski_chronik")
+        }
+        sys.modules["grabowski_tasks"] = fake_tasks
+        sys.modules["grabowski_sqlite_store"] = fake_sqlite
+        sys.modules["grabowski_chronik"] = fake_chronik
+        try:
+            evidence, gaps = module._task_external_evidence(task_id)
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+
+        self.assertNotIn("chronik", {item["source"] for item in evidence})
+        self.assertNotIn("chronik", {gap["source"] for gap in gaps})
 
     def test_chronik_event_source_identity_drift_is_a_gap(self) -> None:
         module = self._load_module([])
@@ -1099,6 +1176,11 @@ class AuditQueryTests(unittest.TestCase):
         fake_sqlite.readonly_sqlite = readonly_sqlite
         fake_chronik = types.ModuleType("grabowski_chronik")
         fake_chronik.MAX_BUNDLE_BYTES = 1024
+        fake_chronik.build_event = lambda _record, _state: {
+            "kind": "agent.run.completed",
+            "data": {"operation": "deploy"},
+        }
+        fake_chronik._event_should_be_recorded = lambda _event: True
         fake_chronik.run_id = lambda record: f"task-{record['task_id']}-a{record['attempt']}"
         fake_chronik.state_root = lambda record: Path(record["chronik_outbox_state_root"])
         fake_chronik.outbox_path = lambda value, root=None: root / "grabowski" / "chronik-outbox" / f"grabowski_{value['source']['run_id']}.jsonl"

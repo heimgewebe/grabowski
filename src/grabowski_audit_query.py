@@ -938,6 +938,27 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
 
     if bool(raw.get("chronik_outbox_enabled")):
         import grabowski_chronik as chronik
+        try:
+            current_state = raw.get("state")
+            if not isinstance(current_state, str) or not current_state:
+                raise ValueError("stored task state is invalid")
+            current_event = chronik.build_event(raw, current_state)
+            source_expected = (
+                current_event is not None
+                and chronik._event_should_be_recorded(current_event)
+            )
+        except Exception as exc:
+            gaps.append(
+                _external_gap(
+                    "chronik",
+                    "chronik_admission_unverifiable",
+                    task_id=task_id,
+                    error=type(exc).__name__,
+                )
+            )
+            return evidence, gaps
+        if not source_expected:
+            return evidence, gaps
         expected_run_id = chronik.run_id(raw)
         source = chronik.outbox_path(
             {"source": {"run_id": expected_run_id}},
