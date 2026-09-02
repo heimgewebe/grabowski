@@ -2365,7 +2365,7 @@ class TaskTests(unittest.TestCase):
                 runtime_seconds=60,
                 chronik_outbox=True,
                 chronik_outbox_state_root=str(outbox_root),
-                chronik_operation="review",
+                chronik_operation="deploy",
             )
         task = result["task"]
         self.assertTrue(task["chronik_outbox_enabled"])
@@ -2374,8 +2374,8 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(len(files), 1)
         event = json.loads(files[0].read_text().splitlines()[0])
         self.assertEqual(event["kind"], "agent.run.started")
-        self.assertEqual(event["data"]["operation"], "review")
-        self.assertEqual(event["data"]["task_class"], "review")
+        self.assertEqual(event["data"]["operation"], "deploy")
+        self.assertEqual(event["data"]["task_class"], "deploy")
 
     def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
         result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}

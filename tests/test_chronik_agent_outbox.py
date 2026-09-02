@@ -154,6 +154,12 @@ class ChronikAgentOutboxTests(unittest.TestCase):
             record(
                 chronik_outbox_enabled=1,
                 chronik_outbox_state_root=str(self.root),
+                chronik_context_json={
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": "deploy",
+                    "task_class": "deploy",
+                },
             ),
             "running",
         )
@@ -161,50 +167,135 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         event = json.loads(self.lines()[0])
         self.assertEqual(event["kind"], "agent.run.started")
 
-    def test_started_event_when_enabled(self):
+    def test_routine_success_lifecycle_operations_are_filtered(self):
         self.enable()
-        result = chronik.record_task_state(record(), "running")
-        self.assertTrue(result["written"])
-        event = json.loads(self.lines()[0])
-        self.assertEqual(event["schema_version"], "agent-run-event.v1")
-        self.assertEqual(event["kind"], "agent.run.started")
-        self.assertEqual(event["source"]["repo"], "heimgewebe/grabowski")
-        self.assertEqual(event["subject"], {"scope": "host", "host": "unknown"})
-        self.assertEqual(event["data"], {"result": "started", "operation": "other", "task_class": "other"})
-        self.assertLessEqual(len(event["caused_by"]), 3)
-        self.assertLessEqual(len(event["evidence_refs"]), 5)
+        task_class_by_operation = {
+            "implement": "coding",
+            "review": "review",
+            "runtime_verify": "runtime_verify",
+            "other": "other",
+        }
+        for index, (operation, task_class) in enumerate(task_class_by_operation.items()):
+            value = record(
+                task_id=f"{index + 1:024x}",
+                unit=f"grabowski-task-{index + 1:024x}-a1.service",
+                chronik_context_json={
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": operation,
+                    "task_class": task_class,
+                },
+            )
+            self.assertEqual(
+                chronik.record_task_state(value, "running"),
+                {"enabled": True, "written": False},
+            )
+            self.assertEqual(
+                chronik.record_task_state(value, "completed"),
+                {"enabled": True, "written": False},
+            )
+        self.assertEqual(list(self.root.rglob("*.jsonl")), [])
 
-    def test_terminal_events_distinguish_execution_failure_from_safety_block(self):
+    def test_arbitrary_operation_cannot_expand_high_value_admission(self):
+        self.enable()
+        value = record(
+            chronik_context_json={
+                "subject_scope": "host",
+                "host": "heim-pc",
+                "operation": "deploy-plus",
+                "task_class": "other",
+            }
+        )
+        self.assertEqual(
+            chronik.record_task_state(value, "running"),
+            {"enabled": True, "written": False},
+        )
+        self.assertEqual(
+            chronik.record_task_state(value, "completed"),
+            {"enabled": True, "written": False},
+        )
+        self.assertEqual(list(self.root.rglob("*.jsonl")), [])
+
+    def test_high_value_operations_retain_start_and_completion_idempotently(self):
+        self.enable()
+        self.assertEqual(
+            chronik.HIGH_VALUE_LIFECYCLE_OPERATIONS,
+            frozenset({"deploy", "merge", "recovery"}),
+        )
+        for index, operation in enumerate(sorted(chronik.HIGH_VALUE_LIFECYCLE_OPERATIONS)):
+            value = record(
+                task_id=f"{index + 20:024x}",
+                unit=f"grabowski-task-{index + 20:024x}-a1.service",
+                chronik_context_json={
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": operation,
+                    "task_class": operation,
+                },
+            )
+            started = chronik.record_task_state(value, "running")
+            started_retry = chronik.record_task_state(value, "running")
+            completed = chronik.record_task_state(value, "completed")
+            completed_retry = chronik.record_task_state(value, "completed")
+            self.assertTrue(started["written"])
+            self.assertFalse(started_retry["written"])
+            self.assertTrue(completed["written"])
+            self.assertFalse(completed_retry["written"])
+            events = [
+                json.loads(line)
+                for line in Path(started["path"]).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [(event["kind"], event["data"]["operation"]) for event in events],
+                [
+                    ("agent.run.started", operation),
+                    ("agent.run.completed", operation),
+                ],
+            )
+
+    def test_terminal_failures_and_safety_block_are_always_retained(self):
+        self.enable()
         cases = [
-            ("completed", "agent.run.completed", "completed", None),
-            ("failed", "agent.run.failed", "failed", None),
-            ("cancelled", "agent.run.cancelled", "cancelled", None),
-            ("timed_out", "agent.run.timed_out", "timed_out", None),
-            ("signalled", "agent.run.signalled", "signalled", None),
-            ("outcome_unknown", "agent.run.blocked", "blocked", "task-outcome-unknown"),
+            ("failed", "agent.run.failed", "failed", None, "implement", "coding"),
+            ("cancelled", "agent.run.cancelled", "cancelled", None, "review", "review"),
+            ("timed_out", "agent.run.timed_out", "timed_out", None, "runtime_verify", "runtime_verify"),
+            ("signalled", "agent.run.signalled", "signalled", None, "other", "other"),
+            ("outcome_unknown", "agent.run.blocked", "blocked", "task-outcome-unknown", "implement", "coding"),
         ]
-        for state, kind, result, blocker_code in cases:
+        for index, (state, kind, result, blocker_code, operation, task_class) in enumerate(cases):
             with self.subTest(state=state):
-                self.tmp.cleanup()
-                self.tmp = tempfile.TemporaryDirectory()
-                self.root = Path(self.tmp.name)
-                self.enable()
-                chronik.record_task_state(record(), state)
-                event = json.loads(self.lines()[0])
+                value = record(
+                    task_id=f"{index + 40:024x}",
+                    unit=f"grabowski-task-{index + 40:024x}-a1.service",
+                    chronik_context_json={
+                        "subject_scope": "host",
+                        "host": "heim-pc",
+                        "operation": operation,
+                        "task_class": task_class,
+                    },
+                )
+                first = chronik.record_task_state(value, state)
+                retry = chronik.record_task_state(value, state)
+                self.assertTrue(first["written"])
+                self.assertFalse(retry["written"])
+                event = json.loads(Path(first["path"]).read_text(encoding="utf-8").splitlines()[0])
                 self.assertEqual(event["schema_version"], "agent-run-event.v1")
                 self.assertEqual(event["kind"], kind)
                 self.assertEqual(event["data"]["result"], result)
+                self.assertEqual(event["data"]["operation"], operation)
+                self.assertEqual(event["data"]["task_class"], task_class)
                 if blocker_code is None:
                     self.assertNotIn("blocker_code", event["data"])
                 else:
                     self.assertEqual(event["data"]["blocker_code"], blocker_code)
+
     def test_repository_context_is_projected_without_raw_execution_data(self):
         self.enable()
         context = {
             "subject_scope": "repository",
             "repo": "heimgewebe/chronik",
-            "operation": "implement",
-            "task_class": "coding",
+            "operation": "merge",
+            "task_class": "merge",
             "branch": "fix/target-identity",
             "head": "a" * 40,
         }
@@ -215,7 +306,7 @@ class ChronikAgentOutboxTests(unittest.TestCase):
             "branch": "fix/target-identity", "head": "a" * 40,
         })
         self.assertEqual(event["data"], {
-            "result": "completed", "operation": "implement", "task_class": "coding",
+            "result": "completed", "operation": "merge", "task_class": "merge",
         })
         rendered = json.dumps(event, sort_keys=True)
         self.assertNotIn("argv", rendered)
@@ -227,8 +318,8 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         context = {
             "subject_scope": "repository",
             "repo": "heimgewebe/chronik",
-            "operation": "implement",
-            "task_class": "coding",
+            "operation": "deploy",
+            "task_class": "deploy",
             "component": "task-runner",
             "bureau_task_id": "CCM-V1-T002",
             "pr_number": 306,
@@ -256,6 +347,22 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         self.assertEqual(event["data"]["operation"], "recovery")
         self.assertEqual(event["data"]["task_class"], "recovery")
 
+    def test_build_event_still_reconstructs_filtered_historical_projection(self):
+        event = chronik.build_event(
+            record(
+                chronik_context_json={
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": "implement",
+                    "task_class": "coding",
+                }
+            ),
+            "completed",
+        )
+        self.assertEqual(event["kind"], "agent.run.completed")
+        self.assertEqual(event["data"]["operation"], "implement")
+        self.assertFalse(chronik._event_should_be_recorded(event))
+
     def test_legacy_v0_execution_failure_event_remains_readable(self):
         event = chronik.build_event(record(), "outcome_unknown")
         event["schema_version"] = "agent-run-event.v0"
@@ -271,10 +378,19 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         event["event_id"] = chronik.event_id(event)
         with self.assertRaisesRegex(ValueError, "unexpected blocker code"):
             chronik._validate_agent_run_event_shape(event, label="v1 event")
+
     def test_deduplicates_same_event(self):
         self.enable()
-        chronik.record_task_state(record(), "running")
-        chronik.record_task_state(record(), "running")
+        value = record(
+            chronik_context_json={
+                "subject_scope": "host",
+                "host": "heim-pc",
+                "operation": "recovery",
+                "task_class": "recovery",
+            }
+        )
+        chronik.record_task_state(value, "running")
+        chronik.record_task_state(value, "running")
         self.assertEqual(len(self.lines()), 1)
 
     def test_event_ids_are_state_unique_and_retry_stable(self):
@@ -641,7 +757,14 @@ class ChronikAgentOutboxTests(unittest.TestCase):
 
     def test_writer_lock_wait_is_bounded_and_safe_wrapper_reports_error(self):
         self.enable()
-        value = record()
+        value = record(
+            chronik_context_json={
+                "subject_scope": "host",
+                "host": "heim-pc",
+                "operation": "deploy",
+                "task_class": "deploy",
+            }
+        )
         path = chronik.outbox_path(
             chronik.build_event(value, "completed"), self.root
         )
@@ -664,7 +787,17 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         bad_root.write_text("x", encoding="utf-8")
         os.environ[chronik.ENABLED_ENV] = "1"
         os.environ[chronik.STATE_ROOT_ENV] = str(bad_root)
-        result = chronik.record_task_state_safely(record(), "running")
+        result = chronik.record_task_state_safely(
+            record(
+                chronik_context_json={
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": "deploy",
+                    "task_class": "deploy",
+                }
+            ),
+            "running",
+        )
         self.assertFalse(result["written"])
         self.assertIn("error", result)
 

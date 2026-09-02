@@ -47,7 +47,7 @@ Use these task parameters for a real smoke:
 ```text
 chronik_outbox=True
 chronik_outbox_state_root=/tmp/grabowski-chronik-smoke
-chronik_operation=implement
+chronik_operation=deploy
 chronik_component=task-runner
 chronik_bureau_task_id=CCM-V1-T002
 chronik_pr_number=306
@@ -61,6 +61,12 @@ For a local task with exactly one canonical `repo:/absolute/path` resource claim
 
 Every new event carries bounded `operation` and `task_class` fields. `chronik_operation` accepts only `implement`, `review`, `merge`, `deploy`, `runtime_verify`, `recovery` or `other`; the task class is derived deterministically from that value. When the caller knows them, `chronik_component`, `chronik_bureau_task_id` and `chronik_pr_number` add bounded target-component, Bureau-task and pull-request references to the persisted subject. These references are accepted only with an enabled task-local outbox; the PR number must be a positive bounded integer. Non-`other` operations also require an enabled task-local outbox. Events never contain raw argv, cwd, environment variables, secrets or private filesystem paths.
 
+### High-value admission
+
+The producer deliberately does not persist every successful task transition. Terminal execution failures (`agent.run.failed`, `agent.run.cancelled`, `agent.run.timed_out`, and `agent.run.signalled`) and the safety-block outcome `agent.run.blocked` are always retained, including their bounded `operation` and `task_class`; blocked events retain their blocker code. `agent.run.started` and successful `agent.run.completed` are written only when the persisted operation is one of the source-defined high-value set: `deploy`, `merge`, or `recovery`. Routine successful `implement`, `review`, `runtime_verify`, and `other` transitions remain in the durable task/runtime evidence that already owns current execution truth and are not duplicated into Chronik history.
+
+This is an admission rule for new outbox writes, not a migration rule. `build_event()` remains able to reconstruct valid historical `agent.run.*` payloads, and existing Chronik records are never rewritten or deleted by this filter. Adding another high-value lifecycle operation therefore requires an explicit source and regression-test change; arbitrary caller strings cannot expand the set.
+
 Event payloads are deterministic for one persisted task transition. `agent.run.started` uses the task creation timestamp; terminal events use the terminalization timestamp, falling back to the persisted update timestamp for legacy rows. The `event_id` is the SHA-256 of the complete canonical payload without the ID itself. Re-emitting the same transition therefore recreates byte-identical evidence, while changed timestamps, subjects or data receive a different ID. An existing ID with different payload fails closed.
 
 ## Safe temporary smoke
@@ -72,7 +78,7 @@ tmp=$(mktemp -d)
 release="$HOME/.local/share/grabowski-mcp"
 GRABOWSKI_CHRONIK_AGENT_RUN_OUTBOX=1 \
 GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT="$tmp" \
-"$release/.venv/bin/python" -c 'import grabowski_chronik as c; r=c.record_task_state_safely({"task_id":"dddddddddddddddddddddddd","unit":"u","attempt":1,"created_at_unix":1700000000,"updated_at_unix":1700000100,"terminalized_at_unix":1700000200}, "completed"); print(r)'
+"$release/.venv/bin/python" -c 'import grabowski_chronik as c; r=c.record_task_state_safely({"task_id":"dddddddddddddddddddddddd","unit":"u","attempt":1,"created_at_unix":1700000000,"updated_at_unix":1700000100,"terminalized_at_unix":1700000200,"chronik_context_json":{"subject_scope":"host","host":"heim-pc","operation":"deploy","task_class":"deploy"}}, "completed"); print(r)'
 find "$tmp" -name '*.jsonl' -print
 rm -rf "$tmp"
 ```
@@ -109,7 +115,7 @@ Check that the default outbox is still empty unless a deliberate experiment has 
 find "$HOME/.local/state/grabowski/chronik-outbox" -type f -name '*.jsonl' 2>/dev/null | wc -l
 ```
 
-Expected result for normal operation: `0`.
+Expected result: routine successful task churn does not create files. High-value `deploy`/`merge`/`recovery` events or terminal failure/block events may legitimately leave an outbox source until normal import/compaction consumes it.
 
 ## Explicit non-goals
 
@@ -120,7 +126,7 @@ This runbook does not authorize:
 - automatic flush to Chronik
 - Bureau task creation from events
 - Leitstand, semantAH, heimlern, or hausKI consumers
-- additional event kinds outside `agent.run.started`, `agent.run.completed`, and `agent.run.blocked`
+- additional event kinds outside the current v1 contract: `agent.run.started`, `agent.run.completed`, `agent.run.failed`, `agent.run.cancelled`, `agent.run.timed_out`, `agent.run.signalled`, and `agent.run.blocked`
 
 ## Escalation rule
 
