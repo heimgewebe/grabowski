@@ -241,6 +241,23 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         self.assertNotIn("a" * 40, json.dumps(receipt["inputs"], sort_keys=True))
         self.assertEqual(receipt_mode, 0o600)
         self.assertEqual(lock_mode, 0o600)
+        workflow_lookup = next(
+            call
+            for call in runner.calls
+            if any(
+                "/actions/workflows/" in item and "/runs?" not in item
+                for item in call
+                if isinstance(item, str)
+            )
+            and "--method" not in call
+        )
+        endpoint = next(
+            item
+            for item in workflow_lookup
+            if isinstance(item, str) and "/actions/workflows/" in item
+        )
+        self.assertTrue(endpoint.endswith("/staging-image-promotion.yml"))
+        self.assertNotIn("%2F", endpoint)
 
     def test_expected_head_drift_never_posts(self) -> None:
         runner = _FakeGitHub(head="b" * 40)
@@ -388,12 +405,26 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             seen_cwds.append(cwd)
             return runner(arguments)
 
+        original_dispatch = self.dispatch.dispatch_workflow
+
+        def deterministic_dispatch(*args, **kwargs):
+            kwargs["time_fn"] = lambda: NOW
+            kwargs["sleep"] = lambda _seconds: None
+            return original_dispatch(*args, **kwargs)
+
         receipt: dict[str, object] = {}
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.object(
-                self.dispatch,
-                "DEFAULT_STATE_DIR",
-                Path(directory),
+            with (
+                mock.patch.object(
+                    self.dispatch,
+                    "DEFAULT_STATE_DIR",
+                    Path(directory),
+                ),
+                mock.patch.object(
+                    self.dispatch,
+                    "dispatch_workflow",
+                    side_effect=deterministic_dispatch,
+                ),
             ):
                 output = self.grips._RUNNERS["github_workflow_dispatch"](
                     self.grips.GRIP_SPECS["github-workflow-dispatch"],
