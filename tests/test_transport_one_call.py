@@ -887,25 +887,11 @@ class OperatorSignedTransportTests(unittest.TestCase):
         consume_verified.assert_called_once()
         begin.assert_not_called()
 
-    def test_github_read_only_shapes_are_transport_exempt(self) -> None:
+    def test_github_pr_view_read_only_shape_is_transport_exempt(self) -> None:
         safe_calls = [
             {"arguments": ["pr", "view", "734", "--repo", "heimgewebe/metarepo"]},
-            {
-                "arguments": [
-                    "api",
-                    "repos/heimgewebe/metarepo/commits/main",
-                    "--jq",
-                    ".sha",
-                ]
-            },
-            {
-                "arguments": [
-                    "api",
-                    "graphql",
-                    "-f",
-                    "query=query { viewer { login } }",
-                ]
-            },
+            {"arguments": ["pr", "view", "734", "--json", "number,state,headRefOid"]},
+            {"arguments": ["pr", "view", "--comments"]},
         ]
         for arguments in safe_calls:
             with self.subTest(arguments=arguments):
@@ -915,55 +901,17 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     )
                 )
 
-    def test_github_mutating_or_ambiguous_shapes_stay_transport_gated(self) -> None:
+    def test_other_github_or_ambiguous_shapes_stay_transport_gated(self) -> None:
         unsafe_calls = [
             {"arguments": ["pr", "merge", "734"]},
             {"arguments": ["pr", "view", "734", "--web"]},
-            {"arguments": ["pr", "view", "734", "-w"]},
-            {"arguments": ["pr", "view", "734", "--web=true"]},
+            {"arguments": ["pr", "view", "734", "--jq", ".number"]},
+            {"arguments": ["pr", "view", "734", "--template", "{{.number}}"]},
             {"arguments": ["pr", "view", "734", "--future-mutate"]},
             {"arguments": ["pr", "view", "734", "extra-positional"]},
             {"arguments": ["issue", "view", "1"]},
-            {"arguments": ["api", "repos/x/y", "--method", "DELETE"]},
-            {"arguments": ["api", "repos/x/y", "-XPOST"]},
-            {"arguments": ["api", "repos/x/y", "-f", "x=y"]},
-            {"arguments": ["api", "repos/x/y", "-fx=y"]},
-            {"arguments": ["api", "repos/x/y", "--cache", "1h"]},
-            {"arguments": ["api", "repos/x/y", "--hostname", "example.invalid"]},
-            {
-                "arguments": [
-                    "api",
-                    "graphql",
-                    "-F",
-                    "secret=@/etc/passwd",
-                    "-f",
-                    "query=query($secret:String!){ viewer { login } }",
-                ]
-            },
-            {
-                "arguments": [
-                    "api",
-                    "graphql",
-                    "-fquery=query { viewer { login } }",
-                ]
-            },
-            {
-                "arguments": [
-                    "api",
-                    "graphql",
-                    "--cache=1h",
-                    "-f",
-                    "query=query { viewer { login } }",
-                ]
-            },
-            {
-                "arguments": [
-                    "api",
-                    "graphql",
-                    "-f",
-                    "query=mutation { deleteProjectV2(input:{projectV2Id:\"x\"}) { clientMutationId } }",
-                ]
-            },
+            {"arguments": ["api", "repos/x/y"]},
+            {"arguments": ["api", "graphql", "-f", "query=query { viewer { login } }"]},
         ]
         for arguments in unsafe_calls:
             with self.subTest(arguments=arguments):
@@ -972,15 +920,13 @@ class OperatorSignedTransportTests(unittest.TestCase):
                         "grabowski_github", arguments
                     )
                 )
-        # Opaque terminal execution remains fully signed/gated; this fix does not
-        # classify arbitrary PATH-resolved commands as effect-free.
         self.assertFalse(
             operator._transport_roundtrip_exempt_call(
                 "grabowski_terminal_run", {"argv": ["true"]}
             )
         )
 
-    def test_github_read_only_shape_does_not_consume_signed_assertion(self) -> None:
+    def test_github_pr_view_does_not_consume_signed_assertion(self) -> None:
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
         with (
             mock.patch.object(operator, "_require_current_serving_process") as serving,

@@ -553,165 +553,7 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
     return hint if isinstance(hint, bool) else None
 
 
-_GITHUB_API_NOARG_READ_ONLY_OPTIONS = frozenset(
-    {"--include", "-i", "--paginate", "--silent", "--slurp", "--verbose"}
-)
-_GITHUB_API_VALUE_READ_ONLY_OPTIONS = frozenset(
-    {"--jq", "-q", "--template", "-t"}
-)
-
-
-def _github_api_common_read_only_option(
-    arguments: list[str], index: int
-) -> tuple[bool, int]:
-    item = arguments[index]
-    if item in _GITHUB_API_NOARG_READ_ONLY_OPTIONS:
-        return True, index + 1
-    if item in _GITHUB_API_VALUE_READ_ONLY_OPTIONS:
-        if index + 1 >= len(arguments):
-            return False, index
-        return True, index + 2
-    for prefix in ("--jq=", "--template="):
-        if item.startswith(prefix) and len(item) > len(prefix):
-            return True, index + 1
-    return False, index
-
-
-def _github_graphql_transport_read_only(arguments: list[str]) -> bool:
-    query: str | None = None
-    method: str | None = None
-    index = 1
-    while index < len(arguments):
-        item = arguments[index]
-        if item == "--cache" or item.startswith("--cache="):
-            return False
-        # gh accepts compact short-option forms such as -XPOST and -fkey=value.
-        # Fail closed rather than interpret an ambiguous body/method shape.
-        if (item.startswith("-X") and item != "-X") or (
-            item.startswith("-f") and item != "-f"
-        ) or (item.startswith("-F") and item != "-F"):
-            return False
-        if item in {"--method", "-X"}:
-            if index + 1 >= len(arguments):
-                return False
-            method = arguments[index + 1].upper()
-            index += 2
-            continue
-        if item.startswith("--method="):
-            method = item.split("=", 1)[1].upper()
-            index += 1
-            continue
-        if item == "--input" or item.startswith("--input="):
-            return False
-        if item in {"-f", "-F", "--field", "--raw-field"}:
-            if index + 1 >= len(arguments):
-                return False
-            field = arguments[index + 1]
-            if item in {"-F", "--field"} and "=" in field:
-                # Typed gh fields interpret @path / @- as local file/stdin reads.
-                # A transport read exemption must never become an exfiltration path.
-                if field.split("=", 1)[1].startswith("@"):
-                    return False
-            if field.startswith("query="):
-                if query is not None:
-                    return False
-                query = field.split("=", 1)[1]
-            index += 2
-            continue
-        if item.startswith(("--field=", "--raw-field=")):
-            field = item.split("=", 1)[1]
-            if field.startswith("query="):
-                if query is not None:
-                    return False
-                query = field.split("=", 1)[1]
-            index += 1
-            continue
-        allowed, next_index = _github_api_common_read_only_option(arguments, index)
-        if allowed:
-            index = next_index
-            continue
-        # Unknown/future gh api options remain behind the signed mutation gate.
-        return False
-    if method not in {None, "GET", "POST"} or not isinstance(query, str):
-        return False
-    document = query.strip()
-    if not document or document.startswith("@"):
-        return False
-    if re.search(r"\b(?:mutation|subscription)\b", document, flags=re.IGNORECASE):
-        return False
-    return document.startswith("query") or document.startswith("{")
-
-
-def _github_rest_api_transport_read_only(arguments: list[str]) -> bool:
-    method: str | None = None
-    index = 1
-    while index < len(arguments):
-        item = arguments[index]
-        if item == "--cache" or item.startswith("--cache="):
-            return False
-        if (item.startswith("-X") and item != "-X") or (
-            item.startswith("-f") and item != "-f"
-        ) or (item.startswith("-F") and item != "-F"):
-            return False
-        if item in {"--method", "-X"}:
-            if index + 1 >= len(arguments):
-                return False
-            method = arguments[index + 1].upper()
-            index += 2
-            continue
-        if item.startswith("--method="):
-            method = item.split("=", 1)[1].upper()
-            index += 1
-            continue
-        # Any request body or input file stays gated, even with an explicit GET.
-        if item == "--input" or item.startswith("--input="):
-            return False
-        if item in {"-f", "-F", "--field", "--raw-field"}:
-            return False
-        if item.startswith(("--field=", "--raw-field=")):
-            return False
-        allowed, next_index = _github_api_common_read_only_option(arguments, index)
-        if allowed:
-            index = next_index
-            continue
-        return False
-    return method in {None, "GET"}
-
-
-def _github_pr_view_transport_read_only(arguments: list[str]) -> bool:
-    # Exact `gh pr view` is the friction source. Parse only the currently
-    # documented read-only flags; unknown/future flags remain gated.
-    if len(arguments) < 2 or arguments[:2] != ["pr", "view"]:
-        return False
-    positional_count = 0
-    index = 2
-    while index < len(arguments):
-        item = arguments[index]
-        if item in {"--web", "-w"}:
-            return False
-        if item in {"--comments", "-c", "--help"}:
-            index += 1
-            continue
-        if item in {"--jq", "-q", "--json", "--template", "-t", "--repo", "-R"}:
-            if index + 1 >= len(arguments):
-                return False
-            index += 2
-            continue
-        if item.startswith(("--jq=", "--json=", "--template=", "--repo=")):
-            if item.endswith("="):
-                return False
-            index += 1
-            continue
-        if item.startswith("-"):
-            return False
-        positional_count += 1
-        if positional_count > 1:
-            return False
-        index += 1
-    return True
-
-
-def _github_transport_read_only_call(arguments: Any) -> bool:
+def _github_pr_view_transport_read_only(arguments: Any) -> bool:
     if not isinstance(arguments, dict) or set(arguments) - {
         "arguments",
         "cwd",
@@ -721,24 +563,49 @@ def _github_transport_read_only_call(arguments: Any) -> bool:
     argv = arguments.get("arguments")
     if (
         not isinstance(argv, list)
-        or not argv
+        or len(argv) < 2
+        or argv[:2] != ["pr", "view"]
         or not all(isinstance(item, str) and item for item in argv)
     ):
         return False
-    if argv[:2] == ["pr", "view"]:
-        return _github_pr_view_transport_read_only(argv)
-    if argv[0] != "api" or len(argv) < 2 or argv[1].startswith("-"):
-        return False
-    if argv[1] == "graphql":
-        return _github_graphql_transport_read_only(argv[1:])
-    return _github_rest_api_transport_read_only(argv[1:])
+    # Parse only the current documented read-only `gh pr view` flags. Unknown
+    # or future flags remain behind the signed mutation transport gate.
+    positional_count = 0
+    index = 2
+    while index < len(argv):
+        item = argv[index]
+        if item in {"--web", "-w"}:
+            return False
+        if item in {"--comments", "-c", "--help"}:
+            index += 1
+            continue
+        if item in {"--json", "--repo", "-R"}:
+            if index + 1 >= len(argv):
+                return False
+            index += 2
+            continue
+        if item.startswith(("--json=", "--repo=")):
+            if item.endswith("="):
+                return False
+            index += 1
+            continue
+        # --jq and --template are intentionally not exempted: they evaluate
+        # caller-controlled formatting programs locally and are unnecessary for
+        # the concrete repeated PR-view friction being repaired.
+        if item.startswith("-"):
+            return False
+        positional_count += 1
+        if positional_count > 1:
+            return False
+        index += 1
+    return True
 
 
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
     if tool_name == "grabowski_github":
-        return _github_transport_read_only_call(arguments)
+        return _github_pr_view_transport_read_only(arguments)
     if tool_name == "grabowski_browser_worker_semantic":
         # The public tool stays conservatively MUTATING. Only the exact read
         # operation may bypass the global mutation roundtrip; act, missing and
