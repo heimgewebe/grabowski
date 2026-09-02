@@ -409,6 +409,19 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         self.assertEqual(runner.post_count, 1)
         self.assertFalse(result["retry_authorized"])
 
+    def test_candidate_must_remain_visible_through_stabilization_window(self) -> None:
+        runner = _FakeGitHub(
+            create_run_on_post=False,
+            run_snapshots=[[101], [], []],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._call(runner, directory, poll_attempts=3)
+
+        self.assertEqual(result["result_code"], "accepted_run_not_observed")
+        self.assertEqual(result["effect_state"], "unknown")
+        self.assertEqual(runner.post_count, 1)
+        self.assertFalse(result["retry_authorized"])
+
     def test_readback_ignores_same_head_run_from_other_ref(self) -> None:
         runner = _FakeGitHub(create_run_on_post=False)
         runner.runs = [101]
