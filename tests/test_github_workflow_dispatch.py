@@ -92,14 +92,19 @@ class _FakeGitHub:
         workflow_state: str = "active",
         post_mode: str = "accepted",
         create_run_on_post: bool = True,
+        runs_per_post: int = 1,
+        run_readback_failures: int = 0,
     ) -> None:
         self.head = head
         self.workflow_state = workflow_state
         self.post_mode = post_mode
         self.create_run_on_post = create_run_on_post
+        self.runs_per_post = runs_per_post
+        self.run_readback_failures = run_readback_failures
         self.calls: list[list[str]] = []
         self.post_count = 0
         self.runs: list[int] = []
+        self.run_branches: dict[int, str] = {}
 
     @staticmethod
     def _result(
@@ -155,13 +160,16 @@ class _FakeGitHub:
         if "/commits/" in endpoint:
             return self._result(stdout=json.dumps({"sha": self.head}))
         if "/runs?" in endpoint:
+            if self.post_count > 0 and self.run_readback_failures > 0:
+                self.run_readback_failures -= 1
+                return self._result(returncode=1, stderr="connection reset")
             rows = [
                 {
                     "id": run_id,
                     "workflow_id": 42,
                     "event": "workflow_dispatch",
                     "head_sha": self.head,
-                    "head_branch": "main",
+                    "head_branch": self.run_branches.get(run_id, "main"),
                     "status": "queued",
                     "conclusion": None,
                     "html_url": f"https://github.example/runs/{run_id}",
@@ -176,7 +184,10 @@ class _FakeGitHub:
         if "--method" in args and "POST" in args:
             self.post_count += 1
             if self.create_run_on_post:
-                self.runs.append(100 + self.post_count)
+                first_run_id = 100 + (self.post_count - 1) * 10 + 1
+                self.runs.extend(
+                    first_run_id + offset for offset in range(self.runs_per_post)
+                )
             if self.post_mode == "accepted":
                 return self._result()
             if self.post_mode == "422":
@@ -315,6 +326,73 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             second["result_code"],
             "prior_ambiguous_outcome_unresolved",
         )
+        self.assertEqual(second["effect_state"], "unknown")
+        self.assertEqual(runner.post_count, 1)
+        self.assertFalse(second["retry_authorized"])
+
+    def test_readback_ignores_same_head_run_from_other_ref(self) -> None:
+        runner = _FakeGitHub(create_run_on_post=False)
+        runner.runs = [101]
+        runner.run_branches[101] = "release"
+
+        run, state, error = self.dispatch._readback(
+            runner,
+            repository="heimgewebe/commonthing",
+            workflow_id=42,
+            workflow_path=".github/workflows/staging-image-promotion.yml",
+            ref="main",
+            head="a" * 40,
+            baseline=set(),
+            attempted_at=NOW,
+            attempts=1,
+            sleep=lambda _seconds: None,
+            time_fn=lambda: NOW,
+        )
+
+        self.assertIsNone(run)
+        self.assertEqual(state, "missing")
+        self.assertIsNone(error)
+
+    def test_prior_ambiguous_outcome_survives_later_ref_drift(self) -> None:
+        runner = _FakeGitHub(post_mode="timeout", create_run_on_post=False)
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._call(runner, directory)
+            self.assertEqual(first["result_code"], "dispatch_outcome_unknown")
+
+            runner.head = "b" * 40
+            second = self._call(runner, directory)
+            self.assertEqual(second["result_code"], "prior_ambiguous_ref_drift")
+            self.assertEqual(second["effect_state"], "unknown")
+
+            runner.head = "a" * 40
+            third = self._call(runner, directory)
+
+        self.assertEqual(third["result_code"], "prior_ambiguous_outcome_unresolved")
+        self.assertEqual(third["effect_state"], "unknown")
+        self.assertEqual(runner.post_count, 1)
+
+    def test_accepted_readback_failure_blocks_duplicate_post_and_recovers(self) -> None:
+        runner = _FakeGitHub(run_readback_failures=1)
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._call(runner, directory)
+            self.assertEqual(first["result_code"], "accepted_run_readback_failed")
+            second = self._call(runner, directory)
+
+        self.assertEqual(
+            second["result_code"],
+            "dispatch_recovered_after_ambiguous_transport",
+        )
+        self.assertEqual(second["run"]["run_id"], 101)
+        self.assertEqual(runner.post_count, 1)
+
+    def test_multiple_matching_runs_block_duplicate_post(self) -> None:
+        runner = _FakeGitHub(runs_per_post=2)
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._call(runner, directory)
+            self.assertEqual(first["result_code"], "run_identity_ambiguous")
+            second = self._call(runner, directory)
+
+        self.assertEqual(second["result_code"], "prior_ambiguous_multiple_runs")
         self.assertEqual(second["effect_state"], "unknown")
         self.assertEqual(runner.post_count, 1)
         self.assertFalse(second["retry_authorized"])

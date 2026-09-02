@@ -62,6 +62,14 @@ _SECRET_KEYS = (
 _ALLOWED_PARAMETERS = frozenset(
     {"repository", "workflow", "ref", "inputs", "expected_head"}
 )
+_UNRESOLVED_DISPATCH_CODES = frozenset(
+    {
+        "dispatch_outcome_unknown",
+        "accepted_run_not_observed",
+        "accepted_run_readback_failed",
+        "run_identity_ambiguous",
+    }
+)
 
 GithubRunner = Callable[[list[str]], dict[str, Any]]
 Sleep = Callable[[float], None]
@@ -309,11 +317,10 @@ def _unresolved(receipts: list[dict[str, Any]]) -> dict[str, Any] | None:
         if (
             receipt.get("effect_state") == "unknown"
             and receipt.get("run") is None
-            and receipt.get("result_code")
-            in {"dispatch_outcome_unknown", "accepted_run_not_observed"}
+            and receipt.get("result_code") in _UNRESOLVED_DISPATCH_CODES
         ):
             return receipt
-        if receipt.get("effect_state") in {"observed", "not_started"}:
+        if receipt.get("effect_state") == "observed":
             return None
     return None
 
@@ -549,6 +556,7 @@ def _readback(
     repository: str,
     workflow_id: int,
     workflow_path: str,
+    ref: str,
     head: str,
     baseline: set[int],
     attempted_at: float,
@@ -568,6 +576,7 @@ def _readback(
             created = _created_at(run["created_at"])
             if (
                 run["workflow_id"] == workflow_id
+                and run["head_branch"] == ref
                 and run["head_sha"] == head
                 and run["run_id"] not in baseline
                 and created is not None
@@ -785,6 +794,7 @@ def dispatch_workflow(
             inputs_meta,
             time_fn(),
         )
+        prior = _unresolved(_prior_receipts(directory))
         workflow_info, head, error = _preflight(
             runner, repository, workflow_kind, workflow_selector, ref
         )
@@ -792,8 +802,10 @@ def dispatch_workflow(
             return _finish(
                 directory,
                 receipt,
-                error["result_code"],
-                error["effect_state"],
+                "prior_ambiguous_preflight_failed"
+                if prior is not None
+                else error["result_code"],
+                "unknown" if prior is not None else error["effect_state"],
                 time_fn(),
                 status=error.get("http_status"),
             )
@@ -805,6 +817,14 @@ def dispatch_workflow(
             "state": workflow_info["state"],
         }
         receipt["observed_head"] = head
+        if prior is not None and prior.get("observed_head") != head:
+            return _finish(
+                directory,
+                receipt,
+                "prior_ambiguous_ref_drift",
+                "unknown",
+                time_fn(),
+            )
         if expected_head is not None and head != expected_head:
             return _finish(
                 directory,
@@ -824,8 +844,10 @@ def dispatch_workflow(
             return _finish(
                 directory,
                 receipt,
-                error["result_code"],
-                "not_started",
+                "prior_ambiguous_readback_failed"
+                if prior is not None
+                else error["result_code"],
+                "unknown" if prior is not None else "not_started",
                 time_fn(),
                 status=error.get("http_status"),
             )
@@ -838,18 +860,9 @@ def dispatch_workflow(
         }
         receipt["baseline_run_ids"] = sorted(baseline)
 
-        prior = _unresolved(_prior_receipts(directory))
         if prior is not None:
             prior_baseline = prior.get("baseline_run_ids")
             attempted = prior.get("dispatch_attempted_at_unix")
-            if prior.get("observed_head") != head:
-                return _finish(
-                    directory,
-                    receipt,
-                    "prior_ambiguous_ref_drift",
-                    "unknown",
-                    time_fn(),
-                )
             if (
                 not isinstance(prior_baseline, list)
                 or not all(
@@ -873,6 +886,7 @@ def dispatch_workflow(
                 repository=repository,
                 workflow_id=workflow_info["id"],
                 workflow_path=workflow_info["path"],
+                ref=ref,
                 head=head,
                 baseline=set(prior_baseline),
                 attempted_at=float(attempted),
@@ -938,6 +952,7 @@ def dispatch_workflow(
             repository=repository,
             workflow_id=workflow_info["id"],
             workflow_path=workflow_info["path"],
+            ref=ref,
             head=head,
             baseline=baseline,
             attempted_at=attempted,
@@ -1043,7 +1058,7 @@ def _grip_runner(
     elif effect == "unknown":
         grabowski_grips._check(
             receipt,
-            "ambiguous-outcome-dedupe",
+            "ambiguous-dedupe",
             "pass",
             "retry remains unauthorized until authoritative readback",
         )
