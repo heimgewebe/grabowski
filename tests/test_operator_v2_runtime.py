@@ -784,7 +784,23 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ],
             "status_projection": {
                 "schema_version": 1,
+                "kind": "grabowski_pr_review_status_projection",
+                "repo": "heimgewebe/bureau",
+                "pr": 2237,
                 "pull_request": 2237,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "audit_sha256": "d" * 64,
+                "review_policy_version": 1,
+                "gate_verdict": "PASS",
+                "self_review_gate_valid": True,
+                "all_findings_triaged": True,
+                "material_findings_remaining": 0,
+                "minimum_review_iterations": 5,
+                "actual_review_iterations": 6,
+                "review_tier": "high_critical",
+                "tuning_signal": "observe",
                 "unresolved_review_threads": 0,
                 "measurement": 1.0,
             },
@@ -843,6 +859,11 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
         self.assertEqual(canonical, normalized)
         self.assertIsInstance(normalized["status_projection"]["measurement"], float)
+        self.assertIsInstance(normalized["status_projection"]["pr"], int)
+        self.assertIsInstance(normalized["status_projection"]["review_policy_version"], int)
+        self.assertIsInstance(
+            normalized["status_projection"]["material_findings_remaining"], int
+        )
         self.assertIsInstance(normalized["actions"][0]["target"]["pr"], int)
         self.assertIsInstance(normalized["codex_review_evidence"]["finding_count"], int)
         self.assertIsInstance(normalized["review_evidence"]["review_policy_version"], int)

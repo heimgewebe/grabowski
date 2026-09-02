@@ -1597,7 +1597,16 @@ def _normalize_captain_transport_integer_fields(value: Any) -> Any:
 
     _normalize_captain_transport_mapping_integers(
         normalized.get("status_projection"),
-        ("schema_version", "pull_request", "unresolved_review_threads"),
+        (
+            "schema_version",
+            "pr",
+            "pull_request",
+            "review_policy_version",
+            "material_findings_remaining",
+            "minimum_review_iterations",
+            "actual_review_iterations",
+            "unresolved_review_threads",
+        ),
     )
     _normalize_captain_transport_mapping_integers(
         normalized.get("review_evidence"),
