@@ -947,6 +947,13 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 current_event is not None
                 and chronik._event_should_be_recorded(current_event)
             )
+            if current_state == "interrupted":
+                context = chronik._context(raw)
+                source_expected = (
+                    source_expected
+                    or context.get("operation")
+                    in chronik.HIGH_VALUE_LIFECYCLE_OPERATIONS
+                )
         except Exception as exc:
             gaps.append(
                 _external_gap(
