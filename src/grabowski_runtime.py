@@ -14,6 +14,7 @@ import grabowski_current_work_surface
 import grabowski_work_acquire  # noqa: F401
 import grabowski_operator_optimization
 import grabowski_runtime_extensions
+import grabowski_github_workflow_dispatch  # noqa: F401
 import grabowski_audit_query
 import grabowski_reposkop_effectiveness  # noqa: F401
 import grabowski_read_surface
