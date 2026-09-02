@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 import fcntl
 import hashlib
 import json
@@ -27,30 +27,27 @@ RESULT_KIND = "grabowski_github_workflow_dispatch_result"
 STATE_DIR_ENV = "GRABOWSKI_GITHUB_WORKFLOW_DISPATCH_STATE_DIR"
 DEFAULT_STATE_DIR = Path.home() / ".local/state/grabowski/github-workflow-dispatch"
 
-MAX_REPOSITORY_BYTES = 205
-MAX_WORKFLOW_BYTES = 255
-MAX_REF_BYTES = 255
-MAX_INPUTS = 32
-MAX_INPUT_KEY_BYTES = 80
-MAX_INPUT_VALUE_BYTES = 4096
-MAX_INPUT_BYTES = 32 * 1024
 MAX_RECEIPT_BYTES = 128 * 1024
-RUN_POLL_ATTEMPTS = 20
-RUN_POLL_INTERVAL_SECONDS = 1.0
-RUN_CREATED_SKEW_SECONDS = 15.0
-RUN_CREATED_FUTURE_SECONDS = 60.0
+MAX_INPUTS = 32
+MAX_INPUT_BYTES = 32 * 1024
+POLL_ATTEMPTS = 20
+POLL_SECONDS = 1.0
+RUN_SKEW_SECONDS = 15.0
+RUN_FUTURE_SECONDS = 60.0
 
-_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-_WORKFLOW_FILE_RE = re.compile(r"[A-Za-z0-9_.-]+\.(?:yml|yaml)\Z", re.IGNORECASE)
-_SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
-_INPUT_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
+_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_WORKFLOW_RE = re.compile(r"[A-Za-z0-9_.-]+\.(?:yml|yaml)\Z", re.I)
+_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_REF_BAD_RE = re.compile(r"(?:\.\.|@\{|[ ~^:?*\[\\])")
+_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_HTTP_STATUS_RE = re.compile(r"\bHTTP\s+([1-5][0-9]{2})\b", re.IGNORECASE)
-_SECRET_VALUE_RE = re.compile(
-    r"(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|Bearer\s+\S{12,}|-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----)",
-    re.IGNORECASE,
+_HTTP_RE = re.compile(r"\bHTTP\s+([1-5][0-9]{2})\b", re.I)
+_SECRET_RE = re.compile(
+    r"(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"Bearer\s+\S{12,}|-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----)",
+    re.I,
 )
-_SECRET_KEY_PARTS = (
+_SECRET_KEYS = (
     "token",
     "secret",
     "password",
@@ -62,294 +59,209 @@ _SECRET_KEY_PARTS = (
     "apikey",
     "private_key",
 )
-_ALLOWED_GRIP_PARAMETERS = frozenset(
+_ALLOWED_PARAMETERS = frozenset(
     {"repository", "workflow", "ref", "inputs", "expected_head"}
 )
 
-
-class WorkflowDispatchContractError(ValueError):
-    def __init__(self, code: str, detail: str) -> None:
-        super().__init__(f"{code}: {detail}")
-        self.code = code
-        self.detail = detail
-
-
-GitHubRunner = Callable[[list[str]], dict[str, Any]]
+GithubRunner = Callable[[list[str]], dict[str, Any]]
 Sleep = Callable[[float], None]
 TimeFn = Callable[[], float]
 
 
-def _canonical_json_bytes(value: Any) -> bytes:
+class DispatchError(ValueError):
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+
+
+def _json_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
-    ).encode("utf-8")
+    ).encode()
 
 
-def _sha256_json(value: Any) -> str:
-    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
-
-
-def _bounded_text(value: Any, *, label: str, maximum: int) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise WorkflowDispatchContractError(
-            "input_invalid", f"{label} must be non-empty trimmed text"
-        )
-    if len(value.encode("utf-8")) > maximum or _CONTROL_RE.search(value):
-        raise WorkflowDispatchContractError(
-            "input_invalid", f"{label} is unbounded or contains controls"
-        )
-    return value
+def _digest(value: Any) -> str:
+    return hashlib.sha256(_json_bytes(value)).hexdigest()
 
 
 def _normalize_repository(value: Any) -> str:
-    repository = _bounded_text(
-        value, label="repository", maximum=MAX_REPOSITORY_BYTES
-    )
-    if _REPOSITORY_RE.fullmatch(repository) is None:
-        raise WorkflowDispatchContractError(
-            "repository_invalid", "repository must be owner/name"
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or len(value.encode()) > 205
+        or not _REPO_RE.fullmatch(value)
+    ):
+        raise DispatchError(
+            "repository_invalid", "repository must be bounded owner/name text"
         )
-    owner, name = repository.split("/", 1)
-    if owner in {".", ".."} or name in {".", ".."}:
-        raise WorkflowDispatchContractError(
-            "repository_invalid", "repository segments are invalid"
-        )
-    return repository
+    if any(part in {".", ".."} for part in value.split("/", 1)):
+        raise DispatchError("repository_invalid", "repository segments are invalid")
+    return value
 
 
 def _normalize_workflow(value: Any) -> tuple[str, str]:
-    workflow = _bounded_text(value, label="workflow", maximum=MAX_WORKFLOW_BYTES)
-    if workflow.isdigit():
-        if int(workflow) < 1:
-            raise WorkflowDispatchContractError(
-                "workflow_invalid", "workflow id must be positive"
-            )
-        return "id", str(int(workflow))
-    filename = workflow.removeprefix(".github/workflows/")
     if (
-        "/" in filename
-        or filename in {".", ".."}
-        or _WORKFLOW_FILE_RE.fullmatch(filename) is None
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value.encode()) > 255
     ):
-        raise WorkflowDispatchContractError(
-            "workflow_invalid",
-            "workflow must be a positive id or one filename under .github/workflows",
+        raise DispatchError("workflow_invalid", "workflow must be bounded text")
+    if value.isdigit():
+        if int(value) < 1:
+            raise DispatchError("workflow_invalid", "workflow id must be positive")
+        return "id", str(int(value))
+    filename = value.removeprefix(".github/workflows/")
+    if "/" in filename or not _WORKFLOW_RE.fullmatch(filename):
+        raise DispatchError(
+            "workflow_invalid", "workflow must be a positive id or workflow filename"
         )
     return "path", f".github/workflows/{filename}"
 
 
 def _normalize_ref(value: Any) -> str:
-    ref = _bounded_text(value, label="ref", maximum=MAX_REF_BYTES)
     if (
-        ref.startswith(("-", "."))
-        or ref.endswith((".", "/"))
-        or ".." in ref
-        or "@{" in ref
-        or "\\" in ref
-        or " " in ref
-        or any(character in ref for character in "~^:?*[")
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value.encode()) > 255
+        or value.startswith(("-", "."))
+        or value.endswith((".", "/"))
+        or _REF_BAD_RE.search(value)
     ):
-        raise WorkflowDispatchContractError(
-            "ref_invalid", "ref is not a conservative Git ref"
-        )
-    return ref
+        raise DispatchError("ref_invalid", "ref is not a conservative Git ref")
+    return value
 
 
-def _normalize_expected_head(value: Any) -> str | None:
+def _normalize_head(value: Any) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or _SHA40_RE.fullmatch(value) is None:
-        raise WorkflowDispatchContractError(
-            "expected_head_invalid",
-            "expected_head must be a full lowercase Git SHA",
+    if not isinstance(value, str) or not _SHA_RE.fullmatch(value):
+        raise DispatchError(
+            "expected_head_invalid", "expected_head must be a full lowercase SHA"
         )
     return value
 
 
-def _looks_sensitive_key(value: str) -> bool:
-    normalized = value.casefold()
-    return any(part in normalized for part in _SECRET_KEY_PARTS)
-
-
-def _looks_sensitive_value(value: str) -> bool:
-    if _SECRET_VALUE_RE.search(value):
-        return True
-    redactor = getattr(operator, "_redact", None)
-    return bool(callable(redactor) and redactor(value) != value)
-
-
 def _normalize_inputs(value: Any) -> tuple[dict[str, str], dict[str, Any]]:
-    raw: Mapping[str, Any]
     if value is None:
-        raw = {}
-    elif isinstance(value, Mapping):
-        raw = value
-    else:
-        raise WorkflowDispatchContractError(
-            "inputs_invalid", "inputs must be a structured object"
-        )
-    if len(raw) > MAX_INPUTS:
-        raise WorkflowDispatchContractError(
-            "inputs_invalid", "inputs exceed the item bound"
-        )
+        value = {}
+    if not isinstance(value, Mapping) or len(value) > MAX_INPUTS:
+        raise DispatchError("inputs_invalid", "inputs must be a bounded object")
     normalized: dict[str, str] = {}
-    total_bytes = 0
-    for raw_key, raw_value in raw.items():
-        if not isinstance(raw_key, str) or _INPUT_KEY_RE.fullmatch(raw_key) is None:
-            raise WorkflowDispatchContractError(
-                "inputs_invalid", "workflow input key is invalid"
-            )
-        if (
-            len(raw_key.encode("utf-8")) > MAX_INPUT_KEY_BYTES
-            or _looks_sensitive_key(raw_key)
-        ):
-            raise WorkflowDispatchContractError(
+    total = 0
+    redactor = getattr(operator, "_redact", None)
+    for key, item in value.items():
+        if not isinstance(key, str) or not _KEY_RE.fullmatch(key):
+            raise DispatchError("inputs_invalid", "workflow input key is invalid")
+        if any(part in key.casefold() for part in _SECRET_KEYS):
+            raise DispatchError(
                 "secret_input_rejected",
                 "secret-like workflow input keys are forbidden",
             )
-        if not isinstance(raw_value, str):
-            raise WorkflowDispatchContractError(
-                "inputs_invalid", "workflow input values must be strings"
-            )
         if (
-            len(raw_value.encode("utf-8")) > MAX_INPUT_VALUE_BYTES
-            or _CONTROL_RE.search(raw_value)
+            not isinstance(item, str)
+            or len(item.encode()) > 4096
+            or _CONTROL_RE.search(item)
         ):
-            raise WorkflowDispatchContractError(
-                "inputs_invalid",
-                "workflow input value is unbounded or contains controls",
+            raise DispatchError(
+                "inputs_invalid", "workflow input values must be bounded strings"
             )
-        if _looks_sensitive_value(raw_value):
-            raise WorkflowDispatchContractError(
+        if _SECRET_RE.search(item) or (
+            callable(redactor) and redactor(item) != item
+        ):
+            raise DispatchError(
                 "secret_input_rejected",
                 "workflow input value resembles secret material",
             )
-        normalized[raw_key] = raw_value
-        total_bytes += len(raw_key.encode("utf-8")) + len(raw_value.encode("utf-8"))
-    if total_bytes > MAX_INPUT_BYTES:
-        raise WorkflowDispatchContractError(
-            "inputs_invalid", "workflow inputs exceed the byte bound"
-        )
-    ordered = dict(sorted(normalized.items()))
-    metadata = {
-        "count": len(ordered),
-        "keys": sorted(ordered),
-        "bytes": total_bytes,
-        "sha256": _sha256_json(ordered),
+        normalized[key] = item
+        total += len(key.encode()) + len(item.encode())
+    if total > MAX_INPUT_BYTES:
+        raise DispatchError("inputs_invalid", "workflow inputs exceed the byte bound")
+    normalized = dict(sorted(normalized.items()))
+    return normalized, {
+        "count": len(normalized),
+        "keys": sorted(normalized),
+        "bytes": total,
+        "sha256": _digest(normalized),
         "values_persisted": False,
     }
-    return ordered, metadata
 
 
-def _operator_identity() -> dict[str, Any]:
-    hostname = socket.gethostname()
-    trusted_predicate = getattr(operator, "_trusted_owner_mode", None)
-    trusted = bool(trusted_predicate()) if callable(trusted_predicate) else False
-    return {
-        "kind": "grabowski_operator_process",
-        "uid": os.geteuid(),
-        "pid": os.getpid(),
-        "hostname_sha256": hashlib.sha256(hostname.encode("utf-8")).hexdigest(),
-        "profile": "trusted_owner" if trusted else "operator",
-    }
-
-
-def _state_root(value: Path | None = None) -> Path:
-    if value is not None:
-        root = value
-    else:
-        configured = os.environ.get(STATE_DIR_ENV)
-        root = Path(configured).expanduser() if configured else DEFAULT_STATE_DIR
+def _state_root(override: Path | None) -> Path:
+    root = override or Path(os.environ.get(STATE_DIR_ENV, DEFAULT_STATE_DIR)).expanduser()
     if not root.is_absolute():
-        raise WorkflowDispatchContractError(
-            "receipt_store_invalid", "receipt state root must be absolute"
-        )
+        raise DispatchError("receipt_store_invalid", "state root must be absolute")
     return root
 
 
-def _ensure_private_directory(path: Path) -> Path:
+def _private_dir(path: Path) -> Path:
     if path.exists() and path.is_symlink():
-        raise WorkflowDispatchContractError(
-            "receipt_store_invalid", "receipt directory may not be a symlink"
+        raise DispatchError(
+            "receipt_store_invalid", "state directory may not be a symlink"
         )
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata = path.lstat()
+    info = path.lstat()
     if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o700
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
     ):
-        raise WorkflowDispatchContractError(
-            "receipt_store_invalid",
-            "receipt directory is not private and owner-controlled",
+        raise DispatchError(
+            "receipt_store_invalid", "state directory is not private"
         )
     return path
 
 
-def _request_directory(root: Path, request_sha256: str) -> Path:
-    return _ensure_private_directory(_ensure_private_directory(root) / request_sha256)
-
-
 @contextmanager
-def _request_lock(directory: Path) -> Iterator[None]:
-    path = directory / ".lock"
-    descriptor = os.open(
-        path,
+def _lock(directory: Path) -> Iterator[None]:
+    fd = os.open(
+        directory / ".lock",
         os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
         0o600,
     )
     try:
-        metadata = os.fstat(descriptor)
+        info = os.fstat(fd)
         if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o600
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
         ):
-            raise WorkflowDispatchContractError(
-                "receipt_store_invalid",
-                "request lock is not private and owner-controlled",
+            raise DispatchError(
+                "receipt_store_invalid", "request lock is not private"
             )
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-
-
-def _receipt_unsigned(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in receipt.items()
-        if key not in {"receipt_sha256", "receipt_path"}
-    }
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _write_receipt(directory: Path, receipt: dict[str, Any]) -> dict[str, Any]:
-    unsigned = _receipt_unsigned(receipt)
-    finalized = dict(unsigned)
-    finalized["receipt_sha256"] = _sha256_json(unsigned)
-    encoded = _canonical_json_bytes(finalized) + b"\n"
-    if len(encoded) > MAX_RECEIPT_BYTES:
-        raise WorkflowDispatchContractError(
-            "receipt_too_large", "dispatch receipt exceeds size bound"
-        )
-    target = directory / f"{time.time_ns()}-{uuid.uuid4().hex}.json"
-    descriptor = os.open(
-        target,
+    unsigned = {
+        key: item
+        for key, item in receipt.items()
+        if key not in {"receipt_sha256", "receipt_path"}
+    }
+    stored = {**unsigned, "receipt_sha256": _digest(unsigned)}
+    data = _json_bytes(stored) + b"\n"
+    if len(data) > MAX_RECEIPT_BYTES:
+        raise DispatchError("receipt_too_large", "receipt exceeds size bound")
+    path = directory / f"{time.time_ns()}-{uuid.uuid4().hex}.json"
+    fd = os.open(
+        path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
         0o600,
     )
     try:
-        os.write(descriptor, encoded)
-        os.fsync(descriptor)
+        os.write(fd, data)
+        os.fsync(fd)
     finally:
-        os.close(descriptor)
+        os.close(fd)
     directory_fd = os.open(
         directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     )
@@ -357,52 +269,42 @@ def _write_receipt(directory: Path, receipt: dict[str, Any]) -> dict[str, Any]:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-    return {**finalized, "receipt_path": str(target)}
+    return {**stored, "receipt_path": str(path)}
 
 
-def _read_prior_receipts(directory: Path) -> list[dict[str, Any]]:
-    receipts: list[dict[str, Any]] = []
-    try:
-        entries = sorted(directory.iterdir(), key=lambda item: item.name)
-    except FileNotFoundError:
-        return []
-    for path in entries[-64:]:
-        if path.suffix != ".json" or path.is_symlink():
-            continue
+def _prior_receipts(directory: Path) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("*.json"))[-64:]:
         try:
-            metadata = path.lstat()
+            info = path.lstat()
             if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-                or metadata.st_size > MAX_RECEIPT_BYTES
+                path.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > MAX_RECEIPT_BYTES
             ):
                 continue
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                continue
-            stored_sha = payload.get("receipt_sha256")
-            unsigned = {
-                key: value
-                for key, value in payload.items()
-                if key != "receipt_sha256"
-            }
-            if not isinstance(stored_sha, str) or stored_sha != _sha256_json(unsigned):
-                continue
+            payload = json.loads(path.read_text())
+            stored = payload.pop("receipt_sha256", None)
             if (
-                payload.get("schema_version") != SCHEMA_VERSION
-                or payload.get("kind") != RECEIPT_KIND
+                payload.get("kind") == RECEIPT_KIND
+                and payload.get("schema_version") == SCHEMA_VERSION
+                and stored == _digest(payload)
             ):
-                continue
-            receipts.append({**payload, "receipt_path": str(path)})
+                result.append(
+                    {
+                        **payload,
+                        "receipt_sha256": stored,
+                        "receipt_path": str(path),
+                    }
+                )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-    return receipts
+    return result
 
 
-def _latest_unresolved_ambiguous(
-    receipts: list[dict[str, Any]],
-) -> dict[str, Any] | None:
+def _unresolved(receipts: list[dict[str, Any]]) -> dict[str, Any] | None:
     for receipt in reversed(receipts):
         if (
             receipt.get("effect_state") == "unknown"
@@ -417,45 +319,32 @@ def _latest_unresolved_ambiguous(
 
 
 def _http_status(result: Mapping[str, Any]) -> int | None:
-    for field in ("stderr", "stdout"):
-        value = result.get(field)
-        if isinstance(value, str):
-            match = _HTTP_STATUS_RE.search(value)
-            if match:
-                return int(match.group(1))
-    return None
+    text = f"{result.get('stderr', '')}\n{result.get('stdout', '')}"
+    match = _HTTP_RE.search(text)
+    return int(match.group(1)) if match else None
 
 
-def _runner_result(runner: GitHubRunner, args: list[str]) -> dict[str, Any]:
+def _call(runner: GithubRunner, args: list[str]) -> dict[str, Any]:
     try:
         result = runner(args)
+        return (
+            result
+            if isinstance(result, dict)
+            else {"runner_exception": "invalid_result"}
+        )
     except Exception as exc:
-        return {
-            "returncode": None,
-            "timed_out": False,
-            "stdout": "",
-            "stderr": "",
-            "runner_exception": type(exc).__name__,
-        }
-    if not isinstance(result, dict):
-        return {
-            "returncode": None,
-            "timed_out": False,
-            "stdout": "",
-            "stderr": "",
-            "runner_exception": "invalid_runner_result",
-        }
-    return result
+        return {"runner_exception": type(exc).__name__}
 
 
 def _gh_json(
-    runner: GitHubRunner,
-    args: list[str],
+    runner: GithubRunner,
+    endpoint: str,
+    jq: str,
     *,
     phase: str,
-    not_found_code: str,
+    not_found: str,
 ) -> tuple[Any | None, dict[str, Any] | None]:
-    result = _runner_result(runner, args)
+    result = _call(runner, ["api", endpoint, "--jq", jq])
     status = _http_status(result)
     if result.get("timed_out") is True or result.get("runner_exception"):
         return None, {
@@ -464,29 +353,23 @@ def _gh_json(
             "http_status": status,
         }
     if result.get("returncode") != 0:
-        if status in {401, 403}:
-            code = "github_auth_or_permission"
-        elif status == 404:
-            code = not_found_code
-        elif status == 422:
-            code = f"{phase}_invalid"
-        else:
-            code = f"{phase}_github_error"
+        code = (
+            "github_auth_or_permission"
+            if status in {401, 403}
+            else not_found
+            if status == 404
+            else f"{phase}_invalid"
+            if status == 422
+            else f"{phase}_github_error"
+        )
         return None, {
             "result_code": code,
             "effect_state": "not_started",
             "http_status": status,
         }
-    stdout = result.get("stdout")
-    if not isinstance(stdout, str):
-        return None, {
-            "result_code": f"{phase}_response_invalid",
-            "effect_state": "not_started",
-            "http_status": status,
-        }
     try:
-        return json.loads(stdout), None
-    except json.JSONDecodeError:
+        return json.loads(result.get("stdout", "")), None
+    except (TypeError, json.JSONDecodeError):
         return None, {
             "result_code": f"{phase}_response_invalid",
             "effect_state": "not_started",
@@ -494,191 +377,126 @@ def _gh_json(
         }
 
 
-def _repository_preflight(
-    runner: GitHubRunner, repository: str
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    payload, error = _gh_json(
-        runner,
-        [
-            "api",
-            f"repos/{repository}",
-            "--jq",
-            '{"full_name":.full_name,"archived":.archived,"disabled":.disabled,"default_branch":.default_branch}',
-        ],
-        phase="repository_preflight",
-        not_found_code="repository_not_found",
-    )
-    if error:
-        return None, error
-    if (
-        not isinstance(payload, dict)
-        or payload.get("full_name") != repository
-        or not isinstance(payload.get("archived"), bool)
-        or not isinstance(payload.get("disabled"), bool)
-        or not isinstance(payload.get("default_branch"), str)
-    ):
-        return None, {
-            "result_code": "repository_response_invalid",
-            "effect_state": "not_started",
-        }
-    if payload["archived"] or payload["disabled"]:
-        return None, {
-            "result_code": "repository_inactive",
-            "effect_state": "not_started",
-        }
-    return payload, None
-
-
-def _workflow_preflight(
-    runner: GitHubRunner,
+def _preflight(
+    runner: GithubRunner,
     repository: str,
     workflow_kind: str,
     workflow_selector: str,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    api_identifier = (
+    ref: str,
+) -> tuple[dict[str, Any] | None, str | None, dict[str, Any] | None]:
+    repo, error = _gh_json(
+        runner,
+        f"repos/{repository}",
+        '{"full_name":.full_name,"archived":.archived,"disabled":.disabled}',
+        phase="repository_preflight",
+        not_found="repository_not_found",
+    )
+    if error:
+        return None, None, error
+    if (
+        not isinstance(repo, dict)
+        or repo.get("full_name") != repository
+        or not isinstance(repo.get("archived"), bool)
+        or not isinstance(repo.get("disabled"), bool)
+    ):
+        return None, None, {
+            "result_code": "repository_response_invalid",
+            "effect_state": "not_started",
+        }
+    if repo["archived"] or repo["disabled"]:
+        return None, None, {
+            "result_code": "repository_inactive",
+            "effect_state": "not_started",
+        }
+
+    identifier = (
         workflow_selector
         if workflow_kind == "id"
         else workflow_selector.rsplit("/", 1)[-1]
     )
-    payload, error = _gh_json(
+    workflow, error = _gh_json(
         runner,
-        [
-            "api",
-            f"repos/{repository}/actions/workflows/{quote(api_identifier, safe='')}",
-            "--jq",
-            '{"id":.id,"name":.name,"path":.path,"state":.state}',
-        ],
+        f"repos/{repository}/actions/workflows/{quote(identifier, safe='')}",
+        '{"id":.id,"name":.name,"path":.path,"state":.state}',
         phase="workflow_preflight",
-        not_found_code="workflow_not_found",
+        not_found="workflow_not_found",
     )
     if error:
-        return None, error
+        return None, None, error
     if (
-        not isinstance(payload, dict)
-        or isinstance(payload.get("id"), bool)
-        or not isinstance(payload.get("id"), int)
-        or payload["id"] < 1
-        or not isinstance(payload.get("path"), str)
-        or not isinstance(payload.get("state"), str)
+        not isinstance(workflow, dict)
+        or not isinstance(workflow.get("id"), int)
+        or isinstance(workflow.get("id"), bool)
+        or workflow["id"] < 1
+        or not isinstance(workflow.get("path"), str)
+        or not isinstance(workflow.get("state"), str)
     ):
-        return None, {
+        return None, None, {
             "result_code": "workflow_response_invalid",
             "effect_state": "not_started",
         }
-    if payload["state"] != "active":
-        return None, {
+    if workflow["state"] != "active":
+        return None, None, {
             "result_code": "workflow_inactive",
             "effect_state": "not_started",
         }
-    if workflow_kind == "id" and str(payload["id"]) != workflow_selector:
-        return None, {
+    if (
+        workflow_kind == "id"
+        and str(workflow["id"]) != workflow_selector
+    ) or (
+        workflow_kind == "path"
+        and workflow.get("path") != workflow_selector
+    ):
+        return None, None, {
             "result_code": "workflow_identity_mismatch",
             "effect_state": "not_started",
         }
-    if workflow_kind == "path" and payload["path"] != workflow_selector:
-        return None, {
-            "result_code": "workflow_identity_mismatch",
-            "effect_state": "not_started",
-        }
-    return payload, None
 
-
-def _ref_preflight(
-    runner: GitHubRunner, repository: str, ref: str
-) -> tuple[str | None, dict[str, Any] | None]:
-    payload, error = _gh_json(
+    commit, error = _gh_json(
         runner,
-        [
-            "api",
-            f"repos/{repository}/commits/{quote(ref, safe='')}",
-            "--jq",
-            '{"sha":.sha}',
-        ],
+        f"repos/{repository}/commits/{quote(ref, safe='')}",
+        '{"sha":.sha}',
         phase="ref_preflight",
-        not_found_code="ref_not_found",
+        not_found="ref_not_found",
     )
     if error:
-        return None, error
-    sha = payload.get("sha") if isinstance(payload, dict) else None
-    if not isinstance(sha, str) or _SHA40_RE.fullmatch(sha) is None:
-        return None, {
+        return None, None, error
+    sha = commit.get("sha") if isinstance(commit, dict) else None
+    if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
+        return None, None, {
             "result_code": "ref_response_invalid",
             "effect_state": "not_started",
         }
-    return sha, None
+    return workflow, sha, None
 
 
-def _parse_created_at(value: Any) -> float | None:
-    if not isinstance(value, str) or not value:
+def _created_at(value: Any) -> float | None:
+    if not isinstance(value, str):
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
 
 
-def _normalize_run(
-    raw: Mapping[str, Any], workflow_path: str
-) -> dict[str, Any] | None:
-    run_id = raw.get("id")
-    workflow_id = raw.get("workflow_id")
-    head_sha = raw.get("head_sha")
-    created_at = raw.get("created_at")
-    if (
-        isinstance(run_id, bool)
-        or not isinstance(run_id, int)
-        or run_id < 1
-        or isinstance(workflow_id, bool)
-        or not isinstance(workflow_id, int)
-        or workflow_id < 1
-        or raw.get("event") != "workflow_dispatch"
-        or not isinstance(head_sha, str)
-        or _SHA40_RE.fullmatch(head_sha) is None
-        or _parse_created_at(created_at) is None
-    ):
-        return None
-    return {
-        "run_id": run_id,
-        "workflow_id": workflow_id,
-        "workflow_path": workflow_path,
-        "event": "workflow_dispatch",
-        "head_sha": head_sha,
-        "head_branch": raw.get("head_branch"),
-        "status": raw.get("status"),
-        "conclusion": raw.get("conclusion"),
-        "url": raw.get("html_url"),
-        "created_at": created_at,
-        "updated_at": raw.get("updated_at"),
-        "run_attempt": raw.get("run_attempt"),
-        "run_number": raw.get("run_number"),
-    }
-
-
-def _workflow_runs(
-    runner: GitHubRunner,
+def _runs(
+    runner: GithubRunner,
     repository: str,
     workflow_id: int,
     workflow_path: str,
 ) -> tuple[list[dict[str, Any]] | None, dict[str, Any] | None]:
     jq = (
-        '{"workflow_runs":[.workflow_runs[]|'
-        '{id:.id,workflow_id:.workflow_id,event:.event,head_sha:.head_sha,'
-        'head_branch:.head_branch,status:.status,conclusion:.conclusion,html_url:.html_url,'
-        'created_at:.created_at,updated_at:.updated_at,run_attempt:.run_attempt,run_number:.run_number}]}'
+        '{"workflow_runs":[.workflow_runs[]|{id:.id,workflow_id:.workflow_id,'
+        'event:.event,head_sha:.head_sha,head_branch:.head_branch,status:.status,'
+        'conclusion:.conclusion,html_url:.html_url,created_at:.created_at,'
+        'updated_at:.updated_at,run_attempt:.run_attempt,run_number:.run_number}]}'
     )
     payload, error = _gh_json(
         runner,
-        [
-            "api",
-            f"repos/{repository}/actions/workflows/{workflow_id}/runs?event=workflow_dispatch&per_page=100",
-            "--jq",
-            jq,
-        ],
+        f"repos/{repository}/actions/workflows/{workflow_id}/runs?event=workflow_dispatch&per_page=100",
+        jq,
         phase="run_readback",
-        not_found_code="workflow_not_found",
+        not_found="workflow_not_found",
     )
     if error:
         return None, error
@@ -690,110 +508,100 @@ def _workflow_runs(
         }
     normalized: list[dict[str, Any]] = []
     for row in rows:
-        if not isinstance(row, Mapping):
+        if (
+            not isinstance(row, Mapping)
+            or row.get("event") != "workflow_dispatch"
+            or not isinstance(row.get("id"), int)
+            or isinstance(row.get("id"), bool)
+            or not isinstance(row.get("workflow_id"), int)
+            or isinstance(row.get("workflow_id"), bool)
+            or not isinstance(row.get("head_sha"), str)
+            or not _SHA_RE.fullmatch(row["head_sha"])
+            or _created_at(row.get("created_at")) is None
+        ):
             return None, {
                 "result_code": "run_readback_response_invalid",
                 "effect_state": "not_started",
             }
-        run = _normalize_run(row, workflow_path)
-        if run is None:
-            return None, {
-                "result_code": "run_readback_response_invalid",
-                "effect_state": "not_started",
+        normalized.append(
+            {
+                "run_id": row["id"],
+                "workflow_id": row["workflow_id"],
+                "workflow_path": workflow_path,
+                "event": "workflow_dispatch",
+                "head_sha": row["head_sha"],
+                "head_branch": row.get("head_branch"),
+                "status": row.get("status"),
+                "conclusion": row.get("conclusion"),
+                "url": row.get("html_url"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "run_attempt": row.get("run_attempt"),
+                "run_number": row.get("run_number"),
             }
-        normalized.append(run)
+        )
     return normalized, None
 
 
-def _new_matching_runs(
-    runs: list[dict[str, Any]],
-    *,
-    workflow_id: int,
-    head_sha: str,
-    baseline_ids: set[int],
-    attempted_at_unix: float,
-    now_unix: float,
-) -> list[dict[str, Any]]:
-    lower = attempted_at_unix - RUN_CREATED_SKEW_SECONDS
-    upper = now_unix + RUN_CREATED_FUTURE_SECONDS
-    matches: list[dict[str, Any]] = []
-    for run in runs:
-        created = _parse_created_at(run.get("created_at"))
-        if (
-            run.get("workflow_id") == workflow_id
-            and run.get("head_sha") == head_sha
-            and run.get("event") == "workflow_dispatch"
-            and run.get("run_id") not in baseline_ids
-            and created is not None
-            and lower <= created <= upper
-        ):
-            matches.append(run)
-    return sorted(matches, key=lambda item: int(item["run_id"]))
-
-
-def _readback_new_run(
-    runner: GitHubRunner,
+def _readback(
+    runner: GithubRunner,
     *,
     repository: str,
     workflow_id: int,
     workflow_path: str,
-    head_sha: str,
-    baseline_ids: set[int],
-    attempted_at_unix: float,
+    head: str,
+    baseline: set[int],
+    attempted_at: float,
     attempts: int,
     sleep: Sleep,
     time_fn: TimeFn,
 ) -> tuple[dict[str, Any] | None, str, dict[str, Any] | None]:
-    for attempt in range(max(1, attempts)):
-        runs, error = _workflow_runs(
-            runner, repository, workflow_id, workflow_path
-        )
+    for index in range(max(1, attempts)):
+        rows, error = _runs(runner, repository, workflow_id, workflow_path)
         if error:
-            return None, "run_readback_failed", error
-        assert runs is not None
-        matches = _new_matching_runs(
-            runs,
-            workflow_id=workflow_id,
-            head_sha=head_sha,
-            baseline_ids=baseline_ids,
-            attempted_at_unix=attempted_at_unix,
-            now_unix=time_fn(),
-        )
+            return None, "failed", error
+        assert rows is not None
+        lower = attempted_at - RUN_SKEW_SECONDS
+        upper = time_fn() + RUN_FUTURE_SECONDS
+        matches = []
+        for run in rows:
+            created = _created_at(run["created_at"])
+            if (
+                run["workflow_id"] == workflow_id
+                and run["head_sha"] == head
+                and run["run_id"] not in baseline
+                and created is not None
+                and lower <= created <= upper
+            ):
+                matches.append(run)
         if len(matches) == 1:
             return matches[0], "unique", None
         if len(matches) > 1:
             return None, "ambiguous", None
-        if attempt + 1 < attempts:
-            sleep(RUN_POLL_INTERVAL_SECONDS)
+        if index + 1 < attempts:
+            sleep(POLL_SECONDS)
     return None, "missing", None
 
 
-def _dispatch_post(
-    runner: GitHubRunner,
-    *,
+def _post(
+    runner: GithubRunner,
+    directory: Path,
     repository: str,
     workflow_id: int,
     ref: str,
     inputs: dict[str, str],
-    request_directory: Path,
 ) -> tuple[str, int | None]:
-    descriptor, temp_name = tempfile.mkstemp(
-        prefix="dispatch-body-",
-        suffix=".json",
-        dir=request_directory,
-        text=False,
+    fd, raw_path = tempfile.mkstemp(
+        prefix="dispatch-", suffix=".json", dir=directory
     )
-    temp_path = Path(temp_name)
+    path = Path(raw_path)
     try:
-        os.fchmod(descriptor, 0o600)
-        os.write(
-            descriptor,
-            _canonical_json_bytes({"ref": ref, "inputs": inputs}),
-        )
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        result = _runner_result(
+        os.fchmod(fd, 0o600)
+        os.write(fd, _json_bytes({"ref": ref, "inputs": inputs}))
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        result = _call(
             runner,
             [
                 "api",
@@ -801,16 +609,13 @@ def _dispatch_post(
                 "POST",
                 f"repos/{repository}/actions/workflows/{workflow_id}/dispatches",
                 "--input",
-                str(temp_path),
+                str(path),
             ],
         )
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if fd >= 0:
+            os.close(fd)
+        path.unlink(missing_ok=True)
     status = _http_status(result)
     if result.get("timed_out") is True or result.get("runner_exception"):
         return "unknown", status
@@ -825,22 +630,30 @@ def _dispatch_post(
     return "unknown", status
 
 
-def _base_receipt(
-    *,
-    request_sha256: str,
+def _receipt(
+    request_sha: str,
     repository: str,
     workflow_kind: str,
     workflow_selector: str,
     ref: str,
     expected_head: str | None,
-    inputs_metadata: dict[str, Any],
-    started_at_unix: float,
+    inputs_meta: dict[str, Any],
+    started: float,
 ) -> dict[str, Any]:
+    trusted = getattr(operator, "_trusted_owner_mode", lambda: False)()
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": RECEIPT_KIND,
-        "request_sha256": request_sha256,
-        "operator_identity": _operator_identity(),
+        "request_sha256": request_sha,
+        "operator_identity": {
+            "kind": "grabowski_operator_process",
+            "uid": os.geteuid(),
+            "pid": os.getpid(),
+            "hostname_sha256": hashlib.sha256(
+                socket.gethostname().encode()
+            ).hexdigest(),
+            "profile": "trusted_owner" if trusted else "operator",
+        },
         "repository": repository,
         "workflow_requested": {
             "kind": workflow_kind,
@@ -850,9 +663,9 @@ def _base_receipt(
         "ref": ref,
         "expected_head": expected_head,
         "observed_head": None,
-        "inputs": inputs_metadata,
+        "inputs": inputs_meta,
         "baseline_run_ids": [],
-        "started_at_unix": started_at_unix,
+        "started_at_unix": started,
         "dispatch_attempted_at_unix": None,
         "completed_at_unix": None,
         "result_code": None,
@@ -872,29 +685,34 @@ def _base_receipt(
 def _finish(
     directory: Path,
     receipt: dict[str, Any],
+    code: str,
+    effect: str,
+    now: float,
     *,
-    result_code: str,
-    effect_state: str,
-    completed_at_unix: float,
-    http_status: int | None = None,
+    status: int | None = None,
     run: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    receipt = {
-        **receipt,
-        "result_code": result_code,
-        "effect_state": effect_state,
-        "http_status": http_status,
-        "run": run,
-        "completed_at_unix": completed_at_unix,
+    stored = _write_receipt(
+        directory,
+        {
+            **receipt,
+            "result_code": code,
+            "effect_state": effect,
+            "http_status": status,
+            "run": run,
+            "completed_at_unix": now,
+        },
+    )
+    ok = code in {
+        "dispatch_accepted",
+        "dispatch_recovered_after_ambiguous_transport",
     }
-    stored = _write_receipt(directory, receipt)
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": RESULT_KIND,
-        "ok": result_code
-        in {"dispatch_accepted", "dispatch_recovered_after_ambiguous_transport"},
-        "result_code": result_code,
-        "effect_state": effect_state,
+        "ok": ok,
+        "result_code": code,
+        "effect_state": effect,
         "repository": receipt["repository"],
         "workflow": receipt["workflow_resolved"] or receipt["workflow_requested"],
         "ref": receipt["ref"],
@@ -907,19 +725,7 @@ def _finish(
             "sha256": stored["receipt_sha256"],
         },
         "retry_authorized": False,
-        "authoritative_readback_required": effect_state == "unknown",
-    }
-
-
-def _contract_error_result(exc: WorkflowDispatchContractError) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "kind": RESULT_KIND,
-        "ok": False,
-        "result_code": exc.code,
-        "effect_state": "not_started",
-        "retry_authorized": False,
-        "authoritative_readback_required": False,
+        "authoritative_readback_required": effect == "unknown",
     }
 
 
@@ -930,19 +736,19 @@ def dispatch_workflow(
     inputs: Mapping[str, str] | None = None,
     expected_head: str | None = None,
     *,
-    runner: GitHubRunner,
+    runner: GithubRunner,
     state_root: Path | None = None,
     sleep: Sleep = time.sleep,
     time_fn: TimeFn = time.time,
-    poll_attempts: int = RUN_POLL_ATTEMPTS,
+    poll_attempts: int = POLL_ATTEMPTS,
 ) -> dict[str, Any]:
     try:
         repository = _normalize_repository(repository)
         workflow_kind, workflow_selector = _normalize_workflow(workflow)
         ref = _normalize_ref(ref)
-        expected_head = _normalize_expected_head(expected_head)
-        normalized_inputs, inputs_metadata = _normalize_inputs(inputs)
-        request_sha256 = _sha256_json(
+        expected_head = _normalize_head(expected_head)
+        normalized_inputs, inputs_meta = _normalize_inputs(inputs)
+        request_sha = _digest(
             {
                 "repository": repository,
                 "workflow": {
@@ -951,274 +757,241 @@ def dispatch_workflow(
                 },
                 "ref": ref,
                 "expected_head": expected_head,
-                "inputs_sha256": inputs_metadata["sha256"],
+                "inputs_sha256": inputs_meta["sha256"],
             }
         )
-        directory = _request_directory(_state_root(state_root), request_sha256)
-    except WorkflowDispatchContractError as exc:
-        return _contract_error_result(exc)
-
-    with _request_lock(directory):
-        started_at = time_fn()
-        receipt = _base_receipt(
-            request_sha256=request_sha256,
-            repository=repository,
-            workflow_kind=workflow_kind,
-            workflow_selector=workflow_selector,
-            ref=ref,
-            expected_head=expected_head,
-            inputs_metadata=inputs_metadata,
-            started_at_unix=started_at,
+        directory = _private_dir(
+            _private_dir(_state_root(state_root)) / request_sha
         )
+    except DispatchError as exc:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": RESULT_KIND,
+            "ok": False,
+            "result_code": exc.code,
+            "effect_state": "not_started",
+            "retry_authorized": False,
+            "authoritative_readback_required": False,
+        }
 
-        _repository, error = _repository_preflight(runner, repository)
-        if error:
-            return _finish(
-                directory,
-                receipt,
-                result_code=error["result_code"],
-                effect_state=error["effect_state"],
-                completed_at_unix=time_fn(),
-                http_status=error.get("http_status"),
-            )
-
-        workflow_info, error = _workflow_preflight(
-            runner, repository, workflow_kind, workflow_selector
+    with _lock(directory):
+        receipt = _receipt(
+            request_sha,
+            repository,
+            workflow_kind,
+            workflow_selector,
+            ref,
+            expected_head,
+            inputs_meta,
+            time_fn(),
+        )
+        workflow_info, head, error = _preflight(
+            runner, repository, workflow_kind, workflow_selector, ref
         )
         if error:
             return _finish(
                 directory,
                 receipt,
-                result_code=error["result_code"],
-                effect_state=error["effect_state"],
-                completed_at_unix=time_fn(),
-                http_status=error.get("http_status"),
+                error["result_code"],
+                error["effect_state"],
+                time_fn(),
+                status=error.get("http_status"),
             )
-        assert workflow_info is not None
+        assert workflow_info is not None and head is not None
         receipt["workflow_resolved"] = {
             "id": workflow_info["id"],
             "path": workflow_info["path"],
             "name": workflow_info.get("name"),
             "state": workflow_info["state"],
         }
-
-        observed_head, error = _ref_preflight(runner, repository, ref)
-        if error:
+        receipt["observed_head"] = head
+        if expected_head is not None and head != expected_head:
             return _finish(
                 directory,
                 receipt,
-                result_code=error["result_code"],
-                effect_state=error["effect_state"],
-                completed_at_unix=time_fn(),
-                http_status=error.get("http_status"),
-            )
-        assert observed_head is not None
-        receipt["observed_head"] = observed_head
-        if expected_head is not None and observed_head != expected_head:
-            return _finish(
-                directory,
-                receipt,
-                result_code="ref_head_drift",
-                effect_state="not_started",
-                completed_at_unix=time_fn(),
+                "ref_head_drift",
+                "not_started",
+                time_fn(),
             )
 
-        runs, error = _workflow_runs(
+        rows, error = _runs(
             runner,
             repository,
-            int(workflow_info["id"]),
-            str(workflow_info["path"]),
+            workflow_info["id"],
+            workflow_info["path"],
         )
         if error:
             return _finish(
                 directory,
                 receipt,
-                result_code=error["result_code"],
-                effect_state="not_started",
-                completed_at_unix=time_fn(),
-                http_status=error.get("http_status"),
+                error["result_code"],
+                "not_started",
+                time_fn(),
+                status=error.get("http_status"),
             )
-        assert runs is not None
-        baseline_ids = {
-            int(run["run_id"])
-            for run in runs
-            if run.get("workflow_id") == workflow_info["id"]
-            and run.get("head_sha") == observed_head
-            and run.get("event") == "workflow_dispatch"
+        assert rows is not None
+        baseline = {
+            run["run_id"]
+            for run in rows
+            if run["workflow_id"] == workflow_info["id"]
+            and run["head_sha"] == head
         }
-        receipt["baseline_run_ids"] = sorted(baseline_ids)
+        receipt["baseline_run_ids"] = sorted(baseline)
 
-        prior = _latest_unresolved_ambiguous(_read_prior_receipts(directory))
+        prior = _unresolved(_prior_receipts(directory))
         if prior is not None:
-            if prior.get("observed_head") != observed_head:
+            prior_baseline = prior.get("baseline_run_ids")
+            attempted = prior.get("dispatch_attempted_at_unix")
+            if prior.get("observed_head") != head:
                 return _finish(
                     directory,
                     receipt,
-                    result_code="prior_ambiguous_ref_drift",
-                    effect_state="unknown",
-                    completed_at_unix=time_fn(),
+                    "prior_ambiguous_ref_drift",
+                    "unknown",
+                    time_fn(),
                 )
-            prior_baseline = prior.get("baseline_run_ids")
-            attempted_at = prior.get("dispatch_attempted_at_unix")
             if (
                 not isinstance(prior_baseline, list)
                 or not all(
-                    isinstance(item, int) and not isinstance(item, bool) and item > 0
+                    isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and item > 0
                     for item in prior_baseline
                 )
-                or not isinstance(attempted_at, (int, float))
-                or isinstance(attempted_at, bool)
+                or not isinstance(attempted, (int, float))
+                or isinstance(attempted, bool)
             ):
                 return _finish(
                     directory,
                     receipt,
-                    result_code="prior_ambiguous_receipt_invalid",
-                    effect_state="unknown",
-                    completed_at_unix=time_fn(),
+                    "prior_ambiguous_receipt_invalid",
+                    "unknown",
+                    time_fn(),
                 )
-            run, state, readback_error = _readback_new_run(
+            run, state, error = _readback(
                 runner,
                 repository=repository,
-                workflow_id=int(workflow_info["id"]),
-                workflow_path=str(workflow_info["path"]),
-                head_sha=observed_head,
-                baseline_ids=set(prior_baseline),
-                attempted_at_unix=float(attempted_at),
+                workflow_id=workflow_info["id"],
+                workflow_path=workflow_info["path"],
+                head=head,
+                baseline=set(prior_baseline),
+                attempted_at=float(attempted),
                 attempts=1,
                 sleep=sleep,
                 time_fn=time_fn,
             )
-            if readback_error:
+            if error:
                 return _finish(
                     directory,
                     receipt,
-                    result_code="prior_ambiguous_readback_failed",
-                    effect_state="unknown",
-                    completed_at_unix=time_fn(),
-                    http_status=readback_error.get("http_status"),
+                    "prior_ambiguous_readback_failed",
+                    "unknown",
+                    time_fn(),
+                    status=error.get("http_status"),
                 )
-            if state == "unique" and run is not None:
+            if state == "unique" and run:
                 return _finish(
                     directory,
                     receipt,
-                    result_code="dispatch_recovered_after_ambiguous_transport",
-                    effect_state="observed",
-                    completed_at_unix=time_fn(),
+                    "dispatch_recovered_after_ambiguous_transport",
+                    "observed",
+                    time_fn(),
                     run=run,
                 )
-            if state == "ambiguous":
-                return _finish(
-                    directory,
-                    receipt,
-                    result_code="prior_ambiguous_multiple_runs",
-                    effect_state="unknown",
-                    completed_at_unix=time_fn(),
-                )
             return _finish(
                 directory,
                 receipt,
-                result_code="prior_ambiguous_outcome_unresolved",
-                effect_state="unknown",
-                completed_at_unix=time_fn(),
+                "prior_ambiguous_multiple_runs"
+                if state == "ambiguous"
+                else "prior_ambiguous_outcome_unresolved",
+                "unknown",
+                time_fn(),
             )
 
-        attempted_at = time_fn()
-        receipt["dispatch_attempted_at_unix"] = attempted_at
-        post_state, http_status = _dispatch_post(
+        attempted = time_fn()
+        receipt["dispatch_attempted_at_unix"] = attempted
+        post, status = _post(
             runner,
-            repository=repository,
-            workflow_id=int(workflow_info["id"]),
-            ref=ref,
-            inputs=normalized_inputs,
-            request_directory=directory,
+            directory,
+            repository,
+            workflow_info["id"],
+            ref,
+            normalized_inputs,
         )
-        if post_state == "auth":
+        terminal = {
+            "auth": "github_auth_or_permission",
+            "not_found": "workflow_or_ref_not_found_at_dispatch",
+            "invalid_inputs": "invalid_workflow_inputs",
+        }
+        if post in terminal:
             return _finish(
                 directory,
                 receipt,
-                result_code="github_auth_or_permission",
-                effect_state="not_started",
-                completed_at_unix=time_fn(),
-                http_status=http_status,
-            )
-        if post_state == "not_found":
-            return _finish(
-                directory,
-                receipt,
-                result_code="workflow_or_ref_not_found_at_dispatch",
-                effect_state="not_started",
-                completed_at_unix=time_fn(),
-                http_status=http_status,
-            )
-        if post_state == "invalid_inputs":
-            return _finish(
-                directory,
-                receipt,
-                result_code="invalid_workflow_inputs",
-                effect_state="not_started",
-                completed_at_unix=time_fn(),
-                http_status=http_status,
+                terminal[post],
+                "not_started",
+                time_fn(),
+                status=status,
             )
 
-        run, readback_state, readback_error = _readback_new_run(
+        run, state, error = _readback(
             runner,
             repository=repository,
-            workflow_id=int(workflow_info["id"]),
-            workflow_path=str(workflow_info["path"]),
-            head_sha=observed_head,
-            baseline_ids=baseline_ids,
-            attempted_at_unix=attempted_at,
-            attempts=poll_attempts if post_state == "accepted" else 1,
+            workflow_id=workflow_info["id"],
+            workflow_path=workflow_info["path"],
+            head=head,
+            baseline=baseline,
+            attempted_at=attempted,
+            attempts=poll_attempts if post == "accepted" else 1,
             sleep=sleep,
             time_fn=time_fn,
         )
-        if readback_error:
-            return _finish(
-                directory,
-                receipt,
-                result_code=(
-                    "accepted_run_readback_failed"
-                    if post_state == "accepted"
-                    else "dispatch_outcome_unknown"
-                ),
-                effect_state="unknown",
-                completed_at_unix=time_fn(),
-                http_status=readback_error.get("http_status"),
+        if error:
+            code = (
+                "accepted_run_readback_failed"
+                if post == "accepted"
+                else "dispatch_outcome_unknown"
             )
-        if readback_state == "unique" and run is not None:
             return _finish(
                 directory,
                 receipt,
-                result_code=(
-                    "dispatch_accepted"
-                    if post_state == "accepted"
-                    else "dispatch_recovered_after_ambiguous_transport"
-                ),
-                effect_state="observed",
-                completed_at_unix=time_fn(),
-                http_status=http_status,
+                code,
+                "unknown",
+                time_fn(),
+                status=error.get("http_status"),
+            )
+        if state == "unique" and run:
+            code = (
+                "dispatch_accepted"
+                if post == "accepted"
+                else "dispatch_recovered_after_ambiguous_transport"
+            )
+            return _finish(
+                directory,
+                receipt,
+                code,
+                "observed",
+                time_fn(),
+                status=status,
                 run=run,
             )
-        if readback_state == "ambiguous":
+        if state == "ambiguous":
             return _finish(
                 directory,
                 receipt,
-                result_code="run_identity_ambiguous",
-                effect_state="unknown",
-                completed_at_unix=time_fn(),
-                http_status=http_status,
+                "run_identity_ambiguous",
+                "unknown",
+                time_fn(),
+                status=status,
             )
         return _finish(
             directory,
             receipt,
-            result_code=(
-                "accepted_run_not_observed"
-                if post_state == "accepted"
-                else "dispatch_outcome_unknown"
-            ),
-            effect_state="unknown",
-            completed_at_unix=time_fn(),
-            http_status=http_status,
+            "accepted_run_not_observed"
+            if post == "accepted"
+            else "dispatch_outcome_unknown",
+            "unknown",
+            time_fn(),
+            status=status,
         )
 
 
@@ -1230,14 +1003,11 @@ def _grip_runner(
     github_runner: grabowski_grips.GithubRunner,
 ) -> dict[str, Any]:
     del spec, command_runner
-    unknown = sorted(set(parameters) - _ALLOWED_GRIP_PARAMETERS)
+    unknown = sorted(set(parameters) - _ALLOWED_PARAMETERS)
     if unknown:
         raise grabowski_grips.GripPreflightError(
-            f"github-workflow-dispatch received unsupported parameters: {unknown}"
+            f"{GRIP_NAME} received unsupported parameters: {unknown}"
         )
-
-    def run_github(arguments: list[str]) -> dict[str, Any]:
-        return github_runner(operator.HOME, arguments)
 
     result = dispatch_workflow(
         parameters.get("repository"),
@@ -1245,26 +1015,22 @@ def _grip_runner(
         parameters.get("ref"),
         inputs=parameters.get("inputs"),
         expected_head=parameters.get("expected_head"),
-        runner=run_github,
+        runner=lambda args: github_runner(operator.HOME, args),
     )
     code = str(result.get("result_code", "unknown"))
-    effect_state = result.get("effect_state")
-    if code == "ref_head_drift":
-        grabowski_grips._check(
-            receipt,
-            "exact-head-fail-closed",
-            "pass",
-            "observed ref head differed; no dispatch was attempted",
+    effect = result.get("effect_state")
+    if parameters.get("expected_head") is not None:
+        passed = (
+            code == "ref_head_drift"
+            or result.get("observed_head") == parameters.get("expected_head")
+            or effect == "not_started"
         )
-    elif parameters.get("expected_head") is not None:
-        exact = result.get("observed_head") == parameters.get("expected_head")
         grabowski_grips._check(
             receipt,
             "exact-head-fail-closed",
-            "pass" if exact or effect_state == "not_started" else "fail",
+            "pass" if passed else "fail",
             code,
         )
-
     if result.get("ok") is True:
         run = result.get("run")
         unique = isinstance(run, dict) and isinstance(run.get("run_id"), int)
@@ -1274,14 +1040,13 @@ def _grip_runner(
             "pass" if unique else "fail",
             str(run.get("run_id")) if isinstance(run, dict) else "missing",
         )
-    elif effect_state == "unknown":
+    elif effect == "unknown":
         grabowski_grips._check(
             receipt,
             "ambiguous-outcome-dedupe",
             "pass",
-            "retry remains unauthorized until authoritative readback resolves the effect",
+            "retry remains unauthorized until authoritative readback",
         )
-
     return {
         **result,
         "receipt_status": "passed" if result.get("ok") is True else "blocked",
@@ -1290,12 +1055,12 @@ def _grip_runner(
     }
 
 
-_GRIP_SPEC = grabowski_grips.GripSpec(
+_SPEC = grabowski_grips.GripSpec(
     name=GRIP_NAME,
     version="1.0",
     summary=(
-        "Dispatch one explicitly named GitHub Actions workflow with fresh target "
-        "resolution, optional exact-head binding, deduplicating readback and a durable receipt."
+        "Dispatch one named GitHub Actions workflow with fresh resolution, optional "
+        "exact-head binding, deduplicating readback and a durable receipt."
     ),
     effect=grabowski_grips.MUTATING,
     required_parameters=("repository", "workflow", "ref", "inputs"),
@@ -1315,14 +1080,10 @@ _GRIP_SPEC = grabowski_grips.GripSpec(
 )
 
 
-def _register_grip() -> None:
-    existing_spec = grabowski_grips.GRIP_SPECS.get(GRIP_NAME)
-    existing_runner = grabowski_grips._RUNNERS.get(RUNNER_NAME)
-    if existing_spec is not None or existing_runner is not None:
-        if existing_spec == _GRIP_SPEC and existing_runner is _grip_runner:
-            return
-        raise RuntimeError("github-workflow-dispatch grip registration collision")
-    grabowski_grips.GRIP_SPECS[GRIP_NAME] = _GRIP_SPEC
+def _register() -> None:
+    if GRIP_NAME in grabowski_grips.GRIP_SPECS or RUNNER_NAME in grabowski_grips._RUNNERS:
+        raise RuntimeError(f"{GRIP_NAME} registration collision")
+    grabowski_grips.GRIP_SPECS[GRIP_NAME] = _SPEC
     grabowski_grips._RUNNERS[RUNNER_NAME] = _grip_runner
     grabowski_grips.GRIP_SURFACE_ALLOWLIST = frozenset(
         {*grabowski_grips.GRIP_SURFACE_ALLOWLIST, GRIP_NAME}
@@ -1332,9 +1093,9 @@ def _register_grip() -> None:
         "one explicit GitHub Actions workflow dispatch"
     )
     grabowski_grips.GRIP_RECOVERY_PATHS_BY_NAME[GRIP_NAME] = (
-        "inspect the nested dispatch receipt and authoritative workflow-run readback; "
-        "if effect_state is unknown, do not dispatch again until the same request is reconciled"
+        "inspect the nested dispatch receipt; unknown effects must be authoritatively "
+        "reconciled before another dispatch"
     )
 
 
-_register_grip()
+_register()
