@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import nullcontext
 import ctypes
 import ctypes.util
@@ -4442,11 +4443,149 @@ def _read_root_owned_public_json(
     return value
 
 
+def _rootbroker_artifact_source_paths(helper_bytes: bytes) -> tuple[Path, ...]:
+    try:
+        source = helper_bytes.decode("utf-8")
+        tree = ast.parse(source, filename="tools/grabowski_rootbroker_cutover.py")
+    except (UnicodeDecodeError, SyntaxError):
+        core.fail(
+            "Rootbroker-Cutover-Manifest ist nicht parsebar",
+            phase="operator-authority-attestation",
+        )
+    artifact_value: ast.AST | None = None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == "ARTIFACTS"
+            for target in node.targets
+        ):
+            if artifact_value is not None:
+                core.fail(
+                    "Rootbroker-Cutover-Manifest definiert ARTIFACTS mehrfach",
+                    phase="operator-authority-attestation",
+                )
+            artifact_value = node.value
+    if not isinstance(artifact_value, (ast.Tuple, ast.List)):
+        core.fail(
+            "Rootbroker-Cutover-Manifest besitzt keine statische ARTIFACTS-Closure",
+            phase="operator-authority-attestation",
+        )
+    result: list[Path] = []
+    seen: set[str] = set()
+    for element in artifact_value.elts:
+        if (
+            not isinstance(element, ast.Call)
+            or not isinstance(element.func, ast.Name)
+            or element.func.id != "Artifact"
+            or not element.args
+            or not isinstance(element.args[0], ast.Constant)
+            or not isinstance(element.args[0].value, str)
+        ):
+            core.fail(
+                "Rootbroker-Cutover-Manifest enthält keine statische Artifact-Quelle",
+                phase="operator-authority-attestation",
+            )
+        raw = element.args[0].value
+        pure = PurePosixPath(raw)
+        if (
+            not raw
+            or "\\" in raw
+            or pure.is_absolute()
+            or pure.as_posix() != raw
+            or any(part in {".", ".."} for part in pure.parts)
+            or raw in seen
+        ):
+            core.fail(
+                "Rootbroker-Cutover-Manifest enthält eine unsichere Artifact-Quelle",
+                phase="operator-authority-attestation",
+                details={"path": raw},
+            )
+        seen.add(raw)
+        result.append(Path(raw))
+    cutover_helper = Path("tools/grabowski_rootbroker_cutover.py")
+    if not result or cutover_helper not in result:
+        core.fail(
+            "Rootbroker-Cutover-Manifest bindet den Cutover-Helper nicht selbst",
+            phase="operator-authority-attestation",
+        )
+    return tuple(result)
+
+
+def _require_compatible_operator_authority_predecessor(
+    repo: Path,
+    *,
+    attested_head: str,
+    expected_head: str,
+) -> None:
+    if re.fullmatch(r"[0-9a-f]{40}", attested_head) is None:
+        core.fail(
+            "Operator-Authority-Attestation Vorgänger-Commit ist ungültig",
+            phase="operator-authority-attestation",
+        )
+    ancestry = core.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            attested_head,
+            expected_head,
+        ],
+        cwd=repo,
+        capture=True,
+        check=False,
+        timeout=core.TIMEOUTS["git"],
+    )
+    if ancestry.returncode != 0:
+        core.fail(
+            "Operator-Authority-Attestation Vorgänger ist kein Ancestor des Ziel-Commits",
+            phase="operator-authority-attestation",
+            details={
+                "attested_head": attested_head,
+                "expected_head": expected_head,
+                "merge_base_returncode": ancestry.returncode,
+            },
+        )
+    cutover_helper = Path("tools/grabowski_rootbroker_cutover.py")
+    attested_helper = core.git_show(repo, attested_head, cutover_helper)
+    target_helper = core.git_show(repo, expected_head, cutover_helper)
+    if attested_helper != target_helper:
+        core.fail(
+            "Operator-Authority-Cutover-Manifest driftet zwischen Attestation und Bootstrap-Ziel",
+            phase="operator-authority-attestation",
+            details={
+                "attested_head": attested_head,
+                "expected_head": expected_head,
+                "path": cutover_helper.as_posix(),
+            },
+        )
+    artifact_paths = _rootbroker_artifact_source_paths(target_helper)
+    compatibility_paths = list(artifact_paths)
+    privileged_actions = Path("config/privileged-actions.example.json")
+    if privileged_actions not in compatibility_paths:
+        compatibility_paths.append(privileged_actions)
+    for relative in compatibility_paths:
+        if core.git_show(repo, attested_head, relative) != core.git_show(
+            repo, expected_head, relative
+        ):
+            core.fail(
+                "Operator-Authority-Vertrag driftet zwischen Attestation und Bootstrap-Ziel",
+                phase="operator-authority-attestation",
+                details={
+                    "attested_head": attested_head,
+                    "expected_head": expected_head,
+                    "path": relative.as_posix(),
+                },
+            )
+
+
 def require_operator_authority_anchored(
     repo: Path,
     expected_head: str,
     *,
     path: Path = OPERATOR_AUTHORITY_ATTESTATION_PATH,
+    allow_compatible_predecessor: bool = False,
 ) -> dict[str, Any]:
     attestation = _read_root_owned_public_json(path)
     required = {
@@ -4466,7 +4605,6 @@ def require_operator_authority_anchored(
         set(attestation) != required
         or attestation.get("schema_version") != 1
         or attestation.get("kind") != "grabowski_operator_authority_attestation"
-        or attestation.get("expected_head") != expected_head
     ):
         core.fail(
             "Operator-Authority-Attestation passt nicht zum Ziel-Commit",
@@ -4475,6 +4613,22 @@ def require_operator_authority_anchored(
                 "expected_head": expected_head,
                 "observed_head": attestation.get("expected_head"),
             },
+        )
+    attested_head = attestation.get("expected_head")
+    if attested_head != expected_head:
+        if not allow_compatible_predecessor or not isinstance(attested_head, str):
+            core.fail(
+                "Operator-Authority-Attestation passt nicht zum Ziel-Commit",
+                phase="operator-authority-attestation",
+                details={
+                    "expected_head": expected_head,
+                    "observed_head": attested_head,
+                },
+            )
+        _require_compatible_operator_authority_predecessor(
+            repo,
+            attested_head=attested_head,
+            expected_head=expected_head,
         )
     self_hash = attestation.get("attestation_sha256")
     unsigned = dict(attestation)
@@ -4606,6 +4760,7 @@ def _preflight_source_topology(
     profile_path: Path,
     *,
     expected_head: str | None = None,
+    allow_compatible_authority_predecessor: bool = False,
 ) -> tuple[core.Snapshot, Path, ProfileTopology]:
     snapshot = core.snapshot_from_git(repo)
     if expected_head is not None and snapshot.repo_head != expected_head:
@@ -4621,7 +4776,11 @@ def _preflight_source_topology(
     topology = profile_topology(profile_path, runtime)
     require_topology_matches_contract(topology, runtime, snapshot.contract)
     if topology.kind == "url":
-        require_operator_authority_anchored(repo, snapshot.repo_head)
+        require_operator_authority_anchored(
+            repo,
+            snapshot.repo_head,
+            allow_compatible_predecessor=allow_compatible_authority_predecessor,
+        )
     return snapshot, runtime, topology
 
 
@@ -4751,7 +4910,11 @@ def preflight_bootstrap_recovery_url(
     dict[str, dict[str, Any]],
 ]:
     snapshot, runtime, topology = _preflight_source_topology(
-        repo, runtime, profile_path, expected_head=expected_head
+        repo,
+        runtime,
+        profile_path,
+        expected_head=expected_head,
+        allow_compatible_authority_predecessor=True,
     )
     predecessor_state, observations = bootstrap_recovery_predecessor_state(topology)
     if predecessor_state == "active":
