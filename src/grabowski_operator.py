@@ -620,13 +620,10 @@ def _transport_roundtrip_exempt_call(
     if grip_name == "transport-roundtrip":
         # The handshake grip must remain exempt to avoid recursive gating.
         return True
-    if not isinstance(grip_name, str):
-        return False
-    spec = grabowski_grips.GRIP_SPECS.get(grip_name)
-    # grip_run is a multiplexed MCP surface. Its outer annotation is mutating,
-    # but the registered grip effect is the authoritative inner contract.
-    # Unknown grips stay fail-closed and continue through the mutation gate.
-    return spec is not None and spec.effect == grabowski_grips.READ_ONLY
+    # Every other grip stays behind the signed one-call boundary. A read-only
+    # grip may still execute child processes, so its effect label alone is not
+    # sufficient authority for transport replay exemption.
+    return False
 
 
 _PROVENANCE_RECOVERY_REPAIR_TOOL = "grabowski_recovery_provenance_repair"

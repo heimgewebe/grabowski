@@ -1648,7 +1648,7 @@ class CentralTransportGateTests(unittest.TestCase):
         self.assertTrue(first_result["called"])
         self.assertTrue(second_result["called"])
 
-    def test_registered_read_only_grip_skips_mutation_roundtrip(self) -> None:
+    def test_registered_read_only_grip_requires_exact_roundtrip(self) -> None:
         operator = self.configured_operator()
         context = types.SimpleNamespace(client_id=None)
         arguments = {
@@ -1657,22 +1657,43 @@ class CentralTransportGateTests(unittest.TestCase):
             "profile": "operator",
             "allow_mutation": False,
         }
-        with mock.patch.object(
-            operator.grabowski_transport_roundtrip,
-            "consume_verified",
-            side_effect=AssertionError("read-only grip reached mutation gate"),
-        ) as consume_verified:
-            result = asyncio.run(
-                operator.mcp._tool_manager.call_tool(
-                    "grip_run", arguments, context
+        with (
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "consume_verified",
+                side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+            ) as consume_verified,
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "begin",
+                return_value={
+                    "state": "challenge_pending",
+                    "challenge_receipt_sha256": "a" * 64,
+                },
+            ),
+            mock.patch.object(operator.base, "_retain_pending_transport_target"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "action=execute"):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "grip_run", arguments, context
+                    )
                 )
-            )
-        self.assertTrue(result["called"])
-        consume_verified.assert_not_called()
+        consume_verified.assert_called_once()
 
     def test_browser_semantic_grip_transport_classification_is_not_widened(self) -> None:
         operator = self.configured_operator()
         self.assertTrue(
+            operator._transport_roundtrip_exempt_call(
+                "grabowski_browser_worker_semantic", {"operation": "observe"}
+            )
+        )
+        self.assertFalse(
+            operator._transport_roundtrip_exempt_call(
+                "grabowski_browser_worker_semantic", {"operation": "act"}
+            )
+        )
+        self.assertFalse(
             operator._transport_roundtrip_exempt_call(
                 "grip_run", {"name": "browser-semantic-observe"}
             )
