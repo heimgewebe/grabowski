@@ -1872,6 +1872,50 @@ def _safe_environment() -> dict[str, str]:
     return environment
 
 
+_GITHUB_PR_VIEW_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GH_CONFIG_DIR",
+        "GH_HOST",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    }
+)
+
+
+def _github_pr_view_environment() -> dict[str, str]:
+    source = _safe_environment()
+    environment = {
+        key: value
+        for key, value in source.items()
+        if key in _GITHUB_PR_VIEW_ENV_ALLOWLIST
+    }
+    # The exemption must not inherit executable-selection knobs.  Keep both
+    # gh and any repository-detection git child inside the verified /usr/bin
+    # parent and force pager selection to the root-owned system `cat`.
+    environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
+    environment["GH_PAGER"] = "cat"
+    environment["PAGER"] = "cat"
+    environment["GIT_PAGER"] = "cat"
+    environment["GH_PROMPT_DISABLED"] = "1"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    return environment
+
+
 def _resolve_cwd(cwd: str | None) -> Path:
     path = HOME if cwd is None else Path(cwd).expanduser()
     resolved = path.resolve(strict=True)
@@ -5725,8 +5769,7 @@ def grabowski_github(
             "timeout_seconds": timeout_seconds,
         }
     ):
-        environment = _safe_environment()
-        environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
+        environment = _github_pr_view_environment()
     return _run(
         command,
         cwd=working_directory,

@@ -972,8 +972,21 @@ class OperatorSignedTransportTests(unittest.TestCase):
             shim = Path(directory) / "gh"
             shim.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
             shim.chmod(0o755)
+            hostile_environment = {
+                "PATH": directory,
+                "GH_FORCE_TTY": "1",
+                "GH_PAGER": str(Path(directory) / "evil-gh-pager"),
+                "PAGER": str(Path(directory) / "evil-pager"),
+                "GIT_PAGER": str(Path(directory) / "evil-git-pager"),
+                "LD_PRELOAD": str(Path(directory) / "evil.so"),
+                "BROWSER": str(Path(directory) / "evil-browser"),
+                "EDITOR": str(Path(directory) / "evil-editor"),
+                "VISUAL": str(Path(directory) / "evil-visual"),
+                "GH_TOKEN": "fixture-token",
+            }
             with (
-                mock.patch.dict(operator.os.environ, {"PATH": directory}, clear=False),
+                mock.patch.dict(operator.os.environ, hostile_environment, clear=False),
+                mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
                 mock.patch.object(operator, "_require_operator_mutation"),
                 mock.patch.object(
                     operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
@@ -993,6 +1006,30 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertNotEqual(command[0], str(shim))
         self.assertEqual(environment["PATH"], "/usr/bin")
         self.assertNotIn(directory, environment["PATH"])
+        self.assertEqual(environment["GH_PAGER"], "cat")
+        self.assertEqual(environment["PAGER"], "cat")
+        self.assertEqual(environment["GIT_PAGER"], "cat")
+        self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
+        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+        for unsafe_key in (
+            "GH_FORCE_TTY",
+            "LD_PRELOAD",
+            "BROWSER",
+            "EDITOR",
+            "VISUAL",
+        ):
+            self.assertNotIn(unsafe_key, environment)
+
+    def test_exempt_github_environment_keeps_untrusted_secret_scrubbing(self) -> None:
+        with (
+            mock.patch.dict(operator.os.environ, {"GH_TOKEN": "fixture-token"}, clear=False),
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=False),
+        ):
+            environment = operator._github_pr_view_environment()
+        self.assertNotIn("GH_TOKEN", environment)
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["GH_PAGER"], "cat")
 
     def test_nonexempt_github_call_keeps_default_child_environment(self) -> None:
         with (
