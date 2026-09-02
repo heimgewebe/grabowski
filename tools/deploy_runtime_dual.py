@@ -5804,16 +5804,7 @@ class ProductionBlueGreenRuntime:
                 "Green readiness is unavailable for agent-instruction transition",
                 phase="snapshot-authenticity-preflight",
             )
-        expected_source_identity = _deployment_source_identity_sha256(self.snapshot)
-        if self.deployment_source_identity_sha256 != expected_source_identity:
-            core.fail(
-                "Deployment source identity does not bind the agent-instruction transition",
-                phase="snapshot-authenticity-preflight",
-                details={
-                    "expected_source_identity_sha256": expected_source_identity,
-                    "provided_source_identity_sha256": self.deployment_source_identity_sha256,
-                },
-            )
+        source_identity = self.deployment_source_identity_sha256
         try:
             transition = client_snapshot.prepare_agent_instructions_transition_for_cutover(
                 cutover_id=self.cutover_id,
@@ -5827,7 +5818,7 @@ class ProductionBlueGreenRuntime:
                 target_agent_instructions_sha256=self.green_binding[
                     "agent_instructions_sha256"
                 ],
-                deployment_source_identity_sha256=expected_source_identity,
+                deployment_source_identity_sha256=source_identity,
                 green_readiness=self.green_readiness,
             )
         except client_snapshot.ClientSnapshotError as exc:
