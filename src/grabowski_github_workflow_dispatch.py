@@ -675,6 +675,8 @@ def _readback(
                 and lower <= created <= upper
             ):
                 matches.append(run)
+        if len(matches) == 0 and candidates:
+            return None, "missing", None
         if len(matches) == 1:
             candidate = matches[0]
             candidates[candidate["run_id"]] = candidate
