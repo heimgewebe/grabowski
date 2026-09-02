@@ -635,7 +635,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def test_operator_prefers_signed_one_call_without_roundtrip(self) -> None:
-        arguments = {"argv": ["true"]}
+        arguments = {"argv": ["touch", "marker"]}
         body = _tool_body(arguments)
         signed = ingress.signed_tool_headers(
             token=SECRET,
@@ -820,7 +820,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(evidence["recovery_preflight"], preflight)
 
     def test_operator_generic_signed_replay_cannot_use_roundtrip_recovery(self) -> None:
-        arguments = {"argv": ["true"]}
+        arguments = {"argv": ["touch", "marker"]}
         tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
         replay_message = "signed one-call transport request was already consumed"
         with (
@@ -887,6 +887,110 @@ class OperatorSignedTransportTests(unittest.TestCase):
         consume_verified.assert_called_once()
         begin.assert_not_called()
 
+    def test_effect_free_multiplexed_reads_are_transport_exempt(self) -> None:
+        safe_calls = [
+            ("grabowski_terminal_run", {"argv": ["sleep", "0"]}),
+            ("grabowski_terminal_run", {"argv": ["date", "+%FT%TZ"]}),
+            ("grabowski_terminal_run", {"argv": ["true"]}),
+            (
+                "grabowski_github",
+                {"arguments": ["pr", "view", "734", "--repo", "heimgewebe/metarepo"]},
+            ),
+            (
+                "grabowski_github",
+                {
+                    "arguments": [
+                        "api",
+                        "repos/heimgewebe/metarepo/commits/main",
+                        "--jq",
+                        ".sha",
+                    ]
+                },
+            ),
+            (
+                "grabowski_github",
+                {
+                    "arguments": [
+                        "api",
+                        "graphql",
+                        "-f",
+                        "query=query { viewer { login } }",
+                    ]
+                },
+            ),
+        ]
+        for tool_name, arguments in safe_calls:
+            with self.subTest(tool_name=tool_name, arguments=arguments):
+                self.assertTrue(
+                    operator._transport_roundtrip_exempt_call(tool_name, arguments)
+                )
+
+    def test_potentially_mutating_multiplexed_calls_stay_transport_gated(self) -> None:
+        unsafe_calls = [
+            ("grabowski_terminal_run", {"argv": ["touch", "marker"]}),
+            ("grabowski_terminal_run", {"argv": ["date", "--set=2030-01-01"]}),
+            ("grabowski_terminal_run", {"argv": ["/tmp/sleep", "1"]}),
+            ("grabowski_github", {"arguments": ["pr", "merge", "734"]}),
+            (
+                "grabowski_github",
+                {"arguments": ["api", "repos/x/y", "--method", "DELETE"]},
+            ),
+            ("grabowski_github", {"arguments": ["api", "repos/x/y", "-XPOST"]}),
+            ("grabowski_github", {"arguments": ["api", "repos/x/y", "-f", "x=y"]}),
+            ("grabowski_github", {"arguments": ["api", "repos/x/y", "-fx=y"]}),
+            (
+                "grabowski_github",
+                {
+                    "arguments": [
+                        "api",
+                        "graphql",
+                        "-fquery=query { viewer { login } }",
+                    ]
+                },
+            ),
+            (
+                "grabowski_github",
+                {
+                    "arguments": [
+                        "api",
+                        "graphql",
+                        "-f",
+                        "query=mutation { deleteProjectV2(input:{projectV2Id:\"x\"}) { clientMutationId } }",
+                    ]
+                },
+            ),
+        ]
+        for tool_name, arguments in unsafe_calls:
+            with self.subTest(tool_name=tool_name, arguments=arguments):
+                self.assertFalse(
+                    operator._transport_roundtrip_exempt_call(tool_name, arguments)
+                )
+
+    def test_effect_free_multiplexed_read_does_not_consume_signed_assertion(self) -> None:
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with (
+            mock.patch.object(operator, "_require_current_serving_process") as serving,
+            mock.patch.object(base, "_transport_signed_one_call_evidence") as signed,
+            mock.patch.object(roundtrip, "consume_verified") as legacy,
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_github",
+                arguments={
+                    "arguments": [
+                        "api",
+                        "graphql",
+                        "-f",
+                        "query=query { viewer { login } }",
+                    ]
+                },
+                context=_ctx({}),
+                tool=tool,
+            )
+        self.assertIsNone(evidence)
+        serving.assert_not_called()
+        signed.assert_not_called()
+        legacy.assert_not_called()
+
     def test_stale_serving_process_blocks_before_signed_assertion_consumption(
         self,
     ) -> None:
@@ -902,7 +1006,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stale serving process"):
                 operator._require_transport_roundtrip_for_tool(
                     tool_name="grabowski_terminal_run",
-                    arguments={"argv": ["true"]},
+                    arguments={"argv": ["touch", "marker"]},
                     context=_ctx({}),
                     tool=tool,
                 )

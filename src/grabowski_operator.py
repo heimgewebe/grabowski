@@ -553,9 +553,191 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
     return hint if isinstance(hint, bool) else None
 
 
+_TERMINAL_TRANSPORT_EFFECT_FREE_COMMANDS = frozenset(
+    {"sleep", "true", "false", "pwd", "whoami"}
+)
+_DATE_TRANSPORT_READ_ONLY_FLAGS = frozenset(
+    {
+        "-u",
+        "--utc",
+        "--universal",
+        "-R",
+        "--rfc-email",
+        "--resolution",
+        "--debug",
+        "--help",
+        "--version",
+    }
+)
+_GITHUB_TRANSPORT_READ_ONLY_SUBCOMMANDS: dict[str, frozenset[str] | None] = {
+    "pr": frozenset({"view", "checks", "diff", "list", "status"}),
+    "issue": frozenset({"view", "list", "status"}),
+    "run": frozenset({"view", "list", "watch"}),
+    "workflow": frozenset({"view", "list"}),
+    "repo": frozenset({"view", "list"}),
+    "release": frozenset({"view", "list"}),
+    "auth": frozenset({"status"}),
+    "search": None,
+}
+
+
+def _terminal_transport_effect_free_call(arguments: Any) -> bool:
+    if not isinstance(arguments, dict) or set(arguments) - {"argv", "cwd"}:
+        return False
+    argv = arguments.get("argv")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(item, str) and item for item in argv)
+    ):
+        return False
+    command = argv[0]
+    if command in _TERMINAL_TRANSPORT_EFFECT_FREE_COMMANDS:
+        return True
+    if command != "date":
+        return False
+    for argument in argv[1:]:
+        if argument.startswith("+"):
+            continue
+        if argument in _DATE_TRANSPORT_READ_ONLY_FLAGS:
+            continue
+        if argument.startswith(("--date=", "--iso-8601=", "--rfc-3339=")):
+            continue
+        # In particular, reject -s/--set and legacy positional date operands.
+        return False
+    return True
+
+
+def _github_graphql_transport_read_only(arguments: list[str]) -> bool:
+    query: str | None = None
+    method: str | None = None
+    index = 1
+    while index < len(arguments):
+        item = arguments[index]
+        # gh accepts compact short-option forms such as -XPOST and -fkey=value.
+        # They are deliberately not interpreted here: fail closed rather than
+        # risk classifying a body-bearing or non-GET request as a read.
+        if (item.startswith("-X") and item != "-X") or (
+            item.startswith("-f") and item != "-f"
+        ) or (item.startswith("-F") and item != "-F"):
+            return False
+        if item in {"--method", "-X"}:
+            if index + 1 >= len(arguments):
+                return False
+            method = arguments[index + 1].upper()
+            index += 2
+            continue
+        if item.startswith("--method="):
+            method = item.split("=", 1)[1].upper()
+            index += 1
+            continue
+        if item == "--input" or item.startswith("--input="):
+            return False
+        if item in {"-f", "-F", "--field", "--raw-field"}:
+            if index + 1 >= len(arguments):
+                return False
+            field = arguments[index + 1]
+            if field.startswith("query="):
+                if query is not None:
+                    return False
+                query = field.split("=", 1)[1]
+            index += 2
+            continue
+        if item.startswith(("--field=", "--raw-field=")):
+            field = item.split("=", 1)[1]
+            if field.startswith("query="):
+                if query is not None:
+                    return False
+                query = field.split("=", 1)[1]
+            index += 1
+            continue
+        index += 1
+    if method not in {None, "GET", "POST"} or not isinstance(query, str):
+        return False
+    document = query.strip()
+    if not document or document.startswith("@"):
+        return False
+    if re.search(r"\b(?:mutation|subscription)\b", document, flags=re.IGNORECASE):
+        return False
+    return document.startswith("query") or document.startswith("{")
+
+
+def _github_rest_api_transport_read_only(arguments: list[str]) -> bool:
+    method: str | None = None
+    body_fields = False
+    index = 1
+    while index < len(arguments):
+        item = arguments[index]
+        # gh accepts compact short-option forms such as -XPOST and -fkey=value.
+        # They are deliberately not interpreted here: fail closed rather than
+        # risk classifying a body-bearing or non-GET request as a read.
+        if (item.startswith("-X") and item != "-X") or (
+            item.startswith("-f") and item != "-f"
+        ) or (item.startswith("-F") and item != "-F"):
+            return False
+        if item in {"--method", "-X"}:
+            if index + 1 >= len(arguments):
+                return False
+            method = arguments[index + 1].upper()
+            index += 2
+            continue
+        if item.startswith("--method="):
+            method = item.split("=", 1)[1].upper()
+            index += 1
+            continue
+        if item == "--input" or item.startswith("--input="):
+            return False
+        if item in {"-f", "-F", "--field", "--raw-field"}:
+            body_fields = True
+            if index + 1 >= len(arguments):
+                return False
+            index += 2
+            continue
+        if item.startswith(("--field=", "--raw-field=")):
+            body_fields = True
+        index += 1
+    if method is not None:
+        return method == "GET"
+    return not body_fields
+
+
+def _github_transport_read_only_call(arguments: Any) -> bool:
+    if not isinstance(arguments, dict) or set(arguments) - {
+        "arguments",
+        "cwd",
+        "timeout_seconds",
+    }:
+        return False
+    argv = arguments.get("arguments")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(item, str) and item for item in argv)
+    ):
+        return False
+    if argv[0] == "api":
+        if len(argv) < 2 or argv[1].startswith("-"):
+            return False
+        if argv[1] == "graphql":
+            return _github_graphql_transport_read_only(argv[1:])
+        return _github_rest_api_transport_read_only(argv[1:])
+    allowed = _GITHUB_TRANSPORT_READ_ONLY_SUBCOMMANDS.get(argv[0])
+    if argv[0] not in _GITHUB_TRANSPORT_READ_ONLY_SUBCOMMANDS:
+        return False
+    if "--web" in argv:
+        return False
+    if allowed is None:
+        return len(argv) >= 2
+    return len(argv) >= 2 and argv[1] in allowed
+
+
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
+    if tool_name == "grabowski_terminal_run":
+        return _terminal_transport_effect_free_call(arguments)
+    if tool_name == "grabowski_github":
+        return _github_transport_read_only_call(arguments)
     if tool_name == "grabowski_browser_worker_semantic":
         # The public tool stays conservatively MUTATING. Only the exact read
         # operation may bypass the global mutation roundtrip; act, missing and
