@@ -228,6 +228,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         *,
         expected_head: str | None = "a" * 40,
         inputs: dict[str, str] | None = None,
+        poll_attempts: int = 2,
     ):
         return self.dispatch.dispatch_workflow(
             "heimgewebe/commonthing",
@@ -239,7 +240,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             state_root=Path(directory),
             sleep=lambda _seconds: None,
             time_fn=lambda: NOW,
-            poll_attempts=2,
+            poll_attempts=poll_attempts,
         )
 
     def test_exact_head_success_returns_unique_run_and_private_receipt(self) -> None:
@@ -395,13 +396,13 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         )
         self.assertEqual(runner.post_count, 1)
 
-    def test_unique_run_requires_stable_second_observation(self) -> None:
+    def test_unique_run_observes_full_stabilization_window(self) -> None:
         runner = _FakeGitHub(
             create_run_on_post=False,
-            run_snapshots=[[101], [101, 102]],
+            run_snapshots=[[101], [101], [101, 102]],
         )
         with tempfile.TemporaryDirectory() as directory:
-            result = self._call(runner, directory)
+            result = self._call(runner, directory, poll_attempts=3)
 
         self.assertEqual(result["result_code"], "run_identity_ambiguous")
         self.assertEqual(result["effect_state"], "unknown")

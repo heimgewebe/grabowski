@@ -654,9 +654,9 @@ def _readback(
     sleep: Sleep,
     time_fn: TimeFn,
 ) -> tuple[dict[str, Any] | None, str, dict[str, Any] | None]:
-    polls_remaining = max(1, attempts)
-    pending_run_id: int | None = None
-    while polls_remaining > 0 or pending_run_id is not None:
+    poll_count = max(1, attempts)
+    candidates: dict[int, dict[str, Any]] = {}
+    for index in range(poll_count):
         rows, error = _runs(runner, repository, workflow_id, workflow_path)
         if error:
             return None, "failed", error
@@ -676,20 +676,16 @@ def _readback(
             ):
                 matches.append(run)
         if len(matches) == 1:
-            current_run_id = matches[0]["run_id"]
-            if pending_run_id == current_run_id:
-                return matches[0], "unique", None
-            if pending_run_id is not None and pending_run_id != current_run_id:
+            candidate = matches[0]
+            candidates[candidate["run_id"]] = candidate
+            if len(candidates) > 1:
                 return None, "ambiguous", None
-            pending_run_id = current_run_id
         if len(matches) > 1:
             return None, "ambiguous", None
-        if len(matches) == 0:
-            pending_run_id = None
-        if polls_remaining > 0:
-            polls_remaining -= 1
-        if polls_remaining > 0 or pending_run_id is not None:
+        if index + 1 < poll_count:
             sleep(POLL_SECONDS)
+    if len(candidates) == 1:
+        return next(iter(candidates.values())), "unique", None
     return None, "missing", None
 
 
@@ -1019,7 +1015,7 @@ def dispatch_workflow(
                 head=head,
                 baseline=set(prior_baseline),
                 attempted_at=float(attempted),
-                attempts=1,
+                attempts=poll_attempts,
                 sleep=sleep,
                 time_fn=time_fn,
             )
@@ -1107,7 +1103,7 @@ def dispatch_workflow(
             head=head,
             baseline=baseline,
             attempted_at=attempted,
-            attempts=poll_attempts if post == "accepted" else 1,
+            attempts=poll_attempts,
             sleep=sleep,
             time_fn=time_fn,
         )
