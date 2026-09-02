@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import importlib.util
 import json
 from pathlib import Path
@@ -8,20 +10,34 @@ import tempfile
 import types
 import unittest
 from unittest import mock
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "src" / "grabowski_github_workflow_dispatch.py"
+NOW = datetime(2026, 9, 2, 5, 0, 0, tzinfo=timezone.utc).timestamp()
 
 
-class _FakeMCP:
-    def tool(self, *args, **kwargs):
-        return lambda function: function
+@dataclass(frozen=True)
+class _GripSpec:
+    name: str
+    version: str
+    summary: str
+    effect: str
+    required_parameters: tuple[str, ...]
+    acceptance_ids: tuple[str, ...]
+    runner: str
+    uses_github: bool = False
+    operation_effect_class: str = "unknown"
+    operation_class: str = "unknown"
+    capability: str = "terminal_execute"
+
+
+class _GripPreflightError(ValueError):
+    pass
 
 
 def _load_module():
     fake_operator = types.ModuleType("grabowski_operator_core")
-    fake_operator.mcp = _FakeMCP()
-    fake_operator.MUTATING = object()
     fake_operator.HOME = Path("/tmp")
     fake_operator._redact = (
         lambda value: "<REDACTED>"
@@ -29,11 +45,28 @@ def _load_module():
         else value
     )
     fake_operator._trusted_owner_mode = lambda: True
-    fake_operator._require_operator_mutation = lambda *args, **kwargs: None
-    fake_operator._validate_argv = lambda argv, cwd=None: argv
-    fake_operator._run = lambda *args, **kwargs: {}
 
-    module_name = "grabowski_github_workflow_dispatch_test_target"
+    fake_grips = types.ModuleType("grabowski_grips")
+    fake_grips.GripSpec = _GripSpec
+    fake_grips.GripPreflightError = _GripPreflightError
+    fake_grips.MUTATING = "mutating"
+    fake_grips.CommandRunner = object
+    fake_grips.GithubRunner = object
+    fake_grips.GRIP_SPECS = {}
+    fake_grips._RUNNERS = {}
+    fake_grips.GRIP_SURFACE_ALLOWLIST = frozenset()
+    fake_grips.GRIP_RISK_LEVELS = {}
+    fake_grips.GRIP_SURFACE_TARGETS = {}
+    fake_grips.GRIP_RECOVERY_PATHS_BY_NAME = {}
+
+    def check(receipt, name, status, detail):
+        receipt.setdefault("checks", []).append(
+            {"name": name, "status": status, "detail": detail}
+        )
+
+    fake_grips._check = check
+
+    module_name = f"grabowski_github_workflow_dispatch_test_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, MODULE_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load workflow dispatch module")
@@ -42,12 +75,13 @@ def _load_module():
         sys.modules,
         {
             "grabowski_operator_core": fake_operator,
+            "grabowski_grips": fake_grips,
             module_name: module,
         },
         clear=False,
     ):
         spec.loader.exec_module(module)
-    return module, fake_operator
+    return module, fake_operator, fake_grips
 
 
 class _FakeGitHub:
@@ -164,7 +198,7 @@ class _FakeGitHub:
 
 class GitHubWorkflowDispatchTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.dispatch, self.operator = _load_module()
+        self.dispatch, self.operator, self.grips = _load_module()
 
     def _call(
         self,
@@ -183,6 +217,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             runner=runner,
             state_root=Path(directory),
             sleep=lambda _seconds: None,
+            time_fn=lambda: NOW,
             poll_attempts=2,
         )
 
@@ -193,6 +228,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             receipt_path = Path(result["receipt"]["path"])
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             receipt_mode = receipt_path.stat().st_mode & 0o777
+            lock_mode = (receipt_path.parent / ".lock").stat().st_mode & 0o777
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["result_code"], "dispatch_accepted")
@@ -204,6 +240,7 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         self.assertEqual(receipt["inputs"]["keys"], ["source_commit"])
         self.assertNotIn("a" * 40, json.dumps(receipt["inputs"], sort_keys=True))
         self.assertEqual(receipt_mode, 0o600)
+        self.assertEqual(lock_mode, 0o600)
 
     def test_expected_head_drift_never_posts(self) -> None:
         runner = _FakeGitHub(head="b" * 40)
@@ -226,7 +263,15 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             result = self._call(runner, directory)
         self.assertEqual(result["result_code"], "invalid_workflow_inputs")
         self.assertEqual(result["effect_state"], "not_started")
-        self.assertEqual(result["receipt"]["sha256"].__len__(), 64)
+        self.assertEqual(len(result["receipt"]["sha256"]), 64)
+        self.assertEqual(runner.post_count, 1)
+
+    def test_auth_failure_is_typed_and_not_started(self) -> None:
+        runner = _FakeGitHub(post_mode="403", create_run_on_post=False)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._call(runner, directory)
+        self.assertEqual(result["result_code"], "github_auth_or_permission")
+        self.assertEqual(result["effect_state"], "not_started")
         self.assertEqual(runner.post_count, 1)
 
     def test_ambiguous_timeout_recovers_unique_run_without_retry(self) -> None:
@@ -277,7 +322,9 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             first = self._call(runner, directory)
             second = self._call(runner, directory)
         self.assertEqual(first["result_code"], "dispatch_outcome_unknown")
-        self.assertEqual(second["result_code"], "prior_ambiguous_outcome_unresolved")
+        self.assertEqual(
+            second["result_code"], "prior_ambiguous_outcome_unresolved"
+        )
         self.assertEqual(runner.post_count, 1)
 
     def test_secret_like_input_key_is_rejected_before_runner(self) -> None:
@@ -315,39 +362,81 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         flattened = json.dumps(runner.calls, sort_keys=True)
         self.assertNotIn(marker, flattened)
-        post = next(call for call in runner.calls if "--method" in call and "POST" in call)
+        post = next(
+            call for call in runner.calls if "--method" in call and "POST" in call
+        )
         self.assertIn("--input", post)
 
-    def test_public_tool_requires_github_cli_mutation_authority(self) -> None:
-        with mock.patch.object(
-            self.operator,
-            "_require_operator_mutation",
-        ) as require:
+    def test_import_registers_high_risk_github_cli_grip_not_mcp_tool(self) -> None:
+        spec = self.grips.GRIP_SPECS["github-workflow-dispatch"]
+        self.assertEqual(spec.effect, "mutating")
+        self.assertEqual(spec.capability, "github_cli")
+        self.assertTrue(spec.uses_github)
+        self.assertEqual(spec.operation_effect_class, "external_provider")
+        self.assertIn("github-workflow-dispatch", self.grips.GRIP_SURFACE_ALLOWLIST)
+        self.assertEqual(
+            self.grips.GRIP_RISK_LEVELS["github-workflow-dispatch"], "high"
+        )
+        self.assertIn("github_workflow_dispatch", self.grips._RUNNERS)
+        self.assertFalse(hasattr(self.dispatch, "grabowski_github_workflow_dispatch"))
+
+    def test_grip_runner_adapts_remote_github_runner_and_blocks_unknown_parameter(self) -> None:
+        runner = _FakeGitHub()
+        seen_cwds: list[Path] = []
+
+        def grip_github_runner(cwd: Path, arguments: list[str]):
+            seen_cwds.append(cwd)
+            return runner(arguments)
+
+        receipt: dict[str, object] = {}
+        with tempfile.TemporaryDirectory() as directory:
             with mock.patch.object(
                 self.dispatch,
-                "dispatch_workflow",
-                return_value={"ok": True},
-            ) as dispatch:
-                result = self.dispatch.grabowski_github_workflow_dispatch(
-                    "heimgewebe/commonthing",
-                    "staging-image-promotion.yml",
-                    "main",
-                    inputs={"source_commit": "a" * 40},
-                    expected_head="a" * 40,
+                "DEFAULT_STATE_DIR",
+                Path(directory),
+            ):
+                output = self.grips._RUNNERS["github_workflow_dispatch"](
+                    self.grips.GRIP_SPECS["github-workflow-dispatch"],
+                    {
+                        "repository": "heimgewebe/commonthing",
+                        "workflow": "staging-image-promotion.yml",
+                        "ref": "main",
+                        "inputs": {"source_commit": "a" * 40},
+                        "expected_head": "a" * 40,
+                    },
+                    receipt,
+                    object(),
+                    grip_github_runner,
                 )
-        self.assertEqual(result, {"ok": True})
-        require.assert_called_once_with(
-            "github_cli",
-            repo="heimgewebe/commonthing",
-            fresh_preflight=True,
-        )
-        dispatch.assert_called_once()
+        self.assertTrue(output["ok"])
+        self.assertEqual(output["receipt_status"], "passed")
+        self.assertTrue(seen_cwds)
+        self.assertTrue(all(cwd == self.operator.HOME for cwd in seen_cwds))
+        check_names = {item["name"] for item in receipt["checks"]}
+        self.assertIn("unique-run-readback", check_names)
 
-    def test_runtime_contract_publishes_typed_tool_and_supporting_module(self) -> None:
+        with self.assertRaises(_GripPreflightError):
+            self.grips._RUNNERS["github_workflow_dispatch"](
+                self.grips.GRIP_SPECS["github-workflow-dispatch"],
+                {
+                    "repository": "heimgewebe/commonthing",
+                    "workflow": "staging-image-promotion.yml",
+                    "ref": "main",
+                    "inputs": {},
+                    "unexpected": True,
+                },
+                {},
+                object(),
+                grip_github_runner,
+            )
+
+    def test_runtime_contract_keeps_public_tool_surface_stable(self) -> None:
         runtime_contract = json.loads(
-            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(
+                encoding="utf-8"
+            )
         )
-        self.assertIn(
+        self.assertNotIn(
             "grabowski_github_workflow_dispatch",
             runtime_contract["expected_tools"],
         )
@@ -360,7 +449,9 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
             "src/grabowski_github_workflow_dispatch.py",
         )
 
-        runtime_source = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        runtime_source = (ROOT / "src" / "grabowski_runtime.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("import grabowski_github_workflow_dispatch", runtime_source)
 
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
