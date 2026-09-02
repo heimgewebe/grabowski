@@ -6511,6 +6511,7 @@ def _chronik_retained_source_expected(record: dict[str, Any]) -> bool:
         "schema_version": CHRONIK_RETAINED_SOURCE_EXPECTATION_SCHEMA_VERSION,
         "attempt": int(record["attempt"]),
         "run_id": chronik.run_id(record),
+        "event_kind": "agent.run.blocked",
     }
     if marker != expected:
         raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
@@ -7173,6 +7174,7 @@ def _set_state(
             "schema_version": CHRONIK_RETAINED_SOURCE_EXPECTATION_SCHEMA_VERSION,
             "attempt": selected_attempt,
             "run_id": chronik.run_id(marker_record),
+            "event_kind": "agent.run.blocked",
         }
         existing_marker = selected_launcher.get(
             CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY

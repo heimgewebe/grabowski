@@ -2417,6 +2417,7 @@ class TaskTests(unittest.TestCase):
                 "schema_version": 1,
                 "attempt": 1,
                 "run_id": tasks.chronik.run_id(stored),
+                "event_kind": "agent.run.blocked",
             },
         )
         self.assertTrue(tasks._chronik_retained_source_expected(stored))

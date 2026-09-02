@@ -947,14 +947,14 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 current_event is not None
                 and chronik._event_should_be_recorded(current_event)
             )
+            retained_event_kind_expected: str | None = None
             retained_source_expected = getattr(
                 tasks, "_chronik_retained_source_expected", None
             )
             if callable(retained_source_expected):
-                source_expected = (
-                    source_expected
-                    or bool(retained_source_expected(raw))
-                )
+                if bool(retained_source_expected(raw)):
+                    source_expected = True
+                    retained_event_kind_expected = "agent.run.blocked"
             else:
                 # Compatibility for synthetic/legacy task providers: an exact
                 # launcher outcome_unknown flag is itself durable evidence that
@@ -964,10 +964,9 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                     launcher = json.loads(launcher_raw)
                     if not isinstance(launcher, dict):
                         raise ValueError("stored task launcher is invalid")
-                    source_expected = (
-                        source_expected
-                        or launcher.get("outcome_unknown") is True
-                    )
+                    if launcher.get("outcome_unknown") is True:
+                        source_expected = True
+                        retained_event_kind_expected = "agent.run.blocked"
             if current_state == "interrupted":
                 context = chronik._context(raw)
                 source_expected = (
@@ -1006,6 +1005,7 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
             if not events:
                 raise ValueError("empty Chronik source")
             event_ids: list[str] = []
+            event_kinds: list[str] = []
             for event in events:
                 if (
                     not isinstance(event, dict)
@@ -1017,6 +1017,14 @@ def _task_external_evidence(task_id: str) -> tuple[list[dict[str, Any]], list[di
                 if event.get("event_id") != recomputed_event_id:
                     raise ValueError("Chronik event identity drift")
                 event_ids.append(recomputed_event_id)
+                kind = event.get("kind")
+                if isinstance(kind, str):
+                    event_kinds.append(kind)
+            if (
+                retained_event_kind_expected is not None
+                and retained_event_kind_expected not in event_kinds
+            ):
+                raise ValueError("required retained Chronik event is missing")
         except Exception as exc:
             gaps.append(_external_gap("chronik", "chronik_source_unverifiable", task_id=task_id, error=type(exc).__name__))
         else:
