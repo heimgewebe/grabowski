@@ -2408,9 +2408,11 @@ class TaskTests(unittest.TestCase):
                     "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
                 ).fetchone()
             )
-        marker = json.loads(stored["launcher_json"])[
+        markers = json.loads(stored["launcher_json"])[
             tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
         ]
+        self.assertEqual(len(markers), 1)
+        marker = markers[0]
         self.assertEqual(
             marker,
             {
@@ -2420,23 +2422,63 @@ class TaskTests(unittest.TestCase):
                 "event_kind": "agent.run.blocked",
             },
         )
-        self.assertTrue(tasks._chronik_retained_source_expected(stored))
+        self.assertEqual(tasks._chronik_retained_source_expectations(stored), [marker])
 
-        tasks._set_state(task["task_id"], "running")
+        fresh_launcher = {
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+        }
+        tasks._set_state(
+            task["task_id"],
+            "running",
+            launcher=fresh_launcher,
+            attempt=2,
+        )
         with sqlite3.connect(self.database) as connection:
             connection.row_factory = sqlite3.Row
-            later = dict(
+            resumed = dict(
                 connection.execute(
                     "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
                 ).fetchone()
             )
         self.assertEqual(
-            json.loads(later["launcher_json"])[
+            json.loads(resumed["launcher_json"])[
                 tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY
             ],
-            marker,
+            [marker],
         )
-        self.assertTrue(tasks._chronik_retained_source_expected(later))
+        self.assertEqual(tasks._chronik_retained_source_expectations(resumed), [marker])
+
+        ambiguous_launcher = {**fresh_launcher, "outcome_unknown": True}
+        tasks._set_state(
+            task["task_id"],
+            "outcome_unknown",
+            launcher=ambiguous_launcher,
+            attempt=2,
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.row_factory = sqlite3.Row
+            ambiguous = dict(
+                connection.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task["task_id"],)
+                ).fetchone()
+            )
+        marker_2 = {
+            "schema_version": 1,
+            "attempt": 2,
+            "run_id": tasks.chronik.run_id(ambiguous),
+            "event_kind": "agent.run.blocked",
+        }
+        self.assertEqual(
+            tasks._chronik_retained_source_expectations(ambiguous),
+            [marker, marker_2],
+        )
+        self.assertNotIn(
+            tasks.CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY,
+            tasks._public(ambiguous)["launcher"],
+        )
 
     def test_chronik_context_derives_repository_from_canonical_repo_claim(self) -> None:
         result = {"returncode": 0, "stdout": "git@github.com:heimgewebe/chronik.git\n", "stderr": "", "timed_out": False}

@@ -1219,6 +1219,93 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(chronik_gaps[0]["reason"], "chronik_source_unverifiable")
         self.assertEqual(chronik_gaps[0]["context"]["error"], "FileNotFoundError")
 
+    def test_chronik_missing_retained_source_from_earlier_attempt_is_gap(self) -> None:
+        module = self._load_module([])
+        import grabowski_chronik as real_chronik
+        from contextlib import contextmanager
+
+        task_id = "task-chronik-prior-attempt-source-missing"
+        with tempfile.TemporaryDirectory() as tmp:
+            row = {
+                "task_id": task_id,
+                "attempt": 2,
+                "state": "completed",
+                "unit": "unit",
+                "created_at_unix": 1,
+                "updated_at_unix": 2,
+                "terminalized_at_unix": None,
+                "lifecycle_receipt_sha256": None,
+                "terminalization_sha256": None,
+                "chronik_outbox_enabled": 1,
+                "chronik_outbox_state_root": tmp,
+                "chronik_context_json": {
+                    "subject_scope": "host",
+                    "host": "heim-pc",
+                    "operation": "deploy",
+                    "task_class": "deploy",
+                },
+                "launcher_json": json.dumps({}),
+            }
+            current_written = real_chronik.record_task_state(row, "running")
+            self.assertTrue(current_written["written"])
+            prior_run_id = real_chronik.run_id({**row, "attempt": 1})
+            retained = {
+                "schema_version": 1,
+                "attempt": 1,
+                "run_id": prior_run_id,
+                "event_kind": "agent.run.blocked",
+            }
+
+            class Connection:
+                def execute(self, _query, _parameters):
+                    return self
+
+                def fetchone(self):
+                    return row
+
+            fake_tasks = types.ModuleType("grabowski_tasks")
+            fake_tasks.TASK_DB = Path("/tmp/tasks.sqlite3")
+            fake_tasks.TASK_OUTCOMES_DIR = Path("/tmp/outcomes")
+            fake_tasks._preflight_task_store = lambda: "5"
+            fake_tasks._task_archive_record = lambda value: {
+                "task_id": value["task_id"],
+                "attempt": value["attempt"],
+                "state": value["state"],
+            }
+            fake_tasks._chronik_retained_source_expectations = lambda _value: [retained]
+            fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+            @contextmanager
+            def readonly_sqlite(_path):
+                yield Connection()
+
+            fake_sqlite.readonly_sqlite = readonly_sqlite
+            previous = {
+                name: sys.modules.get(name)
+                for name in ("grabowski_tasks", "grabowski_sqlite_store", "grabowski_chronik")
+            }
+            sys.modules["grabowski_tasks"] = fake_tasks
+            sys.modules["grabowski_sqlite_store"] = fake_sqlite
+            sys.modules["grabowski_chronik"] = real_chronik
+            try:
+                evidence, gaps = module._task_external_evidence(task_id)
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = value
+
+        chronik_evidence = [item for item in evidence if item["source"] == "chronik"]
+        self.assertEqual(len(chronik_evidence), 1)
+        self.assertEqual(chronik_evidence[0]["identity"]["attempt"], 2)
+        chronik_gaps = [gap for gap in gaps if gap["source"] == "chronik"]
+        self.assertEqual(len(chronik_gaps), 1)
+        self.assertEqual(chronik_gaps[0]["reason"], "chronik_source_unverifiable")
+        self.assertEqual(chronik_gaps[0]["context"]["attempt"], 1)
+        self.assertEqual(chronik_gaps[0]["context"]["run_id"], prior_run_id)
+        self.assertEqual(chronik_gaps[0]["context"]["error"], "FileNotFoundError")
+
     def test_chronik_filtered_current_state_still_verifies_prior_retained_event(self) -> None:
         module = self._load_module([])
         import grabowski_chronik as real_chronik
