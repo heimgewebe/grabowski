@@ -1057,7 +1057,28 @@ MAX_CONTRACT_BYTES = 64 * 1024
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
-mcp = FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS)
+MCP_BRANDING_VARIANT_ENV = "GRABOWSKI_MCP_BRANDING_VARIANT"
+
+
+def _configured_mcp_icons():
+    variant = os.environ.get(MCP_BRANDING_VARIANT_ENV, "").strip()
+    if not variant:
+        return None
+    if variant != "kleiner-maulwurf":
+        raise RuntimeError(
+            f"unsupported {MCP_BRANDING_VARIANT_ENV} value: {variant!r}"
+        )
+
+    from kleiner_maulwurf_operator import mcp_icons
+
+    return mcp_icons()
+
+
+_configured_icons = _configured_mcp_icons()
+if _configured_icons is None:
+    mcp = FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS)
+else:
+    mcp = FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS, icons=_configured_icons)
 
 READ_ANNOTATIONS = ToolAnnotations(
     title="Read local data",
