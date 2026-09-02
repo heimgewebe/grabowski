@@ -213,6 +213,16 @@ The next prospective attempt changes the order of operations. The PR must first 
 
 Captain execution must therefore occur in the same stable identity window as the post-CI Saga run. Settlement must use the resulting `VerifiedSagaRunReceiptRef.v1` plus the exact verified Captain completion reference and authoritative GitHub readback. Only `saga-settle == settled` for that unchanged identity establishes pilot 1 and releases its exact merge commit as the sole deployment target for pilot 2.
 
+### Final post-fix acceptance pairing — 2026-09-02
+
+PR #1024 subsequently achieved a real prospective PR-settlement Saga with a durable `VerifiedSagaRunReceiptRef.v1`, verified Captain merge, authoritative GitHub readback and reference-based `saga-settle == settled`; its exact settled merge commit was `b56f6997dac48ead915d05c2e9bcf3ea9817bb33`. The immediately paired runtime-deployment Saga then exposed a distinct production defect before selector switch: Green was ready, but the agent-instruction transition incorrectly required the scheduler deployment-source identity to equal the separate runtime-snapshot identity. The deployment rolled back with Blue preserved and therefore did not establish pilot 2.
+
+PR #1025 repaired that identity-domain mixup and merged as `46a0394d6f2e3940e8226a2b066e348aeb5f9ce7`. A normal prerequisite deployment of that exact commit completed successfully through Blue-Green cutover, and the serving runtime now reports the same commit with complete integrity and manifest/process convergence. That deployment proves the regression is fixed in production, but it is not promoted to T121 Saga acceptance because it was not the runtime-deployment Saga paired with a newly settled PR pilot.
+
+Final T121 acceptance therefore requires one fresh post-fix pair. This documentation change is the new PR-settlement target. It must first converge to current protected `main` and complete required CI/review gates; only then may a new `saga-plan` and `saga-run` freeze the exact PR head/base/diff. From that run onward, no identity-changing branch action is permitted. Captain merge, authoritative GitHub readback and `saga-settle` must use the durable run reference and verified Captain completion reference and reach `settled`.
+
+Only that newly settled merge commit may become the runtime-deployment target. Pilot 2 must then create its own fresh plan and durable run reference, execute Captain deployment against that exact commit, observe deployment identity to complete manifest/process convergence, and settle from the durable run and Captain references. A prerequisite deployment, an older settled PR, or a later concurrent `main` head is not a substitute for this paired proof.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
