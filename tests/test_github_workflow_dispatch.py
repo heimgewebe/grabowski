@@ -94,6 +94,7 @@ class _FakeGitHub:
         create_run_on_post: bool = True,
         runs_per_post: int = 1,
         run_readback_failures: int = 0,
+        run_snapshots: list[list[int]] | None = None,
     ) -> None:
         self.head = head
         self.workflow_state = workflow_state
@@ -105,6 +106,8 @@ class _FakeGitHub:
         self.post_count = 0
         self.runs: list[int] = []
         self.run_branches: dict[int, str] = {}
+        self.run_snapshots = run_snapshots
+        self.run_readback_count = 0
 
     @staticmethod
     def _result(
@@ -163,6 +166,13 @@ class _FakeGitHub:
             if self.post_count > 0 and self.run_readback_failures > 0:
                 self.run_readback_failures -= 1
                 return self._result(returncode=1, stderr="connection reset")
+            run_ids = self.runs
+            if self.post_count > 0 and self.run_snapshots is not None:
+                snapshot_index = min(
+                    self.run_readback_count, len(self.run_snapshots) - 1
+                )
+                run_ids = self.run_snapshots[snapshot_index]
+                self.run_readback_count += 1
             rows = [
                 {
                     "id": run_id,
@@ -178,7 +188,7 @@ class _FakeGitHub:
                     "run_attempt": 1,
                     "run_number": run_id,
                 }
-                for run_id in self.runs
+                for run_id in run_ids
             ]
             return self._result(stdout=json.dumps({"workflow_runs": rows}))
         if "--method" in args and "POST" in args:
@@ -329,6 +339,74 @@ class GitHubWorkflowDispatchTests(unittest.TestCase):
         self.assertEqual(second["effect_state"], "unknown")
         self.assertEqual(runner.post_count, 1)
         self.assertFalse(second["retry_authorized"])
+
+    def test_dispatch_attempt_is_durable_before_external_post(self) -> None:
+        runner = _FakeGitHub(create_run_on_post=False)
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                self.dispatch,
+                "_post",
+                side_effect=SystemExit("simulated process loss"),
+            ):
+                with self.assertRaises(SystemExit):
+                    self._call(runner, directory)
+
+            active_path = next(
+                Path(directory).glob(f"*/{self.dispatch.ACTIVE_ATTEMPT_FILE}")
+            )
+            active = json.loads(active_path.read_text(encoding="utf-8"))
+            second = self._call(runner, directory)
+
+        self.assertEqual(active["result_code"], "dispatch_in_flight")
+        self.assertEqual(active["effect_state"], "unknown")
+        self.assertRegex(active["dispatch_attempt_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(
+            second["result_code"], "prior_ambiguous_outcome_unresolved"
+        )
+        self.assertEqual(runner.post_count, 0)
+
+    def test_active_attempt_survives_bounded_receipt_history(self) -> None:
+        runner = _FakeGitHub(post_mode="timeout", create_run_on_post=False)
+        with tempfile.TemporaryDirectory() as directory:
+            first = self._call(runner, directory)
+            request_dir = Path(first["receipt"]["path"]).parent
+            original = json.loads(
+                Path(first["receipt"]["path"]).read_text(encoding="utf-8")
+            )
+            original.pop("receipt_sha256")
+            for index in range(70):
+                noise = {
+                    **original,
+                    "dispatch_attempt_id": f"{index + 1:032x}",
+                    "dispatch_attempted_at_unix": NOW + index + 1,
+                    "effect_state": "not_started",
+                    "result_code": "noise_terminal",
+                    "completed_at_unix": NOW + index + 1,
+                }
+                self.dispatch._write_receipt(request_dir, noise)
+
+            runner.post_mode = "accepted"
+            runner.create_run_on_post = True
+            second = self._call(runner, directory)
+
+        self.assertEqual(first["result_code"], "dispatch_outcome_unknown")
+        self.assertEqual(
+            second["result_code"], "prior_ambiguous_outcome_unresolved"
+        )
+        self.assertEqual(runner.post_count, 1)
+
+    def test_unique_run_requires_stable_second_observation(self) -> None:
+        runner = _FakeGitHub(
+            create_run_on_post=False,
+            run_snapshots=[[101], [101, 102]],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = self._call(runner, directory)
+
+        self.assertEqual(result["result_code"], "run_identity_ambiguous")
+        self.assertEqual(result["effect_state"], "unknown")
+        self.assertEqual(runner.post_count, 1)
+        self.assertFalse(result["retry_authorized"])
 
     def test_readback_ignores_same_head_run_from_other_ref(self) -> None:
         runner = _FakeGitHub(create_run_on_post=False)

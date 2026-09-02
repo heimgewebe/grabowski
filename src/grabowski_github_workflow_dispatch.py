@@ -26,6 +26,7 @@ RECEIPT_KIND = "grabowski_github_workflow_dispatch_receipt"
 RESULT_KIND = "grabowski_github_workflow_dispatch_result"
 STATE_DIR_ENV = "GRABOWSKI_GITHUB_WORKFLOW_DISPATCH_STATE_DIR"
 DEFAULT_STATE_DIR = Path.home() / ".local/state/grabowski/github-workflow-dispatch"
+ACTIVE_ATTEMPT_FILE = "active-attempt.json"
 
 MAX_RECEIPT_BYTES = 128 * 1024
 MAX_INPUTS = 32
@@ -38,6 +39,7 @@ RUN_FUTURE_SECONDS = 60.0
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _WORKFLOW_RE = re.compile(r"[A-Za-z0-9_.-]+\.(?:yml|yaml)\Z", re.I)
 _SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_ATTEMPT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _REF_BAD_RE = re.compile(r"(?:\.\.|@\{|[ ~^:?*\[\\])")
 _KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -64,6 +66,7 @@ _ALLOWED_PARAMETERS = frozenset(
 )
 _UNRESOLVED_DISPATCH_CODES = frozenset(
     {
+        "dispatch_in_flight",
         "dispatch_outcome_unknown",
         "accepted_run_not_observed",
         "accepted_run_readback_failed",
@@ -249,6 +252,16 @@ def _lock(directory: Path) -> Iterator[None]:
         os.close(fd)
 
 
+def _fsync_directory(directory: Path) -> None:
+    directory_fd = os.open(
+        directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_receipt(directory: Path, receipt: dict[str, Any]) -> dict[str, Any]:
     unsigned = {
         key: item
@@ -270,59 +283,136 @@ def _write_receipt(directory: Path, receipt: dict[str, Any]) -> dict[str, Any]:
         os.fsync(fd)
     finally:
         os.close(fd)
-    directory_fd = os.open(
-        directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    )
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    _fsync_directory(directory)
     return {**stored, "receipt_path": str(path)}
+
+
+def _read_receipt(path: Path) -> dict[str, Any] | None:
+    try:
+        info = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > MAX_RECEIPT_BYTES
+        ):
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        stored = payload.pop("receipt_sha256", None)
+        if (
+            payload.get("kind") != RECEIPT_KIND
+            or payload.get("schema_version") != SCHEMA_VERSION
+            or stored != _digest(payload)
+        ):
+            return None
+        return {
+            **payload,
+            "receipt_sha256": stored,
+            "receipt_path": str(path),
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _write_active_attempt(directory: Path, receipt: dict[str, Any]) -> None:
+    attempt_id = receipt.get("dispatch_attempt_id")
+    if (
+        receipt.get("kind") != RECEIPT_KIND
+        or receipt.get("schema_version") != SCHEMA_VERSION
+        or receipt.get("effect_state") != "unknown"
+        or receipt.get("result_code") != "dispatch_in_flight"
+        or not isinstance(attempt_id, str)
+        or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None
+    ):
+        raise DispatchError("dispatch_journal_invalid", "active attempt is invalid")
+    payload = {key: value for key, value in receipt.items() if key != "receipt_path"}
+    stored_sha = payload.get("receipt_sha256")
+    unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    if stored_sha != _digest(unsigned):
+        raise DispatchError(
+            "dispatch_journal_invalid", "active attempt receipt hash is invalid"
+        )
+    data = _json_bytes(payload) + b"\n"
+    fd, raw_path = tempfile.mkstemp(prefix=".active-attempt-", suffix=".tmp", dir=directory)
+    temporary = Path(raw_path)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, directory / ACTIVE_ATTEMPT_FILE)
+        _fsync_directory(directory)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+
+
+def _clear_active_attempt(directory: Path) -> None:
+    path = directory / ACTIVE_ATTEMPT_FILE
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(directory)
 
 
 def _prior_receipts(directory: Path) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    for path in sorted(directory.glob("*.json"))[-64:]:
-        try:
-            info = path.lstat()
-            if (
-                path.is_symlink()
-                or not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_size > MAX_RECEIPT_BYTES
-            ):
-                continue
-            payload = json.loads(path.read_text())
-            stored = payload.pop("receipt_sha256", None)
-            if (
-                payload.get("kind") == RECEIPT_KIND
-                and payload.get("schema_version") == SCHEMA_VERSION
-                and stored == _digest(payload)
-            ):
-                result.append(
-                    {
-                        **payload,
-                        "receipt_sha256": stored,
-                        "receipt_path": str(path),
-                    }
-                )
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
+    paths = [
+        path
+        for path in sorted(directory.glob("*.json"))
+        if path.name != ACTIVE_ATTEMPT_FILE
+    ][-64:]
+    for path in paths:
+        receipt = _read_receipt(path)
+        if receipt is not None:
+            result.append(receipt)
     return result
 
 
-def _unresolved(receipts: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _unresolved(
+    directory: Path, receipts: list[dict[str, Any]]
+) -> tuple[dict[str, Any] | None, str | None]:
+    active_path = directory / ACTIVE_ATTEMPT_FILE
+    if active_path.exists() or active_path.is_symlink():
+        active = _read_receipt(active_path)
+        if active is None:
+            return None, "active_attempt_invalid"
+        attempt_id = active.get("dispatch_attempt_id")
+        if (
+            not isinstance(attempt_id, str)
+            or _ATTEMPT_ID_RE.fullmatch(attempt_id) is None
+            or active.get("result_code") != "dispatch_in_flight"
+            or active.get("effect_state") != "unknown"
+        ):
+            return None, "active_attempt_invalid"
+        for receipt in reversed(receipts):
+            if (
+                receipt.get("dispatch_attempt_id") == attempt_id
+                and receipt.get("effect_state") in {"observed", "not_started"}
+                and receipt.get("completed_at_unix") is not None
+            ):
+                try:
+                    _clear_active_attempt(directory)
+                except OSError:
+                    pass
+                return None, None
+        return active, None
     for receipt in reversed(receipts):
         if (
             receipt.get("effect_state") == "unknown"
             and receipt.get("run") is None
             and receipt.get("result_code") in _UNRESOLVED_DISPATCH_CODES
         ):
-            return receipt
+            return receipt, None
         if receipt.get("effect_state") == "observed":
-            return None
-    return None
+            return None, None
+    return None, None
 
 
 def _http_status(result: Mapping[str, Any]) -> int | None:
@@ -564,7 +654,9 @@ def _readback(
     sleep: Sleep,
     time_fn: TimeFn,
 ) -> tuple[dict[str, Any] | None, str, dict[str, Any] | None]:
-    for index in range(max(1, attempts)):
+    polls_remaining = max(1, attempts)
+    pending_run_id: int | None = None
+    while polls_remaining > 0 or pending_run_id is not None:
         rows, error = _runs(runner, repository, workflow_id, workflow_path)
         if error:
             return None, "failed", error
@@ -584,10 +676,19 @@ def _readback(
             ):
                 matches.append(run)
         if len(matches) == 1:
-            return matches[0], "unique", None
+            current_run_id = matches[0]["run_id"]
+            if pending_run_id == current_run_id:
+                return matches[0], "unique", None
+            if pending_run_id is not None and pending_run_id != current_run_id:
+                return None, "ambiguous", None
+            pending_run_id = current_run_id
         if len(matches) > 1:
             return None, "ambiguous", None
-        if index + 1 < attempts:
+        if len(matches) == 0:
+            pending_run_id = None
+        if polls_remaining > 0:
+            polls_remaining -= 1
+        if polls_remaining > 0 or pending_run_id is not None:
             sleep(POLL_SECONDS)
     return None, "missing", None
 
@@ -675,6 +776,7 @@ def _receipt(
         "inputs": inputs_meta,
         "baseline_run_ids": [],
         "started_at_unix": started,
+        "dispatch_attempt_id": None,
         "dispatch_attempted_at_unix": None,
         "completed_at_unix": None,
         "result_code": None,
@@ -700,6 +802,7 @@ def _finish(
     *,
     status: int | None = None,
     run: dict[str, Any] | None = None,
+    clear_active: bool = False,
 ) -> dict[str, Any]:
     stored = _write_receipt(
         directory,
@@ -712,6 +815,11 @@ def _finish(
             "completed_at_unix": now,
         },
     )
+    if clear_active:
+        try:
+            _clear_active_attempt(directory)
+        except OSError:
+            pass
     ok = code in {
         "dispatch_accepted",
         "dispatch_recovered_after_ambiguous_transport",
@@ -794,7 +902,16 @@ def dispatch_workflow(
             inputs_meta,
             time_fn(),
         )
-        prior = _unresolved(_prior_receipts(directory))
+        prior_receipts = _prior_receipts(directory)
+        prior, prior_error = _unresolved(directory, prior_receipts)
+        if prior_error is not None:
+            return _finish(
+                directory,
+                receipt,
+                prior_error,
+                "unknown",
+                time_fn(),
+            )
         workflow_info, head, error = _preflight(
             runner, repository, workflow_kind, workflow_selector, ref
         )
@@ -863,6 +980,7 @@ def dispatch_workflow(
         if prior is not None:
             prior_baseline = prior.get("baseline_run_ids")
             attempted = prior.get("dispatch_attempted_at_unix")
+            prior_attempt_id = prior.get("dispatch_attempt_id")
             if (
                 not isinstance(prior_baseline, list)
                 or not all(
@@ -873,6 +991,13 @@ def dispatch_workflow(
                 )
                 or not isinstance(attempted, (int, float))
                 or isinstance(attempted, bool)
+                or (
+                    prior_attempt_id is not None
+                    and (
+                        not isinstance(prior_attempt_id, str)
+                        or _ATTEMPT_ID_RE.fullmatch(prior_attempt_id) is None
+                    )
+                )
             ):
                 return _finish(
                     directory,
@@ -881,6 +1006,10 @@ def dispatch_workflow(
                     "unknown",
                     time_fn(),
                 )
+            if isinstance(prior_attempt_id, str):
+                receipt["dispatch_attempt_id"] = prior_attempt_id
+            receipt["dispatch_attempted_at_unix"] = float(attempted)
+            receipt["baseline_run_ids"] = list(prior_baseline)
             run, state, error = _readback(
                 runner,
                 repository=repository,
@@ -911,6 +1040,7 @@ def dispatch_workflow(
                     "observed",
                     time_fn(),
                     run=run,
+                    clear_active=True,
                 )
             return _finish(
                 directory,
@@ -924,6 +1054,26 @@ def dispatch_workflow(
 
         attempted = time_fn()
         receipt["dispatch_attempted_at_unix"] = attempted
+        receipt["dispatch_attempt_id"] = uuid.uuid4().hex
+        try:
+            in_flight = _write_receipt(
+                directory,
+                {
+                    **receipt,
+                    "result_code": "dispatch_in_flight",
+                    "effect_state": "unknown",
+                    "completed_at_unix": None,
+                },
+            )
+            _write_active_attempt(directory, in_flight)
+        except (DispatchError, OSError):
+            return _finish(
+                directory,
+                receipt,
+                "dispatch_journal_failed",
+                "unknown",
+                time_fn(),
+            )
         post, status = _post(
             runner,
             directory,
@@ -945,6 +1095,7 @@ def dispatch_workflow(
                 "not_started",
                 time_fn(),
                 status=status,
+                clear_active=True,
             )
 
         run, state, error = _readback(
@@ -988,6 +1139,7 @@ def dispatch_workflow(
                 time_fn(),
                 status=status,
                 run=run,
+                clear_active=True,
             )
         if state == "ambiguous":
             return _finish(
