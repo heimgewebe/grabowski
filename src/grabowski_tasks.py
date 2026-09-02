@@ -11673,7 +11673,8 @@ def _chronik_history_event_matches_query(
     *,
     since_timestamp: datetime | None,
 ) -> bool:
-    if event.get("schema_version") != "agent-run-event.v0":
+    schema_version = event.get("schema_version")
+    if schema_version not in {"agent-run-event.v0", "agent-run-event.v1"}:
         return False
     source = event.get("source")
     if (
@@ -11682,11 +11683,21 @@ def _chronik_history_event_matches_query(
         or source.get("component") != "grabowski"
     ):
         return False
-    if event.get("kind") not in {
+    allowed_kinds = {
         "agent.run.started",
         "agent.run.completed",
         "agent.run.blocked",
-    }:
+    }
+    if schema_version == "agent-run-event.v1":
+        allowed_kinds.update(
+            {
+                "agent.run.failed",
+                "agent.run.cancelled",
+                "agent.run.timed_out",
+                "agent.run.signalled",
+            }
+        )
+    if event.get("kind") not in allowed_kinds:
         return False
     if event.get("event_id") != chronik.event_id(event):
         return False

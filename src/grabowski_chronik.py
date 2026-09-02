@@ -721,8 +721,10 @@ def classify(state: str) -> tuple[str, dict[str, Any]] | None:
         return "agent.run.started", {"result": "started"}
     if state == "completed":
         return "agent.run.completed", {"result": "completed"}
-    if state in TERMINAL:
-        return "agent.run.blocked", {"result": "blocked", "blocker_code": f"task-{state.replace('_', '-')}"}
+    if state in {"failed", "cancelled", "timed_out", "signalled"}:
+        return f"agent.run.{state}", {"result": state}
+    if state == "outcome_unknown":
+        return "agent.run.blocked", {"result": "blocked", "blocker_code": "task-outcome-unknown"}
     return None
 
 
@@ -762,7 +764,7 @@ def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:
     context = _context(record)
     data = {**data, "operation": context["operation"], "task_class": context["task_class"]}
     event = {
-        "schema_version": "agent-run-event.v0",
+        "schema_version": "agent-run-event.v1",
         "kind": kind,
         "ts": _event_timestamp(record, state),
         "source": {"repo": "heimgewebe/grabowski", "component": "grabowski", "run_id": rid},
@@ -940,12 +942,22 @@ _EVENT_TASK_CLASSES = frozenset(
         "other",
     }
 )
-_EVENT_BLOCKER_CODES = frozenset(
+_V0_EVENT_BLOCKER_CODES = frozenset(
     {"task-failed", "task-cancelled", "task-timed-out", "task-signalled", "task-outcome-unknown"}
 )
-_EVENT_KIND_RESULT = {
+_V1_EVENT_BLOCKER_CODES = frozenset({"task-outcome-unknown"})
+_V0_EVENT_KIND_RESULT = {
     "agent.run.started": "started",
     "agent.run.completed": "completed",
+    "agent.run.blocked": "blocked",
+}
+_V1_EVENT_KIND_RESULT = {
+    "agent.run.started": "started",
+    "agent.run.completed": "completed",
+    "agent.run.failed": "failed",
+    "agent.run.cancelled": "cancelled",
+    "agent.run.timed_out": "timed_out",
+    "agent.run.signalled": "signalled",
     "agent.run.blocked": "blocked",
 }
 _RUN_ID_PATTERN = re.compile(r"task-([0-9a-f]{24})-a([1-9][0-9]*)\Z")
@@ -953,13 +965,20 @@ _EVENT_TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
 
 def _validate_agent_run_event_shape(event: Any, *, label: str) -> None:
-    """Reject anything that is not exactly the agent-run-event.v0 shape Grabowski emits."""
+    """Validate current v1 events while retaining exact legacy v0 readability."""
     if not isinstance(event, dict) or set(event) != _EVENT_TOP_LEVEL_KEYS:
         raise ValueError(f"{label} has invalid fields")
-    if event.get("schema_version") != "agent-run-event.v0":
+    schema_version = event.get("schema_version")
+    if schema_version == "agent-run-event.v0":
+        kind_results = _V0_EVENT_KIND_RESULT
+        blocker_codes = _V0_EVENT_BLOCKER_CODES
+    elif schema_version == "agent-run-event.v1":
+        kind_results = _V1_EVENT_KIND_RESULT
+        blocker_codes = _V1_EVENT_BLOCKER_CODES
+    else:
         raise ValueError(f"{label} has invalid schema")
     kind = event.get("kind")
-    if kind not in _EVENT_KIND_RESULT:
+    if kind not in kind_results:
         raise ValueError(f"{label} has unsupported kind")
     ts = event.get("ts")
     if not isinstance(ts, str) or not _EVENT_TIMESTAMP_PATTERN.match(ts):
@@ -1028,7 +1047,7 @@ def _validate_agent_run_event_shape(event: Any, *, label: str) -> None:
     ]:
         raise ValueError(f"{label} has invalid evidence refs")
     data = event.get("data")
-    expected_result = _EVENT_KIND_RESULT[kind]
+    expected_result = kind_results[kind]
     if (
         not isinstance(data, dict)
         or set(data) - _EVENT_DATA_KEYS
@@ -1039,7 +1058,7 @@ def _validate_agent_run_event_shape(event: Any, *, label: str) -> None:
         raise ValueError(f"{label} has invalid data")
     if expected_result == "blocked":
         blocker_code = data.get("blocker_code")
-        if blocker_code not in _EVENT_BLOCKER_CODES:
+        if blocker_code not in blocker_codes:
             raise ValueError(f"{label} has an invalid blocker code")
     elif "blocker_code" in data:
         raise ValueError(f"{label} has an unexpected blocker code")
