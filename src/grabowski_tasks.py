@@ -942,6 +942,8 @@ TASK_STATES = {
     "outcome_unknown",
     "interrupted",
 }
+CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY = "_chronik_retained_source_expected_v1"
+CHRONIK_RETAINED_SOURCE_EXPECTATION_SCHEMA_VERSION = 1
 TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
     # "active" is current execution truth, not retained recovery history.
     "active": ("launching", "running"),
@@ -6490,12 +6492,81 @@ def _task_systemd_unit_health(
     return {"status": "unknown", "reason": "unexpected_systemd_load_state", **health}
 
 
+def _chronik_retained_source_expectations(record: dict[str, Any]) -> list[dict[str, Any]]:
+    if not bool(record.get("chronik_outbox_enabled")):
+        return []
+    launcher_raw = record.get("launcher_json")
+    if not isinstance(launcher_raw, str):
+        raise RuntimeError("Stored task launcher is invalid")
+    launcher = json.loads(launcher_raw)
+    if not isinstance(launcher, dict):
+        raise RuntimeError("Stored task launcher is invalid")
+    marker = launcher.get(CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY)
+    if marker is None:
+        # Backward-compatible proof for attempts created before the sticky marker:
+        # an ambiguous launcher result necessarily entered outcome_unknown, whose
+        # Chronik blocked event is always retained when the outbox is enabled.
+        if launcher.get("outcome_unknown") is not True:
+            return []
+        markers: list[Any] = [
+            {
+                "schema_version": CHRONIK_RETAINED_SOURCE_EXPECTATION_SCHEMA_VERSION,
+                "attempt": int(record["attempt"]),
+                "run_id": chronik.run_id(record),
+                "event_kind": "agent.run.blocked",
+            }
+        ]
+    elif isinstance(marker, dict):
+        # Accept the first PR revision's scalar marker so already-persisted rows
+        # remain auditable after upgrading to the per-attempt representation.
+        markers = [marker]
+    elif isinstance(marker, list):
+        markers = marker
+    else:
+        raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
+
+    expectations: list[dict[str, Any]] = []
+    seen_attempts: set[int] = set()
+    for item in markers:
+        if not isinstance(item, dict):
+            raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
+        marker_attempt = item.get("attempt")
+        if (
+            isinstance(marker_attempt, bool)
+            or not isinstance(marker_attempt, int)
+            or marker_attempt < 1
+            or marker_attempt in seen_attempts
+        ):
+            raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
+        expected_record = {**record, "attempt": marker_attempt}
+        expected = {
+            "schema_version": CHRONIK_RETAINED_SOURCE_EXPECTATION_SCHEMA_VERSION,
+            "attempt": marker_attempt,
+            "run_id": chronik.run_id(expected_record),
+            "event_kind": "agent.run.blocked",
+        }
+        if item != expected:
+            raise RuntimeError("Stored task Chronik retained-source expectation is invalid")
+        seen_attempts.add(marker_attempt)
+        expectations.append(dict(item))
+    expectations.sort(key=lambda item: int(item["attempt"]))
+    return expectations
+
+
+def _chronik_retained_source_expected(record: dict[str, Any]) -> bool:
+    return bool(_chronik_retained_source_expectations(record))
+
+
 def _public(record: dict[str, Any]) -> dict[str, Any]:
     last_observation = (
         json.loads(record["last_observation_json"])
         if record["last_observation_json"]
         else None
     )
+    launcher = json.loads(record["launcher_json"])
+    if not isinstance(launcher, dict):
+        raise RuntimeError("Stored task launcher is invalid")
+    launcher.pop(CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY, None)
     return {
         "task_id": record["task_id"],
         "host": record["host"],
@@ -6515,7 +6586,7 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         "memory_max_bytes": record["memory_max_bytes"],
         "created_at_unix": record["created_at_unix"],
         "updated_at_unix": record["updated_at_unix"],
-        "launcher": json.loads(record["launcher_json"]),
+        "launcher": launcher,
         "last_observation": last_observation,
         "systemd_unit_health": _task_systemd_unit_health(
             str(record["state"]), last_observation
@@ -7080,6 +7151,17 @@ def _set_state(
     if _is_terminal_state(current["state"]):
         recovered = _recover_task_terminalization(identifier)
         return recovered if recovered is not None else _row_raw(identifier)
+    retained_source_expectations: list[dict[str, Any]] = []
+    if bool(current.get("chronik_outbox_enabled")):
+        retained_source_expectations = _chronik_retained_source_expectations(current)
+        if launcher is not None:
+            selected_launcher = dict(launcher)
+            selected_launcher.pop(CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY, None)
+            if retained_source_expectations:
+                selected_launcher[CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY] = [
+                    dict(item) for item in retained_source_expectations
+                ]
+            launcher = selected_launcher
     if _is_terminal_state(state):
         projection_launcher = launcher
         selected_launcher = (
@@ -7127,6 +7209,37 @@ def _set_state(
             observation_sha256=_sha256_json(observation_material),
         )
         return _apply_terminalization_projection(terminalization)
+    if state == "outcome_unknown" and bool(current.get("chronik_outbox_enabled")):
+        current_attempt = int(current["attempt"])
+        selected_attempt = current_attempt if attempt is None else int(attempt)
+        selected_launcher = (
+            dict(launcher)
+            if launcher is not None
+            else json.loads(str(current["launcher_json"]))
+        )
+        if not isinstance(selected_launcher, dict):
+            raise RuntimeError("Stored task launcher is invalid")
+        marker_record = {**current, "attempt": selected_attempt}
+        marker = {
+            "schema_version": CHRONIK_RETAINED_SOURCE_EXPECTATION_SCHEMA_VERSION,
+            "attempt": selected_attempt,
+            "run_id": chronik.run_id(marker_record),
+            "event_kind": "agent.run.blocked",
+        }
+        by_attempt = {
+            int(item["attempt"]): dict(item) for item in retained_source_expectations
+        }
+        existing_marker = by_attempt.get(selected_attempt)
+        if existing_marker is not None and existing_marker != marker:
+            raise RuntimeError(
+                "Stored task Chronik retained-source expectation conflicts with attempt"
+            )
+        by_attempt[selected_attempt] = marker
+        selected_launcher[CHRONIK_RETAINED_SOURCE_EXPECTATION_KEY] = [
+            by_attempt[key] for key in sorted(by_attempt)
+        ]
+        launcher = selected_launcher
+
     updates = ["state=?", "updated_at_unix=?"]
     values: list[Any] = [state, _now()]
     if launcher is not None:

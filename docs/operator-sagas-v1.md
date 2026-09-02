@@ -231,6 +231,14 @@ PR #1026 itself is not promoted to the final PR pilot because the historical pla
 
 This documentation-only change is the final fresh PR-settlement target. After CI/review and base convergence, its exact PR head/base/diff receives a new plan and durable run reference; no identity-changing action is allowed afterward. Captain merge and `saga-settle` must complete in that same frozen identity window. Only the resulting settled merge commit may be used for one final runtime-deployment Saga and reference-based settlement. The missing durable reconstruction of historical PR plan inputs is tracked separately and does not weaken the current settlement contract.
 
+### Final protected pilot reset — 2026-09-02
+
+PR #1029 preserved the intended exact head `329ba95fbad93fd06ec39c84af84f1117660da15` on base `49e78e25a6a329959157bfb04bb5dd1078353153` and merged as `d5b2ce89205657e52cb73820df8a285f07531ae0`, but the verified Grabowski audit chain contains no Captain or Saga record bound to either exact identity. The merge is therefore useful historical evidence only and is not promoted to the final PR-settlement pilot. No completed merge is replayed solely to manufacture acceptance.
+
+This documentation-only change is the next and final protected pilot target, created from the then-current protected `main`. It remains draft while CI and review converge. Immediately before the Saga run, the PR must be non-draft, mergeable, current with `main`, and bound to one exact head/base/diff plus a passing high-critical self-review audit. `saga-plan` and durable `saga-run` then freeze that identity. From that point until Captain completion no branch, base, diff or review-bound identity may change.
+
+Only a verified Captain merge and reference-based `saga-settle == settled` for that frozen identity establish pilot 1. The exact resulting merge commit must still be current protected `main` when pilot 2 starts; otherwise the attempt stops rather than deploying an older repository state. Pilot 2 then requires its own fresh runtime-deployment plan and durable run reference, Captain deployment of exactly that merge commit, authoritative deployment-identity convergence and reference-based `saga-settle == settled`.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
