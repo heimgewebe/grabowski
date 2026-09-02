@@ -10175,6 +10175,23 @@ def _operational_guidance_runbook_from_result(
     }, None
 
 
+def _operational_guidance_hit_start_line(row: dict[str, Any]) -> int | None:
+    candidates: list[Any] = [
+        row,
+        _repoground_range_identity_from_hit(row),
+        row.get("source_range"),
+        row.get("resolved_range"),
+        row.get("range"),
+    ]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        value = candidate.get("start_line")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+            return value
+    return None
+
+
 def _operational_guidance_discover_repo(
     repo: str,
     *,
@@ -10216,8 +10233,7 @@ def _operational_guidance_discover_repo(
             "errors": [str(raw.get("reason") or raw.get("error_code") or "RepoGround query unavailable")],
             "examined_count": 0,
         }
-    query_result = raw.get("query_result") if isinstance(raw.get("query_result"), dict) else {}
-    results = query_result.get("results") if isinstance(query_result.get("results"), list) else []
+    results, _result_shape = _repoground_extract_query_hits(raw)
     results = results[: (1 if exact_path else max_candidates)]
     examined_count = len(results)
     runbooks: list[dict[str, Any]] = []
@@ -10231,7 +10247,7 @@ def _operational_guidance_discover_repo(
             continue
         if exact_path is not None and path != exact_path:
             continue
-        if row.get("start_line") != 1:
+        if _operational_guidance_hit_start_line(row) != 1:
             continue
         try:
             path = _operational_guidance_path(path)
@@ -10424,6 +10440,7 @@ def grabowski_operational_guidance(
     mode = "explicit" if guidance_refs else "automatic"
 
     if guidance_refs:
+        seen_explicit_refs: set[tuple[str, str]] = set()
         for ref in guidance_refs:
             if not isinstance(ref, dict) or set(ref) != {"repo", "path"}:
                 diagnostics.append("guidance_ref must contain exactly repo and path")
@@ -10434,6 +10451,10 @@ def grabowski_operational_guidance(
             except (TypeError, ValueError) as exc:
                 diagnostics.append(str(exc))
                 continue
+            ref_identity = (repo, path)
+            if ref_identity in seen_explicit_refs:
+                continue
+            seen_explicit_refs.add(ref_identity)
             result = _operational_guidance_discover_repo(repo, exact_path=path)
             candidates = result.get("runbooks") if isinstance(result.get("runbooks"), list) else []
             if len(candidates) != 1:

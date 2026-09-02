@@ -597,6 +597,82 @@ class OperationalGuidanceReviewRegressionTests(unittest.TestCase):
         self.assertLessEqual(max(calls), mcp._OPERATIONAL_GUIDANCE_MAX_RESULTS_PER_REPO)
         self.assertTrue(any("global 24-candidate budget" in item for item in result["diagnostics"]))
 
+    def test_discovery_accepts_all_canonical_repoground_result_shapes(self) -> None:
+        hit = {
+            "source_path": "docs/runbooks/windows.md",
+            "range_ref": {"content_sha256": "c" * 64, "start_line": 1, "end_line": 20},
+            "final_score": 0.5,
+        }
+        freshness = {
+            "freshness_status": "fresh",
+            "bundle": {"git_commit": "a" * 40, "manifest_sha256": "b" * 64},
+        }
+        shapes = [
+            {"status": "available", "results": [hit]},
+            {"status": "available", "resolved_evidence": {"hits": [hit]}},
+            {"status": "available", "query_result": [hit]},
+            {"status": "available", "query_result": {"results": [hit]}},
+        ]
+        for payload in shapes:
+            with self.subTest(payload=payload), mock.patch.object(
+                mcp, "_repoground_selected_manifest_for_repo",
+                return_value=(freshness, "fixture", Path("/tmp/manifest.json"), None),
+            ), mock.patch.object(
+                mcp, "_repoground_query_existing_index", return_value=payload,
+            ), mock.patch.object(
+                mcp, "_repoground_range_get", return_value={"range": {"text": VALID_FRONTMATTER}},
+            ):
+                result = mcp._operational_guidance_discover_repo("heimgewebe/example")
+            self.assertEqual(len(result["runbooks"]), 1)
+
+    def test_discovery_accepts_start_line_from_supported_range_shapes(self) -> None:
+        freshness = {
+            "freshness_status": "fresh",
+            "bundle": {"git_commit": "a" * 40, "manifest_sha256": "b" * 64},
+        }
+        variants = [
+            {"range_ref": {"content_sha256": "c" * 64, "start_line": 1}},
+            {"source_range": {"start_line": 1}, "range_ref": {"content_sha256": "c" * 64}},
+            {"resolved_range": {"start_line": 1}, "range_ref": {"content_sha256": "c" * 64}},
+        ]
+        for variant in variants:
+            hit = {"source_path": "docs/runbooks/windows.md", "final_score": 0.5, **variant}
+            with self.subTest(variant=variant), mock.patch.object(
+                mcp, "_repoground_selected_manifest_for_repo",
+                return_value=(freshness, "fixture", Path("/tmp/manifest.json"), None),
+            ), mock.patch.object(
+                mcp, "_repoground_query_existing_index",
+                return_value={"status": "available", "results": [hit]},
+            ), mock.patch.object(
+                mcp, "_repoground_range_get", return_value={"range": {"text": VALID_FRONTMATTER}},
+            ):
+                result = mcp._operational_guidance_discover_repo("heimgewebe/example")
+            self.assertEqual(len(result["runbooks"]), 1)
+
+    def test_duplicate_explicit_refs_do_not_create_false_ambiguity(self) -> None:
+        item = candidate("one", repo="heimgewebe/example")
+        item["path"] = "docs/runbooks/windows.md"
+        item["source"]["repo"] = "heimgewebe/example"
+        item["source"]["path"] = "docs/runbooks/windows.md"
+        item["semantic_score"] = 0.5
+        with mock.patch.object(
+            mcp, "_operational_guidance_discover_repo",
+            return_value={"runbooks": [item], "errors": []},
+        ) as discover:
+            result = mcp.grabowski_operational_guidance(
+                operation="ssh_diagnostics",
+                platforms=["windows"],
+                components=["tailscale"],
+                symptoms=["ssh_timeout"],
+                guidance_refs=[
+                    {"repo": "heimgewebe/example", "path": "docs/runbooks/windows.md"},
+                    {"repo": "heimgewebe/example", "path": "docs/runbooks/windows.md"},
+                ],
+            )
+        self.assertNotEqual(result["status"], "ambiguous")
+        self.assertEqual(len(result["guidance"]), 1)
+        discover.assert_called_once()
+
     def test_published_operational_runbook_contract_tracks_validator_surface(self) -> None:
         contract = json.loads((ROOT / "contracts/operational-runbook.v1.json").read_text(encoding="utf-8"))
         self.assertEqual(contract["$id"], "operational-runbook.v1")
