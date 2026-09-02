@@ -403,15 +403,30 @@ def _unresolved(
                     pass
                 return None, None
         return active, None
+    terminal_attempt_ids: set[str] = set()
     for receipt in reversed(receipts):
+        attempt_id = receipt.get("dispatch_attempt_id")
+        valid_attempt_id = (
+            isinstance(attempt_id, str)
+            and _ATTEMPT_ID_RE.fullmatch(attempt_id) is not None
+        )
+        if (
+            receipt.get("effect_state") in {"observed", "not_started"}
+            and receipt.get("completed_at_unix") is not None
+        ):
+            if valid_attempt_id:
+                terminal_attempt_ids.add(attempt_id)
+            if receipt.get("effect_state") == "observed":
+                return None, None
+            continue
         if (
             receipt.get("effect_state") == "unknown"
             and receipt.get("run") is None
             and receipt.get("result_code") in _UNRESOLVED_DISPATCH_CODES
         ):
+            if valid_attempt_id and attempt_id in terminal_attempt_ids:
+                continue
             return receipt, None
-        if receipt.get("effect_state") == "observed":
-            return None, None
     return None, None
 
 
@@ -650,6 +665,7 @@ def _readback(
     head: str,
     baseline: set[int],
     attempted_at: float,
+    observation_deadline: float,
     attempts: int,
     sleep: Sleep,
     time_fn: TimeFn,
@@ -662,7 +678,7 @@ def _readback(
             return None, "failed", error
         assert rows is not None
         lower = attempted_at - RUN_SKEW_SECONDS
-        upper = time_fn() + RUN_FUTURE_SECONDS
+        upper = observation_deadline
         matches = []
         for run in rows:
             created = _created_at(run["created_at"])
@@ -776,6 +792,7 @@ def _receipt(
         "started_at_unix": started,
         "dispatch_attempt_id": None,
         "dispatch_attempted_at_unix": None,
+        "dispatch_observation_deadline_unix": None,
         "completed_at_unix": None,
         "result_code": None,
         "effect_state": "not_started",
@@ -978,6 +995,7 @@ def dispatch_workflow(
         if prior is not None:
             prior_baseline = prior.get("baseline_run_ids")
             attempted = prior.get("dispatch_attempted_at_unix")
+            prior_deadline = prior.get("dispatch_observation_deadline_unix")
             prior_attempt_id = prior.get("dispatch_attempt_id")
             if (
                 not isinstance(prior_baseline, list)
@@ -1004,9 +1022,26 @@ def dispatch_workflow(
                     "unknown",
                     time_fn(),
                 )
+            attempted = float(attempted)
+            if prior_deadline is None:
+                prior_deadline = attempted + RUN_FUTURE_SECONDS
+            if (
+                not isinstance(prior_deadline, (int, float))
+                or isinstance(prior_deadline, bool)
+                or float(prior_deadline) < attempted
+            ):
+                return _finish(
+                    directory,
+                    receipt,
+                    "prior_ambiguous_receipt_invalid",
+                    "unknown",
+                    time_fn(),
+                )
+            observation_deadline = float(prior_deadline)
             if isinstance(prior_attempt_id, str):
                 receipt["dispatch_attempt_id"] = prior_attempt_id
-            receipt["dispatch_attempted_at_unix"] = float(attempted)
+            receipt["dispatch_attempted_at_unix"] = attempted
+            receipt["dispatch_observation_deadline_unix"] = observation_deadline
             receipt["baseline_run_ids"] = list(prior_baseline)
             run, state, error = _readback(
                 runner,
@@ -1016,7 +1051,8 @@ def dispatch_workflow(
                 ref=ref,
                 head=head,
                 baseline=set(prior_baseline),
-                attempted_at=float(attempted),
+                attempted_at=attempted,
+                observation_deadline=observation_deadline,
                 attempts=poll_attempts,
                 sleep=sleep,
                 time_fn=time_fn,
@@ -1051,7 +1087,9 @@ def dispatch_workflow(
             )
 
         attempted = time_fn()
+        observation_deadline = attempted + RUN_FUTURE_SECONDS
         receipt["dispatch_attempted_at_unix"] = attempted
+        receipt["dispatch_observation_deadline_unix"] = observation_deadline
         receipt["dispatch_attempt_id"] = uuid.uuid4().hex
         try:
             in_flight = _write_receipt(
@@ -1069,8 +1107,9 @@ def dispatch_workflow(
                 directory,
                 receipt,
                 "dispatch_journal_failed",
-                "unknown",
+                "not_started",
                 time_fn(),
+                clear_active=True,
             )
         post, status = _post(
             runner,
@@ -1105,6 +1144,7 @@ def dispatch_workflow(
             head=head,
             baseline=baseline,
             attempted_at=attempted,
+            observation_deadline=observation_deadline,
             attempts=poll_attempts,
             sleep=sleep,
             time_fn=time_fn,
