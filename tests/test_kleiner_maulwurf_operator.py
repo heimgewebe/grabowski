@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from pathlib import Path
 import struct
 import sys
@@ -49,6 +50,17 @@ class TestKleinerMaulwurfOperator(unittest.TestCase):
             self.assertEqual(before_tools, set(mole.operator.mcp._tool_manager._tools))
         finally:
             server.icons = original_icons
+
+    def test_runtime_contract_installs_mole_entrypoint(self) -> None:
+        contract = json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text())
+        sources = {
+            item["module"]: item["source"]
+            for item in contract["supporting_sources"]
+        }
+        self.assertEqual(
+            "src/kleiner_maulwurf_operator.py",
+            sources.get("kleiner_maulwurf_operator"),
+        )
 
     def test_main_configures_icon_before_running_operator(self) -> None:
         calls: list[str] = []
