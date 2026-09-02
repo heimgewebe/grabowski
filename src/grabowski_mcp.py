@@ -1604,9 +1604,11 @@ def _normalize_captain_transport_integer_fields(value: Any) -> Any:
         (
             "schema_version",
             "pr",
+            "review_policy_version",
             "actual_review_iterations",
             "minimum_review_iterations",
             "finding_count",
+            "material_findings_after_first_review",
             "material_findings_remaining",
         ),
     )

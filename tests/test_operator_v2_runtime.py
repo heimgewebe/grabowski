@@ -790,11 +790,27 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             },
             "review_evidence": {
                 "schema_version": 1,
+                "kind": "grabowski_self_review_audit",
+                "generated_at": "2026-09-02T20:00:00+00:00",
+                "repo": "heimgewebe/bureau",
                 "pr": 2237,
-                "actual_review_iterations": 6,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "review_policy_version": 1,
+                "diff_sha256": "c" * 64,
+                "review_tier": "high_critical",
                 "minimum_review_iterations": 5,
-                "finding_count": 0,
+                "actual_review_iterations": 6,
+                "all_findings_triaged": True,
+                "finding_count": 1,
+                "material_findings_after_first_review": 1,
                 "material_findings_remaining": 0,
+                "uncertainty": 0.25,
+                "residual_risk_accepted": False,
+                "residual_risk_reason": "",
+                "gate_verdict": "PASS",
+                "self_review_gate_valid": True,
+                "tuning_signal": "observe",
             },
             "codex_review_evidence": {
                 "schema_version": 1,
@@ -829,6 +845,11 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         self.assertIsInstance(normalized["status_projection"]["measurement"], float)
         self.assertIsInstance(normalized["actions"][0]["target"]["pr"], int)
         self.assertIsInstance(normalized["codex_review_evidence"]["finding_count"], int)
+        self.assertIsInstance(normalized["review_evidence"]["review_policy_version"], int)
+        self.assertIsInstance(
+            normalized["review_evidence"]["material_findings_after_first_review"], int
+        )
+        self.assertIsInstance(normalized["review_evidence"]["uncertainty"], float)
         self.assertIsInstance(normalized["execution_intent"]["context"]["pr"], float)
         self.assertEqual(1.0, normalized["execution_intent"]["context"]["pr"])
 
