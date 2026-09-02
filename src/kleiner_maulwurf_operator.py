@@ -5,9 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 
-from mcp.types import Icon
-
-import grabowski_operator as operator
 
 
 ICON_MIME_TYPE = "image/png"
@@ -2375,28 +2372,19 @@ def icon_data_uri() -> str:
     return f"data:{ICON_MIME_TYPE};base64,{ICON_DATA_B64}"
 
 
-def configure_kleiner_maulwurf_icon() -> Icon:
-    """Attach the deployment-specific icon to the MCP server implementation."""
 
-    low_level_server = getattr(operator.mcp, "_mcp_server", None)
-    if low_level_server is None or not hasattr(low_level_server, "icons"):
-        raise RuntimeError("FastMCP low-level Server.icons support is unavailable")
+def mcp_icons():
+    """Return the Kleiner-Maulwurf MCP implementation icon via the public MCP Icon type."""
 
-    icon = Icon(
-        src=icon_data_uri(),
-        mimeType=ICON_MIME_TYPE,
-        sizes=[ICON_SIZE],
-    )
-    low_level_server.icons = [icon]
-    if operator.mcp.icons != [icon]:
-        raise RuntimeError("FastMCP icon readback did not match configured icon")
-    return icon
+    try:
+        from mcp.types import Icon
+    except ImportError as exc:
+        raise RuntimeError("MCP Icon support is unavailable") from exc
 
-
-def main() -> None:
-    configure_kleiner_maulwurf_icon()
-    operator.main()
-
-
-if __name__ == "__main__":
-    main()
+    return [
+        Icon(
+            src=icon_data_uri(),
+            mimeType=ICON_MIME_TYPE,
+            sizes=[ICON_SIZE],
+        )
+    ]

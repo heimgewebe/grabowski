@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import struct
 import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import kleiner_maulwurf_operator as mole
+
+
+class _TestIcon:
+    def __init__(self, *, src: str, mimeType: str | None = None, sizes=None):
+        self.src = src
+        self.mimeType = mimeType
+        self.sizes = sizes
 
 
 class TestKleinerMaulwurfOperator(unittest.TestCase):
@@ -38,20 +46,39 @@ class TestKleinerMaulwurfOperator(unittest.TestCase):
         decoded = base64.b64decode(uri.removeprefix(prefix), validate=True)
         self.assertEqual(mole.ICON_SHA256, hashlib.sha256(decoded).hexdigest())
 
-    def test_configure_sets_server_info_icon_without_changing_tools(self) -> None:
-        server = mole.operator.mcp._mcp_server
-        original_icons = server.icons
-        before_tools = set(mole.operator.mcp._tool_manager._tools)
-        try:
-            icon = mole.configure_kleiner_maulwurf_icon()
-            self.assertEqual([icon], mole.operator.mcp.icons)
-            self.assertEqual("image/png", icon.mimeType)
-            self.assertEqual(["512x512"], icon.sizes)
-            self.assertEqual(before_tools, set(mole.operator.mcp._tool_manager._tools))
-        finally:
-            server.icons = original_icons
+    def test_mcp_icons_uses_public_icon_type(self) -> None:
+        fake_mcp = types.ModuleType("mcp")
+        fake_types = types.ModuleType("mcp.types")
+        fake_types.Icon = _TestIcon
+        fake_mcp.types = fake_types
 
-    def test_runtime_contract_installs_mole_entrypoint(self) -> None:
+        with patch.dict(sys.modules, {"mcp": fake_mcp, "mcp.types": fake_types}):
+            icons = mole.mcp_icons()
+
+        self.assertEqual(1, len(icons))
+        icon = icons[0]
+        self.assertEqual("image/png", icon.mimeType)
+        self.assertEqual(["512x512"], icon.sizes)
+        self.assertEqual(mole.icon_data_uri(), icon.src)
+
+    def test_branding_provider_uses_no_private_fastmcp_state(self) -> None:
+        source = (SRC / "kleiner_maulwurf_operator.py").read_text(encoding="utf-8")
+        self.assertNotIn("_mcp_server", source)
+        self.assertNotIn("grabowski_operator", source)
+
+    def test_core_selects_branding_at_public_fastmcp_constructor(self) -> None:
+        source = (SRC / "grabowski_mcp.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'MCP_BRANDING_VARIANT_ENV = "GRABOWSKI_MCP_BRANDING_VARIANT"',
+            source,
+        )
+        self.assertIn('variant != "kleiner-maulwurf"', source)
+        self.assertIn(
+            "FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS, icons=_configured_icons)",
+            source,
+        )
+
+    def test_runtime_contract_installs_branding_provider(self) -> None:
         contract = json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text())
         sources = {
             item["module"]: item["source"]
@@ -61,24 +88,6 @@ class TestKleinerMaulwurfOperator(unittest.TestCase):
             "src/kleiner_maulwurf_operator.py",
             sources.get("kleiner_maulwurf_operator"),
         )
-
-    def test_main_configures_icon_before_running_operator(self) -> None:
-        calls: list[str] = []
-        with (
-            patch.object(
-                mole,
-                "configure_kleiner_maulwurf_icon",
-                side_effect=lambda: calls.append("configure"),
-            ),
-            patch.object(
-                mole.operator,
-                "main",
-                side_effect=lambda: calls.append("main"),
-            ),
-        ):
-            mole.main()
-
-        self.assertEqual(["configure", "main"], calls)
 
 
 if __name__ == "__main__":
