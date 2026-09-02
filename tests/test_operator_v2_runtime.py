@@ -774,6 +774,142 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     }
                 )
 
+    def test_captain_transport_normalizes_only_contract_integer_fields(self) -> None:
+        canonical = {
+            "actions": [
+                {
+                    "target": {"repo": "heimgewebe/bureau", "pr": 2237},
+                    "scope": {"max_targets": 1},
+                }
+            ],
+            "status_projection": {
+                "schema_version": 1,
+                "pull_request": 2237,
+                "unresolved_review_threads": 0,
+                "measurement": 1.0,
+            },
+            "review_evidence": {
+                "schema_version": 1,
+                "pr": 2237,
+                "actual_review_iterations": 6,
+                "minimum_review_iterations": 5,
+                "finding_count": 0,
+                "material_findings_remaining": 0,
+            },
+            "codex_review_evidence": {
+                "schema_version": 1,
+                "pr": 2237,
+                "exit_code": 0,
+                "finding_count": 18,
+                "completion": {"comment_id": 5514070466, "review_id": None},
+                "policy": {"minimum_self_review_iterations": 5},
+            },
+            "execution_intent": {
+                "schema_version": 1,
+                "context": {"pr": 1.0, "measurement": 2.0},
+            },
+        }
+
+        def transported(value):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int):
+                return float(value)
+            if isinstance(value, list):
+                return [transported(item) for item in value]
+            if isinstance(value, dict):
+                return {key: transported(item) for key, item in value.items()}
+            return value
+
+        normalized = grabowski_mcp._normalize_captain_transport_integer_fields(
+            transported(canonical)
+        )
+
+        self.assertEqual(canonical, normalized)
+        self.assertIsInstance(normalized["status_projection"]["measurement"], float)
+        self.assertIsInstance(normalized["actions"][0]["target"]["pr"], int)
+        self.assertIsInstance(normalized["codex_review_evidence"]["finding_count"], int)
+        self.assertIsInstance(normalized["execution_intent"]["context"]["pr"], float)
+        self.assertEqual(1.0, normalized["execution_intent"]["context"]["pr"])
+
+        invalid = grabowski_mcp._normalize_captain_transport_integer_fields(
+            {"pr": 2237.5, "schema_version": float("inf")}
+        )
+        self.assertEqual(2237.5, invalid["pr"])
+        self.assertEqual(float("inf"), invalid["schema_version"])
+
+    def test_captain_run_normalizes_transport_pr_before_dispatch(self) -> None:
+        parameters = {
+            "actions": [
+                {
+                    "action": "pr-merge",
+                    "target": {
+                        "repo": "heimgewebe/bureau",
+                        "pr": 2237.0,
+                        "base": "main",
+                    },
+                    "scope": {"max_targets": 1.0},
+                }
+            ],
+            "status_projection": {
+                "schema_version": 1.0,
+                "pull_request": 2237.0,
+                "measurement": 1.0,
+            },
+            "session_escalation": {
+                "target": {"repo": "heimgewebe/bureau"},
+                "reason": "bounded transport normalization test",
+                "expires_at_unix": float(int(__import__("time").time()) + 60),
+                "recovery": {"plan": "no mutation in this unit test"},
+            },
+        }
+
+        class Session:
+            pass
+
+        class RequestContext:
+            session = Session()
+
+        decision = {
+            "allowed": True,
+            "session_profile": {"profile": "test"},
+        }
+        with (
+            patch.object(grabowski_mcp, "_require_capability"),
+            patch.object(
+                grabowski_mcp.grabowski_grips,
+                "grip_required_capability",
+                return_value="terminal_execute",
+            ),
+            patch.object(
+                grabowski_mcp, "_session_grip_policy_decision", return_value=decision
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_captain_audit_intent",
+                return_value={"audit_record_sha256": "a" * 64},
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_captain_audit_completion",
+                return_value={"audit_record_sha256": "b" * 64},
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_grips, "grip_run", return_value={"ok": True}
+            ) as run,
+        ):
+            result = grabowski_mcp.grip_run(
+                "captain-run", parameters, ctx=RequestContext()
+            )
+
+        self.assertEqual({"ok": True}, result)
+        dispatched = run.call_args.args[1]
+        self.assertEqual(2237, dispatched["actions"][0]["target"]["pr"])
+        self.assertIsInstance(dispatched["actions"][0]["target"]["pr"], int)
+        self.assertEqual(1, dispatched["actions"][0]["scope"]["max_targets"])
+        self.assertIsInstance(dispatched["status_projection"]["measurement"], float)
+        self.assertNotIn("session_escalation", dispatched)
+
     def test_high_risk_grip_requires_explicit_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
