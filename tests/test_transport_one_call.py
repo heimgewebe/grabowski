@@ -905,6 +905,8 @@ class OperatorSignedTransportTests(unittest.TestCase):
         unsafe_calls = [
             {"arguments": ["pr", "merge", "734"]},
             {"arguments": ["pr", "view", "734", "--web"]},
+            {"arguments": ["pr", "view", "734", "-w"]},
+            {"arguments": ["pr", "view", "734", "--web=true"]},
             {"arguments": ["pr", "view", "734", "--jq", ".number"]},
             {"arguments": ["pr", "view", "734", "--template", "{{.number}}"]},
             {"arguments": ["pr", "view", "734", "--future-mutate"]},
