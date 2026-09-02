@@ -1535,6 +1535,16 @@ TOOL_PROFILES.update(
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
+        },
+        "grabowski_operational_guidance": {
+            "category": "knowledge",
+            "purpose": (
+                "Return bounded, source-cited operational runbook guidance in shadow mode "
+                "without task, policy, retry, recovery or execution authority."
+            ),
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
         }
     }
 )

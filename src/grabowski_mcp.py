@@ -28,6 +28,8 @@ import time
 import urllib.parse
 import uuid
 
+import yaml
+
 from mcp.server.fastmcp import FastMCP
 
 try:
@@ -736,6 +738,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_context_fabric_compare": (),
     "grabowski_host_capability_resolve": ("file_read",),
     "grabowski_systemkatalog_query": (),
+    "grabowski_operational_guidance": ("bundle_registry",),
     "grabowski_resource_nonconflict_assess": ("resource_lease",),
     "grabowski_runtime_refresh_lease_release": ("resource_lease",),
     "grabowski_resource_reconcile_obsolete_path_leases": ("resource_lease",),
@@ -9697,6 +9700,670 @@ def repoground_range_get(
             "review_complete",
             "runtime_correctness",
         ],
+    }
+
+
+_OPERATIONAL_RUNBOOK_CONTRACT = "operational-runbook.v1"
+_OPERATIONAL_RUNBOOK_STATUSES = {"active", "experimental", "deprecated", "historical"}
+_OPERATIONAL_GUIDANCE_NON_CLAIMS = [
+    "current_state",
+    "root_cause",
+    "mutation_permission",
+    "retry_permission",
+    "task_completion",
+    "routing_authority",
+    "policy_authority",
+    "recovery_authority",
+    "merge_readiness",
+    "deployment_authority",
+]
+_OPERATIONAL_RUNBOOK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,159}$")
+_OPERATIONAL_RUNBOOK_TOKEN_RE = re.compile(r"^[a-z0-9*][a-z0-9._:*+-]{0,95}$")
+
+
+def _operational_guidance_string_list(
+    value: Any,
+    *,
+    label: str,
+    max_items: int = 32,
+    max_length: int = 160,
+    tokenized: bool = False,
+    allow_empty: bool = False,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    if len(value) > max_items:
+        raise ValueError(f"{label} must contain at most {max_items} entries")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{label} entries must be strings")
+        normalized = item.strip().lower() if tokenized else item.strip()
+        if not normalized or len(normalized) > max_length:
+            raise ValueError(f"{label} entries must be non-empty and bounded")
+        if any(ord(ch) < 32 for ch in normalized):
+            raise ValueError(f"{label} entries must not contain control characters")
+        if tokenized and _OPERATIONAL_RUNBOOK_TOKEN_RE.fullmatch(normalized) is None:
+            raise ValueError(f"{label} entries must use normalized operational tokens")
+        if normalized not in result:
+            result.append(normalized)
+    if not result and not allow_empty:
+        raise ValueError(f"{label} must not be empty")
+    return result
+
+
+def _operational_guidance_path(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("guidance path must be a string")
+    path = value.strip()
+    if not path or len(path) > 300 or path.startswith("/") or "\\" in path:
+        raise ValueError("guidance path must be a bounded repository-relative POSIX path")
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("guidance path must not contain empty, dot, or parent segments")
+    if not path.endswith(".md") or "runbooks" not in parts:
+        raise ValueError("guidance path must identify a Markdown file under a runbooks directory")
+    return path
+
+
+def _operational_guidance_frontmatter(text: Any) -> dict[str, Any]:
+    if not isinstance(text, str) or not text.startswith("---\n"):
+        raise ValueError("operational runbook must start with YAML frontmatter")
+    end = text.find("\n---\n", 4)
+    if end < 0 or end > 12_000:
+        raise ValueError("operational runbook frontmatter is missing or too large")
+    loaded = yaml.safe_load(text[4:end])
+    if not isinstance(loaded, dict):
+        raise ValueError("operational runbook frontmatter must be an object")
+    metadata = loaded.get("operational_runbook")
+    if not isinstance(metadata, dict):
+        raise ValueError("frontmatter must contain operational_runbook metadata")
+    return metadata
+
+
+def _operational_guidance_validate_runbook(metadata: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "contract",
+        "id",
+        "status",
+        "title",
+        "applies_to",
+        "symptoms",
+        "evidence_refs",
+        "verified_against",
+        "does_not_establish",
+        "known_bad_paths",
+        "rollback",
+        "related_runbooks",
+        "version_constraints",
+        "supersedes",
+    }
+    unknown = sorted(set(metadata) - allowed)
+    if unknown:
+        raise ValueError(f"unsupported operational runbook fields: {', '.join(unknown)}")
+    if metadata.get("contract") != _OPERATIONAL_RUNBOOK_CONTRACT:
+        raise ValueError("operational runbook contract must be operational-runbook.v1")
+    runbook_id = metadata.get("id")
+    if not isinstance(runbook_id, str) or _OPERATIONAL_RUNBOOK_ID_RE.fullmatch(runbook_id) is None:
+        raise ValueError("operational runbook id is invalid")
+    status = metadata.get("status")
+    if status not in _OPERATIONAL_RUNBOOK_STATUSES:
+        raise ValueError("operational runbook status is invalid")
+    title = metadata.get("title")
+    if not isinstance(title, str) or not title.strip() or len(title.strip()) > 160:
+        raise ValueError("operational runbook title is invalid")
+    applies_to = metadata.get("applies_to")
+    if not isinstance(applies_to, dict) or set(applies_to) != {
+        "operations",
+        "platforms",
+        "components",
+    }:
+        raise ValueError(
+            "operational runbook applies_to must contain operations, platforms, and components"
+        )
+    normalized = {
+        "contract": _OPERATIONAL_RUNBOOK_CONTRACT,
+        "id": runbook_id,
+        "status": status,
+        "title": title.strip(),
+        "applies_to": {
+            "operations": _operational_guidance_string_list(
+                applies_to["operations"], label="applies_to.operations", tokenized=True
+            ),
+            "platforms": _operational_guidance_string_list(
+                applies_to["platforms"], label="applies_to.platforms", tokenized=True
+            ),
+            "components": _operational_guidance_string_list(
+                applies_to["components"], label="applies_to.components", tokenized=True
+            ),
+        },
+        "symptoms": _operational_guidance_string_list(
+            metadata.get("symptoms"), label="symptoms", tokenized=True
+        ),
+        "evidence_refs": _operational_guidance_string_list(
+            metadata.get("evidence_refs"),
+            label="evidence_refs",
+            max_items=16,
+            max_length=400,
+        ),
+        "does_not_establish": _operational_guidance_string_list(
+            metadata.get("does_not_establish"),
+            label="does_not_establish",
+            max_items=32,
+            max_length=200,
+        ),
+    }
+    verified_against = metadata.get("verified_against")
+    if not isinstance(verified_against, list) or not verified_against or len(verified_against) > 16:
+        raise ValueError("verified_against must be a non-empty list with at most 16 entries")
+    verified_rows: list[Any] = []
+    for row in verified_against:
+        if not isinstance(row, (str, dict)):
+            raise ValueError("verified_against entries must be strings or objects")
+        encoded = json.dumps(row, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 2_048:
+            raise ValueError("verified_against entry is too large")
+        verified_rows.append(row)
+    normalized["verified_against"] = verified_rows
+    for field in (
+        "known_bad_paths",
+        "rollback",
+        "related_runbooks",
+        "version_constraints",
+        "supersedes",
+    ):
+        if field in metadata:
+            encoded = json.dumps(
+                metadata[field], sort_keys=True, ensure_ascii=False, separators=(",", ":")
+            )
+            if len(encoded.encode("utf-8")) > 8_192:
+                raise ValueError(f"{field} is too large")
+            normalized[field] = metadata[field]
+    return normalized
+
+
+def _operational_guidance_freshness(freshness: Any) -> tuple[str, dict[str, Any]]:
+    if not isinstance(freshness, dict):
+        return "unverifiable", {}
+    status = freshness.get("freshness_status")
+    if not isinstance(status, str):
+        raw = freshness.get("freshness")
+        status = raw if isinstance(raw, str) else "unknown"
+    normalized = "current" if status in {"fresh", "fresh_exact"} else "stale"
+    bundle = freshness.get("bundle") if isinstance(freshness.get("bundle"), dict) else {}
+    return normalized, {
+        "status": status,
+        "bundle_commit": bundle.get("git_commit"),
+        "manifest_sha256": bundle.get("manifest_sha256"),
+    }
+
+
+def _operational_guidance_runbook_from_result(
+    *,
+    repo: str,
+    path: str,
+    raw_result: dict[str, Any],
+    freshness: dict[str, Any],
+    stem: str,
+    manifest_path: Path,
+) -> tuple[dict[str, Any] | None, str | None]:
+    range_ref = raw_result.get("range_ref")
+    if not isinstance(range_ref, dict):
+        return None, "runbook result has no RepoGround range_ref"
+    resolved = _repoground_range_get(manifest_path, range_ref)
+    range_value = resolved.get("range") if isinstance(resolved, dict) else None
+    text = range_value.get("text") if isinstance(range_value, dict) else None
+    if not isinstance(text, str) or _OPERATIONAL_RUNBOOK_CONTRACT not in text:
+        return None, None
+    try:
+        metadata = _operational_guidance_validate_runbook(
+            _operational_guidance_frontmatter(text)
+        )
+    except (TypeError, ValueError, yaml.YAMLError) as exc:
+        return None, str(exc)
+    freshness_state, source = _operational_guidance_freshness(freshness)
+    source.update(
+        {
+            "repo": repo,
+            "path": path,
+            "stem": stem,
+            "range_ref": range_ref,
+            "content_sha256": range_ref.get("content_sha256"),
+        }
+    )
+    return {
+        "repo": repo,
+        "path": path,
+        "metadata": metadata,
+        "freshness_state": freshness_state,
+        "source": source,
+    }, None
+
+
+def _operational_guidance_discover_repo(
+    repo: str,
+    *,
+    exact_path: str | None = None,
+) -> dict[str, Any]:
+    repo = _repoground_validate_repo(repo) or ""
+    freshness, stem, manifest_path, selection_error = _repoground_selected_manifest_for_repo(
+        repo, None
+    )
+    if selection_error is not None or manifest_path is None or stem is None:
+        return {
+            "repo": repo,
+            "status": "unverifiable",
+            "runbooks": [],
+            "errors": [str((selection_error or {}).get("reason") or "RepoGround unavailable")],
+        }
+    filters = {"path": exact_path} if exact_path else None
+    raw = _repoground_query_existing_index(
+        manifest_path,
+        _OPERATIONAL_RUNBOOK_CONTRACT,
+        k=50,
+        filters=filters,
+        resolve_evidence=True,
+        project_sources=True,
+    )
+    if raw.get("status") != "available":
+        return {
+            "repo": repo,
+            "status": "unverifiable",
+            "runbooks": [],
+            "errors": [str(raw.get("reason") or raw.get("error_code") or "RepoGround query unavailable")],
+        }
+    query_result = raw.get("query_result") if isinstance(raw.get("query_result"), dict) else {}
+    results = query_result.get("results") if isinstance(query_result.get("results"), list) else []
+    runbooks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        path = row.get("source_path") or row.get("path")
+        if not isinstance(path, str) or path in seen:
+            continue
+        if exact_path is not None and path != exact_path:
+            continue
+        if row.get("start_line") != 1:
+            continue
+        seen.add(path)
+        runbook, error = _operational_guidance_runbook_from_result(
+            repo=repo,
+            path=path,
+            raw_result=row,
+            freshness=freshness,
+            stem=stem,
+            manifest_path=manifest_path,
+        )
+        if runbook is not None:
+            runbooks.append(runbook)
+        elif error:
+            errors.append(f"{path}: {error}")
+    if exact_path is not None and not runbooks and not errors:
+        errors.append(f"{exact_path}: operational-runbook.v1 metadata not present")
+    return {
+        "repo": repo,
+        "status": "available",
+        "runbooks": runbooks,
+        "errors": errors[:20],
+        "freshness": freshness,
+        "stem": stem,
+    }
+
+
+def _operational_guidance_match_score(
+    metadata: dict[str, Any],
+    *,
+    operation: str,
+    platforms: list[str],
+    components: list[str],
+    symptoms: list[str],
+) -> int | None:
+    applies_to = metadata["applies_to"]
+    operations = set(applies_to["operations"])
+    if operation not in operations and "*" not in operations:
+        return None
+    score = 8
+    for values, candidates, weight in (
+        (platforms, set(applies_to["platforms"]), 4),
+        (components, set(applies_to["components"]), 3),
+        (symptoms, set(metadata["symptoms"]), 5),
+    ):
+        if not values:
+            continue
+        overlap = set(values) & candidates
+        if not overlap and "*" not in candidates:
+            return None
+        score += weight * max(1, len(overlap))
+    return score
+
+
+def _operational_guidance_semantic_score(
+    candidate: dict[str, Any],
+    *,
+    query: str,
+) -> float | None:
+    freshness, _stem, manifest_path, selection_error = _repoground_selected_manifest_for_repo(
+        candidate["repo"], None
+    )
+    if selection_error is not None or manifest_path is None:
+        return None
+    fresh_state, _source = _operational_guidance_freshness(freshness)
+    if fresh_state != "current":
+        return None
+    raw = _repoground_query_existing_index(
+        manifest_path,
+        query,
+        k=3,
+        filters={"path": candidate["path"]},
+        resolve_evidence=False,
+        project_sources=False,
+    )
+    query_result = raw.get("query_result") if isinstance(raw.get("query_result"), dict) else {}
+    results = query_result.get("results") if isinstance(query_result.get("results"), list) else []
+    for row in results:
+        if not isinstance(row, dict):
+            continue
+        path = row.get("source_path") or row.get("path")
+        if path != candidate["path"]:
+            continue
+        score = row.get("final_score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            return float(score)
+    return None
+
+
+def _operational_guidance_system_scope(system_refs: list[str]) -> dict[str, Any]:
+    from grabowski_systemkatalog import query_systemkatalog
+
+    repositories: list[str] = []
+    bindings: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for ref in system_refs:
+        result = query_systemkatalog(operation="system", value=ref)
+        payload = result.get("systemkatalog") if isinstance(result, dict) else None
+        inner = payload.get("result") if isinstance(payload, dict) else None
+        system = inner.get("system") if isinstance(inner, dict) else None
+        system_id = system.get("id") if isinstance(system, dict) else None
+        if result.get("status") != "ok" or not isinstance(system_id, str) or not system_id.startswith("repo:"):
+            errors.append(f"{ref}: Systemkatalog did not resolve one repository system")
+            continue
+        repo = system_id.removeprefix("repo:")
+        if repo not in repositories:
+            repositories.append(repo)
+        bindings.append(
+            {
+                "system_ref": ref,
+                "system_id": system_id,
+                "repo": repo,
+                "catalog_commit": payload.get("catalogCommit") if isinstance(payload, dict) else None,
+            }
+        )
+    return {"repositories": repositories, "bindings": bindings, "errors": errors}
+
+
+def _operational_guidance_rank(
+    candidates: list[dict[str, Any]],
+    *,
+    semantic_query: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    for candidate in candidates:
+        candidate["semantic_score"] = _operational_guidance_semantic_score(
+            candidate, query=semantic_query
+        )
+    candidates.sort(
+        key=lambda item: (
+            -int(item["match_score"]),
+            item["repo"],
+            -float(item["semantic_score"])
+            if isinstance(item.get("semantic_score"), (int, float))
+            else float("inf"),
+            item["path"],
+        )
+    )
+    if len(candidates) < 2:
+        return candidates, False
+    top_score = candidates[0]["match_score"]
+    tied = [item for item in candidates if item["match_score"] == top_score]
+    if len(tied) < 2:
+        return candidates, False
+    repos = {item["repo"] for item in tied}
+    if len(repos) > 1:
+        return candidates, True
+    tied.sort(
+        key=lambda item: (
+            -float(item["semantic_score"])
+            if isinstance(item.get("semantic_score"), (int, float))
+            else float("inf"),
+            item["path"],
+        )
+    )
+    remaining = [item for item in candidates if item["match_score"] != top_score]
+    candidates[:] = tied + remaining
+    first = tied[0].get("semantic_score")
+    second = tied[1].get("semantic_score")
+    ambiguous = first is None or second is None or float(first) == float(second)
+    return candidates, ambiguous
+
+
+@mcp.tool(name="grabowski_operational_guidance", annotations=READ_ANNOTATIONS)
+def grabowski_operational_guidance(
+    operation: str,
+    platforms: list[str] | None = None,
+    components: list[str] | None = None,
+    symptoms: list[str] | None = None,
+    system_refs: list[str] | None = None,
+    guidance_refs: list[dict[str, str]] | None = None,
+    max_results: int = 3,
+) -> dict[str, Any]:
+    """Return bounded, cited operational runbook guidance without execution authority."""
+    _require_capability("bundle_registry")
+    if not isinstance(operation, str):
+        raise ValueError("operation must be a string")
+    normalized_operation = operation.strip().lower()
+    if _OPERATIONAL_RUNBOOK_TOKEN_RE.fullmatch(normalized_operation) is None:
+        raise ValueError("operation must be one normalized operational token")
+    normalized_platforms = _operational_guidance_string_list(
+        platforms or [], label="platforms", tokenized=True, allow_empty=True
+    )
+    normalized_components = _operational_guidance_string_list(
+        components or [], label="components", tokenized=True, allow_empty=True
+    )
+    normalized_symptoms = _operational_guidance_string_list(
+        symptoms or [], label="symptoms", tokenized=True, allow_empty=True
+    )
+    if not isinstance(max_results, int) or isinstance(max_results, bool) or not 1 <= max_results <= 5:
+        raise ValueError("max_results must be an integer between 1 and 5")
+    if guidance_refs is not None and not isinstance(guidance_refs, list):
+        raise ValueError("guidance_refs must be a list when supplied")
+    if system_refs is not None and not isinstance(system_refs, list):
+        raise ValueError("system_refs must be a list when supplied")
+    if guidance_refs and len(guidance_refs) > 8:
+        raise ValueError("guidance_refs must contain at most 8 entries")
+    if system_refs and len(system_refs) > 8:
+        raise ValueError("system_refs must contain at most 8 entries")
+
+    diagnostics: list[str] = []
+    scope: dict[str, Any] = {"systems": [], "repositories": []}
+    discovered: list[dict[str, Any]] = []
+    mode = "explicit" if guidance_refs else "automatic"
+
+    if guidance_refs:
+        for ref in guidance_refs:
+            if not isinstance(ref, dict) or set(ref) != {"repo", "path"}:
+                diagnostics.append("guidance_ref must contain exactly repo and path")
+                continue
+            try:
+                repo = _repoground_validate_repo(ref["repo"]) or ""
+                path = _operational_guidance_path(ref["path"])
+            except (TypeError, ValueError) as exc:
+                diagnostics.append(str(exc))
+                continue
+            result = _operational_guidance_discover_repo(repo, exact_path=path)
+            candidates = result.get("runbooks") if isinstance(result.get("runbooks"), list) else []
+            if len(candidates) != 1:
+                diagnostics.append(f"{repo}:{path}: exact operational runbook metadata unavailable")
+                diagnostics.extend(str(item) for item in result.get("errors", [])[:3])
+                continue
+            discovered.extend(candidates)
+            if repo not in scope["repositories"]:
+                scope["repositories"].append(repo)
+    else:
+        refs = _operational_guidance_string_list(
+            system_refs or [],
+            label="system_refs",
+            max_items=8,
+            max_length=120,
+            allow_empty=True,
+        )
+        if not refs:
+            return {
+                "kind": "grabowski.operational_guidance",
+                "schema_version": 1,
+                "status": "no_match",
+                "mode": mode,
+                "reason": "automatic guidance requires at least one Systemkatalog system_ref",
+                "input": {
+                    "operation": normalized_operation,
+                    "platforms": normalized_platforms,
+                    "components": normalized_components,
+                    "symptoms": normalized_symptoms,
+                },
+                "scope": scope,
+                "guidance": [],
+                "diagnostics": [],
+                "shadow_mode": True,
+                "does_not_establish": list(_OPERATIONAL_GUIDANCE_NON_CLAIMS),
+            }
+        resolved_scope = _operational_guidance_system_scope(refs)
+        scope = {
+            "systems": resolved_scope["bindings"],
+            "repositories": resolved_scope["repositories"],
+        }
+        diagnostics.extend(resolved_scope["errors"])
+        for repo in scope["repositories"]:
+            result = _operational_guidance_discover_repo(repo)
+            discovered.extend(result.get("runbooks", []))
+            diagnostics.extend(str(item) for item in result.get("errors", [])[:5])
+
+    if not discovered:
+        status = "unverifiable" if diagnostics or guidance_refs else "no_match"
+        return {
+            "kind": "grabowski.operational_guidance",
+            "schema_version": 1,
+            "status": status,
+            "mode": mode,
+            "reason": "no valid operational-runbook.v1 metadata was resolved",
+            "input": {
+                "operation": normalized_operation,
+                "platforms": normalized_platforms,
+                "components": normalized_components,
+                "symptoms": normalized_symptoms,
+            },
+            "scope": scope,
+            "guidance": [],
+            "diagnostics": diagnostics[:20],
+            "shadow_mode": True,
+            "does_not_establish": list(_OPERATIONAL_GUIDANCE_NON_CLAIMS),
+        }
+
+    candidates: list[dict[str, Any]] = []
+    stale_candidates: list[dict[str, Any]] = []
+    for item in discovered:
+        metadata = item["metadata"]
+        match_score = _operational_guidance_match_score(
+            metadata,
+            operation=normalized_operation,
+            platforms=normalized_platforms,
+            components=normalized_components,
+            symptoms=normalized_symptoms,
+        )
+        if match_score is None:
+            continue
+        item = dict(item)
+        item["match_score"] = match_score
+        if metadata["status"] != "active" or item["freshness_state"] != "current":
+            stale_candidates.append(item)
+        else:
+            candidates.append(item)
+
+    if not candidates:
+        status = "stale" if stale_candidates else "no_match"
+        return {
+            "kind": "grabowski.operational_guidance",
+            "schema_version": 1,
+            "status": status,
+            "mode": mode,
+            "reason": "matching runbooks are stale/inactive" if stale_candidates else "metadata filter found no applicable runbook",
+            "input": {
+                "operation": normalized_operation,
+                "platforms": normalized_platforms,
+                "components": normalized_components,
+                "symptoms": normalized_symptoms,
+            },
+            "scope": scope,
+            "guidance": [],
+            "stale_candidates": [
+                {
+                    "id": item["metadata"]["id"],
+                    "repo": item["repo"],
+                    "path": item["path"],
+                    "runbook_status": item["metadata"]["status"],
+                    "source": item["source"],
+                }
+                for item in stale_candidates[:max_results]
+            ],
+            "diagnostics": diagnostics[:20],
+            "shadow_mode": True,
+            "does_not_establish": list(_OPERATIONAL_GUIDANCE_NON_CLAIMS),
+        }
+
+    semantic_query = " ".join(
+        [normalized_operation, *normalized_platforms, *normalized_components, *normalized_symptoms]
+    )
+    ranked, ambiguous = _operational_guidance_rank(
+        candidates, semantic_query=semantic_query
+    )
+    status = "ambiguous" if ambiguous else "matched"
+    selected = ranked[:max_results] if ambiguous else ranked[:1]
+    guidance = []
+    for item in selected:
+        metadata = item["metadata"]
+        guidance.append(
+            {
+                "id": metadata["id"],
+                "title": metadata["title"],
+                "repo": item["repo"],
+                "path": item["path"],
+                "runbook_status": metadata["status"],
+                "match_score": item["match_score"],
+                "semantic_score": item.get("semantic_score"),
+                "applies_to": metadata["applies_to"],
+                "symptoms": metadata["symptoms"],
+                "evidence_refs": metadata["evidence_refs"],
+                "verified_against": metadata["verified_against"],
+                "runbook_does_not_establish": metadata["does_not_establish"],
+                "source": item["source"],
+            }
+        )
+    return {
+        "kind": "grabowski.operational_guidance",
+        "schema_version": 1,
+        "status": status,
+        "mode": mode,
+        "reason": "multiple equally applicable runbooks remain across bounded scope" if ambiguous else "one current runbook is the strongest bounded match",
+        "input": {
+            "operation": normalized_operation,
+            "platforms": normalized_platforms,
+            "components": normalized_components,
+            "symptoms": normalized_symptoms,
+        },
+        "scope": scope,
+        "guidance": guidance,
+        "diagnostics": diagnostics[:20],
+        "shadow_mode": True,
+        "does_not_establish": list(_OPERATIONAL_GUIDANCE_NON_CLAIMS),
     }
 
 

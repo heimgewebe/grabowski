@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "741a584dddf4261737cf650ed47a818d6c4551230555798503949476961cbb9f",
+  "capability_source_sha256": "74af0172a58d9e2700847e9db47f717c7ce9160a752148c90b325d0bf6f12c41",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "93fd46c038d4ddafe3b4e153063b2b51e0fa9ded87d8a9f8aa4d64558aed3953",
+  "contract_sha256": "9ffea892bd534d4a9cf0984a1bb2cd3fe75546f240d10bee2592f96f259aacfe",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1785,6 +1785,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_systemkatalog_query"
+    },
+    {
+      "category": "knowledge",
+      "description": "Return bounded, cited operational runbook guidance without execution authority.",
+      "effects": [],
+      "id": "grabowski_operational_guidance",
+      "purpose": "Return bounded, source-cited operational runbook guidance in shadow mode without task, policy, retry, recovery or execution authority.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operational_guidance"
     },
     {
       "category": "bureau",
