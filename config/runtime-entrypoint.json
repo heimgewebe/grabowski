@@ -1,1 +1,821 @@
-{"expected_tools":["grabowski_status","grabowski_context","grip_list","grip_run","grabowski_list_directory","grabowski_stat","grabowski_read_text","grabowski_secret_inspect","grabowski_secret_reveal","grabowski_secret_use","grabowski_secret_export","grabowski_browser_profile_read","grabowski_create_text","grabowski_replace_text","grabowski_remove_path","grabowski_restore_removed_path","grabowski_destroy_path","grabowski_rollback_text","grabowski_verify_audit","grabowski_audit_query","grabowski_audit_trace","grabowski_audit_analyze","grabowski_reposkop_effectiveness","latest_complete_bundles","repoground_bundle_discover","repoground_bundle_status","repoground_freshness_check","repoground_preflight","repoground_query","repoground_query_existing_index","repoground_range_get","repoground_context_pack","repoground_context_compose","repoground_agent_handoff","repoground_find_symbol","repoground_get_callers","repoground_get_callees","grabowski_runtime_health","grabowski_audit_projection","grabowski_deployment_identity","grabowski_contract_drift","grabowski_checkout_summary","grabowski_current_work","grabowski_work_acquire","grabowski_reposkop_context","grabowski_operator_optimization_report","grabowski_git_status","grabowski_git_diff","grabowski_git_log","grabowski_git_show","grabowski_github_pr_view","grabowski_github_checks","grabowski_service_status","grabowski_service_logs","grabowski_runtime_deploy_schedule","grabowski_terminal_run","grabowski_job_start","grabowski_job_status","grabowski_job_notification_list","grabowski_job_notification_ack","grabowski_job_logs","grabowski_job_cancel","grabowski_git","grabowski_git_branch","grabowski_checkout_inventory","grabowski_checkout_binding_reconciliation","grabowski_checkout_binding_terminal_preview","grabowski_checkout_binding_terminal_apply","grabowski_checkout_binding_identity_rebind_preview","grabowski_checkout_binding_identity_rebind_apply","grabowski_checkout_retain","grabowski_checkout_archive","grabowski_checkout_cleanup","grabowski_github","grabowski_github_workflow_dispatch","grabowski_user_service","grabowski_tmux_list","grabowski_tmux_capture","grabowski_tmux_send","grabowski_process_list","grabowski_process_signal","grabowski_ports","grabowski_privileged_action_reference","grabowski_power_run","grabowski_fleet_list","grabowski_fleet_run","grabowski_juno_status","grabowski_juno_pair","grabowski_juno_run","ipad_bluetooth_scan","ipad_bluetooth_inspect","ipad_bluetooth_read","ipad_native_permission_status","ipad_native_permission_request","ipad_capability_manifest","ipad_storage_inventory","ipad_storage_grant_status","ipad_permission_probe","ipad_file_stat","ipad_directory_list","ipad_file_read","ipad_file_create","ipad_file_replace","grabowski_operation_list","grabowski_operation_plan","grabowski_operation_run","grabowski_privileged_broker_status","grabowski_task_start","grabowski_task_routing_shadow_seal","grabowski_task_status","grabowski_task_logs","grabowski_task_cancel","grabowski_task_resume","grabowski_task_list","grabowski_chronik_outbox_import","grabowski_chronik_history","grabowski_operator_historical_recall","grabowski_task_reconcile_check","grabowski_task_reconcile_refresh","grabowski_task_reconcile_resume","grabowski_recovery_provenance_assess","grabowski_recovery_provenance_repair","grabowski_recovery_status","grabowski_recovery_server_probe","grabowski_operator_blockade_status","grabowski_operator_blockade_engage","grabowski_operator_blockade_migrate_legacy","grabowski_operator_blockade_disarm","grabowski_friction_record","grabowski_friction_resolve","grabowski_friction_summary","grabowski_execution_shape","grabowski_execution_outcome_record","grabowski_execution_governor_summary","grabowski_connector_transport_diagnostics","grabowski_operator_recall_export","grabowski_context_fabric_plan","grabowski_context_fabric_compose","grabowski_context_fabric_explain","grabowski_context_fabric_compare","grabowski_host_capability_resolve","grabowski_systemkatalog_query","grabowski_bureau_candidate_record","grabowski_bureau_candidate_assess","grabowski_bureau_task_propose","grabowski_bureau_task_review","grabowski_bureau_task_publish_preview","grabowski_bureau_task_publish","grabowski_bureau_pickup_execute","grabowski_bureau_pickup_status","grabowski_bureau_pickup_release","grabowski_resource_nonconflict_assess","grabowski_runtime_refresh_lease_release","grabowski_resource_reconcile_obsolete_path_leases","grabowski_resource_acquire","grabowski_resource_renew","grabowski_resource_release","grabowski_resource_inspect","grabowski_resource_list","grabowski_task_reconcile","grabowski_artifact_stat","grabowski_artifact_push","grabowski_artifact_pull","grabowski_text_artifact_publish","grabowski_text_artifact_read","grabowski_merge_delivery_record","grabowski_browser_worker_start","grabowski_browser_worker_stored_form_action","grabowski_browser_worker_semantic","grabowski_browser_worker_status","grabowski_browser_worker_stop","grabowski_browser_worker_list","grabowski_gui_worker_start","grabowski_gui_worker_status","grabowski_gui_worker_stop","grabowski_gui_worker_list","grabowski_agent_workspace_create","grabowski_agent_workspace_status","grabowski_agent_workspace_attach","grabowski_agent_workspace_collect","grabowski_agent_workspace_role_retry","grabowski_agent_workspace_writer_handoff","grabowski_agent_workspace_close","grabowski_agent_workspace_observe","grabowski_agent_workspace_optimize","grabowski_agent_workspace_cleanup_plan","grabowski_agent_workspace_reconcile_stale","grabowski_agent_workspace_reconcile_idle_tmux","grabowski_agent_workspace_cleanup","grabowski_agent_execution_route","grabowski_coding_agent_catalog","grabowski_coding_agent_route","grabowski_agent_competition_start","grabowski_agent_competition_status","grabowski_agent_competition_compare","grabowski_agent_bootstrap","grabowski_call_shape_check","grabowski_task_archive_list","grabowski_task_archive_read"],"mode":"module","module":"grabowski_operator","schema_version":4,"source":"src/grabowski_runtime.py","supporting_sources":[{"module":"grabowski_operator_core","source":"src/grabowski_operator.py"},{"module":"grabowski_bureau_runtime_refresh_executor","source":"src/grabowski_bureau_runtime_refresh_executor.py"},{"module":"grabowski_effect_receipt","source":"src/grabowski_effect_receipt.py"},{"module":"grabowski_effect_interceptor","source":"src/grabowski_effect_interceptor.py"},{"module":"grabowski_lane_closeout","source":"src/grabowski_lane_closeout.py"},{"module":"grabowski_deployment_observer","source":"src/grabowski_deployment_observer.py"},{"module":"grabowski_runtime_contract","source":"src/grabowski_runtime_contract.py"},{"module":"grabowski_mcp","source":"src/grabowski_mcp.py"},{"module":"grabowski_system_map","source":"src/grabowski_system_map.py"},{"module":"grabowski_client_snapshot","source":"src/grabowski_client_snapshot.py"},{"module":"grabowski_transport_roundtrip","source":"src/grabowski_transport_roundtrip.py"},{"module":"grabowski_transport_assertion","source":"src/grabowski_transport_assertion.py"},{"module":"grabowski_serving_process","source":"src/grabowski_serving_process.py"},{"module":"grabowski_connector_contract","source":"src/grabowski_connector_contract.py"},{"module":"grabowski_blockades","source":"src/grabowski_blockades.py"},{"module":"grabowski_blockade_store","source":"src/grabowski_blockade_store.py"},{"module":"grabowski_blockade_authority","source":"src/grabowski_blockade_authority.py"},{"module":"grabowski_grips","source":"src/grabowski_grips.py"},{"module":"grabowski_forrest_server_exit","source":"src/grabowski_forrest_server_exit.py"},{"module":"grabowski_n8n_runtime","source":"src/grabowski_n8n_runtime.py"},{"module":"grabowski_n8n_provider","source":"src/grabowski_n8n_provider.py"},{"module":"grabowski_convergence","source":"src/grabowski_convergence.py"},{"module":"grabowski_operator_obligation","source":"src/grabowski_operator_obligation.py"},{"module":"grabowski_operator_obligation_evidence","source":"src/grabowski_operator_obligation_evidence.py"},{"module":"grabowski_worktree_ensure","source":"src/grabowski_worktree_ensure.py"},{"module":"grabowski_checkout_identity","source":"src/grabowski_checkout_identity.py"},{"module":"grabowski_work_acquire","source":"src/grabowski_work_acquire.py"},{"module":"grabowski_grip_orchestration","source":"src/grabowski_grip_orchestration.py"},{"module":"grabowski_merge_delivery","source":"src/grabowski_merge_delivery.py"},{"module":"grabowski_merge_delivery_surface","source":"src/grabowski_merge_delivery_surface.py"},{"module":"grabowski_merge_guard","source":"src/grabowski_merge_guard.py"},{"module":"grabowski_pr_diff","source":"src/grabowski_pr_diff.py"},{"module":"grabowski_decision_reviews","source":"src/grabowski_decision_reviews.py"},{"module":"grabowski_merge_authority","source":"src/grabowski_merge_authority.py"},{"module":"grabowski_agent_workspace_observer","source":"src/grabowski_agent_workspace_observer.py"},{"module":"grabowski_agent_competition","source":"src/grabowski_agent_competition.py"},{"module":"grabowski_coding_agent_router","source":"src/grabowski_coding_agent_router.py"},{"module":"grabowski_capabilities","source":"src/grabowski_capabilities.py"},{"module":"grabowski_audit_signal","source":"src/grabowski_audit_signal.py"},{"module":"grabowski_read_surface","source":"src/grabowski_read_surface.py"},{"module":"grabowski_git_preimage","source":"src/grabowski_git_preimage.py"},{"module":"grabowski_self_deploy","source":"src/grabowski_self_deploy.py"},{"module":"grabowski_runtime_extensions","source":"src/grabowski_runtime_extensions.py"},{"module":"grabowski_github_workflow_dispatch","source":"src/grabowski_github_workflow_dispatch.py"},{"module":"grabowski_audit_query","source":"src/grabowski_audit_query.py"},{"module":"grabowski_reposkop_effectiveness","source":"src/grabowski_reposkop_effectiveness.py"},{"module":"grabowski_reposkop_shadow","source":"src/grabowski_reposkop_shadow.py"},{"module":"grabowski_checkouts","source":"src/grabowski_checkouts.py"},{"module":"grabowski_checkout_binding_reconciler","source":"src/grabowski_checkout_binding_reconciler.py"},{"module":"grabowski_checkout_terminal_sources","source":"src/grabowski_checkout_terminal_sources.py"},{"module":"grabowski_checkout_terminal_reconciliation","source":"src/grabowski_checkout_terminal_reconciliation.py"},{"module":"grabowski_current_work","source":"src/grabowski_current_work.py"},{"module":"grabowski_managed_cargo","source":"src/grabowski_managed_cargo.py"},{"module":"grabowski_current_work_surface","source":"src/grabowski_current_work_surface.py"},{"module":"grabowski_operator_optimization","source":"src/grabowski_operator_optimization.py"},{"module":"grabowski_fleet","source":"src/grabowski_fleet.py"},{"module":"grabowski_fleet_mutation","source":"src/grabowski_fleet_mutation.py"},{"module":"grabowski_operations","source":"src/grabowski_operations.py"},{"module":"grabowski_reposkop_context","source":"src/grabowski_reposkop_context.py"},{"module":"grabowski_privileged","source":"src/grabowski_privileged.py"},{"module":"grabowski_privileged_broker","source":"src/grabowski_privileged_broker.py"},{"module":"grabowski_command_identity","source":"src/grabowski_command_identity.py"},{"module":"grabowski_sqlite_store","source":"src/grabowski_sqlite_store.py"},{"module":"grabowski_tasks","source":"src/grabowski_tasks.py"},{"module":"grabowski_task_attention","source":"src/grabowski_task_attention.py"},{"module":"grabowski_terminal_convergence","source":"src/grabowski_terminal_convergence.py"},{"module":"grabowski_chronik","source":"src/grabowski_chronik.py"},{"module":"grabowski_recovery","source":"src/grabowski_recovery.py"},{"module":"grabowski_midcutover_resume","source":"src/grabowski_midcutover_resume.py"},{"module":"grabowski_provenance_recovery","source":"src/grabowski_provenance_recovery.py"},{"module":"grabowski_blockade_runtime","source":"src/grabowski_blockade_runtime.py"},{"module":"grabowski_friction","source":"src/grabowski_friction.py"},{"module":"grabowski_recall","source":"src/grabowski_recall.py"},{"module":"grabowski_context_fabric","source":"src/grabowski_context_fabric.py"},{"module":"grabowski_systemkatalog","source":"src/grabowski_systemkatalog.py"},{"module":"grabowski_bureau_launcher_contract","source":"src/grabowski_bureau_launcher_contract.py"},{"module":"grabowski_bureau_leases","source":"src/grabowski_bureau_leases.py"},{"module":"grabowski_bureau_intake","source":"src/grabowski_bureau_intake.py"},{"module":"grabowski_bureau_pickup","source":"src/grabowski_bureau_pickup.py"},{"module":"grabowski_nonconflict","source":"src/grabowski_nonconflict.py"},{"module":"grabowski_resources","source":"src/grabowski_resources.py"},{"module":"grabowski_task_reconcile","source":"src/grabowski_task_reconcile.py"},{"module":"grabowski_artifacts","source":"src/grabowski_artifacts.py"},{"module":"grabowski_text_artifact_reconcile","source":"src/grabowski_text_artifact_reconcile.py"},{"module":"grabowski_browser_bidi","source":"src/grabowski_browser_bidi.py"},{"module":"grabowski_workers","source":"src/grabowski_workers.py"},{"module":"grabowski_worker_process","source":"src/grabowski_worker_process.py"},{"module":"grabowski_repobrief","source":"src/grabowski_repobrief.py"},{"module":"grabowski_repoground_catalog","source":"src/grabowski_repoground_catalog.py"},{"module":"grabowski_operator_routing_shadow_capture","source":"src/grabowski_operator_routing_shadow_capture.py"},{"module":"grabowski_agent_workspace","source":"src/grabowski_agent_workspace.py"},{"module":"grabowski_candidate_verification","source":"src/grabowski_candidate_verification.py"},{"module":"grabowski_execution_plan","source":"src/grabowski_execution_plan.py"},{"module":"grabowski_execution_coordinator","source":"src/grabowski_execution_coordinator.py"},{"module":"grabowski_candidate_adoption","source":"src/grabowski_candidate_adoption.py"},{"module":"grabowski_agent_role","source":"src/grabowski_agent_role.py"},{"module":"grabowski_agent_sandbox","source":"src/grabowski_agent_sandbox.py"},{"module":"grabowski_agent_writer","source":"src/grabowski_agent_writer.py"},{"module":"grabowski_agent_bootstrap","source":"src/grabowski_agent_bootstrap.py"},{"module":"grabowski_consumer_surface","source":"src/grabowski_consumer_surface.py"},{"module":"grabowski_private_io","source":"src/grabowski_private_io.py"},{"module":"grabowski_job_origin","source":"src/grabowski_job_origin.py"},{"module":"grabowski_job_finalizer","source":"src/grabowski_job_finalizer.py"},{"module":"grabowski_alert_outbox","source":"src/grabowski_alert_outbox.py"},{"module":"grabowski_ntfy_dispatch","source":"src/grabowski_ntfy_dispatch.py"},{"module":"grabowski_juno","source":"src/grabowski_juno.py"},{"module":"grabowski_juno_storage","source":"src/grabowski_juno_storage.py"},{"module":"grabowski_juno_bluetooth","source":"src/grabowski_juno_bluetooth.py"},{"module":"grabowski_lifecycle_archive","source":"src/grabowski_lifecycle_archive.py"},{"module":"grabowski_lifecycle_collectors","source":"src/grabowski_lifecycle_collectors.py"},{"module":"grabowski_lifecycle_evidence","source":"src/grabowski_lifecycle_evidence.py"},{"module":"grabowski_lifecycle_effect_plan","source":"src/grabowski_lifecycle_effect_plan.py"},{"module":"grabowski_lifecycle_projection","source":"src/grabowski_lifecycle_projection.py"},{"module":"grabowski_lifecycle_read_surface","source":"src/grabowski_lifecycle_read_surface.py"},{"module":"grabowski_operator_relay","source":"src/grabowski_operator_relay.py"},{"module":"grabowski_coding_agent_catalog_data","source":"src/grabowski_coding_agent_catalog_data.py"},{"module":"grabowski_coding_agent_router_cli","source":"src/grabowski_coding_agent_router_cli.py"},{"module":"grabowski_work_admission","source":"src/grabowski_work_admission.py"}],"runtime_assets":[{"source":"config/coding-agent-catalog.json","destination":"config/coding-agent-catalog.json"},{"source":"tools/maintain_runtime_state.py","destination":"tools/maintain_runtime_state.py"},{"source":"tools/external_programming_candidate.py","destination":"tools/external_programming_candidate.py"}],"spawn_dependencies":[{"kind":"python_module","launcher_module":"grabowski_agent_workspace","spawned_module":"grabowski_agent_workspace"},{"kind":"python_module","launcher_module":"grabowski_agent_workspace","spawned_module":"grabowski_agent_writer"},{"kind":"python_module","launcher_module":"grabowski_agent_workspace","spawned_module":"grabowski_agent_role"},{"kind":"python_module","launcher_module":"grabowski_self_deploy","spawned_module":"grabowski_coding_agent_router_cli"},{"kind":"python_module","launcher_module":"grabowski_grips","spawned_module":"grabowski_grips"},{"kind":"python_module","launcher_module":"grabowski_workers","spawned_module":"grabowski_worker_process"},{"kind":"python_module","launcher_module":"grabowski_fleet_mutation","spawned_module":"grabowski_fleet_mutation"},{"kind":"python_module","launcher_module":"grabowski_job_finalizer","spawned_module":"grabowski_ntfy_dispatch"},{"kind":"python_module","launcher_module":"grabowski_alert_outbox","spawned_module":"grabowski_ntfy_dispatch"}],"browser_operator_default":{"schema_version":2,"authority":"grabowski","decision_rule":"Use this path by default for agent browser work unless a concrete task requirement cannot be satisfied by it.","canonical_browser":{"family":"chrome-stable","vendor":"google","executable":"/opt/google/chrome/google-chrome","adapter":"chrome-cdp","protocol":"cdp","selection_role":"canonical-operator"},"transport":{"primary":"direct-cdp","endpoint_address":"127.0.0.1","loopback_only":true,"vendor_mcp_role":"optional-diagnostic-or-adapter-never-lifecycle-authority"},"semantic_gateway":{"coverage":"partial","tool":"grabowski_browser_worker_semantic","operations":["observe","act"],"supported_intents":["read_state","navigate","scroll_into_view","activate"],"uncovered_intents":{},"public_target_contract":"opaque-handles-and-validated-navigation-targets","implemented_effect_classes":["read","local_ui","network_navigation"],"fail_closed_effect_classes":["reversible_external","external_mutation","high_impact"],"ambiguous_effect_retry_authorized":false,"authoritative_readback_required_before_new_intent":true,"readback_grants_retry_authority":false},"profile":{"default":"ephemeral","human_profile_reuse":false,"persistent_profile_policy":"explicit-auth-or-trust-scope-only","exclusive_profile_lease":true},"lifecycle":["grabowski_browser_worker_start","direct_cdp_action","direct_cdp_readback","grabowski_browser_worker_stop","profile_and_lease_cleanup_readback"],"human_browser_default":{"browser":"brave","preserve":true,"agent_primary":false},"future_adapter":{"id":"webdriver-bidi","browser_family":"firefox","status":"not-implemented"},"evidence_anchor":{"bureau_task_id":"GRABOWSKI-OPERATOR-SURFACE-V1-FU-BROWSER-RUNTIME-LIVE-PROOF-20260811","completion_receipt_sha256":"ab5b16ec7e17bed0e6a28ce15a4365a5d7f2e07197c008325d6c08546a0e5a90","validated_at":"2026-08-11T23:56:29.955408Z","does_not_establish":["future_runtime_availability","semantic_gateway_live_deployment"]}}}
+{
+  "expected_tools": [
+    "grabowski_status",
+    "grabowski_context",
+    "grip_list",
+    "grip_run",
+    "grabowski_list_directory",
+    "grabowski_stat",
+    "grabowski_read_text",
+    "grabowski_secret_inspect",
+    "grabowski_secret_reveal",
+    "grabowski_secret_use",
+    "grabowski_secret_export",
+    "grabowski_browser_profile_read",
+    "grabowski_create_text",
+    "grabowski_replace_text",
+    "grabowski_remove_path",
+    "grabowski_restore_removed_path",
+    "grabowski_destroy_path",
+    "grabowski_rollback_text",
+    "grabowski_verify_audit",
+    "grabowski_audit_query",
+    "grabowski_audit_trace",
+    "grabowski_audit_analyze",
+    "grabowski_reposkop_effectiveness",
+    "latest_complete_bundles",
+    "repoground_bundle_discover",
+    "repoground_bundle_status",
+    "repoground_freshness_check",
+    "repoground_preflight",
+    "repoground_query",
+    "repoground_query_existing_index",
+    "repoground_range_get",
+    "repoground_context_pack",
+    "repoground_context_compose",
+    "repoground_agent_handoff",
+    "repoground_find_symbol",
+    "repoground_get_callers",
+    "repoground_get_callees",
+    "grabowski_runtime_health",
+    "grabowski_audit_projection",
+    "grabowski_deployment_identity",
+    "grabowski_contract_drift",
+    "grabowski_checkout_summary",
+    "grabowski_current_work",
+    "grabowski_work_acquire",
+    "grabowski_reposkop_context",
+    "grabowski_operator_optimization_report",
+    "grabowski_git_status",
+    "grabowski_git_diff",
+    "grabowski_git_log",
+    "grabowski_git_show",
+    "grabowski_github_pr_view",
+    "grabowski_github_checks",
+    "grabowski_service_status",
+    "grabowski_service_logs",
+    "grabowski_runtime_deploy_schedule",
+    "grabowski_terminal_run",
+    "grabowski_job_start",
+    "grabowski_job_status",
+    "grabowski_job_notification_list",
+    "grabowski_job_notification_ack",
+    "grabowski_job_logs",
+    "grabowski_job_cancel",
+    "grabowski_git",
+    "grabowski_git_branch",
+    "grabowski_checkout_inventory",
+    "grabowski_checkout_binding_reconciliation",
+    "grabowski_checkout_binding_terminal_preview",
+    "grabowski_checkout_binding_terminal_apply",
+    "grabowski_checkout_binding_identity_rebind_preview",
+    "grabowski_checkout_binding_identity_rebind_apply",
+    "grabowski_checkout_retain",
+    "grabowski_checkout_archive",
+    "grabowski_checkout_cleanup",
+    "grabowski_github",
+    "grabowski_user_service",
+    "grabowski_tmux_list",
+    "grabowski_tmux_capture",
+    "grabowski_tmux_send",
+    "grabowski_process_list",
+    "grabowski_process_signal",
+    "grabowski_ports",
+    "grabowski_privileged_action_reference",
+    "grabowski_power_run",
+    "grabowski_fleet_list",
+    "grabowski_fleet_run",
+    "grabowski_juno_status",
+    "grabowski_juno_pair",
+    "grabowski_juno_run",
+    "ipad_bluetooth_scan",
+    "ipad_bluetooth_inspect",
+    "ipad_bluetooth_read",
+    "ipad_native_permission_status",
+    "ipad_native_permission_request",
+    "ipad_capability_manifest",
+    "ipad_storage_inventory",
+    "ipad_storage_grant_status",
+    "ipad_permission_probe",
+    "ipad_file_stat",
+    "ipad_directory_list",
+    "ipad_file_read",
+    "ipad_file_create",
+    "ipad_file_replace",
+    "grabowski_operation_list",
+    "grabowski_operation_plan",
+    "grabowski_operation_run",
+    "grabowski_privileged_broker_status",
+    "grabowski_task_start",
+    "grabowski_task_routing_shadow_seal",
+    "grabowski_task_status",
+    "grabowski_task_logs",
+    "grabowski_task_cancel",
+    "grabowski_task_resume",
+    "grabowski_task_list",
+    "grabowski_chronik_outbox_import",
+    "grabowski_chronik_history",
+    "grabowski_operator_historical_recall",
+    "grabowski_task_reconcile_check",
+    "grabowski_task_reconcile_refresh",
+    "grabowski_task_reconcile_resume",
+    "grabowski_recovery_provenance_assess",
+    "grabowski_recovery_provenance_repair",
+    "grabowski_recovery_status",
+    "grabowski_recovery_server_probe",
+    "grabowski_operator_blockade_status",
+    "grabowski_operator_blockade_engage",
+    "grabowski_operator_blockade_migrate_legacy",
+    "grabowski_operator_blockade_disarm",
+    "grabowski_friction_record",
+    "grabowski_friction_resolve",
+    "grabowski_friction_summary",
+    "grabowski_execution_shape",
+    "grabowski_execution_outcome_record",
+    "grabowski_execution_governor_summary",
+    "grabowski_connector_transport_diagnostics",
+    "grabowski_operator_recall_export",
+    "grabowski_context_fabric_plan",
+    "grabowski_context_fabric_compose",
+    "grabowski_context_fabric_explain",
+    "grabowski_context_fabric_compare",
+    "grabowski_host_capability_resolve",
+    "grabowski_systemkatalog_query",
+    "grabowski_bureau_candidate_record",
+    "grabowski_bureau_candidate_assess",
+    "grabowski_bureau_task_propose",
+    "grabowski_bureau_task_review",
+    "grabowski_bureau_task_publish_preview",
+    "grabowski_bureau_task_publish",
+    "grabowski_bureau_pickup_execute",
+    "grabowski_bureau_pickup_status",
+    "grabowski_bureau_pickup_release",
+    "grabowski_resource_nonconflict_assess",
+    "grabowski_runtime_refresh_lease_release",
+    "grabowski_resource_reconcile_obsolete_path_leases",
+    "grabowski_resource_acquire",
+    "grabowski_resource_renew",
+    "grabowski_resource_release",
+    "grabowski_resource_inspect",
+    "grabowski_resource_list",
+    "grabowski_task_reconcile",
+    "grabowski_artifact_stat",
+    "grabowski_artifact_push",
+    "grabowski_artifact_pull",
+    "grabowski_text_artifact_publish",
+    "grabowski_text_artifact_read",
+    "grabowski_merge_delivery_record",
+    "grabowski_browser_worker_start",
+    "grabowski_browser_worker_stored_form_action",
+    "grabowski_browser_worker_semantic",
+    "grabowski_browser_worker_status",
+    "grabowski_browser_worker_stop",
+    "grabowski_browser_worker_list",
+    "grabowski_gui_worker_start",
+    "grabowski_gui_worker_status",
+    "grabowski_gui_worker_stop",
+    "grabowski_gui_worker_list",
+    "grabowski_agent_workspace_create",
+    "grabowski_agent_workspace_status",
+    "grabowski_agent_workspace_attach",
+    "grabowski_agent_workspace_collect",
+    "grabowski_agent_workspace_role_retry",
+    "grabowski_agent_workspace_writer_handoff",
+    "grabowski_agent_workspace_close",
+    "grabowski_agent_workspace_observe",
+    "grabowski_agent_workspace_optimize",
+    "grabowski_agent_workspace_cleanup_plan",
+    "grabowski_agent_workspace_reconcile_stale",
+    "grabowski_agent_workspace_reconcile_idle_tmux",
+    "grabowski_agent_workspace_cleanup",
+    "grabowski_agent_execution_route",
+    "grabowski_coding_agent_catalog",
+    "grabowski_coding_agent_route",
+    "grabowski_agent_competition_start",
+    "grabowski_agent_competition_status",
+    "grabowski_agent_competition_compare",
+    "grabowski_agent_bootstrap",
+    "grabowski_call_shape_check",
+    "grabowski_task_archive_list",
+    "grabowski_task_archive_read"
+  ],
+  "mode": "module",
+  "module": "grabowski_operator",
+  "schema_version": 4,
+  "source": "src/grabowski_runtime.py",
+  "supporting_sources": [
+    {
+      "module": "grabowski_operator_core",
+      "source": "src/grabowski_operator.py"
+    },
+    {
+      "module": "grabowski_bureau_runtime_refresh_executor",
+      "source": "src/grabowski_bureau_runtime_refresh_executor.py"
+    },
+    {
+      "module": "grabowski_effect_receipt",
+      "source": "src/grabowski_effect_receipt.py"
+    },
+    {
+      "module": "grabowski_effect_interceptor",
+      "source": "src/grabowski_effect_interceptor.py"
+    },
+    {
+      "module": "grabowski_lane_closeout",
+      "source": "src/grabowski_lane_closeout.py"
+    },
+    {
+      "module": "grabowski_deployment_observer",
+      "source": "src/grabowski_deployment_observer.py"
+    },
+    {
+      "module": "grabowski_runtime_contract",
+      "source": "src/grabowski_runtime_contract.py"
+    },
+    {
+      "module": "grabowski_mcp",
+      "source": "src/grabowski_mcp.py"
+    },
+    {
+      "module": "grabowski_system_map",
+      "source": "src/grabowski_system_map.py"
+    },
+    {
+      "module": "grabowski_client_snapshot",
+      "source": "src/grabowski_client_snapshot.py"
+    },
+    {
+      "module": "grabowski_transport_roundtrip",
+      "source": "src/grabowski_transport_roundtrip.py"
+    },
+    {
+      "module": "grabowski_transport_assertion",
+      "source": "src/grabowski_transport_assertion.py"
+    },
+    {
+      "module": "grabowski_serving_process",
+      "source": "src/grabowski_serving_process.py"
+    },
+    {
+      "module": "grabowski_connector_contract",
+      "source": "src/grabowski_connector_contract.py"
+    },
+    {
+      "module": "grabowski_blockades",
+      "source": "src/grabowski_blockades.py"
+    },
+    {
+      "module": "grabowski_blockade_store",
+      "source": "src/grabowski_blockade_store.py"
+    },
+    {
+      "module": "grabowski_blockade_authority",
+      "source": "src/grabowski_blockade_authority.py"
+    },
+    {
+      "module": "grabowski_grips",
+      "source": "src/grabowski_grips.py"
+    },
+    {
+      "module": "grabowski_forrest_server_exit",
+      "source": "src/grabowski_forrest_server_exit.py"
+    },
+    {
+      "module": "grabowski_n8n_runtime",
+      "source": "src/grabowski_n8n_runtime.py"
+    },
+    {
+      "module": "grabowski_n8n_provider",
+      "source": "src/grabowski_n8n_provider.py"
+    },
+    {
+      "module": "grabowski_convergence",
+      "source": "src/grabowski_convergence.py"
+    },
+    {
+      "module": "grabowski_operator_obligation",
+      "source": "src/grabowski_operator_obligation.py"
+    },
+    {
+      "module": "grabowski_operator_obligation_evidence",
+      "source": "src/grabowski_operator_obligation_evidence.py"
+    },
+    {
+      "module": "grabowski_worktree_ensure",
+      "source": "src/grabowski_worktree_ensure.py"
+    },
+    {
+      "module": "grabowski_checkout_identity",
+      "source": "src/grabowski_checkout_identity.py"
+    },
+    {
+      "module": "grabowski_work_acquire",
+      "source": "src/grabowski_work_acquire.py"
+    },
+    {
+      "module": "grabowski_grip_orchestration",
+      "source": "src/grabowski_grip_orchestration.py"
+    },
+    {
+      "module": "grabowski_merge_delivery",
+      "source": "src/grabowski_merge_delivery.py"
+    },
+    {
+      "module": "grabowski_merge_delivery_surface",
+      "source": "src/grabowski_merge_delivery_surface.py"
+    },
+    {
+      "module": "grabowski_merge_guard",
+      "source": "src/grabowski_merge_guard.py"
+    },
+    {
+      "module": "grabowski_pr_diff",
+      "source": "src/grabowski_pr_diff.py"
+    },
+    {
+      "module": "grabowski_decision_reviews",
+      "source": "src/grabowski_decision_reviews.py"
+    },
+    {
+      "module": "grabowski_merge_authority",
+      "source": "src/grabowski_merge_authority.py"
+    },
+    {
+      "module": "grabowski_agent_workspace_observer",
+      "source": "src/grabowski_agent_workspace_observer.py"
+    },
+    {
+      "module": "grabowski_agent_competition",
+      "source": "src/grabowski_agent_competition.py"
+    },
+    {
+      "module": "grabowski_coding_agent_router",
+      "source": "src/grabowski_coding_agent_router.py"
+    },
+    {
+      "module": "grabowski_capabilities",
+      "source": "src/grabowski_capabilities.py"
+    },
+    {
+      "module": "grabowski_audit_signal",
+      "source": "src/grabowski_audit_signal.py"
+    },
+    {
+      "module": "grabowski_read_surface",
+      "source": "src/grabowski_read_surface.py"
+    },
+    {
+      "module": "grabowski_git_preimage",
+      "source": "src/grabowski_git_preimage.py"
+    },
+    {
+      "module": "grabowski_self_deploy",
+      "source": "src/grabowski_self_deploy.py"
+    },
+    {
+      "module": "grabowski_runtime_extensions",
+      "source": "src/grabowski_runtime_extensions.py"
+    },
+    {
+      "module": "grabowski_github_workflow_dispatch",
+      "source": "src/grabowski_github_workflow_dispatch.py"
+    },
+    {
+      "module": "grabowski_audit_query",
+      "source": "src/grabowski_audit_query.py"
+    },
+    {
+      "module": "grabowski_reposkop_effectiveness",
+      "source": "src/grabowski_reposkop_effectiveness.py"
+    },
+    {
+      "module": "grabowski_reposkop_shadow",
+      "source": "src/grabowski_reposkop_shadow.py"
+    },
+    {
+      "module": "grabowski_checkouts",
+      "source": "src/grabowski_checkouts.py"
+    },
+    {
+      "module": "grabowski_checkout_binding_reconciler",
+      "source": "src/grabowski_checkout_binding_reconciler.py"
+    },
+    {
+      "module": "grabowski_checkout_terminal_sources",
+      "source": "src/grabowski_checkout_terminal_sources.py"
+    },
+    {
+      "module": "grabowski_checkout_terminal_reconciliation",
+      "source": "src/grabowski_checkout_terminal_reconciliation.py"
+    },
+    {
+      "module": "grabowski_current_work",
+      "source": "src/grabowski_current_work.py"
+    },
+    {
+      "module": "grabowski_managed_cargo",
+      "source": "src/grabowski_managed_cargo.py"
+    },
+    {
+      "module": "grabowski_current_work_surface",
+      "source": "src/grabowski_current_work_surface.py"
+    },
+    {
+      "module": "grabowski_operator_optimization",
+      "source": "src/grabowski_operator_optimization.py"
+    },
+    {
+      "module": "grabowski_fleet",
+      "source": "src/grabowski_fleet.py"
+    },
+    {
+      "module": "grabowski_fleet_mutation",
+      "source": "src/grabowski_fleet_mutation.py"
+    },
+    {
+      "module": "grabowski_operations",
+      "source": "src/grabowski_operations.py"
+    },
+    {
+      "module": "grabowski_reposkop_context",
+      "source": "src/grabowski_reposkop_context.py"
+    },
+    {
+      "module": "grabowski_privileged",
+      "source": "src/grabowski_privileged.py"
+    },
+    {
+      "module": "grabowski_privileged_broker",
+      "source": "src/grabowski_privileged_broker.py"
+    },
+    {
+      "module": "grabowski_command_identity",
+      "source": "src/grabowski_command_identity.py"
+    },
+    {
+      "module": "grabowski_sqlite_store",
+      "source": "src/grabowski_sqlite_store.py"
+    },
+    {
+      "module": "grabowski_tasks",
+      "source": "src/grabowski_tasks.py"
+    },
+    {
+      "module": "grabowski_task_attention",
+      "source": "src/grabowski_task_attention.py"
+    },
+    {
+      "module": "grabowski_terminal_convergence",
+      "source": "src/grabowski_terminal_convergence.py"
+    },
+    {
+      "module": "grabowski_chronik",
+      "source": "src/grabowski_chronik.py"
+    },
+    {
+      "module": "grabowski_recovery",
+      "source": "src/grabowski_recovery.py"
+    },
+    {
+      "module": "grabowski_midcutover_resume",
+      "source": "src/grabowski_midcutover_resume.py"
+    },
+    {
+      "module": "grabowski_provenance_recovery",
+      "source": "src/grabowski_provenance_recovery.py"
+    },
+    {
+      "module": "grabowski_blockade_runtime",
+      "source": "src/grabowski_blockade_runtime.py"
+    },
+    {
+      "module": "grabowski_friction",
+      "source": "src/grabowski_friction.py"
+    },
+    {
+      "module": "grabowski_recall",
+      "source": "src/grabowski_recall.py"
+    },
+    {
+      "module": "grabowski_context_fabric",
+      "source": "src/grabowski_context_fabric.py"
+    },
+    {
+      "module": "grabowski_systemkatalog",
+      "source": "src/grabowski_systemkatalog.py"
+    },
+    {
+      "module": "grabowski_bureau_launcher_contract",
+      "source": "src/grabowski_bureau_launcher_contract.py"
+    },
+    {
+      "module": "grabowski_bureau_leases",
+      "source": "src/grabowski_bureau_leases.py"
+    },
+    {
+      "module": "grabowski_bureau_intake",
+      "source": "src/grabowski_bureau_intake.py"
+    },
+    {
+      "module": "grabowski_bureau_pickup",
+      "source": "src/grabowski_bureau_pickup.py"
+    },
+    {
+      "module": "grabowski_nonconflict",
+      "source": "src/grabowski_nonconflict.py"
+    },
+    {
+      "module": "grabowski_resources",
+      "source": "src/grabowski_resources.py"
+    },
+    {
+      "module": "grabowski_task_reconcile",
+      "source": "src/grabowski_task_reconcile.py"
+    },
+    {
+      "module": "grabowski_artifacts",
+      "source": "src/grabowski_artifacts.py"
+    },
+    {
+      "module": "grabowski_text_artifact_reconcile",
+      "source": "src/grabowski_text_artifact_reconcile.py"
+    },
+    {
+      "module": "grabowski_browser_bidi",
+      "source": "src/grabowski_browser_bidi.py"
+    },
+    {
+      "module": "grabowski_workers",
+      "source": "src/grabowski_workers.py"
+    },
+    {
+      "module": "grabowski_worker_process",
+      "source": "src/grabowski_worker_process.py"
+    },
+    {
+      "module": "grabowski_repobrief",
+      "source": "src/grabowski_repobrief.py"
+    },
+    {
+      "module": "grabowski_repoground_catalog",
+      "source": "src/grabowski_repoground_catalog.py"
+    },
+    {
+      "module": "grabowski_operator_routing_shadow_capture",
+      "source": "src/grabowski_operator_routing_shadow_capture.py"
+    },
+    {
+      "module": "grabowski_agent_workspace",
+      "source": "src/grabowski_agent_workspace.py"
+    },
+    {
+      "module": "grabowski_candidate_verification",
+      "source": "src/grabowski_candidate_verification.py"
+    },
+    {
+      "module": "grabowski_execution_plan",
+      "source": "src/grabowski_execution_plan.py"
+    },
+    {
+      "module": "grabowski_execution_coordinator",
+      "source": "src/grabowski_execution_coordinator.py"
+    },
+    {
+      "module": "grabowski_candidate_adoption",
+      "source": "src/grabowski_candidate_adoption.py"
+    },
+    {
+      "module": "grabowski_agent_role",
+      "source": "src/grabowski_agent_role.py"
+    },
+    {
+      "module": "grabowski_agent_sandbox",
+      "source": "src/grabowski_agent_sandbox.py"
+    },
+    {
+      "module": "grabowski_agent_writer",
+      "source": "src/grabowski_agent_writer.py"
+    },
+    {
+      "module": "grabowski_agent_bootstrap",
+      "source": "src/grabowski_agent_bootstrap.py"
+    },
+    {
+      "module": "grabowski_consumer_surface",
+      "source": "src/grabowski_consumer_surface.py"
+    },
+    {
+      "module": "grabowski_private_io",
+      "source": "src/grabowski_private_io.py"
+    },
+    {
+      "module": "grabowski_job_origin",
+      "source": "src/grabowski_job_origin.py"
+    },
+    {
+      "module": "grabowski_job_finalizer",
+      "source": "src/grabowski_job_finalizer.py"
+    },
+    {
+      "module": "grabowski_alert_outbox",
+      "source": "src/grabowski_alert_outbox.py"
+    },
+    {
+      "module": "grabowski_ntfy_dispatch",
+      "source": "src/grabowski_ntfy_dispatch.py"
+    },
+    {
+      "module": "grabowski_juno",
+      "source": "src/grabowski_juno.py"
+    },
+    {
+      "module": "grabowski_juno_storage",
+      "source": "src/grabowski_juno_storage.py"
+    },
+    {
+      "module": "grabowski_juno_bluetooth",
+      "source": "src/grabowski_juno_bluetooth.py"
+    },
+    {
+      "module": "grabowski_lifecycle_archive",
+      "source": "src/grabowski_lifecycle_archive.py"
+    },
+    {
+      "module": "grabowski_lifecycle_collectors",
+      "source": "src/grabowski_lifecycle_collectors.py"
+    },
+    {
+      "module": "grabowski_lifecycle_evidence",
+      "source": "src/grabowski_lifecycle_evidence.py"
+    },
+    {
+      "module": "grabowski_lifecycle_effect_plan",
+      "source": "src/grabowski_lifecycle_effect_plan.py"
+    },
+    {
+      "module": "grabowski_lifecycle_projection",
+      "source": "src/grabowski_lifecycle_projection.py"
+    },
+    {
+      "module": "grabowski_lifecycle_read_surface",
+      "source": "src/grabowski_lifecycle_read_surface.py"
+    },
+    {
+      "module": "grabowski_operator_relay",
+      "source": "src/grabowski_operator_relay.py"
+    },
+    {
+      "module": "grabowski_coding_agent_catalog_data",
+      "source": "src/grabowski_coding_agent_catalog_data.py"
+    },
+    {
+      "module": "grabowski_coding_agent_router_cli",
+      "source": "src/grabowski_coding_agent_router_cli.py"
+    },
+    {
+      "module": "grabowski_work_admission",
+      "source": "src/grabowski_work_admission.py"
+    }
+  ],
+  "runtime_assets": [
+    {
+      "source": "config/coding-agent-catalog.json",
+      "destination": "config/coding-agent-catalog.json"
+    },
+    {
+      "source": "tools/maintain_runtime_state.py",
+      "destination": "tools/maintain_runtime_state.py"
+    },
+    {
+      "source": "tools/external_programming_candidate.py",
+      "destination": "tools/external_programming_candidate.py"
+    }
+  ],
+  "spawn_dependencies": [
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_workspace"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_writer"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_role"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_self_deploy",
+      "spawned_module": "grabowski_coding_agent_router_cli"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_grips",
+      "spawned_module": "grabowski_grips"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_workers",
+      "spawned_module": "grabowski_worker_process"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_fleet_mutation",
+      "spawned_module": "grabowski_fleet_mutation"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_job_finalizer",
+      "spawned_module": "grabowski_ntfy_dispatch"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_alert_outbox",
+      "spawned_module": "grabowski_ntfy_dispatch"
+    }
+  ],
+  "browser_operator_default": {
+    "schema_version": 2,
+    "authority": "grabowski",
+    "decision_rule": "Use this path by default for agent browser work unless a concrete task requirement cannot be satisfied by it.",
+    "canonical_browser": {
+      "family": "chrome-stable",
+      "vendor": "google",
+      "executable": "/opt/google/chrome/google-chrome",
+      "adapter": "chrome-cdp",
+      "protocol": "cdp",
+      "selection_role": "canonical-operator"
+    },
+    "transport": {
+      "primary": "direct-cdp",
+      "endpoint_address": "127.0.0.1",
+      "loopback_only": true,
+      "vendor_mcp_role": "optional-diagnostic-or-adapter-never-lifecycle-authority"
+    },
+    "semantic_gateway": {
+      "coverage": "partial",
+      "tool": "grabowski_browser_worker_semantic",
+      "operations": [
+        "observe",
+        "act"
+      ],
+      "supported_intents": [
+        "read_state",
+        "navigate",
+        "scroll_into_view",
+        "activate"
+      ],
+      "uncovered_intents": {},
+      "public_target_contract": "opaque-handles-and-validated-navigation-targets",
+      "implemented_effect_classes": [
+        "read",
+        "local_ui",
+        "network_navigation"
+      ],
+      "fail_closed_effect_classes": [
+        "reversible_external",
+        "external_mutation",
+        "high_impact"
+      ],
+      "ambiguous_effect_retry_authorized": false,
+      "authoritative_readback_required_before_new_intent": true,
+      "readback_grants_retry_authority": false
+    },
+    "profile": {
+      "default": "ephemeral",
+      "human_profile_reuse": false,
+      "persistent_profile_policy": "explicit-auth-or-trust-scope-only",
+      "exclusive_profile_lease": true
+    },
+    "lifecycle": [
+      "grabowski_browser_worker_start",
+      "direct_cdp_action",
+      "direct_cdp_readback",
+      "grabowski_browser_worker_stop",
+      "profile_and_lease_cleanup_readback"
+    ],
+    "human_browser_default": {
+      "browser": "brave",
+      "preserve": true,
+      "agent_primary": false
+    },
+    "future_adapter": {
+      "id": "webdriver-bidi",
+      "browser_family": "firefox",
+      "status": "not-implemented"
+    },
+    "evidence_anchor": {
+      "bureau_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-FU-BROWSER-RUNTIME-LIVE-PROOF-20260811",
+      "completion_receipt_sha256": "ab5b16ec7e17bed0e6a28ce15a4365a5d7f2e07197c008325d6c08546a0e5a90",
+      "validated_at": "2026-08-11T23:56:29.955408Z",
+      "does_not_establish": [
+        "future_runtime_availability",
+        "semantic_gateway_live_deployment"
+      ]
+    }
+  }
+}
