@@ -27,6 +27,16 @@ TASK_STATE_ROOT_FIELD = "chronik_outbox_state_root"
 TASK_CONTEXT_FIELD = "chronik_context_json"
 TRUTHY = {"1", "true", "yes", "on"}
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
+HIGH_VALUE_LIFECYCLE_OPERATIONS = frozenset({"deploy", "merge", "recovery"})
+ALWAYS_RETAINED_TERMINAL_EVENT_KINDS = frozenset(
+    {
+        "agent.run.failed",
+        "agent.run.cancelled",
+        "agent.run.timed_out",
+        "agent.run.signalled",
+        "agent.run.blocked",
+    }
+)
 ARCHIVE_INDEX_FILENAME = "archive-index.v1.json"
 ARCHIVE_INDEX_SCHEMA = "chronik-grabowski-outbox-archive-index.v1"
 BUNDLE_MANIFEST_SCHEMA = "chronik-grabowski-outbox-bundle-manifest.v1"
@@ -815,11 +825,24 @@ def append_unique(path: Path, event: dict[str, Any]) -> bool:
         return True
 
 
+def _event_should_be_recorded(event: dict[str, Any]) -> bool:
+    kind = event.get("kind")
+    if kind in ALWAYS_RETAINED_TERMINAL_EVENT_KINDS:
+        return True
+    if kind not in {"agent.run.started", "agent.run.completed"}:
+        return False
+    data = event.get("data")
+    return (
+        isinstance(data, dict)
+        and data.get("operation") in HIGH_VALUE_LIFECYCLE_OPERATIONS
+    )
+
+
 def record_task_state(record: dict[str, Any], state: str) -> dict[str, Any]:
     if not record_enabled(record):
         return {"enabled": False, "written": False}
     event = build_event(record, state)
-    if event is None:
+    if event is None or not _event_should_be_recorded(event):
         return {"enabled": True, "written": False}
     path = outbox_path(event, state_root(record))
     return {"enabled": True, "written": append_unique(path, event), "path": str(path), "kind": event["kind"]}
