@@ -2361,9 +2361,9 @@ ICON_DATA_B64 = (
 def icon_bytes() -> bytes:
     payload = base64.b64decode(ICON_DATA_B64, validate=True)
     if len(payload) != ICON_BYTES:
-        raise RuntimeError("embedded Kleiner-Maulwurf icon size mismatch")
+        raise RuntimeError("embedded der kleine maulwurf icon size mismatch")
     if hashlib.sha256(payload).hexdigest() != ICON_SHA256:
-        raise RuntimeError("embedded Kleiner-Maulwurf icon hash mismatch")
+        raise RuntimeError("embedded der kleine maulwurf icon hash mismatch")
     return payload
 
 
@@ -2374,7 +2374,7 @@ def icon_data_uri() -> str:
 
 
 def mcp_icons():
-    """Return the Kleiner-Maulwurf MCP implementation icon via the public MCP Icon type."""
+    """Return the der kleine maulwurf MCP implementation icon via the public MCP Icon type."""
 
     try:
         from mcp.types import Icon
