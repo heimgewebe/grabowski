@@ -416,9 +416,21 @@ def run_captain_run(
         if (
             result.get("execution_invoked") is not True
             and result.get("verification_passed") is True
-            and result.get("merge_queued") is True
-            and result.get("merge_completion_verified") is False
             and result.get("duplicate_dispatch_prevented") is True
+            and (
+                (
+                    result.get("merge_queued") is True
+                    and result.get("merge_completion_verified") is False
+                )
+                or (
+                    result.get("merge_completion_verified") is True
+                    and isinstance(result.get("external_merge_reconciliation"), dict)
+                    and result["external_merge_reconciliation"].get(
+                        "external_merge_observed"
+                    )
+                    is True
+                )
+            )
         )
     ]
     pre_execution_failures = [
@@ -514,7 +526,7 @@ def run_captain_run(
                 receipt,
                 "execution-attempted",
                 "skip",
-                "exact asynchronous merge-queue state already existed; duplicate dispatch prevented",
+                "exact remote merge/queue state was reconciled without dispatch; duplicate dispatch prevented",
             )
         else:
             core._check(

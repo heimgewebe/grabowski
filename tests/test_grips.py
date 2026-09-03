@@ -9847,6 +9847,113 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("not safely reconcilable", execution["verification_error"])
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
+    def test_captain_run_reconciles_merge_completed_during_pre_dispatch_queue_readback(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        open_view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        merged_view = dict(
+            open_view,
+            state="MERGED",
+            mergedAt="2026-07-08T03:00:00Z",
+            mergeCommit={"oid": "d" * 40},
+        )
+        gh = FakeGh(
+            view_sequence=[open_view, merged_view],
+            merge_queue_view_overrides={"state": "MERGED"},
+            merge_updates_view=False,
+        )
+        gh.active_rules.append(
+            {
+                "type": "merge_queue",
+                "parameters": {"merge_method": "MERGE"},
+                "ruleset_source_type": "Repository",
+                "ruleset_source": "heimgewebe/grabowski",
+                "ruleset_id": 18801517,
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("executed", result["output"]["decision"])
+        self.assertEqual("not-performed", result["output"]["actions"][0]["execution"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertTrue(execution["verification_passed"])
+        self.assertTrue(execution["merge_completion_verified"])
+        self.assertTrue(execution["remote_mutation_observed"])
+        self.assertTrue(execution["duplicate_dispatch_prevented"])
+        self.assertEqual(
+            "merged_during_pre_dispatch_queue_readback",
+            execution["merge_queue_reconciliation"],
+        )
+        self.assertEqual("MERGED", execution["verified_pr"]["state"])
+        self.assertTrue(
+            execution["external_merge_reconciliation"]["external_merge_observed"]
+        )
+        self.assertFalse(execution["external_merge_reconciliation"]["dispatch_called"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        attempted_checks = [
+            check
+            for check in result["receipt"]["checks"]
+            if check["id"] == "execution-attempted"
+        ]
+        self.assertEqual("skip", attempted_checks[-1]["status"])
+
+    def test_captain_run_blocks_unbound_pre_dispatch_merged_queue_readback(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_queue_view_overrides={
+                "state": "MERGED",
+                "headRefOid": "f" * 40,
+            },
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertIn("merge_queue_head_mismatch", execution["preflight_errors"])
+        self.assertFalse(execution["remote_mutation_observed"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_captain_run_reconciles_merge_completed_during_queue_readback(self) -> None:
         parameters = authorized_captain_run_parameters()
         gh = FakeGh(

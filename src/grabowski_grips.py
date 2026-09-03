@@ -12535,6 +12535,61 @@ def _run_captain_pr_merge(
         expected_base_sha=expected_base_sha,
     )
     execution_result["pre_dispatch_merge_queue_readback"] = queue_info
+    pre_queue_view = queue_info.get("view") if isinstance(queue_info, dict) else None
+    pre_queue_binding_errors = [
+        error
+        for error in queue_errors
+        if error != "merge_queue_pr_state_not_open"
+    ]
+    if (
+        isinstance(pre_queue_view, dict)
+        and pre_queue_view.get("state") == "MERGED"
+        and not pre_queue_binding_errors
+    ):
+        (
+            reconciled_view,
+            reconciliation_attempts,
+            reconciliation_errors,
+            reconciliation_summary,
+        ) = _captain_pr_merge_post_view(
+            repo_path,
+            github_runner,
+            repo_slug=repo_slug,
+            pr_number=pr_number,
+            expected_head=expected_head,
+            expected_base=expected_base,
+        )
+        execution_result["pre_queue_merge_verify_view_attempts"] = (
+            reconciliation_attempts
+        )
+        execution_result["pre_queue_merge_verify_summary"] = reconciliation_summary
+        if reconciliation_errors or reconciled_view is None:
+            reconciliation_failures = (
+                reconciliation_errors
+                if reconciliation_errors
+                else ["pre_dispatch_merged_pr_verification_failed"]
+            )
+            execution_result["preflight_errors"].extend(reconciliation_failures)
+            execution_result["verification_error"] = (
+                "merge completed during pre-dispatch queue readback but canonical "
+                "merged identity could not be verified: "
+                + "; ".join(reconciliation_failures)
+            )
+            return execution_result
+        execution_result.update(
+            {
+                "preflight_passed": True,
+                "remote_mutation_observed": True,
+                "verification_passed": True,
+                "merge_completion_verified": True,
+                "duplicate_dispatch_prevented": True,
+                "merge_queue_reconciliation": (
+                    "merged_during_pre_dispatch_queue_readback"
+                ),
+                "verified_pr": reconciled_view,
+            }
+        )
+        return execution_result
     if queue_errors:
         execution_result["preflight_errors"].extend(queue_errors)
         execution_result["verification_error"] = (
