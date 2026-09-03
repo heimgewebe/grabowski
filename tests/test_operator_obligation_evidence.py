@@ -1273,6 +1273,93 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             )
         )
 
+    def test_prepare_github_accepts_empty_batched_merge_group_backlink_with_group_base_sha(self) -> None:
+        repo = "heimgewebe/grabowski"
+        pr = 950
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        group_base = "4" * 40
+        merge_run = 9052
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=354,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8052,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                )
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=pr,
+                run_head_branch_overrides={
+                    merge_run: f"gh-readonly-queue/main/pr-{pr}-{group_base}"
+                },
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": pr}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith(
+                "checks=1/1-effective-success"
+            )
+        )
+
+    def test_prepare_github_rejects_empty_merge_group_backlink_with_malformed_group_base(self) -> None:
+        repo = "heimgewebe/grabowski"
+        pr = 953
+        merge_run = 9053
+        payload = self._github_v2_payload(
+            head="1" * 40,
+            base="2" * 40,
+            merge="3" * 40,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=355,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8053,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                )
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=pr,
+                run_head_branch_overrides={
+                    merge_run: f"gh-readonly-queue/main/pr-{pr}-not-a-sha"
+                },
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": pr}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
     def test_prepare_github_rejects_mismatched_expected_pr_inside_batched_merge_group(self) -> None:
         repo = "heimgewebe/grabowski"
         pr = 951

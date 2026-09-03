@@ -899,7 +899,7 @@ def _github_v2_merge_group_bindings_valid(
         "base_ref": base_ref,
         "base_sha": base_sha,
     }
-    expected_queue_branch = f"gh-readonly-queue/{base_ref}/pr-{pr}-{base_sha}"
+    expected_queue_branch_prefix = f"gh-readonly-queue/{base_ref}/pr-{pr}-"
     for run_id in run_ids:
         binding = bindings.get(run_id)
         if binding is None or binding.get("event") != "merge_group":
@@ -908,9 +908,15 @@ def _github_v2_merge_group_bindings_valid(
         if not isinstance(pulls, list):
             return False
         if not pulls:
+            queue_branch = binding.get("head_branch")
             if (
                 binding.get("head_sha") != merge_sha
-                or binding.get("head_branch") != expected_queue_branch
+                or not isinstance(queue_branch, str)
+                or not queue_branch.startswith(expected_queue_branch_prefix)
+                or SHA40_RE.fullmatch(
+                    queue_branch[len(expected_queue_branch_prefix) :]
+                )
+                is None
             ):
                 return False
         else:
