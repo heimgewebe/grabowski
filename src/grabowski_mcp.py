@@ -1058,27 +1058,38 @@ MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
 MCP_BRANDING_VARIANT_ENV = "GRABOWSKI_MCP_BRANDING_VARIANT"
+DER_KLEINE_MAULWURF_BRANDING_VARIANT = "der-kleine-maulwurf"
+LEGACY_KLEINER_MAULWURF_BRANDING_VARIANT = "kleiner-maulwurf"
+DER_KLEINE_MAULWURF_APP_NAME = "der kleine maulwurf"
 
 
-def _configured_mcp_icons():
+def _configured_mcp_branding():
     variant = os.environ.get(MCP_BRANDING_VARIANT_ENV, "").strip()
     if not variant:
         return None
-    if variant != "kleiner-maulwurf":
+    if variant not in {
+        DER_KLEINE_MAULWURF_BRANDING_VARIANT,
+        LEGACY_KLEINER_MAULWURF_BRANDING_VARIANT,
+    }:
         raise RuntimeError(
             f"unsupported {MCP_BRANDING_VARIANT_ENV} value: {variant!r}"
         )
 
-    from kleiner_maulwurf_operator import mcp_icons
+    from der_kleine_maulwurf_operator import mcp_icons
 
-    return mcp_icons()
+    return DER_KLEINE_MAULWURF_APP_NAME, mcp_icons()
 
 
-_configured_icons = _configured_mcp_icons()
-if _configured_icons is None:
+_configured_branding = _configured_mcp_branding()
+if _configured_branding is None:
     mcp = FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS)
 else:
-    mcp = FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS, icons=_configured_icons)
+    _configured_app_name, _configured_icons = _configured_branding
+    mcp = FastMCP(
+        _configured_app_name,
+        instructions=AGENT_INSTRUCTIONS,
+        icons=_configured_icons,
+    )
 
 READ_ANNOTATIONS = ToolAnnotations(
     title="Read local data",
