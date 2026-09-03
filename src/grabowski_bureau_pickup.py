@@ -607,10 +607,9 @@ def _read_private_bytes_at(
         linked_after = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
     finally:
         os.close(descriptor)
-    if (
-        _file_snapshot_identity(before) != _file_snapshot_identity(after)
-        or _file_snapshot_identity(after) != _file_snapshot_identity(linked_after)
-    ):
+    if _file_snapshot_identity(before) != _file_snapshot_identity(
+        after
+    ) or _file_snapshot_identity(after) != _file_snapshot_identity(linked_after):
         raise BureauPickupError(f"{label}-changed-during-read")
     _assert_private_directory_binding(
         directory_descriptor, directory_path, label="pickup-run"
@@ -933,7 +932,10 @@ def _validate_registry_binding_identity(identity: dict[str, Any]) -> dict[str, A
     if set(identity) != expected:
         raise BureauPickupError("canonical-registry-binding-shape-invalid")
     source_commit = identity.get("source_commit")
-    if not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+    if (
+        not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+    ):
         raise BureauPickupError("canonical-registry-source-commit-invalid")
     # Launcher and manifest digests preserve deployment provenance only.
     # Journal replay must survive a later deployment rotation; the inventory
@@ -1165,12 +1167,19 @@ def _machine_completion_closeout_latch(
     normalized_acceptance_ids: list[str] = []
     for item in acceptance:
         identifier = item.get("id") if isinstance(item, dict) else None
-        if not isinstance(identifier, str) or not identifier or identifier in acceptance_ids:
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in acceptance_ids
+        ):
             return None
         normalized_identifier = re.sub(
             r"[^a-z0-9]+", "_", identifier.lower()
         ).strip("_")
-        if not normalized_identifier or normalized_identifier in normalized_acceptance_ids:
+        if (
+            not normalized_identifier
+            or normalized_identifier in normalized_acceptance_ids
+        ):
             return None
         acceptance_ids.append(identifier)
         normalized_acceptance_ids.append(normalized_identifier)
@@ -1225,9 +1234,10 @@ def _machine_completion_closeout_latch(
     for field, value in bound_evidence.items():
         if field.endswith("sha256") and SHA256_RE.fullmatch(value) is None:
             return None
-        if field in {"merge_commit", "runtime_head", "source_commit"} and re.fullmatch(
-            r"[0-9a-f]{40}", value
-        ) is None:
+        if (
+            field in {"merge_commit", "runtime_head", "source_commit"}
+            and re.fullmatch(r"[0-9a-f]{40}", value) is None
+        ):
             return None
 
     material = {
@@ -1416,12 +1426,15 @@ def _claim_intent_rejection(payload: dict[str, Any]) -> BureauPickupError:
     status = payload.get("status")
     source_code = payload.get("code")
     token = source_code if isinstance(source_code, str) else status
-    if not isinstance(token, str) or re.fullmatch(
-        r"[a-z0-9]+(?:-[a-z0-9]+)*", token
-    ) is None:
+    if (
+        not isinstance(token, str)
+        or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", token) is None
+    ):
         error_code = "claim-intent-not-ready"
     else:
-        candidate = token if token.startswith("claim-intent-") else f"claim-intent-{token}"
+        candidate = (
+            token if token.startswith("claim-intent-") else f"claim-intent-{token}"
+        )
         error_code = (
             candidate
             if len(candidate) <= MAX_CLAIM_REJECTION_CODE_BYTES
@@ -1814,9 +1827,10 @@ def _preflight_acquisition_groups(
             expected_purpose = (
                 f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
             )
-            if validated_proof["purpose_sha256"] != hashlib.sha256(
-                expected_purpose.encode("utf-8")
-            ).hexdigest():
+            if (
+                validated_proof["purpose_sha256"]
+                != hashlib.sha256(expected_purpose.encode("utf-8")).hexdigest()
+            ):
                 raise nonconflict.NonConflictDenied(
                     "purpose-drift",
                     "non-conflict proof purpose does not match the acquisition group",
@@ -1840,10 +1854,7 @@ def _preflight_acquisition_groups(
                     "requested scope changed after proof creation",
                 )
             requested_ttl_seconds = group["ttl_seconds"]
-            if (
-                type(requested_ttl_seconds) is not int
-                or requested_ttl_seconds <= 0
-            ):
+            if type(requested_ttl_seconds) is not int or requested_ttl_seconds <= 0:
                 raise ValueError("requested_ttl_seconds must be a positive integer")
             if (
                 requested_ttl_seconds > nonconflict.MAX_PROOF_TTL_SECONDS
@@ -1903,7 +1914,8 @@ def _validate_acquired_group(
     if sorted(observed) != expected:
         raise BureauPickupError(
             "lease-acquisition-resource-set-mismatch",
-            details={"group": group["name"], "expected": expected, "observed": sorted(observed)},
+            details={"group": group["name"], "expected": expected, "observed": sorted(observed),
+            },
         )
 
 
@@ -2045,18 +2057,20 @@ def _commit_claim(
 
 
 def _coordination_status(
-    run_id: str, *, registry_root: str, coordination_root: str | None
+    run_id: str, *, registry_root: str, coordination_root: str | None,
+    activity_id: str | None = None,
 ) -> dict[str, Any]:
-    return bureau._invoke_bureau(
-        [
-            *_bureau_arguments(
-                "claim-coordination-status",
-                registry_root=registry_root,
-                coordination_root=coordination_root,
-            ),
-            run_id,
-        ]
-    )
+    arguments = [
+        *_bureau_arguments(
+            "claim-coordination-status",
+            registry_root=registry_root,
+            coordination_root=coordination_root,
+        ),
+        run_id,
+    ]
+    if activity_id is not None:
+        arguments.extend(["--activity-id", activity_id])
+    return bureau._invoke_bureau(arguments)
 
 
 def _definitive_missing_run(payload: dict[str, Any]) -> bool:
@@ -2376,10 +2390,7 @@ def _claim_rejection_allows_journal_replay(
     detail = error.details.get("detail")
     if not isinstance(detail, str):
         return False
-    prefix = (
-        "request binding mismatch for existing assignment "
-        f"{request['task_id']}: "
-    )
+    prefix = f"request binding mismatch for existing assignment {request['task_id']}: "
     if not detail.startswith(prefix):
         return False
     digests = detail[len(prefix) :]
@@ -2542,7 +2553,8 @@ def _registry_successor_proof(
         if lines is None:
             raise BureauPickupError(
                 "orphan-recovery-registry-source-not-ancestor",
-                details={"stored_source_commit": before, "current_source_commit": after},
+                details={"stored_source_commit": before, "current_source_commit": after,
+                },
             )
     return {
         "repository": str(bureau_leases.BUREAU_REPOSITORY_ROOT),
@@ -2773,7 +2785,8 @@ def _validate_recoverable_orphan(
     if coordination.get("status") != "coordinated":
         raise BureauPickupError(
             "orphan-recovery-coordination-unavailable",
-            details={"status": coordination.get("status"), "code": coordination.get("code")},
+            details={"status": coordination.get("status"), "code": coordination.get("code"),
+            },
         )
     run = coordination.get("run")
     if not isinstance(run, dict):
@@ -2831,13 +2844,15 @@ def _validate_recoverable_orphan(
     }
     if any(release.get(key) != value for key, value in expected_release.items()):
         raise BureauPickupError("orphan-recovery-release-binding-drift")
-    if acquisition.get("run_id") != intent["run_id"] or acquisition.get(
-        "task_id"
-    ) != intent["task_id"]:
+    if (
+        acquisition.get("run_id") != intent["run_id"]
+        or acquisition.get("task_id") != intent["task_id"]
+    ):
         raise BureauPickupError("orphan-recovery-acquisition-run-drift")
-    if acquisition.get("owner_id") != intent["lease_owner_id"] or acquisition.get(
-        "claim_intent_sha256"
-    ) != intent["intent_sha256"]:
+    if (
+        acquisition.get("owner_id") != intent["lease_owner_id"]
+        or acquisition.get("claim_intent_sha256") != intent["intent_sha256"]
+    ):
         raise BureauPickupError("orphan-recovery-acquisition-owner-drift")
     return run
 
@@ -3087,7 +3102,10 @@ def _ensure_registry_binding_recovery_receipt(
     journal_identity = candidate["journal_identity"]
     chain = _registry_recovery_receipt_chain(candidate)
     current_binding_sha256 = current_binding["identity"]["binding_sha256"]
-    if chain and chain[-1].get("current_registry_binding_sha256") == current_binding_sha256:
+    if (
+        chain
+        and chain[-1].get("current_registry_binding_sha256") == current_binding_sha256
+    ):
         return chain[-1]
     if any(
         existing.get("current_registry_binding_sha256") == current_binding_sha256
@@ -3262,7 +3280,8 @@ def _reacquire_orphaned_assignment_leases(
                 if observed.get("owner_id") != intent["lease_owner_id"]:
                     raise BureauPickupError(
                         "orphan-recovery-lease-foreign-owner",
-                        details={"resource_key": key, "owner_id": observed.get("owner_id")},
+                        details={"resource_key": key, "owner_id": observed.get("owner_id"),
+                        },
                     )
                 if observed.get("purpose") != purpose:
                     raise BureauPickupError(
@@ -3284,7 +3303,8 @@ def _reacquire_orphaned_assignment_leases(
             if persisted.get("owner_id") != intent["lease_owner_id"]:
                 raise BureauPickupError(
                     "orphan-recovery-lease-foreign-owner",
-                    details={"resource_key": key, "owner_id": persisted.get("owner_id")},
+                    details={"resource_key": key, "owner_id": persisted.get("owner_id"),
+                    },
                 )
             if persisted.get("purpose") != purpose or persisted.get(
                 "metadata_sha256"
@@ -3670,11 +3690,11 @@ def _recover_orphaned_journal_before_claim(
             run = validated
 
     lease_request = dict(candidate["stored_request"])
-    lease_request["_orphan_recovery_pre_effect_guard"] = (
-        lambda: _guard_recovery_authority(post_effect=False)
+    lease_request["_orphan_recovery_pre_effect_guard"] = lambda: (
+        _guard_recovery_authority(post_effect=False)
     )
-    lease_request["_orphan_recovery_post_effect_guard"] = (
-        lambda: _guard_recovery_authority(post_effect=True)
+    lease_request["_orphan_recovery_post_effect_guard"] = lambda: (
+        _guard_recovery_authority(post_effect=True)
     )
     lease_receipt = _reacquire_orphaned_assignment_leases(
         intent, lease_request, acquisition, candidate["run_dir"]
@@ -3726,7 +3746,10 @@ def _recover_orphaned_journal_before_claim(
                 },
             ) from exc
     observed_run = readback.get("run") if isinstance(readback, dict) else None
-    if isinstance(observed_run, dict) and observed_run.get("state") in ACTIVE_EXECUTION_STATES:
+    if (
+        isinstance(observed_run, dict)
+        and observed_run.get("state") in ACTIVE_EXECUTION_STATES
+    ):
         _validate_resumed_run(readback, intent, acquisition, journal_identity)
     else:
         raise BureauPickupError(
@@ -4119,13 +4142,558 @@ def _persisted_resource_lease(resource_key: str) -> dict[str, Any] | None:
     return {**snapshot, "purpose": purpose}
 
 
+def _existing_assignment_repair_external_binding(
+    run: dict[str, Any],
+) -> dict[str, Any]:
+    fields = (
+        "external_system",
+        "external_id",
+        "external_state",
+        "external_observed_at",
+    )
+    snapshot = {field: run.get(field) for field in fields}
+    if all(value is None for value in snapshot.values()):
+        return {"external_unbound": True, **snapshot}
+    if any(value is None for value in snapshot.values()):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-external-binding-incomplete",
+            details={
+                "present_fields": [
+                    field for field, value in snapshot.items() if value is not None
+                ],
+                "missing_fields": [
+                    field for field, value in snapshot.items() if value is None
+                ],
+            },
+        )
+    if any(
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x00" in value
+        for value in snapshot.values()
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-external-binding-invalid"
+        )
+    external_state = snapshot["external_state"]
+    run_state = run.get("state")
+    if external_state not in ACTIVE_EXTERNAL_STATES:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-external-state-invalid",
+            details={"external_state": external_state},
+        )
+    if (run_state == "verifying") != (external_state == "succeeded"):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-external-state-inconsistent",
+            details={"run_state": run_state, "external_state": external_state},
+        )
+    observed_at, parse_error = _parse_utc_timestamp(snapshot["external_observed_at"])
+    if parse_error is not None:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-external-observation-invalid",
+            details={"parse_error": parse_error},
+        )
+    assert observed_at is not None
+    age = (datetime.now(timezone.utc) - observed_at).total_seconds()
+    if age < 0 or age > EXECUTION_HEARTBEAT_MAX_AGE_SECONDS:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-external-observation-not-current",
+            details={"age_seconds": int(age)},
+        )
+    return {"external_unbound": False, **snapshot}
+
+
+def _existing_assignment_repair_authority(
+    coordination: dict[str, Any],
+    intent: dict[str, Any],
+    acquisition: dict[str, Any],
+    run_dir: Path,
+    registry_binding: RegistryBinding,
+    *,
+    coordination_root: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if coordination.get("status") != "coordinated":
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-not-coordinated",
+            details={"status": coordination.get("status")},
+        )
+    run = coordination.get("run")
+    if not isinstance(run, dict):
+        raise BureauPickupError("existing-assignment-lease-repair-run-missing")
+    if run.get("state") not in ACTIVE_EXECUTION_STATES or run.get("error") is not None:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-run-not-active",
+            details={"state": run.get("state"), "error": run.get("error")},
+        )
+
+    journal_identity = _journal_run_identity(run_dir, intent)
+    expected_run = {
+        key: journal_identity[key]
+        for key in (
+            "run_id",
+            "task_id",
+            "worker_id",
+            "task_sha256",
+            "plan_sha256",
+            "envelope_sha256",
+        )
+    }
+    mismatches = {
+        key: {"expected": value, "observed": run.get(key)}
+        for key, value in expected_run.items()
+        if run.get(key) != value
+    }
+    if mismatches:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-run-identity-drift",
+            details={"mismatches": mismatches},
+        )
+
+    _validate_acquisition(acquisition)
+    expected_acquisition = {
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "owner_id": intent["lease_owner_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "resource_keys": intent["required_resource_keys"],
+    }
+    acquisition_mismatches = {
+        key: {"expected": value, "observed": acquisition.get(key)}
+        for key, value in expected_acquisition.items()
+        if acquisition.get(key) != value
+    }
+    if acquisition_mismatches:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-acquisition-drift",
+            details={"mismatches": acquisition_mismatches},
+        )
+    acquisition_leases = acquisition.get("leases")
+    if not isinstance(acquisition_leases, list):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-acquisition-leases-invalid"
+        )
+    lease_keys: list[str] = []
+    for lease in acquisition_leases:
+        if (
+            not isinstance(lease, dict)
+            or not isinstance(lease.get("resource_key"), str)
+            or lease.get("owner_id") != intent["lease_owner_id"]
+        ):
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-acquisition-lease-drift"
+            )
+        lease_keys.append(lease["resource_key"])
+    if sorted(lease_keys) != intent["required_resource_keys"] or len(lease_keys) != len(
+        set(lease_keys)
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-acquisition-lease-set-drift"
+        )
+    if coordination.get("claim_intent_sha256") != intent["intent_sha256"]:
+        raise BureauPickupError("existing-assignment-lease-repair-intent-drift")
+    release = coordination.get("release")
+    expected_release = {
+        "required": bool(intent["required_resource_keys"]),
+        "owner_id": intent["lease_owner_id"],
+        "resource_keys": intent["required_resource_keys"],
+        "claim_intent_sha256": intent["intent_sha256"],
+    }
+    if not isinstance(release, dict):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-release-binding-missing"
+        )
+    release_mismatches = {
+        key: {"expected": value, "observed": release.get(key)}
+        for key, value in expected_release.items()
+        if release.get(key) != value
+    }
+    if release_mismatches:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-release-binding-drift",
+            details={"mismatches": release_mismatches},
+        )
+
+    binding = _classify_execution_binding(run)
+    if binding["classification"] not in {"actively_bound", "stale"}:
+        raise BureauPickupError(
+            "existing-assignment-execution-not-bound",
+            details={
+                "action": "repair-existing-assignment-lease-binding",
+                "run_id": run.get("run_id"),
+                "state": run.get("state"),
+                "heartbeat_age_seconds": binding.get("heartbeat_age_seconds"),
+                "heartbeat_parse_error": binding.get("heartbeat_parse_error"),
+                "missing_bindings": binding.get("missing_bindings"),
+                "reason_codes": binding.get("reason_codes"),
+                "execution_binding": binding,
+                "does_not_establish": binding.get("does_not_establish"),
+            },
+        )
+    external = _existing_assignment_repair_external_binding(run)
+    _bound_bureau_call(
+        registry_binding,
+        lambda: _current_registry_revision_proof(
+            registry_binding,
+            intent,
+            coordination_root=coordination_root,
+        ),
+    )
+    return journal_identity, external
+
+
+def _validated_lease_repair_receipt(
+    run_dir: Path, filename: str, receipt: dict[str, Any]
+) -> dict[str, Any]:
+    claimed = receipt.get("receipt_sha256")
+    payload = dict(receipt)
+    payload.pop("receipt_sha256", None)
+    if (
+        not isinstance(claimed, str)
+        or SHA256_RE.fullmatch(claimed) is None
+        or _sha256(payload) != claimed
+    ):
+        raise BureauPickupError("existing-assignment-lease-repair-receipt-invalid")
+    _write_bound_json(run_dir / filename, receipt)
+    persisted = _read_bound_json(
+        run_dir / filename, label=filename.removesuffix(".json")
+    )
+    if persisted != receipt:
+        raise BureauPickupError("existing-assignment-lease-repair-receipt-drift")
+    return persisted
+
+
+def _lease_repair_activity_id(receipt_sha256: str) -> str:
+    if SHA256_RE.fullmatch(receipt_sha256) is None:
+        raise BureauPickupError("existing-assignment-lease-repair-receipt-invalid")
+    return f"lease-repair:{receipt_sha256}"
+
+
+def _bound_activity_binding(
+    intent: dict[str, Any],
+    journal_identity: dict[str, Any],
+    external: dict[str, Any],
+    activity_id: str,
+) -> dict[str, Any]:
+    if external["external_unbound"]:
+        external_binding = {"status": "explicitly-unbound"}
+    else:
+        external_binding = {
+            "status": "bound",
+            "external_system": external["external_system"],
+            "external_id": external["external_id"],
+            "external_state": external["external_state"],
+            "external_observed_at": external["external_observed_at"],
+        }
+    return {
+        "activity_id": activity_id,
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "task_sha256": intent["task_sha256"],
+        "plan_sha256": intent["plan_sha256"],
+        "envelope_sha256": journal_identity["envelope_sha256"],
+        "external_binding": external_binding,
+    }
+
+
+def _heartbeat_lease_repair(
+    intent: dict[str, Any],
+    request: dict[str, Any],
+    acquisition: dict[str, Any],
+    registry_binding: RegistryBinding,
+    journal_identity: dict[str, Any],
+    external: dict[str, Any],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    activity_id = _lease_repair_activity_id(receipt["receipt_sha256"])
+    expected_activity = _bound_activity_binding(
+        intent, journal_identity, external, activity_id
+    )
+    arguments = _bureau_arguments(
+        "heartbeat",
+        registry_root=request["registry_root"],
+        coordination_root=request["coordination_root"],
+    )
+    arguments.extend(
+        [
+            intent["run_id"],
+            "--bound-activity",
+            "--activity-id",
+            activity_id,
+            "--task-id",
+            intent["task_id"],
+            "--worker",
+            intent["worker_id"],
+            "--task-sha256",
+            intent["task_sha256"],
+            "--plan-sha256",
+            intent["plan_sha256"],
+            "--envelope-sha256",
+            journal_identity["envelope_sha256"],
+        ]
+    )
+    if external["external_unbound"]:
+        arguments.append("--external-unbound")
+    else:
+        for field in (
+            "external_system",
+            "external_id",
+            "external_state",
+            "external_observed_at",
+        ):
+            arguments.extend([f"--{field.replace('_', '-')}", external[field]])
+
+    heartbeat_error: Exception | None = None
+    try:
+        heartbeat = _bound_bureau_call(
+            registry_binding,
+            lambda: bureau._invoke_bureau(
+                arguments,
+                mutation=True,
+                required_readback=[
+                    f"bureau_run:{intent['run_id']}",
+                    f"bureau_bound_activity:{activity_id}",
+                ],
+            ),
+        )
+    except Exception as exc:
+        heartbeat = None
+        heartbeat_error = exc
+
+    mutation_ambiguous = heartbeat_error is not None or not isinstance(heartbeat, dict)
+    if isinstance(heartbeat, dict) and _adapter_outcome_unknown(
+        heartbeat, run_id=intent["run_id"]
+    ):
+        mutation_ambiguous = True
+    if (
+        isinstance(heartbeat, dict)
+        and not mutation_ambiguous
+        and bureau._is_bureau_failure_payload(heartbeat)
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-rejected",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "heartbeat": heartbeat,
+                "lease_mutation_committed": True,
+            },
+        )
+
+    try:
+        readback = _bound_bureau_call(
+            registry_binding,
+            lambda: _coordination_status(
+                intent["run_id"],
+                registry_root=request["registry_root"],
+                coordination_root=request["coordination_root"],
+                activity_id=activity_id,
+            ),
+        )
+    except Exception as exc:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-outcome-unknown",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "rebind_required": True,
+                "lease_mutation_committed": True,
+                "heartbeat_error_type": (
+                    type(heartbeat_error).__name__ if heartbeat_error else None
+                ),
+                "readback_error_type": type(exc).__name__,
+            },
+        ) from exc
+    if not isinstance(readback, dict) or _adapter_outcome_unknown(
+        readback, run_id=intent["run_id"]
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-outcome-unknown",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "rebind_required": True,
+                "lease_mutation_committed": True,
+                "coordination": readback,
+            },
+        )
+    if "bound_activity" not in readback:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-outcome-unknown",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "rebind_required": True,
+                "lease_mutation_committed": True,
+                "definitively_missing": False,
+            },
+        )
+    bound_activity_status = readback["bound_activity"]
+    expected_status_keys = {
+        "schema_version",
+        "kind",
+        "status",
+        "run_id",
+        "activity_id",
+        "bound_activity",
+    }
+    expected_status_binding = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "bureau_bound_activity_status",
+        "run_id": intent["run_id"],
+        "activity_id": activity_id,
+    }
+    if not isinstance(bound_activity_status, dict):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-conflict",
+            details={"run_id": intent["run_id"], "activity_id": activity_id},
+        )
+    status_mismatches = {
+        key: {"expected": value, "observed": bound_activity_status.get(key)}
+        for key, value in expected_status_binding.items()
+        if bound_activity_status.get(key) != value
+    }
+    if set(bound_activity_status) != expected_status_keys or status_mismatches:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-conflict",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "expected_fields": sorted(expected_status_keys),
+                "observed_fields": sorted(bound_activity_status),
+                "mismatches": status_mismatches,
+            },
+        )
+    status = bound_activity_status["status"]
+    bound_activity = bound_activity_status["bound_activity"]
+    if status == "missing":
+        if bound_activity is not None:
+            raise BureauPickupError(
+                "existing-assignment-lease-repair-heartbeat-readback-conflict",
+                details={"run_id": intent["run_id"], "activity_id": activity_id},
+            )
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-missing",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "rebind_required": True,
+                "lease_mutation_committed": True,
+                "definitively_missing": True,
+            },
+        )
+    if status != "recorded" or not isinstance(bound_activity, dict):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-conflict",
+            details={"run_id": intent["run_id"], "activity_id": activity_id},
+        )
+    expected_event_keys = {
+        "kind",
+        "source",
+        "outcome",
+        "activity",
+        "heartbeat_at",
+    }
+    expected_event_binding = {
+        "kind": "bureau.bound_activity_heartbeat",
+        "source": "bound-activity",
+        "outcome": "succeeded",
+    }
+    event_mismatches = {
+        key: {"expected": value, "observed": bound_activity.get(key)}
+        for key, value in expected_event_binding.items()
+        if bound_activity.get(key) != value
+    }
+    if set(bound_activity) != expected_event_keys or event_mismatches:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-conflict",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "expected_fields": sorted(expected_event_keys),
+                "observed_fields": sorted(bound_activity),
+                "mismatches": event_mismatches,
+            },
+        )
+    activity = bound_activity["activity"]
+    if activity != expected_activity:
+        observed_activity = activity if isinstance(activity, dict) else {}
+        activity_mismatches = {
+            key: {"expected": value, "observed": observed_activity.get(key)}
+            for key, value in expected_activity.items()
+            if observed_activity.get(key) != value
+        }
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-conflict",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "mismatches": activity_mismatches,
+            },
+        )
+    heartbeat_at = bound_activity["heartbeat_at"]
+    _, heartbeat_parse_error = _parse_utc_timestamp(heartbeat_at)
+    if (
+        heartbeat_parse_error is not None
+        or not isinstance(heartbeat_at, str)
+        or heartbeat_at != heartbeat_at.strip()
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-conflict",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "heartbeat_parse_error": heartbeat_parse_error,
+            },
+        )
+    run = _validate_claim_readback(readback, intent, acquisition)
+    expected_run_binding = {
+        key: expected_activity[key]
+        for key in (
+            "run_id",
+            "task_id",
+            "worker_id",
+            "task_sha256",
+            "plan_sha256",
+            "envelope_sha256",
+        )
+    }
+    expected_run_binding.update(
+        {
+            field: external[field]
+            for field in (
+                "external_system",
+                "external_id",
+                "external_state",
+                "external_observed_at",
+            )
+        }
+    )
+    identity_mismatches = {
+        key: {"expected": value, "observed": run.get(key)}
+        for key, value in expected_run_binding.items()
+        if run.get(key) != value
+    }
+    if identity_mismatches:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-run-drift",
+            details={"mismatches": identity_mismatches},
+        )
+    _require_active_execution_binding(
+        readback, action="repair-existing-assignment-lease-heartbeat-readback"
+    )
+    return readback
+
+
 def _repair_existing_assignment_lease_binding(
     coordination: dict[str, Any],
     intent: dict[str, Any],
     request: dict[str, Any],
     acquisition: dict[str, Any],
     run_dir: Path,
-) -> bool:
+    registry_binding: RegistryBinding,
+) -> dict[str, Any] | bool:
     lease_state = coordination.get("lease")
     lease_error = lease_state.get("error") if isinstance(lease_state, dict) else None
     error_code = lease_error.get("code") if isinstance(lease_error, dict) else None
@@ -4140,22 +4708,13 @@ def _repair_existing_assignment_lease_binding(
         }
     ):
         return False
-    run = coordination.get("run")
-    if not isinstance(run, dict) or run.get("state") not in ACTIVE_EXECUTION_STATES:
-        return False
-    release = coordination.get("release")
-    if not isinstance(release, dict):
-        return False
-    expected_release = {
-        "owner_id": intent["lease_owner_id"],
-        "resource_keys": intent["required_resource_keys"],
-        "claim_intent_sha256": intent["intent_sha256"],
-    }
-    if any(release.get(key) != value for key, value in expected_release.items()):
-        return False
-    # Fail closed before any reacquire/rebind side effect without fresh binding.
-    _require_active_execution_binding(
-        coordination, action="repair-existing-assignment-lease-binding"
+    journal_identity, external = _existing_assignment_repair_authority(
+        coordination,
+        intent,
+        acquisition,
+        run_dir,
+        registry_binding,
+        coordination_root=request["coordination_root"],
     )
     original_by_key = {
         item["resource_key"]: item
@@ -4266,10 +4825,15 @@ def _repair_existing_assignment_lease_binding(
                     intent["lease_owner_id"], rebound_group, result
                 )
                 leases = result["leases"]
+                expected_expired = {
+                    item["resource_key"]: item for item in expired_snapshots
+                }
                 if any(
                     item.get("purpose") != purpose
                     or item.get("metadata_sha256")
                     != original_by_key[item["resource_key"]].get("metadata_sha256")
+                    or _lease_snapshot(item)
+                    == expected_expired.get(item["resource_key"])
                     for item in leases
                 ):
                     raise BureauPickupError(
@@ -4310,7 +4874,12 @@ def _repair_existing_assignment_lease_binding(
             "kind": "grabowski_bureau_pickup_lease_reacquire",
             "run_id": intent["run_id"],
             "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+            "task_sha256": intent["task_sha256"],
+            "plan_sha256": intent["plan_sha256"],
+            "envelope_sha256": journal_identity["envelope_sha256"],
             "claim_intent_sha256": intent["intent_sha256"],
+            "external_binding": external,
             "groups": [
                 {
                     "group": entry["group"],
@@ -4325,8 +4894,16 @@ def _repair_existing_assignment_lease_binding(
             ),
         }
         receipt["receipt_sha256"] = _sha256(receipt)
-        _write_bound_json(run_dir / "lease-reacquire.json", receipt)
-        return True
+        receipt = _validated_lease_repair_receipt(run_dir, "lease-reacquire.json", receipt)
+        return _heartbeat_lease_repair(
+            intent,
+            request,
+            acquisition,
+            registry_binding,
+            journal_identity,
+            external,
+            receipt,
+        )
 
     if error_code == "lease-resources-missing":
         reacquired: list[dict[str, Any]] = []
@@ -4365,25 +4942,13 @@ def _repair_existing_assignment_lease_binding(
                     metadata=group["metadata"],
                     nonconflict_proof=group["nonconflict_proof"],
                 )
-                entry = {
-                    "group": group["name"],
-                    "resource_keys": keys,
-                    "reacquired_resource_keys": missing_before,
-                    "method": "acquire",
-                    "result": result,
-                }
-                reacquired.append(entry)
                 preserved = {
                     item.get("resource_key") if isinstance(item, dict) else item
                     for item in result.get("preserved", [])
                 }
-                compensation_keys = [
+                mutated_keys = [
                     key for key in missing_before if key not in preserved
                 ]
-                if compensation_keys:
-                    compensation_entries.append(
-                        {"group": group["name"], "resource_keys": compensation_keys}
-                    )
                 _validate_acquired_group(intent["lease_owner_id"], group, result)
                 leases = result["leases"]
                 if any(
@@ -4395,6 +4960,20 @@ def _repair_existing_assignment_lease_binding(
                     raise BureauPickupError(
                         "existing-assignment-lease-reacquire-mismatch",
                         details={"group": group["name"]},
+                    )
+                if not mutated_keys:
+                    continue
+                entry = {
+                    "group": group["name"],
+                    "resource_keys": keys,
+                    "reacquired_resource_keys": mutated_keys,
+                    "method": "acquire",
+                    "result": result,
+                }
+                reacquired.append(entry)
+                if mutated_keys:
+                    compensation_entries.append(
+                        {"group": group["name"], "resource_keys": mutated_keys}
                     )
                 _write_bound_json(run_dir / f"lease-reacquired-{index:02d}.json", entry)
         except Exception as exc:
@@ -4417,7 +4996,12 @@ def _repair_existing_assignment_lease_binding(
             "kind": "grabowski_bureau_pickup_lease_reacquire",
             "run_id": intent["run_id"],
             "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+            "task_sha256": intent["task_sha256"],
+            "plan_sha256": intent["plan_sha256"],
+            "envelope_sha256": journal_identity["envelope_sha256"],
             "claim_intent_sha256": intent["intent_sha256"],
+            "external_binding": external,
             "groups": [
                 {
                     "group": entry["group"],
@@ -4432,8 +5016,16 @@ def _repair_existing_assignment_lease_binding(
             ),
         }
         receipt["receipt_sha256"] = _sha256(receipt)
-        _write_bound_json(run_dir / "lease-reacquire.json", receipt)
-        return True
+        receipt = _validated_lease_repair_receipt(run_dir, "lease-reacquire.json", receipt)
+        return _heartbeat_lease_repair(
+            intent,
+            request,
+            acquisition,
+            registry_binding,
+            journal_identity,
+            external,
+            receipt,
+        )
 
     if len(groups) != 1:
         return False
@@ -4470,19 +5062,42 @@ def _repair_existing_assignment_lease_binding(
             _lease_snapshot(original_by_key[key]) for key in keys
         ],
     )
+    _validate_acquired_group(intent["lease_owner_id"], group, result)
+    if any(
+        item.get("purpose") != purpose
+        or item.get("metadata_sha256")
+        != original_by_key[item["resource_key"]].get("metadata_sha256")
+        or _lease_snapshot(item)
+        == _lease_snapshot(current_by_key[item["resource_key"]])
+        for item in result["leases"]
+    ):
+        raise BureauPickupError("existing-assignment-lease-rebind-mismatch")
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup_lease_rebind",
         "run_id": intent["run_id"],
         "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+        "task_sha256": intent["task_sha256"],
+        "plan_sha256": intent["plan_sha256"],
+        "envelope_sha256": journal_identity["envelope_sha256"],
         "claim_intent_sha256": intent["intent_sha256"],
+        "external_binding": external,
         "group": group["name"],
         "resource_keys": keys,
         "metadata_sha256": result["metadata_sha256"],
     }
     receipt["receipt_sha256"] = _sha256(receipt)
-    _write_bound_json(run_dir / "lease-rebind.json", receipt)
-    return True
+    receipt = _validated_lease_repair_receipt(run_dir, "lease-rebind.json", receipt)
+    return _heartbeat_lease_repair(
+        intent,
+        request,
+        acquisition,
+        registry_binding,
+        journal_identity,
+        external,
+        receipt,
+    )
 
 
 def _closeout_latched_response(
@@ -4642,17 +5257,11 @@ def grabowski_bureau_pickup_execute(
                 normalized,
                 acquisition,
                 run_dir,
+                registry_binding,
             )
             if not repaired:
                 raise
-            coordination = _bound_bureau_call(
-                registry_binding,
-                lambda: _coordination_status(
-                    intent["run_id"],
-                    registry_root=normalized["registry_root"],
-                    coordination_root=normalized["coordination_root"],
-                ),
-            )
+            coordination = repaired
             _validate_claim_readback(coordination, intent, acquisition)
         result = {
             "schema_version": SCHEMA_VERSION,
@@ -4861,9 +5470,7 @@ def _current_root_binding(
     default_coordination = _normalize_coordination_root(
         str(_default_coordination_root()), registry_root=default_registry
     )
-    legacy_fallback_allowed = (
-        Path(default_coordination) != _legacy_coordination_root()
-    )
+    legacy_fallback_allowed = Path(default_coordination) != _legacy_coordination_root()
     return {
         "registry_root": default_registry,
         "registry_binding": registry_binding,
@@ -5186,9 +5793,10 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         remaining_existing: dict[str, dict[str, Any]] = {}
         for key in acquisition["resource_keys"]:
             observed = resources.inspect_resource(key)
-            if observed is not None and observed.get("owner_id") == acquisition[
-                "owner_id"
-            ]:
+            if (
+                observed is not None
+                and observed.get("owner_id") == acquisition["owner_id"]
+            ):
                 remaining_existing[key] = observed
         if not remaining_existing:
             saved_release = _read_bound_json(
