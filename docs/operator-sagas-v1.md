@@ -239,6 +239,12 @@ This documentation-only change is the next and final protected pilot target, cre
 
 Only a verified Captain merge and reference-based `saga-settle == settled` for that frozen identity establish pilot 1. The exact resulting merge commit must still be current protected `main` when pilot 2 starts; otherwise the attempt stops rather than deploying an older repository state. Pilot 2 then requires its own fresh runtime-deployment plan and durable run reference, Captain deployment of exactly that merge commit, authoritative deployment-identity convergence and reference-based `saga-settle == settled`.
 
+### Post-bootstrap terminal pairing — 2026-09-03
+
+PR #1040 merged the bootstrap-authority compatibility repair as `a263b3e7fb6d68225b3f1aa794a95439a4cb52f4`, and PR #1041 subsequently repaired operator-exec settling during bootstrap deployment and merged as `e29ab7903a70453ba1681c162d0dc2dd85235663`. The serving Grabowski runtime now reports that latter protected `main` commit with complete manifest, integrity and serving-process convergence. Both changes are infrastructure prerequisites only: neither is promoted to the final T121 pair because neither was prospectively frozen and settled as the required PR-settlement plus runtime-deployment Saga pair.
+
+The documentation-only PR created from protected baseline `e29ab7903a70453ba1681c162d0dc2dd85235663` is therefore the new prospective PR-settlement target. It may receive `saga-plan` and durable `saga-run` only after its CI, review and base have converged to one exact head/base/diff. Any later `main` or PR identity drift invalidates that attempt before Captain. If pilot 1 settles, pilot 2 may target only its exact settled merge commit and only while that commit is still protected `main`; bootstrap deployments, prerequisite deployments and later unrelated `main` heads remain non-substitutable evidence.
+
 ## Non-claims
 
 This document does not by itself establish successful live pilots or Bureau acceptance. It also does not establish automatic post-`integration_ready` controller custody. The latter requires a separate bounded-autonomy decision after the Saga primitive is proven; T121 itself preserves the current Captain boundary by design.
