@@ -735,6 +735,53 @@ def _github_actions_run_pr_bindings(
     return bindings
 
 
+def _github_actions_run_pr_bindings_by_id(
+    repo: str,
+    run_ids: set[int],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[int, dict[str, Any]] | None:
+    wanted = set(run_ids)
+    if any(_positive_int(run_id) != run_id for run_id in wanted):
+        return None
+    if not wanted:
+        return {}
+    jq_filter = (
+        '{id,event,head_sha,head_branch,'
+        'repository:{full_name:.repository.full_name},'
+        'pull_requests:[.pull_requests[]|{number,'
+        'head:{ref:.head.ref,sha:.head.sha},'
+        'base:{ref:.base.ref,sha:.base.sha}}]}'
+    )
+    bindings: dict[int, dict[str, Any]] = {}
+    for run_id in sorted(wanted):
+        returncode, stdout, _stderr = _run_command(
+            [
+                'gh',
+                'api',
+                '-X',
+                'GET',
+                f'repos/{repo}/actions/runs/{run_id}',
+                '--jq',
+                jq_filter,
+            ],
+            deadline_monotonic=deadline_monotonic,
+        )
+        if returncode != 0:
+            raise EvidenceAssessmentError('github Actions run source unavailable')
+        try:
+            payload = json.loads(stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        binding = _github_actions_run_pr_binding_from_payload(repo, payload)
+        if binding is None or binding.get('run_id') != run_id:
+            return None
+        bindings[run_id] = binding
+    return bindings
+
+
 def _github_v2_rerun_pr_bindings_valid(
     repo: str,
     pr: int,
@@ -838,10 +885,9 @@ def _github_v2_merge_group_bindings_valid(
         run_ids.add(run_id)
     if not run_ids:
         return False
-    bindings = _github_actions_run_pr_bindings(
+    bindings = _github_actions_run_pr_bindings_by_id(
         repo,
         run_ids,
-        candidate_head_shas=(merge_sha,),
         deadline_monotonic=deadline_monotonic,
     )
     if bindings is None:
@@ -856,17 +902,16 @@ def _github_v2_merge_group_bindings_valid(
     expected_queue_branch = f"gh-readonly-queue/{base_ref}/pr-{pr}-{base_sha}"
     for run_id in run_ids:
         binding = bindings.get(run_id)
-        if (
-            binding is None
-            or binding.get("event") != "merge_group"
-            or binding.get("head_sha") != merge_sha
-        ):
+        if binding is None or binding.get("event") != "merge_group":
             return False
         pulls = binding.get("pull_requests")
         if not isinstance(pulls, list):
             return False
         if not pulls:
-            if binding.get("head_branch") != expected_queue_branch:
+            if (
+                binding.get("head_sha") != merge_sha
+                or binding.get("head_branch") != expected_queue_branch
+            ):
                 return False
         else:
             expected_number_bindings = [

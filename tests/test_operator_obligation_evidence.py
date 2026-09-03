@@ -270,6 +270,55 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         def run(argv, **_kwargs):
             if argv[:3] == ["gh", "api", "graphql"]:
                 return 0, encoded_graphql, b""
+            exact_endpoint = next(
+                (
+                    part
+                    for part in argv
+                    if isinstance(part, str)
+                    and part.startswith("repos/")
+                    and "/actions/runs/" in part
+                    and part.rsplit("/", 1)[-1].isdigit()
+                ),
+                None,
+            )
+            if argv[:2] == ["gh", "api"] and exact_endpoint is not None:
+                prefix, run_id_text = exact_endpoint.rsplit("/", 1)
+                repo_slug = prefix[len("repos/") : -len("/actions/runs")]
+                run_id = int(run_id_text)
+                event = workflow_events.get(run_id)
+                if event is None:
+                    return 1, b"", b"unknown run"
+                default_run_head = merge if event == "merge_group" else head
+                run_head_sha = sha_overrides.get(run_id, default_run_head)
+                bound_pr = pr_overrides.get(run_id, pr)
+                if event == "merge_group":
+                    default_branch = f"gh-readonly-queue/{base_ref}/pr-{bound_pr}-{base}"
+                else:
+                    default_branch = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
+                bound_head_ref = branch_overrides.get(run_id, default_branch)
+                pull_requests: list[dict[str, object]] = []
+                if run_id in pull_overrides:
+                    pull_requests = deepcopy(pull_overrides[run_id])
+                elif run_id not in empty_pull_runs and event != "merge_group":
+                    pull_requests = [
+                        {
+                            "number": bound_pr,
+                            "head": {
+                                "ref": head_ref if bound_pr == pr else f"feature/pr-{bound_pr}",
+                                "sha": head,
+                            },
+                            "base": {"ref": base_ref, "sha": base},
+                        }
+                    ]
+                run_payload = {
+                    "id": run_id,
+                    "event": event,
+                    "head_sha": run_head_sha,
+                    "head_branch": bound_head_ref,
+                    "repository": {"full_name": repo_slug},
+                    "pull_requests": pull_requests,
+                }
+                return 0, json.dumps(run_payload).encode("utf-8"), b""
             endpoint = next(
                 (
                     part
@@ -1108,13 +1157,19 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             call
             for call in run_command.call_args_list
             if any(
-                isinstance(part, str) and part.endswith("/actions/runs")
+                isinstance(part, str) and part.endswith("/actions/runs/9001")
                 for part in call.args[0]
             )
         ]
         self.assertEqual(2, len(actions_calls))
         self.assertTrue(
-            all(f"head_sha={merge}" in call.args[0] for call in actions_calls)
+            all(
+                not any(
+                    isinstance(part, str) and part.startswith("head_sha=")
+                    for part in call.args[0]
+                )
+                for call in actions_calls
+            )
         )
 
     def test_prepare_github_uses_merge_group_checks_without_head_rollup(self) -> None:
@@ -1200,6 +1255,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             side_effect=self._github_v2_command_side_effect(
                 payload,
                 pr=pr,
+                run_head_sha_overrides={merge_run: "6" * 40},
                 run_pull_requests_overrides={merge_run: batch_pulls},
                 run_head_branch_overrides={
                     merge_run: f"gh-readonly-queue/main/pr-950-{base}"
