@@ -182,9 +182,11 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 198)
+        self.assertEqual(len(tools), 200)
+        self.assertIn("grabowski_operational_guidance", tools)
         self.assertNotIn("grabowski_agent_workspace_adopt", tools)
         self.assertIn("grabowski_browser_worker_semantic", tools)
+        self.assertIn("grabowski_tailscale_status", tools)
         self.assertTrue(
             {
                 "grabowski_juno_status",

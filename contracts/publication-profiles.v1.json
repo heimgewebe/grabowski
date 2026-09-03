@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "c8220a81cfa8f76d7b858dae375ce06ce38e301c4c2299bb4ab4951645f59e4b"
+    "sha256": "2ac459a3206001f36f9a5bc5051d98ccc1ed8ec1a3e61de47c5403fe5f215dd8"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "6e9822f4f4a9005498e687ed87e4208c7320122e85fc08ad13df30ee473984da"
+    "sha256": "77818810257c1046bbaa8157ac14e054bbb85865c21e7ffcc5d66e1750449f90"
   },
   "counts": {
-    "core": 22,
-    "full": 198,
-    "operator": 183
+    "core": 23,
+    "full": 200,
+    "operator": 184
   },
   "profiles": {
     "core": [
@@ -33,6 +33,7 @@
       "grabowski_service_status",
       "grabowski_service_logs",
       "grabowski_ports",
+      "grabowski_tailscale_status",
       "grabowski_fleet_list",
       "grabowski_privileged_broker_status",
       "grabowski_recovery_status"
@@ -119,6 +120,7 @@
       "grabowski_process_list",
       "grabowski_process_signal",
       "grabowski_ports",
+      "grabowski_tailscale_status",
       "grabowski_privileged_action_reference",
       "grabowski_power_run",
       "grabowski_fleet_list",
@@ -179,6 +181,7 @@
       "grabowski_context_fabric_compare",
       "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
+      "grabowski_operational_guidance",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -364,6 +367,7 @@
       "grabowski_context_fabric_compare",
       "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
+      "grabowski_operational_guidance",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -449,6 +453,7 @@
         "grabowski_runtime_health",
         "grabowski_service_logs",
         "grabowski_service_status",
+        "grabowski_tailscale_status",
         "grabowski_verify_audit",
         "repoground_bundle_discover",
         "repoground_bundle_status",

@@ -92,6 +92,29 @@ class FleetTransportGateTests(unittest.TestCase):
         self.assertTrue(contract["server_owned_limits"])
         self.assertFalse(contract["client_selected_timeout_supported"])
 
+    def test_fleet_list_is_registry_read_without_terminal_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            module, fake = _load_fleet_module(Path(tmp))
+            fake._require_operator_capability = Mock(side_effect=AssertionError("must not gate pure read"))
+            result = module.grabowski_fleet_list()
+        fake._require_operator_capability.assert_not_called()
+        fake._run.assert_not_called()
+        encoded = json.dumps(result, sort_keys=True)
+        for forbidden in (
+            "target",
+            "command_allowlist",
+            "connect_timeout_seconds",
+            "roles",
+            "remote_command_mode",
+        ):
+            self.assertNotIn(forbidden, encoded)
+        self.assertNotIn("path", result)
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(
+            result["hosts"]["local"],
+            {"kind": "local", "ready": True},
+        )
+
     def test_public_fleet_run_enforces_server_owned_limits_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             module, fake = _load_fleet_module(Path(tmp))

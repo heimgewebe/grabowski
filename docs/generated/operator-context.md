@@ -120,9 +120,10 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_process_list` | process | yes | low | List current-user processes with optional regular-expression filtering. |
 | `grabowski_process_signal` | process | no | high | Signal one process owned by the current user. |
 | `grabowski_ports` | diagnostics | yes | low | List listening TCP and UDP sockets. |
+| `grabowski_tailscale_status` | diagnostics | yes | low | Read bounded local Tailscale node and peer health without account records or mutation controls. |
 | `grabowski_privileged_action_reference` | privileged-reference | yes | medium | Create a non-executable reference contract for a future external privileged action. |
 | `grabowski_power_run` | privileged-execution | no | critical | Run one audited root command through the recovery-gated power broker. |
-| `grabowski_fleet_list` | fleet | yes | low | Return the validated local and SSH host registry. |
+| `grabowski_fleet_list` | fleet | yes | low | Return a bounded projection of the validated local and SSH host registry. |
 | `grabowski_fleet_run` | fleet | no | variable | Run one bounded argv command on one registered local or SSH host. |
 | `grabowski_juno_status` | device-worker | yes | low | Read bounded health and job evidence from the paired Juno device worker. |
 | `grabowski_juno_pair` | device-worker | no | high | Pair one exact Juno session after local consent and explicit escalation. |
@@ -180,6 +181,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_context_fabric_compare` | context-fabric | yes | low | Compare two digest-bound operator contexts for one target without ranking, resolving or approving either. |
 | `grabowski_host_capability_resolve` | knowledge | yes | low | Resolve one declared host-local capability intent through the installed byte-identical operator-entry contract without execution authority. |
 | `grabowski_systemkatalog_query` | knowledge | yes | low | Run one bounded, revision-bound Systemkatalog v2 semantic query without catalog, task, runtime or merge authority. |
+| `grabowski_operational_guidance` | knowledge | yes | low | Return bounded, source-cited operational runbook guidance in shadow mode without task, policy, retry, recovery or execution authority. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |

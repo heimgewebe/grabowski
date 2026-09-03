@@ -11,7 +11,7 @@ import sys
 import types
 from typing import get_args
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -211,10 +211,39 @@ class ReadSurfaceTests(unittest.TestCase):
             "heimgewebe/..",
             "heimgewebe-/grabowski",
             "--repo/heimgewebe",
+            "heimgewebe/grabowski?x=1",
+            "heimgewebe/grabowski#frag",
+            "heimgewebe/grab%0aowski",
+            "heimgewebe//grabowski",
         ):
             with self.subTest(repo=repo):
                 with self.assertRaisesRegex(ValueError, "canonical GitHub"):
                     read_surface._resolve_github_repository(repo)
+
+    def test_github_rest_rejects_paths_outside_fixed_allowlist_before_network(self) -> None:
+        invalid_paths = (
+            "/repos/heimgewebe/grabowski/../../users",
+            "/repos/heimgewebe/../pulls/1",
+            "/repos/heimgewebe/grabowski/pulls/1?extra=1",
+            "/repos/heimgewebe/grabowski/issues/1",
+            "/repos/heimgewebe/grab%0aowski/pulls/1",
+            "/repos/heimgewebe//grabowski/pulls/1",
+        )
+        with patch.object(read_surface.http.client, "HTTPSConnection") as connection:
+            for path in invalid_paths:
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "allowlist"):
+                    read_surface._github_rest_json(path)
+        connection.assert_not_called()
+
+    def test_github_rest_path_uses_canonical_encoded_segments(self) -> None:
+        self.assertEqual(
+            read_surface._github_rest_path("heimgewebe/.github", "pulls", "12"),
+            "/repos/heimgewebe/.github/pulls/12",
+        )
+        with self.assertRaisesRegex(ValueError, "query"):
+            read_surface._github_rest_path(
+                "heimgewebe/grabowski", "pulls", "12", query="page=2"
+            )
 
     def test_github_checks_uses_repo_flag_for_canonical_identifier(self) -> None:
         result = {
@@ -293,6 +322,601 @@ class ReadSurfaceTests(unittest.TestCase):
         resolver.assert_called_once_with(str(repository))
         self.assertNotIn("--repo", runner.call_args.args[0])
         self.assertEqual(runner.call_args.kwargs["cwd"], repository)
+
+    def test_github_pr_view_falls_back_to_bounded_anonymous_rest_without_cli(self) -> None:
+        rest = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "number": 546,
+                "title": "read only",
+                "state": "open",
+                "draft": False,
+                "mergeable": True,
+                "head": {"ref": "topic", "sha": "a" * 40},
+                "base": {"ref": "main"},
+                "html_url": "https://github.com/heimgewebe/grabowski/pull/546",
+                "updated_at": "2026-09-03T06:00:00Z",
+            },
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", return_value=rest) as request,
+            patch.object(read_surface, "_run_read") as runner,
+        ):
+            response = read_surface.grabowski_github_pr_view("heimgewebe/grabowski", 546)
+        runner.assert_not_called()
+        request.assert_called_once_with("/repos/heimgewebe/grabowski/pulls/546")
+        self.assertEqual(response["data"]["headRefName"], "topic")
+        self.assertEqual(response["data"]["state"], "OPEN")
+        self.assertEqual(response["data"]["mergeable"], "MERGEABLE")
+        self.assertIsNone(response["data"]["reviewDecision"])
+        self.assertEqual(response["field_availability"]["reviewDecision"], "unavailable_anonymous_rest")
+
+    def test_github_checks_falls_back_to_bounded_anonymous_rest_without_cli(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "a" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "validate",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "details_url": "https://github.com/example/check/1",
+                        "started_at": "2026-09-03T06:00:00Z",
+                        "completed_at": "2026-09-03T06:01:00Z",
+                        "output": {"title": "validation"},
+                    }
+                ],
+            },
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "success", "total_count": 0, "statuses": []},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]) as request,
+            patch.object(read_surface, "_run_read") as runner,
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        runner.assert_not_called()
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(response["head_sha"], "a" * 40)
+        self.assertEqual(response["data"][0]["bucket"], "pass")
+        self.assertEqual(response["data"][0]["state"], "SUCCESS")
+        self.assertIsNone(response["data"][0]["workflow"])
+        self.assertEqual(response["check_run_count"], 1)
+        self.assertEqual(response["status_context_count"], 0)
+        self.assertEqual(response["transport_returncode"], 0)
+        self.assertEqual(response["returncode"], 0)
+
+    def test_github_checks_anonymous_fallback_includes_legacy_status_contexts(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "b" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"total_count": 0, "check_runs": []},
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "state": "failure",
+                "total_count": 2,
+                "statuses": [
+                    {
+                        "state": "failure",
+                        "context": "legacy/required",
+                        "description": "required legacy status failed",
+                        "target_url": "https://ci.example/failure",
+                        "created_at": "2026-09-03T06:00:00Z",
+                        "updated_at": "2026-09-03T06:01:00Z",
+                    },
+                    {
+                        "state": "pending",
+                        "context": "legacy/pending",
+                        "description": "still running",
+                        "target_url": "https://ci.example/pending",
+                        "created_at": "2026-09-03T06:02:00Z",
+                        "updated_at": "2026-09-03T06:02:00Z",
+                    },
+                ],
+            },
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]) as request,
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertEqual(request.call_count, 3)
+        by_name = {item["name"]: item for item in response["data"]}
+        self.assertEqual(by_name["legacy/required"]["bucket"], "fail")
+        self.assertEqual(by_name["legacy/required"]["state"], "FAILURE")
+        self.assertEqual(by_name["legacy/pending"]["bucket"], "pending")
+        self.assertEqual(by_name["legacy/pending"]["state"], "PENDING")
+        self.assertEqual(response["check_run_count"], 0)
+        self.assertEqual(response["status_context_count"], 2)
+        self.assertEqual(response["total_count"], 2)
+        self.assertEqual(response["transport_returncode"], 0)
+        self.assertEqual(response["returncode"], 1)
+
+    def test_github_checks_preserves_check_rows_when_status_transport_is_unavailable(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "e" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "validate",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "output": {},
+                    }
+                ],
+            },
+        }
+        status_error = {
+            "transport": "github-rest-anonymous",
+            "origin": "https://api.github.com",
+            "returncode": 1,
+            "http_status": 403,
+            "json_valid": True,
+            "data": {"message": "API rate limit exceeded"},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, status_error]),
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertEqual(response["http_status"], 403)
+        self.assertFalse(response["complete"])
+        self.assertEqual(response["returncode"], 1)
+        self.assertEqual(response["check_run_count"], 1)
+        self.assertEqual(response["data"][0]["name"], "validate")
+        self.assertFalse(response["checks_truncated"])
+        self.assertEqual(response["reported_check_run_count"], 1)
+        self.assertNotIn("API rate limit exceeded", json.dumps(response, sort_keys=True))
+
+    def test_github_checks_preserves_check_rows_when_status_shape_is_invalid(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "a" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "validate",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "output": {},
+                    }
+                ],
+            },
+        }
+        statuses = {
+            "transport": "github-rest-anonymous",
+            "origin": "https://api.github.com",
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "success"},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]),
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertFalse(response["complete"])
+        self.assertFalse(response["json_valid"])
+        self.assertEqual(response["returncode"], 1)
+        self.assertEqual(response["field_availability"]["commit_status"], "invalid_shape")
+        self.assertEqual(response["data"][0]["name"], "validate")
+
+    def test_github_checks_anonymous_fallback_uses_pending_exit_code(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "d" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "validate",
+                        "status": "in_progress",
+                        "conclusion": None,
+                        "details_url": "https://github.com/example/check/pending",
+                        "started_at": "2026-09-03T06:00:00Z",
+                        "completed_at": None,
+                        "output": {},
+                    }
+                ],
+            },
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "pending", "total_count": 0, "statuses": []},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]),
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertEqual(response["transport_returncode"], 0)
+        self.assertEqual(response["returncode"], 8)
+        self.assertEqual(response["data"][0]["bucket"], "pending")
+
+    def test_github_checks_anonymous_fallback_fails_closed_on_truncated_status_contexts(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "c" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"total_count": 0, "check_runs": []},
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "pending", "total_count": 101, "statuses": [{}] * 100},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]),
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertTrue(response["json_valid"])
+        self.assertFalse(response["complete"])
+        self.assertFalse(response["checks_truncated"])
+        self.assertTrue(response["status_contexts_truncated"])
+        self.assertEqual(response["status_context_count"], 100)
+        self.assertEqual(response["reported_status_context_count"], 101)
+        self.assertEqual(len(response["data"]), 100)
+        self.assertEqual(response["returncode"], 1)
+
+    def test_github_checks_anonymous_fallback_preserves_bounded_check_page_when_truncated(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "b" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "total_count": 101,
+                "check_runs": [
+                    {
+                        "name": f"check-{index}",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "output": {},
+                    }
+                    for index in range(100)
+                ],
+            },
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "success", "total_count": 0, "statuses": []},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]),
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertFalse(response["complete"])
+        self.assertTrue(response["checks_truncated"])
+        self.assertFalse(response["status_contexts_truncated"])
+        self.assertEqual(response["check_run_count"], 100)
+        self.assertEqual(response["reported_check_run_count"], 101)
+        self.assertEqual(len(response["data"]), 100)
+        self.assertEqual(response["returncode"], 1)
+
+    def test_github_rest_projection_preserves_gh_state_enums(self) -> None:
+        merged = read_surface._github_pr_projection(
+            {
+                "state": "closed",
+                "merged_at": "2026-09-03T06:00:00Z",
+                "mergeable": None,
+            }
+        )
+        conflicting = read_surface._github_pr_projection(
+            {"state": "open", "merged_at": None, "mergeable": False}
+        )
+        self.assertEqual(merged["state"], "MERGED")
+        self.assertEqual(merged["mergeable"], "UNKNOWN")
+        self.assertEqual(conflicting["state"], "OPEN")
+        self.assertEqual(conflicting["mergeable"], "CONFLICTING")
+
+    def test_github_rest_pending_check_normalizes_to_gh_pending_state(self) -> None:
+        projected = read_surface._github_check_projection(
+            {
+                "status": "in_progress",
+                "conclusion": None,
+                "name": "validate",
+                "output": {},
+            }
+        )
+        self.assertEqual(projected["bucket"], "pending")
+        self.assertEqual(projected["state"], "PENDING")
+
+    def test_github_rest_redirect_is_fail_closed(self) -> None:
+        response = Mock()
+        response.status = 301
+        response.read.return_value = b'{"message":"moved somewhere private"}'
+        response.getheader.side_effect = {
+            "X-RateLimit-Limit": "60",
+            "X-RateLimit-Remaining": "17",
+            "X-RateLimit-Reset": "1788449999",
+            "X-RateLimit-Resource": "core",
+        }.get
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(
+            read_surface.http.client, "HTTPSConnection", return_value=connection
+        ):
+            result = read_surface._github_rest_json(
+                "/repos/heimgewebe/grabowski/pulls/1"
+            )
+        self.assertEqual(result["http_status"], 301)
+        self.assertEqual(result["returncode"], 1)
+        self.assertEqual(result["error_kind"], "github_rest_http_error")
+        self.assertIsNone(result["data"])
+        self.assertEqual(result["rate_limit"]["limit"], 60)
+        self.assertEqual(result["rate_limit"]["remaining"], 17)
+        self.assertEqual(result["rate_limit"]["reset_unix"], 1788449999)
+        self.assertNotIn("moved somewhere private", json.dumps(result, sort_keys=True))
+        connection.request.assert_called_once()
+
+    def test_github_projection_bounds_untrusted_strings(self) -> None:
+        projected = read_surface._github_check_projection(
+            {
+                "name": "n" * 1000,
+                "details_url": "u" * 2000,
+                "status": "completed",
+                "conclusion": "success",
+                "output": {"title": "d" * 1000},
+            }
+        )
+        self.assertEqual(len(projected["name"]), 255)
+        self.assertEqual(len(projected["description"]), read_surface.MAX_PROJECTED_TEXT)
+        self.assertEqual(len(projected["link"]), read_surface.MAX_PROJECTED_URL)
+
+    def test_github_anonymous_fallback_rejects_absolute_worktree(self) -> None:
+        repository = Path("/tmp/repository")
+        with (
+            patch.object(read_surface, "_resolve_repository", return_value=repository),
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json") as request,
+        ):
+            with self.assertRaisesRegex(PermissionError, "absolute-worktree"):
+                read_surface.grabowski_github_pr_view(str(repository), 12)
+        request.assert_not_called()
+
+    def test_tailscale_status_uses_fixed_argv_and_redacts_account_fields(self) -> None:
+        payload = {
+            "Version": "1.2.3",
+            "TUN": True,
+            "BackendState": "Running",
+            "HaveNodeKey": True,
+            "TailscaleIPs": ["100.64.0.1"],
+            "Self": {"HostName": "node", "DNSName": "node.private.ts.net.", "Online": True, "PublicKey": "secret-key", "UserID": 1},
+            "Peer": {"nodekey:secret": {"HostName": "peer", "DNSName": "peer.private.ts.net.", "Online": True, "PublicKey": "peer-key", "UserID": 2, "Addrs": ["1.2.3.4:123"], "PeerAPIURL": ["http://100.64.0.2:1"], "LastHandshake": "private-handshake", "KeyExpiry": "private-expiry", "Relay": "private-relay"}},
+            "User": {"1": {"LoginName": "private@example.test"}},
+            "CurrentTailnet": {"Name": "private@example.test"},
+            "Health": ["login private@example.test via node.private.ts.net"],
+        }
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": json.dumps(payload),
+            "stderr": "warning private@example.test nodekey:secret",
+        }
+        with patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"), patch.object(read_surface, "_run_read", return_value=result) as runner:
+            response = read_surface.grabowski_tailscale_status()
+        self.assertEqual(runner.call_args.args[0], ["/usr/bin/tailscale", "status", "--json"])
+        encoded = json.dumps(response, sort_keys=True)
+        for forbidden_value in (
+            "private@example.test",
+            "nodekey:secret",
+            "secret-key",
+            "peer-key",
+            "1.2.3.4:123",
+            "node.private.ts.net",
+            "peer.private.ts.net",
+            "private-handshake",
+            "private-expiry",
+            "private-relay",
+            "100.64.0.1",
+        ):
+            self.assertNotIn(forbidden_value, encoded)
+        projected = json.dumps(response["data"], sort_keys=True)
+        for forbidden_field in ("PeerAPIURL", "PublicKey", "UserID", "Addrs"):
+            self.assertNotIn(forbidden_field, projected)
+        self.assertNotIn("stdout", response)
+        self.assertNotIn("stderr", response)
+        self.assertEqual(response["data"]["peer_count"], 1)
+        self.assertEqual(response["data"]["health_issue_count"], 1)
+        self.assertTrue(response["status_readable"])
+
+    def test_tailscale_status_missing_binary_is_not_available(self) -> None:
+        with patch.object(read_surface.shutil, "which", return_value=None):
+            response = read_surface.grabowski_tailscale_status()
+        self.assertFalse(response["available"])
+        self.assertFalse(response["executable_present"])
+        self.assertFalse(response["status_readable"])
+
+    def test_tailscale_projection_bounds_peer_materialization_before_projection(self) -> None:
+        payload = {
+            "Peer": {
+                f"nodekey:{index}": {
+                    "HostName": "x" * 1000,
+                    "DNSName": "secret.ts.net",
+                    "Online": True,
+                }
+                for index in range(read_surface.MAX_TAILSCALE_PEERS + 10)
+            },
+            "Health": [],
+        }
+        projected = read_surface._tailscale_status_projection(payload)
+        self.assertEqual(
+            projected["peer_count"], read_surface.MAX_TAILSCALE_PEERS + 10
+        )
+        self.assertEqual(len(projected["Peers"]), read_surface.MAX_TAILSCALE_PEERS)
+        self.assertTrue(projected["peers_truncated"])
+        self.assertNotIn("secret.ts.net", json.dumps(projected, sort_keys=True))
+
+    def test_tailscale_status_failure_distinguishes_executable_from_readability(self) -> None:
+        result = {
+            "returncode": 1,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": "",
+            "stderr": "failed",
+        }
+        with (
+            patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(read_surface, "_run_read", return_value=result),
+        ):
+            response = read_surface.grabowski_tailscale_status()
+        self.assertFalse(response["available"])
+        self.assertTrue(response["executable_present"])
+        self.assertFalse(response["status_readable"])
+        self.assertEqual(response["reason"], "tailscale_status_command_failed")
+
+    def test_tailscale_status_unexpected_shape_is_fail_closed_without_raw_payload(self) -> None:
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": json.dumps(["private@example.test", "nodekey:secret"]),
+            "stderr": "",
+        }
+        with (
+            patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(read_surface, "_run_read", return_value=result),
+        ):
+            response = read_surface.grabowski_tailscale_status()
+        encoded = json.dumps(response, sort_keys=True)
+        self.assertFalse(response["available"])
+        self.assertTrue(response["executable_present"])
+        self.assertFalse(response["status_readable"])
+        self.assertFalse(response["json_valid"])
+        self.assertEqual(response["reason"], "tailscale_status_unexpected_shape")
+        self.assertNotIn("private@example.test", encoded)
+        self.assertNotIn("nodekey:secret", encoded)
+        self.assertNotIn("stdout", response)
+        self.assertNotIn("stderr", response)
+
+    def test_tailscale_status_failure_never_returns_valid_json_payload(self) -> None:
+        secret_payload = {
+            "CurrentTailnet": {"Name": "private@example.test"},
+            "Self": {"PublicKey": "nodekey:secret", "UserID": 42},
+        }
+        result = {
+            "returncode": 1,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": json.dumps(secret_payload),
+            "stderr": "private@example.test",
+        }
+        with (
+            patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(read_surface, "_run_read", return_value=result),
+        ):
+            response = read_surface.grabowski_tailscale_status()
+        encoded = json.dumps(response, sort_keys=True)
+        self.assertNotIn("private@example.test", encoded)
+        self.assertNotIn("nodekey:secret", encoded)
+        self.assertNotIn("stdout", response)
+        self.assertNotIn("stderr", response)
+        self.assertIsNone(response["data"])
+        self.assertEqual(response["reason"], "tailscale_status_command_failed")
+
+    def test_tailscale_status_invalid_json_never_returns_raw_stdout(self) -> None:
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": "private@example.test nodekey:secret not-json",
+            "stderr": "",
+        }
+        with (
+            patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(read_surface, "_run_read", return_value=result),
+        ):
+            response = read_surface.grabowski_tailscale_status()
+        encoded = json.dumps(response, sort_keys=True)
+        self.assertNotIn("private@example.test", encoded)
+        self.assertNotIn("nodekey:secret", encoded)
+        self.assertNotIn("stdout", response)
+        self.assertNotIn("stderr", response)
+        self.assertFalse(response["json_valid"])
+        self.assertEqual(response["reason"], "tailscale_status_invalid_json")
+        self.assertIsNone(response["data"])
 
     def test_git_status_uses_fixed_arguments(self) -> None:
         repo = Path("/tmp/repository")

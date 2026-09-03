@@ -6837,7 +6837,8 @@ class GripFoundationTests(unittest.TestCase):
         contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
         contract = json.loads(contract_path.read_text())
         self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
-        self.assertEqual(198, len(contract["expected_tools"]))
+        self.assertEqual(200, len(contract["expected_tools"]))
+        self.assertIn("grabowski_operational_guidance", contract["expected_tools"])
         supporting = {
             (item["module"], item["source"])
             for item in contract["supporting_sources"]
