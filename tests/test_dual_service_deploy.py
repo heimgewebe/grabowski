@@ -3808,8 +3808,12 @@ class DeploymentSequenceTests(unittest.TestCase):
                     side_effect=lambda unit: events.append(f"start:{unit}") or active,
                 )
             )
-            stack.enter_context(
-                mock.patch.object(dual, "verify_operator_process", return_value={"pid": 1})
+            verify_operator = stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "_verify_operator_process_after_start",
+                    return_value={"pid": 1},
+                )
             )
             stack.enter_context(
                 mock.patch.object(
@@ -3866,6 +3870,9 @@ class DeploymentSequenceTests(unittest.TestCase):
         drain_guard.assert_not_called()
         stop.assert_not_called()
         verify_admission.assert_not_called()
+        verify_operator.assert_called_once_with(
+            RUNTIME, snapshot.contract, release_hint=Path("/release/new")
+        )
         restore_watchdogs.assert_not_called()
         self.assertIn("quiesce:predecessor", events)
         self.assertIn("activate", events)
