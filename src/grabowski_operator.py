@@ -560,6 +560,13 @@ def _github_pr_view_transport_read_only(arguments: Any) -> bool:
         "timeout_seconds",
     }:
         return False
+    timeout_seconds = arguments.get("timeout_seconds", 60)
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 60
+    ):
+        return False
     argv = arguments.get("arguments")
     if (
         not isinstance(argv, list)

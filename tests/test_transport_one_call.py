@@ -918,7 +918,20 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     "heimgewebe/metarepo",
                     "--json",
                     "number",
-                ]
+                ],
+                "timeout_seconds": 60,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 1,
             },
         ]
         for arguments in safe_calls:
@@ -990,6 +1003,54 @@ class OperatorSignedTransportTests(unittest.TestCase):
             {"arguments": ["issue", "view", "1"]},
             {"arguments": ["api", "repos/x/y"]},
             {"arguments": ["api", "graphql", "-f", "query=query { viewer { login } }"]},
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 61,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 86_400,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": True,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 0,
+            },
         ]
         for arguments in unsafe_calls:
             with self.subTest(arguments=arguments):
