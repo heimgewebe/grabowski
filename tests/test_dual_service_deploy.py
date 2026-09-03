@@ -23,6 +23,7 @@ if str(TOOLS) not in sys.path:
 
 import deploy_runtime as core
 import deploy_runtime_dual as dual
+import grabowski_rootbroker_cutover as rootbroker_cutover_module
 
 
 RUNTIME = Path("/home/alex/.local/share/grabowski-mcp")
@@ -95,15 +96,26 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 dual.ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
             },
         }
+        artifact_sources = tuple(
+            Path(artifact.source_relative) for artifact in rootbroker_cutover_module.ARTIFACTS
+        )
+        cutover_path = Path("tools/grabowski_rootbroker_cutover.py")
+        cutover_manifest = (
+            "ARTIFACTS = (\n"
+            + "".join(
+                f"    Artifact({json.dumps(path.as_posix())}, None, 0),\n"
+                for path in artifact_sources
+            )
+            + ")\n"
+        ).encode("utf-8")
         blobs = {
-            Path("src/grabowski_privileged_broker.py"): b"broker-module\n",
-            Path("tools/grabowski_privileged_broker.py"): b"broker-wrapper\n",
-            Path("tools/grabowski_rootbroker_cutover.py"): b"cutover-helper\n",
-            Path("systemd/grabowski-operator.service.example"): b"operator-unit\n",
-            Path("config/privileged-actions.example.json"): (
-                json.dumps(config, sort_keys=True) + "\n"
-            ).encode("utf-8"),
+            path: (path.as_posix() + "\n").encode("utf-8")
+            for path in artifact_sources
         }
+        blobs[cutover_path] = cutover_manifest
+        blobs[Path("config/privileged-actions.example.json")] = (
+            json.dumps(config, sort_keys=True) + "\n"
+        ).encode("utf-8")
         artifact_sha256 = {
             "broker_module": __import__("hashlib").sha256(
                 blobs[Path("src/grabowski_privileged_broker.py")]
@@ -174,6 +186,135 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 ROOT, self.HEAD, path=Path("/ignored")
             )
         self.assertEqual(observed["expected_head"], self.HEAD)
+
+    def test_rootbroker_artifact_parser_tracks_canonical_cutover_manifest(self) -> None:
+        helper = (ROOT / "tools" / "grabowski_rootbroker_cutover.py").read_bytes()
+        expected = tuple(
+            Path(artifact.source_relative) for artifact in rootbroker_cutover_module.ARTIFACTS
+        )
+        self.assertEqual(dual._rootbroker_artifact_source_paths(helper), expected)
+        self.assertIn(Path("src/grabowski_blockade_authority.py"), expected)
+        self.assertIn(Path("src/grabowski_command_identity.py"), expected)
+
+    def test_bootstrap_compatible_predecessor_attestation_is_accepted(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry) as run,
+            mock.patch.object(dual.core, "git_show", side_effect=lambda _repo, head, path: blobs[path]),
+        ):
+            observed = dual.require_operator_authority_anchored(
+                ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+            )
+        self.assertEqual(observed["expected_head"], predecessor)
+        self.assertIn("merge-base", run.call_args.args[0])
+        self.assertIn("--is-ancestor", run.call_args.args[0])
+
+    def test_bootstrap_compatible_predecessor_rejects_non_ancestor(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry),
+            mock.patch.object(dual.core, "git_show", side_effect=lambda _repo, _head, path: blobs[path]),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+                )
+        self.assertEqual(raised.exception.phase, "operator-authority-attestation")
+        self.assertIn("kein Ancestor", str(raised.exception))
+
+    def test_bootstrap_compatible_predecessor_rejects_rootbroker_closure_drift(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        drift_path = Path("src/grabowski_command_identity.py")
+
+        def show(_repo: Path, head: str, path: Path) -> bytes:
+            if head == predecessor and path == drift_path:
+                return blobs[path] + b"drift\n"
+            return blobs[path]
+
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry),
+            mock.patch.object(dual.core, "git_show", side_effect=show),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+                )
+        self.assertEqual(raised.exception.phase, "operator-authority-attestation")
+        self.assertIn("Authority-Vertrag driftet", str(raised.exception))
+        self.assertEqual(raised.exception.details["path"], drift_path.as_posix())
+
+    def test_bootstrap_compatible_predecessor_rejects_cutover_manifest_drift(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        cutover_path = Path("tools/grabowski_rootbroker_cutover.py")
+
+        def show(_repo: Path, head: str, path: Path) -> bytes:
+            if head == predecessor and path == cutover_path:
+                return blobs[path] + b"# drift\n"
+            return blobs[path]
+
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry),
+            mock.patch.object(dual.core, "git_show", side_effect=show),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+                )
+        self.assertEqual(raised.exception.phase, "operator-authority-attestation")
+        self.assertIn("Cutover-Manifest driftet", str(raised.exception))
+
+    def test_bootstrap_compatible_predecessor_rejects_authority_contract_drift(self) -> None:
+        attestation, blobs = self._fixture()
+        predecessor = "e" * 40
+        attestation["expected_head"] = predecessor
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        ancestry = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        config_path = Path("config/privileged-actions.example.json")
+        def show(_repo: Path, head: str, path: Path) -> bytes:
+            if head == predecessor and path == config_path:
+                return blobs[path] + b" "
+            return blobs[path]
+        with (
+            mock.patch.object(dual, "_read_root_owned_public_json", return_value=attestation),
+            mock.patch.object(dual.core, "run", return_value=ancestry),
+            mock.patch.object(dual.core, "git_show", side_effect=show),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored"), allow_compatible_predecessor=True
+                )
+        self.assertEqual(raised.exception.phase, "operator-authority-attestation")
+        self.assertIn("Authority-Vertrag driftet", str(raised.exception))
 
     def test_attestation_rejects_head_and_artifact_tamper(self) -> None:
         for mutation in ("head", "artifact"):
@@ -3038,6 +3179,29 @@ class DeploymentSequenceTests(unittest.TestCase):
         listener.assert_not_called()
         verify_tunnel.assert_not_called()
 
+    def test_bootstrap_recovery_preflight_requests_compatible_authority_predecessor(self) -> None:
+        snapshot = self.snapshot()
+        topology = dual.ProfileTopology(
+            "url", server_url_count=1, server_url_port=dual.TRANSPORT_INGRESS_LISTENER_PORT
+        )
+        inactive = observation(False)
+        with (
+            mock.patch.object(
+                dual, "_preflight_source_topology", return_value=(snapshot, RUNTIME, topology)
+            ) as source_preflight,
+            mock.patch.object(dual, "observe_service", return_value=inactive),
+        ):
+            dual.preflight_bootstrap_recovery_url(
+                ROOT, RUNTIME, Path("profile.yaml"), expected_head="a" * 40
+            )
+        source_preflight.assert_called_once_with(
+            ROOT,
+            RUNTIME,
+            Path("profile.yaml"),
+            expected_head="a" * 40,
+            allow_compatible_authority_predecessor=True,
+        )
+
     def test_bootstrap_recovery_preflight_rejects_mixed_runtime_state(self) -> None:
         snapshot = self.snapshot()
         topology = dual.ProfileTopology(
@@ -3644,8 +3808,12 @@ class DeploymentSequenceTests(unittest.TestCase):
                     side_effect=lambda unit: events.append(f"start:{unit}") or active,
                 )
             )
-            stack.enter_context(
-                mock.patch.object(dual, "verify_operator_process", return_value={"pid": 1})
+            verify_operator = stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "_verify_operator_process_after_start",
+                    return_value={"pid": 1},
+                )
             )
             stack.enter_context(
                 mock.patch.object(
@@ -3702,6 +3870,9 @@ class DeploymentSequenceTests(unittest.TestCase):
         drain_guard.assert_not_called()
         stop.assert_not_called()
         verify_admission.assert_not_called()
+        verify_operator.assert_called_once_with(
+            RUNTIME, snapshot.contract, release_hint=Path("/release/new")
+        )
         restore_watchdogs.assert_not_called()
         self.assertIn("quiesce:predecessor", events)
         self.assertIn("activate", events)

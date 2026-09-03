@@ -676,6 +676,10 @@
     {
       "module": "grabowski_work_admission",
       "source": "src/grabowski_work_admission.py"
+    },
+    {
+      "module": "kleiner_maulwurf_operator",
+      "source": "src/kleiner_maulwurf_operator.py"
     }
   ],
   "runtime_assets": [

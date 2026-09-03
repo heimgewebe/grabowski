@@ -928,30 +928,78 @@ class SelfDeployToolTests(unittest.TestCase):
 
     def test_public_github_main_lookup_is_fixed_and_credential_free(self) -> None:
         expected = "d" * 40
-        completed = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=f"{expected}\trefs/heads/main\n",
-            stderr="",
-        )
+        payload = json.dumps(
+            {
+                "ref": SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF,
+                "object": {"sha": expected, "type": "commit"},
+            }
+        ).encode("utf-8")
+        completed = subprocess.CompletedProcess([], 0, stdout=payload, stderr=b"")
         with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed) as run:
             observed = REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
         self.assertEqual(observed, expected)
         argv = run.call_args.args[0]
-        self.assertEqual(argv[0], "/usr/bin/git")
-        self.assertIn("credential.helper=", argv)
-        self.assertEqual(argv[-2:], [SELF_DEPLOY.PUBLIC_GITHUB_REPOSITORY_URL, SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF])
-        kwargs = run.call_args.kwargs
-        self.assertEqual(kwargs["cwd"], "/")
-        self.assertEqual(kwargs["timeout"], SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS)
-        env = kwargs["env"]
-        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
-        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
-        self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
-        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(env["GIT_ASKPASS"], "/bin/false")
-        self.assertNotIn("HOME", env)
-        self.assertFalse(any("PROXY" in key.upper() for key in env))
+        self.assertEqual(argv[:3], ["/usr/bin/python3", "-I", "-c"])
+        self.assertEqual(argv[4], SELF_DEPLOY.PUBLIC_GITHUB_API_HOST)
+        self.assertEqual(argv[5], SELF_DEPLOY.PUBLIC_GITHUB_MAIN_API_PATH)
+        self.assertIn('"Accept": "application/vnd.github+json"', argv[3])
+        self.assertIn('"User-Agent": "grabowski-public-main-probe/1"', argv[3])
+        self.assertNotIn("Authorization", argv[3])
+        self.assertNotIn("Proxy-Authorization", argv[3])
+        self.assertEqual(run.call_args.kwargs["timeout"], SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS)
+        self.assertEqual(
+            run.call_args.kwargs["env"],
+            {
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PYTHONNOUSERSITE": "1",
+            },
+        )
+        self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_public_github_main_lookup_preserves_wall_clock_deadline(self) -> None:
+        expected = "d" * 40
+        with patch.object(
+            SELF_DEPLOY.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["/usr/bin/python3"], SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS),
+        ) as run:
+            with self.assertRaisesRegex(RuntimeError, "wall-clock deadline"):
+                REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+        self.assertEqual(run.call_args.kwargs["timeout"], SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS)
+
+    def test_public_github_main_lookup_rejects_helper_failure(self) -> None:
+        expected = "d" * 40
+        completed = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"unexpected HTTP status 302")
+        with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "helper exit 1"):
+                REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+
+    def test_public_github_main_lookup_enforces_response_bound(self) -> None:
+        expected = "d" * 40
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=b"x" * (SELF_DEPLOY.PUBLIC_GITHUB_LOOKUP_MAX_BYTES + 1),
+            stderr=b"",
+        )
+        with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "exceeded output bound"):
+                REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
+
+    def test_public_github_main_lookup_rejects_non_commit_object(self) -> None:
+        expected = "d" * 40
+        payload = json.dumps(
+            {
+                "ref": SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF,
+                "object": {"sha": expected, "type": "tag"},
+            }
+        ).encode("utf-8")
+        completed = subprocess.CompletedProcess([], 0, stdout=payload, stderr=b"")
+        with patch.object(SELF_DEPLOY.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "invalid object"):
+                REAL_FRESH_PUBLIC_GITHUB_MAIN(expected)
 
     def test_schedule_blocks_when_public_github_main_differs_before_root_effect(self) -> None:
         repo = Path("/home/alex/repos/grabowski")

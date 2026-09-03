@@ -3571,6 +3571,10 @@
       {
         "module": "grabowski_work_admission",
         "source": "src/grabowski_work_admission.py"
+      },
+      {
+        "module": "kleiner_maulwurf_operator",
+        "source": "src/kleiner_maulwurf_operator.py"
       }
     ]
   },
@@ -3590,7 +3594,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "9ffea892bd534d4a9cf0984a1bb2cd3fe75546f240d10bee2592f96f259aacfe"
+      "sha256": "b08c1a524fc56e03d59cbf0a0dca261d0f5c1390c130de1c43cd346bce140a31"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3712,7 +3716,8 @@
       "src/grabowski_work_admission.py": "5c7529ac26df8ae698d59dbac8267dc1065711b9579274267e9a661e55748c2a",
       "src/grabowski_worker_process.py": "36b8bef1785e9e41c4a8a041b95cc69f3686c881680a89ac6680f2074f5919c0",
       "src/grabowski_workers.py": "99f7ae5b0beb2f986dcc403cc666a2e95f1218aade668014dea00c6a7b110e99",
-      "src/grabowski_worktree_ensure.py": "4b16010a5209e0b1ca02633eee2ce14da9fe1ff989fc04110995a3bc62abaff0"
+      "src/grabowski_worktree_ensure.py": "4b16010a5209e0b1ca02633eee2ce14da9fe1ff989fc04110995a3bc62abaff0",
+      "src/kleiner_maulwurf_operator.py": "b67ef01f02145b3dd8e5c19a3c7cea4e5c636947a659f333553b4b4ebea678c4"
     }
   }
 }
