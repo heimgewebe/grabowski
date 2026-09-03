@@ -553,9 +553,108 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
     return hint if isinstance(hint, bool) else None
 
 
+def _github_pr_view_transport_read_only(arguments: Any) -> bool:
+    if not isinstance(arguments, dict) or set(arguments) - {
+        "arguments",
+        "cwd",
+        "timeout_seconds",
+    }:
+        return False
+    timeout_seconds = arguments.get("timeout_seconds", 60)
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 60
+    ):
+        return False
+    argv = arguments.get("arguments")
+    if (
+        not isinstance(argv, list)
+        or len(argv) < 5
+        or len(argv) > 7
+        or argv[:2] != ["pr", "view"]
+        or not all(
+            isinstance(item, str) and item and len(item) <= 1024
+            for item in argv
+        )
+    ):
+        return False
+
+    def valid_pr_selector(value: str) -> bool:
+        if len(value) > 10 or not value.isascii() or not value.isdecimal():
+            return False
+        number = int(value)
+        return 1 <= number <= 2_147_483_647
+
+    def valid_repo_selector(value: str) -> bool:
+        return (
+            len(value) <= 200
+            and re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value
+            )
+            is not None
+        )
+
+    def valid_json_projection(value: str) -> bool:
+        return (
+            len(value) <= 1024
+            and re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9]*(?:,[A-Za-z][A-Za-z0-9]*){0,63}",
+                value,
+            )
+            is not None
+        )
+
+    # Exempt only the concrete machine-readable form needed for repeated PR
+    # observation. Requiring a numeric PR, explicit owner/repo and JSON
+    # projection prevents local-repository inference, branch/URL selectors and
+    # caller-selected GitHub Enterprise hosts from entering the exemption.
+    selector_seen = False
+    repo_seen = False
+    json_seen = False
+    index = 2
+    while index < len(argv):
+        item = argv[index]
+        if item in {"--repo", "-R"}:
+            if repo_seen or index + 1 >= len(argv):
+                return False
+            if not valid_repo_selector(argv[index + 1]):
+                return False
+            repo_seen = True
+            index += 2
+            continue
+        if item.startswith("--repo="):
+            if repo_seen or not valid_repo_selector(item.removeprefix("--repo=")):
+                return False
+            repo_seen = True
+            index += 1
+            continue
+        if item == "--json":
+            if json_seen or index + 1 >= len(argv):
+                return False
+            if not valid_json_projection(argv[index + 1]):
+                return False
+            json_seen = True
+            index += 2
+            continue
+        if item.startswith("--json="):
+            if json_seen or not valid_json_projection(item.removeprefix("--json=")):
+                return False
+            json_seen = True
+            index += 1
+            continue
+        if item.startswith("-") or selector_seen or not valid_pr_selector(item):
+            return False
+        selector_seen = True
+        index += 1
+    return selector_seen and repo_seen and json_seen
+
+
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
+    if tool_name == "grabowski_github":
+        return _github_pr_view_transport_read_only(arguments)
     if tool_name == "grabowski_browser_worker_semantic":
         # The public tool stays conservatively MUTATING. Only the exact read
         # operation may bypass the global mutation roundtrip; act, missing and
@@ -570,13 +669,10 @@ def _transport_roundtrip_exempt_call(
     if grip_name == "transport-roundtrip":
         # The handshake grip must remain exempt to avoid recursive gating.
         return True
-    if not isinstance(grip_name, str):
-        return False
-    spec = grabowski_grips.GRIP_SPECS.get(grip_name)
-    # grip_run is a multiplexed MCP surface. Its outer annotation is mutating,
-    # but the registered grip effect is the authoritative inner contract.
-    # Unknown grips stay fail-closed and continue through the mutation gate.
-    return spec is not None and spec.effect == grabowski_grips.READ_ONLY
+    # Every other grip stays behind the signed one-call boundary. A read-only
+    # grip may still execute child processes, so its effect label alone is not
+    # sufficient authority for transport replay exemption.
+    return False
 
 
 _PROVENANCE_RECOVERY_REPAIR_TOOL = "grabowski_recovery_provenance_repair"
@@ -1752,6 +1848,7 @@ def _limit(text: str, limit: int) -> tuple[str, bool]:
 
 MANAGED_NODE_RUNTIME_DIRECTORY_NAME = "grabowski-node-runtime-env"
 MANAGED_UV_CACHE_DIRECTORY_NAME = "grabowski-uv-cache"
+TRUSTED_GITHUB_CLI_PATH = Path("/usr/bin/gh")
 
 
 def _managed_runtime_environment(
@@ -1783,6 +1880,28 @@ def _managed_runtime_environment(
     }
 
 
+def _trusted_github_cli_path() -> str:
+    path = TRUSTED_GITHUB_CLI_PATH
+    try:
+        executable = os.lstat(path)
+        directories = [os.lstat(path.parent.parent), os.lstat(path.parent)]
+    except OSError as exc:
+        raise RuntimeError("trusted GitHub CLI path is unavailable") from exc
+    unsafe_write_bits = stat.S_IWGRP | stat.S_IWOTH
+    if not stat.S_ISREG(executable.st_mode):
+        raise RuntimeError("trusted GitHub CLI path is not a regular file")
+    if executable.st_uid != 0 or executable.st_mode & unsafe_write_bits:
+        raise RuntimeError("trusted GitHub CLI path is not root-owned and immutable to non-root users")
+    if not executable.st_mode & stat.S_IXUSR:
+        raise RuntimeError("trusted GitHub CLI path is not executable")
+    for directory in directories:
+        if not stat.S_ISDIR(directory.st_mode):
+            raise RuntimeError("trusted GitHub CLI parent path is not a directory")
+        if directory.st_uid != 0 or directory.st_mode & unsafe_write_bits:
+            raise RuntimeError("trusted GitHub CLI parent path is writable by non-root users")
+    return str(path)
+
+
 def _safe_environment() -> dict[str, str]:
     if _trusted_owner_mode():
         environment = dict(os.environ)
@@ -1798,6 +1917,189 @@ def _safe_environment() -> dict[str, str]:
     environment["GRABOWSKI_TRUSTED_OWNER"] = "1" if _trusted_owner_mode() else "0"
     return environment
 
+
+_GITHUB_PR_VIEW_AUTH_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GH_CONFIG_DIR",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GNOME_KEYRING_CONTROL",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    }
+)
+_GITHUB_PR_VIEW_DEFAULT_HOST = "github.com"
+_GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH = Path(
+    "/nonexistent-grabowski-github-pr-view-config-v1"
+)
+_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS = 5
+_GITHUB_PR_VIEW_MAX_TOKEN_BYTES = 4096
+
+
+def _github_pr_view_host(source: dict[str, str]) -> str:
+    raw_host = source.get("GH_HOST", _GITHUB_PR_VIEW_DEFAULT_HOST).strip().lower()
+    if not raw_host or len(raw_host) > 259:
+        raise RuntimeError("trusted GitHub host is invalid")
+    match = re.fullmatch(
+        r"([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([1-9][0-9]{0,4}))?",
+        raw_host,
+    )
+    if match is None or ".." in match.group(1):
+        raise RuntimeError("trusted GitHub host is invalid")
+    port = match.group(2)
+    if port is not None and int(port) > 65535:
+        raise RuntimeError("trusted GitHub host port is invalid")
+    return raw_host
+
+
+def _validated_github_pr_view_token(value: Any) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    token = value.strip()
+    if (
+        not token
+        or len(token.encode("utf-8")) > _GITHUB_PR_VIEW_MAX_TOKEN_BYTES
+        or any(ord(character) < 33 or ord(character) == 127 for character in token)
+    ):
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    return token
+
+
+def _github_pr_view_direct_token(
+    source: dict[str, str], host: str
+) -> str | None:
+    keys = (
+        ("GH_TOKEN", "GITHUB_TOKEN")
+        if host == _GITHUB_PR_VIEW_DEFAULT_HOST
+        else ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+    )
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return _validated_github_pr_view_token(value)
+    return None
+
+
+def _github_pr_view_auth_lookup_environment(
+    source: dict[str, str], host: str
+) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in source.items()
+        if key in _GITHUB_PR_VIEW_AUTH_ENV_ALLOWLIST
+        and isinstance(value, str)
+        and value
+    }
+    # The credential lookup is local-only and may access the configured gh
+    # account/keyring. It receives no token environment and no executable-
+    # selection knobs; the network-capable PR-view child never receives this
+    # HOME/config environment.
+    environment["GH_HOST"] = host
+    environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
+    environment["GH_PAGER"] = "cat"
+    environment["PAGER"] = "cat"
+    environment["GIT_PAGER"] = "cat"
+    environment["GH_PROMPT_DISABLED"] = "1"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["NO_COLOR"] = "1"
+    return environment
+
+
+def _github_pr_view_auth_token(
+    executable: str, source: dict[str, str], host: str
+) -> str:
+    direct = (
+        _github_pr_view_direct_token(source, host)
+        if _trusted_owner_mode()
+        else None
+    )
+    if direct is not None:
+        return direct
+    process = subprocess.Popen(
+        [executable, "auth", "token", "--hostname", host],
+        cwd=HOME,
+        env=_github_pr_view_auth_lookup_environment(source, host),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        stdout_raw, _stderr_raw = process.communicate(
+            timeout=_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(process)
+        raise RuntimeError("trusted GitHub credential lookup timed out") from exc
+    if process.returncode != 0:
+        raise RuntimeError("trusted GitHub credential lookup failed")
+    if len(stdout_raw) > _GITHUB_PR_VIEW_MAX_TOKEN_BYTES + 1:
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    try:
+        decoded = stdout_raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            "trusted GitHub credential lookup returned invalid data"
+        ) from exc
+    lines = decoded.splitlines()
+    if len(lines) != 1:
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    return _validated_github_pr_view_token(lines[0])
+
+
+def _github_pr_view_isolated_config_path() -> str:
+    path = _GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError("isolated GitHub configuration path is not verifiable") from exc
+    else:
+        raise RuntimeError("isolated GitHub configuration path must remain absent")
+    try:
+        parent = os.lstat(path.parent)
+    except OSError as exc:
+        raise RuntimeError("isolated GitHub configuration parent is unavailable") from exc
+    unsafe_write_bits = stat.S_IWGRP | stat.S_IWOTH
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or parent.st_mode & unsafe_write_bits
+    ):
+        raise RuntimeError(
+            "isolated GitHub configuration parent is writable by non-root users"
+        )
+    return str(path)
+
+
+def _github_pr_view_environment(*, host: str, token: str) -> dict[str, str]:
+    isolated = _github_pr_view_isolated_config_path()
+    credential = _validated_github_pr_view_token(token)
+    environment = {
+        "HOME": isolated,
+        "XDG_CONFIG_HOME": isolated,
+        "GH_CONFIG_DIR": isolated,
+        "GH_HOST": host,
+        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "GH_PROMPT_DISABLED": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "NO_COLOR": "1",
+    }
+    # Bind exactly one credential family to the server-selected host. The
+    # network process receives neither the user's gh config/keyring paths nor
+    # proxy/browser/editor/loader overrides.
+    if host == _GITHUB_PR_VIEW_DEFAULT_HOST:
+        environment["GH_TOKEN"] = credential
+    else:
+        environment["GH_ENTERPRISE_TOKEN"] = credential
+    return environment
 
 def _resolve_cwd(cwd: str | None) -> Path:
     path = HOME if cwd is None else Path(cwd).expanduser()
@@ -5638,14 +5940,37 @@ def grabowski_github(
             f"({bypass_reason}); use Captain pr-merge so live review, CI and "
             "decision-bound review reconciliation gates cannot be bypassed"
         )
-    working_directory = _resolve_cwd(cwd)
+    transport_exempt = _github_pr_view_transport_read_only(
+        {
+            "arguments": arguments,
+            "cwd": cwd,
+            "timeout_seconds": timeout_seconds,
+        }
+    )
+    requested_directory = _resolve_cwd(cwd)
+    working_directory = HOME if transport_exempt else requested_directory
     _require_operator_mutation("github_cli", path=str(working_directory))
-    command = _validate_argv(["gh", *arguments], cwd=working_directory)
+    trusted_github_cli = _trusted_github_cli_path()
+    command = _validate_argv(
+        [trusted_github_cli, *arguments], cwd=working_directory
+    )
+    if transport_exempt:
+        source_environment = _safe_environment()
+        github_host = _github_pr_view_host(source_environment)
+        github_token = _github_pr_view_auth_token(
+            trusted_github_cli, source_environment, github_host
+        )
+        environment = _github_pr_view_environment(
+            host=github_host, token=github_token
+        )
+    else:
+        environment = None
     return _run(
         command,
         cwd=working_directory,
         timeout_seconds=_timeout(timeout_seconds),
         max_output_bytes=MAX_OUTPUT_BYTES,
+        environment=environment,
     )
 
 

@@ -887,6 +887,472 @@ class OperatorSignedTransportTests(unittest.TestCase):
         consume_verified.assert_called_once()
         begin.assert_not_called()
 
+    def test_github_pr_view_read_only_shape_is_transport_exempt(self) -> None:
+        safe_calls = [
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number,state,headRefOid",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo=heimgewebe/metarepo",
+                    "--json=number,state",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "-R",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 60,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 1,
+            },
+        ]
+        for arguments in safe_calls:
+            with self.subTest(arguments=arguments):
+                self.assertTrue(
+                    operator._transport_roundtrip_exempt_call(
+                        "grabowski_github", arguments
+                    )
+                )
+
+    def test_other_github_or_ambiguous_shapes_stay_transport_gated(self) -> None:
+        unsafe_calls = [
+            {"arguments": ["pr", "merge", "734"]},
+            {"arguments": ["pr", "view", "734", "--repo", "heimgewebe/metarepo"]},
+            {"arguments": ["pr", "view", "734", "--json", "number"]},
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "main",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "https://github.com/heimgewebe/metarepo/pull/734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "evil.example/heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number,,state",
+                ]
+            },
+            {"arguments": ["pr", "view", "734", "--web"]},
+            {"arguments": ["pr", "view", "734", "-w"]},
+            {"arguments": ["pr", "view", "734", "--web=true"]},
+            {"arguments": ["pr", "view", "734", "--comments"]},
+            {"arguments": ["pr", "view", "734", "--help"]},
+            {"arguments": ["pr", "view", "734", "--jq", ".number"]},
+            {"arguments": ["pr", "view", "734", "--template", "{{.number}}"]},
+            {"arguments": ["pr", "view", "734", "--future-mutate"]},
+            {"arguments": ["pr", "view", "734", "extra-positional"]},
+            {"arguments": ["issue", "view", "1"]},
+            {"arguments": ["api", "repos/x/y"]},
+            {"arguments": ["api", "graphql", "-f", "query=query { viewer { login } }"]},
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 61,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 86_400,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": True,
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ],
+                "timeout_seconds": 0,
+            },
+        ]
+        for arguments in unsafe_calls:
+            with self.subTest(arguments=arguments):
+                self.assertFalse(
+                    operator._transport_roundtrip_exempt_call(
+                        "grabowski_github", arguments
+                    )
+                )
+        self.assertFalse(
+            operator._transport_roundtrip_exempt_call(
+                "grabowski_terminal_run", {"argv": ["true"]}
+            )
+        )
+
+    def test_trusted_github_cli_pin_rejects_unsafe_metadata(self) -> None:
+        trusted_file = SimpleNamespace(
+            st_mode=operator.stat.S_IFREG | 0o755, st_uid=0
+        )
+        trusted_dir = SimpleNamespace(
+            st_mode=operator.stat.S_IFDIR | 0o755, st_uid=0
+        )
+
+        def lstat_for(path: object) -> object:
+            value = Path(path)
+            if value == operator.TRUSTED_GITHUB_CLI_PATH:
+                return trusted_file
+            if value in {
+                operator.TRUSTED_GITHUB_CLI_PATH.parent,
+                operator.TRUSTED_GITHUB_CLI_PATH.parent.parent,
+            }:
+                return trusted_dir
+            raise AssertionError(f"unexpected lstat path: {value}")
+
+        with mock.patch.object(operator.os, "lstat", side_effect=lstat_for):
+            self.assertEqual(operator._trusted_github_cli_path(), "/usr/bin/gh")
+
+        unsafe_cases = [
+            SimpleNamespace(st_mode=operator.stat.S_IFREG | 0o755, st_uid=1000),
+            SimpleNamespace(st_mode=operator.stat.S_IFREG | 0o775, st_uid=0),
+            SimpleNamespace(st_mode=operator.stat.S_IFLNK | 0o777, st_uid=0),
+        ]
+        for unsafe_file in unsafe_cases:
+            with self.subTest(mode=unsafe_file.st_mode, uid=unsafe_file.st_uid):
+                def unsafe_lstat(path: object) -> object:
+                    value = Path(path)
+                    if value == operator.TRUSTED_GITHUB_CLI_PATH:
+                        return unsafe_file
+                    return trusted_dir
+
+                with mock.patch.object(operator.os, "lstat", side_effect=unsafe_lstat):
+                    with self.assertRaises(RuntimeError):
+                        operator._trusted_github_cli_path()
+
+    def test_github_wrapper_ignores_path_shim_and_user_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            shim = Path(directory) / "gh"
+            shim.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            shim.chmod(0o755)
+            hostile_environment = {
+                "PATH": directory,
+                "HOME": directory,
+                "XDG_CONFIG_HOME": str(Path(directory) / "xdg"),
+                "GH_CONFIG_DIR": str(Path(directory) / "gh-config"),
+                "GH_FORCE_TTY": "1",
+                "GH_PAGER": str(Path(directory) / "evil-gh-pager"),
+                "PAGER": str(Path(directory) / "evil-pager"),
+                "GIT_PAGER": str(Path(directory) / "evil-git-pager"),
+                "LD_PRELOAD": str(Path(directory) / "evil.so"),
+                "BROWSER": str(Path(directory) / "evil-browser"),
+                "EDITOR": str(Path(directory) / "evil-editor"),
+                "VISUAL": str(Path(directory) / "evil-visual"),
+                "HTTPS_PROXY": "http://evil.example:8080",
+            }
+            with (
+                mock.patch.dict(operator.os.environ, hostile_environment, clear=False),
+                mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+                mock.patch.object(operator, "_require_operator_mutation"),
+                mock.patch.object(
+                    operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+                ) as trusted,
+                mock.patch.object(
+                    operator,
+                    "_github_pr_view_auth_token",
+                    return_value="fixture-token",
+                ) as auth_token,
+                mock.patch.object(
+                    operator, "_run", return_value={"returncode": 0}
+                ) as run,
+            ):
+                operator.grabowski_github(
+                    [
+                        "pr",
+                        "view",
+                        "1031",
+                        "--repo",
+                        "heimgewebe/grabowski",
+                        "--json",
+                        "number,state",
+                    ],
+                    cwd=str(ROOT),
+                )
+        trusted.assert_called_once_with()
+        auth_token.assert_called_once()
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["environment"]
+        isolated = str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH)
+        self.assertEqual(command[0], "/usr/bin/gh")
+        self.assertNotEqual(command[0], str(shim))
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["GH_HOST"], "github.com")
+        self.assertEqual(run.call_args.kwargs["cwd"], operator.HOME)
+        self.assertEqual(environment["HOME"], isolated)
+        self.assertEqual(environment["XDG_CONFIG_HOME"], isolated)
+        self.assertEqual(environment["GH_CONFIG_DIR"], isolated)
+        self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+        self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
+        for unsafe_key in (
+            "GH_FORCE_TTY",
+            "LD_PRELOAD",
+            "BROWSER",
+            "EDITOR",
+            "VISUAL",
+            "HTTPS_PROXY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ):
+            self.assertNotIn(unsafe_key, environment)
+
+    def test_exempt_github_environment_isolates_config_and_binds_github_token(self) -> None:
+        environment = operator._github_pr_view_environment(
+            host="github.com", token="fixture-token"
+        )
+        isolated = str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH)
+        self.assertEqual(environment["HOME"], isolated)
+        self.assertEqual(environment["XDG_CONFIG_HOME"], isolated)
+        self.assertEqual(environment["GH_CONFIG_DIR"], isolated)
+        self.assertEqual(environment["GH_HOST"], "github.com")
+        self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+        self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["GH_PAGER"], "cat")
+        self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
+        for key in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ):
+            self.assertNotIn(key, environment)
+
+    def test_exempt_github_environment_binds_enterprise_token_to_server_host(self) -> None:
+        environment = operator._github_pr_view_environment(
+            host="ghe.example.internal", token="fixture-enterprise-token"
+        )
+        self.assertEqual(environment["GH_HOST"], "ghe.example.internal")
+        self.assertEqual(
+            environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token"
+        )
+        self.assertNotIn("GH_TOKEN", environment)
+        self.assertFalse(
+            operator._github_pr_view_transport_read_only(
+                {
+                    "arguments": [
+                        "pr",
+                        "view",
+                        "1031",
+                        "--repo",
+                        "evil.example/heimgewebe/grabowski",
+                        "--json",
+                        "number",
+                    ]
+                }
+            )
+        )
+
+    def test_exempt_github_auth_lookup_uses_local_keyring_without_network_env(self) -> None:
+        process = mock.Mock()
+        process.returncode = 0
+        process.communicate.return_value = (b"fixture-keyring-token\n", b"")
+        source = {
+            "HOME": "/home/alex",
+            "XDG_CONFIG_HOME": "/home/alex/.config",
+            "GH_CONFIG_DIR": "/home/alex/.config/gh",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "GH_FORCE_TTY": "1",
+            "HTTPS_PROXY": "http://evil.example:8080",
+            "LD_PRELOAD": "/tmp/evil.so",
+        }
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
+        ):
+            token = operator._github_pr_view_auth_token(
+                "/usr/bin/gh", source, "github.com"
+            )
+        self.assertEqual(token, "fixture-keyring-token")
+        argv = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(argv, ["/usr/bin/gh", "auth", "token", "--hostname", "github.com"])
+        self.assertEqual(environment["HOME"], "/home/alex")
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(
+            environment["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/1000/bus",
+        )
+        for key in (
+            "GH_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GH_FORCE_TTY",
+            "HTTPS_PROXY",
+            "LD_PRELOAD",
+        ):
+            self.assertNotIn(key, environment)
+
+    def test_exempt_github_auth_prefers_server_token_without_keyring_lookup(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator.subprocess, "Popen") as popen,
+        ):
+            token = operator._github_pr_view_auth_token(
+                "/usr/bin/gh", {"GH_TOKEN": "fixture-token"}, "github.com"
+            )
+        self.assertEqual(token, "fixture-token")
+        popen.assert_not_called()
+
+    def test_exempt_github_untrusted_ignores_env_token_and_uses_local_auth(self) -> None:
+        process = mock.Mock()
+        process.returncode = 0
+        process.communicate.return_value = (b"fixture-keyring-token\n", b"")
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=False),
+            mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
+        ):
+            token = operator._github_pr_view_auth_token(
+                "/usr/bin/gh",
+                {"HOME": "/home/alex", "GH_TOKEN": "fixture-env-token"},
+                "github.com",
+            )
+        self.assertEqual(token, "fixture-keyring-token")
+        popen.assert_called_once()
+        self.assertNotIn("GH_TOKEN", popen.call_args.kwargs["env"])
+
+    def test_exempt_github_isolation_path_fails_closed_if_created(self) -> None:
+        root = SimpleNamespace(st_mode=operator.stat.S_IFDIR | 0o755, st_uid=0)
+        created = SimpleNamespace(st_mode=operator.stat.S_IFDIR | 0o755, st_uid=0)
+
+        def lstat(path: object) -> object:
+            value = Path(path)
+            if value == operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH:
+                return created
+            if value == Path("/"):
+                return root
+            raise AssertionError(f"unexpected path: {value}")
+
+        with mock.patch.object(operator.os, "lstat", side_effect=lstat):
+            with self.assertRaisesRegex(RuntimeError, "must remain absent"):
+                operator._github_pr_view_isolated_config_path()
+
+    def test_nonexempt_github_call_keeps_default_child_environment(self) -> None:
+        with (
+            mock.patch.object(operator, "_require_operator_mutation"),
+            mock.patch.object(
+                operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
+            ),
+            mock.patch.object(operator, "_run", return_value={"returncode": 0}) as run,
+        ):
+            operator.grabowski_github(
+                ["issue", "view", "1", "--repo", "heimgewebe/grabowski"],
+                cwd=str(ROOT),
+            )
+        self.assertIsNone(run.call_args.kwargs["environment"])
+
+    def test_github_pr_view_does_not_consume_signed_assertion(self) -> None:
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with (
+            mock.patch.object(operator, "_require_current_serving_process") as serving,
+            mock.patch.object(base, "_transport_signed_one_call_evidence") as signed,
+            mock.patch.object(roundtrip, "consume_verified") as legacy,
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_github",
+                arguments={
+                    "arguments": [
+                        "pr",
+                        "view",
+                        "734",
+                        "--repo",
+                        "heimgewebe/metarepo",
+                        "--json",
+                        "number,state,headRefOid",
+                    ]
+                },
+                context=_ctx({}),
+                tool=tool,
+            )
+        self.assertIsNone(evidence)
+        serving.assert_not_called()
+        signed.assert_not_called()
+        legacy.assert_not_called()
+
     def test_stale_serving_process_blocks_before_signed_assertion_consumption(
         self,
     ) -> None:
