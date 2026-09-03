@@ -967,6 +967,7 @@ def _github_v2_snapshot(
         return None
     merged = pull_request.get("state") == "MERGED"
     merge_group_checks: list[Any] = []
+    merge_gate_checks: list[Any] = []
     if isinstance(merge, Mapping):
         merge_check_nodes = _github_v2_rollup_nodes(
             merge.get("statusCheckRollup"), allow_empty=True
@@ -979,8 +980,16 @@ def _github_v2_snapshot(
             normalized = _github_v2_check(check)
             if normalized is None:
                 return None
-            if normalized[3].get("workflow_event") == "merge_group":
+            material = normalized[3]
+            if material.get("workflow_event") == "merge_group":
                 merge_group_checks.append(check)
+                merge_gate_checks.append(check)
+            elif material.get("workflow_run_database_id") is None:
+                # External CheckRuns and StatusContexts can be required merge
+                # gates even though they have no Actions workflow binding.
+                # Retain them in success evaluation; ignore only workflow runs
+                # from other events such as the post-merge push.
+                merge_gate_checks.append(check)
     if merge_group_checks:
         if (
             not merged
@@ -999,7 +1008,7 @@ def _github_v2_snapshot(
             )
         ):
             return None
-        effective_checks = _effective_github_v2_checks(merge_group_checks)
+        effective_checks = _effective_github_v2_checks(merge_gate_checks)
     else:
         if not _github_v2_rerun_pr_bindings_valid(
             repo,

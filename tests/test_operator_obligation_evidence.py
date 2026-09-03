@@ -1106,6 +1106,105 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
             all(f"head_sha={merge}" in call.args[0] for call in actions_calls)
         )
 
+    def test_prepare_github_merge_queue_includes_successful_non_workflow_checks(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        merge_run = 9051
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[
+                self._github_v2_external_check(
+                    database_id=351,
+                    name="head-codeql",
+                    started_at="2026-08-25T14:30:01Z",
+                )
+            ],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=352,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8051,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                ),
+                self._github_v2_external_check(
+                    database_id=353,
+                    name="external-security",
+                    started_at="2026-08-25T14:40:02Z",
+                ),
+                self._github_v2_status_context(
+                    node_id="SC_merge_gate",
+                    context="external-status",
+                    created_at="2026-08-25T14:40:03Z",
+                ),
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=946),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 946}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith(
+                "checks=3/3-effective-success"
+            )
+        )
+
+    def test_prepare_github_merge_queue_non_workflow_failure_fails_closed(self) -> None:
+        merge_run = 9061
+        payload = self._github_v2_payload(
+            head="1" * 40,
+            base="2" * 40,
+            merge="3" * 40,
+            checks=[
+                self._github_v2_external_check(
+                    database_id=361,
+                    name="head-codeql",
+                    started_at="2026-08-25T14:30:01Z",
+                )
+            ],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=362,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8061,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=9,
+                ),
+                self._github_v2_external_check(
+                    database_id=363,
+                    name="external-security",
+                    started_at="2026-08-25T14:40:02Z",
+                    conclusion="FAILURE",
+                ),
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=947),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 947}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
     def test_prepare_github_merge_queue_failed_check_fails_closed(self) -> None:
         merge_run = 9101
         payload = self._github_v2_payload(
