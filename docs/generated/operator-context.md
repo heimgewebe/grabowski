@@ -123,7 +123,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_tailscale_status` | diagnostics | yes | low | Read bounded local Tailscale node and peer health without account records or mutation controls. |
 | `grabowski_privileged_action_reference` | privileged-reference | yes | medium | Create a non-executable reference contract for a future external privileged action. |
 | `grabowski_power_run` | privileged-execution | no | critical | Run one audited root command through the recovery-gated power broker. |
-| `grabowski_fleet_list` | fleet | yes | low | Return the validated local and SSH host registry. |
+| `grabowski_fleet_list` | fleet | yes | low | Return a bounded projection of the validated local and SSH host registry. |
 | `grabowski_fleet_run` | fleet | no | variable | Run one bounded argv command on one registered local or SSH host. |
 | `grabowski_juno_status` | device-worker | yes | low | Read bounded health and job evidence from the paired Juno device worker. |
 | `grabowski_juno_pair` | device-worker | no | high | Pair one exact Juno session after local consent and explicit escalation. |

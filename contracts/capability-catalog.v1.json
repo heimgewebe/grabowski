@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "c9a6b1bcf99fd97a9191e0016139cf8b2507f4ccd316282b02f286fb2ee2ef84",
+  "capability_source_sha256": "6ceac03492515358aa12c4ff1bb6660f908917a33f06f77d63dca73af30367ec",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "f22d3c3b508ea1e438b0ade99bc85780beb3661adcd8685666f5356e7ad656a7",
   "integrity": {
@@ -1008,7 +1008,7 @@
     },
     {
       "category": "diagnostics",
-      "description": "Read bounded local Tailscale health without mutation controls or account records.",
+      "description": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
       "effects": [],
       "id": "grabowski_tailscale_status",
       "purpose": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
@@ -1044,10 +1044,10 @@
     },
     {
       "category": "fleet",
-      "description": "Return the validated local and SSH host registry.",
+      "description": "Return a bounded projection of the validated local and SSH host registry.",
       "effects": [],
       "id": "grabowski_fleet_list",
-      "purpose": "Return the validated local and SSH host registry.",
+      "purpose": "Return a bounded projection of the validated local and SSH host registry.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",

@@ -46,13 +46,15 @@ Diff and show disable external helpers and text conversion. Git reads run with `
 - `grabowski_github_pr_view`
 - `grabowski_github_checks`
 
-JSON fields are fixed. Pull-request bodies, comments, reviews and caller-selected fields are excluded. Profiles with `github_cli` retain the authenticated `gh` path. Observe-only profiles may instead read canonical public `owner/repository` identifiers through bounded anonymous requests to the fixed `api.github.com` origin; absolute-worktree resolution still requires `github_cli`. Anonymous reads do not follow caller-selected URLs and explicitly mark fields unavailable when REST cannot provide the same semantic value.
+JSON fields are fixed. Pull-request bodies, comments, reviews and caller-selected fields are excluded. Profiles with `github_cli` retain the authenticated `gh` path. Observe-only profiles may instead read canonical public `owner/repository` identifiers through bounded anonymous requests to the fixed `api.github.com` origin; absolute-worktree resolution still requires `github_cli`. Anonymous reads do not follow caller-selected URLs and explicitly mark fields unavailable when REST cannot provide the same semantic value. The anonymous checks path performs at most three requests (pull request, first 100 check-runs, first 100 legacy commit-status contexts) and never paginates. If either check collection is larger, the bounded page remains visible with `complete=false` and a failing semantic return code, so unseen checks cannot false-green the result. Safe rate-limit counters from GitHub response headers are projected; arbitrary HTTP error bodies are not.
 
 ## Tailscale read tool
 
 - `grabowski_tailscale_status`
 
-The command shape is fixed to the locally resolved `tailscale status --json`. The response projects only bounded node/peer health and reachability fields. Account records, node public keys, user IDs, raw addresses, PeerAPI URLs, capability maps and mutation controls are excluded. The tool accepts no argv, URL, peer selector or Serve/Funnel operation.
+The command shape is fixed to the locally resolved `tailscale status --json`. The response projects only bounded identity-redacted node/peer health: booleans, bounded OS/backend/version state, peer count, truncation state and health-issue count. Host names, MagicDNS names, Tailscale IPs, account records, node public keys, user IDs, raw addresses, relays, timestamps, PeerAPI URLs, capability maps, raw health messages and mutation controls are excluded. The tool accepts no argv, URL, peer selector or Serve/Funnel operation.
+
+`grabowski_fleet_list` exposes only each validated host identifier, transport kind and ready state. Roles, SSH targets, command allowlists, connect timeouts, remote-command mode and the registry path remain internal.
 
 ## Service read tools
 
@@ -77,12 +79,12 @@ Select every tool in `expected_tools`. It retains all generic reads, mutations a
 
 The Core canary uses all of these predicates:
 
-- the tool belongs to an explicit 23-tool Canary set
+- the tool belongs to the explicit `CORE_TOOLS` Canary set in the publication-profile builder
 - `read_only == true`
 - `risk_class` is `low` or `medium`
 - declared effects are empty or only `remote-read`
 
-The explicit set prevents a newly added tool from entering Core merely because it shares a category. Generic filesystem reading, tmux capture, process inventory, job/task logs, operation plans, resources, artifacts and browser/GUI worker inventory are intentionally absent. Core retains audit verification, narrow runtime and deployment identity, contract and checkout drift, typed Git and GitHub reads, service status/logs, ports, bounded Tailscale status, fleet identity, privileged-broker status and recovery status. The current projection contains 23 tools.
+The explicit set prevents a newly added tool from entering Core merely because it shares a category. Generic filesystem reading, tmux capture, process inventory, job/task logs, operation plans, resources, artifacts and browser/GUI worker inventory are intentionally absent. Core retains audit verification, narrow runtime and deployment identity, contract and checkout drift, typed Git and GitHub reads, service status/logs, ports, bounded Tailscale status, fleet identity, privileged-broker status and recovery status. Exact tool counts are generated into the publication-profile contracts instead of being duplicated here.
 
 ### `operator`
 

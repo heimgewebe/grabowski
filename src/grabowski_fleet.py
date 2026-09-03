@@ -474,10 +474,16 @@ def run_fleet_task_unit_show(
 
 @mcp.tool(name="grabowski_fleet_list", annotations=READ_ONLY)
 def grabowski_fleet_list() -> dict[str, Any]:
-    """Return the validated local and SSH host registry."""
+    """Return a bounded projection of the validated local and SSH host registry."""
     fleet = load_fleet()
-    return {"path": str(FLEET_CONFIG), "schema_version": 1,
-            "hosts": fleet["hosts"], "count": len(fleet["hosts"])}
+    hosts = {
+        name: {
+            "kind": host["transport"],
+            "ready": host["enabled"],
+        }
+        for name, host in fleet["hosts"].items()
+    }
+    return {"schema_version": 1, "hosts": hosts, "count": len(hosts)}
 
 
 def run_public_fleet_host(

@@ -1068,7 +1068,7 @@
     },
     {
       "category": "diagnostics",
-      "description": "Read bounded local Tailscale health without mutation controls or account records.",
+      "description": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
       "effects": [],
       "id": "grabowski_tailscale_status",
       "purpose": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
@@ -1104,10 +1104,10 @@
     },
     {
       "category": "fleet",
-      "description": "Return the validated local and SSH host registry.",
+      "description": "Return a bounded projection of the validated local and SSH host registry.",
       "effects": [],
       "id": "grabowski_fleet_list",
-      "purpose": "Return the validated local and SSH host registry.",
+      "purpose": "Return a bounded projection of the validated local and SSH host registry.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -3586,7 +3586,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "c9a6b1bcf99fd97a9191e0016139cf8b2507f4ccd316282b02f286fb2ee2ef84"
+      "sha256": "6ceac03492515358aa12c4ff1bb6660f908917a33f06f77d63dca73af30367ec"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3645,7 +3645,7 @@
       "src/grabowski_effect_receipt.py": "b3114c0835203a57a42acbea5bbb2843ee0633d8a52e673f1497cc17e87e4a29",
       "src/grabowski_execution_coordinator.py": "d31054cc2eb0fe90faf3b1fe84f7c23fc33277817ab88b25fc658524a4cdcc2f",
       "src/grabowski_execution_plan.py": "d4c71362493f73714b5d0420c5b5a9f115f39c38cbf203cfa4a5507527fe4a54",
-      "src/grabowski_fleet.py": "8142b437eeac7158fca22bb7df105df9fbc0ba824300a5431a7b1827dc1c9db9",
+      "src/grabowski_fleet.py": "fbe1efbceefdb72715cb67e7e9e6a491576a642d889d87d18b641b28ddcb4782",
       "src/grabowski_fleet_mutation.py": "f03f8d44e6ac436ffbe016341e3f3dba4a313cbd7973b1f18929e4fa643d3be9",
       "src/grabowski_forrest_server_exit.py": "f7a709556197a5c15240e1b0be9c2015f35cad198ce29fe98c4b6fe1204f9cea",
       "src/grabowski_friction.py": "524d7839aabd0cbb8b710714b7656214f17aa3bc9504dc635f890231e3a37e4f",
@@ -3688,7 +3688,7 @@
       "src/grabowski_privileged.py": "70b7c434b60f3dc7a5f08f650f21db9f598a0b2fa9747d7679f396b00a47a7eb",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
       "src/grabowski_provenance_recovery.py": "b507add38c5fdaf9ad4248f0e2cc5bf7570f1a62415a06e1bf171d44f26e0730",
-      "src/grabowski_read_surface.py": "9af875852800a6bb2a32f774d925226a18f4191b8eeee96b4449918c5010a94d",
+      "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",
       "src/grabowski_recall.py": "386afec03e078b6a7934b0744eb17edb1ae97b0addde982c34c544d0c1b74413",
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",

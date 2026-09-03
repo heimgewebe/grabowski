@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import time
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from mcp.types import ToolAnnotations
 from pydantic import Field
@@ -47,7 +48,10 @@ MAX_OUTPUT_BYTES = 2_000_000
 MAX_LOG_LINES = 2_000
 MAX_GIT_COMMITS = 100
 MAX_GITHUB_RESPONSE_BYTES = 1_000_000
+MAX_TAILSCALE_RESPONSE_BYTES = 512_000
 MAX_TAILSCALE_PEERS = 256
+MAX_PROJECTED_TEXT = 500
+MAX_PROJECTED_URL = 1_000
 MAX_WORKTREES = 100
 MAX_REVISION_LENGTH = 200
 MAX_AUDIT_PROJECTION_TOP = 25
@@ -80,6 +84,11 @@ GITHUB_OWNER_RE = re.compile(
 )
 GITHUB_REPOSITORY_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
+GITHUB_REST_PATH_RE = re.compile(
+    r"/repos/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/"
+    r"(?!\.{1,2}/)[A-Za-z0-9._-]{1,100}/"
+    r"(?:pulls/[1-9][0-9]*|commits/[0-9a-f]{40,64}/(?:check-runs|status)\?per_page=100)\Z"
+)
 DEPLOYMENT_IDENTITY_FIELDS = (
     "schema_version",
     "release_id",
@@ -281,10 +290,7 @@ def _resolve_repository(raw: str) -> Path:
     return path
 
 
-def _resolve_github_repository(raw: str) -> tuple[Path, list[str]]:
-    candidate = Path(raw)
-    if candidate.is_absolute():
-        return _resolve_repository(raw), []
+def _canonical_github_repository(raw: str) -> str:
     parts = raw.split("/")
     valid_identifier = (
         len(parts) == 2
@@ -293,11 +299,42 @@ def _resolve_github_repository(raw: str) -> tuple[Path, list[str]]:
         and parts[1] not in {".", ".."}
     )
     if not valid_identifier:
+        raise ValueError("repo must be a canonical GitHub owner/repository identifier")
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _github_rest_path(
+    repository: str, *segments: str, query: str | None = None
+) -> str:
+    owner, name = _canonical_github_repository(repository).split("/", 1)
+    if not segments or any(
+        not segment or "/" in segment or segment in {".", ".."}
+        for segment in segments
+    ):
+        raise ValueError("Invalid GitHub REST path segment")
+    encoded = [
+        quote(owner, safe=""),
+        quote(name, safe=""),
+        *(quote(segment, safe="") for segment in segments),
+    ]
+    if query not in {None, "per_page=100"}:
+        raise ValueError("Invalid GitHub REST query")
+    path = "/repos/" + "/".join(encoded)
+    return f"{path}?{query}" if query is not None else path
+
+
+def _resolve_github_repository(raw: str) -> tuple[Path, list[str]]:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return _resolve_repository(raw), []
+    try:
+        repository = _canonical_github_repository(raw)
+    except ValueError as exc:
         raise ValueError(
             "repo must be an absolute local Git worktree path or a canonical "
             "GitHub owner/repository identifier"
-        )
-    return operator.HOME, ["--repo", raw]
+        ) from exc
+    return operator.HOME, ["--repo", repository]
 
 
 def _git_command(repo: Path, *arguments: str) -> list[str]:
@@ -1222,10 +1259,28 @@ def _github_cli_enabled() -> bool:
     return True
 
 
+def _github_rate_limit_projection(response: http.client.HTTPResponse) -> dict[str, Any]:
+    def _header_int(name: str) -> int | None:
+        raw = response.getheader(name)
+        if not isinstance(raw, str) or not raw.isdigit():
+            return None
+        return int(raw)
+
+    resource = response.getheader("X-RateLimit-Resource")
+    return {
+        "limit": _header_int("X-RateLimit-Limit"),
+        "remaining": _header_int("X-RateLimit-Remaining"),
+        "reset_unix": _header_int("X-RateLimit-Reset"),
+        "resource": resource[:64] if isinstance(resource, str) else None,
+    }
+
+
 def _github_rest_json(path: str) -> dict[str, Any]:
     """Read one fixed-origin bounded anonymous GitHub REST resource."""
-    if not path.startswith("/repos/") or "\n" in path or "\r" in path:
-        raise ValueError("Invalid GitHub REST path")
+    if GITHUB_REST_PATH_RE.fullmatch(path) is None:
+        raise ValueError(
+            "GitHub REST path is outside the fixed typed-read allowlist"
+        )
     started = time.monotonic()
     connection = http.client.HTTPSConnection("api.github.com", timeout=20)
     try:
@@ -1241,6 +1296,7 @@ def _github_rest_json(path: str) -> dict[str, Any]:
         response = connection.getresponse()
         raw = response.read(MAX_GITHUB_RESPONSE_BYTES + 1)
         status = response.status
+        rate_limit = _github_rate_limit_projection(response)
     except (OSError, http.client.HTTPException) as exc:
         return {
             "transport": "github-rest-anonymous",
@@ -1272,6 +1328,7 @@ def _github_rest_json(path: str) -> dict[str, Any]:
         "stderr": "",
         "stdout_truncated": truncated,
         "stderr_truncated": False,
+        "rate_limit": rate_limit,
     }
     if truncated:
         return {
@@ -1283,7 +1340,20 @@ def _github_rest_json(path: str) -> dict[str, Any]:
         payload = json.loads(raw.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         return {**result, "json_valid": False, "json_error": str(exc)}
+    if result["returncode"] != 0:
+        return {
+            **result,
+            "json_valid": True,
+            "data": None,
+            "error_kind": "github_rest_http_error",
+        }
     return {**result, "json_valid": True, "data": payload}
+
+
+def _bounded_str(value: Any, limit: int = MAX_PROJECTED_TEXT) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value[:limit]
 
 
 def _github_pr_projection(payload: Any) -> dict[str, Any]:
@@ -1292,13 +1362,12 @@ def _github_pr_projection(payload: Any) -> dict[str, Any]:
     head = payload.get("head") if isinstance(payload.get("head"), dict) else {}
     base_ref = payload.get("base") if isinstance(payload.get("base"), dict) else {}
     raw_state = payload.get("state")
-    state = (
-        "MERGED"
-        if isinstance(payload.get("merged_at"), str) and bool(payload.get("merged_at"))
-        else raw_state.upper()
-        if isinstance(raw_state, str)
-        else None
-    )
+    if isinstance(payload.get("merged_at"), str) and bool(payload.get("merged_at")):
+        state = "MERGED"
+    elif isinstance(raw_state, str):
+        state = raw_state.upper()
+    else:
+        state = None
     raw_mergeable = payload.get("mergeable")
     mergeable = (
         "MERGEABLE" if raw_mergeable is True else
@@ -1307,15 +1376,15 @@ def _github_pr_projection(payload: Any) -> dict[str, Any]:
     )
     return {
         "number": payload.get("number"),
-        "title": payload.get("title"),
+        "title": _bounded_str(payload.get("title")),
         "state": state,
         "isDraft": payload.get("draft"),
         "mergeable": mergeable,
-        "headRefName": head.get("ref"),
-        "baseRefName": base_ref.get("ref"),
-        "url": payload.get("html_url"),
+        "headRefName": _bounded_str(head.get("ref"), 255),
+        "baseRefName": _bounded_str(base_ref.get("ref"), 255),
+        "url": _bounded_str(payload.get("html_url"), MAX_PROJECTED_URL),
         "reviewDecision": None,
-        "updatedAt": payload.get("updated_at"),
+        "updatedAt": _bounded_str(payload.get("updated_at"), 64),
     }
 
 
@@ -1347,12 +1416,12 @@ def _github_check_projection(payload: Any) -> dict[str, Any]:
     conclusion = payload.get("conclusion")
     return {
         "bucket": _github_check_bucket(status, conclusion),
-        "completedAt": payload.get("completed_at"),
-        "description": output.get("title"),
+        "completedAt": _bounded_str(payload.get("completed_at"), 64),
+        "description": _bounded_str(output.get("title")),
         "event": None,
-        "link": payload.get("details_url"),
-        "name": payload.get("name"),
-        "startedAt": payload.get("started_at"),
+        "link": _bounded_str(payload.get("details_url"), MAX_PROJECTED_URL),
+        "name": _bounded_str(payload.get("name"), 255),
+        "startedAt": _bounded_str(payload.get("started_at"), 64),
         "state": _github_check_state(status, conclusion),
         "workflow": None,
     }
@@ -1372,12 +1441,16 @@ def _github_status_projection(payload: Any) -> dict[str, Any]:
     )
     return {
         "bucket": bucket,
-        "completedAt": payload.get("updated_at") if state != "pending" else None,
-        "description": payload.get("description"),
+        "completedAt": (
+            _bounded_str(payload.get("updated_at"), 64)
+            if state != "pending"
+            else None
+        ),
+        "description": _bounded_str(payload.get("description")),
         "event": None,
-        "link": payload.get("target_url"),
-        "name": payload.get("context"),
-        "startedAt": payload.get("created_at"),
+        "link": _bounded_str(payload.get("target_url"), MAX_PROJECTED_URL),
+        "name": _bounded_str(payload.get("context"), 255),
+        "startedAt": _bounded_str(payload.get("created_at"), 64),
         "state": state.upper() if isinstance(state, str) else None,
         "workflow": None,
     }
@@ -1397,7 +1470,9 @@ def _tailscale_failure_projection(
 ) -> dict[str, Any]:
     """Return only non-content execution metadata for a failed Tailscale read."""
     return {
-        "available": True,
+        "available": False,
+        "executable_present": True,
+        "status_readable": False,
         "returncode": result.get("returncode"),
         "timed_out": bool(result.get("timed_out")),
         "duration_seconds": result.get("duration_seconds"),
@@ -1413,17 +1488,18 @@ def _tailscale_node_projection(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     return {
-        "HostName": payload.get("HostName"),
-        "DNSName": payload.get("DNSName"),
-        "OS": payload.get("OS"),
-        "TailscaleIPs": payload.get("TailscaleIPs"),
-        "Relay": payload.get("Relay"),
-        "Online": payload.get("Online"),
-        "Active": payload.get("Active"),
-        "ExitNode": payload.get("ExitNode"),
-        "LastSeen": payload.get("LastSeen"),
-        "LastHandshake": payload.get("LastHandshake"),
-        "KeyExpiry": payload.get("KeyExpiry"),
+        "OS": _bounded_str(payload.get("OS"), 64),
+        "Online": (
+            payload.get("Online") if isinstance(payload.get("Online"), bool) else None
+        ),
+        "Active": (
+            payload.get("Active") if isinstance(payload.get("Active"), bool) else None
+        ),
+        "ExitNode": (
+            payload.get("ExitNode")
+            if isinstance(payload.get("ExitNode"), bool)
+            else None
+        ),
     }
 
 
@@ -1431,22 +1507,27 @@ def _tailscale_status_projection(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Tailscale status response is not an object")
     raw_peers = payload.get("Peer") if isinstance(payload.get("Peer"), dict) else {}
-    peers = sorted(
-        (_tailscale_node_projection(value) for value in raw_peers.values()),
-        key=lambda item: (str(item.get("DNSName") or ""), str(item.get("HostName") or "")),
-    )
+    peer_count = len(raw_peers)
+    peers: list[dict[str, Any]] = []
+    for index, value in enumerate(raw_peers.values()):
+        if index >= MAX_TAILSCALE_PEERS:
+            break
+        peers.append(_tailscale_node_projection(value))
     health = payload.get("Health") if isinstance(payload.get("Health"), list) else []
     return {
-        "Version": payload.get("Version"),
-        "TUN": payload.get("TUN"),
-        "BackendState": payload.get("BackendState"),
-        "HaveNodeKey": payload.get("HaveNodeKey"),
-        "TailscaleIPs": payload.get("TailscaleIPs"),
+        "Version": _bounded_str(payload.get("Version"), 64),
+        "TUN": payload.get("TUN") if isinstance(payload.get("TUN"), bool) else None,
+        "BackendState": _bounded_str(payload.get("BackendState"), 64),
+        "HaveNodeKey": (
+            payload.get("HaveNodeKey")
+            if isinstance(payload.get("HaveNodeKey"), bool)
+            else None
+        ),
         "Self": _tailscale_node_projection(payload.get("Self")),
-        "Health": [item[:500] for item in health[:50] if isinstance(item, str)],
-        "Peers": peers[:MAX_TAILSCALE_PEERS],
-        "peer_count": len(peers),
-        "peers_truncated": len(peers) > MAX_TAILSCALE_PEERS,
+        "health_issue_count": len(health),
+        "Peers": peers,
+        "peer_count": peer_count,
+        "peers_truncated": peer_count > MAX_TAILSCALE_PEERS,
     }
 
 
@@ -2031,7 +2112,10 @@ def grabowski_github_pr_view(
                 "github_cli is required for absolute-worktree GitHub reads; "
                 "anonymous reads require canonical owner/repository"
             )
-        result = _github_rest_json(f"/repos/{repo}/pulls/{validated_pr}")
+        canonical_repo = repository_args[-1]
+        result = _github_rest_json(
+            _github_rest_path(canonical_repo, "pulls", str(validated_pr))
+        )
         if result.get("returncode") != 0 or result.get("json_valid") is not True:
             return result
         try:
@@ -2074,7 +2158,10 @@ def grabowski_github_checks(
                 "github_cli is required for absolute-worktree GitHub reads; "
                 "anonymous reads require canonical owner/repository"
             )
-        pull = _github_rest_json(f"/repos/{repo}/pulls/{validated_pr}")
+        canonical_repo = repository_args[-1]
+        pull = _github_rest_json(
+            _github_rest_path(canonical_repo, "pulls", str(validated_pr))
+        )
         if pull.get("returncode") != 0 or pull.get("json_valid") is not True:
             return {**pull, "stage": "pull_request"}
         pull_data = pull.get("data")
@@ -2089,7 +2176,9 @@ def grabowski_github_checks(
                 "stage": "pull_request",
             }
         result = _github_rest_json(
-            f"/repos/{repo}/commits/{head_sha}/check-runs?per_page=100"
+            _github_rest_path(
+                canonical_repo, "commits", head_sha, "check-runs", query="per_page=100"
+            )
         )
         if result.get("returncode") != 0 or result.get("json_valid") is not True:
             return {**result, "stage": "check_runs", "head_sha": head_sha}
@@ -2106,28 +2195,45 @@ def grabowski_github_checks(
             }
         check_total = payload.get("total_count")
         bounded_runs = runs[:100]
-        if isinstance(check_total, int) and check_total > len(bounded_runs):
-            return {
-                **result,
-                "json_valid": False,
-                "json_error": "GitHub check-runs exceed the bounded anonymous page",
-                "data": None,
-                "stage": "check_runs",
-                "head_sha": head_sha,
-            }
+        checks_truncated = (
+            isinstance(check_total, int) and check_total > len(bounded_runs)
+        )
+        check_rows = [_github_check_projection(item) for item in bounded_runs]
 
         status_result = _github_rest_json(
-            f"/repos/{repo}/commits/{head_sha}/status?per_page=100"
+            _github_rest_path(
+                canonical_repo, "commits", head_sha, "status", query="per_page=100"
+            )
         )
         if (
             status_result.get("returncode") != 0
             or status_result.get("json_valid") is not True
         ):
             return {
-                **status_result,
+                "transport": status_result.get("transport"),
+                "origin": status_result.get("origin"),
+                "http_status": status_result.get("http_status"),
+                "rate_limit": status_result.get("rate_limit"),
+                "transport_returncode": status_result.get("returncode"),
+                "returncode": 1,
+                "json_valid": status_result.get("json_valid"),
                 "stage": "commit_status",
                 "head_sha": head_sha,
-                "data": None,
+                "data": check_rows,
+                "check_run_count": len(check_rows),
+                "status_context_count": None,
+                "total_count": len(check_rows),
+                "reported_check_run_count": (
+                    check_total if isinstance(check_total, int) else None
+                ),
+                "checks_truncated": checks_truncated,
+                "complete": False,
+                "semantic_scope": "check_runs_and_commit_statuses_only",
+                "field_availability": {
+                    "commit_status": "unavailable",
+                    "event": "unavailable_anonymous_rest",
+                    "workflow": "unavailable_anonymous_rest",
+                },
             }
         status_payload = status_result.get("data")
         statuses = (
@@ -2137,39 +2243,61 @@ def grabowski_github_checks(
         )
         if not isinstance(statuses, list):
             return {
-                **status_result,
+                "transport": status_result.get("transport"),
+                "origin": status_result.get("origin"),
+                "http_status": status_result.get("http_status"),
+                "rate_limit": status_result.get("rate_limit"),
+                "transport_returncode": status_result.get("returncode"),
+                "returncode": 1,
                 "json_valid": False,
                 "json_error": "GitHub combined-status response lacks statuses",
-                "data": None,
                 "stage": "commit_status",
                 "head_sha": head_sha,
+                "data": check_rows,
+                "check_run_count": len(check_rows),
+                "status_context_count": None,
+                "reported_check_run_count": (
+                    check_total if isinstance(check_total, int) else None
+                ),
+                "checks_truncated": checks_truncated,
+                "complete": False,
+                "semantic_scope": "check_runs_and_commit_statuses_only",
+                "field_availability": {
+                    "commit_status": "invalid_shape",
+                    "event": "unavailable_anonymous_rest",
+                    "workflow": "unavailable_anonymous_rest",
+                },
             }
         status_total = status_payload.get("total_count")
         bounded_statuses = statuses[:100]
-        if isinstance(status_total, int) and status_total > len(bounded_statuses):
-            return {
-                **status_result,
-                "json_valid": False,
-                "json_error": "GitHub status contexts exceed the bounded anonymous page",
-                "data": None,
-                "stage": "commit_status",
-                "head_sha": head_sha,
-            }
+        status_contexts_truncated = (
+            isinstance(status_total, int) and status_total > len(bounded_statuses)
+        )
 
-        check_rows = [_github_check_projection(item) for item in bounded_runs]
         status_rows = [_github_status_projection(item) for item in bounded_statuses]
         projected_rows = [*check_rows, *status_rows]
+        complete = not checks_truncated and not status_contexts_truncated
+        semantic_returncode = _github_checks_semantic_returncode(projected_rows)
         return {
             **result,
-            "transport_returncode": result.get("returncode"),
-            "returncode": _github_checks_semantic_returncode(projected_rows),
+            "rate_limit": status_result.get("rate_limit"),
+            "transport_returncode": status_result.get("returncode"),
+            "returncode": semantic_returncode if complete else 1,
             "data": projected_rows,
             "head_sha": head_sha,
-            "total_count": len(check_rows) + len(status_rows),
+            "total_count": len(projected_rows),
             "check_run_count": len(check_rows),
             "status_context_count": len(status_rows),
-            "checks_truncated": False,
-            "status_contexts_truncated": False,
+            "reported_check_run_count": (
+                check_total if isinstance(check_total, int) else None
+            ),
+            "reported_status_context_count": (
+                status_total if isinstance(status_total, int) else None
+            ),
+            "checks_truncated": checks_truncated,
+            "status_contexts_truncated": status_contexts_truncated,
+            "complete": complete,
+            "semantic_scope": "check_runs_and_commit_statuses_only",
             "field_availability": {
                 "event": "unavailable_anonymous_rest",
                 "workflow": "unavailable_anonymous_rest",
@@ -2194,11 +2322,13 @@ def grabowski_github_checks(
 
 @mcp.tool(name="grabowski_tailscale_status", annotations=LOCAL_READ)
 def grabowski_tailscale_status() -> dict[str, Any]:
-    """Read bounded local Tailscale health without mutation controls or account records."""
+    """Read bounded local Tailscale node and peer health without account records or mutation controls."""
     executable = shutil.which("tailscale")
     if not executable:
         return {
             "available": False,
+            "executable_present": False,
+            "status_readable": False,
             "reason": "tailscale executable is not installed",
             "data": None,
         }
@@ -2206,7 +2336,7 @@ def grabowski_tailscale_status() -> dict[str, Any]:
         [executable, "status", "--json"],
         cwd=operator.HOME,
         timeout_seconds=20,
-        max_output_bytes=MAX_GITHUB_RESPONSE_BYTES,
+        max_output_bytes=MAX_TAILSCALE_RESPONSE_BYTES,
     )
     if raw.get("returncode") != 0:
         return _tailscale_failure_projection(
@@ -2231,6 +2361,8 @@ def grabowski_tailscale_status() -> dict[str, Any]:
         )
     return {
         "available": True,
+        "executable_present": True,
+        "status_readable": True,
         "returncode": parsed.get("returncode"),
         "timed_out": bool(parsed.get("timed_out")),
         "duration_seconds": parsed.get("duration_seconds"),
@@ -2238,7 +2370,6 @@ def grabowski_tailscale_status() -> dict[str, Any]:
         "stderr_truncated": bool(parsed.get("stderr_truncated")),
         "json_valid": True,
         "data": data,
-        "redacted_source_fields": ["User", "CurrentTailnet", "PublicKey", "UserID", "Addrs", "PeerAPIURL", "CapMap", "Capabilities"],
     }
 
 

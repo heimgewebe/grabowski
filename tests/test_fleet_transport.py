@@ -99,8 +99,21 @@ class FleetTransportGateTests(unittest.TestCase):
             result = module.grabowski_fleet_list()
         fake._require_operator_capability.assert_not_called()
         fake._run.assert_not_called()
+        encoded = json.dumps(result, sort_keys=True)
+        for forbidden in (
+            "target",
+            "command_allowlist",
+            "connect_timeout_seconds",
+            "roles",
+            "remote_command_mode",
+        ):
+            self.assertNotIn(forbidden, encoded)
+        self.assertNotIn("path", result)
         self.assertEqual(result["count"], 1)
-        self.assertIn("local", result["hosts"])
+        self.assertEqual(
+            result["hosts"]["local"],
+            {"kind": "local", "ready": True},
+        )
 
     def test_public_fleet_run_enforces_server_owned_limits_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

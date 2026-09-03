@@ -481,7 +481,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_fleet_list": {
         "category": "fleet",
-        "purpose": "Return the validated local and SSH host registry.",
+        "purpose": "Return a bounded projection of the validated local and SSH host registry.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
