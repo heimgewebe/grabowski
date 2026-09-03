@@ -8988,6 +8988,40 @@ class CaptainAuthorityPathTests(unittest.TestCase):
     def gate(self, result: dict[str, object], gate_id: str) -> dict[str, object]:
         return next(item for item in result["output"]["gates"] if item["id"] == gate_id)
 
+    def _merge_queue_race_gh(self) -> FakeGh:
+        class QueueRaceGh(FakeGh):
+            def __init__(self) -> None:
+                super().__init__(
+                    view={
+                        "number": 96,
+                        "state": "OPEN",
+                        "baseRefName": "main",
+                        "baseRefOid": CAPTAIN_BASE_SHA,
+                        "headRefName": "feat/captain",
+                        "headRefOid": CAPTAIN_HEAD,
+                        "isDraft": False,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                    }
+                )
+                self.queue_reads = 0
+
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if (
+                    argv[:2] == ["api", "graphql"]
+                    and any("mergeQueueEntry" in item for item in argv)
+                ):
+                    self.queue_reads += 1
+                    if self.queue_reads >= 2:
+                        self.merge_queue_entry = {
+                            "id": "MQE_guard_race",
+                            "position": 1,
+                            "estimatedTimeToMerge": 30,
+                        }
+                return super().__call__(repo, argv)
+
+        return QueueRaceGh()
+
     def assert_blocked_gate_reason(self, result: dict[str, object], gate_id: str, fragment: str) -> None:
         gate = self.gate(result, gate_id)
         self.assertEqual("blocked", gate["status"])
@@ -10061,6 +10095,191 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             check for check in result["receipt"]["checks"] if check["id"] == "execution-attempted"
         ]
         self.assertEqual("skip", execution_attempt_checks[-1]["status"])
+
+    def test_captain_run_blocks_external_queue_merge_under_exact_base_cas(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        open_view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        merged_view = dict(
+            open_view,
+            state="MERGED",
+            mergedAt="2026-07-08T03:00:00Z",
+            mergeCommit={"oid": "d" * 40},
+        )
+        gh = FakeGh(
+            view_sequence=[open_view, merged_view],
+            merge_queue_view_overrides={"state": "MERGED"},
+            merge_updates_view=False,
+        )
+        action = grips._captain_actions(
+            {"actions": parameters["actions"]}, gate_native_validation=True
+        )[0]
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ):
+            execution = grips._run_captain_pr_merge(
+                Path.cwd(), action, parameters, gh
+            )
+
+        self.assertFalse(execution["verification_passed"])
+        self.assertFalse(execution["execution_invoked"])
+        self.assertTrue(execution["remote_mutation_observed"])
+        self.assertTrue(execution["duplicate_dispatch_prevented"])
+        self.assertIn(
+            "merge_queue_requires_server_enforced_base_update_guard",
+            execution["preflight_errors"],
+        )
+        self.assertEqual(
+            "blocked_merged_queue_without_server_base_guard",
+            execution["merge_queue_reconciliation"],
+        )
+
+    def test_captain_run_blocks_existing_queue_under_exact_base_cas(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_queue_entry={"id": "MQE_existing", "position": 2},
+        )
+        action = grips._captain_actions(
+            {"actions": parameters["actions"]}, gate_native_validation=True
+        )[0]
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ):
+            execution = grips._run_captain_pr_merge(
+                Path.cwd(), action, parameters, gh
+            )
+
+        self.assertFalse(execution["verification_passed"])
+        self.assertFalse(execution["execution_invoked"])
+        self.assertTrue(execution["duplicate_dispatch_prevented"])
+        self.assertIn(
+            "merge_queue_requires_server_enforced_base_update_guard",
+            execution["preflight_errors"],
+        )
+        self.assertEqual(
+            "blocked_existing_queue_without_server_base_guard",
+            execution["merge_queue_reconciliation"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_guard_reconciles_queue_race_without_duplicate_dispatch(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = self._merge_queue_race_gh()
+
+        with patch.object(
+            merge_guard,
+            "resolve_captain_merge_repository",
+            return_value=(Path.cwd().resolve(), "test-bound-checkout"),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("scheduled", result["output"]["decision"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertTrue(execution["verification_passed"])
+        self.assertTrue(execution["merge_queued"])
+        self.assertTrue(execution["duplicate_dispatch_prevented"])
+        self.assertEqual(
+            "queued_during_dispatch_guard", execution["merge_queue_reconciliation"]
+        )
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual("queue_reconciled_before_dispatch_released", guard["status"])
+        self.assertEqual(
+            "scheduled", guard["dispatch_merge_queue_reconciliation"]["status"]
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_guard_blocks_queue_race_under_exact_base_cas(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = self._merge_queue_race_gh()
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ), patch.object(
+            merge_guard,
+            "resolve_captain_merge_repository",
+            return_value=(Path.cwd().resolve(), "test-bound-checkout"),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["verification_passed"])
+        self.assertTrue(execution["duplicate_dispatch_prevented"])
+        self.assertIn(
+            "merge_queue_requires_server_enforced_base_update_guard",
+            execution["preflight_errors"],
+        )
+        self.assertIn(
+            "merge_queue_requires_server_enforced_base_update_guard",
+            execution["post_verify_errors"],
+        )
+        self.assertEqual(
+            "blocked_queue_during_dispatch_guard_without_server_base_guard",
+            execution["merge_queue_reconciliation"],
+        )
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual("blocked_after_guard_revalidation_released", guard["status"])
+        self.assertEqual(
+            "blocked", guard["dispatch_merge_queue_reconciliation"]["status"]
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_captain_run_blocks_mismatched_existing_merge_queue_binding(self) -> None:
         parameters = authorized_captain_run_parameters()

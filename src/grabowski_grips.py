@@ -12541,6 +12541,11 @@ def _run_captain_pr_merge(
         for error in queue_errors
         if error != "merge_queue_pr_state_not_open"
     ]
+    base_update_guard_mode = base_update_guard.get("mode")
+    server_enforced_base_update_guard = (
+        base_update_guard_mode == "strict_required_status_checks_ruleset"
+    )
+    execution_result["base_update_guard_mode"] = base_update_guard_mode
     if (
         isinstance(pre_queue_view, dict)
         and pre_queue_view.get("state") == "MERGED"
@@ -12580,14 +12585,25 @@ def _run_captain_pr_merge(
             {
                 "preflight_passed": True,
                 "remote_mutation_observed": True,
-                "verification_passed": True,
                 "merge_completion_verified": True,
                 "duplicate_dispatch_prevented": True,
-                "merge_queue_reconciliation": (
-                    "merged_during_pre_dispatch_queue_readback"
-                ),
                 "verified_pr": reconciled_view,
             }
+        )
+        if not server_enforced_base_update_guard:
+            error = "merge_queue_requires_server_enforced_base_update_guard"
+            execution_result["preflight_errors"].append(error)
+            execution_result["verification_error"] = (
+                "external queue merge cannot prove the reviewed exact base under "
+                f"{base_update_guard_mode or 'unknown'}: {error}"
+            )
+            execution_result["merge_queue_reconciliation"] = (
+                "blocked_merged_queue_without_server_base_guard"
+            )
+            return execution_result
+        execution_result["verification_passed"] = True
+        execution_result["merge_queue_reconciliation"] = (
+            "merged_during_pre_dispatch_queue_readback"
         )
         return execution_result
     if queue_errors:
@@ -12598,6 +12614,19 @@ def _run_captain_pr_merge(
         )
         return execution_result
     if queue_entry is not None:
+        execution_result["merge_queue_entry"] = queue_entry
+        execution_result["duplicate_dispatch_prevented"] = True
+        if not server_enforced_base_update_guard:
+            error = "merge_queue_requires_server_enforced_base_update_guard"
+            execution_result["preflight_errors"].append(error)
+            execution_result["verification_error"] = (
+                "existing merge queue entry cannot satisfy the reviewed exact-base "
+                f"fallback under {base_update_guard_mode or 'unknown'}: {error}"
+            )
+            execution_result["merge_queue_reconciliation"] = (
+                "blocked_existing_queue_without_server_base_guard"
+            )
+            return execution_result
         execution_result.update(
             {
                 "preflight_passed": True,
@@ -12605,8 +12634,6 @@ def _run_captain_pr_merge(
                 "verification_passed": True,
                 "merge_queued": True,
                 "merge_completion_verified": False,
-                "duplicate_dispatch_prevented": True,
-                "merge_queue_entry": queue_entry,
                 "merge_queue_reconciliation": "already_queued_before_dispatch",
             }
         )
@@ -12628,6 +12655,38 @@ def _run_captain_pr_merge(
         merge_result = github_runner(repo_path, merge_args)
         execution_result["command_returned"] = True
         execution_result["execution_attempted"] = True
+    except grabowski_merge_guard.CaptainMergeQueueObservedUnderGuard as exc:
+        execution_result.update(
+            {
+                "execution_invoked": False,
+                "execution_attempted": False,
+                "command_returned": False,
+                "merge_queue_entry": dict(exc.entry),
+                "merge_queue_base_guard_mode": exc.base_update_guard_mode,
+                "duplicate_dispatch_prevented": True,
+            }
+        )
+        if exc.safely_reconcilable:
+            execution_result.update(
+                {
+                    "verification_passed": True,
+                    "merge_queued": True,
+                    "merge_completion_verified": False,
+                    "merge_queue_reconciliation": "queued_during_dispatch_guard",
+                }
+            )
+        else:
+            error = "merge_queue_requires_server_enforced_base_update_guard"
+            execution_result["preflight_errors"].append(error)
+            execution_result["verification_error"] = (
+                "merge queue entry appeared inside the atomic dispatch guard but "
+                f"{exc.base_update_guard_mode or 'unknown'} cannot preserve the "
+                f"reviewed exact base: {error}"
+            )
+            execution_result["merge_queue_reconciliation"] = (
+                "blocked_queue_during_dispatch_guard_without_server_base_guard"
+            )
+        return execution_result
     except Exception as exc:  # pragma: no cover - defensive receipt boundary
         execution_result["runner_exception"] = f"{type(exc).__name__}: {_bounded_command_output(str(exc), limit=512)}"
         merge_result = {"returncode": 1, "stdout": "", "stderr": f"gh pr merge runner exception: {type(exc).__name__}: {exc}"}
