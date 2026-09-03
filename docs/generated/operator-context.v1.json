@@ -3573,8 +3573,8 @@
         "source": "src/grabowski_work_admission.py"
       },
       {
-        "module": "kleiner_maulwurf_operator",
-        "source": "src/kleiner_maulwurf_operator.py"
+        "module": "der_kleine_maulwurf_operator",
+        "source": "src/der_kleine_maulwurf_operator.py"
       }
     ]
   },
@@ -3594,10 +3594,11 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b08c1a524fc56e03d59cbf0a0dca261d0f5c1390c130de1c43cd346bce140a31"
+      "sha256": "93e20c549369f8d938cf41f6916388a740328f7d6dfaf3eafce3701b1c1f6e4e"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
+      "src/der_kleine_maulwurf_operator.py": "e924d54aa1e0b1d6dbcdc0390515f7f5f4aa4b22c055af674278aea1772bcbce",
       "src/grabowski_agent_bootstrap.py": "30d9764e86f6e2ef8ff5d52c77e84832259412db7194390b4c42e06e196b403d",
       "src/grabowski_agent_competition.py": "14e9221e20a4f84cdca55eb1d2d7692ba1251af3e510da6b8891c23f115ba119",
       "src/grabowski_agent_role.py": "41e18f20608fb675d1bbc2953d934522f5404b0140fc1f590d56ff5d9e4e46ec",
@@ -3716,8 +3717,7 @@
       "src/grabowski_work_admission.py": "5c7529ac26df8ae698d59dbac8267dc1065711b9579274267e9a661e55748c2a",
       "src/grabowski_worker_process.py": "36b8bef1785e9e41c4a8a041b95cc69f3686c881680a89ac6680f2074f5919c0",
       "src/grabowski_workers.py": "99f7ae5b0beb2f986dcc403cc666a2e95f1218aade668014dea00c6a7b110e99",
-      "src/grabowski_worktree_ensure.py": "4b16010a5209e0b1ca02633eee2ce14da9fe1ff989fc04110995a3bc62abaff0",
-      "src/kleiner_maulwurf_operator.py": "b67ef01f02145b3dd8e5c19a3c7cea4e5c636947a659f333553b4b4ebea678c4"
+      "src/grabowski_worktree_ensure.py": "4b16010a5209e0b1ca02633eee2ce14da9fe1ff989fc04110995a3bc62abaff0"
     }
   }
 }
