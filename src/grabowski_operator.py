@@ -563,42 +563,84 @@ def _github_pr_view_transport_read_only(arguments: Any) -> bool:
     argv = arguments.get("arguments")
     if (
         not isinstance(argv, list)
-        or len(argv) < 2
+        or len(argv) < 5
+        or len(argv) > 7
         or argv[:2] != ["pr", "view"]
-        or not all(isinstance(item, str) and item for item in argv)
+        or not all(
+            isinstance(item, str) and item and len(item) <= 1024
+            for item in argv
+        )
     ):
         return False
-    # Parse only the current documented read-only `gh pr view` flags. Unknown
-    # or future flags remain behind the signed mutation transport gate.
-    positional_count = 0
+
+    def valid_pr_selector(value: str) -> bool:
+        if len(value) > 10 or not value.isascii() or not value.isdecimal():
+            return False
+        number = int(value)
+        return 1 <= number <= 2_147_483_647
+
+    def valid_repo_selector(value: str) -> bool:
+        return (
+            len(value) <= 200
+            and re.fullmatch(
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value
+            )
+            is not None
+        )
+
+    def valid_json_projection(value: str) -> bool:
+        return (
+            len(value) <= 1024
+            and re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9]*(?:,[A-Za-z][A-Za-z0-9]*){0,63}",
+                value,
+            )
+            is not None
+        )
+
+    # Exempt only the concrete machine-readable form needed for repeated PR
+    # observation. Requiring a numeric PR, explicit owner/repo and JSON
+    # projection prevents local-repository inference, branch/URL selectors and
+    # caller-selected GitHub Enterprise hosts from entering the exemption.
+    selector_seen = False
+    repo_seen = False
+    json_seen = False
     index = 2
     while index < len(argv):
         item = argv[index]
-        if item in {"--web", "-w"}:
-            return False
-        if item in {"--comments", "-c", "--help"}:
-            index += 1
-            continue
-        if item in {"--json", "--repo", "-R"}:
-            if index + 1 >= len(argv):
+        if item in {"--repo", "-R"}:
+            if repo_seen or index + 1 >= len(argv):
                 return False
+            if not valid_repo_selector(argv[index + 1]):
+                return False
+            repo_seen = True
             index += 2
             continue
-        if item.startswith(("--json=", "--repo=")):
-            if item.endswith("="):
+        if item.startswith("--repo="):
+            if repo_seen or not valid_repo_selector(item.removeprefix("--repo=")):
                 return False
+            repo_seen = True
             index += 1
             continue
-        # --jq and --template are intentionally not exempted: they evaluate
-        # caller-controlled formatting programs locally and are unnecessary for
-        # the concrete repeated PR-view friction being repaired.
-        if item.startswith("-"):
+        if item == "--json":
+            if json_seen or index + 1 >= len(argv):
+                return False
+            if not valid_json_projection(argv[index + 1]):
+                return False
+            json_seen = True
+            index += 2
+            continue
+        if item.startswith("--json="):
+            if json_seen or not valid_json_projection(item.removeprefix("--json=")):
+                return False
+            json_seen = True
+            index += 1
+            continue
+        if item.startswith("-") or selector_seen or not valid_pr_selector(item):
             return False
-        positional_count += 1
-        if positional_count > 1:
-            return False
+        selector_seen = True
         index += 1
-    return True
+    return selector_seen and repo_seen and json_seen
 
 
 def _transport_roundtrip_exempt_call(
@@ -1892,6 +1934,23 @@ _GITHUB_PR_VIEW_ENV_ALLOWLIST = frozenset(
         "LC_CTYPE",
     }
 )
+_GITHUB_PR_VIEW_DEFAULT_HOST = "github.com"
+
+
+def _github_pr_view_host(source: dict[str, str]) -> str:
+    raw_host = source.get("GH_HOST", _GITHUB_PR_VIEW_DEFAULT_HOST).strip().lower()
+    if not raw_host or len(raw_host) > 259:
+        raise RuntimeError("trusted GitHub host is invalid")
+    match = re.fullmatch(
+        r"([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([1-9][0-9]{0,4}))?",
+        raw_host,
+    )
+    if match is None or ".." in match.group(1):
+        raise RuntimeError("trusted GitHub host is invalid")
+    port = match.group(2)
+    if port is not None and int(port) > 65535:
+        raise RuntimeError("trusted GitHub host port is invalid")
+    return raw_host
 
 
 def _github_pr_view_environment() -> dict[str, str]:
@@ -1901,9 +1960,11 @@ def _github_pr_view_environment() -> dict[str, str]:
         for key, value in source.items()
         if key in _GITHUB_PR_VIEW_ENV_ALLOWLIST
     }
-    # The exemption must not inherit executable-selection knobs.  Keep both
-    # gh and any repository-detection git child inside the verified /usr/bin
-    # parent and force pager selection to the root-owned system `cat`.
+    # Host authority comes only from server-owned process configuration. The
+    # exempt argv accepts OWNER/REPO but never [HOST/]OWNER/REPO, so a caller
+    # cannot redirect GH_ENTERPRISE_TOKEN to an arbitrary host. Explicit repo
+    # and numeric PR selectors also remove any need for local Git discovery.
+    environment["GH_HOST"] = _github_pr_view_host(source)
     environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
     environment["GH_PAGER"] = "cat"
     environment["PAGER"] = "cat"
@@ -5752,21 +5813,21 @@ def grabowski_github(
             f"({bypass_reason}); use Captain pr-merge so live review, CI and "
             "decision-bound review reconciliation gates cannot be bypassed"
         )
-    working_directory = _resolve_cwd(cwd)
-    _require_operator_mutation("github_cli", path=str(working_directory))
-    trusted_github_cli = _trusted_github_cli_path()
-    command = _validate_argv(
-        [trusted_github_cli, *arguments], cwd=working_directory
-    )
-    environment = None
-    if _github_pr_view_transport_read_only(
+    transport_exempt = _github_pr_view_transport_read_only(
         {
             "arguments": arguments,
             "cwd": cwd,
             "timeout_seconds": timeout_seconds,
         }
-    ):
-        environment = _github_pr_view_environment()
+    )
+    requested_directory = _resolve_cwd(cwd)
+    working_directory = HOME if transport_exempt else requested_directory
+    _require_operator_mutation("github_cli", path=str(working_directory))
+    trusted_github_cli = _trusted_github_cli_path()
+    command = _validate_argv(
+        [trusted_github_cli, *arguments], cwd=working_directory
+    )
+    environment = _github_pr_view_environment() if transport_exempt else None
     return _run(
         command,
         cwd=working_directory,

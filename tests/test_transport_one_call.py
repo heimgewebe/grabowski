@@ -889,9 +889,37 @@ class OperatorSignedTransportTests(unittest.TestCase):
 
     def test_github_pr_view_read_only_shape_is_transport_exempt(self) -> None:
         safe_calls = [
-            {"arguments": ["pr", "view", "734", "--repo", "heimgewebe/metarepo"]},
-            {"arguments": ["pr", "view", "734", "--json", "number,state,headRefOid"]},
-            {"arguments": ["pr", "view", "--comments"]},
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number,state,headRefOid",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo=heimgewebe/metarepo",
+                    "--json=number,state",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "-R",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ]
+            },
         ]
         for arguments in safe_calls:
             with self.subTest(arguments=arguments):
@@ -904,9 +932,57 @@ class OperatorSignedTransportTests(unittest.TestCase):
     def test_other_github_or_ambiguous_shapes_stay_transport_gated(self) -> None:
         unsafe_calls = [
             {"arguments": ["pr", "merge", "734"]},
+            {"arguments": ["pr", "view", "734", "--repo", "heimgewebe/metarepo"]},
+            {"arguments": ["pr", "view", "734", "--json", "number"]},
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "main",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "https://github.com/heimgewebe/metarepo/pull/734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "evil.example/heimgewebe/metarepo",
+                    "--json",
+                    "number",
+                ]
+            },
+            {
+                "arguments": [
+                    "pr",
+                    "view",
+                    "734",
+                    "--repo",
+                    "heimgewebe/metarepo",
+                    "--json",
+                    "number,,state",
+                ]
+            },
             {"arguments": ["pr", "view", "734", "--web"]},
             {"arguments": ["pr", "view", "734", "-w"]},
             {"arguments": ["pr", "view", "734", "--web=true"]},
+            {"arguments": ["pr", "view", "734", "--comments"]},
+            {"arguments": ["pr", "view", "734", "--help"]},
             {"arguments": ["pr", "view", "734", "--jq", ".number"]},
             {"arguments": ["pr", "view", "734", "--template", "{{.number}}"]},
             {"arguments": ["pr", "view", "734", "--future-mutate"]},
@@ -996,7 +1072,15 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 ) as run,
             ):
                 operator.grabowski_github(
-                    ["pr", "view", "1031", "--json", "number,state"],
+                    [
+                        "pr",
+                        "view",
+                        "1031",
+                        "--repo",
+                        "heimgewebe/grabowski",
+                        "--json",
+                        "number,state",
+                    ],
                     cwd=str(ROOT),
                 )
         trusted.assert_called_once_with()
@@ -1005,6 +1089,8 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(command[0], "/usr/bin/gh")
         self.assertNotEqual(command[0], str(shim))
         self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertEqual(environment["GH_HOST"], "github.com")
+        self.assertEqual(run.call_args.kwargs["cwd"], operator.HOME)
         self.assertNotIn(directory, environment["PATH"])
         self.assertEqual(environment["GH_PAGER"], "cat")
         self.assertEqual(environment["PAGER"], "cat")
@@ -1028,8 +1114,42 @@ class OperatorSignedTransportTests(unittest.TestCase):
         ):
             environment = operator._github_pr_view_environment()
         self.assertNotIn("GH_TOKEN", environment)
+        self.assertEqual(environment["GH_HOST"], "github.com")
         self.assertEqual(environment["PATH"], "/usr/bin")
         self.assertEqual(environment["GH_PAGER"], "cat")
+
+    def test_exempt_github_environment_binds_enterprise_token_to_server_host(self) -> None:
+        with (
+            mock.patch.dict(
+                operator.os.environ,
+                {
+                    "GH_HOST": "ghe.example.internal",
+                    "GH_ENTERPRISE_TOKEN": "fixture-enterprise-token",
+                },
+                clear=True,
+            ),
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+        ):
+            environment = operator._github_pr_view_environment()
+        self.assertEqual(environment["GH_HOST"], "ghe.example.internal")
+        self.assertEqual(
+            environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token"
+        )
+        self.assertFalse(
+            operator._github_pr_view_transport_read_only(
+                {
+                    "arguments": [
+                        "pr",
+                        "view",
+                        "1031",
+                        "--repo",
+                        "evil.example/heimgewebe/grabowski",
+                        "--json",
+                        "number",
+                    ]
+                }
+            )
+        )
 
     def test_nonexempt_github_call_keeps_default_child_environment(self) -> None:
         with (
@@ -1061,6 +1181,8 @@ class OperatorSignedTransportTests(unittest.TestCase):
                         "734",
                         "--repo",
                         "heimgewebe/metarepo",
+                        "--json",
+                        "number,state,headRefOid",
                     ]
                 },
                 context=_ctx({}),
