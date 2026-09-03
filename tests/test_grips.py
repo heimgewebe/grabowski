@@ -339,8 +339,10 @@ class FakeGh:
         merge_queue_entry: dict[str, object] | None = None,
         post_merge_queue_entry: dict[str, object] | None = None,
         merge_queue_view_overrides: dict[str, object] | None = None,
+        post_merge_queue_view_overrides: dict[str, object] | None = None,
         merge_queue_failure: bool = False,
         merge_queue_graphql_errors: list[dict[str, object]] | None = None,
+        merge_queue_view_promotes_pr_view: bool = False,
     ):
         self.existing = existing
         self.failure = failure
@@ -389,8 +391,12 @@ class FakeGh:
         self.merge_queue_entry = deepcopy(merge_queue_entry)
         self.post_merge_queue_entry = deepcopy(post_merge_queue_entry)
         self.merge_queue_view_overrides = dict(merge_queue_view_overrides or {})
+        self.post_merge_queue_view_overrides = dict(
+            post_merge_queue_view_overrides or {}
+        )
         self.merge_queue_failure = merge_queue_failure
         self.merge_queue_graphql_errors = deepcopy(merge_queue_graphql_errors)
+        self.merge_queue_view_promotes_pr_view = merge_queue_view_promotes_pr_view
         self.view_failure_after_merge = view_failure_after_merge
         self.post_merge_view = post_merge_view or {}
         self.post_merge_view_failures = post_merge_view_failures
@@ -492,6 +498,19 @@ class FakeGh:
                     "mergeQueueEntry": deepcopy(self.merge_queue_entry),
                 }
                 queue_view.update(self.merge_queue_view_overrides)
+                merge_dispatched = any(
+                    call[:2] == ("pr", "merge") for call in self.calls
+                )
+                if merge_dispatched:
+                    queue_view.update(self.post_merge_queue_view_overrides)
+                if (
+                    self.merge_queue_view_promotes_pr_view
+                    and merge_dispatched
+                    and queue_view.get("state") == "MERGED"
+                ):
+                    promoted_view = dict(self.view)
+                    promoted_view.update(queue_view)
+                    self.view = promoted_view
                 queue_payload: dict[str, object] = {
                     "data": {"repository": {"pullRequest": queue_view}}
                 }
@@ -9827,6 +9846,60 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertIn("not safely reconcilable", execution["verification_error"])
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_captain_run_reconciles_merge_completed_during_queue_readback(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_updates_view=False,
+            merge_returncode=1,
+            merge_stderr="merge queued",
+            post_merge_queue_view_overrides={
+                "state": "MERGED",
+                "mergeCommit": {"oid": "d" * 40},
+            },
+            merge_queue_view_promotes_pr_view=True,
+        )
+        gh.active_rules.append(
+            {
+                "type": "merge_queue",
+                "parameters": {"merge_method": "MERGE"},
+                "ruleset_source_type": "Repository",
+                "ruleset_source": "heimgewebe/grabowski",
+                "ruleset_id": 18801517,
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["execution_invoked"])
+        self.assertTrue(execution["verification_passed"])
+        self.assertTrue(execution["merge_completion_verified"])
+        self.assertTrue(execution["remote_mutation_observed"])
+        self.assertEqual(
+            "merged_during_queue_readback", execution["merge_queue_reconciliation"]
+        )
+        self.assertEqual("MERGED", execution["verified_pr"]["state"])
+        self.assertNotIn("post_verify_errors", execution)
 
     def test_captain_run_reconciles_existing_queue_entry_without_duplicate_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()

@@ -12604,6 +12604,54 @@ def _run_captain_pr_merge(
             expected_base_sha=expected_base_sha,
         )
         execution_result["post_dispatch_merge_queue_readback"] = queue_info
+        queue_view = queue_info.get("view") if isinstance(queue_info, dict) else None
+        queue_binding_errors = [
+            error
+            for error in queue_errors
+            if error != "merge_queue_pr_state_not_open"
+        ]
+        prior_verify_race = (
+            isinstance(verify_summary.get("last_viewed"), dict)
+            and verify_summary["last_viewed"].get("state") == "OPEN"
+            and verify_summary.get("error_codes_seen")
+            == ["pr_not_merged_after_execution"]
+        )
+        if (
+            prior_verify_race
+            and isinstance(queue_view, dict)
+            and queue_view.get("state") == "MERGED"
+            and not queue_binding_errors
+        ):
+            (
+                reconciled_view,
+                reconciliation_attempts,
+                reconciliation_errors,
+                reconciliation_summary,
+            ) = _captain_pr_merge_post_view(
+                repo_path,
+                github_runner,
+                repo_slug=repo_slug,
+                pr_number=pr_number,
+                expected_head=expected_head,
+                expected_base=expected_base,
+            )
+            execution_result["post_queue_merge_verify_view_attempts"] = (
+                reconciliation_attempts
+            )
+            execution_result["post_queue_merge_verify_summary"] = (
+                reconciliation_summary
+            )
+            if not reconciliation_errors and reconciled_view is not None:
+                execution_result.update(
+                    {
+                        "remote_mutation_observed": True,
+                        "verification_passed": True,
+                        "merge_completion_verified": True,
+                        "merge_queue_reconciliation": "merged_during_queue_readback",
+                        "verified_pr": reconciled_view,
+                    }
+                )
+                return execution_result
         if queue_errors:
             execution_result["post_dispatch_merge_queue_errors"] = queue_errors
         elif queue_entry is not None:

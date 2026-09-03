@@ -231,9 +231,15 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         base = pull_request["baseRefOid"]
         base_ref = pull_request["baseRefName"]
         merge = pull_request["mergeCommit"]["oid"]
-        checks = list(
-            pull_request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]
+        head_commit = pull_request["commits"]["nodes"][0]["commit"]
+        head_rollup = head_commit.get("statusCheckRollup")
+        head_contexts = (
+            head_rollup.get("contexts") if isinstance(head_rollup, dict) else None
         )
+        head_nodes = (
+            head_contexts.get("nodes") if isinstance(head_contexts, dict) else None
+        )
+        checks = list(head_nodes) if isinstance(head_nodes, list) else []
         merge_commit = pull_request.get("mergeCommit")
         merge_rollup = merge_commit.get("statusCheckRollup") if isinstance(merge_commit, dict) else None
         merge_contexts = merge_rollup.get("contexts") if isinstance(merge_rollup, dict) else None
@@ -1104,6 +1110,46 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         self.assertEqual(2, len(actions_calls))
         self.assertTrue(
             all(f"head_sha={merge}" in call.args[0] for call in actions_calls)
+        )
+
+    def test_prepare_github_uses_merge_group_checks_without_head_rollup(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        merge_run = 9041
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=341,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8041,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=7,
+                )
+            ],
+        )
+        del payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=948),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 948}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith(
+                "checks=1/1-effective-success"
+            )
         )
 
     def test_prepare_github_merge_queue_includes_successful_non_workflow_checks(self) -> None:

@@ -942,7 +942,7 @@ def _github_v2_snapshot(
     if not isinstance(commit, Mapping):
         return None
     head_check_nodes = _github_v2_rollup_nodes(
-        commit.get("statusCheckRollup"), allow_empty=False
+        commit.get("statusCheckRollup"), allow_empty=True
     )
     if head_check_nodes is None:
         return None
