@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "741a584dddf4261737cf650ed47a818d6c4551230555798503949476961cbb9f",
+  "capability_source_sha256": "c9a6b1bcf99fd97a9191e0016139cf8b2507f4ccd316282b02f286fb2ee2ef84",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "109b49d82c7c0a16fc18501e1df9b3dcf25c89a185ce03cda8cc237887174a9d",
+  "contract_sha256": "f22d3c3b508ea1e438b0ade99bc85780beb3661adcd8685666f5356e7ad656a7",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1005,6 +1005,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_ports"
+    },
+    {
+      "category": "diagnostics",
+      "description": "Read bounded local Tailscale health without mutation controls or account records.",
+      "effects": [],
+      "id": "grabowski_tailscale_status",
+      "purpose": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_tailscale_status"
     },
     {
       "category": "privileged-reference",

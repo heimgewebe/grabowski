@@ -294,6 +294,137 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertNotIn("--repo", runner.call_args.args[0])
         self.assertEqual(runner.call_args.kwargs["cwd"], repository)
 
+    def test_github_pr_view_falls_back_to_bounded_anonymous_rest_without_cli(self) -> None:
+        rest = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "number": 546,
+                "title": "read only",
+                "state": "open",
+                "draft": False,
+                "mergeable": True,
+                "head": {"ref": "topic", "sha": "a" * 40},
+                "base": {"ref": "main"},
+                "html_url": "https://github.com/heimgewebe/grabowski/pull/546",
+                "updated_at": "2026-09-03T06:00:00Z",
+            },
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", return_value=rest) as request,
+            patch.object(read_surface, "_run_read") as runner,
+        ):
+            response = read_surface.grabowski_github_pr_view("heimgewebe/grabowski", 546)
+        runner.assert_not_called()
+        request.assert_called_once_with("/repos/heimgewebe/grabowski/pulls/546")
+        self.assertEqual(response["data"]["headRefName"], "topic")
+        self.assertEqual(response["data"]["state"], "OPEN")
+        self.assertEqual(response["data"]["mergeable"], "MERGEABLE")
+        self.assertIsNone(response["data"]["reviewDecision"])
+        self.assertEqual(response["field_availability"]["reviewDecision"], "unavailable_anonymous_rest")
+
+    def test_github_checks_falls_back_to_bounded_anonymous_rest_without_cli(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "a" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "validate",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "details_url": "https://github.com/example/check/1",
+                        "started_at": "2026-09-03T06:00:00Z",
+                        "completed_at": "2026-09-03T06:01:00Z",
+                        "output": {"title": "validation"},
+                    }
+                ],
+            },
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks]) as request,
+            patch.object(read_surface, "_run_read") as runner,
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        runner.assert_not_called()
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(response["head_sha"], "a" * 40)
+        self.assertEqual(response["data"][0]["bucket"], "pass")
+        self.assertEqual(response["data"][0]["state"], "SUCCESS")
+        self.assertIsNone(response["data"][0]["workflow"])
+
+    def test_github_rest_projection_preserves_gh_state_enums(self) -> None:
+        merged = read_surface._github_pr_projection(
+            {
+                "state": "closed",
+                "merged_at": "2026-09-03T06:00:00Z",
+                "mergeable": None,
+            }
+        )
+        conflicting = read_surface._github_pr_projection(
+            {"state": "open", "merged_at": None, "mergeable": False}
+        )
+        self.assertEqual(merged["state"], "MERGED")
+        self.assertEqual(merged["mergeable"], "UNKNOWN")
+        self.assertEqual(conflicting["state"], "OPEN")
+        self.assertEqual(conflicting["mergeable"], "CONFLICTING")
+
+    def test_github_rest_pending_check_normalizes_to_gh_pending_state(self) -> None:
+        projected = read_surface._github_check_projection(
+            {
+                "status": "in_progress",
+                "conclusion": None,
+                "name": "validate",
+                "output": {},
+            }
+        )
+        self.assertEqual(projected["bucket"], "pending")
+        self.assertEqual(projected["state"], "PENDING")
+
+    def test_github_anonymous_fallback_rejects_absolute_worktree(self) -> None:
+        repository = Path("/tmp/repository")
+        with (
+            patch.object(read_surface, "_resolve_repository", return_value=repository),
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json") as request,
+        ):
+            with self.assertRaisesRegex(PermissionError, "absolute-worktree"):
+                read_surface.grabowski_github_pr_view(str(repository), 12)
+        request.assert_not_called()
+
+    def test_tailscale_status_uses_fixed_argv_and_redacts_account_fields(self) -> None:
+        payload = {
+            "Version": "1.2.3",
+            "TUN": True,
+            "BackendState": "Running",
+            "HaveNodeKey": True,
+            "TailscaleIPs": ["100.64.0.1"],
+            "Self": {"HostName": "node", "DNSName": "node.ts.net.", "Online": True, "PublicKey": "secret-key", "UserID": 1},
+            "Peer": {"nodekey:secret": {"HostName": "peer", "DNSName": "peer.ts.net.", "Online": True, "PublicKey": "peer-key", "UserID": 2, "Addrs": ["1.2.3.4:123"], "PeerAPIURL": ["http://100.64.0.2:1"]}},
+            "User": {"1": {"LoginName": "private@example.test"}},
+            "CurrentTailnet": {"Name": "private@example.test"},
+            "Health": [],
+        }
+        result = {"returncode": 0, "timed_out": False, "stdout_truncated": False, "stderr_truncated": False, "stdout": json.dumps(payload), "stderr": ""}
+        with patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"), patch.object(read_surface, "_run_read", return_value=result) as runner:
+            response = read_surface.grabowski_tailscale_status()
+        self.assertEqual(runner.call_args.args[0], ["/usr/bin/tailscale", "status", "--json"])
+        encoded = json.dumps(response["data"], sort_keys=True)
+        for forbidden in ("private@example.test", "secret-key", "peer-key", "1.2.3.4:123", "PeerAPIURL", "PublicKey", "UserID"):
+            self.assertNotIn(forbidden, encoded)
+        self.assertEqual(response["data"]["peer_count"], 1)
+
     def test_git_status_uses_fixed_arguments(self) -> None:
         repo = Path("/tmp/repository")
         sentinel = {"returncode": 0}

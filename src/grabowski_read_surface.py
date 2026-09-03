@@ -3,9 +3,11 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 import hashlib
+import http.client
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 from typing import Annotated, Any
@@ -44,6 +46,8 @@ DEFAULT_OUTPUT_BYTES = 250_000
 MAX_OUTPUT_BYTES = 2_000_000
 MAX_LOG_LINES = 2_000
 MAX_GIT_COMMITS = 100
+MAX_GITHUB_RESPONSE_BYTES = 1_000_000
+MAX_TAILSCALE_PEERS = 256
 MAX_WORKTREES = 100
 MAX_REVISION_LENGTH = 200
 MAX_AUDIT_PROJECTION_TOP = 25
@@ -1209,6 +1213,192 @@ def _parse_json_result(result: dict[str, Any]) -> dict[str, Any]:
     return {**result, "json_valid": True, "data": payload, "stdout": ""}
 
 
+def _github_cli_enabled() -> bool:
+    """Return whether the active profile grants the authenticated GitHub CLI lane."""
+    try:
+        operator._require_operator_capability("github_cli")
+    except PermissionError:
+        return False
+    return True
+
+
+def _github_rest_json(path: str) -> dict[str, Any]:
+    """Read one fixed-origin bounded anonymous GitHub REST resource."""
+    if not path.startswith("/repos/") or "\n" in path or "\r" in path:
+        raise ValueError("Invalid GitHub REST path")
+    started = time.monotonic()
+    connection = http.client.HTTPSConnection("api.github.com", timeout=20)
+    try:
+        connection.request(
+            "GET",
+            path,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "grabowski-typed-read",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        response = connection.getresponse()
+        raw = response.read(MAX_GITHUB_RESPONSE_BYTES + 1)
+        status = response.status
+    except (OSError, http.client.HTTPException) as exc:
+        return {
+            "transport": "github-rest-anonymous",
+            "origin": "https://api.github.com",
+            "request_path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+            "returncode": 1,
+            "http_status": None,
+            "timed_out": isinstance(exc, TimeoutError),
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "stdout": "",
+            "stderr": str(exc),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "json_valid": False,
+        }
+    finally:
+        connection.close()
+    truncated = len(raw) > MAX_GITHUB_RESPONSE_BYTES
+    raw = raw[:MAX_GITHUB_RESPONSE_BYTES]
+    result = {
+        "transport": "github-rest-anonymous",
+        "origin": "https://api.github.com",
+        "request_path_sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+        "returncode": 0 if 200 <= status < 300 else 1,
+        "http_status": status,
+        "timed_out": False,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": truncated,
+        "stderr_truncated": False,
+    }
+    if truncated:
+        return {
+            **result,
+            "json_valid": False,
+            "json_error": "GitHub REST response exceeded bounded read limit",
+        }
+    try:
+        payload = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {**result, "json_valid": False, "json_error": str(exc)}
+    return {**result, "json_valid": True, "data": payload}
+
+
+def _github_pr_projection(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub pull-request response is not an object")
+    head = payload.get("head") if isinstance(payload.get("head"), dict) else {}
+    base_ref = payload.get("base") if isinstance(payload.get("base"), dict) else {}
+    raw_state = payload.get("state")
+    state = (
+        "MERGED"
+        if isinstance(payload.get("merged_at"), str) and bool(payload.get("merged_at"))
+        else raw_state.upper()
+        if isinstance(raw_state, str)
+        else None
+    )
+    raw_mergeable = payload.get("mergeable")
+    mergeable = (
+        "MERGEABLE" if raw_mergeable is True else
+        "CONFLICTING" if raw_mergeable is False else
+        "UNKNOWN"
+    )
+    return {
+        "number": payload.get("number"),
+        "title": payload.get("title"),
+        "state": state,
+        "isDraft": payload.get("draft"),
+        "mergeable": mergeable,
+        "headRefName": head.get("ref"),
+        "baseRefName": base_ref.get("ref"),
+        "url": payload.get("html_url"),
+        "reviewDecision": None,
+        "updatedAt": payload.get("updated_at"),
+    }
+
+
+def _github_check_bucket(status: Any, conclusion: Any) -> str:
+    if status != "completed":
+        return "pending"
+    if conclusion in {"success", "neutral"}:
+        return "pass"
+    if conclusion in {"skipped"}:
+        return "skipping"
+    if conclusion in {"cancelled"}:
+        return "cancel"
+    return "fail"
+
+
+def _github_check_state(status: Any, conclusion: Any) -> str | None:
+    if status != "completed":
+        return "PENDING"
+    if isinstance(conclusion, str):
+        return conclusion.upper()
+    return None
+
+
+def _github_check_projection(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub check-run response is not an object")
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    status = payload.get("status")
+    conclusion = payload.get("conclusion")
+    return {
+        "bucket": _github_check_bucket(status, conclusion),
+        "completedAt": payload.get("completed_at"),
+        "description": output.get("title"),
+        "event": None,
+        "link": payload.get("details_url"),
+        "name": payload.get("name"),
+        "startedAt": payload.get("started_at"),
+        "state": _github_check_state(status, conclusion),
+        "workflow": None,
+    }
+
+
+def _tailscale_node_projection(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "HostName": payload.get("HostName"),
+        "DNSName": payload.get("DNSName"),
+        "OS": payload.get("OS"),
+        "TailscaleIPs": payload.get("TailscaleIPs"),
+        "Relay": payload.get("Relay"),
+        "Online": payload.get("Online"),
+        "Active": payload.get("Active"),
+        "ExitNode": payload.get("ExitNode"),
+        "LastSeen": payload.get("LastSeen"),
+        "LastHandshake": payload.get("LastHandshake"),
+        "KeyExpiry": payload.get("KeyExpiry"),
+    }
+
+
+def _tailscale_status_projection(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("Tailscale status response is not an object")
+    raw_peers = payload.get("Peer") if isinstance(payload.get("Peer"), dict) else {}
+    peers = sorted(
+        (_tailscale_node_projection(value) for value in raw_peers.values()),
+        key=lambda item: (str(item.get("DNSName") or ""), str(item.get("HostName") or "")),
+    )
+    health = payload.get("Health") if isinstance(payload.get("Health"), list) else []
+    return {
+        "Version": payload.get("Version"),
+        "TUN": payload.get("TUN"),
+        "BackendState": payload.get("BackendState"),
+        "HaveNodeKey": payload.get("HaveNodeKey"),
+        "TailscaleIPs": payload.get("TailscaleIPs"),
+        "Self": _tailscale_node_projection(payload.get("Self")),
+        "Health": [item[:500] for item in health[:50] if isinstance(item, str)],
+        "Peers": peers[:MAX_TAILSCALE_PEERS],
+        "peer_count": len(peers),
+        "peers_truncated": len(peers) > MAX_TAILSCALE_PEERS,
+    }
+
+
 @mcp.tool(name="grabowski_runtime_health", annotations=LOCAL_READ)
 def grabowski_runtime_health() -> dict[str, Any]:
     """Return minimal Grabowski deployment, audit and kill-switch health."""
@@ -1782,14 +1972,32 @@ def grabowski_github_pr_view(
     pr: PullRequestNumber,
 ) -> dict[str, Any]:
     """Read bounded GitHub pull-request metadata without body or comments."""
-    operator._require_operator_capability("github_cli")
     repository, repository_args = _resolve_github_repository(repo)
+    validated_pr = _validate_pr(pr)
+    if not _github_cli_enabled():
+        if not repository_args:
+            raise PermissionError(
+                "github_cli is required for absolute-worktree GitHub reads; "
+                "anonymous reads require canonical owner/repository"
+            )
+        result = _github_rest_json(f"/repos/{repo}/pulls/{validated_pr}")
+        if result.get("returncode") != 0 or result.get("json_valid") is not True:
+            return result
+        try:
+            data = _github_pr_projection(result.get("data"))
+        except ValueError as exc:
+            return {**result, "json_valid": False, "json_error": str(exc), "data": None}
+        return {
+            **result,
+            "data": data,
+            "field_availability": {"reviewDecision": "unavailable_anonymous_rest"},
+        }
     result = _run_read(
         [
             "gh",
             "pr",
             "view",
-            str(_validate_pr(pr)),
+            str(validated_pr),
             *repository_args,
             "--json",
             ",".join(GITHUB_PR_FIELDS),
@@ -1807,14 +2015,51 @@ def grabowski_github_checks(
     pr: PullRequestNumber,
 ) -> dict[str, Any]:
     """Read bounded GitHub pull-request check results."""
-    operator._require_operator_capability("github_cli")
     repository, repository_args = _resolve_github_repository(repo)
+    validated_pr = _validate_pr(pr)
+    if not _github_cli_enabled():
+        if not repository_args:
+            raise PermissionError(
+                "github_cli is required for absolute-worktree GitHub reads; "
+                "anonymous reads require canonical owner/repository"
+            )
+        pull = _github_rest_json(f"/repos/{repo}/pulls/{validated_pr}")
+        if pull.get("returncode") != 0 or pull.get("json_valid") is not True:
+            return {**pull, "stage": "pull_request"}
+        pull_data = pull.get("data")
+        head = pull_data.get("head") if isinstance(pull_data, dict) else None
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(head_sha, str) or OBJECT_ID_RE.fullmatch(head_sha) is None:
+            return {
+                **pull,
+                "json_valid": False,
+                "json_error": "GitHub pull-request response lacks a valid head SHA",
+                "data": None,
+                "stage": "pull_request",
+            }
+        result = _github_rest_json(
+            f"/repos/{repo}/commits/{head_sha}/check-runs?per_page=100"
+        )
+        if result.get("returncode") != 0 or result.get("json_valid") is not True:
+            return {**result, "stage": "check_runs", "head_sha": head_sha}
+        payload = result.get("data")
+        runs = payload.get("check_runs") if isinstance(payload, dict) else None
+        if not isinstance(runs, list):
+            return {**result, "json_valid": False, "json_error": "GitHub check-runs response lacks check_runs", "data": None}
+        return {
+            **result,
+            "data": [_github_check_projection(item) for item in runs[:100]],
+            "head_sha": head_sha,
+            "total_count": payload.get("total_count"),
+            "checks_truncated": isinstance(payload.get("total_count"), int) and payload["total_count"] > len(runs[:100]),
+            "field_availability": {"event": "unavailable_anonymous_rest", "workflow": "unavailable_anonymous_rest"},
+        }
     result = _run_read(
         [
             "gh",
             "pr",
             "checks",
-            str(_validate_pr(pr)),
+            str(validated_pr),
             *repository_args,
             "--json",
             ",".join(GITHUB_CHECK_FIELDS),
@@ -1824,6 +2069,38 @@ def grabowski_github_checks(
         max_output_bytes=MAX_OUTPUT_BYTES,
     )
     return _parse_json_result(result)
+
+
+@mcp.tool(name="grabowski_tailscale_status", annotations=LOCAL_READ)
+def grabowski_tailscale_status() -> dict[str, Any]:
+    """Read bounded local Tailscale health without mutation controls or account records."""
+    executable = shutil.which("tailscale")
+    if not executable:
+        return {
+            "available": False,
+            "reason": "tailscale executable is not installed",
+            "data": None,
+        }
+    parsed = _parse_json_result(
+        _run_read(
+            [executable, "status", "--json"],
+            cwd=operator.HOME,
+            timeout_seconds=20,
+            max_output_bytes=MAX_GITHUB_RESPONSE_BYTES,
+        )
+    )
+    if parsed.get("returncode") != 0 or parsed.get("json_valid") is not True:
+        return parsed
+    try:
+        data = _tailscale_status_projection(parsed.get("data"))
+    except ValueError as exc:
+        return {**parsed, "json_valid": False, "json_error": str(exc), "data": None}
+    return {
+        **parsed,
+        "available": True,
+        "data": data,
+        "redacted_source_fields": ["User", "CurrentTailnet", "PublicKey", "UserID", "Addrs", "PeerAPIURL", "CapMap", "Capabilities"],
+    }
 
 
 @mcp.tool(name="grabowski_service_status", annotations=LOCAL_READ)

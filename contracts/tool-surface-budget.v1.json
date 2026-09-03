@@ -1,5 +1,28 @@
 {
   "accepted_additions": {
+    "grabowski_tailscale_status": {
+      "evidence_refs": [
+        "tests:test_read_surface.py",
+        "docs:typed-read-surface.md",
+        "gate:G5-dual-operator-read-matrix"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only a bounded projection of local Tailscale status through one fixed argv and never accepts caller-selected commands, URLs or mutation controls.",
+        "evidence": "Fixed local tailscale status --json execution, bounded peer and health projections, explicit account/key/address redaction, no terminal_execute gate, and focused projection/argv tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic terminal or fleet execution was rejected because either would grant a much broader command authority merely to observe node and peer reachability.",
+      "rationale": "Independent operator health requires Tailscale reachability evidence even in observe-only profiles. A typed fixed-shape read closes that diagnostic gap without granting shell or Tailscale mutation authority.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "diagnostics",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_tailscale_status"
+      }
+    },
     "grabowski_agent_workspace_reconcile_idle_tmux": {
       "evidence_refs": [
         "contract:idle-tmux-stale-abandonment-v1",

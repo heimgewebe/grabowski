@@ -120,6 +120,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_process_list` | process | yes | low | List current-user processes with optional regular-expression filtering. |
 | `grabowski_process_signal` | process | no | high | Signal one process owned by the current user. |
 | `grabowski_ports` | diagnostics | yes | low | List listening TCP and UDP sockets. |
+| `grabowski_tailscale_status` | diagnostics | yes | low | Read bounded local Tailscale node and peer health without account records or mutation controls. |
 | `grabowski_privileged_action_reference` | privileged-reference | yes | medium | Create a non-executable reference contract for a future external privileged action. |
 | `grabowski_power_run` | privileged-execution | no | critical | Run one audited root command through the recovery-gated power broker. |
 | `grabowski_fleet_list` | fleet | yes | low | Return the validated local and SSH host registry. |

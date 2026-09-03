@@ -475,7 +475,6 @@ def run_fleet_task_unit_show(
 @mcp.tool(name="grabowski_fleet_list", annotations=READ_ONLY)
 def grabowski_fleet_list() -> dict[str, Any]:
     """Return the validated local and SSH host registry."""
-    operator._require_operator_capability("terminal_execute")
     fleet = load_fleet()
     return {"path": str(FLEET_CONFIG), "schema_version": 1,
             "hosts": fleet["hosts"], "count": len(fleet["hosts"])}
