@@ -599,6 +599,7 @@ class RepositoryContractTests(unittest.TestCase):
             "resource_lease",
             "git_cli",
             "github_cli",
+            "user_service_logs_read",
             "user_service_control",
         ):
             self.assertNotIn(capability, observe_caps)
@@ -609,6 +610,7 @@ class RepositoryContractTests(unittest.TestCase):
             "resource_lease",
             "git_cli",
             "github_cli",
+            "user_service_logs_read",
             "user_service_control",
         ):
             self.assertIn(capability, mutate_caps)

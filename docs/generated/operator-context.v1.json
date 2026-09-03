@@ -3602,7 +3602,7 @@
     },
     "policy_example": {
       "path": "config/access.example.json",
-      "sha256": "d548f3a0d0e29fdadaca69404a8c51c83e618adf81076499e11946112b4e44be"
+      "sha256": "2cb49727da14b27b9e205bc6529dd0e69db0e744a52ffa9070b9f1489c39610f"
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",

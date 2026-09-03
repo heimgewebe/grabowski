@@ -1085,21 +1085,31 @@ class ReadSurfaceTests(unittest.TestCase):
                 read_surface.grabowski_service_status("--system")
         runner.assert_not_called()
 
-    def test_service_logs_are_bounded_read_without_control_capability(self) -> None:
+    def test_service_logs_are_bounded_read_with_dedicated_read_capability(self) -> None:
         result = {"returncode": 0, "stdout": "one line\n", "stderr": ""}
         with patch.object(
             read_surface.operator,
             "_require_operator_capability",
-            side_effect=AssertionError("typed service read must not require control authority"),
         ) as capability_gate, patch.object(
             read_surface.operator, "_validate_unit", return_value="demo.service"
         ), patch.object(read_surface, "_run_read", return_value=result) as runner:
             response = read_surface.grabowski_service_logs("demo.service", 5)
-        capability_gate.assert_not_called()
+        capability_gate.assert_called_once_with("user_service_logs_read")
         argv = runner.call_args.args[0]
         self.assertEqual(argv[:4], ["journalctl", "--user", "--unit", "demo.service"])
         self.assertEqual(argv[-2:], ["--lines", "5"])
         self.assertEqual(response, result)
+
+    def test_service_logs_deny_before_journal_read_without_dedicated_capability(self) -> None:
+        with patch.object(
+            read_surface.operator,
+            "_require_operator_capability",
+            side_effect=PermissionError("not enabled"),
+        ) as capability_gate, patch.object(read_surface, "_run_read") as runner:
+            with self.assertRaisesRegex(PermissionError, "not enabled"):
+                read_surface.grabowski_service_logs("demo.service", 5)
+        capability_gate.assert_called_once_with("user_service_logs_read")
+        runner.assert_not_called()
 
     def test_service_logs_reject_option_shaped_unit_before_read(self) -> None:
         with patch.object(read_surface, "_run_read") as runner:

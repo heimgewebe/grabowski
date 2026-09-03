@@ -2412,6 +2412,7 @@ def grabowski_service_logs(
     name = _validate_service_read_unit(unit)
     if isinstance(max_lines, bool) or max_lines < 1 or max_lines > MAX_LOG_LINES:
         raise ValueError(f"max_lines must be between 1 and {MAX_LOG_LINES}")
+    operator._require_operator_capability("user_service_logs_read")
     return _run_read(
         [
             "journalctl",
