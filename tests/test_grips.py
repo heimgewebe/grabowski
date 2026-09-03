@@ -340,6 +340,7 @@ class FakeGh:
         post_merge_queue_entry: dict[str, object] | None = None,
         merge_queue_view_overrides: dict[str, object] | None = None,
         merge_queue_failure: bool = False,
+        merge_queue_graphql_errors: list[dict[str, object]] | None = None,
     ):
         self.existing = existing
         self.failure = failure
@@ -389,6 +390,7 @@ class FakeGh:
         self.post_merge_queue_entry = deepcopy(post_merge_queue_entry)
         self.merge_queue_view_overrides = dict(merge_queue_view_overrides or {})
         self.merge_queue_failure = merge_queue_failure
+        self.merge_queue_graphql_errors = deepcopy(merge_queue_graphql_errors)
         self.view_failure_after_merge = view_failure_after_merge
         self.post_merge_view = post_merge_view or {}
         self.post_merge_view_failures = post_merge_view_failures
@@ -490,11 +492,14 @@ class FakeGh:
                     "mergeQueueEntry": deepcopy(self.merge_queue_entry),
                 }
                 queue_view.update(self.merge_queue_view_overrides)
+                queue_payload: dict[str, object] = {
+                    "data": {"repository": {"pullRequest": queue_view}}
+                }
+                if self.merge_queue_graphql_errors is not None:
+                    queue_payload["errors"] = deepcopy(self.merge_queue_graphql_errors)
                 return {
                     "returncode": 0,
-                    "stdout": json.dumps(
-                        {"data": {"repository": {"pullRequest": queue_view}}}
-                    ),
+                    "stdout": json.dumps(queue_payload),
                     "stderr": "",
                 }
             state = (
@@ -9776,6 +9781,52 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("queued_after_dispatch", execution["merge_queue_reconciliation"])
         self.assertEqual(1, len([call for call in gh.calls if call[:2] == ("pr", "merge")]))
         self.assertNotIn("post_verify_errors", execution)
+
+    def test_captain_run_blocks_partial_merge_queue_graphql_errors_before_dispatch(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_queue_graphql_errors=[
+                {"message": "mergeQueueEntry field failed"}
+            ],
+        )
+        gh.active_rules.append(
+            {
+                "type": "merge_queue",
+                "parameters": {"merge_method": "MERGE"},
+                "ruleset_source_type": "Repository",
+                "ruleset_source": "heimgewebe/grabowski",
+                "ruleset_id": 18801517,
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertIn(
+            "merge_queue_readback_graphql_errors", execution["preflight_errors"]
+        )
+        self.assertIn("not safely reconcilable", execution["verification_error"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_captain_run_reconciles_existing_queue_entry_without_duplicate_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()

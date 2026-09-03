@@ -11794,6 +11794,12 @@ def _captain_pr_merge_queue_readback(
         payload = _json_stdout(result)
     except GripActionError:
         return None, info, ["merge_queue_readback_invalid"]
+    if isinstance(payload, dict) and "errors" in payload:
+        return (
+            None,
+            {**info, "graphql_errors_present": True},
+            ["merge_queue_readback_graphql_errors"],
+        )
     repository = payload.get("data", {}).get("repository") if isinstance(payload, dict) else None
     viewed = repository.get("pullRequest") if isinstance(repository, dict) else None
     if not isinstance(viewed, dict):
