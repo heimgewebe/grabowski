@@ -371,6 +371,8 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertIsNone(response["data"][0]["workflow"])
         self.assertEqual(response["check_run_count"], 1)
         self.assertEqual(response["status_context_count"], 0)
+        self.assertEqual(response["transport_returncode"], 0)
+        self.assertEqual(response["returncode"], 0)
 
     def test_github_checks_anonymous_fallback_includes_legacy_status_contexts(self) -> None:
         pull = {
@@ -426,6 +428,49 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(response["check_run_count"], 0)
         self.assertEqual(response["status_context_count"], 2)
         self.assertEqual(response["total_count"], 2)
+        self.assertEqual(response["transport_returncode"], 0)
+        self.assertEqual(response["returncode"], 1)
+
+    def test_github_checks_anonymous_fallback_uses_pending_exit_code(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "d" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "total_count": 1,
+                "check_runs": [
+                    {
+                        "name": "validate",
+                        "status": "in_progress",
+                        "conclusion": None,
+                        "details_url": "https://github.com/example/check/pending",
+                        "started_at": "2026-09-03T06:00:00Z",
+                        "completed_at": None,
+                        "output": {},
+                    }
+                ],
+            },
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "pending", "total_count": 0, "statuses": []},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]),
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertEqual(response["transport_returncode"], 0)
+        self.assertEqual(response["returncode"], 8)
+        self.assertEqual(response["data"][0]["bucket"], "pending")
 
     def test_github_checks_anonymous_fallback_fails_closed_on_truncated_status_contexts(self) -> None:
         pull = {

@@ -1383,6 +1383,15 @@ def _github_status_projection(payload: Any) -> dict[str, Any]:
     }
 
 
+def _github_checks_semantic_returncode(rows: list[dict[str, Any]]) -> int:
+    buckets = {row.get("bucket") for row in rows}
+    if buckets & {"fail", "cancel"}:
+        return 1
+    if "pending" in buckets:
+        return 8
+    return 0
+
+
 def _tailscale_failure_projection(
     result: dict[str, Any], *, reason: str, json_valid: bool | None
 ) -> dict[str, Any]:
@@ -2149,9 +2158,12 @@ def grabowski_github_checks(
 
         check_rows = [_github_check_projection(item) for item in bounded_runs]
         status_rows = [_github_status_projection(item) for item in bounded_statuses]
+        projected_rows = [*check_rows, *status_rows]
         return {
             **result,
-            "data": [*check_rows, *status_rows],
+            "transport_returncode": result.get("returncode"),
+            "returncode": _github_checks_semantic_returncode(projected_rows),
+            "data": projected_rows,
             "head_sha": head_sha,
             "total_count": len(check_rows) + len(status_rows),
             "check_run_count": len(check_rows),
