@@ -1079,6 +1079,12 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(response["properties"]["ActiveState"], "active")
         self.assertEqual(response["stdout"], "")
 
+    def test_service_status_rejects_option_shaped_unit_before_read(self) -> None:
+        with patch.object(read_surface, "_run_read") as runner:
+            with self.assertRaisesRegex(ValueError, "Invalid systemd unit name"):
+                read_surface.grabowski_service_status("--system")
+        runner.assert_not_called()
+
     def test_service_logs_are_bounded_read_without_control_capability(self) -> None:
         result = {"returncode": 0, "stdout": "one line\n", "stderr": ""}
         with patch.object(
@@ -1094,6 +1100,12 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(argv[:4], ["journalctl", "--user", "--unit", "demo.service"])
         self.assertEqual(argv[-2:], ["--lines", "5"])
         self.assertEqual(response, result)
+
+    def test_service_logs_reject_option_shaped_unit_before_read(self) -> None:
+        with patch.object(read_surface, "_run_read") as runner:
+            with self.assertRaisesRegex(ValueError, "Invalid systemd unit name"):
+                read_surface.grabowski_service_logs("--system", 5)
+        runner.assert_not_called()
 
     def test_service_logs_bounds_lines(self) -> None:
         with patch.object(read_surface.operator, "_validate_unit", return_value="demo.service"):
