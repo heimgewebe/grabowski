@@ -16,7 +16,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import kleiner_maulwurf_operator as mole
+import der_kleine_maulwurf_operator as mole  # noqa: E402
 
 
 class _TestIcon:
@@ -26,9 +26,9 @@ class _TestIcon:
         self.sizes = sizes
 
 
-class TestKleinerMaulwurfOperator(unittest.TestCase):
+class TestDerKleineMaulwurfOperator(unittest.TestCase):
     def test_source_asset_matches_embedded_icon(self) -> None:
-        asset = SRC / "kleiner_maulwurf_logo_512.png"
+        asset = SRC / "der_kleine_maulwurf_logo_512.png"
         payload = asset.read_bytes()
 
         self.assertEqual(mole.ICON_BYTES, len(payload))
@@ -62,7 +62,7 @@ class TestKleinerMaulwurfOperator(unittest.TestCase):
         self.assertEqual(mole.icon_data_uri(), icon.src)
 
     def test_branding_provider_uses_no_private_fastmcp_state(self) -> None:
-        source = (SRC / "kleiner_maulwurf_operator.py").read_text(encoding="utf-8")
+        source = (SRC / "der_kleine_maulwurf_operator.py").read_text(encoding="utf-8")
         self.assertNotIn("_mcp_server", source)
         self.assertNotIn("grabowski_operator", source)
 
@@ -72,11 +72,19 @@ class TestKleinerMaulwurfOperator(unittest.TestCase):
             'MCP_BRANDING_VARIANT_ENV = "GRABOWSKI_MCP_BRANDING_VARIANT"',
             source,
         )
-        self.assertIn('variant != "kleiner-maulwurf"', source)
         self.assertIn(
-            "FastMCP(APP_NAME, instructions=AGENT_INSTRUCTIONS, icons=_configured_icons)",
-            source,
+            'DER_KLEINE_MAULWURF_BRANDING_VARIANT = "der-kleine-maulwurf"', source
         )
+        self.assertIn(
+            'LEGACY_KLEINER_MAULWURF_BRANDING_VARIANT = "kleiner-maulwurf"', source
+        )
+        self.assertIn(
+            'DER_KLEINE_MAULWURF_APP_NAME = "der kleine maulwurf"', source
+        )
+        self.assertIn(
+            "from der_kleine_maulwurf_operator import mcp_icons", source
+        )
+        self.assertIn("_configured_app_name, _configured_icons", source)
 
     def test_runtime_contract_installs_branding_provider(self) -> None:
         contract = json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text())
@@ -85,8 +93,8 @@ class TestKleinerMaulwurfOperator(unittest.TestCase):
             for item in contract["supporting_sources"]
         }
         self.assertEqual(
-            "src/kleiner_maulwurf_operator.py",
-            sources.get("kleiner_maulwurf_operator"),
+            "src/der_kleine_maulwurf_operator.py",
+            sources.get("der_kleine_maulwurf_operator"),
         )
 
 
