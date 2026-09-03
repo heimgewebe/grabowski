@@ -10339,6 +10339,150 @@ class TaskTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual([], journals)
 
+    def test_runtime_refresh_task_server_acquires_missing_intent_leases(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        observed: dict[str, object] = {}
+
+        def dispatch(*args, **kwargs):
+            observed["leases"] = {
+                key: tasks.resources.inspect_resource(key)
+                for key in fixture["resource_keys"]
+            }
+            observed["metadata"] = self._runtime_refresh_lease_metadata(
+                fixture["resource_keys"]
+            )
+            return _launcher()
+
+        with self._runtime_refresh_start_environment(
+            fixture, dispatch_effect=dispatch
+        ) as (dispatch_mock, _audit_mock):
+            result = tasks.grabowski_task_start(
+                "local",
+                fixture["argv"],
+                cwd=str(tasks.operator.HOME),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+        self.assertEqual(1, dispatch_mock.call_count)
+        self.assertEqual([], result["task"]["resource_keys"])
+        self.assertEqual(
+            {fixture["lease_owner"]},
+            {item["owner_id"] for item in observed["leases"].values()},
+        )
+        metadata = observed["metadata"]
+        self.assertEqual(
+            {fixture["approval_task_id"]},
+            {item["approval_task_id"] for item in metadata.values()},
+        )
+        self.assertEqual(
+            {fixture["intent_sha256"]},
+            {item["intent_sha256"] for item in metadata.values()},
+        )
+        self.assertEqual(
+            {result["task"]["unit"]},
+            {item["executor_unit"] for item in metadata.values()},
+        )
+
+    def test_runtime_refresh_task_reclaims_expired_foreign_intent_lease(self) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        first = fixture["resource_keys"][0]
+        tasks.resources.acquire_resources(
+            "runtime-refresh:expiredowner",
+            [first],
+            purpose="expired runtime refresh",
+            ttl_seconds=1200,
+            metadata={"marker": "expired"},
+        )
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=1 WHERE resource_key=?",
+                (first,),
+            )
+            connection.commit()
+        with self._runtime_refresh_start_environment(fixture) as (
+            dispatch_mock,
+            _audit_mock,
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                fixture["argv"],
+                cwd=str(tasks.operator.HOME),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+        self.assertEqual(1, dispatch_mock.call_count)
+        self.assertEqual(
+            fixture["lease_owner"],
+            tasks.resources.inspect_resource(first)["owner_id"],
+        )
+        self.assertEqual(
+            result["task"]["unit"],
+            self._runtime_refresh_lease_metadata([first])[first]["executor_unit"],
+        )
+
+    def test_runtime_refresh_task_foreign_intent_lease_blocks_before_server_acquire(
+        self,
+    ) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        first, second = fixture["resource_keys"]
+        tasks.resources.acquire_resources(
+            "runtime-refresh:foreignowner",
+            [first],
+            purpose="foreign runtime refresh",
+            ttl_seconds=1200,
+            metadata={"marker": "foreign"},
+        )
+        with self._runtime_refresh_start_environment(fixture) as (
+            dispatch_mock,
+            _audit_mock,
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "resource lease is owned by another owner"
+            ):
+                tasks.grabowski_task_start(
+                    "local",
+                    fixture["argv"],
+                    cwd=str(tasks.operator.HOME),
+                    runtime_seconds=60,
+                    resume_policy="never",
+                )
+        dispatch_mock.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(second))
+        self.assertEqual(
+            "runtime-refresh:foreignowner",
+            tasks.resources.inspect_resource(first)["owner_id"],
+        )
+
+    def test_runtime_refresh_task_precommit_failure_releases_server_acquired_leases(
+        self,
+    ) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        with self._runtime_refresh_start_environment(fixture) as (
+            dispatch_mock,
+            _audit_mock,
+        ):
+            with patch.object(
+                tasks,
+                "_register_task_reconcile_sequence",
+                side_effect=RuntimeError("forced precommit failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "forced precommit failure"):
+                    tasks.grabowski_task_start(
+                        "local",
+                        fixture["argv"],
+                        cwd=str(tasks.operator.HOME),
+                        runtime_seconds=60,
+                        resume_policy="never",
+                    )
+        dispatch_mock.assert_not_called()
+        self.assertEqual(
+            [None] * len(fixture["resource_keys"]),
+            [
+                tasks.resources.inspect_resource(key)
+                for key in fixture["resource_keys"]
+            ],
+        )
+
     def test_runtime_refresh_task_precommit_failure_restores_external_leases(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
         metadata = {

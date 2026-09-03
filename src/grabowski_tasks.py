@@ -2030,6 +2030,70 @@ def _runtime_refresh_prelaunch_lease_binding_request(
     return {**material, "request_sha256": _sha256_json(material)}
 
 
+def _acquire_missing_runtime_refresh_prelaunch_leases(
+    request: dict[str, Any],
+    intent: dict[str, Any],
+) -> dict[str, Any] | None:
+    owner = request["lease_owner"]
+    keys = list(request["resource_keys"])
+    current = resources.inspect_resources(keys)
+    foreign = sorted(
+        key for key, lease in current.items() if lease.get("owner_id") != owner
+    )
+    if foreign:
+        raise PermissionError(
+            "Bureau runtime-refresh prelaunch resource lease is owned by another owner: "
+            + foreign[0]
+        )
+    missing = [key for key in keys if key not in current]
+    if not missing:
+        return None
+
+    expires_at = intent.get("expires_at")
+    if not isinstance(expires_at, str):
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid")
+    try:
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid") from exc
+    if expires.tzinfo is None or expires.utcoffset() is None:
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid")
+    remaining_seconds = int((expires - datetime.now(timezone.utc)).total_seconds())
+    if remaining_seconds <= BUREAU_RUNTIME_REFRESH_PRELAUNCH_MIN_REMAINING_SECONDS:
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch approval expires too soon for lease acquisition"
+        )
+    acquired = resources.acquire_resources(
+        owner,
+        missing,
+        purpose=f"Bureau runtime-refresh prelaunch {request['intent_sha256'][:16]}",
+        ttl_seconds=min(resources.MAX_TTL_SECONDS, remaining_seconds),
+        metadata={
+            "approval_task_id": request["lease_task_id"],
+            "intent_sha256": request["intent_sha256"],
+        },
+    )
+    return {
+        "owner_id": owner,
+        "resource_keys": missing,
+        "leases": list(acquired["leases"]),
+    }
+
+
+def _release_runtime_refresh_prelaunch_acquisition(
+    acquisition: dict[str, Any] | None,
+) -> None:
+    if acquisition is None:
+        return
+    resources.release_resources(
+        acquisition["owner_id"],
+        acquisition["resource_keys"],
+        expected_leases=[
+            resources._release_lease_snapshot(item) for item in acquisition["leases"]
+        ],
+    )
+
+
 BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX = (
     "runtime_refresh_executor_prelaunch_v1:"
 )
@@ -7736,6 +7800,7 @@ def grabowski_task_start(
     executor_intent: dict[str, Any] | None = None
     executor_authority_contract: dict[str, Any] | None = None
     executor_lease_binding_request: dict[str, Any] | None = None
+    executor_prelaunch_acquisition: dict[str, Any] | None = None
     if bureau_runtime_refresh_executor.is_reserved_task_request(argv):
         if target.get("transport") != "local" or target.get("target") != "local":
             raise PermissionError("Bureau runtime-refresh executor requires the local fleet host")
@@ -8740,6 +8805,11 @@ def grabowski_task_start(
             executor_intent = live_executor_intent
             executor_authority_contract = live_executor_authority_contract
             executor_lease_binding_request = revalidated_executor_lease_binding_request
+            executor_prelaunch_acquisition = (
+                _acquire_missing_runtime_refresh_prelaunch_leases(
+                    executor_lease_binding_request, executor_intent
+                )
+            )
             executor_lease_binding_plan = (
                 resources.prepare_runtime_refresh_executor_lease_binding(
                     executor_lease_binding_request["lease_owner"],
@@ -8833,6 +8903,7 @@ def grabowski_task_start(
     except Exception as exc:
         executor_record_state = "not_applicable"
         executor_compensation_error: Exception | None = None
+        executor_acquisition_compensation_error: Exception | None = None
         if executor_lease_binding is not None:
             try:
                 observed_record = _row_raw(task_id)
@@ -8859,6 +8930,19 @@ def grabowski_task_start(
                     )
                 except Exception as compensation_error:
                     executor_compensation_error = compensation_error
+        if executor_prelaunch_acquisition is not None and (
+            executor_lease_binding is None
+            or (
+                executor_record_state == "absent"
+                and executor_compensation_error is None
+            )
+        ):
+            try:
+                _release_runtime_refresh_prelaunch_acquisition(
+                    executor_prelaunch_acquisition
+                )
+            except Exception as acquisition_compensation_error:
+                executor_acquisition_compensation_error = acquisition_compensation_error
         if task_resources and lease_result is not None:
             resources.release_resources(
                 lease_owner,
@@ -8868,6 +8952,16 @@ def grabowski_task_start(
                     for item in lease_result["leases"]
                 ],
             )
+        if executor_acquisition_compensation_error is not None:
+            compensation_detail = (
+                f"{type(executor_acquisition_compensation_error).__name__}: "
+                f"{_redact_reason(str(executor_acquisition_compensation_error))[:512]}"
+            )
+            raise RuntimeError(
+                "Bureau runtime-refresh task start failed before dispatch and server-owned "
+                "prelaunch lease compensation failed; reconciliation is required; "
+                f"compensation_error={compensation_detail}"
+            ) from exc
         if executor_lease_binding is not None:
             if executor_record_state != "absent":
                 raise RuntimeError(
@@ -8951,6 +9045,17 @@ def grabowski_task_start(
                     "executor lease compensation failed; prelaunch journal retained "
                     "for reconciliation"
                 ) from compensation_error
+            if executor_prelaunch_acquisition is not None:
+                try:
+                    _release_runtime_refresh_prelaunch_acquisition(
+                        executor_prelaunch_acquisition
+                    )
+                except Exception as compensation_error:
+                    raise RuntimeError(
+                        "Bureau runtime-refresh launch failed before dispatch and server-owned "
+                        "prelaunch lease compensation failed; prelaunch journal retained "
+                        "for reconciliation"
+                    ) from compensation_error
         if state in {"running", "failed"}:
             try:
                 with _database_connection() as connection:
