@@ -29,6 +29,7 @@ CORE_TOOLS = {
     "grabowski_service_status",
     "grabowski_service_logs",
     "grabowski_ports",
+    "grabowski_tailscale_status",
     "grabowski_fleet_list",
     "grabowski_privileged_broker_status",
     "grabowski_recovery_status",

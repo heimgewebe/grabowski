@@ -81,6 +81,7 @@
     "grabowski_process_list",
     "grabowski_process_signal",
     "grabowski_ports",
+    "grabowski_tailscale_status",
     "grabowski_privileged_action_reference",
     "grabowski_power_run",
     "grabowski_fleet_list",

@@ -1067,6 +1067,17 @@
       "tool": "grabowski_ports"
     },
     {
+      "category": "diagnostics",
+      "description": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
+      "effects": [],
+      "id": "grabowski_tailscale_status",
+      "purpose": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_tailscale_status"
+    },
+    {
       "category": "privileged-reference",
       "description": "Create a strict reference for a future privileged action without executing it.",
       "effects": [],
@@ -1093,10 +1104,10 @@
     },
     {
       "category": "fleet",
-      "description": "Return the validated local and SSH host registry.",
+      "description": "Return a bounded projection of the validated local and SSH host registry.",
       "effects": [],
       "id": "grabowski_fleet_list",
-      "purpose": "Return the validated local and SSH host registry.",
+      "purpose": "Return a bounded projection of the validated local and SSH host registry.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -2920,6 +2931,7 @@
       "grabowski_process_list",
       "grabowski_process_signal",
       "grabowski_ports",
+      "grabowski_tailscale_status",
       "grabowski_privileged_action_reference",
       "grabowski_power_run",
       "grabowski_fleet_list",
@@ -3574,7 +3586,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "741a584dddf4261737cf650ed47a818d6c4551230555798503949476961cbb9f"
+      "sha256": "6ceac03492515358aa12c4ff1bb6660f908917a33f06f77d63dca73af30367ec"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3582,7 +3594,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "c8220a81cfa8f76d7b858dae375ce06ce38e301c4c2299bb4ab4951645f59e4b"
+      "sha256": "c60e84c3799fd2270ef7c975681ca0e46b1cc53c4811cbee59217ac914a43f60"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3634,7 +3646,7 @@
       "src/grabowski_effect_receipt.py": "b3114c0835203a57a42acbea5bbb2843ee0633d8a52e673f1497cc17e87e4a29",
       "src/grabowski_execution_coordinator.py": "d31054cc2eb0fe90faf3b1fe84f7c23fc33277817ab88b25fc658524a4cdcc2f",
       "src/grabowski_execution_plan.py": "d4c71362493f73714b5d0420c5b5a9f115f39c38cbf203cfa4a5507527fe4a54",
-      "src/grabowski_fleet.py": "8142b437eeac7158fca22bb7df105df9fbc0ba824300a5431a7b1827dc1c9db9",
+      "src/grabowski_fleet.py": "fbe1efbceefdb72715cb67e7e9e6a491576a642d889d87d18b641b28ddcb4782",
       "src/grabowski_fleet_mutation.py": "f03f8d44e6ac436ffbe016341e3f3dba4a313cbd7973b1f18929e4fa643d3be9",
       "src/grabowski_forrest_server_exit.py": "f7a709556197a5c15240e1b0be9c2015f35cad198ce29fe98c4b6fe1204f9cea",
       "src/grabowski_friction.py": "524d7839aabd0cbb8b710714b7656214f17aa3bc9504dc635f890231e3a37e4f",
@@ -3677,7 +3689,7 @@
       "src/grabowski_privileged.py": "70b7c434b60f3dc7a5f08f650f21db9f598a0b2fa9747d7679f396b00a47a7eb",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
       "src/grabowski_provenance_recovery.py": "b507add38c5fdaf9ad4248f0e2cc5bf7570f1a62415a06e1bf171d44f26e0730",
-      "src/grabowski_read_surface.py": "3811fcba0d891807795c9cf5c379cde164c8a54aa998780980f7ddab5fc8badb",
+      "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",
       "src/grabowski_recall.py": "386afec03e078b6a7934b0744eb17edb1ae97b0addde982c34c544d0c1b74413",
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",

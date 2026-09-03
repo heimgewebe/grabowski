@@ -1707,6 +1707,24 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             operator_tools,
         )
 
+    def test_g5_typed_reads_do_not_require_coarse_operator_capabilities(self) -> None:
+        requirements = grabowski_mcp.TOOL_CAPABILITY_REQUIREMENTS
+        operator_tools = grabowski_mcp.OPERATOR_CAPABILITY_REQUIREMENT_TOOLS
+        for tool in (
+            "grabowski_github_pr_view",
+            "grabowski_github_checks",
+            "grabowski_tailscale_status",
+            "grabowski_fleet_list",
+            "grabowski_privileged_broker_status",
+        ):
+            with self.subTest(tool=tool):
+                self.assertEqual(requirements[tool], ())
+                self.assertNotIn(tool, operator_tools)
+        self.assertEqual(
+            requirements["grabowski_recovery_status"],
+            ("audit_verify",),
+        )
+
     def test_legacy_policy_does_not_implicitly_gain_audit_read(self) -> None:
         policy = {
             "mode": "bounded-read-write",
@@ -1761,8 +1779,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 198)
-        self.assertEqual(summary["known_tool_requirements"], 199)
+        self.assertEqual(summary["registered_tool_requirements"], 199)
+        self.assertEqual(summary["known_tool_requirements"], 200)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],

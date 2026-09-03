@@ -1,15 +1,15 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "c8220a81cfa8f76d7b858dae375ce06ce38e301c4c2299bb4ab4951645f59e4b"
+    "sha256": "c60e84c3799fd2270ef7c975681ca0e46b1cc53c4811cbee59217ac914a43f60"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "6e9822f4f4a9005498e687ed87e4208c7320122e85fc08ad13df30ee473984da"
+    "sha256": "42cb64d0d1efad0c97f06dcafbc80c4139638c747ce47e13afe9673cde2c5b27"
   },
   "counts": {
-    "core": 22,
-    "full": 198,
+    "core": 23,
+    "full": 199,
     "operator": 183
   },
   "profiles": {
@@ -33,6 +33,7 @@
       "grabowski_service_status",
       "grabowski_service_logs",
       "grabowski_ports",
+      "grabowski_tailscale_status",
       "grabowski_fleet_list",
       "grabowski_privileged_broker_status",
       "grabowski_recovery_status"
@@ -119,6 +120,7 @@
       "grabowski_process_list",
       "grabowski_process_signal",
       "grabowski_ports",
+      "grabowski_tailscale_status",
       "grabowski_privileged_action_reference",
       "grabowski_power_run",
       "grabowski_fleet_list",
@@ -449,6 +451,7 @@
         "grabowski_runtime_health",
         "grabowski_service_logs",
         "grabowski_service_status",
+        "grabowski_tailscale_status",
         "grabowski_verify_audit",
         "repoground_bundle_discover",
         "repoground_bundle_status",
