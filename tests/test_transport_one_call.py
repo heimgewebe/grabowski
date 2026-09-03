@@ -1104,13 +1104,16 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         operator._trusted_github_cli_path()
 
-    def test_github_wrapper_ignores_path_shim_and_uses_trusted_pin(self) -> None:
+    def test_github_wrapper_ignores_path_shim_and_user_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             shim = Path(directory) / "gh"
             shim.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
             shim.chmod(0o755)
             hostile_environment = {
                 "PATH": directory,
+                "HOME": directory,
+                "XDG_CONFIG_HOME": str(Path(directory) / "xdg"),
+                "GH_CONFIG_DIR": str(Path(directory) / "gh-config"),
                 "GH_FORCE_TTY": "1",
                 "GH_PAGER": str(Path(directory) / "evil-gh-pager"),
                 "PAGER": str(Path(directory) / "evil-pager"),
@@ -1119,7 +1122,7 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 "BROWSER": str(Path(directory) / "evil-browser"),
                 "EDITOR": str(Path(directory) / "evil-editor"),
                 "VISUAL": str(Path(directory) / "evil-visual"),
-                "GH_TOKEN": "fixture-token",
+                "HTTPS_PROXY": "http://evil.example:8080",
             }
             with (
                 mock.patch.dict(operator.os.environ, hostile_environment, clear=False),
@@ -1128,6 +1131,11 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 mock.patch.object(
                     operator, "_trusted_github_cli_path", return_value="/usr/bin/gh"
                 ) as trusted,
+                mock.patch.object(
+                    operator,
+                    "_github_pr_view_auth_token",
+                    return_value="fixture-token",
+                ) as auth_token,
                 mock.patch.object(
                     operator, "_run", return_value={"returncode": 0}
                 ) as run,
@@ -1145,57 +1153,64 @@ class OperatorSignedTransportTests(unittest.TestCase):
                     cwd=str(ROOT),
                 )
         trusted.assert_called_once_with()
+        auth_token.assert_called_once()
         command = run.call_args.args[0]
         environment = run.call_args.kwargs["environment"]
+        isolated = str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH)
         self.assertEqual(command[0], "/usr/bin/gh")
         self.assertNotEqual(command[0], str(shim))
         self.assertEqual(environment["PATH"], "/usr/bin")
         self.assertEqual(environment["GH_HOST"], "github.com")
         self.assertEqual(run.call_args.kwargs["cwd"], operator.HOME)
-        self.assertNotIn(directory, environment["PATH"])
-        self.assertEqual(environment["GH_PAGER"], "cat")
-        self.assertEqual(environment["PAGER"], "cat")
-        self.assertEqual(environment["GIT_PAGER"], "cat")
-        self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
-        self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(environment["HOME"], isolated)
+        self.assertEqual(environment["XDG_CONFIG_HOME"], isolated)
+        self.assertEqual(environment["GH_CONFIG_DIR"], isolated)
         self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+        self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
         for unsafe_key in (
             "GH_FORCE_TTY",
             "LD_PRELOAD",
             "BROWSER",
             "EDITOR",
             "VISUAL",
+            "HTTPS_PROXY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
         ):
             self.assertNotIn(unsafe_key, environment)
 
-    def test_exempt_github_environment_keeps_untrusted_secret_scrubbing(self) -> None:
-        with (
-            mock.patch.dict(operator.os.environ, {"GH_TOKEN": "fixture-token"}, clear=False),
-            mock.patch.object(operator, "_trusted_owner_mode", return_value=False),
-        ):
-            environment = operator._github_pr_view_environment()
-        self.assertNotIn("GH_TOKEN", environment)
+    def test_exempt_github_environment_isolates_config_and_binds_github_token(self) -> None:
+        environment = operator._github_pr_view_environment(
+            host="github.com", token="fixture-token"
+        )
+        isolated = str(operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH)
+        self.assertEqual(environment["HOME"], isolated)
+        self.assertEqual(environment["XDG_CONFIG_HOME"], isolated)
+        self.assertEqual(environment["GH_CONFIG_DIR"], isolated)
         self.assertEqual(environment["GH_HOST"], "github.com")
+        self.assertEqual(environment["GH_TOKEN"], "fixture-token")
+        self.assertNotIn("GH_ENTERPRISE_TOKEN", environment)
         self.assertEqual(environment["PATH"], "/usr/bin")
         self.assertEqual(environment["GH_PAGER"], "cat")
+        self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
+        for key in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ):
+            self.assertNotIn(key, environment)
 
     def test_exempt_github_environment_binds_enterprise_token_to_server_host(self) -> None:
-        with (
-            mock.patch.dict(
-                operator.os.environ,
-                {
-                    "GH_HOST": "ghe.example.internal",
-                    "GH_ENTERPRISE_TOKEN": "fixture-enterprise-token",
-                },
-                clear=True,
-            ),
-            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
-        ):
-            environment = operator._github_pr_view_environment()
+        environment = operator._github_pr_view_environment(
+            host="ghe.example.internal", token="fixture-enterprise-token"
+        )
         self.assertEqual(environment["GH_HOST"], "ghe.example.internal")
         self.assertEqual(
             environment["GH_ENTERPRISE_TOKEN"], "fixture-enterprise-token"
         )
+        self.assertNotIn("GH_TOKEN", environment)
         self.assertFalse(
             operator._github_pr_view_transport_read_only(
                 {
@@ -1211,6 +1226,90 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_exempt_github_auth_lookup_uses_local_keyring_without_network_env(self) -> None:
+        process = mock.Mock()
+        process.returncode = 0
+        process.communicate.return_value = (b"fixture-keyring-token\n", b"")
+        source = {
+            "HOME": "/home/alex",
+            "XDG_CONFIG_HOME": "/home/alex/.config",
+            "GH_CONFIG_DIR": "/home/alex/.config/gh",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "GH_FORCE_TTY": "1",
+            "HTTPS_PROXY": "http://evil.example:8080",
+            "LD_PRELOAD": "/tmp/evil.so",
+        }
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
+        ):
+            token = operator._github_pr_view_auth_token(
+                "/usr/bin/gh", source, "github.com"
+            )
+        self.assertEqual(token, "fixture-keyring-token")
+        argv = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(argv, ["/usr/bin/gh", "auth", "token", "--hostname", "github.com"])
+        self.assertEqual(environment["HOME"], "/home/alex")
+        self.assertEqual(environment["XDG_RUNTIME_DIR"], "/run/user/1000")
+        self.assertEqual(
+            environment["DBUS_SESSION_BUS_ADDRESS"],
+            "unix:path=/run/user/1000/bus",
+        )
+        for key in (
+            "GH_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GH_FORCE_TTY",
+            "HTTPS_PROXY",
+            "LD_PRELOAD",
+        ):
+            self.assertNotIn(key, environment)
+
+    def test_exempt_github_auth_prefers_server_token_without_keyring_lookup(self) -> None:
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=True),
+            mock.patch.object(operator.subprocess, "Popen") as popen,
+        ):
+            token = operator._github_pr_view_auth_token(
+                "/usr/bin/gh", {"GH_TOKEN": "fixture-token"}, "github.com"
+            )
+        self.assertEqual(token, "fixture-token")
+        popen.assert_not_called()
+
+    def test_exempt_github_untrusted_ignores_env_token_and_uses_local_auth(self) -> None:
+        process = mock.Mock()
+        process.returncode = 0
+        process.communicate.return_value = (b"fixture-keyring-token\n", b"")
+        with (
+            mock.patch.object(operator, "_trusted_owner_mode", return_value=False),
+            mock.patch.object(operator.subprocess, "Popen", return_value=process) as popen,
+        ):
+            token = operator._github_pr_view_auth_token(
+                "/usr/bin/gh",
+                {"HOME": "/home/alex", "GH_TOKEN": "fixture-env-token"},
+                "github.com",
+            )
+        self.assertEqual(token, "fixture-keyring-token")
+        popen.assert_called_once()
+        self.assertNotIn("GH_TOKEN", popen.call_args.kwargs["env"])
+
+    def test_exempt_github_isolation_path_fails_closed_if_created(self) -> None:
+        root = SimpleNamespace(st_mode=operator.stat.S_IFDIR | 0o755, st_uid=0)
+        created = SimpleNamespace(st_mode=operator.stat.S_IFDIR | 0o755, st_uid=0)
+
+        def lstat(path: object) -> object:
+            value = Path(path)
+            if value == operator._GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH:
+                return created
+            if value == Path("/"):
+                return root
+            raise AssertionError(f"unexpected path: {value}")
+
+        with mock.patch.object(operator.os, "lstat", side_effect=lstat):
+            with self.assertRaisesRegex(RuntimeError, "must remain absent"):
+                operator._github_pr_view_isolated_config_path()
 
     def test_nonexempt_github_call_keeps_default_child_environment(self) -> None:
         with (

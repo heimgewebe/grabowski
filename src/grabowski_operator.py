@@ -1918,30 +1918,25 @@ def _safe_environment() -> dict[str, str]:
     return environment
 
 
-_GITHUB_PR_VIEW_ENV_ALLOWLIST = frozenset(
+_GITHUB_PR_VIEW_AUTH_ENV_ALLOWLIST = frozenset(
     {
         "HOME",
         "XDG_CONFIG_HOME",
         "GH_CONFIG_DIR",
-        "GH_HOST",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GITHUB_ENTERPRISE_TOKEN",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "NO_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "no_proxy",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GNOME_KEYRING_CONTROL",
         "LANG",
         "LC_ALL",
         "LC_CTYPE",
     }
 )
 _GITHUB_PR_VIEW_DEFAULT_HOST = "github.com"
+_GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH = Path(
+    "/nonexistent-grabowski-github-pr-view-config-v1"
+)
+_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS = 5
+_GITHUB_PR_VIEW_MAX_TOKEN_BYTES = 4096
 
 
 def _github_pr_view_host(source: dict[str, str]) -> str:
@@ -1960,26 +1955,151 @@ def _github_pr_view_host(source: dict[str, str]) -> str:
     return raw_host
 
 
-def _github_pr_view_environment() -> dict[str, str]:
-    source = _safe_environment()
+def _validated_github_pr_view_token(value: Any) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    token = value.strip()
+    if (
+        not token
+        or len(token.encode("utf-8")) > _GITHUB_PR_VIEW_MAX_TOKEN_BYTES
+        or any(ord(character) < 33 or ord(character) == 127 for character in token)
+    ):
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    return token
+
+
+def _github_pr_view_direct_token(
+    source: dict[str, str], host: str
+) -> str | None:
+    keys = (
+        ("GH_TOKEN", "GITHUB_TOKEN")
+        if host == _GITHUB_PR_VIEW_DEFAULT_HOST
+        else ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+    )
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return _validated_github_pr_view_token(value)
+    return None
+
+
+def _github_pr_view_auth_lookup_environment(
+    source: dict[str, str], host: str
+) -> dict[str, str]:
     environment = {
         key: value
         for key, value in source.items()
-        if key in _GITHUB_PR_VIEW_ENV_ALLOWLIST
+        if key in _GITHUB_PR_VIEW_AUTH_ENV_ALLOWLIST
+        and isinstance(value, str)
+        and value
     }
-    # Host authority comes only from server-owned process configuration. The
-    # exempt argv accepts OWNER/REPO but never [HOST/]OWNER/REPO, so a caller
-    # cannot redirect GH_ENTERPRISE_TOKEN to an arbitrary host. Explicit repo
-    # and numeric PR selectors also remove any need for local Git discovery.
-    environment["GH_HOST"] = _github_pr_view_host(source)
+    # The credential lookup is local-only and may access the configured gh
+    # account/keyring. It receives no token environment and no executable-
+    # selection knobs; the network-capable PR-view child never receives this
+    # HOME/config environment.
+    environment["GH_HOST"] = host
     environment["PATH"] = str(TRUSTED_GITHUB_CLI_PATH.parent)
     environment["GH_PAGER"] = "cat"
     environment["PAGER"] = "cat"
     environment["GIT_PAGER"] = "cat"
     environment["GH_PROMPT_DISABLED"] = "1"
     environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["NO_COLOR"] = "1"
     return environment
 
+
+def _github_pr_view_auth_token(
+    executable: str, source: dict[str, str], host: str
+) -> str:
+    direct = (
+        _github_pr_view_direct_token(source, host)
+        if _trusted_owner_mode()
+        else None
+    )
+    if direct is not None:
+        return direct
+    process = subprocess.Popen(
+        [executable, "auth", "token", "--hostname", host],
+        cwd=HOME,
+        env=_github_pr_view_auth_lookup_environment(source, host),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        stdout_raw, _stderr_raw = process.communicate(
+            timeout=_GITHUB_PR_VIEW_AUTH_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(process)
+        raise RuntimeError("trusted GitHub credential lookup timed out") from exc
+    if process.returncode != 0:
+        raise RuntimeError("trusted GitHub credential lookup failed")
+    if len(stdout_raw) > _GITHUB_PR_VIEW_MAX_TOKEN_BYTES + 1:
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    try:
+        decoded = stdout_raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(
+            "trusted GitHub credential lookup returned invalid data"
+        ) from exc
+    lines = decoded.splitlines()
+    if len(lines) != 1:
+        raise RuntimeError("trusted GitHub credential lookup returned invalid data")
+    return _validated_github_pr_view_token(lines[0])
+
+
+def _github_pr_view_isolated_config_path() -> str:
+    path = _GITHUB_PR_VIEW_ISOLATED_CONFIG_PATH
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError("isolated GitHub configuration path is not verifiable") from exc
+    else:
+        raise RuntimeError("isolated GitHub configuration path must remain absent")
+    try:
+        parent = os.lstat(path.parent)
+    except OSError as exc:
+        raise RuntimeError("isolated GitHub configuration parent is unavailable") from exc
+    unsafe_write_bits = stat.S_IWGRP | stat.S_IWOTH
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or parent.st_mode & unsafe_write_bits
+    ):
+        raise RuntimeError(
+            "isolated GitHub configuration parent is writable by non-root users"
+        )
+    return str(path)
+
+
+def _github_pr_view_environment(*, host: str, token: str) -> dict[str, str]:
+    isolated = _github_pr_view_isolated_config_path()
+    credential = _validated_github_pr_view_token(token)
+    environment = {
+        "HOME": isolated,
+        "XDG_CONFIG_HOME": isolated,
+        "GH_CONFIG_DIR": isolated,
+        "GH_HOST": host,
+        "PATH": str(TRUSTED_GITHUB_CLI_PATH.parent),
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        "GH_PROMPT_DISABLED": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "NO_COLOR": "1",
+    }
+    # Bind exactly one credential family to the server-selected host. The
+    # network process receives neither the user's gh config/keyring paths nor
+    # proxy/browser/editor/loader overrides.
+    if host == _GITHUB_PR_VIEW_DEFAULT_HOST:
+        environment["GH_TOKEN"] = credential
+    else:
+        environment["GH_ENTERPRISE_TOKEN"] = credential
+    return environment
 
 def _resolve_cwd(cwd: str | None) -> Path:
     path = HOME if cwd is None else Path(cwd).expanduser()
@@ -5834,7 +5954,17 @@ def grabowski_github(
     command = _validate_argv(
         [trusted_github_cli, *arguments], cwd=working_directory
     )
-    environment = _github_pr_view_environment() if transport_exempt else None
+    if transport_exempt:
+        source_environment = _safe_environment()
+        github_host = _github_pr_view_host(source_environment)
+        github_token = _github_pr_view_auth_token(
+            trusted_github_cli, source_environment, github_host
+        )
+        environment = _github_pr_view_environment(
+            host=github_host, token=github_token
+        )
+    else:
+        environment = None
     return _run(
         command,
         cwd=working_directory,
