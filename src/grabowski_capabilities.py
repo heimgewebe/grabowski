@@ -458,6 +458,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_tailscale_status": {
+        "category": "diagnostics",
+        "purpose": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_privileged_action_reference": {
         "category": "privileged-reference",
         "purpose": "Create a non-executable reference contract for a future external privileged action.",
@@ -474,7 +481,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_fleet_list": {
         "category": "fleet",
-        "purpose": "Return the validated local and SSH host registry.",
+        "purpose": "Return a bounded projection of the validated local and SSH host registry.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",

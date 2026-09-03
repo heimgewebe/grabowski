@@ -102,7 +102,6 @@ def _privileged_broker_status() -> dict[str, Any]:
 @mcp.tool(name="grabowski_privileged_broker_status", annotations=READ_ONLY)
 def grabowski_privileged_broker_status() -> dict[str, Any]:
     """Inspect the fail-closed root-owned privileged broker installation."""
-    operator._require_operator_capability("privileged_reference")
     return _privileged_broker_status()
 
 POWER_ACTION = "operator_power_argv"

@@ -586,8 +586,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_git_diff": (),
     "grabowski_git_log": (),
     "grabowski_git_show": (),
-    "grabowski_github_pr_view": ("github_cli",),
-    "grabowski_github_checks": ("github_cli",),
+    "grabowski_github_pr_view": (),
+    "grabowski_github_checks": (),
+    "grabowski_tailscale_status": (),
     "grabowski_service_status": ("user_service_control",),
     "grabowski_service_logs": ("user_service_control",),
     "grabowski_runtime_deploy_schedule": (
@@ -675,7 +676,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_ports": ("port_inspect",),
     "grabowski_privileged_action_reference": ("privileged_reference",),
     "grabowski_power_run": ("power_execute",),
-    "grabowski_fleet_list": ("terminal_execute",),
+    "grabowski_fleet_list": (),
     "grabowski_fleet_run": ("terminal_execute",),
     "grabowski_juno_status": ("terminal_execute",),
     "grabowski_juno_pair": ("terminal_execute",),
@@ -697,7 +698,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_operation_list": ("terminal_execute",),
     "grabowski_operation_plan": ("terminal_execute",),
     "grabowski_operation_run": ("terminal_execute",),
-    "grabowski_privileged_broker_status": ("privileged_reference",),
+    "grabowski_privileged_broker_status": (),
     "grabowski_task_start": ("durable_job",),
     "grabowski_task_routing_shadow_seal": ("durable_job",),
     "grabowski_task_status": ("durable_job",),
@@ -786,8 +787,6 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_text_artifact_read",
     "grabowski_merge_delivery_record",
     "grabowski_host_capability_resolve",
-    "grabowski_github_pr_view",
-    "grabowski_github_checks",
     "grabowski_service_status",
     "grabowski_service_logs",
     "grabowski_runtime_deploy_schedule",
@@ -838,7 +837,6 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_ports",
     "grabowski_privileged_action_reference",
     "grabowski_power_run",
-    "grabowski_fleet_list",
     "grabowski_fleet_run",
     "grabowski_juno_status",
     "grabowski_juno_pair",
@@ -860,7 +858,6 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_operation_list",
     "grabowski_operation_plan",
     "grabowski_operation_run",
-    "grabowski_privileged_broker_status",
     "grabowski_connector_transport_diagnostics",
     "grabowski_task_start",
     "grabowski_task_routing_shadow_seal",
@@ -9841,7 +9838,7 @@ def repoground_range_get(
 
 
 _OPERATIONAL_RUNBOOK_CONTRACT = "operational-runbook.v1"
-_OPERATIONAL_RUNBOOK_STATUSES = {"active", "experimental", "deprecated", "historical"}
+_OPERATIONAL_RUNBOOK_STATUSES = {"active", "deprecated", "superseded", "draft"}
 _OPERATIONAL_GUIDANCE_NON_CLAIMS = [
     "current_state",
     "root_cause",
@@ -9866,6 +9863,7 @@ def _operational_guidance_string_list(
     max_length: int = 160,
     tokenized: bool = False,
     allow_empty: bool = False,
+    schema_strict: bool = False,
 ) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"{label} must be a list")
@@ -9875,15 +9873,25 @@ def _operational_guidance_string_list(
     for item in value:
         if not isinstance(item, str):
             raise ValueError(f"{label} entries must be strings")
-        normalized = item.strip().lower() if tokenized else item.strip()
-        if not normalized or len(normalized) > max_length:
+        if schema_strict and len(item) > max_length:
+            raise ValueError(f"{label} entries must be non-empty and bounded")
+        normalized = item.strip()
+        if tokenized and not schema_strict:
+            normalized = normalized.lower()
+        if not normalized or (not schema_strict and len(normalized) > max_length):
             raise ValueError(f"{label} entries must be non-empty and bounded")
         if any(ord(ch) < 32 for ch in normalized):
             raise ValueError(f"{label} entries must not contain control characters")
-        if tokenized and _OPERATIONAL_RUNBOOK_TOKEN_RE.fullmatch(normalized) is None:
+        if tokenized and (
+            (schema_strict and normalized != item)
+            or _OPERATIONAL_RUNBOOK_TOKEN_RE.fullmatch(normalized) is None
+        ):
             raise ValueError(f"{label} entries must use normalized operational tokens")
-        if normalized not in result:
-            result.append(normalized)
+        if normalized in result:
+            if schema_strict:
+                raise ValueError(f"{label} must not contain duplicate entries")
+            continue
+        result.append(normalized)
     if not result and not allow_empty:
         raise ValueError(f"{label} must not be empty")
     return result
@@ -10175,7 +10183,7 @@ def _operational_guidance_validate_runbook(metadata: dict[str, Any]) -> dict[str
     if status not in _OPERATIONAL_RUNBOOK_STATUSES:
         raise ValueError("operational runbook status is invalid")
     title = metadata.get("title")
-    if not isinstance(title, str) or not title.strip() or len(title.strip()) > 160:
+    if not isinstance(title, str) or not title.strip() or len(title) > 160:
         raise ValueError("operational runbook title is invalid")
     applies_to = metadata.get("applies_to")
     if not isinstance(applies_to, dict) or set(applies_to) != {
@@ -10193,29 +10201,43 @@ def _operational_guidance_validate_runbook(metadata: dict[str, Any]) -> dict[str
         "title": title.strip(),
         "applies_to": {
             "operations": _operational_guidance_string_list(
-                applies_to["operations"], label="applies_to.operations", tokenized=True
+                applies_to["operations"],
+                label="applies_to.operations",
+                tokenized=True,
+                schema_strict=True,
             ),
             "platforms": _operational_guidance_string_list(
-                applies_to["platforms"], label="applies_to.platforms", tokenized=True
+                applies_to["platforms"],
+                label="applies_to.platforms",
+                tokenized=True,
+                schema_strict=True,
             ),
             "components": _operational_guidance_string_list(
-                applies_to["components"], label="applies_to.components", tokenized=True
+                applies_to["components"],
+                label="applies_to.components",
+                tokenized=True,
+                schema_strict=True,
             ),
         },
         "symptoms": _operational_guidance_string_list(
-            metadata.get("symptoms"), label="symptoms", tokenized=True
+            metadata.get("symptoms"),
+            label="symptoms",
+            tokenized=True,
+            schema_strict=True,
         ),
         "evidence_refs": _operational_guidance_string_list(
             metadata.get("evidence_refs"),
             label="evidence_refs",
             max_items=16,
             max_length=400,
+            schema_strict=True,
         ),
         "does_not_establish": _operational_guidance_string_list(
             metadata.get("does_not_establish"),
             label="does_not_establish",
             max_items=32,
             max_length=200,
+            schema_strict=True,
         ),
     }
     verified_against = metadata.get("verified_against")

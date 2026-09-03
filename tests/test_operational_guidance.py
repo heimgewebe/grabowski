@@ -139,6 +139,48 @@ class OperationalGuidanceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "verified_against"):
             mcp._operational_guidance_validate_runbook(parsed)
 
+    def test_runtime_does_not_normalize_schema_invalid_metadata_into_acceptance(self) -> None:
+        base = metadata(
+            "infra.windows-tailnet-openssh",
+            operation="ssh_diagnostics",
+            platform="windows",
+            component="tailscale",
+            symptom="ssh_timeout",
+        )
+        base["applies_to"]["platforms"] = ["WINDOWS"]
+        with self.assertRaisesRegex(ValueError, "normalized operational tokens"):
+            mcp._operational_guidance_validate_runbook(base)
+
+        duplicate = metadata(
+            "infra.windows-tailnet-openssh",
+            operation="ssh_diagnostics",
+            platform="windows",
+            component="tailscale",
+            symptom="ssh_timeout",
+        )
+        duplicate["symptoms"] = ["ssh_timeout", "ssh_timeout"]
+        with self.assertRaisesRegex(ValueError, "duplicate entries"):
+            mcp._operational_guidance_validate_runbook(duplicate)
+
+        oversized_title = metadata(
+            "infra.windows-tailnet-openssh",
+            operation="ssh_diagnostics",
+            platform="windows",
+            component="tailscale",
+            symptom="ssh_timeout",
+        )
+        oversized_title["title"] = "x" * 160 + " "
+        with self.assertRaisesRegex(ValueError, "title is invalid"):
+            mcp._operational_guidance_validate_runbook(oversized_title)
+
+    def test_public_input_token_normalization_remains_tolerant(self) -> None:
+        self.assertEqual(
+            mcp._operational_guidance_string_list(
+                [" WINDOWS ", "windows"], label="platforms", tokenized=True, allow_empty=True
+            ),
+            ["windows"],
+        )
+
     def test_metadata_filter_runs_before_semantic_ranking(self) -> None:
         row = metadata(
             "infra.windows-tailnet-openssh",
@@ -677,6 +719,10 @@ class OperationalGuidanceReviewRegressionTests(unittest.TestCase):
         contract = json.loads((ROOT / "contracts/operational-runbook.v1.json").read_text(encoding="utf-8"))
         self.assertEqual(contract["$id"], "operational-runbook.v1")
         self.assertFalse(contract["additionalProperties"])
+        self.assertEqual(
+            set(contract["properties"]["status"]["enum"]),
+            mcp._OPERATIONAL_RUNBOOK_STATUSES,
+        )
         expected = {
             "contract", "id", "status", "title", "applies_to", "symptoms",
             "evidence_refs", "verified_against", "does_not_establish",

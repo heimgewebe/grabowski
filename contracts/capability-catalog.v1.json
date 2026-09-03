@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "74af0172a58d9e2700847e9db47f717c7ce9160a752148c90b325d0bf6f12c41",
+  "capability_source_sha256": "da4477924ee5d8d7b4fa305a9373dfb958dd9e4e9cce564e1118896193626cd1",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "93e20c549369f8d938cf41f6916388a740328f7d6dfaf3eafce3701b1c1f6e4e",
+  "contract_sha256": "2ac459a3206001f36f9a5bc5051d98ccc1ed8ec1a3e61de47c5403fe5f215dd8",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1007,6 +1007,17 @@
       "tool": "grabowski_ports"
     },
     {
+      "category": "diagnostics",
+      "description": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
+      "effects": [],
+      "id": "grabowski_tailscale_status",
+      "purpose": "Read bounded local Tailscale node and peer health without account records or mutation controls.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_tailscale_status"
+    },
+    {
       "category": "privileged-reference",
       "description": "Create a strict reference for a future privileged action without executing it.",
       "effects": [],
@@ -1033,10 +1044,10 @@
     },
     {
       "category": "fleet",
-      "description": "Return the validated local and SSH host registry.",
+      "description": "Return a bounded projection of the validated local and SSH host registry.",
       "effects": [],
       "id": "grabowski_fleet_list",
-      "purpose": "Return the validated local and SSH host registry.",
+      "purpose": "Return a bounded projection of the validated local and SSH host registry.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",

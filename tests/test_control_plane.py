@@ -1839,11 +1839,14 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             with patch.object(privileged, "BROKER", root / "missing-broker"), patch.object(
                 privileged, "BROKER_CONFIG", root / "missing-config"
             ), patch.object(
-                privileged.operator, "_require_operator_capability"
-            ), patch.object(
+                privileged.operator,
+                "_require_operator_capability",
+                side_effect=AssertionError("status read must not require privileged authority"),
+            ) as guard, patch.object(
                 privileged.shutil, "which", return_value=None
             ):
                 result = privileged.grabowski_privileged_broker_status()
+            guard.assert_not_called()
             self.assertFalse(result["ready"])
             self.assertTrue(result["fail_closed"])
 
