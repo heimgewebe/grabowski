@@ -10382,6 +10382,127 @@ class TaskTests(unittest.TestCase):
             {result["task"]["unit"]},
             {item["executor_unit"] for item in metadata.values()},
         )
+        self.assertEqual(
+            {result["task"]["task_id"]},
+            {
+                item[tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_METADATA_KEY][
+                    "task_id"
+                ]
+                for item in metadata.values()
+            },
+        )
+
+    def test_runtime_refresh_orphan_server_acquisition_recovers_without_binding_journal(
+        self,
+    ) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        old_task_id = "7" * 24
+        old_unit = f"grabowski-task-{old_task_id}-a1.service"
+        request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"],
+            fixture["intent"],
+            fixture["authority"],
+            old_task_id,
+            old_unit,
+        )
+        acquisition_journal = tasks._runtime_refresh_prelaunch_acquisition_journal(
+            request
+        )
+        tasks._persist_runtime_refresh_prelaunch_acquisition_journal(
+            acquisition_journal
+        )
+        acquisition = tasks._acquire_missing_runtime_refresh_prelaunch_leases(
+            request, fixture["intent"]
+        )
+        self.assertIsNotNone(acquisition)
+        metadata = self._runtime_refresh_lease_metadata(fixture["resource_keys"])
+        self.assertEqual(
+            {old_task_id},
+            {
+                item[tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_METADATA_KEY][
+                    "task_id"
+                ]
+                for item in metadata.values()
+            },
+        )
+        recovery = tasks._reconcile_runtime_refresh_prelaunch_binding_journals(
+            fixture["resource_keys"]
+        )
+        released = [
+            item
+            for item in recovery["acquisition_recovery"]["recovered"]
+            if item.get("action") == "server_acquisition_released"
+        ]
+        self.assertEqual(1, len(released))
+        self.assertEqual(old_task_id, released[0]["task_id"])
+        self.assertEqual(set(fixture["resource_keys"]), set(released[0]["resource_keys"]))
+        self.assertEqual(
+            [None] * len(fixture["resource_keys"]),
+            [tasks.resources.inspect_resource(key) for key in fixture["resource_keys"]],
+        )
+
+    def test_runtime_refresh_orphan_server_acquisition_recovers_after_binding_journal(
+        self,
+    ) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        old_task_id = "8" * 24
+        old_unit = f"grabowski-task-{old_task_id}-a1.service"
+        request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"],
+            fixture["intent"],
+            fixture["authority"],
+            old_task_id,
+            old_unit,
+        )
+        acquisition_journal = tasks._runtime_refresh_prelaunch_acquisition_journal(
+            request
+        )
+        tasks._persist_runtime_refresh_prelaunch_acquisition_journal(
+            acquisition_journal
+        )
+        acquisition = tasks._acquire_missing_runtime_refresh_prelaunch_leases(
+            request, fixture["intent"]
+        )
+        self.assertIsNotNone(acquisition)
+        plan = tasks.resources.prepare_runtime_refresh_executor_lease_binding(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            expected_approval_task_id=fixture["approval_task_id"],
+            expected_intent_sha256=fixture["intent_sha256"],
+        )
+        journal = tasks._runtime_refresh_prelaunch_binding_journal(
+            request, argv_sha256="9" * 64, binding_plan=plan
+        )
+        tasks._persist_runtime_refresh_prelaunch_binding_journal(journal)
+        tasks.resources.bind_runtime_refresh_executor_leases(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            old_unit,
+            prepared_binding=plan,
+        )
+        recovery = tasks._reconcile_runtime_refresh_prelaunch_binding_journals(
+            fixture["resource_keys"]
+        )
+        self.assertTrue(
+            any(
+                item.get("task_id") == old_task_id
+                and item.get("action") in {"restored", "already_original"}
+                for item in recovery["recovered"]
+            )
+        )
+        released = [
+            item
+            for item in recovery["acquisition_recovery"]["recovered"]
+            if item.get("task_id") == old_task_id
+            and item.get("action") == "server_acquisition_released"
+        ]
+        self.assertEqual(1, len(released))
+        self.assertEqual(set(fixture["resource_keys"]), set(released[0]["resource_keys"]))
+        self.assertEqual(
+            [None] * len(fixture["resource_keys"]),
+            [tasks.resources.inspect_resource(key) for key in fixture["resource_keys"]],
+        )
 
     def test_runtime_refresh_task_reclaims_expired_foreign_intent_lease(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()
