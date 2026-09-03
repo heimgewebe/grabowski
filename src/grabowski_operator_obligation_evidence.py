@@ -861,9 +861,19 @@ def _github_v2_merge_group_bindings_valid(
             or binding.get("event") != "merge_group"
             or binding.get("head_sha") != merge_sha
             or binding.get("head_branch") != expected_queue_branch
-            or binding.get("pull_requests") not in ([], [expected_pull])
         ):
             return False
+        pulls = binding.get("pull_requests")
+        if not isinstance(pulls, list):
+            return False
+        if pulls:
+            expected_number_bindings = [
+                pull
+                for pull in pulls
+                if isinstance(pull, Mapping) and pull.get("number") == pr
+            ]
+            if expected_number_bindings != [expected_pull]:
+                return False
     return True
 
 
