@@ -1858,6 +1858,17 @@
       "tool": "grabowski_systemkatalog_query"
     },
     {
+      "category": "knowledge",
+      "description": "Return bounded, cited operational runbook guidance without execution authority.",
+      "effects": [],
+      "id": "grabowski_operational_guidance",
+      "purpose": "Return bounded, source-cited operational runbook guidance in shadow mode without task, policy, retry, recovery or execution authority.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operational_guidance"
+    },
+    {
       "category": "bureau",
       "description": "Record one source-bound Bureau candidate through the canonical typed intake contract.",
       "effects": [
@@ -2992,6 +3003,7 @@
       "grabowski_context_fabric_compare",
       "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
+      "grabowski_operational_guidance",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -3586,7 +3598,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "6ceac03492515358aa12c4ff1bb6660f908917a33f06f77d63dca73af30367ec"
+      "sha256": "da4477924ee5d8d7b4fa305a9373dfb958dd9e4e9cce564e1118896193626cd1"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3594,7 +3606,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "c60e84c3799fd2270ef7c975681ca0e46b1cc53c4811cbee59217ac914a43f60"
+      "sha256": "2ac459a3206001f36f9a5bc5051d98ccc1ed8ec1a3e61de47c5403fe5f215dd8"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3667,7 +3679,7 @@
       "src/grabowski_lifecycle_projection.py": "d96605f48290074d80a86815063144eb4c98df7dc16338eef1e3f11530c4c114",
       "src/grabowski_lifecycle_read_surface.py": "ed8a123c80751204ccb095ce1b5ef77b15310e9aed4b555167a60c4a3d51f467",
       "src/grabowski_managed_cargo.py": "153723e0299cf9b1c624cd342ebf73daf9e05b71c695babba4ed1ed2ca59497e",
-      "src/grabowski_mcp.py": "24c3b0613f45d2c923d400844cff05a88fa4dfb15e6b1f30fb607dcad96a27b8",
+      "src/grabowski_mcp.py": "b5703e7715c434ebe8fc82320bd0dd307131e18a914244456d8f8c1041a00376",
       "src/grabowski_merge_authority.py": "5bfe922272e0a294a20066f140c453c8f613b077aaca39eb01c0bf2f6c985f28",
       "src/grabowski_merge_delivery.py": "6f11c5c7c49efdba215a2c7c49563f8c43ebd798de9ff915408a837b11dc5064",
       "src/grabowski_merge_delivery_surface.py": "97bf36785d928c7070a1e294d7b510d126cb06f63e6f26f62d5130c96e3a8b5e",
