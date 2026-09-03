@@ -1062,18 +1062,41 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(binding["readback_status"], "unresolvable")
         self.assertFalse(binding["stable"])
 
-    def test_service_status_uses_property_allowlist(self) -> None:
+    def test_service_status_uses_property_allowlist_without_control_capability(self) -> None:
         result = {"returncode": 0, "stdout": "LoadState=loaded\nActiveState=active\n", "stderr": ""}
-        with patch.object(read_surface.operator, "_require_operator_capability"), patch.object(read_surface.operator, "_validate_unit", return_value="demo.service"), patch.object(read_surface, "_run_read", return_value=result) as runner:
+        with patch.object(
+            read_surface.operator,
+            "_require_operator_capability",
+            side_effect=AssertionError("typed service read must not require control authority"),
+        ) as capability_gate, patch.object(
+            read_surface.operator, "_validate_unit", return_value="demo.service"
+        ), patch.object(read_surface, "_run_read", return_value=result) as runner:
             response = read_surface.grabowski_service_status("demo.service")
+        capability_gate.assert_not_called()
         argv = runner.call_args.args[0]
         self.assertEqual(argv[:4], ["systemctl", "--user", "show", "demo.service"])
         self.assertNotIn("status", argv)
         self.assertEqual(response["properties"]["ActiveState"], "active")
         self.assertEqual(response["stdout"], "")
 
+    def test_service_logs_are_bounded_read_without_control_capability(self) -> None:
+        result = {"returncode": 0, "stdout": "one line\n", "stderr": ""}
+        with patch.object(
+            read_surface.operator,
+            "_require_operator_capability",
+            side_effect=AssertionError("typed service read must not require control authority"),
+        ) as capability_gate, patch.object(
+            read_surface.operator, "_validate_unit", return_value="demo.service"
+        ), patch.object(read_surface, "_run_read", return_value=result) as runner:
+            response = read_surface.grabowski_service_logs("demo.service", 5)
+        capability_gate.assert_not_called()
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv[:4], ["journalctl", "--user", "--unit", "demo.service"])
+        self.assertEqual(argv[-2:], ["--lines", "5"])
+        self.assertEqual(response, result)
+
     def test_service_logs_bounds_lines(self) -> None:
-        with patch.object(read_surface.operator, "_require_operator_capability"), patch.object(read_surface.operator, "_validate_unit", return_value="demo.service"):
+        with patch.object(read_surface.operator, "_validate_unit", return_value="demo.service"):
             with self.assertRaises(ValueError):
                 read_surface.grabowski_service_logs("demo.service", 0)
             with self.assertRaises(ValueError):

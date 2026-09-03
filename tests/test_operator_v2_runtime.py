@@ -1716,6 +1716,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             "grabowski_tailscale_status",
             "grabowski_fleet_list",
             "grabowski_privileged_broker_status",
+            "grabowski_service_status",
+            "grabowski_service_logs",
         ):
             with self.subTest(tool=tool):
                 self.assertEqual(requirements[tool], ())
