@@ -1201,6 +1201,9 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 payload,
                 pr=pr,
                 run_pull_requests_overrides={merge_run: batch_pulls},
+                run_head_branch_overrides={
+                    merge_run: f"gh-readonly-queue/main/pr-950-{base}"
+                },
             ),
         ):
             prepared = evidence.prepare_evidence(
