@@ -5073,7 +5073,7 @@ def deploy_url(
 
         phase = "start-operator"
         start_service(OPERATOR_SERVICE)
-        verify_operator_process(
+        _verify_operator_process_after_start(
             runtime,
             snapshot.contract,
             release_hint=build.release_path,
