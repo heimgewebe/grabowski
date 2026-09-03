@@ -2218,8 +2218,13 @@ def grabowski_tailscale_status() -> dict[str, Any]:
             json_valid=False,
         )
     return {
-        **parsed,
         "available": True,
+        "returncode": parsed.get("returncode"),
+        "timed_out": bool(parsed.get("timed_out")),
+        "duration_seconds": parsed.get("duration_seconds"),
+        "stdout_truncated": bool(parsed.get("stdout_truncated")),
+        "stderr_truncated": bool(parsed.get("stderr_truncated")),
+        "json_valid": True,
         "data": data,
         "redacted_source_fields": ["User", "CurrentTailnet", "PublicKey", "UserID", "Addrs", "PeerAPIURL", "CapMap", "Capabilities"],
     }

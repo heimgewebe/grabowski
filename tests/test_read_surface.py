@@ -508,13 +508,26 @@ class ReadSurfaceTests(unittest.TestCase):
             "CurrentTailnet": {"Name": "private@example.test"},
             "Health": [],
         }
-        result = {"returncode": 0, "timed_out": False, "stdout_truncated": False, "stderr_truncated": False, "stdout": json.dumps(payload), "stderr": ""}
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": json.dumps(payload),
+            "stderr": "warning private@example.test nodekey:secret",
+        }
         with patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"), patch.object(read_surface, "_run_read", return_value=result) as runner:
             response = read_surface.grabowski_tailscale_status()
         self.assertEqual(runner.call_args.args[0], ["/usr/bin/tailscale", "status", "--json"])
-        encoded = json.dumps(response["data"], sort_keys=True)
-        for forbidden in ("private@example.test", "secret-key", "peer-key", "1.2.3.4:123", "PeerAPIURL", "PublicKey", "UserID"):
-            self.assertNotIn(forbidden, encoded)
+        encoded = json.dumps(response, sort_keys=True)
+        for forbidden_value in ("private@example.test", "nodekey:secret", "secret-key", "peer-key", "1.2.3.4:123"):
+            self.assertNotIn(forbidden_value, encoded)
+        projected = json.dumps(response["data"], sort_keys=True)
+        for forbidden_field in ("PeerAPIURL", "PublicKey", "UserID", "Addrs"):
+            self.assertNotIn(forbidden_field, projected)
+        self.assertNotIn("stdout", response)
+        self.assertNotIn("stderr", response)
         self.assertEqual(response["data"]["peer_count"], 1)
 
     def test_tailscale_status_failure_never_returns_valid_json_payload(self) -> None:
