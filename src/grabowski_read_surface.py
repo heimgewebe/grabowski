@@ -1358,6 +1358,48 @@ def _github_check_projection(payload: Any) -> dict[str, Any]:
     }
 
 
+def _github_status_projection(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("GitHub commit-status response is not an object")
+    raw_state = payload.get("state")
+    state = raw_state.lower() if isinstance(raw_state, str) else None
+    bucket = (
+        "pass"
+        if state == "success"
+        else "pending"
+        if state == "pending"
+        else "fail"
+    )
+    return {
+        "bucket": bucket,
+        "completedAt": payload.get("updated_at") if state != "pending" else None,
+        "description": payload.get("description"),
+        "event": None,
+        "link": payload.get("target_url"),
+        "name": payload.get("context"),
+        "startedAt": payload.get("created_at"),
+        "state": state.upper() if isinstance(state, str) else None,
+        "workflow": None,
+    }
+
+
+def _tailscale_failure_projection(
+    result: dict[str, Any], *, reason: str, json_valid: bool | None
+) -> dict[str, Any]:
+    """Return only non-content execution metadata for a failed Tailscale read."""
+    return {
+        "available": True,
+        "returncode": result.get("returncode"),
+        "timed_out": bool(result.get("timed_out")),
+        "duration_seconds": result.get("duration_seconds"),
+        "stdout_truncated": bool(result.get("stdout_truncated")),
+        "stderr_truncated": bool(result.get("stderr_truncated")),
+        "json_valid": json_valid,
+        "reason": reason,
+        "data": None,
+    }
+
+
 def _tailscale_node_projection(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -2045,14 +2087,81 @@ def grabowski_github_checks(
         payload = result.get("data")
         runs = payload.get("check_runs") if isinstance(payload, dict) else None
         if not isinstance(runs, list):
-            return {**result, "json_valid": False, "json_error": "GitHub check-runs response lacks check_runs", "data": None}
+            return {
+                **result,
+                "json_valid": False,
+                "json_error": "GitHub check-runs response lacks check_runs",
+                "data": None,
+                "stage": "check_runs",
+                "head_sha": head_sha,
+            }
+        check_total = payload.get("total_count")
+        bounded_runs = runs[:100]
+        if isinstance(check_total, int) and check_total > len(bounded_runs):
+            return {
+                **result,
+                "json_valid": False,
+                "json_error": "GitHub check-runs exceed the bounded anonymous page",
+                "data": None,
+                "stage": "check_runs",
+                "head_sha": head_sha,
+            }
+
+        status_result = _github_rest_json(
+            f"/repos/{repo}/commits/{head_sha}/status?per_page=100"
+        )
+        if (
+            status_result.get("returncode") != 0
+            or status_result.get("json_valid") is not True
+        ):
+            return {
+                **status_result,
+                "stage": "commit_status",
+                "head_sha": head_sha,
+                "data": None,
+            }
+        status_payload = status_result.get("data")
+        statuses = (
+            status_payload.get("statuses")
+            if isinstance(status_payload, dict)
+            else None
+        )
+        if not isinstance(statuses, list):
+            return {
+                **status_result,
+                "json_valid": False,
+                "json_error": "GitHub combined-status response lacks statuses",
+                "data": None,
+                "stage": "commit_status",
+                "head_sha": head_sha,
+            }
+        status_total = status_payload.get("total_count")
+        bounded_statuses = statuses[:100]
+        if isinstance(status_total, int) and status_total > len(bounded_statuses):
+            return {
+                **status_result,
+                "json_valid": False,
+                "json_error": "GitHub status contexts exceed the bounded anonymous page",
+                "data": None,
+                "stage": "commit_status",
+                "head_sha": head_sha,
+            }
+
+        check_rows = [_github_check_projection(item) for item in bounded_runs]
+        status_rows = [_github_status_projection(item) for item in bounded_statuses]
         return {
             **result,
-            "data": [_github_check_projection(item) for item in runs[:100]],
+            "data": [*check_rows, *status_rows],
             "head_sha": head_sha,
-            "total_count": payload.get("total_count"),
-            "checks_truncated": isinstance(payload.get("total_count"), int) and payload["total_count"] > len(runs[:100]),
-            "field_availability": {"event": "unavailable_anonymous_rest", "workflow": "unavailable_anonymous_rest"},
+            "total_count": len(check_rows) + len(status_rows),
+            "check_run_count": len(check_rows),
+            "status_context_count": len(status_rows),
+            "checks_truncated": False,
+            "status_contexts_truncated": False,
+            "field_availability": {
+                "event": "unavailable_anonymous_rest",
+                "workflow": "unavailable_anonymous_rest",
+            },
         }
     result = _run_read(
         [
@@ -2081,20 +2190,33 @@ def grabowski_tailscale_status() -> dict[str, Any]:
             "reason": "tailscale executable is not installed",
             "data": None,
         }
-    parsed = _parse_json_result(
-        _run_read(
-            [executable, "status", "--json"],
-            cwd=operator.HOME,
-            timeout_seconds=20,
-            max_output_bytes=MAX_GITHUB_RESPONSE_BYTES,
-        )
+    raw = _run_read(
+        [executable, "status", "--json"],
+        cwd=operator.HOME,
+        timeout_seconds=20,
+        max_output_bytes=MAX_GITHUB_RESPONSE_BYTES,
     )
-    if parsed.get("returncode") != 0 or parsed.get("json_valid") is not True:
-        return parsed
+    if raw.get("returncode") != 0:
+        return _tailscale_failure_projection(
+            raw,
+            reason="tailscale_status_command_failed",
+            json_valid=None,
+        )
+    parsed = _parse_json_result(raw)
+    if parsed.get("json_valid") is not True:
+        return _tailscale_failure_projection(
+            parsed,
+            reason="tailscale_status_invalid_json",
+            json_valid=False,
+        )
     try:
         data = _tailscale_status_projection(parsed.get("data"))
-    except ValueError as exc:
-        return {**parsed, "json_valid": False, "json_error": str(exc), "data": None}
+    except ValueError:
+        return _tailscale_failure_projection(
+            parsed,
+            reason="tailscale_status_unexpected_shape",
+            json_valid=False,
+        )
     return {
         **parsed,
         "available": True,

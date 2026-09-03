@@ -351,18 +351,110 @@ class ReadSurfaceTests(unittest.TestCase):
                 ],
             },
         }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "success", "total_count": 0, "statuses": []},
+        }
         with (
             patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
-            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks]) as request,
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]) as request,
             patch.object(read_surface, "_run_read") as runner,
         ):
             response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
         runner.assert_not_called()
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, 3)
         self.assertEqual(response["head_sha"], "a" * 40)
         self.assertEqual(response["data"][0]["bucket"], "pass")
         self.assertEqual(response["data"][0]["state"], "SUCCESS")
         self.assertIsNone(response["data"][0]["workflow"])
+        self.assertEqual(response["check_run_count"], 1)
+        self.assertEqual(response["status_context_count"], 0)
+
+    def test_github_checks_anonymous_fallback_includes_legacy_status_contexts(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "b" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"total_count": 0, "check_runs": []},
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {
+                "state": "failure",
+                "total_count": 2,
+                "statuses": [
+                    {
+                        "state": "failure",
+                        "context": "legacy/required",
+                        "description": "required legacy status failed",
+                        "target_url": "https://ci.example/failure",
+                        "created_at": "2026-09-03T06:00:00Z",
+                        "updated_at": "2026-09-03T06:01:00Z",
+                    },
+                    {
+                        "state": "pending",
+                        "context": "legacy/pending",
+                        "description": "still running",
+                        "target_url": "https://ci.example/pending",
+                        "created_at": "2026-09-03T06:02:00Z",
+                        "updated_at": "2026-09-03T06:02:00Z",
+                    },
+                ],
+            },
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]) as request,
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertEqual(request.call_count, 3)
+        by_name = {item["name"]: item for item in response["data"]}
+        self.assertEqual(by_name["legacy/required"]["bucket"], "fail")
+        self.assertEqual(by_name["legacy/required"]["state"], "FAILURE")
+        self.assertEqual(by_name["legacy/pending"]["bucket"], "pending")
+        self.assertEqual(by_name["legacy/pending"]["state"], "PENDING")
+        self.assertEqual(response["check_run_count"], 0)
+        self.assertEqual(response["status_context_count"], 2)
+        self.assertEqual(response["total_count"], 2)
+
+    def test_github_checks_anonymous_fallback_fails_closed_on_truncated_status_contexts(self) -> None:
+        pull = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"head": {"sha": "c" * 40}},
+        }
+        checks = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"total_count": 0, "check_runs": []},
+        }
+        statuses = {
+            "returncode": 0,
+            "http_status": 200,
+            "json_valid": True,
+            "data": {"state": "pending", "total_count": 101, "statuses": [{}] * 100},
+        }
+        with (
+            patch.object(read_surface.operator, "_require_operator_capability", side_effect=PermissionError("disabled")),
+            patch.object(read_surface, "_github_rest_json", side_effect=[pull, checks, statuses]),
+        ):
+            response = read_surface.grabowski_github_checks("heimgewebe/grabowski", 546)
+        self.assertFalse(response["json_valid"])
+        self.assertEqual(response["stage"], "commit_status")
+        self.assertIsNone(response["data"])
+        self.assertIn("exceed", response["json_error"])
 
     def test_github_rest_projection_preserves_gh_state_enums(self) -> None:
         merged = read_surface._github_pr_projection(
@@ -424,6 +516,57 @@ class ReadSurfaceTests(unittest.TestCase):
         for forbidden in ("private@example.test", "secret-key", "peer-key", "1.2.3.4:123", "PeerAPIURL", "PublicKey", "UserID"):
             self.assertNotIn(forbidden, encoded)
         self.assertEqual(response["data"]["peer_count"], 1)
+
+    def test_tailscale_status_failure_never_returns_valid_json_payload(self) -> None:
+        secret_payload = {
+            "CurrentTailnet": {"Name": "private@example.test"},
+            "Self": {"PublicKey": "nodekey:secret", "UserID": 42},
+        }
+        result = {
+            "returncode": 1,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": json.dumps(secret_payload),
+            "stderr": "private@example.test",
+        }
+        with (
+            patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(read_surface, "_run_read", return_value=result),
+        ):
+            response = read_surface.grabowski_tailscale_status()
+        encoded = json.dumps(response, sort_keys=True)
+        self.assertNotIn("private@example.test", encoded)
+        self.assertNotIn("nodekey:secret", encoded)
+        self.assertNotIn("stdout", response)
+        self.assertNotIn("stderr", response)
+        self.assertIsNone(response["data"])
+        self.assertEqual(response["reason"], "tailscale_status_command_failed")
+
+    def test_tailscale_status_invalid_json_never_returns_raw_stdout(self) -> None:
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "duration_seconds": 0.1,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": "private@example.test nodekey:secret not-json",
+            "stderr": "",
+        }
+        with (
+            patch.object(read_surface.shutil, "which", return_value="/usr/bin/tailscale"),
+            patch.object(read_surface, "_run_read", return_value=result),
+        ):
+            response = read_surface.grabowski_tailscale_status()
+        encoded = json.dumps(response, sort_keys=True)
+        self.assertNotIn("private@example.test", encoded)
+        self.assertNotIn("nodekey:secret", encoded)
+        self.assertNotIn("stdout", response)
+        self.assertNotIn("stderr", response)
+        self.assertFalse(response["json_valid"])
+        self.assertEqual(response["reason"], "tailscale_status_invalid_json")
+        self.assertIsNone(response["data"])
 
     def test_git_status_uses_fixed_arguments(self) -> None:
         repo = Path("/tmp/repository")
