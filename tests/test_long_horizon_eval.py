@@ -177,6 +177,30 @@ class LongHorizonEvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(evaluator.TraceError, "without requirement"):
             evaluator.evaluate_records(records)
 
+    def test_non_monotone_steps_are_rejected(self) -> None:
+        records = evaluator.parse_jsonl(
+            "\n".join(
+                [
+                    event("r1", 2, "run.started"),
+                    event("r1", 1, "run.terminal"),
+                ]
+            )
+        )
+        with self.assertRaisesRegex(evaluator.TraceError, "steps must be monotone"):
+            evaluator.evaluate_records(records)
+
+    def test_event_after_terminal_at_same_step_is_rejected(self) -> None:
+        records = evaluator.parse_jsonl(
+            "\n".join(
+                [
+                    event("r1", 5, "run.terminal"),
+                    event("r1", 5, "commitment.declared", commitment_id="late"),
+                ]
+            )
+        )
+        with self.assertRaisesRegex(evaluator.TraceError, "events occur after run.terminal"):
+            evaluator.evaluate_records(records)
+
     def test_multi_run_aggregate_keeps_completion_and_abandonment_separate(self) -> None:
         result = evaluate(
             event("a", 0, "commitment.declared", commitment_id="ca"),

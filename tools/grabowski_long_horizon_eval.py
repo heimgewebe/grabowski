@@ -344,14 +344,19 @@ def evaluate_records(
 
     run_results: list[dict[str, Any]] = []
     for run_id in sorted(grouped):
-        events = sorted(grouped[run_id], key=lambda item: (item["step"], item["_ordinal"]))
+        events = grouped[run_id]
+        for previous, current in zip(events, events[1:]):
+            if current["step"] < previous["step"]:
+                raise TraceError(
+                    f"run {run_id}: steps must be monotone non-decreasing"
+                )
         terminal_events = [event for event in events if event["kind"] == "run.terminal"]
         if len(terminal_events) > 1:
             raise TraceError(f"run {run_id}: more than one run.terminal event")
+        if terminal_events and events[-1]["kind"] != "run.terminal":
+            raise TraceError(f"run {run_id}: events occur after run.terminal")
         terminal_step = terminal_events[0]["step"] if terminal_events else None
         max_step = max(event["step"] for event in events)
-        if terminal_step is not None and max_step > terminal_step:
-            raise TraceError(f"run {run_id}: events occur after run.terminal")
         observation_end_step = terminal_step if terminal_step is not None else max_step
 
         monitoring = _evaluate_monitoring(
