@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import stat
 from typing import Any
 from urllib.parse import urlsplit
@@ -273,6 +274,87 @@ def _filter_tools_list_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
     ).encode("utf-8")
 
 
+def _filter_tools_list_sse_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GatewayConfigurationError(
+            "upstream tools/list SSE response is not UTF-8"
+        ) from exc
+
+    parts = re.split(r"(\r\n\r\n|\n\n)", text)
+    saw_json_rpc_event = False
+    for index in range(0, len(parts), 2):
+        block = parts[index]
+        if not block:
+            continue
+        lines = block.splitlines()
+        data_indexes: list[int] = []
+        data_parts: list[str] = []
+        for line_index, line in enumerate(lines):
+            if not line.startswith("data:"):
+                continue
+            value = line[5:]
+            if value.startswith(" "):
+                value = value[1:]
+            data_indexes.append(line_index)
+            data_parts.append(value)
+        if not data_indexes or not any(data_parts):
+            # Keep comments, retry/id-only fields and the MCP resumability
+            # priming event byte-for-byte.
+            continue
+        data = "\n".join(data_parts)
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise GatewayConfigurationError(
+                "upstream tools/list SSE event is invalid JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise GatewayConfigurationError(
+                "upstream tools/list SSE event is not a JSON-RPC object"
+            )
+        if isinstance(payload.get("error"), dict):
+            saw_json_rpc_event = True
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict) or "tools" not in result:
+            raise GatewayConfigurationError(
+                "upstream tools/list SSE event has an unexpected result"
+            )
+        filtered = _filter_tools_list_payload(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            ),
+            allowed_tools,
+        ).decode("utf-8")
+        first_data = data_indexes[0]
+        lines[first_data] = f"data: {filtered}"
+        for extra_data in reversed(data_indexes[1:]):
+            del lines[extra_data]
+        newline = "\r\n" if "\r\n" in block else "\n"
+        parts[index] = newline.join(lines)
+        saw_json_rpc_event = True
+    if not saw_json_rpc_event:
+        raise GatewayConfigurationError(
+            "upstream tools/list SSE response has no JSON-RPC event"
+        )
+    return "".join(parts).encode("utf-8")
+
+
+def _filter_tools_list_response(
+    raw: bytes, content_type: str, allowed_tools: set[str]
+) -> bytes:
+    media_type = content_type.partition(";")[0].strip().lower()
+    if media_type == "application/json":
+        return _filter_tools_list_payload(raw, allowed_tools)
+    if media_type == "text/event-stream":
+        return _filter_tools_list_sse_payload(raw, allowed_tools)
+    raise GatewayConfigurationError(
+        "upstream tools/list response has an unsupported content type"
+    )
+
+
 class ExternalConnectorGateway:
     def __init__(
         self,
@@ -381,7 +463,12 @@ class ExternalConnectorGateway:
                 raw = await upstream.aread()
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise GatewayConfigurationError("upstream tools/list response is too large")
-                filtered = _filter_tools_list_payload(raw, set(self._allowed_tools))
+                content_type = upstream.headers.get("content-type", "")
+                filtered = _filter_tools_list_response(
+                    raw,
+                    content_type,
+                    set(self._allowed_tools),
+                )
                 headers = _response_headers(upstream)
             except (GatewayConfigurationError, ValueError):
                 await upstream.aclose()
@@ -396,7 +483,6 @@ class ExternalConnectorGateway:
             return Response(
                 filtered,
                 status_code=200,
-                media_type="application/json",
                 headers=headers,
             )
 

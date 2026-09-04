@@ -7,7 +7,6 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -185,6 +184,79 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
             ["grabowski_status"],
         )
         self.assertEqual(filtered["result"]["nextCursor"], "page-2")
+
+    def test_tools_list_projection_filters_streamable_http_sse(self) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {
+                "tools": [
+                    {"name": "grabowski_status", "inputSchema": {}},
+                    {"name": "grabowski_destroy_path", "inputSchema": {}},
+                ]
+            },
+        }
+        raw = (
+            "event: message\r\n"
+            f"data: {json.dumps(payload, separators=(',', ':'))}\r\n\r\n"
+        ).encode("utf-8")
+        filtered = gateway._filter_tools_list_response(
+            raw,
+            "text/event-stream; charset=utf-8",
+            {"grabowski_status"},
+        ).decode("utf-8")
+        data_line = next(
+            line for line in filtered.splitlines() if line.startswith("data: ")
+        )
+        projected = json.loads(data_line.removeprefix("data: "))
+        self.assertEqual(
+            [tool["name"] for tool in projected["result"]["tools"]],
+            ["grabowski_status"],
+        )
+        self.assertIn("event: message\r\n", filtered)
+        self.assertTrue(filtered.endswith("\r\n\r\n"))
+
+    def test_tools_list_projection_preserves_sse_priming_event(self) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "result": {"tools": [{"name": "grabowski_status", "inputSchema": {}}]},
+        }
+        priming = "id: priming-1\r\ndata: \r\n\r\n"
+        message = (
+            "event: message\r\n"
+            f"data: {json.dumps(payload, separators=(',', ':'))}\r\n\r\n"
+        )
+        filtered = gateway._filter_tools_list_response(
+            (priming + message).encode("utf-8"),
+            "text/event-stream",
+            {"grabowski_status"},
+        ).decode("utf-8")
+        self.assertTrue(filtered.startswith(priming))
+
+    def test_tools_list_projection_rejects_unprojectable_sse_event(self) -> None:
+        raw = (
+            "event: message\n"
+            'data: {"jsonrpc":"2.0","id":4,"result":{"prompts":[]}}\n\n'
+        ).encode("utf-8")
+        with self.assertRaisesRegex(
+            gateway.GatewayConfigurationError, "unexpected result"
+        ):
+            gateway._filter_tools_list_response(
+                raw,
+                "text/event-stream",
+                {"grabowski_status"},
+            )
+
+    def test_tools_list_projection_rejects_unknown_upstream_media_type(self) -> None:
+        with self.assertRaisesRegex(
+            gateway.GatewayConfigurationError, "unsupported content type"
+        ):
+            gateway._filter_tools_list_response(
+                b"{}",
+                "application/octet-stream",
+                {"grabowski_status"},
+            )
 
     def test_gateway_rejects_shared_external_and_internal_secret(self) -> None:
         with self.assertRaisesRegex(
