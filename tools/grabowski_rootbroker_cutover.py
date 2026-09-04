@@ -49,6 +49,7 @@ SOCKET_UNIT = "grabowski-privileged-broker.socket"
 OPERATOR_UNIT = "grabowski-operator.service"
 LEGACY_OPERATOR_WATCHDOG_TIMER = "grabowski-operator-watchdog.timer"
 CONFIGURED_TARGET = "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc"
+LEGACY_CONFIGURED_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
 CANONICAL_REPOSITORY = Path("/home/alex/repos/grabowski")
 CANONICAL_ORIGIN_URL = "git@github.com:heimgewebe/grabowski.git"
 CANONICAL_REMOTE_READ_URL = "https://github.com/heimgewebe/grabowski.git"
@@ -801,11 +802,22 @@ def _verify_running_helper(
         raise CutoverError("running cutover helper differs from expected commit")
 
 
+def _validate_repository_recovery_target(value: Any, *, automatic: bool) -> str:
+    if not isinstance(value, str):
+        raise CutoverError("recovery target must be a string")
+    if value == CONFIGURED_TARGET:
+        return value
+    if automatic and value == LEGACY_CONFIGURED_TARGET:
+        return value
+    raise CutoverError("recovery target differs from host contract")
+
+
 def _publisher_from_repository(
     repository: Path,
     *,
     expected_head: str,
     runner: RunCommand,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     relative_path = "config/privileged-actions.example.json"
     data = _repository_blob(
@@ -839,8 +851,9 @@ def _publisher_from_repository(
         raise CutoverError("recovery publisher must be enabled")
     if publisher.get("mode") != "recovery-marker-publish":
         raise CutoverError("recovery publisher mode is invalid")
-    if publisher.get("configured_target") != CONFIGURED_TARGET:
-        raise CutoverError("recovery publisher target differs from host contract")
+    _validate_repository_recovery_target(
+        publisher.get("configured_target"), automatic=automatic
+    )
     return json.loads(json.dumps(publisher))
 
 
@@ -849,6 +862,7 @@ def _lifecycle_from_repository(
     *,
     expected_head: str,
     runner: RunCommand,
+    automatic: bool = False,
 ) -> dict[str, Any] | None:
     relative_path = "config/privileged-actions.example.json"
     data = _repository_blob(
@@ -905,8 +919,9 @@ def _lifecycle_from_repository(
         "configured_target",
     }:
         raise CutoverError("blockade lifecycle recovery gate is invalid")
-    if gate.get("configured_target") != CONFIGURED_TARGET:
-        raise CutoverError("blockade lifecycle target differs from host contract")
+    _validate_repository_recovery_target(
+        gate.get("configured_target"), automatic=automatic
+    )
     return json.loads(json.dumps(lifecycle))
 
 
@@ -915,6 +930,7 @@ def _root_task_action_from_repository(
     *,
     expected_head: str,
     runner: RunCommand,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     relative_path = "config/privileged-actions.example.json"
     data = _repository_blob(
@@ -986,8 +1002,9 @@ def _root_task_action_from_repository(
     }
     if set(gate) != required_gate:
         raise CutoverError("root task start gate keys are invalid")
-    if gate.get("configured_target") != CONFIGURED_TARGET:
-        raise CutoverError("root task target differs from host contract")
+    _validate_repository_recovery_target(
+        gate.get("configured_target"), automatic=automatic
+    )
     return json.loads(json.dumps(root_task))
 
 
@@ -1169,6 +1186,7 @@ def _validate_root_task_coherence(
     *,
     publisher: dict[str, Any],
     lifecycle: dict[str, Any] | None,
+    configured_target: str,
 ) -> None:
     if lifecycle is None:
         raise CutoverError("root task cutover requires blockade lifecycle")
@@ -1183,7 +1201,7 @@ def _validate_root_task_coherence(
         "require_root_owned_gate_files": publisher[
             "require_root_owned_destination"
         ],
-        "configured_target": CONFIGURED_TARGET,
+        "configured_target": configured_target,
     }
     if root_task.get("start_gate") != expected_gate:
         raise CutoverError("root task start gate differs from publisher contract")
@@ -1222,6 +1240,10 @@ def merge_privileged_config(
     gate_before = power_before.get("gate")
     if not isinstance(gate_before, dict):
         raise CutoverError("installed operator power gate is malformed")
+
+    configured_target = _validate_repository_recovery_target(
+        publisher.get("configured_target"), automatic=allow_controlled_updates
+    )
 
     merged = json.loads(json.dumps(current))
     merged_actions = merged["actions"]
@@ -1286,7 +1308,7 @@ def merge_privileged_config(
                 raise CutoverError(
                     f"installed power gate differs from publisher contract: {gate_key}"
                 )
-        merged_gate["configured_target"] = CONFIGURED_TARGET
+        merged_gate["configured_target"] = configured_target
     else:
         legacy_path = publisher.get("legacy_kill_switch_path")
         if not isinstance(legacy_path, str) or not legacy_path.startswith("/"):
@@ -1301,7 +1323,7 @@ def merge_privileged_config(
             "require_root_owned_gate_files": publisher[
                 "require_root_owned_destination"
             ],
-            "configured_target": CONFIGURED_TARGET,
+            "configured_target": configured_target,
         }
         for key, value in gate_updates.items():
             merged_gate[key] = value
@@ -1327,7 +1349,7 @@ def merge_privileged_config(
             "require_root_owned_gate_files": publisher[
                 "require_root_owned_destination"
             ],
-            "configured_target": CONFIGURED_TARGET,
+            "configured_target": configured_target,
         }
         if lifecycle_gate != expected_lifecycle_gate:
             raise CutoverError("lifecycle recovery gate differs from publisher")
@@ -1338,6 +1360,7 @@ def merge_privileged_config(
             root_task,
             publisher=publisher,
             lifecycle=lifecycle,
+            configured_target=configured_target,
         )
         if (
             not allow_controlled_updates
@@ -1351,7 +1374,7 @@ def merge_privileged_config(
 
     expected_power = json.loads(json.dumps(power_before))
     if lifecycle is None:
-        expected_power["gate"]["configured_target"] = CONFIGURED_TARGET
+        expected_power["gate"]["configured_target"] = configured_target
     else:
         expected_power["gate"].update(gate_updates)
         expected_power["allowed_peer_unit"] = lifecycle["allowed_peer_unit"]
@@ -2006,16 +2029,19 @@ def _apply_cutover_locked(
         repository,
         expected_head=expected_head,
         runner=runner,
+        automatic=automatic,
     )
     lifecycle = _lifecycle_from_repository(
         repository,
         expected_head=expected_head,
         runner=runner,
+        automatic=automatic,
     )
     root_task = _root_task_action_from_repository(
         repository,
         expected_head=expected_head,
         runner=runner,
+        automatic=automatic,
     )
     process_observer = _process_observer_action_from_repository(
         repository, expected_head=expected_head, runner=runner
