@@ -355,6 +355,27 @@ def _filter_tools_list_response(
     )
 
 
+async def _read_bounded_upstream_response(
+    response: Any, *, maximum_bytes: int = MAX_RESPONSE_BYTES
+) -> bytes:
+    if maximum_bytes <= 0:
+        raise GatewayConfigurationError("upstream response size bound is invalid")
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        iterator = response.aiter_raw()
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        raise GatewayConfigurationError("upstream response stream is unavailable") from exc
+    async for chunk in iterator:
+        if not isinstance(chunk, bytes):
+            raise GatewayConfigurationError("upstream response stream returned invalid bytes")
+        total += len(chunk)
+        if total > maximum_bytes:
+            raise GatewayConfigurationError("upstream tools/list response is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class ExternalConnectorGateway:
     def __init__(
         self,
@@ -460,9 +481,7 @@ class ExternalConnectorGateway:
                 declared_response = upstream.headers.get("content-length")
                 if declared_response is not None and int(declared_response, 10) > MAX_RESPONSE_BYTES:
                     raise GatewayConfigurationError("upstream tools/list response is too large")
-                raw = await upstream.aread()
-                if len(raw) > MAX_RESPONSE_BYTES:
-                    raise GatewayConfigurationError("upstream tools/list response is too large")
+                raw = await _read_bounded_upstream_response(upstream)
                 content_type = upstream.headers.get("content-type", "")
                 filtered = _filter_tools_list_response(
                     raw,

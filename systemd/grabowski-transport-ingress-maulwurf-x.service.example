@@ -2,6 +2,9 @@
 Description=Grabowski signed transport ingress for Maulwurf X
 After=network.target grabowski-transport-ingress.service
 PartOf=grabowski-transport-ingress.service
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.token
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.tools.json
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/require-tool-policy
 StartLimitIntervalSec=300
 StartLimitBurst=10
 

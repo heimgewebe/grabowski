@@ -144,6 +144,17 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn(
             "WantedBy=grabowski-transport-ingress-maulwurf-x.service", gateway
         )
+        for required_path in (
+            "%h/.local/state/grabowski/transport-connectors/maulwurf-x.token",
+            "%h/.local/state/grabowski/transport-connectors/maulwurf-x.tools.json",
+            "%h/.local/state/grabowski/transport-connectors/require-tool-policy",
+        ):
+            self.assertIn(f"ConditionPathExists={required_path}", ingress)
+            self.assertIn(f"ConditionPathExists={required_path}", gateway)
+        self.assertIn(
+            "ConditionPathExists=%h/.local/state/grabowski/external-connectors/maulwurf-x.token",
+            gateway,
+        )
         self.assertNotIn("BindsTo=", ingress)
         self.assertNotIn("BindsTo=", gateway)
 

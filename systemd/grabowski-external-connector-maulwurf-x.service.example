@@ -3,6 +3,10 @@ Description=Grabowski external MCP gateway for Maulwurf X
 After=network.target grabowski-transport-ingress-maulwurf-x.service
 Wants=grabowski-transport-ingress-maulwurf-x.service
 PartOf=grabowski-transport-ingress-maulwurf-x.service
+ConditionPathExists=%h/.local/state/grabowski/external-connectors/maulwurf-x.token
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.token
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.tools.json
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/require-tool-policy
 StartLimitIntervalSec=300
 StartLimitBurst=10
 

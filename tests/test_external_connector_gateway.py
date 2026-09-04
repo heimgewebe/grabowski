@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,15 @@ class _MultiHeaders(_Headers):
 
     def getlist(self, name: str) -> list[str]:
         return list(self._values.get(name, []))
+
+
+class _StreamingResponse:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def aiter_raw(self):
+        for chunk in self._chunks:
+            yield chunk
 
 
 class ExternalConnectorGatewayTests(unittest.TestCase):
@@ -257,6 +267,28 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
                 "application/octet-stream",
                 {"grabowski_status"},
             )
+
+    def test_tools_list_upstream_read_is_bounded_while_streaming(self) -> None:
+        response = _StreamingResponse([b"abcd", b"efgh"])
+        with self.assertRaisesRegex(
+            gateway.GatewayConfigurationError, "too large"
+        ):
+            asyncio.run(
+                gateway._read_bounded_upstream_response(
+                    response, maximum_bytes=7
+                )
+            )
+
+    def test_tools_list_upstream_read_preserves_chunk_bytes(self) -> None:
+        response = _StreamingResponse([b"abc", b"", b"def"])
+        self.assertEqual(
+            asyncio.run(
+                gateway._read_bounded_upstream_response(
+                    response, maximum_bytes=6
+                )
+            ),
+            b"abcdef",
+        )
 
     def test_gateway_rejects_shared_external_and_internal_secret(self) -> None:
         with self.assertRaisesRegex(
