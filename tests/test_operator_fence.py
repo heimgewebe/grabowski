@@ -765,6 +765,7 @@ class OperatorFenceStoreTests(unittest.TestCase):
     def test_database_file_swap_is_detected(self) -> None:
         replacement = Path(self.temporary.name) / "replacement.sqlite3"
         shutil.copyfile(self.database, replacement)
+        os.chmod(replacement, 0o600)
         original_inode = self.database.stat().st_ino
         replacement_inode = replacement.stat().st_ino
         self.assertNotEqual(original_inode, replacement_inode)
