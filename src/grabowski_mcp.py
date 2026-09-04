@@ -501,6 +501,7 @@ OPERATOR_CAPABILITIES = (
     "durable_job",
     "git_cli",
     "github_cli",
+    "user_service_logs_read",
     "user_service_control",
     "tmux_interaction",
     "process_inspect",
@@ -589,8 +590,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_github_pr_view": (),
     "grabowski_github_checks": (),
     "grabowski_tailscale_status": (),
-    "grabowski_service_status": ("user_service_control",),
-    "grabowski_service_logs": ("user_service_control",),
+    "grabowski_service_status": (),
+    "grabowski_service_logs": ("user_service_logs_read",),
     "grabowski_runtime_deploy_schedule": (
         "durable_job",
         "git_cli",
@@ -776,6 +777,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
+    "grabowski_service_logs",
     "grabowski_work_acquire",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_task_propose",
@@ -787,8 +789,6 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_text_artifact_read",
     "grabowski_merge_delivery_record",
     "grabowski_host_capability_resolve",
-    "grabowski_service_status",
-    "grabowski_service_logs",
     "grabowski_runtime_deploy_schedule",
     "grabowski_recovery_provenance_assess",
     "grabowski_recovery_provenance_repair",

@@ -1710,16 +1710,23 @@ class OperatorV2RuntimeTests(unittest.TestCase):
     def test_g5_typed_reads_do_not_require_coarse_operator_capabilities(self) -> None:
         requirements = grabowski_mcp.TOOL_CAPABILITY_REQUIREMENTS
         operator_tools = grabowski_mcp.OPERATOR_CAPABILITY_REQUIREMENT_TOOLS
-        for tool in (
+        capability_free_tools = (
             "grabowski_github_pr_view",
             "grabowski_github_checks",
             "grabowski_tailscale_status",
             "grabowski_fleet_list",
             "grabowski_privileged_broker_status",
-        ):
+            "grabowski_service_status",
+        )
+        for tool in capability_free_tools:
             with self.subTest(tool=tool):
                 self.assertEqual(requirements[tool], ())
                 self.assertNotIn(tool, operator_tools)
+        self.assertEqual(
+            requirements["grabowski_service_logs"],
+            ("user_service_logs_read",),
+        )
+        self.assertIn("grabowski_service_logs", operator_tools)
         self.assertEqual(
             requirements["grabowski_recovery_status"],
             ("audit_verify",),

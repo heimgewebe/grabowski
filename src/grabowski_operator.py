@@ -350,6 +350,7 @@ OPERATOR_CAPABILITIES = (
     "durable_job",
     "git_cli",
     "github_cli",
+    "user_service_logs_read",
     "user_service_control",
     "tmux_interaction",
     "process_inspect",
