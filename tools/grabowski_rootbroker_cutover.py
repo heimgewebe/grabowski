@@ -912,6 +912,45 @@ def _stage_automatic_helper(
     return target
 
 
+def _verify_automatic_continuation_helper(
+    staged_helper: Path,
+    *,
+    repository: Path,
+    expected_head: str,
+    runner: RunCommand = _run,
+) -> dict[str, str]:
+    expected_head = _validate_commit_id(expected_head, label="expected_head")
+    expected_path = _automatic_staged_helper_path(expected_head)
+    resolved_helper = staged_helper.resolve(strict=True)
+    if staged_helper != expected_path or resolved_helper != expected_path:
+        raise CutoverError("automatic continuation staged helper path differs from contract")
+    if Path(__file__).resolve() != expected_path:
+        raise CutoverError("automatic continuation is not running from the staged helper")
+    if os.geteuid() != 0:
+        raise CutoverError("automatic continuation helper verification requires root")
+    data, metadata = _read_regular_file(expected_path, require_root_owned=True)
+    if (
+        stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+    ):
+        raise CutoverError("automatic continuation staged helper identity is invalid")
+    expected_data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=AUTOMATIC_HELPER_SOURCE,
+        runner=runner,
+    )
+    if data != expected_data:
+        raise CutoverError("automatic continuation staged helper differs from expected commit")
+    return {
+        "path": str(expected_path),
+        "sha256": _sha256(data),
+        "expected_head": expected_head,
+    }
+
+
 def _exec_staged_automatic_helper(
     staged_helper: Path,
     *,
@@ -2774,8 +2813,11 @@ def main() -> int:
             raise CutoverError("automatic continuation requires staged helper path")
         expected_staged = _automatic_staged_helper_path(args.expected_head)
         supplied_staged = Path(args.staged_helper_path)
-        if supplied_staged != expected_staged or Path(__file__).resolve() != expected_staged:
-            raise CutoverError("automatic continuation is not running from the staged helper")
+        _verify_automatic_continuation_helper(
+            supplied_staged,
+            repository=repository.resolve(strict=True),
+            expected_head=args.expected_head,
+        )
     elif args.staged_helper_path:
         raise CutoverError("staged helper path is valid only for automatic continuation")
 
