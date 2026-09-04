@@ -138,6 +138,29 @@ class BlockadeStoreTests(unittest.TestCase):
         self.assertEqual(receipt.transaction_id, "engage-1")
         self.assertTrue(receipt.to_mapping()["create_only"])
 
+    def test_read_uses_path_only_directory_traversal(self) -> None:
+        self.engage()
+        original = blockade_store._open_directory_chain
+        with mock.patch(
+            "grabowski_blockade_store._open_directory_chain",
+            wraps=original,
+        ) as open_chain:
+            snapshot = read_blockade_marker(
+                self.marker,
+                expected_marker_path=self.marker,
+            )
+        self.assertEqual(snapshot.record, self.item)
+        self.assertTrue(open_chain.call_args.kwargs["path_only"])
+
+    def test_path_only_directory_flags_use_o_path(self) -> None:
+        if not hasattr(os, "O_PATH"):
+            self.skipTest("Linux O_PATH is required by the production contract")
+        path_only = blockade_store._directory_flags(path_only=True)
+        readable = blockade_store._directory_flags()
+        self.assertTrue(path_only & os.O_PATH)
+        self.assertTrue(path_only & os.O_DIRECTORY)
+        self.assertFalse(readable & os.O_PATH)
+
     def test_exact_engage_rollback_removes_only_matching_marker(self) -> None:
         receipt = self.engage()
         result = rollback_engaged_marker(
