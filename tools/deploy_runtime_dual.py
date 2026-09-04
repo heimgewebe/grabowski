@@ -94,6 +94,13 @@ TUNNEL_OPERATOR_DEPENDENCY_PATH = (
     core.HOME
     / ".config/systemd/user/tunnel-client-grabowski.service.d/70-operator-dependency.conf"
 )
+OPERATOR_RECOVERY_TARGET_RELATIVE = Path(
+    "systemd/grabowski-operator.service.d/90-recovery-target.conf.example"
+)
+OPERATOR_RECOVERY_TARGET_PATH = (
+    core.HOME
+    / ".config/systemd/user/grabowski-operator.service.d/90-recovery-target.conf"
+)
 TUNNEL_OPERATOR_DEPENDENCY_EXPECTED_DIRECTIVES = {
     "Unit": {
         "Wants": TRANSPORT_INGRESS_SERVICE,
@@ -164,6 +171,12 @@ WATCHDOG_HOST_ASSETS = (
     WatchdogHostAsset(
         source=TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
         target=TUNNEL_OPERATOR_DEPENDENCY_PATH,
+        mode=0o600,
+        reloads_systemd=True,
+    ),
+    WatchdogHostAsset(
+        source=OPERATOR_RECOVERY_TARGET_RELATIVE,
+        target=OPERATOR_RECOVERY_TARGET_PATH,
         mode=0o600,
         reloads_systemd=True,
     ),
