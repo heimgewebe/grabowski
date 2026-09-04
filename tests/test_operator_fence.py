@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import hashlib
+import multiprocessing
+import os
+import shutil
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -24,6 +29,26 @@ class Clock:
 
     def advance(self, seconds: int) -> None:
         self.value += seconds
+
+
+def _process_acquire(
+    database: str,
+    owner: str,
+    barrier: object,
+    queue: object,
+) -> None:
+    store = fence.OperatorFenceStore(Path(database))
+    barrier.wait(timeout=5)
+    try:
+        grant = store.acquire(
+            owner_id=owner,
+            session_id=f"session-{owner}",
+            reason="controlled_failover_drill",
+            lease_seconds=30,
+        )
+        queue.put(("granted", owner, int(grant["generation"])))
+    except fence.OperatorFenceDenied as exc:
+        queue.put(("denied", owner, exc.code))
 
 
 class OperatorFenceStoreTests(unittest.TestCase):
@@ -373,9 +398,10 @@ class OperatorFenceStoreTests(unittest.TestCase):
             "operation_id": "op-1",
             "operation_name": "grabowski_git",
             "intent_sha256": INTENT_A,
-            "outcome": "effect_not_applied",
+            "outcome": "effect_applied",
             "evidence_sha256": EVIDENCE_B,
         }
+        self.clock.advance(6)
         first = self.store.reconcile_effect(**arguments)
         replay = self.store.reconcile_effect(**arguments)
         self.assertFalse(first["idempotent"])
@@ -394,12 +420,14 @@ class OperatorFenceStoreTests(unittest.TestCase):
             "evidence_sha256": EVIDENCE_B,
         }
         with self.assertRaisesRegex(
-            fence.OperatorFenceDenied, "effect_not_reconcilable"
+            fence.OperatorFenceDenied, "reconcile_requires_expired_writer"
         ):
             self.store.reconcile_effect(**arguments)
         self.clock.advance(6)
-        reconciled = self.store.reconcile_effect(**arguments)
-        self.assertTrue(reconciled["terminal"])
+        with self.assertRaisesRegex(
+            fence.OperatorFenceDenied, "begun_reconcile_requires_typed_proof"
+        ):
+            self.store.reconcile_effect(**arguments)
 
     def test_settled_operation_id_cannot_replay_under_a_new_generation(self) -> None:
         self.acquire_primary()
@@ -438,9 +466,327 @@ class OperatorFenceStoreTests(unittest.TestCase):
                 intent_sha256=INTENT_A,
             )
 
+    def test_multiprocess_acquire_has_exactly_one_winner(self) -> None:
+        context = multiprocessing.get_context("fork")
+        barrier = context.Barrier(2)
+        queue = context.Queue()
+        processes = [
+            context.Process(
+                target=_process_acquire,
+                args=(str(self.database), owner, barrier, queue),
+            )
+            for owner in ("grabowski", "der-kleine-maulwurf")
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=10)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+        results = [queue.get(timeout=2) for _ in processes]
+        self.assertEqual(sum(item[0] == "granted" for item in results), 1)
+        self.assertEqual(sum(item[0] == "denied" for item in results), 1)
+        self.assertEqual({item[2] for item in results}, {1, "writer_active"})
+        self.assertEqual(self.store.status()["generation"], 1)
+
+    def test_sqlite_write_lock_fails_closed_with_typed_busy_error(self) -> None:
+        locker = sqlite3.connect(self.database, isolation_level=None)
+        try:
+            locker.execute("BEGIN IMMEDIATE")
+            with self.assertRaisesRegex(fence.OperatorFenceError, "SQLite store is busy"):
+                self.acquire_primary()
+        finally:
+            locker.execute("ROLLBACK")
+            locker.close()
+        self.assertEqual(self.store.status()["generation"], 0)
+
     def test_database_and_parent_are_private(self) -> None:
         self.assertEqual(self.database.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.database.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_fencing_token_contains_persistent_instance_identity(self) -> None:
+        initial = self.store.status()
+        grant = self.acquire_primary()
+        self.assertEqual(len(initial["instance_id"]), 32)
+        self.assertEqual(grant["instance_id"], initial["instance_id"])
+        self.assertEqual(grant["fencing_token"]["instance_id"], initial["instance_id"])
+        reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
+        self.assertEqual(reopened.status()["instance_id"], initial["instance_id"])
+
+    def test_session_status_digest_is_keyed_not_plain_sha256(self) -> None:
+        self.acquire_primary()
+        digest = self.store.status()["writer"]["session_id_sha256"]
+        plain = hashlib.sha256(b"primary-session").hexdigest()
+        self.assertNotEqual(digest, plain)
+        self.assertNotIn(b"primary-session", self.store.session_key_path.read_bytes())
+
+    def test_same_intent_cannot_be_settled_twice_under_new_operation_id(self) -> None:
+        self.acquire_primary()
+        self.begin_primary()
+        self.store.settle_effect(
+            owner_id="grabowski", session_id="primary-session", generation=1,
+            operation_id="op-1", operation_name="grabowski_git",
+            intent_sha256=INTENT_A, outcome="effect_applied",
+            evidence_sha256=EVIDENCE_A,
+        )
+        with self.assertRaisesRegex(fence.OperatorFenceDenied, "intent_already_settled"):
+            self.store.begin_effect(
+                owner_id="grabowski", session_id="primary-session", generation=1,
+                operation_id="op-2", operation_name="grabowski_git",
+                intent_sha256=INTENT_A,
+            )
+
+    def test_identical_begin_replay_remains_visible_after_lease_expiry(self) -> None:
+        self.acquire_primary(lease_seconds=5)
+        first = self.begin_primary()
+        self.clock.advance(6)
+        replay = self.begin_primary()
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(replay["started_at_unix"], first["started_at_unix"])
+
+    def test_settlement_replay_survives_later_generation(self) -> None:
+        self.acquire_primary()
+        self.begin_primary()
+        arguments = {
+            "owner_id": "grabowski", "session_id": "primary-session",
+            "generation": 1, "operation_id": "op-1",
+            "operation_name": "grabowski_git", "intent_sha256": INTENT_A,
+            "outcome": "effect_applied", "evidence_sha256": EVIDENCE_A,
+        }
+        self.store.settle_effect(**arguments)
+        self.store.release(
+            owner_id="grabowski", session_id="primary-session", generation=1
+        )
+        self.store.acquire(
+            owner_id="der-kleine-maulwurf", session_id="secondary-session",
+            reason="primary_unavailable", lease_seconds=30,
+        )
+        replay = self.store.settle_effect(**arguments)
+        self.assertTrue(replay["idempotent"])
+        self.assertEqual(replay["recorded_settlement"]["generation"], 1)
+
+    def test_outcome_unknown_persists_evidence_event(self) -> None:
+        self.acquire_primary()
+        self.begin_primary()
+        result = self.store.settle_effect(
+            owner_id="grabowski", session_id="primary-session", generation=1,
+            operation_id="op-1", operation_name="grabowski_git",
+            intent_sha256=INTENT_A, outcome="outcome_unknown",
+            evidence_sha256=EVIDENCE_A,
+        )
+        event = result["status"]["last_event"]
+        self.assertEqual(event["event_type"], "outcome_unknown")
+        self.assertEqual(event["evidence_sha256"], EVIDENCE_A)
+        reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
+        self.assertEqual(reopened.status()["last_event"]["evidence_sha256"], EVIDENCE_A)
+
+    def test_fencing_token_validator_rejects_stale_generation_and_tamper(self) -> None:
+        grant = self.acquire_primary()
+        token = grant["fencing_token"]
+        validated = self.store.validate_fencing_token(
+            token,
+            expected_instance_id=grant["instance_id"],
+            minimum_generation_seen=1,
+        )
+        self.assertEqual(validated, token)
+        with self.assertRaisesRegex(
+            fence.OperatorFenceDenied, "generation_rollback_detected"
+        ):
+            self.store.validate_fencing_token(
+                token,
+                expected_instance_id=grant["instance_id"],
+                minimum_generation_seen=2,
+            )
+        tampered = dict(token)
+        tampered["token_sha256"] = "0" * 64
+        with self.assertRaisesRegex(fence.OperatorFenceDenied, "invalid_fencing_token"):
+            self.store.validate_fencing_token(
+                tampered,
+                expected_instance_id=grant["instance_id"],
+                minimum_generation_seen=1,
+            )
+
+    def test_forward_clock_jump_cannot_authorize_stale_primary_effect(self) -> None:
+        self.acquire_primary(lease_seconds=30)
+        self.clock.advance(10_000)
+        secondary = self.store.acquire(
+            owner_id="der-kleine-maulwurf",
+            session_id="secondary-session",
+            reason="primary_unavailable",
+            lease_seconds=30,
+        )
+        self.assertEqual(secondary["generation"], 2)
+        with self.assertRaisesRegex(fence.OperatorFenceDenied, "stale_generation"):
+            self.store.begin_effect(
+                owner_id="grabowski",
+                session_id="primary-session",
+                generation=1,
+                operation_id="late-primary",
+                operation_name="grabowski_git",
+                intent_sha256=INTENT_A,
+            )
+
+    def test_non_application_reconciliation_fails_closed(self) -> None:
+        self.acquire_primary(lease_seconds=5)
+        self.begin_primary()
+        self.store.settle_effect(
+            owner_id="grabowski", session_id="primary-session", generation=1,
+            operation_id="op-1", operation_name="grabowski_git",
+            intent_sha256=INTENT_A, outcome="outcome_unknown",
+            evidence_sha256=EVIDENCE_A,
+        )
+        self.clock.advance(6)
+        with self.assertRaisesRegex(
+            fence.OperatorFenceDenied,
+            "non_application_reconcile_requires_typed_finality_proof",
+        ):
+            self.store.reconcile_effect(
+                reconciler_id="der-kleine-maulwurf", generation=1,
+                operation_id="op-1", operation_name="grabowski_git",
+                intent_sha256=INTENT_A, outcome="effect_not_applied",
+                evidence_sha256=EVIDENCE_B,
+            )
+        self.assertEqual(self.store.status()["inflight"]["state"], "outcome_unknown")
+
+    def test_backward_clock_denies_mutation_and_surfaces_regression(self) -> None:
+        self.acquire_primary(lease_seconds=30)
+        self.clock.value -= 1
+        with self.assertRaisesRegex(fence.OperatorFenceDenied, "clock_moved_backward"):
+            self.store.renew(
+                owner_id="grabowski", session_id="primary-session",
+                generation=1, lease_seconds=30,
+            )
+        self.assertTrue(self.store.status()["clock_regressed"])
+
+    def test_database_only_rollback_cannot_reissue_generation(self) -> None:
+        first = self.acquire_primary()
+        instance = first["instance_id"]
+        self.store.release(
+            owner_id="grabowski", session_id="primary-session", generation=1
+        )
+        snapshot = Path(self.temporary.name) / "generation-1.sqlite3"
+        shutil.copyfile(self.database, snapshot)
+        second = self.store.acquire(
+            owner_id="der-kleine-maulwurf", session_id="secondary-session",
+            reason="primary_unavailable", lease_seconds=30,
+        )
+        self.assertEqual(second["generation"], 2)
+        self.store.release(
+            owner_id="der-kleine-maulwurf", session_id="secondary-session",
+            generation=2,
+        )
+        shutil.copyfile(snapshot, self.database)
+        reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
+        self.assertEqual(reopened.status()["instance_id"], instance)
+        self.assertEqual(reopened.status()["generation"], 2)
+        third = reopened.acquire(
+            owner_id="grabowski", session_id="primary-session-2",
+            reason="failback", lease_seconds=30,
+        )
+        self.assertEqual(third["generation"], 3)
+
+    def test_full_state_rollback_requires_client_high_water_guard(self) -> None:
+        first = self.acquire_primary()
+        instance = first["instance_id"]
+        self.store.release(
+            owner_id="grabowski", session_id="primary-session", generation=1
+        )
+        snapshot_root = Path(self.temporary.name) / "snapshot"
+        snapshot_root.mkdir()
+        copies = {}
+        for source in (self.database, self.store.anchor_path, self.store.session_key_path):
+            target = snapshot_root / source.name
+            shutil.copyfile(source, target)
+            copies[source] = target
+        second = self.store.acquire(
+            owner_id="der-kleine-maulwurf", session_id="secondary-session",
+            reason="primary_unavailable", lease_seconds=30,
+        )
+        self.assertEqual(second["generation"], 2)
+        self.store.release(
+            owner_id="der-kleine-maulwurf", session_id="secondary-session",
+            generation=2,
+        )
+        for target, source in copies.items():
+            shutil.copyfile(source, target)
+        reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
+        with self.assertRaisesRegex(
+            fence.OperatorFenceDenied, "generation_rollback_detected"
+        ):
+            reopened.acquire(
+                owner_id="grabowski", session_id="primary-session-2",
+                reason="failback", lease_seconds=30,
+                expected_instance_id=instance, minimum_generation_seen=2,
+            )
+
+    def test_stale_fence_instance_is_denied(self) -> None:
+        self.acquire_primary()
+        with self.assertRaisesRegex(fence.OperatorFenceDenied, "stale_fence_instance"):
+            self.store.renew(
+                owner_id="grabowski", session_id="primary-session", generation=1,
+                lease_seconds=30, expected_instance_id="0" * 32,
+            )
+
+    def test_writer_disagreement_after_reconcile_is_durable(self) -> None:
+        self.acquire_primary(lease_seconds=5)
+        self.begin_primary()
+        self.store.settle_effect(
+            owner_id="grabowski", session_id="primary-session", generation=1,
+            operation_id="op-1", operation_name="grabowski_git",
+            intent_sha256=INTENT_A, outcome="outcome_unknown",
+            evidence_sha256=EVIDENCE_A,
+        )
+        self.clock.advance(6)
+        self.store.reconcile_effect(
+            reconciler_id="der-kleine-maulwurf", generation=1,
+            operation_id="op-1", operation_name="grabowski_git",
+            intent_sha256=INTENT_A, outcome="effect_applied",
+            evidence_sha256=EVIDENCE_B,
+        )
+        disputed = self.store.settle_effect(
+            owner_id="grabowski", session_id="primary-session", generation=1,
+            operation_id="op-1", operation_name="grabowski_git",
+            intent_sha256=INTENT_A, outcome="effect_not_applied",
+            evidence_sha256=EVIDENCE_A,
+        )
+        self.assertTrue(disputed["dispute_recorded"])
+        self.assertEqual(disputed["status"]["last_event"]["event_type"], "writer_dispute")
+
+    def test_schema_drift_is_rejected_on_next_connection(self) -> None:
+        raw = sqlite3.connect(self.database)
+        try:
+            raw.execute("CREATE TABLE intruder(value TEXT)")
+            raw.commit()
+        finally:
+            raw.close()
+        with self.assertRaisesRegex(fence.OperatorFenceError, "table set"):
+            self.store.status()
+
+    def test_database_file_swap_is_detected(self) -> None:
+        replacement = Path(self.temporary.name) / "replacement.sqlite3"
+        shutil.copyfile(self.database, replacement)
+        original_inode = self.database.stat().st_ino
+        replacement_inode = replacement.stat().st_ino
+        self.assertNotEqual(original_inode, replacement_inode)
+        os.replace(replacement, self.database)
+        with self.assertRaisesRegex(fence.OperatorFenceError, "identity changed"):
+            self.store.status()
+
+    def test_reopen_converts_wal_mode_back_to_delete(self) -> None:
+        raw = sqlite3.connect(self.database)
+        try:
+            mode = raw.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            self.assertEqual(str(mode).lower(), "wal")
+        finally:
+            raw.close()
+        reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
+        connection = sqlite3.connect(self.database)
+        try:
+            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertEqual(str(mode).lower(), "delete")
+        self.assertEqual(reopened.status()["generation"], 0)
 
     def test_invalid_digest_and_lease_bounds_fail_before_state_change(self) -> None:
         with self.assertRaises(ValueError):
