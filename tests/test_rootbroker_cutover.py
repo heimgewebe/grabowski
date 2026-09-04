@@ -455,6 +455,12 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 kind="repo", value=str(cutover.CANONICAL_REPOSITORY)
             ),
             self._typed_blockade_marker(kind="service", value=cutover.OPERATOR_UNIT),
+            self._typed_blockade_marker(
+                kind="service", value=cutover.LEGACY_OPERATOR_WATCHDOG_TIMER
+            ),
+            self._typed_blockade_marker(
+                kind="service", value="grabowski-privileged-broker@.service"
+            ),
             self._typed_blockade_marker(kind="host", value=os.uname().nodename),
             self._typed_blockade_marker(kind="path", value="/etc/grabowski"),
         )
@@ -492,7 +498,9 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.os.path,
             "lexists",
             side_effect=lambda path: path == cutover.CANONICAL_KILL_SWITCH,
-        ), patch.object(cutover, "_read_regular_file", return_value=(raw, metadata)):
+        ), patch.object(cutover, "_validate_directory"), patch.object(
+            cutover, "_read_regular_file", return_value=(raw, metadata)
+        ):
             cutover._automatic_kill_switch_clear()
 
     def test_automatic_cutover_rejects_root_owned_matching_scope_marker(self) -> None:
@@ -507,7 +515,9 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.os.path,
             "lexists",
             side_effect=lambda path: path == cutover.CANONICAL_KILL_SWITCH,
-        ), patch.object(cutover, "_read_regular_file", return_value=(raw, metadata)):
+        ), patch.object(cutover, "_validate_directory"), patch.object(
+            cutover, "_read_regular_file", return_value=(raw, metadata)
+        ):
             with self.assertRaisesRegex(cutover.CutoverError, "in-scope"):
                 cutover._automatic_kill_switch_clear()
 
@@ -523,7 +533,9 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.os.path,
             "lexists",
             side_effect=lambda path: path == cutover.CANONICAL_KILL_SWITCH,
-        ), patch.object(cutover, "_read_regular_file", return_value=(raw, metadata)):
+        ), patch.object(cutover, "_validate_directory"), patch.object(
+            cutover, "_read_regular_file", return_value=(raw, metadata)
+        ):
             cutover._automatic_kill_switch_clear()
 
     def test_automatic_repository_preflight_requires_canonical_origin_and_remote_main(self) -> None:

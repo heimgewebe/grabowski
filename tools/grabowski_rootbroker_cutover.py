@@ -675,7 +675,12 @@ def _automatic_blockade_matches_cutover(value: Any) -> bool:
     if kind == "repo":
         return _path_scope_matches(scope_value, CANONICAL_REPOSITORY)
     if kind == "service":
-        return scope_value in {OPERATOR_UNIT, SOCKET_UNIT}
+        return scope_value in {
+            OPERATOR_UNIT,
+            SOCKET_UNIT,
+            LEGACY_OPERATOR_WATCHDOG_TIMER,
+            "grabowski-privileged-broker@.service",
+        }
     if kind == "host":
         return scope_value == os.uname().nodename
     if kind == "path":
@@ -716,6 +721,11 @@ def _automatic_kill_switch_clear() -> None:
     if not os.path.lexists(CANONICAL_KILL_SWITCH):
         return
     try:
+        _validate_directory(
+            CANONICAL_KILL_SWITCH.parent,
+            expected_uid=0,
+            label="canonical blockade parent",
+        )
         data, metadata = _read_regular_file(
             CANONICAL_KILL_SWITCH,
             require_root_owned=True,
