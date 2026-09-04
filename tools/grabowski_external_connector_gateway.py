@@ -203,6 +203,24 @@ def _tool_not_available_response(payload: dict[str, Any] | None) -> dict[str, An
     }
 
 
+def _preflight_json_rpc_request(
+    method: str, body: bytes, allowed_tools: frozenset[str] | set[str]
+) -> tuple[int, dict[str, Any]] | None:
+    payload = _parse_json_rpc(body)
+    if method == "POST" and body:
+        if payload is None:
+            return 400, {"error": "invalid_json_rpc_object"}
+        rpc_method = _json_rpc_method(payload)
+        if rpc_method is None:
+            return 400, {"error": "invalid_json_rpc_method"}
+        if rpc_method not in ALLOWED_JSON_RPC_METHODS:
+            return 200, _tool_not_available_response(payload)
+    tool_name = _tool_call_name(payload)
+    if tool_name is not None and tool_name not in allowed_tools:
+        return 200, _tool_not_available_response(payload)
+    return None
+
+
 def _filter_tools_list_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -310,17 +328,12 @@ class ExternalConnectorGateway:
             return JSONResponse({"error": "content_length_mismatch"}, status_code=400)
 
         payload = _parse_json_rpc(body)
-        if request.method == "POST" and body:
-            if payload is None:
-                return JSONResponse({"error": "invalid_json_rpc_object"}, status_code=400)
-            method = _json_rpc_method(payload)
-            if method is None:
-                return JSONResponse({"error": "invalid_json_rpc_method"}, status_code=400)
-            if method not in ALLOWED_JSON_RPC_METHODS:
-                return JSONResponse(_tool_not_available_response(payload), status_code=200)
-        tool_name = _tool_call_name(payload)
-        if tool_name is not None and tool_name not in self._allowed_tools:
-            return JSONResponse(_tool_not_available_response(payload), status_code=200)
+        rejection = _preflight_json_rpc_request(
+            request.method, body, self._allowed_tools
+        )
+        if rejection is not None:
+            status_code, rejection_payload = rejection
+            return JSONResponse(rejection_payload, status_code=status_code)
 
         import httpx
 

@@ -262,14 +262,7 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
         self.assertNotIn("resources/read", gateway.ALLOWED_JSON_RPC_METHODS)
         self.assertNotIn("prompts/get", gateway.ALLOWED_JSON_RPC_METHODS)
 
-    def test_proxy_rejects_json_rpc_batches_before_upstream(self) -> None:
-        proxy = gateway.ExternalConnectorGateway(
-            connector_id="maulwurf-x",
-            external_token=self.EXTERNAL,
-            internal_token=self.INTERNAL,
-            allowed_tools=["grabowski_status"],
-            upstream="http://127.0.0.1:18183/mcp",
-        )
+    def test_proxy_preflight_rejects_json_rpc_batches_without_runtime_dependencies(self) -> None:
         body = json.dumps(
             [
                 {
@@ -283,23 +276,13 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
                 }
             ]
         ).encode("utf-8")
-        request = types.SimpleNamespace(
-            method="POST",
-            headers=_Headers(
-                {
-                    "authorization": f"Bearer {self.EXTERNAL}",
-                    "content-length": str(len(body)),
-                }
-            ),
+        rejection = gateway._preflight_json_rpc_request(
+            "POST", body, {"grabowski_status"}
         )
-        with mock.patch.object(
-            signed_ingress,
-            "_read_bounded_request_body",
-            new=mock.AsyncMock(return_value=body),
-        ):
-            response = __import__("asyncio").run(proxy.proxy(request))
-        self.assertEqual(response.status_code, 400)
-        self.assertIn(b"invalid_json_rpc_object", response.body)
+        self.assertEqual(
+            rejection,
+            (400, {"error": "invalid_json_rpc_object"}),
+        )
 
 
 if __name__ == "__main__":
