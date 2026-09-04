@@ -1014,7 +1014,20 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 )
             link = root / "claude-link"
             link.symlink_to(executable)
-            with self.assertRaisesRegex(runner.RunnerError, "non-symlink"):
+            self.assertEqual(
+                runner._validate_provider_executable(
+                    stream_fixture=None,
+                    executable=str(link),
+                    expected_sha256=digest,
+                ),
+                str(executable.resolve()),
+            )
+            replacement = root / "claude-replacement"
+            replacement.write_bytes(b"#!/bin/sh\nexit 1\n")
+            replacement.chmod(0o700)
+            link.unlink()
+            link.symlink_to(replacement)
+            with self.assertRaisesRegex(runner.RunnerError, "SHA-256 mismatch"):
                 runner._validate_provider_executable(
                     stream_fixture=None,
                     executable=str(link),

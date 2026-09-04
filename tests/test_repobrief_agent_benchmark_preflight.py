@@ -422,6 +422,33 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         self.assertEqual(captured["credential"], Path("/private/credentials.json"))
         self.assertEqual(captured["command_sha256"], "a" * 64)
 
+    def test_live_provider_binding_resolves_symlinked_launcher_without_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "claude-2.1.259"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            launcher = root / "claude"
+            launcher.symlink_to(executable)
+            credential = root / "credentials.json"
+            credential.write_text("{}\n", encoding="utf-8")
+            credential.chmod(0o600)
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            credential_token = support.preflight._credential_file.set(credential)
+            sha_token = support.preflight._command_sha256.set(digest)
+            authorized_token = support.preflight._authorized_credential_sha256.set(None)
+            try:
+                binding = support.preflight._dispatch_provider_binding_adapter(
+                    str(launcher), False
+                )
+            finally:
+                support.preflight._authorized_credential_sha256.reset(authorized_token)
+                support.preflight._command_sha256.reset(sha_token)
+                support.preflight._credential_file.reset(credential_token)
+            self.assertEqual(binding["claude"]["path"], str(executable.resolve()))
+            self.assertEqual(binding["claude"]["sha256"], digest)
+            self.assertEqual(binding["credential"]["mode"], "0o600")
+
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
