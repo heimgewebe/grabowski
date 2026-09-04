@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for Grabowski PR #107. Runtime-default convergence updated after the Rootbroker authority moved to Heimberry.
+Accepted for Grabowski PR #107. Runtime-default convergence now follows the local BACKUP recovery authority; the remote rest-server path remains a supported fallback.
 
 ## Context
 
@@ -15,31 +15,38 @@ At PR #107 acceptance, the default recovery evidence path was Heimserver-backed:
 
 When Heimserver is unavailable, that explicit configuration must stay fail-closed. Do not run Heimserver probes merely to make the gate green.
 
-The current default follows the Rootbroker recovery authority on Heimberry:
+The current default follows the Rootbroker recovery authority on the locally attached BACKUP disk:
 
-- `GRABOWSKI_SERVER_RECOVERY_HOST=heimberry`
-- `GRABOWSKI_SERVER_RECOVERY_TARGET=heimberry:rest-server/grabowski-recovery-probe`
+- `GRABOWSKI_SERVER_RECOVERY_TARGET=local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc`
+- the local target has no recovery host; the versioned `90-recovery-target.conf` drop-in explicitly removes a stale `GRABOWSKI_SERVER_RECOVERY_HOST` assignment before Green starts
 
-Environment overrides remain supported. Choosing another target is still configuration, not recovery evidence: the exact configured target must pass backup, restore-sentinel, repository-check and canonical-publication validation before it can authorize recovery-gated actions. Heimserver remains in the explicit legacy-alias model below; changing the default does not weaken that fail-closed boundary.
+The local probe binds the physical disk by filesystem UUID, the Restic repository by repository ID, and the backup by the full snapshot ID recorded in fresh durability evidence. It restores the Fundus with `restic restore --verify`, compares the restored inventory to the durability receipt, runs a repository data-subset check, then rechecks disk/repository/snapshot identity before canonical Rootbroker publication.
+
+Environment overrides remain supported. Choosing another target is still configuration, not recovery evidence: the exact configured target must pass the target-specific backup/restore/repository checks and canonical-publication validation before it can authorize recovery-gated actions. Heimserver remains in the explicit legacy-alias model below; changing the default does not weaken that fail-closed boundary.
 
 ## Decision
 
 `grabowski_recovery_status` reports a separate `recovery_evidence_boundary` object. The boundary is an explanation and diagnostic surface; it does not activate recovery, power-worker or privileged paths.
 
-Fresh server recovery evidence is valid only for the currently configured recovery target. A fresh marker for one target does not authorize another target.
+Fresh recovery evidence is valid only for the currently configured recovery target. A fresh marker for one target does not authorize another target. The field and check names containing `server_recovery` are retained for compatibility even when the selected backend is the local BACKUP disk.
 
-Server recovery evidence is accepted only if all of the following are true:
+Recovery evidence is accepted only if all of the following are true:
 
-1. The server recovery marker is formally valid and fresh.
+1. The recovery marker is formally valid and fresh.
 2. The marker records a successful backup snapshot.
-3. The marker records restore sentinel validation.
-4. The marker records a repository check.
+3. The selected backend has completed its restore validation.
+4. The selected backend has completed its repository check.
 5. The marker target exactly matches the current `GRABOWSKI_SERVER_RECOVERY_TARGET`.
 6. `grabowski_recovery_status` reports `checks.server_recovery_fresh=true`.
 
 A configured non-Heimserver target alone is not enough. Fresh backup, restore and repository-check evidence against that exact target is required. The configured target must also pass shape validation before it can be considered a custom recovery target.
 
-Configured recovery targets use the explicit shape `<host>:rest-server/<probe>`. The host and probe segments are bounded aliases made of ASCII letters, digits, dots, underscores and hyphens, and may not contain whitespace, control characters, URL schemes, path traversal or additional path separators. Invalid target configuration is fail-closed and is reported separately from stale evidence.
+Configured recovery targets use one of two explicit shapes:
+
+- remote fallback: `<host>:rest-server/<probe>`
+- local BACKUP backend: `local-backup-disk:UUID=<uuid>/restic/<repository>`
+
+The host/probe and UUID/repository segments are bounded by strict parsers; whitespace, control characters and path-shaped escape syntax are rejected. The local backend additionally verifies that `/mnt/backup` is the exact `ntfs3` mount for the configured UUID and that the opened Restic repository has the pinned repository ID. Invalid target configuration is fail-closed and is reported separately from stale evidence.
 
 ## Heimserver backend detection
 
@@ -71,7 +78,7 @@ If the configured recovery target is invalid, `grabowski_recovery_status` must f
 - `ready_for_user_power_worker=false`
 - `ready_for_privileged_actions=false`
 
-If the default Heimserver backend is configured and no fresh matching server recovery marker exists, `grabowski_recovery_status` must report the boundary explicitly:
+If a Heimserver backend is explicitly configured and no fresh matching recovery marker exists, `grabowski_recovery_status` must report the boundary explicitly:
 
 - `recovery_evidence_boundary.uses_default_heimserver_backend=true`
 - `recovery_evidence_boundary.custom_recovery_target_configured=false`
@@ -108,5 +115,5 @@ This boundary does not establish:
 - that the Runtime is broken when recovery is stale,
 - that a stale marker can authorize privileged actions,
 - that a configured non-Heimserver target is valid before its target shape and restore probe succeed,
-- that server recovery evidence for one target authorizes another target,
+- that recovery evidence for one target authorizes another target,
 - that Heimserver should be probed while it is known unavailable.
