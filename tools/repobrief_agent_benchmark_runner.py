@@ -347,15 +347,16 @@ def _validate_provider_executable(
     expected = _validate_hex(
         expected_sha256, "claude_command_sha256", length=64
     )
-    path = Path(executable)
-    if not path.is_absolute():
+    launcher = Path(executable)
+    if not launcher.is_absolute():
         raise RunnerError("live Claude executable path must be absolute")
     try:
+        path = launcher.resolve(strict=True)
         metadata = path.lstat()
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise RunnerError("live Claude executable is unavailable") from exc
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise RunnerError("live Claude executable must be a regular non-symlink file")
+        raise RunnerError("live Claude executable must resolve to a regular file")
     if metadata.st_size <= 0 or metadata.st_size > MAX_PROVIDER_EXECUTABLE_BYTES:
         raise RunnerError("live Claude executable size is invalid")
     if metadata.st_mode & 0o111 == 0:
