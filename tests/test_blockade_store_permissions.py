@@ -51,9 +51,15 @@ class BlockadeStorePermissionTests(unittest.TestCase):
 
             parent.chmod(0o100)
             try:
-                with self.assertRaises(PermissionError):
+                try:
                     descriptor = os.open(parent, store._directory_flags())
+                except PermissionError:
+                    pass
+                else:
                     os.close(descriptor)
+                    self.skipTest(
+                        "test process can bypass execute-only directory read permissions"
+                    )
 
                 snapshot = store.read_blockade_marker(
                     marker,

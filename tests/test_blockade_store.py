@@ -154,12 +154,62 @@ class BlockadeStoreTests(unittest.TestCase):
 
     def test_path_only_directory_flags_use_o_path(self) -> None:
         if not hasattr(os, "O_PATH"):
-            self.skipTest("Linux O_PATH is required by the production contract")
+            self.skipTest("Linux O_PATH is unavailable on this test platform")
         path_only = blockade_store._directory_flags(path_only=True)
         readable = blockade_store._directory_flags()
         self.assertTrue(path_only & os.O_PATH)
         self.assertTrue(path_only & os.O_DIRECTORY)
         self.assertFalse(readable & os.O_PATH)
+
+    def test_path_only_directory_flags_fall_back_without_o_path(self) -> None:
+        with mock.patch.object(os, "O_PATH", None, create=True):
+            self.assertEqual(
+                blockade_store._directory_flags(path_only=True),
+                blockade_store._directory_flags(),
+            )
+
+    def test_path_only_read_rejects_symlinked_parent_components(self) -> None:
+        if not hasattr(os, "O_PATH"):
+            self.skipTest("Linux O_PATH is unavailable on this test platform")
+
+        actual_parent = self.root / "actual-parent"
+        actual_parent.mkdir(mode=0o700)
+        marker = actual_parent / "operator-kill-switch"
+        engage_blockade_marker(
+            self.item,
+            marker,
+            expected_marker_path=marker,
+            transaction_id="symlink-parent-engage",
+            now=NOW,
+        )
+        linked_parent = self.root / "linked-parent"
+        linked_parent.symlink_to(actual_parent, target_is_directory=True)
+        linked_marker = linked_parent / marker.name
+        with self.assertRaises(OSError):
+            read_blockade_marker(
+                linked_marker,
+                expected_marker_path=linked_marker,
+            )
+
+        actual_outer = self.root / "actual-outer"
+        actual_inner = actual_outer / "inner"
+        actual_inner.mkdir(parents=True, mode=0o700)
+        nested_marker = actual_inner / "operator-kill-switch"
+        engage_blockade_marker(
+            self.item,
+            nested_marker,
+            expected_marker_path=nested_marker,
+            transaction_id="symlink-intermediate-engage",
+            now=NOW,
+        )
+        linked_outer = self.root / "linked-outer"
+        linked_outer.symlink_to(actual_outer, target_is_directory=True)
+        linked_nested_marker = linked_outer / "inner" / nested_marker.name
+        with self.assertRaises(OSError):
+            read_blockade_marker(
+                linked_nested_marker,
+                expected_marker_path=linked_nested_marker,
+            )
 
     def test_exact_engage_rollback_removes_only_matching_marker(self) -> None:
         receipt = self.engage()

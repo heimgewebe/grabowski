@@ -276,12 +276,14 @@ def _transaction_id(value: str | None, *, now: datetime | None) -> str:
 
 
 def _directory_flags(*, path_only: bool = False) -> int:
-    if path_only:
-        path_flag = getattr(os, "O_PATH", None)
-        if path_flag is None:
-            raise RuntimeError("O_PATH is required for path-only directory traversal")
+    path_flag = getattr(os, "O_PATH", None) if path_only else None
+    if path_flag is not None:
+        # O_PATH changes O_NOFOLLOW semantics: a symlink itself may be opened.
+        # O_DIRECTORY is therefore also required so every traversed component
+        # must be a directory rather than a symlink.
         flags = path_flag | os.O_DIRECTORY | os.O_CLOEXEC
     else:
+        # Platforms without O_PATH retain the previous O_RDONLY behavior.
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -640,6 +642,10 @@ def read_blockade_marker(
     if not isinstance(require_private_parent, bool):
         raise ValueError("require_private_parent must be boolean")
     max_bytes = _positive_max_bytes(max_bytes)
+    # Marker reads use O_PATH where available so execute-only authority
+    # directories remain traversable. Mutating store paths deliberately retain
+    # O_RDONLY directory descriptors because their durability contract fsyncs
+    # the parent directory.
     parent_fd = _open_directory_chain(
         path.parent,
         expected_uid=uid,
