@@ -599,6 +599,7 @@ class RepositoryContractTests(unittest.TestCase):
             "resource_lease",
             "git_cli",
             "github_cli",
+            "user_service_logs_read",
             "user_service_control",
         ):
             self.assertNotIn(capability, observe_caps)
@@ -609,6 +610,7 @@ class RepositoryContractTests(unittest.TestCase):
             "resource_lease",
             "git_cli",
             "github_cli",
+            "user_service_logs_read",
             "user_service_control",
         ):
             self.assertIn(capability, mutate_caps)
@@ -728,6 +730,28 @@ class RepositoryContractTests(unittest.TestCase):
             "max_risk_level",
             v2["properties"]["profiles"]["additionalProperties"]["required"],
         )
+        validator_tree = ast.parse(
+            (ROOT / "tools" / "validate_access_policy.py").read_text(encoding="utf-8")
+        )
+        known_capability_node = next(
+            node.value
+            for node in validator_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "known_capabilities"
+                for target in node.targets
+            )
+        )
+        known_capabilities = {item.value for item in known_capability_node.elts}
+        profile_capabilities = set(
+            v2["properties"]["profiles"]["additionalProperties"]["properties"]
+            ["capabilities"]["items"]["enum"]
+        )
+        forbidden_capabilities = set(
+            v2["properties"]["forbidden_capabilities"]["items"]["enum"]
+        )
+        self.assertEqual(profile_capabilities, known_capabilities)
+        self.assertEqual(forbidden_capabilities, known_capabilities)
 
     def test_privileged_reference_contract_exists(self) -> None:
         contract = json.loads(

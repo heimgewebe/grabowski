@@ -2030,9 +2030,383 @@ def _runtime_refresh_prelaunch_lease_binding_request(
     return {**material, "request_sha256": _sha256_json(material)}
 
 
+def _acquire_missing_runtime_refresh_prelaunch_leases(
+    request: dict[str, Any],
+    intent: dict[str, Any],
+) -> dict[str, Any] | None:
+    owner = request["lease_owner"]
+    keys = list(request["resource_keys"])
+    current = resources.inspect_resources(keys)
+    foreign = sorted(
+        key for key, lease in current.items() if lease.get("owner_id") != owner
+    )
+    if foreign:
+        raise PermissionError(
+            "Bureau runtime-refresh prelaunch resource lease is owned by another owner: "
+            + foreign[0]
+        )
+    missing = [key for key in keys if key not in current]
+    if not missing:
+        return None
+
+    expires_at = intent.get("expires_at")
+    if not isinstance(expires_at, str):
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid")
+    try:
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid") from exc
+    if expires.tzinfo is None or expires.utcoffset() is None:
+        raise ValueError("Bureau runtime-refresh prelaunch expiry is invalid")
+    remaining_seconds = int((expires - datetime.now(timezone.utc)).total_seconds())
+    if remaining_seconds <= BUREAU_RUNTIME_REFRESH_PRELAUNCH_MIN_REMAINING_SECONDS:
+        raise ValueError(
+            "Bureau runtime-refresh prelaunch approval expires too soon for lease acquisition"
+        )
+    acquisition_marker = {
+        "schema_version": 1,
+        "task_id": request["task_id"],
+        "executor_unit": request["executor_unit"],
+        "request_sha256": request["request_sha256"],
+    }
+    acquired = resources.acquire_resources(
+        owner,
+        missing,
+        purpose=f"Bureau runtime-refresh prelaunch {request['intent_sha256'][:16]}",
+        ttl_seconds=min(resources.MAX_TTL_SECONDS, remaining_seconds),
+        metadata={
+            "approval_task_id": request["lease_task_id"],
+            "intent_sha256": request["intent_sha256"],
+            BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_METADATA_KEY: acquisition_marker,
+        },
+    )
+    return {
+        "owner_id": owner,
+        "resource_keys": missing,
+        "leases": list(acquired["leases"]),
+    }
+
+
+def _release_runtime_refresh_prelaunch_acquisition(
+    acquisition: dict[str, Any] | None,
+) -> None:
+    if acquisition is None:
+        return
+    resources.release_resources(
+        acquisition["owner_id"],
+        acquisition["resource_keys"],
+        expected_leases=[
+            resources._release_lease_snapshot(item) for item in acquisition["leases"]
+        ],
+    )
+
+
+BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_METADATA_KEY = (
+    "runtime_refresh_executor_prelaunch_acquisition_v1"
+)
+BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_JOURNAL_KEY_PREFIX = (
+    "runtime_refresh_executor_prelaunch_acquisition_v1:"
+)
 BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX = (
     "runtime_refresh_executor_prelaunch_v1:"
 )
+
+
+def _normalize_runtime_refresh_prelaunch_acquisition_marker(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    expected_fields = {"schema_version", "task_id", "executor_unit", "request_sha256"}
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise RuntimeError("runtime-refresh prelaunch acquisition marker is invalid")
+    if value.get("schema_version") != 1:
+        raise RuntimeError("runtime-refresh prelaunch acquisition marker is unsupported")
+    task_id = value.get("task_id")
+    unit = value.get("executor_unit")
+    try:
+        bureau_runtime_refresh_executor.task_identity_environment(task_id, unit)
+    except bureau_runtime_refresh_executor.BureauRuntimeRefreshExecutorError as exc:
+        raise RuntimeError("runtime-refresh prelaunch acquisition task identity is invalid") from exc
+    request_sha256 = value.get("request_sha256")
+    if not isinstance(request_sha256, str) or SHA256.fullmatch(request_sha256) is None:
+        raise RuntimeError("runtime-refresh prelaunch acquisition request digest is invalid")
+    return dict(value)
+
+
+def _runtime_refresh_prelaunch_acquisition_journal_key(task_id: str) -> str:
+    if not isinstance(task_id, str) or TASK_ID.fullmatch(task_id) is None:
+        raise ValueError("runtime-refresh prelaunch acquisition journal task id is invalid")
+    return BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_JOURNAL_KEY_PREFIX + task_id
+
+
+def _runtime_refresh_prelaunch_acquisition_journal(
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = request.get("task_id")
+    unit = request.get("executor_unit")
+    bureau_runtime_refresh_executor.task_identity_environment(task_id, unit)
+    intent_sha256 = request.get("intent_sha256")
+    request_sha256 = request.get("request_sha256")
+    lease_owner = request.get("lease_owner")
+    lease_task_id = request.get("lease_task_id")
+    raw_keys = request.get("resource_keys")
+    if (
+        not isinstance(intent_sha256, str)
+        or SHA256.fullmatch(intent_sha256) is None
+        or not isinstance(request_sha256, str)
+        or SHA256.fullmatch(request_sha256) is None
+        or not isinstance(lease_owner, str)
+        or bureau_runtime_refresh_executor.OWNER_RE.fullmatch(lease_owner) is None
+        or lease_owner != f"runtime-refresh:{intent_sha256[:16]}"
+        or not isinstance(lease_task_id, str)
+        or not lease_task_id
+        or not isinstance(raw_keys, list)
+        or any(not isinstance(item, str) for item in raw_keys)
+    ):
+        raise ValueError("runtime-refresh prelaunch acquisition journal request is invalid")
+    keys = resources.normalize_resource_keys(raw_keys)
+    if raw_keys != keys:
+        raise ValueError("runtime-refresh prelaunch acquisition journal resources are not canonical")
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_runtime_refresh_prelaunch_acquisition_journal",
+        "task_id": task_id,
+        "executor_unit": unit,
+        "intent_sha256": intent_sha256,
+        "request_sha256": request_sha256,
+        "lease_owner": lease_owner,
+        "lease_task_id": lease_task_id,
+        "resource_keys": keys,
+    }
+    return {**material, "journal_sha256": _sha256_json(material)}
+
+
+def _normalize_runtime_refresh_prelaunch_acquisition_journal(
+    value: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal is not an object")
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "task_id",
+        "executor_unit",
+        "intent_sha256",
+        "request_sha256",
+        "lease_owner",
+        "lease_task_id",
+        "resource_keys",
+        "journal_sha256",
+    }
+    if set(value) != expected_fields:
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal shape is invalid")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind")
+        != "grabowski_bureau_runtime_refresh_prelaunch_acquisition_journal"
+    ):
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal contract is unsupported")
+    observed = value.get("journal_sha256")
+    material = {key: item for key, item in value.items() if key != "journal_sha256"}
+    if (
+        not isinstance(observed, str)
+        or SHA256.fullmatch(observed) is None
+        or observed != _sha256_json(material)
+    ):
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal digest is invalid")
+    task_id = value.get("task_id")
+    unit = value.get("executor_unit")
+    try:
+        bureau_runtime_refresh_executor.task_identity_environment(task_id, unit)
+    except bureau_runtime_refresh_executor.BureauRuntimeRefreshExecutorError as exc:
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal task identity is invalid") from exc
+    intent_sha256 = value.get("intent_sha256")
+    request_sha256 = value.get("request_sha256")
+    owner = value.get("lease_owner")
+    lease_task_id = value.get("lease_task_id")
+    raw_keys = value.get("resource_keys")
+    if (
+        not isinstance(intent_sha256, str)
+        or SHA256.fullmatch(intent_sha256) is None
+        or not isinstance(request_sha256, str)
+        or SHA256.fullmatch(request_sha256) is None
+        or not isinstance(owner, str)
+        or bureau_runtime_refresh_executor.OWNER_RE.fullmatch(owner) is None
+        or owner != f"runtime-refresh:{intent_sha256[:16]}"
+        or not isinstance(lease_task_id, str)
+        or not lease_task_id
+        or not isinstance(raw_keys, list)
+        or any(not isinstance(item, str) for item in raw_keys)
+    ):
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal identity is invalid")
+    keys = resources.normalize_resource_keys(raw_keys)
+    if raw_keys != keys:
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal resources are not canonical")
+    return {**value, "resource_keys": keys}
+
+
+def _persist_runtime_refresh_prelaunch_acquisition_journal(
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = _normalize_runtime_refresh_prelaunch_acquisition_journal(journal)
+    key = _runtime_refresh_prelaunch_acquisition_journal_key(normalized["task_id"])
+    payload = _canonical_json(normalized)
+    with _database_connection() as connection:
+        row = connection.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        if row is None:
+            connection.execute("INSERT INTO metadata(key, value) VALUES(?, ?)", (key, payload))
+        elif row["value"] != payload:
+            raise RuntimeError("runtime-refresh prelaunch acquisition journal key collision")
+        connection.commit()
+    return {"key": key, "journal_sha256": normalized["journal_sha256"], "persisted": True}
+
+
+def _delete_runtime_refresh_prelaunch_acquisition_journal(
+    connection: sqlite3.Connection,
+    journal: dict[str, Any],
+) -> None:
+    normalized = _normalize_runtime_refresh_prelaunch_acquisition_journal(journal)
+    key = _runtime_refresh_prelaunch_acquisition_journal_key(normalized["task_id"])
+    payload = _canonical_json(normalized)
+    deleted = connection.execute("DELETE FROM metadata WHERE key=? AND value=?", (key, payload))
+    if deleted.rowcount != 1:
+        raise RuntimeError("runtime-refresh prelaunch acquisition journal changed before deletion")
+
+
+def _runtime_refresh_prelaunch_task_release_safe(
+    task_row: sqlite3.Row | None,
+    journal: dict[str, Any],
+) -> tuple[bool, bool]:
+    if task_row is None:
+        return True, False
+    if task_row["task_id"] != journal["task_id"] or task_row["unit"] != journal["executor_unit"]:
+        raise RuntimeError("runtime-refresh prelaunch acquisition task identity mismatched")
+    state = str(task_row["state"])
+    try:
+        launcher = json.loads(str(task_row["launcher_json"]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("runtime-refresh prelaunch acquisition launcher is invalid") from exc
+    if not isinstance(launcher, dict):
+        raise RuntimeError("runtime-refresh prelaunch acquisition launcher is invalid")
+    returncode = launcher.get("returncode")
+    if (
+        state == "failed"
+        and isinstance(returncode, int)
+        and not isinstance(returncode, bool)
+        and returncode != 0
+        and launcher.get("outcome_unknown") is not True
+    ):
+        return True, False
+    if (
+        state == "cancelled"
+        and isinstance(launcher.get("runtime_refresh_prelaunch_undispatched_recovery"), dict)
+    ):
+        return True, False
+    if state in {"launching", "outcome_unknown"}:
+        return False, True
+    return False, False
+
+
+def _reconcile_runtime_refresh_prelaunch_acquisition_journals(
+    resource_keys: list[str],
+) -> dict[str, Any]:
+    keys = resources.normalize_resource_keys(resource_keys)
+    selected = set(keys)
+    recovered: list[dict[str, Any]] = []
+    retained: list[str] = []
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT key, value FROM metadata WHERE key LIKE ? ORDER BY key",
+            (BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_JOURNAL_KEY_PREFIX + "%",),
+        ).fetchall()
+    for raw in rows:
+        try:
+            journal = _normalize_runtime_refresh_prelaunch_acquisition_journal(
+                json.loads(raw["value"])
+            )
+        except (json.JSONDecodeError, TypeError, RuntimeError, ValueError) as exc:
+            raise RuntimeError("runtime-refresh prelaunch acquisition recovery journal is malformed") from exc
+        if not selected.intersection(journal["resource_keys"]):
+            continue
+        with _database_connection() as connection:
+            task_row = connection.execute(
+                "SELECT task_id, unit, state, launcher_json FROM tasks WHERE task_id=?",
+                (journal["task_id"],),
+            ).fetchone()
+        release_safe, retain = _runtime_refresh_prelaunch_task_release_safe(task_row, journal)
+        if retain:
+            retained.append(journal["task_id"])
+            continue
+        released_keys: list[str] = []
+        if release_safe:
+            with resources._database() as resource_connection:
+                placeholders = ",".join("?" for _ in journal["resource_keys"])
+                lease_rows = resource_connection.execute(
+                    f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
+                    journal["resource_keys"],
+                ).fetchall()
+            for lease_row in lease_rows:
+                metadata = resources._row_metadata(lease_row)
+                marker = _normalize_runtime_refresh_prelaunch_acquisition_marker(
+                    metadata.get(BUREAU_RUNTIME_REFRESH_PRELAUNCH_ACQUISITION_METADATA_KEY)
+                )
+                expected_marker = {
+                    "schema_version": 1,
+                    "task_id": journal["task_id"],
+                    "executor_unit": journal["executor_unit"],
+                    "request_sha256": journal["request_sha256"],
+                }
+                if marker != expected_marker:
+                    continue
+                if (
+                    lease_row["owner_id"] != journal["lease_owner"]
+                    or metadata.get("intent_sha256") != journal["intent_sha256"]
+                    or metadata.get("approval_task_id") != journal["lease_task_id"]
+                ):
+                    raise RuntimeError("runtime-refresh prelaunch acquisition lease identity is invalid")
+                if "executor_unit" in metadata:
+                    raise RuntimeError(
+                        "runtime-refresh prelaunch acquisition lease is still unit-bound; "
+                        "binding recovery must complete first"
+                    )
+                resources.release_resources(
+                    journal["lease_owner"],
+                    [lease_row["resource_key"]],
+                    expected_leases=[resources._release_lease_snapshot(lease_row)],
+                )
+                released_keys.append(lease_row["resource_key"])
+        with _database_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (_runtime_refresh_prelaunch_acquisition_journal_key(journal["task_id"]),),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise RuntimeError("runtime-refresh prelaunch acquisition journal disappeared")
+            observed = _normalize_runtime_refresh_prelaunch_acquisition_journal(json.loads(row["value"]))
+            if observed["journal_sha256"] != journal["journal_sha256"]:
+                connection.rollback()
+                raise RuntimeError("runtime-refresh prelaunch acquisition journal changed")
+            _delete_runtime_refresh_prelaunch_acquisition_journal(connection, observed)
+            connection.commit()
+        recovered.append(
+            {
+                "task_id": journal["task_id"],
+                "action": (
+                    "server_acquisition_released" if released_keys else "server_acquisition_absent_or_handed_off"
+                ),
+                "resource_keys": released_keys,
+                "journal_sha256": journal["journal_sha256"],
+            }
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_runtime_refresh_prelaunch_acquisition_recovery",
+        "resource_keys": keys,
+        "recovered": recovered,
+        "retained_task_ids": retained,
+    }
+    return {**material, "recovery_sha256": _sha256_json(material)}
 
 
 def _runtime_refresh_prelaunch_journal_key(task_id: str) -> str:
@@ -2485,12 +2859,16 @@ def _reconcile_runtime_refresh_prelaunch_binding_journals(
             }
         )
 
+    acquisition_recovery = _reconcile_runtime_refresh_prelaunch_acquisition_journals(
+        keys
+    )
     material = {
         "schema_version": 1,
         "kind": "grabowski_bureau_runtime_refresh_prelaunch_recovery",
         "resource_keys": keys,
         "recovered": recovered,
         "retained_task_ids": retained,
+        "acquisition_recovery": acquisition_recovery,
     }
     return {**material, "recovery_sha256": _sha256_json(material)}
 
@@ -7736,6 +8114,8 @@ def grabowski_task_start(
     executor_intent: dict[str, Any] | None = None
     executor_authority_contract: dict[str, Any] | None = None
     executor_lease_binding_request: dict[str, Any] | None = None
+    executor_prelaunch_acquisition: dict[str, Any] | None = None
+    executor_prelaunch_acquisition_journal: dict[str, Any] | None = None
     if bureau_runtime_refresh_executor.is_reserved_task_request(argv):
         if target.get("transport") != "local" or target.get("target") != "local":
             raise PermissionError("Bureau runtime-refresh executor requires the local fleet host")
@@ -8740,6 +9120,19 @@ def grabowski_task_start(
             executor_intent = live_executor_intent
             executor_authority_contract = live_executor_authority_contract
             executor_lease_binding_request = revalidated_executor_lease_binding_request
+            executor_prelaunch_acquisition_journal = (
+                _runtime_refresh_prelaunch_acquisition_journal(
+                    executor_lease_binding_request
+                )
+            )
+            _persist_runtime_refresh_prelaunch_acquisition_journal(
+                executor_prelaunch_acquisition_journal
+            )
+            executor_prelaunch_acquisition = (
+                _acquire_missing_runtime_refresh_prelaunch_leases(
+                    executor_lease_binding_request, executor_intent
+                )
+            )
             executor_lease_binding_plan = (
                 resources.prepare_runtime_refresh_executor_lease_binding(
                     executor_lease_binding_request["lease_owner"],
@@ -8833,6 +9226,7 @@ def grabowski_task_start(
     except Exception as exc:
         executor_record_state = "not_applicable"
         executor_compensation_error: Exception | None = None
+        executor_acquisition_compensation_error: Exception | None = None
         if executor_lease_binding is not None:
             try:
                 observed_record = _row_raw(task_id)
@@ -8859,6 +9253,47 @@ def grabowski_task_start(
                     )
                 except Exception as compensation_error:
                     executor_compensation_error = compensation_error
+                if (
+                    executor_compensation_error is None
+                    and executor_lease_binding_journal is not None
+                ):
+                    try:
+                        with _database_connection() as connection:
+                            connection.execute("BEGIN IMMEDIATE")
+                            _delete_runtime_refresh_prelaunch_binding_journal(
+                                connection, executor_lease_binding_journal
+                            )
+                            connection.commit()
+                    except Exception as compensation_error:
+                        executor_compensation_error = compensation_error
+        safe_acquisition_cleanup = executor_lease_binding is None or (
+            executor_record_state == "absent"
+            and executor_compensation_error is None
+        )
+        if (
+            executor_prelaunch_acquisition is not None
+            and safe_acquisition_cleanup
+        ):
+            try:
+                _release_runtime_refresh_prelaunch_acquisition(
+                    executor_prelaunch_acquisition
+                )
+            except Exception as acquisition_compensation_error:
+                executor_acquisition_compensation_error = acquisition_compensation_error
+        if (
+            safe_acquisition_cleanup
+            and executor_acquisition_compensation_error is None
+            and executor_prelaunch_acquisition_journal is not None
+        ):
+            try:
+                with _database_connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    _delete_runtime_refresh_prelaunch_acquisition_journal(
+                        connection, executor_prelaunch_acquisition_journal
+                    )
+                    connection.commit()
+            except Exception as acquisition_compensation_error:
+                executor_acquisition_compensation_error = acquisition_compensation_error
         if task_resources and lease_result is not None:
             resources.release_resources(
                 lease_owner,
@@ -8868,6 +9303,16 @@ def grabowski_task_start(
                     for item in lease_result["leases"]
                 ],
             )
+        if executor_acquisition_compensation_error is not None:
+            compensation_detail = (
+                f"{type(executor_acquisition_compensation_error).__name__}: "
+                f"{_redact_reason(str(executor_acquisition_compensation_error))[:512]}"
+            )
+            raise RuntimeError(
+                "Bureau runtime-refresh task start failed before dispatch and server-owned "
+                "prelaunch lease compensation failed; reconciliation is required; "
+                f"compensation_error={compensation_detail}"
+            ) from exc
         if executor_lease_binding is not None:
             if executor_record_state != "absent":
                 raise RuntimeError(
@@ -8963,6 +9408,33 @@ def grabowski_task_start(
                 raise RuntimeError(
                     "Bureau runtime-refresh launch journal finalization requires "
                     "reconciliation; exact prelaunch journal retained when possible"
+                ) from journal_error
+            if state == "failed" and executor_prelaunch_acquisition is not None:
+                try:
+                    _release_runtime_refresh_prelaunch_acquisition(
+                        executor_prelaunch_acquisition
+                    )
+                except Exception as compensation_error:
+                    raise RuntimeError(
+                        "Bureau runtime-refresh launch failed before dispatch and server-owned "
+                        "prelaunch lease compensation failed; acquisition journal retained "
+                        "for reconciliation"
+                    ) from compensation_error
+            if executor_prelaunch_acquisition_journal is None:
+                raise RuntimeError(
+                    "Bureau runtime-refresh launch lost its acquisition journal"
+                )
+            try:
+                with _database_connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    _delete_runtime_refresh_prelaunch_acquisition_journal(
+                        connection, executor_prelaunch_acquisition_journal
+                    )
+                    connection.commit()
+            except Exception as journal_error:
+                raise RuntimeError(
+                    "Bureau runtime-refresh acquisition journal finalization requires "
+                    "reconciliation"
                 ) from journal_error
         elif state != "outcome_unknown":
             raise RuntimeError(

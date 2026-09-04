@@ -30,7 +30,8 @@
     "secret_use": "Run bounded argv-only commands with a secret supplied through an inherited file descriptor or restrictive temporary fallback.",
     "terminal_execute": "Run bounded non-interactive argv-only commands without shell expansion.",
     "tmux_interaction": "Read or send literal input to existing tmux panes.",
-    "user_service_control": "Inspect and control user-level systemd units."
+    "user_service_control": "Inspect and control user-level systemd units.",
+    "user_service_logs_read": "Read bounded recent current-user service journal lines; journal content may contain application secrets."
   },
   "forbid_symlinks": true,
   "forbidden_capabilities": [],
@@ -71,6 +72,7 @@
         "durable_job",
         "git_cli",
         "github_cli",
+        "user_service_logs_read",
         "user_service_control",
         "resource_lease",
         "artifact_transfer",
@@ -180,6 +182,7 @@
         "durable_job",
         "git_cli",
         "github_cli",
+        "user_service_logs_read",
         "user_service_control",
         "resource_lease",
         "artifact_transfer",

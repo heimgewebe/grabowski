@@ -2373,11 +2373,17 @@ def grabowski_tailscale_status() -> dict[str, Any]:
     }
 
 
+def _validate_service_read_unit(unit: str) -> str:
+    name = operator._validate_unit(unit)
+    if name.startswith("-"):
+        raise ValueError("Invalid systemd unit name")
+    return name
+
+
 @mcp.tool(name="grabowski_service_status", annotations=LOCAL_READ)
 def grabowski_service_status(unit: SystemdUnit) -> dict[str, Any]:
     """Read a fixed property set for one user-level systemd unit."""
-    operator._require_operator_capability("user_service_control")
-    name = operator._validate_unit(unit)
+    name = _validate_service_read_unit(unit)
     result = _run_read(
         [
             "systemctl",
@@ -2403,10 +2409,10 @@ def grabowski_service_logs(
     max_lines: LogLineCount = 200,
 ) -> dict[str, Any]:
     """Read bounded recent journal lines for one user-level systemd unit."""
-    operator._require_operator_capability("user_service_control")
-    name = operator._validate_unit(unit)
+    name = _validate_service_read_unit(unit)
     if isinstance(max_lines, bool) or max_lines < 1 or max_lines > MAX_LOG_LINES:
         raise ValueError(f"max_lines must be between 1 and {MAX_LOG_LINES}")
+    operator._require_operator_capability("user_service_logs_read")
     return _run_read(
         [
             "journalctl",
