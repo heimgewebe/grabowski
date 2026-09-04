@@ -19,7 +19,7 @@ This document describes the repository contract. Current runtime state must be r
 - Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.
 - Review: operator verifies directly; Claude may provide independent architecture and safety findings.
 - Session: direct operator context first; tmux or Antigravity may preserve a bounded advisory session when useful.
-- Reposkop: `report <absolute-target> --purpose grabowski-repo-state-context --json` is a target-bound read-only coherence signal; no global discovery, no separate trial/noise logging and never an approval gate.
+- Repository state: use target-bound native typed Git, checkout and GitHub reads; these observations never authorize mutation.
 
 ## Browser operator default
 
@@ -61,7 +61,6 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_audit_query` | audit | yes | low | Query bounded safe fields from a verified audit snapshot with explicit scan completeness. |
 | `grabowski_audit_trace` | audit | yes | low | Trace one exact audit anchor through bounded one-hop typed evidence correlations without claiming causality. |
 | `grabowski_audit_analyze` | audit | yes | low | Compute bounded-memory descriptive statistics from a verified audit snapshot with explicit approximation semantics. |
-| `grabowski_reposkop_effectiveness` | audit | yes | low | Project bounded Reposkop coverage, technical outcomes, latency and evidence-bound improvement candidates from the verified audit chain. |
 | `latest_complete_bundles` | knowledge | yes | low | Read latest RepoGround publications with canonical catalog precedence. |
 | `repoground_bundle_discover` | knowledge | yes | low | Discover current RepoGround bundles from the canonical publication catalog. |
 | `repoground_bundle_status` | knowledge | yes | low | Read bounded manifest, health, and sidecar status for one RepoGround bundle. |
@@ -83,7 +82,6 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_checkout_summary` | version-control | yes | low | Read a bounded summary of Grabowski repository worktrees. |
 | `grabowski_current_work` | operations-observability | yes | low | Project bounded global operator work from task, attention, lease, worker and physical sources plus repository-filtered checkout evidence, with mixed scope explicit and no second lifecycle truth. |
 | `grabowski_work_acquire` | work-coordination | no | high | Atomically bind and prepare one controller lane, or persist and audit its evidence-bound terminal closeout with retry-safe audit recovery. |
-| `grabowski_reposkop_context` | repository-observation | no | low | Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt. |
 | `grabowski_operator_optimization_report` | operations-observability | yes | low | Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report. |
 | `grabowski_git_status` | version-control | yes | low | Read fixed short Git status and optionally the exact CAS branch preimage for one allowed repository. |
 | `grabowski_git_diff` | version-control | yes | low | Read a bounded staged or unstaged Git diff without external helpers. |

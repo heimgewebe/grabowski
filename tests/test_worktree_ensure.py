@@ -187,7 +187,6 @@ class WorktreeEnsureTests(unittest.TestCase):
         runner=grips._default_command_runner,
         inspect_lease=None,
         assess_admission=None,
-        reposkop_required: bool = False,
     ) -> dict[str, object]:
         with patch.dict(
             os.environ,
@@ -200,7 +199,6 @@ class WorktreeEnsureTests(unittest.TestCase):
                 record_friction=self._record_friction,
                 resolve_friction=self._resolve_friction,
                 assess_admission=assess_admission,
-                reposkop_required=reposkop_required,
             )
 
     def test_creation_contract_rejects_missing_explicit_lifecycle_fields(self) -> None:
@@ -1296,43 +1294,6 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertTrue(contract["availability"]["requires_allow_mutation"])
 
 
-    def test_required_reposkop_admission_does_not_reduce_worktree_authority(self) -> None:
-        parameters = self._parameters(
-            key="reposkop-required",
-            branch="feat/reposkop-required",
-            target=self.worktree_root / "reposkop-required",
-        )
-        calls: list[dict[str, object]] = []
-        assessment = {
-            "schema_version": 1,
-            "kind": "grabowski.repository_work_admission",
-            "repository": str(self.repo.resolve()),
-            "operation": "worktree_create",
-            "decision": "allow",
-            "blocker_codes": [],
-            "blockers": [],
-            "read_only": False,
-            "evidence_mutation_only": True,
-            "assessment_sha256": "a" * 64,
-        }
-
-        def assessor(**kwargs: object) -> dict[str, object]:
-            calls.append(dict(kwargs))
-            return assessment
-
-        result = self._ensure(
-            parameters,
-            assess_admission=assessor,
-            reposkop_required=True,
-        )
-
-        self.assertEqual(result["result_state"], "CREATED")
-        self.assertTrue(Path(str(parameters["target_path"])).is_dir())
-        self.assertEqual(len(calls), 1)
-        self.assertIs(calls[0]["reposkop_required"], True)
-        self.assertIs(result["work_admission"]["evidence_mutation_only"], True)
-        self.assertIs(result["work_admission"]["read_only"], False)
-
     def test_system_convergence_context_reaches_work_admission_with_lane_plan_binding(self) -> None:
         parameters = self._parameters(
             key="system-convergence-bound",
@@ -1404,54 +1365,6 @@ class WorktreeEnsureTests(unittest.TestCase):
             self._ensure(parameters, assess_admission=assessor)
         self.assertFalse(Path(str(parameters["target_path"])).exists())
         self.assertEqual(list(self.receipt_root.glob("*.json")), [])
-
-    def test_required_reposkop_rejects_incompatible_injected_assessor(self) -> None:
-        parameters = self._parameters(
-            key="reposkop-incompatible-assessor",
-            branch="feat/reposkop-incompatible-assessor",
-            target=self.worktree_root / "reposkop-incompatible-assessor",
-        )
-
-        def assessor(repo: str) -> dict[str, object]:
-            self.fail(f"incompatible assessor was invoked for {repo}")
-
-        with self.assertRaisesRegex(
-            worktree_ensure.WorktreeEnsurePreflight,
-            "must accept reposkop_required",
-        ):
-            self._ensure(
-                parameters,
-                assess_admission=assessor,
-                reposkop_required=True,
-            )
-        self.assertFalse(Path(str(parameters["target_path"])).exists())
-        self.assertEqual(list(self.receipt_root.glob("*.json")), [])
-
-    def test_reposkop_policy_is_bound_to_idempotency_receipt(self) -> None:
-        parameters = self._parameters(
-            key="reposkop-policy-binding",
-            branch="feat/reposkop-policy-binding",
-            target=self.worktree_root / "reposkop-policy-binding",
-        )
-        optional = self._ensure(parameters)
-
-        def should_not_run(**_kwargs: object) -> dict[str, object]:
-            self.fail("policy-mismatched receipt must conflict before admission")
-
-        required = self._ensure(
-            parameters,
-            assess_admission=should_not_run,
-            reposkop_required=True,
-        )
-
-        self.assertEqual(optional["result_state"], "CREATED")
-        self.assertEqual(required["result_state"], "CONFLICT")
-        self.assertEqual(required["error_class"], "IDEMPOTENCY_KEY_REUSE")
-        self.assertTrue(required["replayed"])
-        self.assertNotEqual(
-            optional["parameters_sha256"],
-            required["parameters_sha256"],
-        )
 
     def test_admission_block_creates_no_checkout_or_lifecycle_state(self) -> None:
         parameters = self._parameters(key="admission-blocked")

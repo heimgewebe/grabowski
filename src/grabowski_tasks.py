@@ -34,7 +34,6 @@ import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_execu
 import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
 import grabowski_terminal_convergence as terminal_convergence
-import grabowski_reposkop_effectiveness as reposkop_effectiveness
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -51,7 +50,6 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
-REPOSKOP_SHADOW_TERMINAL_MARKER_MAX_BYTES = 64 * 1024
 TASK_LIST_SCAN_BATCH = 100
 TASK_RECONCILE_BATCH_LIMIT = 500
 DEFAULT_TASK_RECONCILE_BATCH_SIZE = 100
@@ -74,9 +72,6 @@ TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY = (
     "task_terminalization_recovery_cursor_v1"
 )
 TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION = 1
-REPOSKOP_SHADOW_TERMINAL_FINALIZED_METADATA_PREFIX = (
-    "reposkop_shadow_terminal_finalized_v1:"
-)
 GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
@@ -950,12 +945,20 @@ TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
     "attention": ("interrupted", "outcome_unknown", "failed", "timed_out", "signalled"),
     "terminal": ("completed", "failed", "cancelled", "timed_out", "signalled"),
 }
-MUTATING_AGENT_EXECUTABLES = reposkop_effectiveness.AGENT_EXECUTABLES
-READ_ONLY_AGENT_MODES = reposkop_effectiveness.READ_ONLY_AGENT_MODES
-REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION = reposkop_effectiveness.POLICY_VERSION
-REPOSKOP_EXECUTION_ATTESTATION_KIND = (
-    "grabowski.task_reposkop_execution_attestation"
+TASK_EFFECT_PROFILES = frozenset({
+    "read_only",
+    "workspace_write",
+    "repository_write",
+    "host_write",
+    "remote_write",
+    "unknown",
+})
+MUTATING_AGENT_EXECUTABLES = frozenset(
+    {"agy", "claude", "cline", "codex", "grok", "grok-cli", "opencode", "openhands"}
 )
+READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
+TASK_EFFECT_CLASSIFICATION_POLICY_VERSION = 1
+TASK_EFFECT_CLASSIFICATION_SURFACE = "task_start"
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
 SYSTEMD_SCOPES = {"user", "system"}
 TASK_SCHEMA_V4_ADDITIVE_COLUMNS = {
@@ -3538,126 +3541,129 @@ def _mutating_agent_workspace(
     return None
 
 
-def _reposkop_task_purpose(
-    *,
-    task_id: str,
-    argv_sha256: str,
-    executable: str,
-) -> str:
-    readable = re.sub(
-        r"[^a-z0-9._-]+",
-        "-",
-        Path(executable).name.strip().lower(),
-    ).strip("-._") or "agent"
-    binding = _sha256_json(
-        {
-            "policy_version": REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION,
-            "task_id": task_id,
-            "argv_sha256": argv_sha256,
-            "executable": executable,
-        }
-    )
-    return f"grabowski-task-start:{readable[:32]}:{binding[:8]}"
-
-
-def _default_reposkop_execution_context(
-    workspace: str,
-    purpose: str,
-) -> dict[str, Any]:
-    import grabowski_reposkop_context
-
-    return grabowski_reposkop_context.grabowski_reposkop_context(
-        workspace,
-        purpose,
-    )
-
-
-def _capture_reposkop_shadow_before_best_effort(
-    *,
-    task_id: str,
-    workspace: str,
-    evaluation_id: str | None,
-    reposkop_cohort: str | None,
-) -> dict[str, Any] | None:
-    try:
-        import grabowski_reposkop_shadow
-
-        return grabowski_reposkop_shadow.capture_before_best_effort(
-            task_id=task_id,
-            workspace=workspace,
-            evaluation_id=evaluation_id,
-            reposkop_cohort=reposkop_cohort,
-        )
-    except Exception:
-        return {
-            "phase": "before",
-            "status": "unavailable",
-            "task_id": task_id,
-            "evaluation_id": evaluation_id,
-            "reposkop_cohort": reposkop_cohort,
-            "measurement_class": "inconclusive/unavailable",
-            "failure_category": "shadow_adapter_error",
-            "decision_effect": False,
-            "effect_authorized": False,
-            "audit_ref": None,
-        }
-
-
-def _prepare_reposkop_shadow_terminal_best_effort(
-    *,
-    task_id: str,
-    before_summary: dict[str, Any],
-) -> dict[str, Any]:
-    try:
-        import grabowski_reposkop_shadow
-
-        return grabowski_reposkop_shadow.prepare_terminal_best_effort(
-            task_id=task_id,
-            before_summary=before_summary,
-        )
-    except Exception:
-        material = {
-            "schema_version": 1,
-            "kind": "grabowski.reposkop_checkout_shadow_evidence",
-            "phase": "terminal_prepare",
-            "status": "unavailable",
-            "task_id": task_id,
-            "evaluation_id": before_summary.get("evaluation_id"),
-            "reposkop_cohort": before_summary.get("reposkop_cohort"),
-            "captured_at_unix": _now(),
-            "before_evidence_sha256": before_summary.get("evidence_sha256"),
-            "before_observation_sha256": before_summary.get(
-                "before_observation_sha256"
-            ),
-            "failure_category": "shadow_adapter_error",
-            "continuity_state": "inconclusive",
-            "measurement_class": "inconclusive/unavailable",
-            "reason_codes": ["shadow.shadow_adapter_error"],
-            "anomaly_codes": [],
-            "decision_effect": False,
-            "effect_authorized": False,
-        }
-        return {**material, "evidence_sha256": _sha256_json(material)}
-
-
-def _finalize_reposkop_shadow_terminal_best_effort(
-    *,
-    task_id: str,
-    terminalization_sha256: str,
-    lifecycle_receipt_sha256: str,
-    prepared: dict[str, Any],
-) -> dict[str, Any] | None:
-    try:
-        import grabowski_reposkop_shadow
-
-        return grabowski_reposkop_shadow.finalize_terminal_best_effort(
-            task_id=task_id,
-            terminalization_sha256=terminalization_sha256,
-            lifecycle_receipt_sha256=lifecycle_receipt_sha256,
-            prepared=prepared,
-        )
-    except Exception:
+def _validate_task_effect_profile(value: str | None) -> str | None:
+    if value is None:
         return None
+    if not isinstance(value, str) or value not in TASK_EFFECT_PROFILES:
+        raise ValueError(
+            f"effect_profile must be one of {sorted(TASK_EFFECT_PROFILES)}"
+        )
+    return value
+
+
+def _agent_read_only(argv: list[str], executable: str) -> bool:
+    if "--read-only" in argv:
+        return True
+    if executable == "codex":
+        return _argument_value(argv, "--sandbox", "-s") in READ_ONLY_AGENT_MODES
+    return _argument_value(argv, "--permission-mode") in READ_ONLY_AGENT_MODES
+
+
+def _classify_task_effect(
+    *,
+    transport: str,
+    argv: list[str],
+    mutating_workspace: str | None,
+    explicit_effect_profile: str | None = None,
+) -> dict[str, Any]:
+    explicit = _validate_task_effect_profile(explicit_effect_profile)
+    executable = Path(argv[0]).name.lower()
+    declared_agent = executable in MUTATING_AGENT_EXECUTABLES
+    read_only_mode = declared_agent and _agent_read_only(argv, executable)
+
+    if declared_agent and explicit == "unknown":
+        raise ValueError(
+            "declared local or remote agents may not use effect_profile=unknown"
+        )
+
+    if not declared_agent:
+        profile = explicit or "unknown"
+        return {
+            "schema_version": 1,
+            "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
+            "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
+            "effect_profile": profile,
+            "agent_executable": None,
+            "classification_source": (
+                "explicit" if explicit is not None else "legacy_default_unknown"
+            ),
+        }
+
+    if transport != "local":
+        derived = "read_only" if read_only_mode else "remote_write"
+        if explicit is not None and explicit != derived:
+            raise ValueError(
+                f"effect_profile={explicit} conflicts with derived agent profile {derived}"
+            )
+        return {
+            "schema_version": 1,
+            "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
+            "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
+            "effect_profile": derived,
+            "agent_executable": executable,
+            "classification_source": (
+                "explicit" if explicit is not None else "agent_command"
+            ),
+        }
+
+    if read_only_mode:
+        if explicit is not None and explicit != "read_only":
+            raise ValueError(
+                f"effect_profile={explicit} conflicts with read-only agent mode"
+            )
+        return {
+            "schema_version": 1,
+            "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
+            "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
+            "effect_profile": "read_only",
+            "agent_executable": executable,
+            "classification_source": (
+                "explicit" if explicit is not None else "agent_command"
+            ),
+        }
+
+    if mutating_workspace is None:
+        raise RuntimeError("write-capable local agent classification has no workspace")
+    if explicit is not None and explicit not in {"workspace_write", "repository_write"}:
+        raise ValueError(
+            f"effect_profile={explicit} conflicts with write-capable local agent"
+        )
+    return {
+        "schema_version": 1,
+        "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
+        "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
+        "effect_profile": explicit or "workspace_write",
+        "agent_executable": executable,
+        "classification_source": (
+            "explicit" if explicit is not None else "agent_command"
+        ),
+    }
+
+
+def _project_task_effect_classification(
+    value: dict[str, Any] | None,
+    *,
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return dict(fallback)
+    profile = value.get("effect_profile")
+    if profile not in TASK_EFFECT_PROFILES:
+        return dict(fallback)
+    executable = value.get("agent_executable")
+    if executable is not None and not isinstance(executable, str):
+        executable = fallback.get("agent_executable")
+    source = value.get("classification_source")
+    if not isinstance(source, str) or not source:
+        source = "legacy_task_record"
+    return {
+        "schema_version": 1,
+        "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
+        "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
+        "effect_profile": profile,
+        "agent_executable": executable,
+        "classification_source": source,
+    }
 
 
 def _workspace_lease_resource_keys(
@@ -3680,401 +3686,6 @@ def _workspace_lease_resource_keys(
         except ValueError:
             continue
     return sorted(covering)
-
-
-def _attest_mutating_agent_workspace(
-    *,
-    workspace: str,
-    task_id: str,
-    lease_owner_id: str,
-    workspace_lease_resource_keys: list[str],
-    argv: list[str],
-    argv_sha256: str,
-    execution_identity_sha256: str,
-    reposkop_context_loader: Any | None = None,
-) -> dict[str, Any]:
-    import grabowski_work_admission as work_admission
-
-    normalized_workspace_leases = sorted(
-        {
-            resources.normalize_resource_key(value)
-            for value in workspace_lease_resource_keys
-        }
-    )
-    covering_workspace_leases = _workspace_lease_resource_keys(
-        workspace, normalized_workspace_leases
-    )
-    if (
-        not covering_workspace_leases
-        or covering_workspace_leases != normalized_workspace_leases
-    ):
-        raise ValueError(
-            "Reposkop execution attestation requires only workspace-covering "
-            "lease resources"
-        )
-
-    purpose = _reposkop_task_purpose(
-        task_id=task_id,
-        argv_sha256=argv_sha256,
-        executable=argv[0],
-    )
-    result = (
-        reposkop_context_loader or _default_reposkop_execution_context
-    )(workspace, purpose)
-    evidence = work_admission._reposkop_context_evidence(
-        result,
-        repository=workspace,
-        purpose=purpose,
-    )
-    summary = reposkop_effectiveness.finding_summary(result.get("report"))
-    material = {
-        "schema_version": 1,
-        "kind": REPOSKOP_EXECUTION_ATTESTATION_KIND,
-        "policy_version": REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION,
-        "required": True,
-        "status": "verified",
-        "task_id": task_id,
-        "lease_owner_id": lease_owner_id,
-        "workspace_lease_resource_keys": covering_workspace_leases,
-        "workspace_lease_resource_keys_sha256": _sha256_json(
-            covering_workspace_leases
-        ),
-        "workspace": workspace,
-        "argv_sha256": argv_sha256,
-        "execution_identity_sha256": execution_identity_sha256,
-        "purpose": evidence["purpose"],
-        "reposkop_executable_sha256": evidence[
-            "reposkop_executable_sha256"
-        ],
-        "report_sha256": evidence["report_sha256"],
-        "observation_sha256": evidence["observation_sha256"],
-        "projection_sha256": evidence["projection_sha256"],
-        "repository_identity_sha256": evidence[
-            "repository_identity_sha256"
-        ],
-        "checkout_identity_sha256": evidence[
-            "checkout_identity_sha256"
-        ],
-        "usage_receipt_path": evidence["usage_receipt_path"],
-        "usage_receipt_sha256": evidence["usage_receipt_sha256"],
-        "usage_key_sha256": evidence["usage_key_sha256"],
-        "audit_ref": evidence["audit_ref"],
-        "finding_summary": summary,
-        "effect_authorized": False,
-    }
-    return {
-        **material,
-        "execution_binding_sha256": _sha256_json(material),
-    }
-
-
-def _record_reposkop_execution_attestation(
-    record: dict[str, Any],
-) -> dict[str, Any] | None:
-    raw = record.get("launcher_json")
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        launcher = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    value = launcher.get("reposkop_execution_attestation")
-    return dict(value) if isinstance(value, dict) else None
-
-
-def _record_reposkop_checkout_shadow_before(
-    record: dict[str, Any],
-) -> dict[str, Any] | None:
-    raw = record.get("launcher_json")
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        launcher = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    value = launcher.get("reposkop_checkout_shadow_before")
-    if (
-        not isinstance(value, dict)
-        or value.get("phase") != "before"
-        or value.get("status") not in {"completed", "unavailable"}
-        or value.get("decision_effect") is not False
-        or value.get("effect_authorized") is not False
-    ):
-        return None
-    return dict(value)
-
-
-def _record_reposkop_checkout_shadow_terminal_prepare(
-    record: dict[str, Any],
-) -> dict[str, Any] | None:
-    raw = record.get("launcher_json")
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        launcher = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    value = launcher.get("reposkop_checkout_shadow_terminal_prepare")
-    if not isinstance(value, dict):
-        return None
-    digest = value.get("evidence_sha256")
-    material = {key: item for key, item in value.items() if key != "evidence_sha256"}
-    if (
-        value.get("schema_version") != 1
-        or value.get("kind") != "grabowski.reposkop_checkout_shadow_evidence"
-        or value.get("phase") != "terminal_prepare"
-        or value.get("task_id") != record.get("task_id")
-        or value.get("status") not in {"completed", "unavailable"}
-        or value.get("decision_effect") is not False
-        or value.get("effect_authorized") is not False
-        or not isinstance(digest, str)
-        or SHA256.fullmatch(digest) is None
-        or digest != _sha256_json(material)
-    ):
-        return None
-    return dict(value)
-
-
-def _reposkop_shadow_terminal_marker_root() -> Path:
-    parent = TASK_OUTCOMES_DIR
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    parent_stat = parent.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(parent_stat.st_mode)
-        or parent_stat.st_uid != os.getuid()
-        or stat.S_IMODE(parent_stat.st_mode) != 0o700
-    ):
-        raise PermissionError(
-            "Reposkop terminal shadow marker parent violates its private-directory contract"
-        )
-    root = parent / ".reposkop-shadow-terminals"
-    try:
-        root.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    root_stat = root.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(root_stat.st_mode)
-        or root_stat.st_uid != os.getuid()
-        or stat.S_IMODE(root_stat.st_mode) != 0o700
-    ):
-        raise PermissionError(
-            "Reposkop terminal shadow marker root violates its private-directory contract"
-        )
-    return root
-
-
-def _reposkop_shadow_terminal_marker_path(task_id: str) -> Path:
-    identifier = _validate_task_id(task_id)
-    return _reposkop_shadow_terminal_marker_root() / f"{identifier}.json"
-
-
-def _reposkop_shadow_terminal_marker(task_id: str) -> dict[str, Any] | None:
-    path = _reposkop_shadow_terminal_marker_path(task_id)
-    if not path.exists():
-        return None
-    payload = base._read_private_evidence(
-        path,
-        max_bytes=REPOSKOP_SHADOW_TERMINAL_MARKER_MAX_BYTES,
-    )
-    try:
-        value = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Reposkop terminal shadow marker is invalid") from exc
-    if not isinstance(value, dict):
-        raise RuntimeError("Reposkop terminal shadow marker is invalid")
-    digest = value.get("marker_sha256")
-    material = {key: item for key, item in value.items() if key != "marker_sha256"}
-    if (
-        value.get("schema_version") != 1
-        or value.get("kind") != "grabowski.reposkop_terminal_shadow_marker"
-        or value.get("task_id") != task_id
-        or not isinstance(value.get("terminalization_sha256"), str)
-        or SHA256.fullmatch(value["terminalization_sha256"]) is None
-        or not isinstance(value.get("lifecycle_receipt_sha256"), str)
-        or SHA256.fullmatch(value["lifecycle_receipt_sha256"]) is None
-        or not isinstance(value.get("shadow_evidence_sha256"), str)
-        or SHA256.fullmatch(value["shadow_evidence_sha256"]) is None
-        or not isinstance(value.get("audit_ref"), str)
-        or re.fullmatch(r"audit-record-sha256:[0-9a-f]{64}", value["audit_ref"])
-        is None
-        or not isinstance(digest, str)
-        or SHA256.fullmatch(digest) is None
-        or digest != _sha256_json(material)
-        or payload.decode("utf-8") != _canonical_json(value) + "\n"
-    ):
-        raise RuntimeError("Reposkop terminal shadow marker is invalid")
-    return value
-
-
-def _reposkop_shadow_terminal_finalization_metadata_key(
-    *,
-    task_id: str,
-    terminalization_sha256: str,
-    lifecycle_receipt_sha256: str,
-) -> str:
-    identifier = _validate_task_id(task_id)
-    if SHA256.fullmatch(terminalization_sha256) is None:
-        raise ValueError("Reposkop terminalization digest is invalid")
-    if SHA256.fullmatch(lifecycle_receipt_sha256) is None:
-        raise ValueError("Reposkop lifecycle receipt digest is invalid")
-    return (
-        REPOSKOP_SHADOW_TERMINAL_FINALIZED_METADATA_PREFIX
-        + identifier
-        + ":"
-        + terminalization_sha256
-        + ":"
-        + lifecycle_receipt_sha256
-    )
-
-
-def _record_reposkop_shadow_terminal_finalization(
-    marker: dict[str, Any],
-) -> str:
-    marker_sha256 = marker.get("marker_sha256")
-    lifecycle_receipt_sha256 = marker.get("lifecycle_receipt_sha256")
-    if not isinstance(marker_sha256, str) or SHA256.fullmatch(marker_sha256) is None:
-        raise RuntimeError("Reposkop terminal shadow marker digest is invalid")
-    if (
-        not isinstance(lifecycle_receipt_sha256, str)
-        or SHA256.fullmatch(lifecycle_receipt_sha256) is None
-    ):
-        raise RuntimeError("Reposkop terminal shadow lifecycle receipt is invalid")
-    key = _reposkop_shadow_terminal_finalization_metadata_key(
-        task_id=str(marker.get("task_id") or ""),
-        terminalization_sha256=str(marker.get("terminalization_sha256") or ""),
-        lifecycle_receipt_sha256=lifecycle_receipt_sha256,
-    )
-    with _database_connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        existing = connection.execute(
-            "SELECT value FROM metadata WHERE key=?",
-            (key,),
-        ).fetchone()
-        if existing is not None and str(existing[0]) != lifecycle_receipt_sha256:
-            connection.rollback()
-            raise RuntimeError(
-                "Reposkop terminal shadow finalization index conflicts with marker truth"
-            )
-        if existing is None:
-            connection.execute(
-                "INSERT INTO metadata(key, value) VALUES(?, ?)",
-                (key, lifecycle_receipt_sha256),
-            )
-        connection.commit()
-    return key
-
-def _persist_reposkop_shadow_terminal_marker(
-    *,
-    task_id: str,
-    terminalization_sha256: str,
-    lifecycle_receipt_sha256: str,
-    result: dict[str, Any],
-) -> dict[str, Any] | None:
-    evidence_sha256 = result.get("evidence_sha256")
-    audit_ref = result.get("audit_ref")
-    if (
-        not isinstance(evidence_sha256, str)
-        or SHA256.fullmatch(evidence_sha256) is None
-        or not isinstance(audit_ref, str)
-        or re.fullmatch(r"audit-record-sha256:[0-9a-f]{64}", audit_ref) is None
-    ):
-        return None
-    material = {
-        "schema_version": 1,
-        "kind": "grabowski.reposkop_terminal_shadow_marker",
-        "task_id": task_id,
-        "terminalization_sha256": terminalization_sha256,
-        "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
-        "shadow_evidence_sha256": evidence_sha256,
-        "shadow_status": result.get("status"),
-        "audit_ref": audit_ref,
-        "decision_effect": False,
-    }
-    marker = {**material, "marker_sha256": _sha256_json(material)}
-    path = _reposkop_shadow_terminal_marker_path(task_id)
-    payload = (_canonical_json(marker) + "\n").encode("utf-8")
-    try:
-        base._write_private_create_only(path, payload)
-    except FileExistsError:
-        existing = _reposkop_shadow_terminal_marker(task_id)
-        if existing != marker:
-            raise RuntimeError("Reposkop terminal shadow marker conflicts with terminal truth")
-        marker = existing
-    _record_reposkop_shadow_terminal_finalization(marker)
-    return marker
-
-
-def _reposkop_shadow_terminal_recovery_needed(record: dict[str, Any]) -> bool:
-    if not _is_terminal_state(str(record.get("state"))):
-        return False
-    if _record_reposkop_checkout_shadow_terminal_prepare(record) is None:
-        return False
-    transition_sha256 = record.get("terminalization_sha256")
-    receipt_sha256 = record.get("lifecycle_receipt_sha256")
-    if (
-        not isinstance(transition_sha256, str)
-        or SHA256.fullmatch(transition_sha256) is None
-        or not isinstance(receipt_sha256, str)
-        or SHA256.fullmatch(receipt_sha256) is None
-    ):
-        return False
-    try:
-        marker = _reposkop_shadow_terminal_marker(str(record["task_id"]))
-    except Exception:
-        return True
-    if marker is None:
-        return True
-    if (
-        marker["terminalization_sha256"] != transition_sha256
-        or marker["lifecycle_receipt_sha256"] != receipt_sha256
-    ):
-        return True
-    try:
-        _record_reposkop_shadow_terminal_finalization(marker)
-    except Exception:
-        return True
-    return False
-
-
-def _recover_reposkop_shadow_terminal(
-    record: dict[str, Any],
-) -> dict[str, Any] | None:
-    prepared = _record_reposkop_checkout_shadow_terminal_prepare(record)
-    if prepared is None:
-        return None
-    transition_sha256 = record.get("terminalization_sha256")
-    receipt_sha256 = record.get("lifecycle_receipt_sha256")
-    if (
-        not isinstance(transition_sha256, str)
-        or SHA256.fullmatch(transition_sha256) is None
-        or not isinstance(receipt_sha256, str)
-        or SHA256.fullmatch(receipt_sha256) is None
-    ):
-        return None
-    existing = _reposkop_shadow_terminal_marker(str(record["task_id"]))
-    if existing is not None:
-        if (
-            existing["terminalization_sha256"] != transition_sha256
-            or existing["lifecycle_receipt_sha256"] != receipt_sha256
-        ):
-            raise RuntimeError("Reposkop terminal shadow marker is bound to another lifecycle")
-        _record_reposkop_shadow_terminal_finalization(existing)
-        return existing
-    result = _finalize_reposkop_shadow_terminal_best_effort(
-        task_id=str(record["task_id"]),
-        terminalization_sha256=transition_sha256,
-        lifecycle_receipt_sha256=receipt_sha256,
-        prepared=prepared,
-    )
-    if result is None:
-        return None
-    return _persist_reposkop_shadow_terminal_marker(
-        task_id=str(record["task_id"]),
-        terminalization_sha256=transition_sha256,
-        lifecycle_receipt_sha256=receipt_sha256,
-        result=result,
-    )
 
 
 def _record_task_effect_classification(
@@ -4140,162 +3751,6 @@ def _workspace_scope_identity(workspace: str) -> tuple[str, str]:
     else:
         branch = "unversioned"
     return head, branch
-
-
-def _reposkop_broad_admission_evidence(
-    *,
-    lease_result: dict[str, Any] | None,
-    repository_scope_manifest: dict[str, Any] | None,
-    workspace: str | None,
-) -> dict[str, Any] | None:
-    if (
-        not isinstance(lease_result, dict)
-        or not isinstance(repository_scope_manifest, dict)
-        or not isinstance(workspace, str)
-        or repository_scope_manifest.get("repository") != workspace
-        or repository_scope_manifest.get("worktree") != workspace
-    ):
-        return None
-    head = repository_scope_manifest.get("head")
-    branch = repository_scope_manifest.get("branch")
-    if (
-        not isinstance(head, str)
-        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None
-        or set(head) == {"0"}
-        or not isinstance(branch, str)
-        or not branch
-        or branch in {"main", "master", "unversioned"}
-        or branch.startswith("detached/")
-    ):
-        return None
-    evidence = lease_result.get("work_admission")
-    if not isinstance(evidence, list):
-        return None
-    for item in evidence:
-        if (
-            isinstance(item, dict)
-            and item.get("repository") == workspace
-            and item.get("decision") == "allow"
-            and item.get("read_only") is True
-        ):
-            return dict(item)
-    return None
-
-
-def _reposkop_exact_checkout_admission_evidence(
-    *,
-    lease_result: dict[str, Any] | None,
-    lease_owner_id: str,
-    task_resources: list[str],
-    workspace: str | None,
-    head: str,
-    branch: str,
-    now: int,
-) -> dict[str, Any] | None:
-    if (
-        not isinstance(lease_result, dict)
-        or not isinstance(workspace, str)
-        or not isinstance(head, str)
-        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None
-        or set(head) == {"0"}
-        or not isinstance(branch, str)
-        or not branch
-        or branch in {"main", "master", "unversioned"}
-        or branch.startswith("detached/")
-    ):
-        return None
-    exact_path_key = resources.normalize_resource_key(f"path:{workspace}")
-    if exact_path_key not in task_resources:
-        return None
-    branch_bindings: list[tuple[str, str]] = []
-    for key in task_resources:
-        repository = resources.scoped_repository_resource_root(key)
-        if repository is None:
-            continue
-        expected_key = resources.normalize_resource_key(
-            f"repo:{repository}:branch:{branch}"
-        )
-        if key == expected_key:
-            branch_bindings.append((key, repository))
-    if len(branch_bindings) != 1:
-        return None
-    branch_key, repository = branch_bindings[0]
-    acquired = {
-        str(item.get("resource_key")): item
-        for item in lease_result.get("leases", [])
-        if isinstance(item, dict)
-    }
-    for key in (exact_path_key, branch_key):
-        lease = acquired.get(key)
-        if (
-            lease is None
-            or lease.get("owner_id") != lease_owner_id
-            or int(lease.get("expires_at_unix", 0)) <= now
-        ):
-            return None
-    requested_scope = {
-        "schema_version": 1,
-        "repository": repository,
-        "worktree": workspace,
-        "head": head,
-        "branch": branch,
-        "resource_keys": list(task_resources),
-    }
-    try:
-        assessment = resources.work_admission.require_repository_admission(
-            repo=repository,
-            owner_id=lease_owner_id,
-            operation="task_existing_checkout",
-            requested_scope=requested_scope,
-            target_path=workspace,
-            branch=branch,
-        )
-    except (
-        resources.work_admission.WorkAdmissionBlocked,
-        OSError,
-        RuntimeError,
-        ValueError,
-    ):
-        return None
-    if (
-        not isinstance(assessment, dict)
-        or assessment.get("decision") != "allow"
-        or assessment.get("read_only") is not True
-        or assessment.get("scope_mode") != "exact_checkout"
-        or assessment.get("scope_identity")
-        != {"target_path": workspace, "branch": branch, "head": head}
-    ):
-        return None
-    return dict(assessment)
-
-
-def _reposkop_prospective_admission_evidence(
-    *,
-    lease_result: dict[str, Any] | None,
-    lease_owner_id: str,
-    task_resources: list[str],
-    repository_scope_manifest: dict[str, Any] | None,
-    workspace: str | None,
-    head: str,
-    branch: str,
-    now: int,
-) -> dict[str, Any] | None:
-    broad = _reposkop_broad_admission_evidence(
-        lease_result=lease_result,
-        repository_scope_manifest=repository_scope_manifest,
-        workspace=workspace,
-    )
-    if broad is not None:
-        return broad
-    return _reposkop_exact_checkout_admission_evidence(
-        lease_result=lease_result,
-        lease_owner_id=lease_owner_id,
-        task_resources=task_resources,
-        workspace=workspace,
-        head=head,
-        branch=branch,
-        now=now,
-    )
 
 
 def _whole_repository_scope_manifest(
@@ -6546,15 +6001,6 @@ def _apply_terminalization_projection(
             (receipt_sha256, task_id),
         )
         connection.commit()
-    reposkop_effectiveness.record_task_outcome(
-        marker_root=TASK_OUTCOMES_DIR / ".reposkop-outcomes",
-        attestation=_record_reposkop_execution_attestation(updated),
-        task_id=task_id,
-        terminal_state=state,
-        lifecycle_receipt_sha256=receipt_sha256,
-        terminalized_at_unix=int(updated["terminalized_at_unix"]),
-        observation=observation,
-    )
     resources.complete_task_terminalization(
         task_id,
         transition_sha256,
@@ -6563,11 +6009,6 @@ def _apply_terminalization_projection(
     )
     updated = _row_raw(task_id)
     chronik.record_task_state_safely(updated, state)
-    if _record_reposkop_checkout_shadow_terminal_prepare(updated) is not None:
-        try:
-            _recover_reposkop_shadow_terminal(updated)
-        except Exception:
-            pass
     return updated
 
 
@@ -6585,11 +6026,6 @@ def _recover_task_terminalization(task_id: str) -> dict[str, Any] | None:
             != transition.get("lifecycle_receipt_sha256")
         ):
             return _apply_terminalization_projection(transition, recovered=True)
-        if _record_reposkop_checkout_shadow_terminal_prepare(record) is not None:
-            try:
-                _recover_reposkop_shadow_terminal(record)
-            except Exception:
-                pass
         return record
     record = _row_raw(identifier)
     if not _is_terminal_state(str(record["state"])):
@@ -7541,30 +6977,10 @@ def _set_state(
                 ]
             launcher = selected_launcher
     if _is_terminal_state(state):
-        projection_launcher = launcher
-        selected_launcher = (
-            dict(launcher)
-            if launcher is not None
-            else json.loads(str(current["launcher_json"]))
-        )
-        shadow_record = {
-            **current,
-            "launcher_json": _canonical_json(selected_launcher),
-        }
-        before_shadow = _record_reposkop_checkout_shadow_before(shadow_record)
-        if before_shadow is not None:
-            prepared_shadow = _prepare_reposkop_shadow_terminal_best_effort(
-                task_id=identifier,
-                before_summary=before_shadow,
-            )
-            selected_launcher[
-                "reposkop_checkout_shadow_terminal_prepare"
-            ] = prepared_shadow
-            projection_launcher = selected_launcher
         projection = _terminal_projection(
             current,
             state,
-            launcher=projection_launcher,
+            launcher=launcher,
             observation=observation,
             unit=unit,
             authoritative_unit=authoritative_unit,
@@ -8102,10 +7518,9 @@ def grabowski_task_start(
     Direct local write-capable agent CLIs receive an implicit repository lease
     unless the caller supplies an explicit path or repository scope. Before any new
     local writer process starts, its exact checkout first passes the repository admission
-    bound to its task resource lease. Reposkop v3 then keeps risky/exact-path/repository
-    writes fail-closed while deterministically sampling clean admitted workspace writes;
-    the remaining admitted writers form an audit-bound prospective control cohort. Every
-    task-owned broad repository lease carries a complete whole-repository scope manifest.
+    bound to its task resource lease. Task effect classification remains local and
+    deterministic; it does not invoke an external checkout sensor. Every task-owned broad
+    repository lease carries a complete whole-repository scope manifest.
     An exact already-active execution identity is reused instead of launching
     another process, even when no explicit operation identity was supplied.
     """
@@ -8158,7 +7573,7 @@ def grabowski_task_start(
         command,
         cwd=working_directory,
     )
-    task_effect_classification = reposkop_effectiveness.classify_task_effect(
+    task_effect_classification = _classify_task_effect(
         transport=str(target["transport"]),
         argv=command,
         mutating_workspace=mutating_agent_workspace,
@@ -8264,10 +7679,9 @@ def grabowski_task_start(
     )
     reused_record = operation_resolution["reuse"]
     if reused_record is not None:
-        reused_attestation = _record_reposkop_execution_attestation(reused_record)
-        reused_classification = (
-            _record_task_effect_classification(reused_record)
-            or task_effect_classification
+        reused_classification = _project_task_effect_classification(
+            _record_task_effect_classification(reused_record),
+            fallback=task_effect_classification,
         )
         reuse_audit = {
             "timestamp_unix": _now(),
@@ -8279,21 +7693,10 @@ def grabowski_task_start(
                 "operation_identity_sha256"
             ],
             "effect_profile": reused_classification["effect_profile"],
-            "reposkop_policy": reused_classification["reposkop_policy"],
             "surface": reused_classification["surface"],
             "agent_executable": reused_classification.get("agent_executable"),
+            "classification_source": reused_classification["classification_source"],
             "policy_version": reused_classification["policy_version"],
-            "evaluation_id": (
-                reused_attestation.get("evaluation_id")
-                if reused_attestation is not None
-                else None
-            ),
-            "reposkop_reuse_status": (
-                "reused_existing_evaluation"
-                if reused_attestation is not None
-                and reused_attestation.get("evaluation_id")
-                else "legacy_unattested"
-            ),
             "no_process_started": True,
         }
         base._append_audit(reuse_audit)
@@ -8305,7 +7708,6 @@ def grabowski_task_start(
             "routing_shadow_capture": None,
             "operation_identity": normalized_operation_identity,
             "operation_retry_binding": None,
-            "reposkop_execution_attestation": reused_attestation,
             "task_effect_classification": reused_classification,
             "deduplicated_reuse": {
                 "reused": True,
@@ -8437,56 +7839,6 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
-    checkout_head: str | None = None
-    checkout_branch: str | None = None
-    if mutating_agent_workspace is not None:
-        if (
-            repository_scope_manifest is not None
-            and repository_scope_manifest["repository"]
-            == mutating_agent_workspace
-        ):
-            checkout_head = str(repository_scope_manifest["head"])
-            checkout_branch = str(repository_scope_manifest["branch"])
-        else:
-            checkout_head, checkout_branch = _workspace_scope_identity(
-                mutating_agent_workspace
-            )
-        if (
-            task_effect_classification["reposkop_policy"] == "required"
-            and task_effect_classification["effect_profile"] == "workspace_write"
-            and not _workspace_has_git_marker(mutating_agent_workspace)
-        ):
-            task_effect_classification = {
-                **task_effect_classification,
-                "reposkop_policy": "not_required",
-                "reposkop_cohort": "not_applicable",
-                "reposkop_applicability": "no_git_marker",
-            }
-
-    reposkop_evaluation_id: str | None = None
-    reposkop_checkout_binding_sha256: str | None = None
-    if task_effect_classification["reposkop_policy"] == "required":
-        if (
-            mutating_agent_workspace is None
-            or checkout_head is None
-            or checkout_branch is None
-        ):
-            raise RuntimeError("required Reposkop task has no local workspace identity")
-        reposkop_checkout_binding_sha256 = _sha256_json(
-            {
-                "schema_version": 1,
-                "workspace": mutating_agent_workspace,
-                "head": checkout_head,
-                "branch": checkout_branch,
-            }
-        )
-        reposkop_evaluation_id = reposkop_effectiveness.evaluation_id(
-            task_id=task_id,
-            execution_identity_sha256=execution_identity["identity_sha256"],
-            checkout_binding_sha256=reposkop_checkout_binding_sha256,
-            argv_sha256=argv_sha256,
-            policy_version=int(task_effect_classification["policy_version"]),
-        )
     active_execution_reuse = None
     if (
         normalized_operation_identity is None
@@ -8499,12 +7851,9 @@ def grabowski_task_start(
             resume_policy=policy,
         )
     if active_execution_reuse is not None:
-        reused_attestation = _record_reposkop_execution_attestation(
-            active_execution_reuse
-        )
-        reused_classification = (
-            _record_task_effect_classification(active_execution_reuse)
-            or task_effect_classification
+        reused_classification = _project_task_effect_classification(
+            _record_task_effect_classification(active_execution_reuse),
+            fallback=task_effect_classification,
         )
         reuse_audit = {
             "timestamp_unix": _now(),
@@ -8514,21 +7863,10 @@ def grabowski_task_start(
             "reuse_reason": "active_execution_identity",
             "execution_identity_sha256": execution_identity["identity_sha256"],
             "effect_profile": reused_classification["effect_profile"],
-            "reposkop_policy": reused_classification["reposkop_policy"],
             "surface": reused_classification["surface"],
             "agent_executable": reused_classification.get("agent_executable"),
+            "classification_source": reused_classification["classification_source"],
             "policy_version": reused_classification["policy_version"],
-            "evaluation_id": (
-                reused_attestation.get("evaluation_id")
-                if reused_attestation is not None
-                else None
-            ),
-            "reposkop_reuse_status": (
-                "reused_existing_evaluation"
-                if reused_attestation is not None
-                and reused_attestation.get("evaluation_id")
-                else "legacy_unattested"
-            ),
             "no_process_started": True,
         }
         base._append_audit(reuse_audit)
@@ -8542,7 +7880,6 @@ def grabowski_task_start(
             "routing_shadow_capture": None,
             "operation_identity": None,
             "operation_retry_binding": None,
-            "reposkop_execution_attestation": reused_attestation,
             "task_effect_classification": reused_classification,
             "deduplicated_reuse": {
                 "reused": True,
@@ -8595,411 +7932,6 @@ def grabowski_task_start(
             ),
             metadata=lease_metadata,
         )
-    prospective_admission_evidence: dict[str, Any] | None = None
-    if mutating_agent_workspace is not None:
-        prospective_admission_evidence = _reposkop_prospective_admission_evidence(
-            lease_result=lease_result,
-            lease_owner_id=lease_owner,
-            task_resources=task_resources,
-            repository_scope_manifest=repository_scope_manifest,
-            workspace=mutating_agent_workspace,
-            head=checkout_head,
-            branch=checkout_branch,
-            now=now,
-        )
-        task_effect_classification = (
-            reposkop_effectiveness.select_prospective_policy(
-                task_effect_classification,
-                sampling_key=task_id,
-                admission_verified=prospective_admission_evidence is not None,
-            )
-        )
-    reposkop_execution_attestation: dict[str, Any] | None = None
-    reposkop_requested_audit_ref: str | None = None
-    reposkop_completed_audit_ref: str | None = None
-    reposkop_decision_audit_ref: str | None = None
-    reposkop_event_identity = (
-        {
-            "transaction_id": reposkop_evaluation_id,
-            "evaluation_id": reposkop_evaluation_id,
-            "task_id": task_id,
-            "effect_profile": task_effect_classification["effect_profile"],
-            "reposkop_policy": task_effect_classification["reposkop_policy"],
-            "reposkop_cohort": task_effect_classification.get("reposkop_cohort"),
-            "prospective_admission_verified": task_effect_classification.get(
-                "prospective_admission_verified"
-            ),
-            "sampling_modulus": task_effect_classification.get("sampling_modulus"),
-            "sampling_bucket": task_effect_classification.get("sampling_bucket"),
-            "sampling_key_sha256": task_effect_classification.get(
-                "sampling_key_sha256"
-            ),
-            "surface": task_effect_classification["surface"],
-            "agent_executable": task_effect_classification.get(
-                "agent_executable"
-            ),
-            "policy_version": task_effect_classification["policy_version"],
-            "argv_sha256": argv_sha256,
-            "execution_identity_sha256": execution_identity[
-                "identity_sha256"
-            ],
-            "checkout_binding_sha256": (
-                reposkop_checkout_binding_sha256
-            ),
-        }
-        if reposkop_evaluation_id is not None
-        else None
-    )
-    if task_effect_classification["reposkop_policy"] == "required":
-        if mutating_agent_workspace is None or reposkop_event_identity is None:
-            raise RuntimeError("required Reposkop task lacks evaluation identity")
-        try:
-            if lease_result is None:
-                raise RuntimeError(
-                    "write-capable agent workspace lease was not acquired"
-                )
-            acquired_leases = {
-                str(item.get("resource_key")): item
-                for item in lease_result.get("leases", [])
-                if isinstance(item, dict)
-            }
-            for resource_key in workspace_lease_resource_keys:
-                acquired = acquired_leases.get(resource_key)
-                if (
-                    acquired is None
-                    or acquired.get("owner_id") != lease_owner
-                    or int(acquired.get("expires_at_unix", 0)) <= now
-                ):
-                    raise RuntimeError(
-                        "write-capable agent workspace lease evidence is "
-                        "missing, foreign or expired"
-                    )
-            reposkop_requested_audit_ref = (
-                reposkop_effectiveness.append_event(
-                    {
-                        "timestamp_unix": _now(),
-                        "operation": "reposkop-evaluation-requested",
-                        **reposkop_event_identity,
-                        "workspace_lease_resource_keys": (
-                            workspace_lease_resource_keys
-                        ),
-                        "baseline_decision": "allow_without_reposkop",
-                    }
-                )
-            )
-            reposkop_started_ns = time.monotonic_ns()
-            raw_attestation = _attest_mutating_agent_workspace(
-                workspace=mutating_agent_workspace,
-                task_id=task_id,
-                lease_owner_id=lease_owner,
-                workspace_lease_resource_keys=(
-                    workspace_lease_resource_keys
-                ),
-                argv=command,
-                argv_sha256=argv_sha256,
-                execution_identity_sha256=execution_identity[
-                    "identity_sha256"
-                ],
-            )
-            reposkop_duration_ms = max(
-                0,
-                (time.monotonic_ns() - reposkop_started_ns) // 1_000_000,
-            )
-            reposkop_execution_attestation = (
-                reposkop_effectiveness.enrich_attestation(
-                    raw_attestation,
-                    evaluation=reposkop_evaluation_id,
-                    classification=task_effect_classification,
-                    checkout_binding_sha256=(
-                        reposkop_checkout_binding_sha256
-                    ),
-                    duration_ms=reposkop_duration_ms,
-                )
-            )
-            finding_summary = reposkop_execution_attestation[
-                "finding_summary"
-            ]
-            reposkop_completed_audit_ref = (
-                reposkop_effectiveness.append_event(
-                    {
-                        "timestamp_unix": _now(),
-                        "operation": "reposkop-evaluation-completed",
-                        **reposkop_event_identity,
-                        "status": "verified",
-                        "duration_ms": reposkop_duration_ms,
-                        "reposkop_executable_sha256": (
-                            reposkop_execution_attestation[
-                                "reposkop_executable_sha256"
-                            ]
-                        ),
-                        "report_sha256": reposkop_execution_attestation[
-                            "report_sha256"
-                        ],
-                        "observation_sha256": (
-                            reposkop_execution_attestation[
-                                "observation_sha256"
-                            ]
-                        ),
-                        "projection_sha256": (
-                            reposkop_execution_attestation[
-                                "projection_sha256"
-                            ]
-                        ),
-                        "repository_identity_sha256": (
-                            reposkop_execution_attestation[
-                                "repository_identity_sha256"
-                            ]
-                        ),
-                        "checkout_identity_sha256": (
-                            reposkop_execution_attestation[
-                                "checkout_identity_sha256"
-                            ]
-                        ),
-                        "usage_key_sha256": (
-                            reposkop_execution_attestation[
-                                "usage_key_sha256"
-                            ]
-                        ),
-                        "usage_receipt_sha256": (
-                            reposkop_execution_attestation[
-                                "usage_receipt_sha256"
-                            ]
-                        ),
-                        "requested_audit_ref": (
-                            reposkop_requested_audit_ref
-                        ),
-                        **finding_summary,
-                    }
-                )
-            )
-            reposkop_decision_audit_ref = (
-                reposkop_effectiveness.append_event(
-                    {
-                        "timestamp_unix": _now(),
-                        "operation": "reposkop-decision-applied",
-                        **reposkop_event_identity,
-                        "baseline_decision": "allow_without_reposkop",
-                        "final_decision": "allow",
-                        "decision_changed": False,
-                        "action": "task_start_allowed",
-                        "rule_ids": ["reposkop-policy-v3"],
-                        "decision_reason_codes": (
-                            reposkop_effectiveness.decision_reason_codes(
-                                finding_summary,
-                                final_decision="allow",
-                            )
-                        ),
-                        "projection_state": finding_summary.get(
-                            "projection_state"
-                        ),
-                        "advisory_posture": finding_summary.get(
-                            "advisory_posture"
-                        ),
-                        "completed_audit_ref": (
-                            reposkop_completed_audit_ref
-                        ),
-                    }
-                )
-            )
-            attestation_material = {
-                key: value
-                for key, value in reposkop_execution_attestation.items()
-                if key != "execution_binding_sha256"
-            }
-            attestation_material.update(
-                {
-                    "requested_audit_ref": (
-                        reposkop_requested_audit_ref
-                    ),
-                    "completed_audit_ref": (
-                        reposkop_completed_audit_ref
-                    ),
-                    "decision_audit_ref": reposkop_decision_audit_ref,
-                }
-            )
-            reposkop_execution_attestation = {
-                **attestation_material,
-                "execution_binding_sha256": _sha256_json(
-                    attestation_material
-                ),
-            }
-        except Exception as exc:
-            failure = reposkop_effectiveness.failure_summary(exc)
-            if reposkop_event_identity is not None:
-                try:
-                    reposkop_decision_audit_ref = (
-                        reposkop_effectiveness.append_event(
-                            {
-                                "timestamp_unix": _now(),
-                                "operation": "reposkop-decision-applied",
-                                **reposkop_event_identity,
-                                "baseline_decision": (
-                                    "allow_without_reposkop"
-                                ),
-                                "final_decision": "block",
-                                "decision_changed": True,
-                                "action": (
-                                    "blocked_before_task_record"
-                                ),
-                                "rule_ids": ["reposkop-policy-v3"],
-                                "failure_class": type(exc).__name__,
-                                "failure_category": failure[
-                                    "failure_category"
-                                ],
-                                "decision_reason_codes": failure[
-                                    "decision_reason_codes"
-                                ],
-                                "requested_audit_ref": (
-                                    reposkop_requested_audit_ref
-                                ),
-                            }
-                        )
-                    )
-                except Exception:
-                    reposkop_decision_audit_ref = None
-            compensation: dict[str, Any] | None = None
-            compensation_error: str | None = None
-            if task_resources and lease_result is not None:
-                try:
-                    compensation = resources.release_resources(
-                        lease_owner,
-                        task_resources,
-                        expected_leases=[
-                            resources._release_lease_snapshot(item)
-                            for item in lease_result["leases"]
-                        ],
-                    )
-                except Exception as release_exc:
-                    compensation_error = (
-                        f"{type(release_exc).__name__}: {release_exc}"
-                    )[:1024]
-            blocked_audit = {
-                "timestamp_unix": _now(),
-                "operation": "reposkop-execution-attestation-blocked",
-                "transaction_id": reposkop_evaluation_id,
-                "evaluation_id": reposkop_evaluation_id,
-                "task_id": task_id,
-                "host": host,
-                "workspace": mutating_agent_workspace,
-                "lease_owner_id": lease_owner,
-                "workspace_lease_resource_keys": (
-                    workspace_lease_resource_keys
-                ),
-                "argv_sha256": argv_sha256,
-                "execution_identity_sha256": execution_identity[
-                    "identity_sha256"
-                ],
-                "checkout_binding_sha256": (
-                    reposkop_checkout_binding_sha256
-                ),
-                "effect_profile": task_effect_classification[
-                    "effect_profile"
-                ],
-                "reposkop_policy": task_effect_classification[
-                    "reposkop_policy"
-                ],
-                "surface": task_effect_classification["surface"],
-                "agent_executable": task_effect_classification.get(
-                    "agent_executable"
-                ),
-                "policy_version": task_effect_classification[
-                    "policy_version"
-                ],
-                "error_type": type(exc).__name__,
-                "error": _redact_reason(str(exc))[:1024],
-                "failure_category": failure["failure_category"],
-                "decision_reason_codes": failure[
-                    "decision_reason_codes"
-                ],
-                "requested_audit_ref": reposkop_requested_audit_ref,
-                "decision_audit_ref": reposkop_decision_audit_ref,
-                "lease_compensation": compensation,
-                "lease_compensation_error": compensation_error,
-                "no_task_record_created": True,
-                "no_process_started": True,
-            }
-            base._append_audit(blocked_audit)
-            if compensation_error is not None:
-                raise RuntimeError(
-                    "Reposkop execution attestation and lease compensation failed"
-                ) from exc
-            raise RuntimeError(
-                "Reposkop execution attestation failed before task launch"
-            ) from exc
-    elif task_effect_classification.get("reposkop_cohort") == "prospective_control":
-        if (
-            mutating_agent_workspace is None
-            or reposkop_event_identity is None
-            or lease_result is None
-        ):
-            raise RuntimeError("prospective Reposkop control lacks bound admission evidence")
-        admission_evidence = prospective_admission_evidence
-        if admission_evidence is None:
-            raise RuntimeError("prospective Reposkop control lost repository admission")
-        admission_sha256 = _sha256_json(admission_evidence)
-        reposkop_decision_audit_ref = reposkop_effectiveness.append_event(
-            {
-                "timestamp_unix": _now(),
-                "operation": "reposkop-decision-applied",
-                **reposkop_event_identity,
-                "baseline_decision": "allow_without_reposkop",
-                "final_decision": "allow",
-                "decision_changed": False,
-                "action": "task_start_allowed_without_reposkop",
-                "reposkop_execution_skipped": True,
-                "admission_evidence_sha256": admission_sha256,
-                "rule_ids": ["reposkop-policy-v3-prospective-control"],
-                "decision_reason_codes": [
-                    "prospective_control",
-                    "repository_admission_verified",
-                    "reposkop_execution_skipped",
-                ],
-            }
-        )
-        control_material = {
-            "schema_version": 1,
-            "kind": REPOSKOP_EXECUTION_ATTESTATION_KIND,
-            "policy_version": task_effect_classification["policy_version"],
-            "required": False,
-            "status": "skipped_control",
-            "task_id": task_id,
-            "lease_owner_id": lease_owner,
-            "workspace_lease_resource_keys": workspace_lease_resource_keys,
-            "workspace_lease_resource_keys_sha256": _sha256_json(
-                workspace_lease_resource_keys
-            ),
-            "workspace": mutating_agent_workspace,
-            "argv_sha256": argv_sha256,
-            "execution_identity_sha256": execution_identity["identity_sha256"],
-            "evaluation_id": reposkop_evaluation_id,
-            "effect_profile": task_effect_classification["effect_profile"],
-            "reposkop_policy": task_effect_classification["reposkop_policy"],
-            "reposkop_cohort": task_effect_classification.get("reposkop_cohort"),
-            "surface": task_effect_classification["surface"],
-            "agent_executable": task_effect_classification.get("agent_executable"),
-            "checkout_binding_sha256": reposkop_checkout_binding_sha256,
-            "decision_audit_ref": reposkop_decision_audit_ref,
-            "admission_evidence_sha256": admission_sha256,
-            "reposkop_execution_skipped": True,
-            "effect_authorized": False,
-        }
-        reposkop_execution_attestation = {
-            **control_material,
-            "execution_binding_sha256": _sha256_json(control_material),
-        }
-    reposkop_checkout_shadow_before = (
-        _capture_reposkop_shadow_before_best_effort(
-            task_id=task_id,
-            workspace=mutating_agent_workspace,
-            evaluation_id=reposkop_evaluation_id,
-            reposkop_cohort=task_effect_classification.get("reposkop_cohort"),
-        )
-        if (
-            mutating_agent_workspace is not None
-            and task_effect_classification.get("reposkop_cohort") != "not_applicable"
-        )
-        else None
-    )
     task_output_managed_from_attempt = (
         1
         if target["transport"] == "local" and execution_backend == "systemd-user"
@@ -9052,24 +7984,6 @@ def grabowski_task_start(
                 **(
                     {"operation_retry_binding": dict(operation_retry_binding)}
                     if operation_retry_binding is not None
-                    else {}
-                ),
-                **(
-                    {
-                        "reposkop_execution_attestation": dict(
-                            reposkop_execution_attestation
-                        )
-                    }
-                    if reposkop_execution_attestation is not None
-                    else {}
-                ),
-                **(
-                    {
-                        "reposkop_checkout_shadow_before": dict(
-                            reposkop_checkout_shadow_before
-                        )
-                    }
-                    if reposkop_checkout_shadow_before is not None
                     else {}
                 ),
             }
@@ -9364,20 +8278,6 @@ def grabowski_task_start(
             **launcher,
             "operation_retry_binding": dict(operation_retry_binding),
         }
-    if reposkop_execution_attestation is not None:
-        launcher = {
-            **launcher,
-            "reposkop_execution_attestation": dict(
-                reposkop_execution_attestation
-            ),
-        }
-    if reposkop_checkout_shadow_before is not None:
-        launcher = {
-            **launcher,
-            "reposkop_checkout_shadow_before": dict(
-                reposkop_checkout_shadow_before
-            ),
-        }
     state = _launch_state(launcher)
     stored = _set_state(task_id, state, launcher=launcher)
     if executor_lease_binding_journal is not None:
@@ -9483,54 +8383,10 @@ def grabowski_task_start(
         "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
         "routing_shadow_capture": routing_shadow_capture,
         "effect_profile": task_effect_classification["effect_profile"],
-        "reposkop_policy": task_effect_classification["reposkop_policy"],
-        "reposkop_cohort": task_effect_classification.get("reposkop_cohort"),
-        "prospective_admission_verified": task_effect_classification.get(
-            "prospective_admission_verified"
-        ),
-        "sampling_modulus": task_effect_classification.get("sampling_modulus"),
-        "sampling_bucket": task_effect_classification.get("sampling_bucket"),
-        "sampling_key_sha256": task_effect_classification.get(
-            "sampling_key_sha256"
-        ),
         "surface": task_effect_classification["surface"],
-        "agent_executable": task_effect_classification.get(
-            "agent_executable"
-        ),
-        "classification_source": task_effect_classification[
-            "classification_source"
-        ],
+        "agent_executable": task_effect_classification.get("agent_executable"),
+        "classification_source": task_effect_classification["classification_source"],
         "policy_version": task_effect_classification["policy_version"],
-        "evaluation_id": reposkop_evaluation_id,
-        "reposkop_checkout_binding_sha256": (
-            reposkop_checkout_binding_sha256
-        ),
-        "reposkop_requested_audit_ref": reposkop_requested_audit_ref,
-        "reposkop_completed_audit_ref": reposkop_completed_audit_ref,
-        "reposkop_decision_audit_ref": reposkop_decision_audit_ref,
-        "reposkop_execution_attestation_required": (
-            task_effect_classification["reposkop_policy"] == "required"
-        ),
-        "reposkop_execution_attestation_sha256": (
-            reposkop_execution_attestation[
-                "execution_binding_sha256"
-            ]
-            if reposkop_execution_attestation is not None
-            else None
-        ),
-        "reposkop_usage_key_sha256": (
-            reposkop_execution_attestation.get("usage_key_sha256")
-            if reposkop_execution_attestation is not None
-            else None
-        ),
-        "reposkop_workspace_lease_resource_keys": (
-            reposkop_execution_attestation.get(
-                "workspace_lease_resource_keys", []
-            )
-            if reposkop_execution_attestation is not None
-            else []
-        ),
-        "reposkop_checkout_shadow_before": reposkop_checkout_shadow_before,
     }
     base._append_audit(audit)
     return {
@@ -9541,8 +8397,6 @@ def grabowski_task_start(
         "routing_shadow_capture": routing_shadow_capture,
         "operation_identity": normalized_operation_identity,
         "operation_retry_binding": operation_retry_binding,
-        "reposkop_execution_attestation": reposkop_execution_attestation,
-        "reposkop_checkout_shadow_before": reposkop_checkout_shadow_before,
         "task_effect_classification": task_effect_classification,
         "runtime_refresh_executor_lease_binding": executor_lease_binding_evidence,
         "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
@@ -10233,14 +9087,10 @@ def _select_reconcile_task_rows(
     excluded_task_ids: set[str] | None = None,
 ) -> list[sqlite3.Row]:
     candidate_clause = (
-        "(state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
-        "'failed', 'timed_out', 'signalled') OR "
-        "(state IN ('completed', 'cancelled') AND "
-        "launcher_json LIKE '%\"reposkop_checkout_shadow_terminal_prepare\"%' AND "
-        "shadow_terminal_finalized.key IS NULL))"
+        "state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
+        "'failed', 'timed_out', 'signalled')"
     )
     parameters: list[Any] = [
-        REPOSKOP_SHADOW_TERMINAL_FINALIZED_METADATA_PREFIX,
         TASK_RECONCILE_SEQUENCE_KEY_PREFIX,
         cycle["high_water_sequence"],
     ]
@@ -10264,11 +9114,6 @@ def _select_reconcile_task_rows(
     parameters.append(limit)
     return connection.execute(
         "SELECT tasks.* FROM tasks "
-        "LEFT JOIN metadata AS shadow_terminal_finalized ON "
-        "shadow_terminal_finalized.key = ? || tasks.task_id || ':' || "
-        "COALESCE(tasks.terminalization_sha256, '') || ':' || "
-        "COALESCE(tasks.lifecycle_receipt_sha256, '') "
-        "AND shadow_terminal_finalized.value = tasks.lifecycle_receipt_sha256 "
         "LEFT JOIN metadata AS reconcile_order "
         "ON reconcile_order.key = ? || tasks.task_id "
         f"WHERE {candidate_clause} "
@@ -10478,8 +9323,6 @@ def _reconcile_task_candidate_page(
         if _is_terminal_state(str(record["state"])):
             terminal_valid, lease_valid = _terminal_convergence_evidence(record)
             if terminal_valid and lease_valid:
-                if _reposkop_shadow_terminal_recovery_needed(record):
-                    candidates.append(record)
                 continue
         candidates.append(record)
     return {
@@ -11200,39 +10043,6 @@ def _reconcile_tasks_refresh_locked(
     released: list[str] = []
     denied: list[dict[str, Any]] = []
     for record in rows:
-        if _is_terminal_state(str(record["state"])):
-            terminal_valid, lease_valid = _terminal_convergence_evidence(record)
-            if (
-                terminal_valid
-                and lease_valid
-                and _reposkop_shadow_terminal_recovery_needed(record)
-            ):
-                try:
-                    marker = _recover_reposkop_shadow_terminal(record)
-                except Exception as exc:
-                    denied.append(
-                        {
-                            "task_id": str(record["task_id"]),
-                            "reason": _redact_reason(str(exc)),
-                            "error_type": type(exc).__name__,
-                        }
-                    )
-                    continue
-                if marker is None:
-                    denied.append(
-                        {
-                            "task_id": str(record["task_id"]),
-                            "reason": (
-                                "Reposkop terminal shadow recovery did not persist a marker"
-                            ),
-                            "error_type": "Unavailable",
-                        }
-                    )
-                    continue
-                public = _public(_row_raw(str(record["task_id"])))
-                public["lease_maintenance"] = None
-                refreshed.append(public)
-                continue
         try:
             observation = _reconcile_observation(record)
         except PermissionError as exc:

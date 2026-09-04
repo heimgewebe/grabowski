@@ -41,7 +41,7 @@ class CouplingBaselineTests(unittest.TestCase):
         self.assertEqual(coupling.domain_for_module("grabowski_privileged_broker"), {"privileged"})
         self.assertEqual(coupling.domain_for_module("grabowski_runtime_contract"), {"runtime"})
         self.assertEqual(coupling.domain_for_module("grabowski_browser_diagnostics"), {"browser"})
-        self.assertEqual(coupling.domain_for_module("grabowski_reposkop_context"), {"repo_context"})
+        self.assertEqual(coupling.domain_for_module("grabowski_repoground_catalog"), {"repo_context"})
 
     def test_classification_coverage_keeps_unknown_modules_explicit(self) -> None:
         graph = {

@@ -22,7 +22,6 @@
     "grabowski_audit_query",
     "grabowski_audit_trace",
     "grabowski_audit_analyze",
-    "grabowski_reposkop_effectiveness",
     "latest_complete_bundles",
     "repoground_bundle_discover",
     "repoground_bundle_status",
@@ -44,7 +43,6 @@
     "grabowski_checkout_summary",
     "grabowski_current_work",
     "grabowski_work_acquire",
-    "grabowski_reposkop_context",
     "grabowski_operator_optimization_report",
     "grabowski_git_status",
     "grabowski_git_diff",
@@ -391,14 +389,6 @@
       "source": "src/grabowski_audit_query.py"
     },
     {
-      "module": "grabowski_reposkop_effectiveness",
-      "source": "src/grabowski_reposkop_effectiveness.py"
-    },
-    {
-      "module": "grabowski_reposkop_shadow",
-      "source": "src/grabowski_reposkop_shadow.py"
-    },
-    {
       "module": "grabowski_checkouts",
       "source": "src/grabowski_checkouts.py"
     },
@@ -441,10 +431,6 @@
     {
       "module": "grabowski_operations",
       "source": "src/grabowski_operations.py"
-    },
-    {
-      "module": "grabowski_reposkop_context",
-      "source": "src/grabowski_reposkop_context.py"
     },
     {
       "module": "grabowski_privileged",

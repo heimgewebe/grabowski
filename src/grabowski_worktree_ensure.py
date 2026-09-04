@@ -955,18 +955,7 @@ def ensure_worktree(
     record_friction: FrictionRecorder | None = None,
     resolve_friction: FrictionResolver | None = None,
     assess_admission: Callable[..., dict[str, Any]] | None = None,
-    reposkop_required: bool = False,
 ) -> dict[str, Any]:
-    if not isinstance(reposkop_required, bool):
-        raise WorktreeEnsurePreflight("reposkop_required must be a boolean")
-    if (
-        reposkop_required
-        and assess_admission is not None
-        and not _accepts_keyword_argument(assess_admission, "reposkop_required")
-    ):
-        raise WorktreeEnsurePreflight(
-            "assess_admission must accept reposkop_required when Reposkop enforcement is enabled"
-        )
     if (
         parameters.get("system_convergence") is not None
         and assess_admission is not None
@@ -976,8 +965,6 @@ def ensure_worktree(
             "assess_admission must accept system_convergence when convergence context is bound"
         )
     inputs = _normalize_inputs(parameters)
-    if reposkop_required:
-        inputs = {**inputs, "reposkop_required": True}
     parameters_sha256 = _sha256_json(inputs)
     idempotency_key = inputs["idempotency_key"]
 
@@ -1189,8 +1176,6 @@ def ensure_worktree(
                 admission_parameters["system_convergence"] = inputs[
                     "system_convergence"
                 ]
-            if reposkop_required:
-                admission_parameters["reposkop_required"] = True
             admission = assessor(**admission_parameters)
             if (
                 admission.get("decision") == "isolate_and_execute"

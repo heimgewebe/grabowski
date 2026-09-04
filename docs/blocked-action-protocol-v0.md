@@ -54,11 +54,10 @@ Die kleinste Handlung muss beantworten:
    - Nach jedem Ersatzgriff wird zuerst Status, Logs, Diff, Testausgabe oder ein anderes Receipt gelesen.
    - Erst danach entscheidet ChatGPT den naechsten Griff.
 
-3a. **Reposkop context signal**
-   - Bei Repo-, PR-, Branch-, Pull-, Switch- und Merge-Prep-Arbeit kann `reposkop report <absolute-target> --purpose grabowski-repo-state-context --json` als leichter read-only Kontextgriff genutzt werden, wenn das Zielrepository explizit gewählt wurde.
-   - Der Probelauf gilt als bestanden; es wird keine separate `useful_signal`/`changed_decision`/`noise` Trial-Metrik weitergefuehrt.
-   - Nur Felder des expliziten Ziels zaehlen. Globale Discovery, Favoriten und Branch-Drift-Simulation sind keine Reposkop-Flaechen.
-   - Der Report ist kein Gate, keine Genehmigung und kein Ersatz fuer Git-Status, PR-Checks, Review-Gates oder Action-Readiness.
+3a. **Native Repo-State Reads**
+   - Bei Repo-, PR-, Branch-, Pull-, Switch- und Merge-Prep-Arbeit wird der Zustand des expliziten Zielrepos aus den engsten nativen Typed Reads rekonstruiert.
+   - `grabowski_git_status` liefert Checkout-/Branch-/Dirty-Truth; `grabowski_checkout_inventory` wird nur fuer Linked-Checkout- oder Lifecycle-Fragen hinzugezogen; `grabowski_github_pr_view` und `grabowski_github_checks` liefern Remote-PR-Truth.
+   - Nur Felder des expliziten Ziels zaehlen. Ein Read ist kein Gate, keine Genehmigung und kein Ersatz fuer Lease-, Review-, CI- oder Captain-Readiness.
 
 Danach wird nach Aufgabenklasse geroutet.
 
@@ -101,7 +100,7 @@ Danach wird nach Aufgabenklasse geroutet.
 | Blockierte Klasse | Primaerer Ersatz | Warum | Ruecknahmebeleg |
 | --- | --- | --- | --- |
 | Status/Health blockiert | engeres Typed Tool oder Micro-Task | geringes Risiko, sofort pruefbar | Status JSON oder Logtail |
-| Repo-/Branch-Lage fuer Zielrepo unklar | Reposkop target-bound report | leichtes read-only Lagebild ohne Freigabe | Reposkop report JSON, nur explizites Ziel |
+| Repo-/Branch-Lage fuer Zielrepo unklar | native Git-/Checkout-/PR-Typed-Reads | autoritative Quellen ohne zusaetzlichen Sensor | Git-Status, Checkout-Inventar und/oder PR-Readback des expliziten Ziels |
 | kurzer Shell-Griff blockiert | Grabowski Micro-Task | bleibt unter Grabowski-Audit | task_id, status, logs |
 | komplexer Code-/Repo-Slice | Controller direkt oder lane-gebundener scoped Writer | Autoritaet folgt der Rolle und dem Ressourcenscope, nicht dem Modell; Integration bleibt beim Controller | diff, changed files, Tests |
 | lokaler Patch aus Chat/Artefakt | operator_patch_relay.py | prueft und wendet lokal mit Head- und Dirty-Gates an | JSON-Receipt plus Git-Diff |

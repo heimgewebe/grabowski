@@ -148,29 +148,6 @@
         "tool": "grabowski_audit_query"
       }
     },
-    "grabowski_reposkop_effectiveness": {
-      "evidence_refs": [
-        "tests:test_reposkop_effectiveness.py",
-        "tests:test_reposkop_effectiveness_integration.py",
-        "contract:task-reposkop-execution-attestation-v2"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes only bounded coverage, technical-outcome, latency and evidence-qualified improvement projections derived from the verified audit chain.",
-        "evidence": "Complete classified task-start denominator, deterministic evaluation binding, ordered evaluation/decision/outcome events, bounded grouping and percentile limits, privacy exclusions, explicit non-causality claims and focused projection plus lifecycle tests."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Generic audit query or analysis would require callers to reconstruct a multi-event task lifecycle, denominator rules, percentile semantics and improvement thresholds, risking false success claims and inconsistent treatment of legacy or missing attestations.",
-      "rationale": "Reposkop effectiveness is a materially distinct joined lifecycle projection over classified task starts, verified evaluations, decisions and terminal outcomes. The dedicated read-only shape preserves bounded evidence semantics without creating a second truth store or granting mutation authority.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "audit",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_reposkop_effectiveness"
-      }
-    },
     "grabowski_audit_trace": {
       "evidence_refs": [
         "docs:audit-query-trace-v1.md",
@@ -1058,32 +1035,6 @@
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_operator_optimization_report"
-      }
-    },
-    "grabowski_reposkop_context": {
-      "evidence_refs": [
-        "docs:reposkop-context-v1.md",
-        "runtime:reposkop-coherence-report-v1",
-        "tests:test_reposkop_context.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool owns only one fixed Reposkop report call plus strict observer-boundary validation and semantically deduplicated create-only usage evidence.",
-        "evidence": "Owner-held executable validation, exact absolute target and purpose binding, fixed argv and limits, fail-closed effect_authorized checks, semantic observation/projection digest keying, private O_EXCL receipts and focused replay, tamper and authority-boundary tests."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Generic terminal execution plus generic file writes was rejected because it grants caller-controlled command and path authority, does not verify Reposkop observer semantics and cannot produce one create-only receipt per unchanged semantic observation.",
-      "rationale": "A single typed call turns Reposkop from a documented optional command into observable operator use while preserving its non-authoritative boundary. The output shape binds one exact target report to immutable deduplicated usage evidence without introducing a daemon, global scan or action gate.",
-      "tool_contract": {
-        "authority_class": "mutation",
-        "category": "repository-observation",
-        "effects": [
-          "repository-read",
-          "state-create"
-        ],
-        "read_only": false,
-        "reversibility": "idempotent-create-only",
-        "risk_class": "low",
-        "tool": "grabowski_reposkop_context"
       }
     },
     "grabowski_runtime_refresh_lease_release": {

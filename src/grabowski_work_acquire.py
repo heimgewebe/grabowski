@@ -1735,7 +1735,6 @@ def acquire_work(
             "system_convergence_plan_sha256": inputs["system_convergence_plan"][
                 "plan_sha256"
             ],
-            "reposkop_required": True,
         }
         try:
             output = ensure_worktree_fn(

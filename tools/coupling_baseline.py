@@ -27,7 +27,7 @@ DOMAIN_PREFIXES = {
     "lifecycle": ("grabowski_lifecycle", "grabowski_terminal_convergence"),
     "operator": ("grabowski_operator", "grabowski_grips", "grabowski_operations"),
     "privileged": ("grabowski_privileged",),
-    "repo_context": ("grabowski_repobrief", "grabowski_repoground", "grabowski_reposkop"),
+    "repo_context": ("grabowski_repobrief", "grabowski_repoground"),
     "resource": ("grabowski_resource", "grabowski_resources", "grabowski_nonconflict"),
     "runtime": ("grabowski_runtime", "grabowski_serving_process"),
     "task": ("grabowski_task", "grabowski_tasks", "grabowski_workers", "grabowski_worker"),

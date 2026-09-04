@@ -164,13 +164,6 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "grabowski_reposkop_effectiveness": {
-        "category": "audit",
-        "purpose": "Project bounded Reposkop coverage, technical outcomes, latency and evidence-bound improvement candidates from the verified audit chain.",
-        "risk_class": "low",
-        "effects": [],
-        "reversibility": "not-applicable",
-    },
     "latest_complete_bundles": {
         "category": "knowledge",
         "purpose": "Read latest RepoGround publications with canonical catalog precedence.",
@@ -338,13 +331,6 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
-    },
-    "grabowski_reposkop_context": {
-        "category": "repository-observation",
-        "purpose": "Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt.",
-        "risk_class": "low",
-        "effects": ["repository-read", "state-create"],
-        "reversibility": "idempotent-create-only",
     },
     "grabowski_checkout_binding_reconciliation": {
         "category": "checkout-lifecycle",
