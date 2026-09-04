@@ -1624,11 +1624,28 @@ def grabowski_audit_projection(
         view=selected_view,
     )
     candidates = _audit_projection_candidates(private_windows["7d"])
+    def task_terminal_provider(task_id: str) -> dict[str, Any]:
+        import grabowski_tasks as tasks
+
+        row = tasks._row_raw(task_id)
+        terminal_evidence_valid, _lease_evidence_valid = tasks._terminal_convergence_evidence(row)
+        return {
+            "task_id": row.get("task_id"),
+            "attempt": row.get("attempt"),
+            "state": row.get("state"),
+            "authoritative_unit": row.get("authoritative_unit") or row.get("unit"),
+            "lifecycle_receipt_sha256": row.get("lifecycle_receipt_sha256"),
+            "terminalization_sha256": row.get("terminalization_sha256"),
+            "terminalized_at_unix": row.get("terminalized_at_unix"),
+            "terminal_evidence_valid": terminal_evidence_valid,
+        }
+
     signal_projection = audit_signal.build_projection(
         prepared_records,
         as_of_unix=as_of_unix,
         audit_source_binding=binding,
         runtime_status_provider=getattr(base, "grabowski_status", None),
+        task_terminal_provider=task_terminal_provider,
     )
     advanced = (
         after.get("last_record_sha256") != binding["last_record_sha256"]
