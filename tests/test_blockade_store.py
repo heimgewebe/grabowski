@@ -169,29 +169,62 @@ class BlockadeStoreTests(unittest.TestCase):
                 blockade_store._directory_flags(),
             )
 
-    def test_path_only_directory_flags_fail_without_o_path_or_nofollow(self) -> None:
-        with (
-            mock.patch.object(os, "O_PATH", None, create=True),
-            mock.patch.object(os, "O_NOFOLLOW", None, create=True),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
-                blockade_store._directory_flags(path_only=True)
+    def test_safe_flags_require_o_nofollow(self) -> None:
+        builders = (
+            ("directory", lambda: blockade_store._directory_flags()),
+            ("path-only directory", lambda: blockade_store._directory_flags(path_only=True)),
+            ("file", blockade_store._file_flags),
+            ("create", blockade_store._create_flags),
+        )
+        for missing_value in (None, 0):
+            with self.subTest(missing_value=missing_value):
+                with mock.patch.object(os, "O_NOFOLLOW", missing_value, create=True):
+                    for label, builder in builders:
+                        with self.subTest(builder=label):
+                            with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
+                                builder()
 
     def test_read_no_o_path_permission_failure_is_diagnostic(self) -> None:
         self.engage()
+        source_error = PermissionError(
+            errno.EACCES,
+            "directory read denied",
+            str(self.state),
+        )
         with (
             mock.patch.object(os, "O_PATH", None, create=True),
             mock.patch.object(
                 blockade_store,
                 "_open_directory_chain",
-                side_effect=PermissionError("directory read denied"),
+                side_effect=source_error,
             ),
         ):
-            with self.assertRaisesRegex(PermissionError, "O_PATH is unavailable"):
+            with self.assertRaisesRegex(PermissionError, "O_PATH is unavailable") as raised:
                 read_blockade_marker(
                     self.marker,
                     expected_marker_path=self.marker,
                 )
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+        self.assertEqual(raised.exception.filename, str(self.state))
+
+    def test_read_no_o_path_preserves_policy_permission_errors(self) -> None:
+        self.engage()
+        policy_error = PermissionError("marker parent directory owner is unexpected")
+        with (
+            mock.patch.object(os, "O_PATH", None, create=True),
+            mock.patch.object(
+                blockade_store,
+                "_open_directory_chain",
+                side_effect=policy_error,
+            ),
+        ):
+            with self.assertRaisesRegex(PermissionError, "owner is unexpected") as raised:
+                read_blockade_marker(
+                    self.marker,
+                    expected_marker_path=self.marker,
+                )
+        self.assertIsNone(raised.exception.errno)
+        self.assertNotIn("O_PATH", str(raised.exception))
 
     def test_path_only_read_rejects_symlinked_parent_components(self) -> None:
         if not hasattr(os, "O_PATH"):
@@ -237,6 +270,51 @@ class BlockadeStoreTests(unittest.TestCase):
                 expected_marker_path=linked_nested_marker,
             )
         self.assertIn(nested_error.exception.errno, {errno.ENOTDIR, errno.ELOOP})
+
+    def test_no_o_path_fallback_rejects_symlinked_parent_components(self) -> None:
+        actual_parent = self.root / "fallback-actual-parent"
+        actual_parent.mkdir(mode=0o700)
+        marker = actual_parent / "operator-kill-switch"
+        engage_blockade_marker(
+            self.item,
+            marker,
+            expected_marker_path=marker,
+            transaction_id="fallback-symlink-parent-engage",
+            now=NOW,
+        )
+        linked_parent = self.root / "fallback-linked-parent"
+        linked_parent.symlink_to(actual_parent, target_is_directory=True)
+        linked_marker = linked_parent / marker.name
+
+        actual_outer = self.root / "fallback-actual-outer"
+        actual_inner = actual_outer / "inner"
+        actual_inner.mkdir(parents=True, mode=0o700)
+        nested_marker = actual_inner / "operator-kill-switch"
+        engage_blockade_marker(
+            self.item,
+            nested_marker,
+            expected_marker_path=nested_marker,
+            transaction_id="fallback-symlink-intermediate-engage",
+            now=NOW,
+        )
+        linked_outer = self.root / "fallback-linked-outer"
+        linked_outer.symlink_to(actual_outer, target_is_directory=True)
+        linked_nested_marker = linked_outer / "inner" / nested_marker.name
+
+        with mock.patch.object(os, "O_PATH", None, create=True):
+            with self.assertRaises(OSError) as direct_error:
+                read_blockade_marker(
+                    linked_marker,
+                    expected_marker_path=linked_marker,
+                )
+            self.assertIn(direct_error.exception.errno, {errno.ENOTDIR, errno.ELOOP})
+
+            with self.assertRaises(OSError) as nested_error:
+                read_blockade_marker(
+                    linked_nested_marker,
+                    expected_marker_path=linked_nested_marker,
+                )
+            self.assertIn(nested_error.exception.errno, {errno.ENOTDIR, errno.ELOOP})
 
     def test_exact_engage_rollback_removes_only_matching_marker(self) -> None:
         receipt = self.engage()

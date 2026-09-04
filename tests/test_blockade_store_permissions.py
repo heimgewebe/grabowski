@@ -19,11 +19,12 @@ from grabowski_blockades import BlockadeRecord, Provenance, Scope  # noqa: E402
 
 class BlockadeStorePermissionTests(unittest.TestCase):
     def test_read_succeeds_through_execute_only_parent_without_read_permission(self) -> None:
-        if not hasattr(os, "O_PATH"):
-            self.skipTest("Linux O_PATH is required by the production contract")
+        if not hasattr(os, "O_PATH") or not hasattr(os, "fork"):
+            self.skipTest("Linux O_PATH and fork are required by the production contract")
 
         with tempfile.TemporaryDirectory() as temporary:
-            parent = Path(temporary) / "operator-blockade"
+            temporary_root = Path(temporary)
+            parent = temporary_root / "operator-blockade"
             parent.mkdir(mode=0o700)
             marker = parent / "operator-kill-switch"
             record = BlockadeRecord(
@@ -49,79 +50,123 @@ class BlockadeStorePermissionTests(unittest.TestCase):
                 transaction_id="execute-only-engage",
             )
 
-            parent.chmod(0o100)
-            expected_uid = os.geteuid()
-            probe_uid = expected_uid
-            probe_gid = os.getegid()
-            use_child = expected_uid == 0
-            temporary_root = Path(temporary)
-            if use_child:
-                try:
-                    import pwd
+            original_uid = os.geteuid()
+            original_gid = os.getegid()
+            probe_uid = original_uid
+            probe_gid = original_gid
+            use_child = original_uid == 0
 
-                    nobody = pwd.getpwnam("nobody")
-                    probe_uid = nobody.pw_uid
-                    probe_gid = nobody.pw_gid
-                    os.chown(temporary_root, probe_uid, probe_gid)
-                    os.chown(parent, probe_uid, probe_gid)
-                    os.chown(marker, probe_uid, probe_gid)
-                except (ImportError, KeyError, PermissionError, OSError) as exc:
-                    self.skipTest(
-                        f"cannot establish an unprivileged permission probe: {type(exc).__name__}"
-                    )
-
-            def probe() -> int:
+            def assert_probe() -> None:
                 try:
                     descriptor = os.open(parent, store._directory_flags())
                 except PermissionError:
                     pass
-                except OSError:
-                    return 11
                 else:
                     os.close(descriptor)
-                    return 12
-                try:
-                    snapshot = store.read_blockade_marker(
-                        marker,
-                        expected_marker_path=marker,
-                        expected_uid=probe_uid,
-                    )
-                except BaseException:
-                    return 21
-                if snapshot.record != record:
-                    return 22
-                if snapshot.record_sha256 != receipt.record_sha256:
-                    return 23
-                if snapshot.file_sha256 != receipt.marker_file_sha256:
-                    return 24
-                return 0
+                    self.fail("O_RDONLY unexpectedly opened an execute-only directory")
+
+                snapshot = store.read_blockade_marker(
+                    marker,
+                    expected_marker_path=marker,
+                    expected_uid=probe_uid,
+                )
+                self.assertEqual(snapshot.record, record)
+                self.assertEqual(snapshot.record_sha256, receipt.record_sha256)
+                self.assertEqual(snapshot.file_sha256, receipt.marker_file_sha256)
 
             try:
                 if use_child:
-                    pid = os.fork()
-                    if pid == 0:
-                        try:
-                            os.setgroups([])
-                            os.setgid(probe_gid)
-                            os.setuid(probe_uid)
-                        except (PermissionError, OSError):
-                            os._exit(90)
-                        os._exit(probe())
-                    _, status = os.waitpid(pid, 0)
-                    self.assertTrue(os.WIFEXITED(status))
-                    exit_code = os.WEXITSTATUS(status)
-                    if exit_code == 90:
-                        self.skipTest("cannot drop root privileges for permission probe")
-                    self.assertEqual(
-                        exit_code,
-                        0,
-                        f"unprivileged execute-only probe failed with code {exit_code}",
-                    )
+                    try:
+                        import pwd
+
+                        nobody = pwd.getpwnam("nobody")
+                        probe_uid = nobody.pw_uid
+                        probe_gid = nobody.pw_gid
+                        temporary_root.chmod(0o711)
+                        os.chown(parent, probe_uid, probe_gid)
+                        os.chown(marker, probe_uid, probe_gid)
+                    except (ImportError, KeyError, PermissionError, OSError) as exc:
+                        self.skipTest(
+                            "cannot establish an unprivileged permission probe: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+                parent.chmod(0o100)
+                if not use_child:
+                    assert_probe()
                 else:
-                    self.assertEqual(probe(), 0)
+                    read_fd, write_fd = os.pipe()
+                    try:
+                        pid = os.fork()
+                    except BaseException:
+                        os.close(read_fd)
+                        os.close(write_fd)
+                        raise
+                    if pid == 0:
+                        os.close(read_fd)
+                        code = 91
+
+                        def report(message: str) -> None:
+                            try:
+                                os.write(write_fd, message.encode("utf-8", errors="replace")[:4096])
+                            except OSError:
+                                pass
+
+                        try:
+                            try:
+                                os.setgroups([])
+                                os.setgid(probe_gid)
+                                os.setuid(probe_uid)
+                            except (PermissionError, OSError) as exc:
+                                code = 90
+                                report(f"privilege-drop failed: {type(exc).__name__}: {exc}")
+                            else:
+                                try:
+                                    assert_probe()
+                                except Exception as exc:
+                                    code = 92
+                                    report(f"probe failed: {type(exc).__name__}: {exc}")
+                                else:
+                                    code = 0
+                        finally:
+                            try:
+                                os.close(write_fd)
+                            finally:
+                                os._exit(code)
+
+                    os.close(write_fd)
+                    diagnostic = bytearray()
+                    try:
+                        while len(diagnostic) < 4096:
+                            chunk = os.read(read_fd, 4096 - len(diagnostic))
+                            if not chunk:
+                                break
+                            diagnostic.extend(chunk)
+                    finally:
+                        os.close(read_fd)
+                    _, status = os.waitpid(pid, 0)
+                    self.assertTrue(os.WIFEXITED(status), "permission probe child did not exit normally")
+                    exit_code = os.WEXITSTATUS(status)
+                    detail = diagnostic.decode("utf-8", errors="replace")
+                    if exit_code == 90:
+                        self.skipTest(detail or "cannot drop root privileges for permission probe")
+                    self.assertNotEqual(exit_code, 91, detail or "permission probe child escaped its assertion body")
+                    self.assertEqual(exit_code, 0, detail or f"permission probe failed with code {exit_code}")
+
                 self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o100)
             finally:
-                parent.chmod(0o700)
+                if use_child:
+                    try:
+                        if marker.exists():
+                            os.chown(marker, original_uid, original_gid)
+                        if parent.exists():
+                            os.chown(parent, original_uid, original_gid)
+                    finally:
+                        if parent.exists():
+                            parent.chmod(0o700)
+                        temporary_root.chmod(0o700)
+                elif parent.exists():
+                    parent.chmod(0o700)
 
 
 if __name__ == "__main__":

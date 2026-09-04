@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -275,39 +276,34 @@ def _transaction_id(value: str | None, *, now: datetime | None) -> str:
     return f"{prefix}-{secrets.token_hex(8)}"
 
 
+def _nofollow_flag() -> int:
+    flag = getattr(os, "O_NOFOLLOW", None)
+    if isinstance(flag, bool) or not isinstance(flag, int) or flag <= 0:
+        raise RuntimeError("O_NOFOLLOW is required for safe blockade filesystem access")
+    return flag
+
+
 def _directory_flags(*, path_only: bool = False) -> int:
+    nofollow_flag = _nofollow_flag()
     path_flag = getattr(os, "O_PATH", None) if path_only else None
-    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
     if path_flag is not None:
         # O_PATH changes O_NOFOLLOW semantics: a symlink itself may be opened.
         # O_DIRECTORY is therefore also required so every traversed component
         # must be a directory rather than a symlink.
         flags = path_flag | os.O_DIRECTORY | os.O_CLOEXEC
     else:
-        if path_only and nofollow_flag is None:
-            raise RuntimeError(
-                "O_NOFOLLOW is required when O_PATH is unavailable"
-            )
-        # Platforms without O_PATH retain the previous O_RDONLY behavior only
-        # while the existing no-symlink traversal guard remains available.
+        # Platforms without O_PATH retain the previous O_RDONLY behavior while
+        # still requiring the store-wide no-symlink traversal guard.
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    if nofollow_flag is not None:
-        flags |= nofollow_flag
-    return flags
+    return flags | nofollow_flag
 
 
 def _file_flags() -> int:
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return flags
+    return os.O_RDONLY | os.O_CLOEXEC | _nofollow_flag()
 
 
 def _create_flags() -> int:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return flags
+    return os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | _nofollow_flag()
 
 
 def _open_directory_chain(
@@ -661,10 +657,15 @@ def read_blockade_marker(
             path_only=True,
         )
     except PermissionError as exc:
-        if getattr(os, "O_PATH", None) is None:
+        if (
+            getattr(os, "O_PATH", None) is None
+            and exc.errno in {errno.EACCES, errno.EPERM}
+        ):
             raise PermissionError(
+                exc.errno,
                 "marker parent traversal failed because O_PATH is unavailable; "
-                "the O_RDONLY fallback requires directory read permission"
+                "the O_RDONLY fallback requires directory read permission",
+                exc.filename,
             ) from exc
         raise
     try:
