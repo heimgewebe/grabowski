@@ -133,10 +133,16 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("After=network.target grabowski-transport-ingress.service", ingress)
         self.assertNotIn("Wants=grabowski-transport-ingress.service", ingress)
         self.assertIn(
+            "WantedBy=grabowski-transport-ingress.service", ingress
+        )
+        self.assertIn(
             "PartOf=grabowski-transport-ingress-maulwurf-x.service", gateway
         )
         self.assertIn(
             "Wants=grabowski-transport-ingress-maulwurf-x.service", gateway
+        )
+        self.assertIn(
+            "WantedBy=grabowski-transport-ingress-maulwurf-x.service", gateway
         )
         self.assertNotIn("BindsTo=", ingress)
         self.assertNotIn("BindsTo=", gateway)

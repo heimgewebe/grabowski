@@ -28,6 +28,16 @@ DEFAULT_POLICY_FILE = (
     Path.home() / ".local/state/grabowski/transport-connectors/maulwurf-x.tools.json"
 )
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+ALLOWED_JSON_RPC_METHODS = frozenset(
+    {
+        "initialize",
+        "notifications/initialized",
+        "notifications/cancelled",
+        "ping",
+        "tools/list",
+        "tools/call",
+    }
+)
 
 
 class GatewayConfigurationError(RuntimeError):
@@ -160,6 +170,13 @@ def _parse_json_rpc(body: bytes) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _json_rpc_method(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    method = payload.get("method")
+    return method if isinstance(method, str) and method else None
+
+
 def _tool_call_name(payload: dict[str, Any] | None) -> str | None:
     if not isinstance(payload, dict) or payload.get("method") != "tools/call":
         return None
@@ -206,12 +223,9 @@ def _filter_tools_list_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
             raise GatewayConfigurationError("upstream tools/list contains invalid name")
         if name in allowed_tools:
             filtered.append(tool)
-    observed = {str(tool["name"]) for tool in filtered}
-    missing = sorted(allowed_tools - observed)
-    if missing:
-        raise GatewayConfigurationError(
-            "configured connector tools are missing upstream: " + ", ".join(missing)
-        )
+    # MCP tools/list may be paginated. Filter only the current page and preserve
+    # the upstream cursor; authoritative existence/authorization is enforced by
+    # the operator-side connector policy on tools/call.
     result["tools"] = filtered
     return json.dumps(
         payload,
@@ -297,8 +311,14 @@ class ExternalConnectorGateway:
             return JSONResponse({"error": "content_length_mismatch"}, status_code=400)
 
         payload = _parse_json_rpc(body)
-        if request.method == "POST" and body and payload is None:
-            return JSONResponse({"error": "invalid_json_rpc_object"}, status_code=400)
+        if request.method == "POST" and body:
+            if payload is None:
+                return JSONResponse({"error": "invalid_json_rpc_object"}, status_code=400)
+            method = _json_rpc_method(payload)
+            if method is None:
+                return JSONResponse({"error": "invalid_json_rpc_method"}, status_code=400)
+            if method not in ALLOWED_JSON_RPC_METHODS:
+                return JSONResponse(_tool_not_available_response(payload), status_code=200)
         tool_name = _tool_call_name(payload)
         if tool_name is not None and tool_name not in self._allowed_tools:
             return JSONResponse(_tool_not_available_response(payload), status_code=200)

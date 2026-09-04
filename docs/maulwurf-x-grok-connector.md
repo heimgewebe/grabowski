@@ -100,8 +100,8 @@ Die Aktivierung muss in dieser Reihenfolge erfolgen:
    Elternverzeichnis `0700`, Datei `0600`.
 5. **Erst danach** `transport-connectors/require-tool-policy` mit exakt
    `required-v1` und Modus `0600` anlegen.
-6. `grabowski-transport-ingress-maulwurf-x.service` starten und lokal prüfen.
-7. `grabowski-external-connector-maulwurf-x.service` starten und lokal prüfen.
+6. `grabowski-transport-ingress-maulwurf-x.service` **enable + start** und lokal prüfen.
+7. `grabowski-external-connector-maulwurf-x.service` **enable + start** und lokal prüfen.
 8. Erst nach lokalem Negativ-/Positivtest einen stabilen HTTPS-Tunnel auf
    `127.0.0.1:18184` schalten.
 9. Grok-Connector unter dem Namen **Maulwurf X** anlegen.
@@ -109,6 +109,12 @@ Die Aktivierung muss in dieser Reihenfolge erfolgen:
 Der Marker wird absichtlich zuletzt gesetzt. Fehlt danach für irgendeinen
 enrollten Principal die Policy oder ist sie ungültig, verweigert der Operator
 dessen Calls statt auf globale `trusted-owner`-Rechte zurückzufallen.
+
+Die Install-Targets bilden eine optionale, erst durch `enable` aktivierte
+Startkette: der primäre signed ingress zieht den Maulwurf-X-Ingress, dieser das
+Gateway. `PartOf` propagiert Stop/Restart nach unten. Damit bleiben normale
+Grabowski-Deployments restartfest, ohne dass ein nicht provisionierter Maulwurf X
+den primären Connector als Pflichtabhängigkeit belastet.
 
 ## Abnahme
 
@@ -139,6 +145,12 @@ Negative Beweise:
 Der vorhandene `tunnel-client-grabowski` ist OpenAI-spezifisch und wird für
 Maulwurf X nicht wiederverwendet. Der Produktionspfad benötigt einen eigenen,
 providerneutralen, stabilen HTTPS-Endpunkt vor Port 18184.
+
+Auf dem Heim-PC ist Tailscale bereits vorhanden; `cloudflared` ist nicht
+installiert. Für den ersten produktiven Cutover ist deshalb ein **Tailscale
+Funnel auf HTTPS-Port 8443** der bevorzugte Pfad. Er benötigt keine
+Router-Portfreigabe und zeigt ausschließlich auf `http://127.0.0.1:18184`.
+Der Funnel wird erst nach den lokalen Positiv- und Negativtests aktiviert.
 
 Das Gateway unterstützt als schmalen ersten Vertrag Bearer-Header und
 `X-API-Key`. Die konkrete Grok-App-Authentisierungs-UX wird erst gegen die reale

@@ -131,19 +131,26 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
         )
         self.assertIsNone(filtered["result"]["nextCursor"])
 
-    def test_tools_list_projection_fails_if_configured_tool_is_missing(self) -> None:
+    def test_tools_list_projection_preserves_pagination_without_requiring_full_allowlist(self) -> None:
         payload = {
             "jsonrpc": "2.0",
             "id": 4,
-            "result": {"tools": [{"name": "grabowski_status", "inputSchema": {}}]},
+            "result": {
+                "tools": [{"name": "grabowski_status", "inputSchema": {}}],
+                "nextCursor": "page-2",
+            },
         }
-        with self.assertRaisesRegex(
-            gateway.GatewayConfigurationError, "missing upstream"
-        ):
+        filtered = json.loads(
             gateway._filter_tools_list_payload(
                 json.dumps(payload).encode("utf-8"),
                 {"grabowski_status", "grabowski_git_status"},
-            )
+            ).decode("utf-8")
+        )
+        self.assertEqual(
+            [tool["name"] for tool in filtered["result"]["tools"]],
+            ["grabowski_status"],
+        )
+        self.assertEqual(filtered["result"]["nextCursor"], "page-2")
 
     def test_gateway_rejects_shared_external_and_internal_secret(self) -> None:
         with self.assertRaisesRegex(
@@ -239,6 +246,21 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
                 gateway._load_gateway_policy(policy, "maulwurf-x")
         self.assertTrue(loaded["enforced"])
         self.assertEqual(loaded["allowed_tools"], ["grabowski_status"])
+
+    def test_gateway_method_surface_excludes_future_unscoped_capabilities(self) -> None:
+        self.assertEqual(
+            gateway.ALLOWED_JSON_RPC_METHODS,
+            {
+                "initialize",
+                "notifications/initialized",
+                "notifications/cancelled",
+                "ping",
+                "tools/list",
+                "tools/call",
+            },
+        )
+        self.assertNotIn("resources/read", gateway.ALLOWED_JSON_RPC_METHODS)
+        self.assertNotIn("prompts/get", gateway.ALLOWED_JSON_RPC_METHODS)
 
     def test_proxy_rejects_json_rpc_batches_before_upstream(self) -> None:
         proxy = gateway.ExternalConnectorGateway(

@@ -28,4 +28,4 @@ LimitCORE=0
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=default.target
+WantedBy=grabowski-transport-ingress.service
