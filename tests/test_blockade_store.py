@@ -169,6 +169,30 @@ class BlockadeStoreTests(unittest.TestCase):
                 blockade_store._directory_flags(),
             )
 
+    def test_path_only_directory_flags_fail_without_o_path_or_nofollow(self) -> None:
+        with (
+            mock.patch.object(os, "O_PATH", None, create=True),
+            mock.patch.object(os, "O_NOFOLLOW", None, create=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
+                blockade_store._directory_flags(path_only=True)
+
+    def test_read_no_o_path_permission_failure_is_diagnostic(self) -> None:
+        self.engage()
+        with (
+            mock.patch.object(os, "O_PATH", None, create=True),
+            mock.patch.object(
+                blockade_store,
+                "_open_directory_chain",
+                side_effect=PermissionError("directory read denied"),
+            ),
+        ):
+            with self.assertRaisesRegex(PermissionError, "O_PATH is unavailable"):
+                read_blockade_marker(
+                    self.marker,
+                    expected_marker_path=self.marker,
+                )
+
     def test_path_only_read_rejects_symlinked_parent_components(self) -> None:
         if not hasattr(os, "O_PATH"):
             self.skipTest("Linux O_PATH is unavailable on this test platform")

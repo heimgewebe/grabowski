@@ -50,22 +50,75 @@ class BlockadeStorePermissionTests(unittest.TestCase):
             )
 
             parent.chmod(0o100)
-            try:
+            expected_uid = os.geteuid()
+            probe_uid = expected_uid
+            probe_gid = os.getegid()
+            use_child = expected_uid == 0
+            temporary_root = Path(temporary)
+            if use_child:
+                try:
+                    import pwd
+
+                    nobody = pwd.getpwnam("nobody")
+                    probe_uid = nobody.pw_uid
+                    probe_gid = nobody.pw_gid
+                    os.chown(temporary_root, probe_uid, probe_gid)
+                    os.chown(parent, probe_uid, probe_gid)
+                    os.chown(marker, probe_uid, probe_gid)
+                except (ImportError, KeyError, PermissionError, OSError) as exc:
+                    self.skipTest(
+                        f"cannot establish an unprivileged permission probe: {type(exc).__name__}"
+                    )
+
+            def probe() -> int:
                 try:
                     descriptor = os.open(parent, store._directory_flags())
                 except PermissionError:
                     pass
+                except OSError:
+                    return 11
                 else:
                     os.close(descriptor)
+                    return 12
+                try:
+                    snapshot = store.read_blockade_marker(
+                        marker,
+                        expected_marker_path=marker,
+                        expected_uid=probe_uid,
+                    )
+                except BaseException:
+                    return 21
+                if snapshot.record != record:
+                    return 22
+                if snapshot.record_sha256 != receipt.record_sha256:
+                    return 23
+                if snapshot.file_sha256 != receipt.marker_file_sha256:
+                    return 24
+                return 0
 
-                snapshot = store.read_blockade_marker(
-                    marker,
-                    expected_marker_path=marker,
-                )
-
-                self.assertEqual(snapshot.record, record)
-                self.assertEqual(snapshot.record_sha256, receipt.record_sha256)
-                self.assertEqual(snapshot.file_sha256, receipt.marker_file_sha256)
+            try:
+                if use_child:
+                    pid = os.fork()
+                    if pid == 0:
+                        try:
+                            os.setgroups([])
+                            os.setgid(probe_gid)
+                            os.setuid(probe_uid)
+                        except (PermissionError, OSError):
+                            os._exit(90)
+                        os._exit(probe())
+                    _, status = os.waitpid(pid, 0)
+                    self.assertTrue(os.WIFEXITED(status))
+                    exit_code = os.WEXITSTATUS(status)
+                    if exit_code == 90:
+                        self.skipTest("cannot drop root privileges for permission probe")
+                    self.assertEqual(
+                        exit_code,
+                        0,
+                        f"unprivileged execute-only probe failed with code {exit_code}",
+                    )
+                else:
+                    self.assertEqual(probe(), 0)
                 self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o100)
             finally:
                 parent.chmod(0o700)

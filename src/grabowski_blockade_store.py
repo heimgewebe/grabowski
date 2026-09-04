@@ -277,16 +277,22 @@ def _transaction_id(value: str | None, *, now: datetime | None) -> str:
 
 def _directory_flags(*, path_only: bool = False) -> int:
     path_flag = getattr(os, "O_PATH", None) if path_only else None
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
     if path_flag is not None:
         # O_PATH changes O_NOFOLLOW semantics: a symlink itself may be opened.
         # O_DIRECTORY is therefore also required so every traversed component
         # must be a directory rather than a symlink.
         flags = path_flag | os.O_DIRECTORY | os.O_CLOEXEC
     else:
-        # Platforms without O_PATH retain the previous O_RDONLY behavior.
+        if path_only and nofollow_flag is None:
+            raise RuntimeError(
+                "O_NOFOLLOW is required when O_PATH is unavailable"
+            )
+        # Platforms without O_PATH retain the previous O_RDONLY behavior only
+        # while the existing no-symlink traversal guard remains available.
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    if nofollow_flag is not None:
+        flags |= nofollow_flag
     return flags
 
 
@@ -646,13 +652,21 @@ def read_blockade_marker(
     # directories remain traversable. Mutating store paths deliberately retain
     # O_RDONLY directory descriptors because their durability contract fsyncs
     # the parent directory.
-    parent_fd = _open_directory_chain(
-        path.parent,
-        expected_uid=uid,
-        require_private=require_private_parent,
-        label="marker parent",
-        path_only=True,
-    )
+    try:
+        parent_fd = _open_directory_chain(
+            path.parent,
+            expected_uid=uid,
+            require_private=require_private_parent,
+            label="marker parent",
+            path_only=True,
+        )
+    except PermissionError as exc:
+        if getattr(os, "O_PATH", None) is None:
+            raise PermissionError(
+                "marker parent traversal failed because O_PATH is unavailable; "
+                "the O_RDONLY fallback requires directory read permission"
+            ) from exc
+        raise
     try:
         snapshot = _snapshot_from_open_file(
             parent_fd,
