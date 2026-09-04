@@ -65,6 +65,9 @@ BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
 BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
+LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
+LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
+LOCAL_BACKUP_NTFS_DEVICE = "/dev/disk/by-uuid/249180DA265E8DE0"
 AUTOMATIC_CUTOVER_BIND_PATHS = (
     "/home/alex/repos/grabowski",
 )
@@ -1534,6 +1537,53 @@ def _bootstrap_recovery_action_from_repository(
     return json.loads(json.dumps(action))
 
 
+def _local_backup_ntfs_actions_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, dict[str, Any]]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository, commit_id=expected_head, relative_path=relative_path, runner=runner
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    specs = {
+        LOCAL_BACKUP_NTFS_CHECK_ACTION: ("check", "-n"),
+        LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION: ("clear-dirty", "-d"),
+    }
+    result: dict[str, dict[str, Any]] = {}
+    required = {
+        "enabled", "mode", "target_pattern", "argv", "timeout_seconds",
+        "kill_switch_path", "legacy_kill_switch_path",
+        "allowed_peer_uid", "allowed_peer_unit",
+    }
+    for name, (target_pattern, flag) in specs.items():
+        action = actions.get(name)
+        if not isinstance(action, dict) or set(action) != required:
+            raise CutoverError(f"{name} action contract is invalid")
+        if action.get("enabled") is not True or action.get("mode") != "template":
+            raise CutoverError(f"{name} must be an enabled template")
+        if action.get("target_pattern") != target_pattern:
+            raise CutoverError(f"{name} target pattern is invalid")
+        if action.get("argv") != ["/usr/bin/ntfsfix", flag, LOCAL_BACKUP_NTFS_DEVICE]:
+            raise CutoverError(f"{name} argv is invalid")
+        if action.get("timeout_seconds") != 120:
+            raise CutoverError(f"{name} timeout is invalid")
+        if (
+            action.get("kill_switch_path") != str(CANONICAL_KILL_SWITCH)
+            or action.get("legacy_kill_switch_path") != str(LEGACY_KILL_SWITCH)
+            or action.get("allowed_peer_uid") != 1000
+            or action.get("allowed_peer_unit") != OPERATOR_UNIT
+        ):
+            raise CutoverError(f"{name} authority binding is invalid")
+        result[name] = json.loads(json.dumps(action))
+    return result
+
+
 def _validate_root_task_coherence(
     root_task: dict[str, Any],
     *,
@@ -1576,6 +1626,7 @@ def merge_privileged_config(
     bootstrap_recovery: dict[str, Any] | None = None,
     operator_service_control: dict[str, Any] | None = None,
     rootbroker_cutover: dict[str, Any] | None = None,
+    local_backup_ntfs_actions: dict[str, dict[str, Any]] | None = None,
     allow_controlled_updates: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(current) != {"schema_version", "actions"}:
@@ -1644,6 +1695,18 @@ def merge_privileged_config(
         merged_actions[ROOTBROKER_CUTOVER_ACTION] = json.loads(
             json.dumps(rootbroker_cutover)
         )
+
+    local_backup_ntfs_before: dict[str, Any] = {}
+    if local_backup_ntfs_actions is not None:
+        for name in (LOCAL_BACKUP_NTFS_CHECK_ACTION, LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION):
+            action = local_backup_ntfs_actions.get(name)
+            if not isinstance(action, dict):
+                raise CutoverError("local BACKUP NTFS action set is incomplete")
+            before = actions.get(name)
+            local_backup_ntfs_before[name] = before
+            if not allow_controlled_updates and before is not None and before != action:
+                raise CutoverError(f"installed {name} differs from commit-bound contract")
+            merged_actions[name] = json.loads(json.dumps(action))
 
     merged_power = merged_actions[POWER_ACTION]
     merged_gate = merged_power["gate"]
@@ -1748,6 +1811,8 @@ def merge_privileged_config(
         controlled.add(OPERATOR_SERVICE_CONTROL_ACTION)
     if rootbroker_cutover is not None:
         controlled.add(ROOTBROKER_CUTOVER_ACTION)
+    if local_backup_ntfs_actions is not None:
+        controlled.update(local_backup_ntfs_actions)
     evidence = {
         "controlled_updates_allowed": allow_controlled_updates,
         "operator_power_before_sha256": _sha256(_canonical_json(power_before)),
@@ -1785,6 +1850,14 @@ def merge_privileged_config(
             if rootbroker_cutover is not None else None
         ),
         "rootbroker_cutover_preexisting": rootbroker_cutover_before is not None,
+        "local_backup_ntfs_action_sha256": (
+            {name: _sha256(_canonical_json(action)) for name, action in sorted(local_backup_ntfs_actions.items())}
+            if local_backup_ntfs_actions is not None else {}
+        ),
+        "local_backup_ntfs_preexisting": {
+            name: local_backup_ntfs_before.get(name) is not None
+            for name in sorted(local_backup_ntfs_before)
+        },
         "bootstrap_recovery_preexisting": bootstrap_recovery_before is not None,
         "bootstrap_recovery_before_sha256": (
             _sha256(_canonical_json(bootstrap_recovery_before))
@@ -1834,11 +1907,19 @@ def _operator_authority_attestation(
     lifecycle = actions.get(BLOCKADE_LIFECYCLE_ACTION)
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    local_backup_ntfs_check = actions.get(LOCAL_BACKUP_NTFS_CHECK_ACTION)
+    local_backup_ntfs_clear_dirty = actions.get(LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION)
     if not all(
         isinstance(item, dict)
         for item in (power, lifecycle, service_control, rootbroker_cutover)
     ):
         raise CutoverError("operator authority attestation actions are incomplete")
+    if (local_backup_ntfs_check is None) != (local_backup_ntfs_clear_dirty is None):
+        raise CutoverError("operator authority attestation BACKUP NTFS actions are incomplete")
+    if local_backup_ntfs_check is not None and not isinstance(local_backup_ntfs_check, dict):
+        raise CutoverError("operator authority attestation BACKUP NTFS check is invalid")
+    if local_backup_ntfs_clear_dirty is not None and not isinstance(local_backup_ntfs_clear_dirty, dict):
+        raise CutoverError("operator authority attestation BACKUP NTFS clear-dirty is invalid")
     assert isinstance(power, dict)
     assert isinstance(lifecycle, dict)
     assert isinstance(service_control, dict)
@@ -1872,6 +1953,19 @@ def _operator_authority_attestation(
             ),
             ROOTBROKER_CUTOVER_ACTION: _sha256(
                 _canonical_json(rootbroker_cutover)
+            ),
+            **(
+                {
+                    LOCAL_BACKUP_NTFS_CHECK_ACTION: _sha256(
+                        _canonical_json(local_backup_ntfs_check)
+                    ),
+                    LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION: _sha256(
+                        _canonical_json(local_backup_ntfs_clear_dirty)
+                    ),
+                }
+                if isinstance(local_backup_ntfs_check, dict)
+                and isinstance(local_backup_ntfs_clear_dirty, dict)
+                else {}
             ),
         },
         "power_peer_binding": peer_binding,
@@ -2408,6 +2502,13 @@ def _apply_cutover_locked(
     rootbroker_cutover = _rootbroker_cutover_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    local_backup_ntfs_actions = (
+        _local_backup_ntfs_actions_from_repository(
+            repository, expected_head=expected_head, runner=runner
+        )
+        if artifact_targets is None
+        else None
+    )
     if artifact_targets is None:
         _validate_recovery_source_dropin(
             source_artifacts,
@@ -2427,6 +2528,7 @@ def _apply_cutover_locked(
         bootstrap_recovery=bootstrap_recovery,
         operator_service_control=operator_service_control,
         rootbroker_cutover=rootbroker_cutover,
+        local_backup_ntfs_actions=local_backup_ntfs_actions,
         allow_controlled_updates=automatic,
     )
     merged_config_data = _canonical_json(merged_config)
@@ -2753,6 +2855,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
     rootbroker_cutover = _rootbroker_cutover_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    local_backup_ntfs_actions = _local_backup_ntfs_actions_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     _validate_recovery_source_dropin(
         source_artifacts,
         publisher=publisher,
@@ -2768,6 +2873,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         bootstrap_recovery=bootstrap_recovery,
         operator_service_control=operator_service_control,
         rootbroker_cutover=rootbroker_cutover,
+        local_backup_ntfs_actions=local_backup_ntfs_actions,
     )
     return {
         "schema_version": 1,
