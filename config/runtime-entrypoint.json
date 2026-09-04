@@ -263,6 +263,10 @@
       "source": "src/grabowski_connector_contract.py"
     },
     {
+      "module": "grabowski_connector_policy",
+      "source": "src/grabowski_connector_policy.py"
+    },
+    {
       "module": "grabowski_blockades",
       "source": "src/grabowski_blockades.py"
     },

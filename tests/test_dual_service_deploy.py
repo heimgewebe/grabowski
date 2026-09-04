@@ -1869,13 +1869,16 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(12, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(15, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
                 "tools/watchdog_admission_recovery.py",
                 "tools/grabowski_transport_ingress.py",
+                "tools/grabowski_external_connector_gateway.py",
                 "systemd/grabowski-transport-ingress.service.example",
+                "systemd/grabowski-transport-ingress-maulwurf-x.service.example",
+                "systemd/grabowski-external-connector-maulwurf-x.service.example",
                 "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
                 "systemd/grabowski-operator.service.d/90-recovery-target.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
@@ -1890,6 +1893,8 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         self.assertEqual(
             {
                 "grabowski-transport-ingress.service",
+                "grabowski-transport-ingress-maulwurf-x.service",
+                "grabowski-external-connector-maulwurf-x.service",
                 "grabowski-operator-watchdog.service",
                 "grabowski-operator-watchdog.timer",
                 "grabowski-tunnel-watchdog.service",

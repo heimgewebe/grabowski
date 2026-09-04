@@ -1,0 +1,36 @@
+[Unit]
+Description=Grabowski external MCP gateway for Maulwurf X
+After=network.target grabowski-transport-ingress-maulwurf-x.service
+Wants=grabowski-transport-ingress-maulwurf-x.service
+PartOf=grabowski-transport-ingress-maulwurf-x.service
+ConditionPathExists=%h/.local/state/grabowski/external-connectors/maulwurf-x.token
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.token
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.tools.json
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/require-tool-policy
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/libexec/grabowski/grabowski_external_connector_gateway.py --host 127.0.0.1 --port 18184 --upstream http://127.0.0.1:18183/mcp --connector-id maulwurf-x --external-token-file %h/.local/state/grabowski/external-connectors/maulwurf-x.token --internal-token-file %h/.local/state/grabowski/transport-connectors/maulwurf-x.token --tool-policy-file %h/.local/state/grabowski/transport-connectors/maulwurf-x.tools.json
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=20
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+LimitCORE=0
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=grabowski-transport-ingress-maulwurf-x.service
