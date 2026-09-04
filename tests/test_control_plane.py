@@ -742,6 +742,108 @@ class PrivilegedBrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
             privileged_broker.resolve_execution(config, parsed)
 
+    def test_rootbroker_cutover_allows_only_unrelated_typed_in_band_prefilter(self) -> None:
+        reference = self._reference()
+        reference["action"] = "operator_rootbroker_cutover"
+        reference["target"] = "a" * 40
+        reference.pop("reference_sha256")
+        reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        marker = Path(self.tmp.name) / "operator-stop"
+        marker.write_text("typed-placeholder\n", encoding="utf-8")
+        config = {
+            "schema_version": 2,
+            "actions": {
+                "operator_rootbroker_cutover": {
+                    "enabled": True,
+                    "mode": "template",
+                    "target_pattern": r"[0-9a-f]{40}",
+                    "argv": ["/usr/bin/true", "{target}"],
+                    "timeout_seconds": 60,
+                    "kill_switch_path": str(marker),
+                    "legacy_kill_switch_path": str(Path(self.tmp.name) / "legacy-stop"),
+                    "allowed_peer_uid": 1000,
+                    "allowed_peer_unit": "grabowski-operator.service",
+                }
+            },
+        }
+
+        def snapshot(*, kind: str, posture: str = "mutation_freeze", source: str = "typed", disarm_policy: str = "in_band", active: bool = True):
+            record = types.SimpleNamespace(
+                source=source,
+                disarm_policy=disarm_policy,
+                posture=posture,
+                scope=types.SimpleNamespace(kind=kind),
+                active_at=lambda: active,
+            )
+            return types.SimpleNamespace(record=record)
+
+        for kind in ("task", "owner"):
+            with self.subTest(kind=kind), patch.object(
+                privileged_broker, "read_authority_marker", return_value=snapshot(kind=kind)
+            ):
+                execution = privileged_broker.resolve_execution(config, parsed)
+                self.assertEqual(execution["argv"], ["/usr/bin/true", "a" * 40])
+
+        with patch.object(
+            privileged_broker, "read_authority_marker", return_value=snapshot(kind="global", posture="observe")
+        ):
+            execution = privileged_broker.resolve_execution(config, parsed)
+            self.assertEqual(execution["argv"], ["/usr/bin/true", "a" * 40])
+
+        with patch.object(
+            privileged_broker, "read_authority_marker", return_value=snapshot(kind="global", active=False)
+        ):
+            execution = privileged_broker.resolve_execution(config, parsed)
+            self.assertEqual(execution["argv"], ["/usr/bin/true", "a" * 40])
+
+        for kwargs in (
+            {"kind": "global"},
+            {"kind": "capability"},
+            {"kind": "repo"},
+            {"kind": "service"},
+            {"kind": "host"},
+            {"kind": "path"},
+            {"kind": "task", "source": "environment", "disarm_policy": "external_only"},
+            {"kind": "task", "disarm_policy": "external_only"},
+        ):
+            with self.subTest(blocked=kwargs), patch.object(
+                privileged_broker, "read_authority_marker", return_value=snapshot(**kwargs)
+            ):
+                with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
+                    privileged_broker.resolve_execution(config, parsed)
+
+        with patch.object(
+            privileged_broker, "read_authority_marker", side_effect=PermissionError("unsafe marker")
+        ):
+            with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
+                privileged_broker.resolve_execution(config, parsed)
+
+    def test_non_rootbroker_template_still_blocks_typed_task_marker(self) -> None:
+        reference = self._reference()
+        parsed = privileged_broker.parse_reference(
+            json.dumps(reference).encode("utf-8"), now=1000
+        )
+        marker = Path(self.tmp.name) / "operator-stop"
+        marker.write_text("typed-placeholder\n", encoding="utf-8")
+        config = {
+            "schema_version": 2,
+            "actions": {
+                reference["action"]: {
+                    "enabled": True,
+                    "mode": "template",
+                    "target_pattern": r"[A-Za-z0-9_.@:-]{1,200}",
+                    "argv": ["/usr/bin/true", "{target}"],
+                    "timeout_seconds": 60,
+                    "kill_switch_path": str(marker),
+                }
+            },
+        }
+        with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
+            privileged_broker.resolve_execution(config, parsed)
+
     def test_rootbroker_cutover_requires_peer_and_kill_switch_fields(self) -> None:
         reference = self._reference()
         reference["action"] = "operator_rootbroker_cutover"

@@ -413,6 +413,142 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 with self.assertRaisesRegex(cutover.CutoverError, "kill-switch"):
                     cutover._automatic_kill_switch_clear()
 
+    def _typed_blockade_marker(self, *, kind: str = "task", value: str = "HEIM-PC-NIXOS-MIGRATION-V1-T006", posture: str = "mutation_freeze") -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "blockade_id": "nixos-t006-freeze",
+            "posture": posture,
+            "scope": {"kind": kind, "value": value},
+            "reason": "bound scoped freeze",
+            "trigger_class": "task_authority_superseded",
+            "engaged_at": "2026-09-04T11:06:07Z",
+            "evidence_refs": ["candidate:test"],
+            "provenance": {
+                "tool": "grabowski_operator_blockade_engage",
+                "request_id": "request",
+                "session_id": "session",
+                "task_id": "HEIM-PC-NIXOS-MIGRATION-V1-T006",
+                "owner_id": "owner",
+            },
+            "source": "typed",
+            "disarm_policy": "in_band",
+        }
+
+    def test_automatic_cutover_evaluates_typed_marker_against_its_exact_scope(self) -> None:
+        unrelated_task = self._typed_blockade_marker()
+        self.assertFalse(cutover._automatic_blockade_matches_cutover(unrelated_task))
+        self.assertFalse(
+            cutover._automatic_blockade_matches_cutover(
+                self._typed_blockade_marker(kind="owner", value="bureau-run:other")
+            )
+        )
+
+        matching = (
+            self._typed_blockade_marker(kind="global", value="*"),
+            self._typed_blockade_marker(
+                kind="capability", value=cutover.ROOTBROKER_CUTOVER_ACTION
+            ),
+            self._typed_blockade_marker(
+                kind="capability", value="privileged_reference"
+            ),
+            self._typed_blockade_marker(
+                kind="repo", value=str(cutover.CANONICAL_REPOSITORY)
+            ),
+            self._typed_blockade_marker(kind="service", value=cutover.OPERATOR_UNIT),
+            self._typed_blockade_marker(
+                kind="service", value=cutover.LEGACY_OPERATOR_WATCHDOG_TIMER
+            ),
+            self._typed_blockade_marker(
+                kind="service", value="grabowski-privileged-broker@.service"
+            ),
+            self._typed_blockade_marker(kind="host", value=os.uname().nodename),
+            self._typed_blockade_marker(kind="path", value="/etc/grabowski"),
+            self._typed_blockade_marker(
+                kind="path",
+                value=str(cutover.AUTOMATIC_STAGING_ROOT / "future-helper.py"),
+            ),
+            self._typed_blockade_marker(
+                kind="path", value=str(cutover.BACKUP_ROOT / "future-backup")
+            ),
+            self._typed_blockade_marker(
+                kind="path", value=str(cutover.RECEIPT_ROOT / "future-receipt.json")
+            ),
+        )
+        for marker in matching:
+            self.assertTrue(cutover._automatic_blockade_matches_cutover(marker))
+
+        self.assertFalse(
+            cutover._automatic_blockade_matches_cutover(
+                self._typed_blockade_marker(kind="repo", value="/home/alex/repos/heim-pc")
+            )
+        )
+        self.assertFalse(
+            cutover._automatic_blockade_matches_cutover(
+                self._typed_blockade_marker(kind="service", value="unrelated.service")
+            )
+        )
+
+    def test_automatic_cutover_marker_validation_fails_closed(self) -> None:
+        marker = self._typed_blockade_marker()
+        invalid = (
+            {**marker, "schema_version": True},
+            {**marker, "source": "legacy_file"},
+            {**marker, "disarm_policy": "external_only"},
+            {**marker, "scope": {"kind": "global", "value": "wrong"}},
+            {**marker, "scope": {"kind": "repo", "value": "relative/repo"}},
+            {**marker, "unknown": True},
+        )
+        for changed in invalid:
+            with self.assertRaises(cutover.CutoverError):
+                cutover._automatic_blockade_matches_cutover(changed)
+
+    def test_automatic_cutover_accepts_root_owned_unrelated_task_marker(self) -> None:
+        raw = json.dumps(self._typed_blockade_marker(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        metadata = os.stat_result((0o100644, 0, 0, 1, 0, 0, len(raw), 0, 0, 0))
+        with patch.object(
+            cutover.os.path,
+            "lexists",
+            side_effect=lambda path: path == cutover.CANONICAL_KILL_SWITCH,
+        ), patch.object(cutover, "_validate_directory"), patch.object(
+            cutover, "_read_regular_file", return_value=(raw, metadata)
+        ):
+            cutover._automatic_kill_switch_clear()
+
+    def test_automatic_cutover_rejects_root_owned_matching_scope_marker(self) -> None:
+        raw = json.dumps(
+            self._typed_blockade_marker(kind="global", value="*"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        metadata = os.stat_result((0o100644, 0, 0, 1, 0, 0, len(raw), 0, 0, 0))
+        with patch.object(
+            cutover.os.path,
+            "lexists",
+            side_effect=lambda path: path == cutover.CANONICAL_KILL_SWITCH,
+        ), patch.object(cutover, "_validate_directory"), patch.object(
+            cutover, "_read_regular_file", return_value=(raw, metadata)
+        ):
+            with self.assertRaisesRegex(cutover.CutoverError, "in-scope"):
+                cutover._automatic_kill_switch_clear()
+
+    def test_automatic_cutover_observe_marker_does_not_block_mutation(self) -> None:
+        raw = json.dumps(
+            self._typed_blockade_marker(kind="global", value="*", posture="observe"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        metadata = os.stat_result((0o100644, 0, 0, 1, 0, 0, len(raw), 0, 0, 0))
+        with patch.object(
+            cutover.os.path,
+            "lexists",
+            side_effect=lambda path: path == cutover.CANONICAL_KILL_SWITCH,
+        ), patch.object(cutover, "_validate_directory"), patch.object(
+            cutover, "_read_regular_file", return_value=(raw, metadata)
+        ):
+            cutover._automatic_kill_switch_clear()
+
     def test_automatic_repository_preflight_requires_canonical_origin_and_remote_main(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repository = Path(raw).resolve()
@@ -1205,10 +1341,50 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 runner.calls,
             )
 
-    def test_automatic_repository_load_accepts_only_exact_legacy_bridge_target(self) -> None:
-        bridge_text = (ROOT / "config" / "privileged-actions.example.json").read_text(
-            encoding="utf-8"
+    def test_repository_catalog_is_final_backup_target(self) -> None:
+        example = json.loads(
+            (ROOT / "config" / "privileged-actions.example.json").read_text(
+                encoding="utf-8"
+            )
         )
+        actions = example["actions"]
+        self.assertEqual(
+            actions[cutover.PUBLISH_ACTION]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            actions[cutover.POWER_ACTION]["gate"]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            actions[cutover.BLOCKADE_LIFECYCLE_ACTION]["recovery_gate"]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            actions[cutover.ROOT_TASK_ACTION]["start_gate"]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+
+    def test_automatic_repository_load_accepts_only_exact_legacy_bridge_target(self) -> None:
+        example = json.loads(
+            (ROOT / "config" / "privileged-actions.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        actions = example["actions"]
+        actions[cutover.PUBLISH_ACTION]["configured_target"] = (
+            cutover.LEGACY_CONFIGURED_TARGET
+        )
+        actions[cutover.POWER_ACTION]["gate"]["configured_target"] = (
+            cutover.LEGACY_CONFIGURED_TARGET
+        )
+        actions[cutover.BLOCKADE_LIFECYCLE_ACTION]["recovery_gate"][
+            "configured_target"
+        ] = cutover.LEGACY_CONFIGURED_TARGET
+        actions[cutover.ROOT_TASK_ACTION]["start_gate"]["configured_target"] = (
+            cutover.LEGACY_CONFIGURED_TARGET
+        )
+        bridge_text = json.dumps(example, sort_keys=True) + "\n"
         runner = FakeRunner(
             blobs={"config/privileged-actions.example.json": bridge_text}
         )
