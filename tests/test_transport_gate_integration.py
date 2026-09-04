@@ -733,6 +733,23 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
         self.assertEqual(evidence["policy_mode"], "legacy-unrestricted")
         self.assertFalse(evidence["policy_enforced"])
 
+    def test_connector_tool_policy_marker_payload_is_exact(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        marker = self.root / "require-tool-policy"
+        marker.write_bytes(b"required-v1\n")
+        os.chmod(marker, 0o600)
+        with (
+            mock.patch.object(
+                self.base,
+                "_transport_registered_tool_names",
+                return_value=["grabowski_status"],
+            ),
+            self.assertRaisesRegex(RuntimeError, "enforcement marker is invalid"),
+        ):
+            self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_status"
+            )
+
     def test_connector_tool_policy_missing_after_activation_fails_closed(self) -> None:
         self.enroll(primary=self.TOKEN_A)
         self.require_tool_policy()

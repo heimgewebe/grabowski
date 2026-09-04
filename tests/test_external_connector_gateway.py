@@ -262,6 +262,24 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
         self.assertNotIn("resources/read", gateway.ALLOWED_JSON_RPC_METHODS)
         self.assertNotIn("prompts/get", gateway.ALLOWED_JSON_RPC_METHODS)
 
+    def test_proxy_preflight_rejects_bodies_on_get_and_delete(self) -> None:
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {},
+            }
+        ).encode("utf-8")
+        for method in ("GET", "DELETE"):
+            with self.subTest(method=method):
+                self.assertEqual(
+                    gateway._preflight_json_rpc_request(
+                        method, body, {"grabowski_status"}
+                    ),
+                    (400, {"error": "request_body_not_allowed_for_http_method"}),
+                )
+
     def test_proxy_preflight_rejects_json_rpc_batches_without_runtime_dependencies(self) -> None:
         body = json.dumps(
             [

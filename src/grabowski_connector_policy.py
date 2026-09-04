@@ -91,7 +91,7 @@ def enforcement_required(root: Path) -> bool:
         )
     except FileNotFoundError:
         return False
-    if payload.rstrip(b"\n") != ENFORCEMENT_MARKER_PAYLOAD:
+    if payload != ENFORCEMENT_MARKER_PAYLOAD:
         raise ConnectorPolicyError("connector tool-policy enforcement marker is invalid")
     return True
 

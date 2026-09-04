@@ -207,6 +207,8 @@ def _preflight_json_rpc_request(
     method: str, body: bytes, allowed_tools: frozenset[str] | set[str]
 ) -> tuple[int, dict[str, Any]] | None:
     payload = _parse_json_rpc(body)
+    if body and method != "POST":
+        return 400, {"error": "request_body_not_allowed_for_http_method"}
     if method == "POST" and body:
         if payload is None:
             return 400, {"error": "invalid_json_rpc_object"}
