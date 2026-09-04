@@ -159,10 +159,11 @@ class RecoveryToolTests(unittest.TestCase):
             recovery.DEFAULT_SERVER_RECOVERY_TARGET,
             rootbroker_cutover.CONFIGURED_TARGET,
         )
-        self.assertEqual(
-            recovery.DEFAULT_SERVER_RECOVERY_HOST,
-            rootbroker_cutover.CONFIGURED_TARGET.split(":", 1)[0],
-        )
+        target = recovery._recovery_target_info(recovery.DEFAULT_SERVER_RECOVERY_TARGET)
+        self.assertTrue(target["valid"])
+        self.assertEqual(target["kind"], "local_backup_disk")
+        self.assertEqual(target["backup_uuid"], "249180DA265E8DE0")
+        self.assertEqual(target["repository_name"], "heim-pc")
 
     def test_publication_failure_detail_prefers_structured_reason(self) -> None:
         self.assertEqual(
@@ -204,6 +205,223 @@ class RecoveryToolTests(unittest.TestCase):
                 recovery.grabowski_recovery_status()
 
         status.assert_not_called()
+
+    def test_iso_timestamp_accepts_restic_nanoseconds_on_python_310(self) -> None:
+        parsed = recovery._iso_timestamp_unix(
+            "2026-09-03T19:14:32.483537779+02:00"
+        )
+        expected = int(
+            datetime.fromisoformat("2026-09-03T19:14:32.483537+02:00").timestamp()
+        )
+        self.assertEqual(parsed, expected)
+
+    def test_local_backup_target_is_valid_and_not_a_heimserver_backend(self) -> None:
+        target = "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc"
+        info = recovery._recovery_target_info(target)
+        self.assertTrue(info["valid"])
+        self.assertEqual(info["kind"], "local_backup_disk")
+        self.assertEqual(info["backup_uuid"], "249180DA265E8DE0")
+        self.assertEqual(info["repository_name"], "heim-pc")
+        self.assertIsNone(info["host"])
+        with patch.object(recovery, "SERVER_RECOVERY_TARGET", target), patch.object(
+            recovery, "SERVER_RECOVERY_HOST", "heimberry"
+        ):
+            self.assertFalse(recovery._uses_default_heimserver_recovery_backend())
+
+    def test_local_durability_evidence_is_digest_and_snapshot_bound(self) -> None:
+        now = int(time.time())
+        body = {
+            "schema_version": "schauwerk-fundus-durability-evidence.v1",
+            "evidence_ref": "snapshot:" + ("a" * 64),
+            "producer": "infra:heim-pc-restic-backup",
+            "verification": "staged_restore_exact_snapshot",
+            "verified_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "file_count": 1,
+            "inventory_algorithm": "schauwerk-fundus-inventory.v1",
+            "inventory_sha256": "b" * 64,
+            "total_bytes": 1,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                body,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        value = {**body, "receipt_digest": digest}
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "durability.json"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            path.chmod(0o600)
+            with patch.object(recovery, "LOCAL_RECOVERY_DURABILITY_EVIDENCE", path):
+                parsed = recovery._local_recovery_durability_evidence(now=now)
+                self.assertEqual(parsed["snapshot_id"], "a" * 64)
+                self.assertEqual(parsed["inventory_sha256"], "b" * 64)
+                self.assertEqual(parsed["file_count"], 1)
+                value["total_bytes"] = 2
+                path.write_text(json.dumps(value), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+                    recovery._local_recovery_durability_evidence(now=now)
+
+    def test_local_snapshot_metadata_binds_exact_daily_backup_source_contract(self) -> None:
+        snapshot_id = "a" * 64
+        expected_paths = [
+            str(recovery.operator.HOME / "repos"),
+            str(recovery.operator.HOME / "artifacts/merges"),
+            str(recovery.operator.HOME / ".local/share/schauwerk/fundus"),
+            str(
+                recovery.operator.HOME
+                / ".local/state/heim-pc-priorities/backup-sentinel.txt"
+            ),
+        ]
+        completed = types.SimpleNamespace(
+            stdout=json.dumps(
+                [
+                    {
+                        "id": snapshot_id,
+                        "hostname": "heim-pc",
+                        "tags": ["daily", "heim-pc-daily-test"],
+                        "paths": expected_paths,
+                        "time": "2026-09-03T19:14:32.483537779+02:00",
+                    }
+                ]
+            )
+        )
+        with patch.object(recovery, "_run_logged", return_value=completed) as run:
+            parsed = recovery._local_recovery_snapshot_metadata(
+                snapshot_id=snapshot_id,
+                restic_env={"RESTIC_REPOSITORY": "/mnt/backup/restic/heim-pc"},
+                log_path=Path("/tmp/recovery.log"),
+            )
+        self.assertEqual(parsed["snapshot_id"], snapshot_id)
+        self.assertEqual(parsed["hostname"], "heim-pc")
+        self.assertIn("daily", parsed["tags"])
+        self.assertIsInstance(parsed["time_unix"], int)
+        run.assert_called_once()
+
+        completed.stdout = json.dumps(
+            [
+                {
+                    "id": snapshot_id,
+                    "hostname": "heim-pc",
+                    "tags": ["daily"],
+                    "paths": expected_paths[:-1],
+                    "time": "2026-09-03T17:28:59Z",
+                }
+            ]
+        )
+        with patch.object(recovery, "_run_logged", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "source contract mismatch"):
+                recovery._local_recovery_snapshot_metadata(
+                    snapshot_id=snapshot_id,
+                    restic_env={},
+                    log_path=Path("/tmp/recovery.log"),
+                )
+
+    def test_local_recovery_inventory_matches_durability_algorithm(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "a.txt").write_bytes(b"alpha")
+            (root / "nested").mkdir()
+            (root / "nested" / "b.txt").write_bytes(b"beta")
+            result = recovery._local_recovery_inventory(root)
+        files = [
+            {
+                "path": "a.txt",
+                "bytes": 5,
+                "sha256": hashlib.sha256(b"alpha").hexdigest(),
+            },
+            {
+                "path": "nested/b.txt",
+                "bytes": 4,
+                "sha256": hashlib.sha256(b"beta").hexdigest(),
+            },
+        ]
+        payload = {
+            "schema_version": "schauwerk-fundus-inventory.v1",
+            "files": files,
+        }
+        expected_sha256 = hashlib.sha256(
+            json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(result["inventory_sha256"], expected_sha256)
+        self.assertEqual(result["file_count"], 2)
+        self.assertEqual(result["total_bytes"], 9)
+
+    def test_local_restore_probe_replays_exact_snapshot_and_binds_inventory(self) -> None:
+        file_bytes = b"restored-data"
+        inventory_payload = {
+            "schema_version": "schauwerk-fundus-inventory.v1",
+            "files": [
+                {
+                    "path": "proof.txt",
+                    "bytes": len(file_bytes),
+                    "sha256": hashlib.sha256(file_bytes).hexdigest(),
+                }
+            ],
+        }
+        inventory_sha256 = hashlib.sha256(
+            json.dumps(
+                inventory_payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        durability = {
+            "inventory_sha256": inventory_sha256,
+            "file_count": 1,
+            "total_bytes": len(file_bytes),
+        }
+
+        def fake_restore(argv, **_kwargs):
+            target = Path(argv[argv.index("--target") + 1])
+            fundus = target / str(
+                recovery.operator.HOME / ".local/share/schauwerk/fundus"
+            ).lstrip("/")
+            fundus.mkdir(parents=True)
+            (fundus / "proof.txt").write_bytes(file_bytes)
+            return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        with patch.object(recovery, "_run_logged", side_effect=fake_restore) as run:
+            result = recovery._local_recovery_restore_probe(
+                snapshot_id="a" * 64,
+                restic_env={},
+                durability=durability,
+                log_path=Path("/tmp/recovery.log"),
+            )
+        self.assertEqual(result["inventory_sha256"], inventory_sha256)
+        self.assertEqual(result["file_count"], 1)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[0:3], [recovery.RESTIC_BIN, "restore", "a" * 64])
+        self.assertIn("--verify", argv)
+
+    def test_server_recovery_probe_dispatches_local_backend_without_server_secret(self) -> None:
+        target_info = {
+            "valid": True,
+            "kind": "local_backup_disk",
+            "backup_uuid": "249180DA265E8DE0",
+            "repository_name": "heim-pc",
+        }
+        expected = {"target_kind": "local_backup_disk"}
+        with patch.object(
+            recovery, "_configured_recovery_target_info", return_value=target_info
+        ), patch.object(
+            recovery, "_local_recovery_probe", return_value=expected
+        ) as local_probe, patch.object(recovery, "_read_secret_text") as read_secret:
+            result = recovery.server_recovery_probe()
+        self.assertIs(result, expected)
+        local_probe.assert_called_once_with(target_info)
+        read_secret.assert_not_called()
 
     def test_recovery_status_marks_default_heimserver_boundary_fail_closed(self) -> None:
         result = _run_ready_recovery_status(
@@ -649,7 +867,10 @@ class RecoveryToolTests(unittest.TestCase):
         self.assertFalse(marker["valid"])
         self.assertFalse(marker["configured_target_valid"])
         self.assertFalse(marker["target_matches_configured"])
-        self.assertEqual(marker["error"], "server recovery target must match <host>:rest-server/<probe>")
+        self.assertEqual(
+            marker["error"],
+            "recovery target must match <host>:rest-server/<probe> or local-backup-disk:UUID=<uuid>/restic/<repository>",
+        )
 
     def test_server_marker_rejects_fresh_evidence_for_different_configured_target(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
