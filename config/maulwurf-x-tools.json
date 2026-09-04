@@ -7,22 +7,8 @@
     "grabowski_status",
     "grabowski_runtime_health",
     "grabowski_deployment_identity",
-    "grabowski_context",
     "grabowski_contract_drift",
-    "grabowski_git_status",
-    "grabowski_git_log",
-    "grabowski_git_diff",
-    "grabowski_git_show",
-    "grabowski_github_pr_view",
-    "grabowski_github_checks",
-    "repoground_preflight",
-    "repoground_query",
-    "repoground_query_existing_index",
-    "repoground_context_pack",
     "grabowski_systemkatalog_query",
-    "grabowski_bureau_candidate_assess",
-    "grabowski_bureau_pickup_status",
-    "grabowski_audit_projection",
-    "grabowski_operator_historical_recall"
+    "grabowski_audit_projection"
   ]
 }

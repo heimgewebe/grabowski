@@ -85,6 +85,17 @@ Die Repository-Vorlage für Maulwurf X liegt unter
 `config/maulwurf-x-tools.json`. Ein Test bindet ihre Einträge an den publizierten
 Runtime-Toolvertrag und an den Capability-Katalog mit `read_only=true`.
 
+### Initiale Produktionsoberfläche
+
+Der erste produktive Cutover ist absichtlich **Status-Plane-only**. Allgemeine
+Inhaltsleser wie `grabowski_git_show`, `grabowski_git_diff`, `grabowski_context`
+oder freie RepoGround-Abfragen sind nicht freigegeben, obwohl sie technisch
+read-only sind. Ohne argumentgebundene Repo-/Pfadregeln könnten solche Werkzeuge
+einem externen Modell mehr lokale oder private Inhalte zeigen als für den
+Connector nötig. Erweiterungen der Oberfläche erfolgen deshalb erst als eigener,
+reviewter Policy-Schritt mit engeren Argumentgrenzen statt durch bloßes Ergänzen
+von Toolnamen.
+
 ## Fail-closed-Aktivierung
 
 Die Aktivierung muss in dieser Reihenfolge erfolgen:
