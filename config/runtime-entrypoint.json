@@ -371,6 +371,10 @@
       "source": "src/grabowski_git_preimage.py"
     },
     {
+      "module": "grabowski_physical_checkout",
+      "source": "src/grabowski_physical_checkout.py"
+    },
+    {
       "module": "grabowski_self_deploy",
       "source": "src/grabowski_self_deploy.py"
     },

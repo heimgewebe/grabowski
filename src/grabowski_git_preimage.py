@@ -9,6 +9,7 @@ import subprocess
 from typing import Any, Callable
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_physical_checkout as physical_checkout
 
 
 def _frame(digest: Any, tag: bytes, payload: bytes = b"") -> None:
@@ -187,6 +188,7 @@ def capture_branch_preimage(
     require_attached: bool = True,
 ) -> dict[str, Any]:
     """Build one exact branch/index/raw-worktree CAS preimage from safe observations."""
+    physical_before = physical_checkout.capture_physical_checkout_identity(repo)
     branch_probe = probe(["symbolic-ref", "--quiet", "--short", "HEAD"])
     branch: str | None = None
     if branch_probe.returncode == 0:
@@ -228,9 +230,20 @@ def capture_branch_preimage(
         elif ref_probe.returncode != 1:
             raise RuntimeError(f"Git operation-state observation failed: {name}")
 
+    physical_after = physical_checkout.capture_physical_checkout_identity(repo)
+    if (
+        physical_after["physical_identity_sha256"]
+        != physical_before["physical_identity_sha256"]
+        or physical_after["root"] != physical_before["root"]
+        or physical_after["git_dir"] != physical_before["git_dir"]
+        or physical_after["common_dir"] != physical_before["common_dir"]
+    ):
+        raise RuntimeError("Physical checkout identity changed during preimage capture")
+
     material: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": str(repo),
+        "physical_checkout": physical_before,
         "branch": branch,
         "head": head,
         "head_state": head_state,
