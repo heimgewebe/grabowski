@@ -134,6 +134,32 @@ def parse_reference(data: bytes, *, now: int | None = None) -> dict[str, Any]:
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 
 
+def _rootbroker_cutover_template_marker_allows_dispatch(path: Path) -> bool:
+    """Admit only canonical typed markers that cannot govern this cutover.
+
+    The rootbroker helper performs the complete cutover-footprint evaluation and
+    revalidates the marker during every critical phase.  This broker-side gate
+    is deliberately narrower: it only prevents an unrelated task/owner marker
+    (or an observe-only marker) from being promoted to a host-global stop before
+    the helper can run.  Unknown, unsafe, legacy and every other active scope
+    remain fail-closed here.
+    """
+    if not os.path.lexists(path):
+        return True
+    try:
+        snapshot = read_authority_marker(path, authority_uid=0)
+        record = snapshot.record
+        if record.source != "typed" or record.disarm_policy != "in_band":
+            return False
+        if not record.active_at():
+            return True
+        if record.posture == "observe":
+            return True
+        return record.scope.kind in {"task", "owner"}
+    except Exception:
+        return False
+
+
 def _resolve_template_action(
     candidate: dict[str, Any],
     reference: dict[str, Any],
@@ -204,9 +230,16 @@ def _resolve_template_action(
             if legacy_kill_switch_value is not None
             else None
         )
-        if os.path.lexists(kill_switch) or (
+        legacy_engaged = (
             legacy_kill_switch is not None
             and os.path.lexists(legacy_kill_switch)
+        )
+        canonical_engaged = os.path.lexists(kill_switch)
+        if legacy_engaged:
+            raise PermissionError("template kill-switch is engaged")
+        if canonical_engaged and (
+            reference.get("action") != ROOTBROKER_CUTOVER_ACTION
+            or not _rootbroker_cutover_template_marker_allows_dispatch(kill_switch)
         ):
             raise PermissionError("template kill-switch is engaged")
         execution["kill_switch_path"] = str(kill_switch)

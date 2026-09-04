@@ -5,11 +5,13 @@ import argparse
 import ast
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath
 import signal
 import stat
 import subprocess
@@ -447,10 +449,322 @@ def _repository_head(repository: Path, runner: RunCommand) -> str:
     return _validate_commit_id(completed.stdout.strip(), label="repository HEAD")
 
 
+_BLOCKADE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z")
+_BLOCKADE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]{0,127}\Z")
+_GLOBAL_HARD_STOP_TRIGGER_CLASSES = {
+    "audit_integrity_invalid",
+    "audit_provenance_unknown",
+    "deployment_provenance_invalid",
+    "broker_identity_invalid",
+    "recovery_identity_invalid",
+    "external_environment_stop",
+    "host_wide_damage_unknown",
+    "legacy_operator_marker",
+    "global_trust_unknown",
+}
+
+
+def _blockade_text(
+    value: Any,
+    *,
+    label: str,
+    max_chars: int,
+    pattern: re.Pattern[str] | None = None,
+) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise CutoverError(f"canonical operator kill-switch {label} is invalid")
+    if len(value) > max_chars or (pattern is not None and pattern.fullmatch(value) is None):
+        raise CutoverError(f"canonical operator kill-switch {label} is invalid")
+    return value
+
+
+def _blockade_timestamp(value: Any, *, label: str) -> datetime:
+    text = _blockade_text(value, label=label, max_chars=64)
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise CutoverError(
+            f"canonical operator kill-switch {label} is not ISO-8601"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CutoverError(
+            f"canonical operator kill-switch {label} lacks timezone"
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _blockade_absolute_path(value: Any, *, label: str) -> str:
+    text = _blockade_text(value, label=label, max_chars=4096)
+    path = PurePosixPath(text)
+    if (
+        not path.is_absolute()
+        or any(part in {".", ".."} for part in text.split("/"))
+        or str(path) != text
+    ):
+        raise CutoverError(f"canonical operator kill-switch {label} is invalid")
+    return text
+
+
+def _strict_blockade_json(data: bytes) -> dict[str, Any]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CutoverError("canonical operator kill-switch is not UTF-8") from exc
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise CutoverError("canonical operator kill-switch has duplicate JSON keys")
+            result[key] = item
+        return result
+
+    try:
+        value = json.loads(text, object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise CutoverError("canonical operator kill-switch is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise CutoverError("canonical operator kill-switch must contain one JSON object")
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if data != canonical:
+        raise CutoverError("canonical operator kill-switch is not canonical JSON")
+    return value
+
+
+def _automatic_typed_blockade_scope(value: Any) -> tuple[str, str, bool]:
+    if not isinstance(value, dict):
+        raise CutoverError("canonical operator kill-switch must be a JSON object")
+    required = {
+        "schema_version",
+        "blockade_id",
+        "posture",
+        "scope",
+        "reason",
+        "trigger_class",
+        "engaged_at",
+        "evidence_refs",
+        "provenance",
+        "source",
+        "disarm_policy",
+    }
+    if set(value) - required - {"expires_at"} or not required.issubset(value):
+        raise CutoverError("canonical operator kill-switch keys are invalid")
+    schema_version = value.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
+        raise CutoverError("canonical operator kill-switch schema is unsupported")
+    if value.get("source") != "typed" or value.get("disarm_policy") != "in_band":
+        raise CutoverError("canonical operator kill-switch is not typed in-band authority")
+    posture = value.get("posture")
+    if posture not in {"observe", "preflight_required", "mutation_freeze", "hard_stop"}:
+        raise CutoverError("canonical operator kill-switch posture is invalid")
+    _blockade_text(
+        value.get("blockade_id"),
+        label="blockade_id",
+        max_chars=128,
+        pattern=_BLOCKADE_ID_RE,
+    )
+    _blockade_text(value.get("reason"), label="reason", max_chars=1000)
+    trigger_class = _blockade_text(
+        value.get("trigger_class"),
+        label="trigger_class",
+        max_chars=256,
+        pattern=_BLOCKADE_IDENTIFIER_RE,
+    )
+    engaged_text = value.get("engaged_at")
+    engaged_at = _blockade_timestamp(engaged_text, label="engaged_at")
+    if engaged_text != engaged_at.isoformat().replace("+00:00", "Z"):
+        raise CutoverError("canonical operator kill-switch engaged_at is not canonical")
+    evidence_refs = value.get("evidence_refs")
+    if (
+        not isinstance(evidence_refs, list)
+        or not 1 <= len(evidence_refs) <= 64
+        or len(evidence_refs) != len(set(evidence_refs))
+        or evidence_refs != sorted(evidence_refs)
+    ):
+        raise CutoverError("canonical operator kill-switch evidence_refs are invalid")
+    for ref in evidence_refs:
+        _blockade_text(ref, label="evidence_ref", max_chars=1000)
+    provenance = value.get("provenance")
+    if not isinstance(provenance, dict) or set(provenance) != {
+        "tool",
+        "request_id",
+        "session_id",
+        "task_id",
+        "owner_id",
+    }:
+        raise CutoverError("canonical operator kill-switch provenance is invalid")
+    for item in provenance.values():
+        _blockade_text(item, label="provenance", max_chars=256)
+    expires_at: datetime | None = None
+    if "expires_at" in value:
+        expires_text = value["expires_at"]
+        expires_at = _blockade_timestamp(expires_text, label="expires_at")
+        if expires_text != expires_at.isoformat().replace("+00:00", "Z"):
+            raise CutoverError("canonical operator kill-switch expires_at is not canonical")
+        if expires_at <= engaged_at or posture in {"mutation_freeze", "hard_stop"}:
+            raise CutoverError("canonical operator kill-switch expiry contract is invalid")
+    scope = value.get("scope")
+    if not isinstance(scope, dict) or set(scope) != {"kind", "value"}:
+        raise CutoverError("canonical operator kill-switch scope is invalid")
+    kind = scope.get("kind")
+    if kind not in {
+        "path",
+        "capability",
+        "task",
+        "owner",
+        "repo",
+        "service",
+        "host",
+        "global",
+    }:
+        raise CutoverError("canonical operator kill-switch scope is invalid")
+    if kind == "global":
+        if scope.get("value") != "*":
+            raise CutoverError("canonical global operator kill-switch scope is invalid")
+        scope_value = "*"
+    elif kind in {"path", "repo"}:
+        scope_value = _blockade_absolute_path(
+            scope.get("value"), label=f"{kind} scope"
+        )
+    else:
+        scope_value = _blockade_text(
+            scope.get("value"),
+            label=f"{kind} scope",
+            max_chars=256,
+            pattern=_BLOCKADE_IDENTIFIER_RE,
+        )
+    if (
+        posture == "hard_stop"
+        and kind == "global"
+        and trigger_class not in _GLOBAL_HARD_STOP_TRIGGER_CLASSES
+    ):
+        raise CutoverError("canonical global hard-stop trigger class is invalid")
+    active = expires_at is None or datetime.now(timezone.utc) < expires_at
+    return kind, scope_value, active
+
+
+def _path_scope_matches(base: str, candidate: Path) -> bool:
+    base_path = Path(base)
+    return candidate == base_path or base_path in candidate.parents
+
+
+def _path_scope_overlaps_tree(base: str, root: Path) -> bool:
+    base_path = Path(base)
+    return (
+        base_path == root
+        or base_path in root.parents
+        or root in base_path.parents
+    )
+
+
+def _automatic_blockade_matches_cutover(value: Any) -> bool:
+    kind, scope_value, active = _automatic_typed_blockade_scope(value)
+    if not active:
+        return False
+    if kind == "global":
+        return True
+    if kind in {"task", "owner"}:
+        # Automatic Rootbroker authority refresh is not a Bureau task/owner
+        # mutation.  These scopes remain enforced by the caller-side policy,
+        # but an unrelated task/owner marker must not become host-global here.
+        return False
+    if kind == "capability":
+        return scope_value in {
+            "durable_job",
+            "git_cli",
+            "privileged_reference",
+            ROOTBROKER_CUTOVER_ACTION,
+        }
+    if kind == "repo":
+        return _path_scope_matches(scope_value, CANONICAL_REPOSITORY)
+    if kind == "service":
+        return scope_value in {
+            OPERATOR_UNIT,
+            SOCKET_UNIT,
+            LEGACY_OPERATOR_WATCHDOG_TIMER,
+            "grabowski-privileged-broker@.service",
+        }
+    if kind == "host":
+        return scope_value == os.uname().nodename
+    if kind == "path":
+        fixed_cutover_paths = (
+            CONFIG_TARGET,
+            RUNTIME_CONTRACT_SCHEMA_TARGET,
+            BLOCKADES_MODULE_TARGET,
+            BLOCKADE_STORE_MODULE_TARGET,
+            BLOCKADE_AUTHORITY_MODULE_TARGET,
+            COMMAND_IDENTITY_MODULE_TARGET,
+            BROKER_MODULE_TARGET,
+            BROKER_WRAPPER_TARGET,
+            PROCESS_OBSERVER_TARGET,
+            REQUEST_CLIENT_TARGET,
+            BOOTSTRAP_RECOVERY_TARGET,
+            CUTOVER_HELPER_TARGET,
+            BROKER_SERVICE_TARGET,
+            OPERATOR_SERVICE_TARGET,
+            RECOVERY_SOURCE_DROPIN_TARGET,
+            OPERATOR_AUTHORITY_ATTESTATION_TARGET,
+            CUTOVER_LOCK,
+        )
+        dynamic_cutover_roots = (
+            AUTOMATIC_STAGING_ROOT,
+            BACKUP_ROOT,
+            RECEIPT_ROOT,
+        )
+        return (
+            any(_path_scope_matches(scope_value, path) for path in fixed_cutover_paths)
+            or any(
+                _path_scope_overlaps_tree(scope_value, path)
+                for path in dynamic_cutover_roots
+            )
+        )
+    raise CutoverError("canonical operator kill-switch scope is unsupported")
+
+
 def _automatic_kill_switch_clear() -> None:
-    for path in (CANONICAL_KILL_SWITCH, LEGACY_KILL_SWITCH):
-        if os.path.lexists(path):
-            raise CutoverError("automatic Rootbroker cutover blocked by operator kill-switch")
+    # This root-side gate independently revalidates the canonical marker on
+    # every critical phase.  It evaluates the marker against the concrete
+    # Rootbroker cutover footprint instead of promoting every scoped marker to
+    # a host-global stop.  Unknown, legacy, malformed or in-scope authority
+    # still fails closed.
+    if os.path.lexists(LEGACY_KILL_SWITCH):
+        raise CutoverError("automatic Rootbroker cutover blocked by legacy operator kill-switch")
+    if not os.path.lexists(CANONICAL_KILL_SWITCH):
+        return
+    try:
+        _validate_directory(
+            CANONICAL_KILL_SWITCH.parent,
+            expected_uid=0,
+            label="canonical blockade parent",
+        )
+        data, metadata = _read_regular_file(
+            CANONICAL_KILL_SWITCH,
+            require_root_owned=True,
+            max_bytes=64 * 1024,
+        )
+        if stat.S_IMODE(metadata.st_mode) != 0o644:
+            raise CutoverError("canonical operator kill-switch mode is invalid")
+        value = _strict_blockade_json(data)
+        matches_cutover = _automatic_blockade_matches_cutover(value)
+    except Exception as exc:
+        raise CutoverError(
+            "automatic Rootbroker cutover blocked by unsafe canonical operator kill-switch"
+        ) from exc
+    if matches_cutover and value.get("posture") != "observe":
+        raise CutoverError(
+            "automatic Rootbroker cutover blocked by in-scope operator kill-switch"
+        )
 
 
 def _authoritative_remote_main_head(runner: RunCommand) -> str:
