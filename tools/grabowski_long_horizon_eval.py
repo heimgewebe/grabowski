@@ -166,13 +166,12 @@ def _evaluate_monitoring(
                 )
             requirements[monitor_id] = event
         elif kind == "monitor.check":
-            checks[event["monitor_id"]].append(event["step"])
-
-    unknown = sorted(set(checks) - set(requirements))
-    if unknown:
-        raise TraceError(
-            f"run {events[0]['run_id']}: monitor checks without requirement: {unknown}"
-        )
+            monitor_id = event["monitor_id"]
+            if monitor_id not in requirements:
+                raise TraceError(
+                    f"run {event['run_id']}: monitor check without requirement before use: {monitor_id!r}"
+                )
+            checks[monitor_id].append(event["step"])
 
     results: list[dict[str, Any]] = []
     for monitor_id in sorted(requirements):
@@ -266,17 +265,15 @@ def _evaluate_commitments(
             declarations[commitment_id] = event
         elif kind in {"commitment.completed", "commitment.abandoned"}:
             commitment_id = event["commitment_id"]
+            if commitment_id not in declarations:
+                raise TraceError(
+                    f"run {event['run_id']}: commitment resolution without declaration before use: {commitment_id!r}"
+                )
             if commitment_id in resolutions:
                 raise TraceError(
                     f"run {event['run_id']}: commitment {commitment_id!r} resolved more than once"
                 )
             resolutions[commitment_id] = event
-
-    unknown = sorted(set(resolutions) - set(declarations))
-    if unknown:
-        raise TraceError(
-            f"run {events[0]['run_id']}: commitment resolutions without declaration: {unknown}"
-        )
 
     results: list[dict[str, Any]] = []
     for commitment_id in sorted(declarations):

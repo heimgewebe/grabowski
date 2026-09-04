@@ -177,6 +177,36 @@ class LongHorizonEvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(evaluator.TraceError, "without requirement"):
             evaluator.evaluate_records(records)
 
+    def test_monitor_check_before_requirement_at_same_step_is_rejected(self) -> None:
+        records = evaluator.parse_jsonl(
+            "\n".join(
+                [
+                    event("r1", 3, "monitor.check", monitor_id="truth"),
+                    event(
+                        "r1",
+                        3,
+                        "monitor.requirement",
+                        monitor_id="truth",
+                        cadence_steps=20,
+                    ),
+                ]
+            )
+        )
+        with self.assertRaisesRegex(evaluator.TraceError, "without requirement"):
+            evaluator.evaluate_records(records)
+
+    def test_commitment_resolution_before_declaration_at_same_step_is_rejected(self) -> None:
+        records = evaluator.parse_jsonl(
+            "\n".join(
+                [
+                    event("r1", 4, "commitment.completed", commitment_id="c1"),
+                    event("r1", 4, "commitment.declared", commitment_id="c1"),
+                ]
+            )
+        )
+        with self.assertRaisesRegex(evaluator.TraceError, "without declaration"):
+            evaluator.evaluate_records(records)
+
     def test_non_monotone_steps_are_rejected(self) -> None:
         records = evaluator.parse_jsonl(
             "\n".join(
