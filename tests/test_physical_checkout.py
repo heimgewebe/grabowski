@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import copy
+import os
 import shutil
 import subprocess
 import tempfile
@@ -207,6 +209,81 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(0, git_probe.returncode)
+            with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                physical_checkout.capture_physical_checkout_identity(checkout)
+
+    def test_verify_rejects_schema_shape_and_digest_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo)
+            identity = physical_checkout.capture_physical_checkout_identity(repo)
+            cases = []
+            wrong_schema = copy.deepcopy(identity)
+            wrong_schema["schema_version"] = 999
+            cases.append(wrong_schema)
+            wrong_hash = copy.deepcopy(identity)
+            wrong_hash["physical_identity_sha256"] = "0" * 64
+            cases.append(wrong_hash)
+            wrong_inode_type = copy.deepcopy(identity)
+            wrong_inode_type["git_dir"]["inode"] = "not-an-int"
+            cases.append(wrong_inode_type)
+            extra_field = copy.deepcopy(identity)
+            extra_field["unexpected"] = True
+            cases.append(extra_field)
+
+            for expected in cases:
+                with self.subTest(expected=expected):
+                    with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                        physical_checkout.verify_physical_checkout_identity(expected)
+
+    def test_branch_preimage_records_one_absolute_repository_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo)
+            relative = Path(os.path.relpath(repo, Path.cwd()))
+
+            preimage = git_preimage.capture_branch_preimage(relative, self._probe(relative))
+
+            absolute = str(Path(os.path.abspath(os.fspath(relative))))
+            self.assertEqual(absolute, preimage["repository"])
+            self.assertEqual(absolute, preimage["physical_checkout"]["root"]["path"])
+
+    def test_relative_gitdir_pointer_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            metadata = root / "metadata"
+            self._init_committed_repo(checkout)
+            shutil.move(str(checkout / ".git"), str(metadata))
+            (checkout / ".git").write_text("gitdir: ../metadata\n", encoding="utf-8")
+
+            identity = physical_checkout.capture_physical_checkout_identity(checkout)
+
+            self.assertEqual(str(metadata), identity["git_dir"]["path"])
+            physical_checkout.verify_physical_checkout_identity(identity)
+
+    def test_intermediate_symlink_component_is_rejected_by_current_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_parent = root / "real-parent"
+            repo = real_parent / "repo"
+            alias_parent = root / "alias-parent"
+            real_parent.mkdir()
+            self._init_committed_repo(repo)
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+            with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                physical_checkout.capture_physical_checkout_identity(alias_parent / "repo")
+
+    def test_symlinked_dot_git_entry_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            metadata = root / "metadata"
+            self._init_committed_repo(checkout)
+            shutil.move(str(checkout / ".git"), str(metadata))
+            (checkout / ".git").symlink_to(metadata, target_is_directory=True)
+
             with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
                 physical_checkout.capture_physical_checkout_identity(checkout)
 

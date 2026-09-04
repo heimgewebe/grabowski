@@ -188,6 +188,7 @@ def capture_branch_preimage(
     require_attached: bool = True,
 ) -> dict[str, Any]:
     """Build one exact branch/index/raw-worktree CAS preimage from safe observations."""
+    repo = Path(os.path.abspath(os.fspath(repo)))
     physical_before = physical_checkout.capture_physical_checkout_identity(repo)
     branch_probe = probe(["symbolic-ref", "--quiet", "--short", "HEAD"])
     branch: str | None = None
@@ -230,15 +231,12 @@ def capture_branch_preimage(
         elif ref_probe.returncode != 1:
             raise RuntimeError(f"Git operation-state observation failed: {name}")
 
-    physical_after = physical_checkout.capture_physical_checkout_identity(repo)
-    if (
-        physical_after["physical_identity_sha256"]
-        != physical_before["physical_identity_sha256"]
-        or physical_after["root"] != physical_before["root"]
-        or physical_after["git_dir"] != physical_before["git_dir"]
-        or physical_after["common_dir"] != physical_before["common_dir"]
-    ):
-        raise RuntimeError("Physical checkout identity changed during preimage capture")
+    try:
+        physical_checkout.verify_physical_checkout_identity(physical_before)
+    except physical_checkout.PhysicalCheckoutIdentityError as exc:
+        raise physical_checkout.PhysicalCheckoutIdentityError(
+            "physical checkout identity changed during preimage capture"
+        ) from exc
 
     material: dict[str, Any] = {
         "schema_version": 2,

@@ -88,6 +88,49 @@ def _identity(path: Path, metadata: os.stat_result) -> dict[str, Any]:
     }
 
 
+def _identity_material(
+    *,
+    root: dict[str, Any],
+    git_dir: dict[str, Any],
+    common_dir: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": KIND,
+        "root": root,
+        "git_dir": git_dir,
+        "common_dir": common_dir,
+    }
+
+
+def _identity_sha256(material: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json_bytes(material)).hexdigest()
+
+
+def _validated_identity_node(value: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"path", "device", "inode"}:
+        raise PhysicalCheckoutIdentityError(
+            f"expected physical identity {label} has an invalid shape"
+        )
+    path = value.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\x00" in path
+        or not Path(path).is_absolute()
+    ):
+        raise PhysicalCheckoutIdentityError(
+            f"expected physical identity {label} path is invalid"
+        )
+    for field in ("device", "inode"):
+        number = value.get(field)
+        if type(number) is not int or number < 0:
+            raise PhysicalCheckoutIdentityError(
+                f"expected physical identity {label} {field} is invalid"
+            )
+    return {"path": path, "device": value["device"], "inode": value["inode"]}
+
+
 def _validate_component(component: str, *, label: str) -> None:
     if component in {"", ".", ".."} or "/" in component or "\x00" in component:
         raise PhysicalCheckoutIdentityError(f"{label} contains an unsafe path component")
@@ -324,8 +367,8 @@ def capture_physical_checkout_identity(
 ) -> dict[str, Any]:
     """Capture only physical checkout identity: paths plus device/inode triples.
 
-    The observation rejects symlink traversal and revalidates every bound path after
-    capture. It intentionally excludes branch, HEAD, remote, purpose, role, task and
+    The observation rejects symlink traversal in every lexical path component and
+    revalidates every bound path after capture. It intentionally excludes branch, HEAD, remote, purpose, role, task and
     lease semantics.
     """
     root_path = _absolute_lexical(worktree_root)
@@ -403,11 +446,11 @@ def capture_physical_checkout_identity(
                 common_path, label="git common directory"
             )
 
-        material = {
-            "root": _identity(root_path, root_metadata),
-            "git_dir": _identity(git_path, git_metadata),
-            "common_dir": _identity(common_path, common_metadata),
-        }
+        material = _identity_material(
+            root=_identity(root_path, root_metadata),
+            git_dir=_identity(git_path, git_metadata),
+            common_dir=_identity(common_path, common_metadata),
+        )
 
         _assert_absolute_directory_node(
             root_path, root_metadata, label="checkout root"
@@ -415,9 +458,10 @@ def capture_physical_checkout_identity(
         _assert_absolute_directory_node(
             git_path, git_metadata, label="git directory"
         )
-        _assert_absolute_directory_node(
-            common_path, common_metadata, label="git common directory"
-        )
+        if common_path != git_path:
+            _assert_absolute_directory_node(
+                common_path, common_metadata, label="git common directory"
+            )
         if git_entry_kind == "directory":
             _assert_relative_directory_node(
                 root_descriptor,
@@ -457,12 +501,8 @@ def capture_physical_checkout_identity(
             )
 
         return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": KIND,
             **material,
-            "physical_identity_sha256": hashlib.sha256(
-                _canonical_json_bytes(material)
-            ).hexdigest(),
+            "physical_identity_sha256": _identity_sha256(material),
         }
     finally:
         if common_descriptor is not None:
@@ -473,19 +513,34 @@ def capture_physical_checkout_identity(
 
 
 def verify_physical_checkout_identity(expected: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(expected, dict) or expected.get("kind") != KIND:
-        raise PhysicalCheckoutIdentityError("expected physical identity is invalid")
-    root = expected.get("root")
-    if not isinstance(root, dict) or not isinstance(root.get("path"), str):
-        raise PhysicalCheckoutIdentityError("expected physical identity has no root path")
-    observed = capture_physical_checkout_identity(root["path"])
+    required_fields = {
+        "schema_version",
+        "kind",
+        "root",
+        "git_dir",
+        "common_dir",
+        "physical_identity_sha256",
+    }
     if (
-        expected.get("physical_identity_sha256")
-        != observed["physical_identity_sha256"]
-        or expected.get("root") != observed["root"]
-        or expected.get("git_dir") != observed["git_dir"]
-        or expected.get("common_dir") != observed["common_dir"]
+        not isinstance(expected, dict)
+        or set(expected) != required_fields
+        or expected.get("schema_version") != SCHEMA_VERSION
+        or expected.get("kind") != KIND
     ):
+        raise PhysicalCheckoutIdentityError("expected physical identity is invalid")
+
+    root = _validated_identity_node(expected.get("root"), label="root")
+    git_dir = _validated_identity_node(expected.get("git_dir"), label="git_dir")
+    common_dir = _validated_identity_node(expected.get("common_dir"), label="common_dir")
+    material = _identity_material(root=root, git_dir=git_dir, common_dir=common_dir)
+    expected_digest = expected.get("physical_identity_sha256")
+    if not isinstance(expected_digest, str) or expected_digest != _identity_sha256(material):
+        raise PhysicalCheckoutIdentityError(
+            "expected physical identity digest is internally inconsistent"
+        )
+
+    observed = capture_physical_checkout_identity(root["path"])
+    if expected_digest != observed["physical_identity_sha256"]:
         raise PhysicalCheckoutIdentityError(
             "physical checkout identity changed since the expected observation"
         )
