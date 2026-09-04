@@ -3169,6 +3169,10 @@
         "source": "src/grabowski_connector_contract.py"
       },
       {
+        "module": "grabowski_connector_policy",
+        "source": "src/grabowski_connector_policy.py"
+      },
+      {
         "module": "grabowski_blockades",
         "source": "src/grabowski_blockades.py"
       },
@@ -3610,7 +3614,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "d9d1a1077ce221cc8879c1a15da4fccd1ed75c356832251964d9477591e347d8"
+      "sha256": "b7fa14455c1a13713a33912fd329011808529e66a47e4d60d49680c28f6496e0"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3651,6 +3655,7 @@
       "src/grabowski_coding_agent_router_cli.py": "583e4d7e0213245b423d7255fca88834db2de678ea1ae86ed2e515946b9afb14",
       "src/grabowski_command_identity.py": "582b209fa1b1e4cb5faef74fa56214f79aabf6ad1e47ec0425a5962d74209138",
       "src/grabowski_connector_contract.py": "7d8b9011c737b4785595c68aeb97652641c5c2be00f6dfc4d5f1c7be38895c57",
+      "src/grabowski_connector_policy.py": "aef28124fbb361317d8a502fb67da0012ab9a851debbd1bc3b8fd66930871173",
       "src/grabowski_consumer_surface.py": "f007b746c61f89f207b5477d02bc7b8e621b8e6b75810cfc05e437d1bcfdc249",
       "src/grabowski_context_fabric.py": "dda7f6bf1fcc8346df98a323bc545c047548e3f333f317e98838f2f15ae875e0",
       "src/grabowski_convergence.py": "9f12a1397767a088bd20c500d307014a870547d9435587a2d04f5a43afb31e19",

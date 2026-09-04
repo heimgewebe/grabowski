@@ -78,6 +78,12 @@ OPERATOR_AUTHORITY_ATTESTATION_PATH = Path(
     "/var/lib/grabowski/operator-authority-attestation.v1.json"
 )
 TRANSPORT_INGRESS_SERVICE = "grabowski-transport-ingress.service"
+MAULWURF_X_TRANSPORT_INGRESS_SERVICE = (
+    "grabowski-transport-ingress-maulwurf-x.service"
+)
+MAULWURF_X_EXTERNAL_GATEWAY_SERVICE = (
+    "grabowski-external-connector-maulwurf-x.service"
+)
 SAFETY_OBSERVER_SERVICE = "grabowski-safety-observer.service"
 SAFETY_OBSERVER_UNIT_RELATIVE = Path("systemd/grabowski-safety-observer.service.example")
 SAFETY_OBSERVER_UNIT_PATH = core.HOME / ".config/systemd/user/grabowski-safety-observer.service"
@@ -115,6 +121,32 @@ WATCHDOG_HOST_ASSETS = (
         target=core.HOME / ".config/systemd/user/grabowski-transport-ingress.service",
         mode=0o600,
         unit=TRANSPORT_INGRESS_SERVICE,
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-transport-ingress-maulwurf-x.service.example"),
+        target=(
+            core.HOME
+            / ".config/systemd/user/grabowski-transport-ingress-maulwurf-x.service"
+        ),
+        mode=0o600,
+        unit=MAULWURF_X_TRANSPORT_INGRESS_SERVICE,
+    ),
+    WatchdogHostAsset(
+        source=Path("tools/grabowski_external_connector_gateway.py"),
+        target=(
+            core.HOME
+            / ".local/libexec/grabowski/grabowski_external_connector_gateway.py"
+        ),
+        mode=0o700,
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-external-connector-maulwurf-x.service.example"),
+        target=(
+            core.HOME
+            / ".config/systemd/user/grabowski-external-connector-maulwurf-x.service"
+        ),
+        mode=0o600,
+        unit=MAULWURF_X_EXTERNAL_GATEWAY_SERVICE,
     ),
     WatchdogHostAsset(
         source=Path("tools/watchdog_admission_recovery.py"),
