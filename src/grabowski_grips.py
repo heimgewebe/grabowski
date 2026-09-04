@@ -11750,6 +11750,95 @@ def _captain_pr_view(
     return viewed, info
 
 
+def _captain_pr_merge_queue_readback(
+    repo_path: Path,
+    github_runner: GithubRunner,
+    *,
+    repo_slug: str,
+    pr_number: str,
+    expected_head: str,
+    expected_base: str,
+    expected_base_sha: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+    owner, name = repo_slug.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+        "state headRefOid baseRefName baseRefOid "
+        "mergeQueueEntry{id position estimatedTimeToMerge}}}}"
+    )
+    args = [
+        "api",
+        "graphql",
+        "-f",
+        f"query={query}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"number={pr_number}",
+    ]
+    try:
+        result = github_runner(repo_path, args)
+    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+        result = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": f"merge queue readback runner exception: {type(exc).__name__}: {exc}",
+        }
+    info = {"command": ["gh", *args], **_command_result_info(result)}
+    if info["returncode"] != 0:
+        return None, info, ["merge_queue_readback_unavailable"]
+    try:
+        payload = _json_stdout(result)
+    except GripActionError:
+        return None, info, ["merge_queue_readback_invalid"]
+    if isinstance(payload, dict) and "errors" in payload:
+        return (
+            None,
+            {**info, "graphql_errors_present": True},
+            ["merge_queue_readback_graphql_errors"],
+        )
+    repository = payload.get("data", {}).get("repository") if isinstance(payload, dict) else None
+    viewed = repository.get("pullRequest") if isinstance(repository, dict) else None
+    if not isinstance(viewed, dict):
+        return None, info, ["merge_queue_readback_invalid"]
+    errors: list[str] = []
+    if viewed.get("state") != "OPEN":
+        errors.append("merge_queue_pr_state_not_open")
+    if _normalize_40_sha(viewed.get("headRefOid")) != expected_head:
+        errors.append("merge_queue_head_mismatch")
+    if viewed.get("baseRefName") != expected_base:
+        errors.append("merge_queue_base_mismatch")
+    if _normalize_40_sha(viewed.get("baseRefOid")) != expected_base_sha:
+        errors.append("merge_queue_base_sha_mismatch")
+    entry = viewed.get("mergeQueueEntry")
+    if entry is None:
+        return None, {**info, "view": viewed}, errors
+    if not isinstance(entry, dict):
+        return None, {**info, "view": viewed}, [*errors, "merge_queue_entry_invalid"]
+    entry_id = entry.get("id")
+    position = entry.get("position")
+    estimated = entry.get("estimatedTimeToMerge")
+    if (
+        not isinstance(entry_id, str)
+        or not entry_id.strip()
+        or isinstance(position, bool)
+        or not isinstance(position, int)
+        or position < 1
+        or (
+            estimated is not None
+            and (isinstance(estimated, bool) or not isinstance(estimated, int) or estimated < 0)
+        )
+    ):
+        return None, {**info, "view": viewed}, [*errors, "merge_queue_entry_invalid"]
+    normalized = {"id": entry_id, "position": position}
+    if estimated is not None:
+        normalized["estimated_time_to_merge"] = estimated
+    return normalized, {**info, "view": viewed}, errors
+
+
 def _captain_pr_merge_preflight_errors(
     viewed: dict[str, Any],
     *,
@@ -12436,6 +12525,119 @@ def _run_captain_pr_merge(
             f"merge not attempted: {detail}"
         )
         return execution_result
+    queue_entry, queue_info, queue_errors = _captain_pr_merge_queue_readback(
+        repo_path,
+        github_runner,
+        repo_slug=repo_slug,
+        pr_number=pr_number,
+        expected_head=expected_head,
+        expected_base=expected_base,
+        expected_base_sha=expected_base_sha,
+    )
+    execution_result["pre_dispatch_merge_queue_readback"] = queue_info
+    pre_queue_view = queue_info.get("view") if isinstance(queue_info, dict) else None
+    pre_queue_binding_errors = [
+        error
+        for error in queue_errors
+        if error != "merge_queue_pr_state_not_open"
+    ]
+    base_update_guard_mode = base_update_guard.get("mode")
+    server_enforced_base_update_guard = (
+        base_update_guard_mode == "strict_required_status_checks_ruleset"
+    )
+    execution_result["base_update_guard_mode"] = base_update_guard_mode
+    if (
+        isinstance(pre_queue_view, dict)
+        and pre_queue_view.get("state") == "MERGED"
+        and not pre_queue_binding_errors
+    ):
+        (
+            reconciled_view,
+            reconciliation_attempts,
+            reconciliation_errors,
+            reconciliation_summary,
+        ) = _captain_pr_merge_post_view(
+            repo_path,
+            github_runner,
+            repo_slug=repo_slug,
+            pr_number=pr_number,
+            expected_head=expected_head,
+            expected_base=expected_base,
+        )
+        execution_result["pre_queue_merge_verify_view_attempts"] = (
+            reconciliation_attempts
+        )
+        execution_result["pre_queue_merge_verify_summary"] = reconciliation_summary
+        if reconciliation_errors or reconciled_view is None:
+            reconciliation_failures = (
+                reconciliation_errors
+                if reconciliation_errors
+                else ["pre_dispatch_merged_pr_verification_failed"]
+            )
+            execution_result["preflight_errors"].extend(reconciliation_failures)
+            execution_result["verification_error"] = (
+                "merge completed during pre-dispatch queue readback but canonical "
+                "merged identity could not be verified: "
+                + "; ".join(reconciliation_failures)
+            )
+            return execution_result
+        execution_result.update(
+            {
+                "preflight_passed": True,
+                "remote_mutation_observed": True,
+                "merge_completion_verified": True,
+                "duplicate_dispatch_prevented": True,
+                "verified_pr": reconciled_view,
+            }
+        )
+        if not server_enforced_base_update_guard:
+            error = "merge_queue_requires_server_enforced_base_update_guard"
+            execution_result["preflight_errors"].append(error)
+            execution_result["verification_error"] = (
+                "external queue merge cannot prove the reviewed exact base under "
+                f"{base_update_guard_mode or 'unknown'}: {error}"
+            )
+            execution_result["merge_queue_reconciliation"] = (
+                "blocked_merged_queue_without_server_base_guard"
+            )
+            return execution_result
+        execution_result["verification_passed"] = True
+        execution_result["merge_queue_reconciliation"] = (
+            "merged_during_pre_dispatch_queue_readback"
+        )
+        return execution_result
+    if queue_errors:
+        execution_result["preflight_errors"].extend(queue_errors)
+        execution_result["verification_error"] = (
+            "merge queue state is not safely reconcilable before dispatch: "
+            + "; ".join(queue_errors)
+        )
+        return execution_result
+    if queue_entry is not None:
+        execution_result["merge_queue_entry"] = queue_entry
+        execution_result["duplicate_dispatch_prevented"] = True
+        if not server_enforced_base_update_guard:
+            error = "merge_queue_requires_server_enforced_base_update_guard"
+            execution_result["preflight_errors"].append(error)
+            execution_result["verification_error"] = (
+                "existing merge queue entry cannot satisfy the reviewed exact-base "
+                f"fallback under {base_update_guard_mode or 'unknown'}: {error}"
+            )
+            execution_result["merge_queue_reconciliation"] = (
+                "blocked_existing_queue_without_server_base_guard"
+            )
+            return execution_result
+        execution_result.update(
+            {
+                "preflight_passed": True,
+                "remote_mutation_observed": False,
+                "verification_passed": True,
+                "merge_queued": True,
+                "merge_completion_verified": False,
+                "merge_queue_reconciliation": "already_queued_before_dispatch",
+            }
+        )
+        return execution_result
     execution_result["preflight_passed"] = True
     merge_args = [
         "pr",
@@ -12453,6 +12655,38 @@ def _run_captain_pr_merge(
         merge_result = github_runner(repo_path, merge_args)
         execution_result["command_returned"] = True
         execution_result["execution_attempted"] = True
+    except grabowski_merge_guard.CaptainMergeQueueObservedUnderGuard as exc:
+        execution_result.update(
+            {
+                "execution_invoked": False,
+                "execution_attempted": False,
+                "command_returned": False,
+                "merge_queue_entry": dict(exc.entry),
+                "merge_queue_base_guard_mode": exc.base_update_guard_mode,
+                "duplicate_dispatch_prevented": True,
+            }
+        )
+        if exc.safely_reconcilable:
+            execution_result.update(
+                {
+                    "verification_passed": True,
+                    "merge_queued": True,
+                    "merge_completion_verified": False,
+                    "merge_queue_reconciliation": "queued_during_dispatch_guard",
+                }
+            )
+        else:
+            error = "merge_queue_requires_server_enforced_base_update_guard"
+            execution_result["preflight_errors"].append(error)
+            execution_result["verification_error"] = (
+                "merge queue entry appeared inside the atomic dispatch guard but "
+                f"{exc.base_update_guard_mode or 'unknown'} cannot preserve the "
+                f"reviewed exact base: {error}"
+            )
+            execution_result["merge_queue_reconciliation"] = (
+                "blocked_queue_during_dispatch_guard_without_server_base_guard"
+            )
+        return execution_result
     except Exception as exc:  # pragma: no cover - defensive receipt boundary
         execution_result["runner_exception"] = f"{type(exc).__name__}: {_bounded_command_output(str(exc), limit=512)}"
         merge_result = {"returncode": 1, "stdout": "", "stderr": f"gh pr merge runner exception: {type(exc).__name__}: {exc}"}
@@ -12473,6 +12707,80 @@ def _run_captain_pr_merge(
     execution_result["verify_view_summary"] = verify_summary
     execution_result["verified_pr"] = viewed
     execution_result["remote_mutation_observed"] = not verify_errors and viewed is not None
+    if verify_errors:
+        queue_entry, queue_info, queue_errors = _captain_pr_merge_queue_readback(
+            repo_path,
+            github_runner,
+            repo_slug=repo_slug,
+            pr_number=pr_number,
+            expected_head=expected_head,
+            expected_base=expected_base,
+            expected_base_sha=expected_base_sha,
+        )
+        execution_result["post_dispatch_merge_queue_readback"] = queue_info
+        queue_view = queue_info.get("view") if isinstance(queue_info, dict) else None
+        queue_binding_errors = [
+            error
+            for error in queue_errors
+            if error != "merge_queue_pr_state_not_open"
+        ]
+        prior_verify_race = (
+            isinstance(verify_summary.get("last_viewed"), dict)
+            and verify_summary["last_viewed"].get("state") == "OPEN"
+            and verify_summary.get("error_codes_seen")
+            == ["pr_not_merged_after_execution"]
+        )
+        if (
+            prior_verify_race
+            and isinstance(queue_view, dict)
+            and queue_view.get("state") == "MERGED"
+            and not queue_binding_errors
+        ):
+            (
+                reconciled_view,
+                reconciliation_attempts,
+                reconciliation_errors,
+                reconciliation_summary,
+            ) = _captain_pr_merge_post_view(
+                repo_path,
+                github_runner,
+                repo_slug=repo_slug,
+                pr_number=pr_number,
+                expected_head=expected_head,
+                expected_base=expected_base,
+            )
+            execution_result["post_queue_merge_verify_view_attempts"] = (
+                reconciliation_attempts
+            )
+            execution_result["post_queue_merge_verify_summary"] = (
+                reconciliation_summary
+            )
+            if not reconciliation_errors and reconciled_view is not None:
+                execution_result.update(
+                    {
+                        "remote_mutation_observed": True,
+                        "verification_passed": True,
+                        "merge_completion_verified": True,
+                        "merge_queue_reconciliation": "merged_during_queue_readback",
+                        "verified_pr": reconciled_view,
+                    }
+                )
+                return execution_result
+        if queue_errors:
+            execution_result["post_dispatch_merge_queue_errors"] = queue_errors
+        elif queue_entry is not None:
+            execution_result.update(
+                {
+                    "remote_mutation_observed": True,
+                    "verification_passed": True,
+                    "merge_queued": True,
+                    "merge_completion_verified": False,
+                    "duplicate_dispatch_prevented": False,
+                    "merge_queue_entry": queue_entry,
+                    "merge_queue_reconciliation": "queued_after_dispatch",
+                }
+            )
+            return execution_result
     if merge_info["returncode"] != 0:
         if verify_errors:
             execution_result["post_verify_errors"] = ["merge_command_failed", *verify_errors]

@@ -1341,6 +1341,142 @@ def _merge_guard_result_info(result: Any) -> dict[str, Any]:
     }
 
 
+class CaptainMergeQueueObservedUnderGuard(RuntimeError):
+    def __init__(
+        self,
+        *,
+        entry: dict[str, Any],
+        base_update_guard_mode: str | None,
+        safely_reconcilable: bool,
+    ) -> None:
+        super().__init__("merge queue entry observed inside atomic dispatch guard")
+        self.entry = dict(entry)
+        self.base_update_guard_mode = base_update_guard_mode
+        self.safely_reconcilable = safely_reconcilable
+
+
+def _dispatch_merge_queue_readback(
+    repo_path: Path,
+    github_runner: Any,
+    *,
+    repo_slug: str,
+    pr_number: int,
+    expected_head: str,
+    expected_base: str,
+    expected_base_sha: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+    owner, name = repo_slug.split("/", 1)
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+        "state headRefOid baseRefName baseRefOid "
+        "mergeQueueEntry{id position estimatedTimeToMerge}}}}"
+    )
+    args = [
+        "api",
+        "graphql",
+        "-f",
+        f"query={query}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"number={pr_number}",
+    ]
+    try:
+        raw = github_runner(repo_path, args)
+    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+        raw = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": f"merge queue dispatch readback exception: {type(exc).__name__}: {exc}",
+        }
+    info = _merge_guard_result_info(raw)
+    evidence: dict[str, Any] = {
+        "command": ["gh", *args],
+        "returncode": info["returncode"],
+        "stdout_sha256": hashlib.sha256(info["stdout"].encode("utf-8")).hexdigest(),
+        "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
+    }
+    if info["returncode"] != 0:
+        errors = ["merge_guard_dispatch_queue_readback_unavailable"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    try:
+        payload = json.loads(info["stdout"])
+    except json.JSONDecodeError:
+        errors = ["merge_guard_dispatch_queue_readback_invalid_json"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    if not isinstance(payload, dict):
+        errors = ["merge_guard_dispatch_queue_readback_not_object"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    if "errors" in payload:
+        errors = ["merge_guard_dispatch_queue_readback_graphql_errors"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    repository = payload.get("data", {}).get("repository") if isinstance(payload.get("data"), dict) else None
+    viewed = repository.get("pullRequest") if isinstance(repository, dict) else None
+    if not isinstance(viewed, dict):
+        errors = ["merge_guard_dispatch_queue_readback_invalid"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    errors: list[str] = []
+    if viewed.get("state") != "OPEN":
+        errors.append("merge_guard_dispatch_queue_pr_state_not_open")
+    if viewed.get("headRefOid") != expected_head:
+        errors.append("merge_guard_dispatch_queue_head_mismatch")
+    if viewed.get("baseRefName") != expected_base:
+        errors.append("merge_guard_dispatch_queue_base_mismatch")
+    if viewed.get("baseRefOid") != expected_base_sha:
+        errors.append("merge_guard_dispatch_queue_base_sha_mismatch")
+    evidence["view_binding_sha256"] = _sha256_json(
+        {
+            "state": viewed.get("state"),
+            "headRefOid": viewed.get("headRefOid"),
+            "baseRefName": viewed.get("baseRefName"),
+            "baseRefOid": viewed.get("baseRefOid"),
+        }
+    )
+    entry = viewed.get("mergeQueueEntry")
+    if entry is None:
+        evidence["entry_present"] = False
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+    if not isinstance(entry, dict):
+        errors.append("merge_guard_dispatch_queue_entry_invalid")
+        evidence["entry_present"] = True
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+    entry_id = entry.get("id")
+    position = entry.get("position")
+    estimated = entry.get("estimatedTimeToMerge")
+    if (
+        not isinstance(entry_id, str)
+        or not entry_id.strip()
+        or isinstance(position, bool)
+        or not isinstance(position, int)
+        or position < 1
+        or (
+            estimated is not None
+            and (isinstance(estimated, bool) or not isinstance(estimated, int) or estimated < 0)
+        )
+    ):
+        errors.append("merge_guard_dispatch_queue_entry_invalid")
+        evidence["entry_present"] = True
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+    normalized: dict[str, Any] = {"id": entry_id, "position": position}
+    if estimated is not None:
+        normalized["estimated_time_to_merge"] = estimated
+    evidence["entry_present"] = True
+    evidence["entry_sha256"] = _sha256_json(normalized)
+    evidence["errors"] = list(errors)
+    return normalized, evidence, errors
+
+
 def _github_rules_plan_limit_error(stderr: str) -> bool:
     normalized = " ".join(str(stderr).casefold().split())
     return (
@@ -4255,6 +4391,55 @@ class CaptainMergeGuardRunner:
                 if isinstance(dispatch_policy, dict)
                 else None
             )
+            queue_entry, queue_evidence, queue_errors = _dispatch_merge_queue_readback(
+                self.repo_path,
+                self.github_runner,
+                repo_slug=str(bindings["repository"]),
+                pr_number=int(bindings["pull_request"]),
+                expected_head=str(bindings["head_sha"]),
+                expected_base=str(bindings["base_branch"]),
+                expected_base_sha=str(bindings["base_sha"]),
+            )
+            self.receipt["dispatch_merge_queue_readback"] = queue_evidence
+            if queue_errors:
+                self.receipt["status"] = "blocked_after_guard_revalidation"
+                self.receipt["contract_satisfied"] = False
+                self.receipt["errors"] = list(queue_errors)
+                raise RuntimeError(
+                    "merge lease guard queue revalidation blocked: "
+                    + "; ".join(queue_errors)
+                )
+            if queue_entry is not None:
+                safely_reconcilable = (
+                    dispatch_mode == "strict_required_status_checks_ruleset"
+                )
+                reconciliation = {
+                    "schema_version": 1,
+                    "kind": "grabowski_merge_queue_dispatch_reconciliation",
+                    "status": "scheduled" if safely_reconcilable else "blocked",
+                    "base_update_guard_mode": dispatch_mode,
+                    "duplicate_dispatch_prevented": True,
+                    "entry_sha256": _sha256_json(queue_entry),
+                    "does_not_establish": [
+                        "identity_of_queueing_actor",
+                        "future_queue_completion",
+                        "absence_of_noncooperating_external_github_actors",
+                    ],
+                }
+                self.receipt["dispatch_merge_queue_reconciliation"] = reconciliation
+                self.receipt["dispatch_mode"] = dispatch_mode
+                if not safely_reconcilable:
+                    error = "merge_queue_requires_server_enforced_base_update_guard"
+                    self.receipt["status"] = "blocked_after_guard_revalidation"
+                    self.receipt["contract_satisfied"] = False
+                    self.receipt["errors"] = [error]
+                else:
+                    self.receipt["status"] = "queue_reconciled_before_dispatch"
+                raise CaptainMergeQueueObservedUnderGuard(
+                    entry=queue_entry,
+                    base_update_guard_mode=dispatch_mode,
+                    safely_reconcilable=safely_reconcilable,
+                )
             if dispatch_mode == "exact_base_git_cas":
                 expected_head = str(bindings["head_sha"])
                 scope_error = _exact_base_git_cas_pr_scope_error(bindings)
@@ -4496,9 +4681,22 @@ class CaptainMergeGuardRunner:
                 self.receipt["status"] = "completed"
             else:
                 self.receipt["status"] = self.receipt["status"] + "_released"
+        queue_reconciliation = self.receipt.get("dispatch_merge_queue_reconciliation")
+        guarded_queue_reconciled = (
+            isinstance(queue_reconciliation, dict)
+            and queue_reconciliation.get("status") == "scheduled"
+            and execution_result.get("verification_passed") is True
+            and execution_result.get("merge_queued") is True
+            and execution_result.get("duplicate_dispatch_prevented") is True
+        )
+        guarded_queue_blocked = (
+            isinstance(queue_reconciliation, dict)
+            and queue_reconciliation.get("status") == "blocked"
+        )
         if (
             not self.dispatch_called
             and self.receipt["status"] != "not_reached"
+            and not guarded_queue_reconciled
         ):
             execution_result["execution_invoked"] = False
             execution_result["execution_attempted"] = False
@@ -4511,6 +4709,16 @@ class CaptainMergeGuardRunner:
                 execution_result["post_verify_errors"] = [
                     "external_merge_observed_after_merge_guard_block"
                 ]
+            elif guarded_queue_blocked:
+                queue_errors = [
+                    str(item)
+                    for item in self.receipt.get("errors", [])
+                    if isinstance(item, str) and item
+                ] or ["merge_queue_requires_server_enforced_base_update_guard"]
+                execution_result.setdefault(
+                    "verification_error", "; ".join(queue_errors)
+                )
+                execution_result["post_verify_errors"] = queue_errors
             else:
                 execution_result["verification_error"] = (
                     "merge_dispatch_blocked_by_lease_guard"

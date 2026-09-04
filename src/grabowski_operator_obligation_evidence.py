@@ -75,7 +75,43 @@ query($owner:String!,$name:String!,$number:Int!){
       baseRefName
       headRefOid
       headRefName
-      mergeCommit{oid}
+      mergeCommit{
+        oid
+        statusCheckRollup{
+          contexts(first:100){
+            totalCount
+            pageInfo{hasNextPage}
+            nodes{
+              __typename
+              ... on CheckRun{
+                databaseId
+                name
+                startedAt
+                status
+                conclusion
+                checkSuite{
+                  databaseId
+                  app{id slug}
+                  workflowRun{
+                    databaseId
+                    event
+                    runNumber
+                    runAttempt
+                    workflow{databaseId name}
+                  }
+                }
+              }
+              ... on StatusContext{
+                id
+                context
+                createdAt
+                state
+                creator{login}
+              }
+            }
+          }
+        }
+      }
       commits(last:1){
         nodes{
           commit{
@@ -699,6 +735,53 @@ def _github_actions_run_pr_bindings(
     return bindings
 
 
+def _github_actions_run_pr_bindings_by_id(
+    repo: str,
+    run_ids: set[int],
+    *,
+    deadline_monotonic: float | None = None,
+) -> dict[int, dict[str, Any]] | None:
+    wanted = set(run_ids)
+    if any(_positive_int(run_id) != run_id for run_id in wanted):
+        return None
+    if not wanted:
+        return {}
+    jq_filter = (
+        '{id,event,head_sha,head_branch,'
+        'repository:{full_name:.repository.full_name},'
+        'pull_requests:[.pull_requests[]|{number,'
+        'head:{ref:.head.ref,sha:.head.sha},'
+        'base:{ref:.base.ref,sha:.base.sha}}]}'
+    )
+    bindings: dict[int, dict[str, Any]] = {}
+    for run_id in sorted(wanted):
+        returncode, stdout, _stderr = _run_command(
+            [
+                'gh',
+                'api',
+                '-X',
+                'GET',
+                f'repos/{repo}/actions/runs/{run_id}',
+                '--jq',
+                jq_filter,
+            ],
+            deadline_monotonic=deadline_monotonic,
+        )
+        if returncode != 0:
+            raise EvidenceAssessmentError('github Actions run source unavailable')
+        try:
+            payload = json.loads(stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        binding = _github_actions_run_pr_binding_from_payload(repo, payload)
+        if binding is None or binding.get('run_id') != run_id:
+            return None
+        bindings[run_id] = binding
+    return bindings
+
+
 def _github_v2_rerun_pr_bindings_valid(
     repo: str,
     pr: int,
@@ -707,6 +790,7 @@ def _github_v2_rerun_pr_bindings_valid(
     head_sha: str,
     base_ref: str,
     base_sha: str,
+    merged: bool,
     checks: list[Any],
     deadline_monotonic: float | None = None,
 ) -> bool:
@@ -755,10 +839,124 @@ def _github_v2_rerun_pr_bindings_valid(
             binding is None
             or binding.get("event") != event
             or binding.get("head_sha") not in {head_sha, base_sha}
-            or binding.get("pull_requests") != [expected_pull]
         ):
             return False
+        pulls = binding.get("pull_requests")
+        if pulls == [expected_pull]:
+            continue
+        if (
+            merged
+            and pulls == []
+            and binding.get("head_branch") == head_ref
+        ):
+            # GitHub can erase the REST pull_requests backlink after the PR is
+            # terminal while retaining the exact run head/ref.  Accept that
+            # terminal-only shape; nonterminal and nonempty mismatches remain
+            # fail-closed.
+            continue
+        return False
     return True
+
+
+def _github_v2_merge_group_bindings_valid(
+    repo: str,
+    pr: int,
+    *,
+    head_ref: str,
+    head_sha: str,
+    base_ref: str,
+    base_sha: str,
+    merge_sha: str,
+    checks: list[Any],
+    deadline_monotonic: float | None = None,
+) -> bool:
+    run_ids: set[int] = set()
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return False
+        normalized = _github_v2_check(check)
+        if normalized is None:
+            return False
+        material = normalized[3]
+        run_id = material.get("workflow_run_database_id")
+        event = material.get("workflow_event")
+        if event != "merge_group" or not isinstance(run_id, int) or isinstance(run_id, bool):
+            return False
+        run_ids.add(run_id)
+    if not run_ids:
+        return False
+    bindings = _github_actions_run_pr_bindings_by_id(
+        repo,
+        run_ids,
+        deadline_monotonic=deadline_monotonic,
+    )
+    if bindings is None:
+        return False
+    expected_pull = {
+        "number": pr,
+        "head_ref": head_ref,
+        "head_sha": head_sha,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+    }
+    expected_queue_branch_prefix = f"gh-readonly-queue/{base_ref}/pr-{pr}-"
+    for run_id in run_ids:
+        binding = bindings.get(run_id)
+        if binding is None or binding.get("event") != "merge_group":
+            return False
+        pulls = binding.get("pull_requests")
+        if not isinstance(pulls, list):
+            return False
+        if not pulls:
+            queue_branch = binding.get("head_branch")
+            if (
+                binding.get("head_sha") != merge_sha
+                or not isinstance(queue_branch, str)
+                or not queue_branch.startswith(expected_queue_branch_prefix)
+                or SHA40_RE.fullmatch(
+                    queue_branch[len(expected_queue_branch_prefix) :]
+                )
+                is None
+            ):
+                return False
+        else:
+            expected_number_bindings = [
+                pull
+                for pull in pulls
+                if isinstance(pull, Mapping) and pull.get("number") == pr
+            ]
+            if expected_number_bindings != [expected_pull]:
+                return False
+    return True
+
+
+def _github_v2_rollup_nodes(
+    rollup: Any,
+    *,
+    allow_empty: bool,
+) -> list[Any] | None:
+    if rollup is None:
+        return [] if allow_empty else None
+    if not isinstance(rollup, Mapping):
+        return None
+    contexts = rollup.get("contexts")
+    if not isinstance(contexts, Mapping):
+        return None
+    nodes = contexts.get("nodes")
+    page_info = contexts.get("pageInfo")
+    total_count = contexts.get("totalCount")
+    if (
+        not isinstance(nodes, list)
+        or (not allow_empty and not 1 <= len(nodes) <= 100)
+        or (allow_empty and not 0 <= len(nodes) <= 100)
+        or not isinstance(page_info, Mapping)
+        or page_info.get("hasNextPage") is not False
+        or isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count != len(nodes)
+    ):
+        return None
+    return nodes
 
 
 def _github_v2_snapshot(
@@ -806,20 +1004,10 @@ def _github_v2_snapshot(
     commit = nodes[0].get("commit")
     if not isinstance(commit, Mapping):
         return None
-    rollup = commit.get("statusCheckRollup")
-    contexts = rollup.get("contexts") if isinstance(rollup, Mapping) else None
-    check_nodes = contexts.get("nodes") if isinstance(contexts, Mapping) else None
-    page_info = contexts.get("pageInfo") if isinstance(contexts, Mapping) else None
-    total_count = contexts.get("totalCount") if isinstance(contexts, Mapping) else None
-    if (
-        not isinstance(check_nodes, list)
-        or not 1 <= len(check_nodes) <= 100
-        or not isinstance(page_info, Mapping)
-        or page_info.get("hasNextPage") is not False
-        or isinstance(total_count, bool)
-        or not isinstance(total_count, int)
-        or total_count != len(check_nodes)
-    ):
+    head_check_nodes = _github_v2_rollup_nodes(
+        commit.get("statusCheckRollup"), allow_empty=True
+    )
+    if head_check_nodes is None:
         return None
     head = pull_request.get("headRefOid")
     head_ref = pull_request.get("headRefName")
@@ -840,19 +1028,65 @@ def _github_v2_snapshot(
         or not base_ref
     ):
         return None
-    if not _github_v2_rerun_pr_bindings_valid(
-        repo,
-        pr,
-        head_ref=head_ref,
-        head_sha=head,
-        base_ref=base_ref,
-        base_sha=base,
-        checks=check_nodes,
-        deadline_monotonic=deadline_monotonic,
-    ):
-        return None
-    effective_checks = _effective_github_v2_checks(check_nodes)
-    if effective_checks is None:
+    merged = pull_request.get("state") == "MERGED"
+    merge_group_checks: list[Any] = []
+    merge_gate_checks: list[Any] = []
+    if isinstance(merge, Mapping):
+        merge_check_nodes = _github_v2_rollup_nodes(
+            merge.get("statusCheckRollup"), allow_empty=True
+        )
+        if merge_check_nodes is None:
+            return None
+        for check in merge_check_nodes:
+            if not isinstance(check, Mapping):
+                return None
+            normalized = _github_v2_check(check)
+            if normalized is None:
+                return None
+            material = normalized[3]
+            if material.get("workflow_event") == "merge_group":
+                merge_group_checks.append(check)
+                merge_gate_checks.append(check)
+            elif material.get("workflow_run_database_id") is None:
+                # External CheckRuns and StatusContexts can be required merge
+                # gates even though they have no Actions workflow binding.
+                # Retain them in success evaluation; ignore only workflow runs
+                # from other events such as the post-merge push.
+                merge_gate_checks.append(check)
+    if merge_group_checks:
+        if (
+            not merged
+            or not isinstance(merge_oid, str)
+            or SHA40_RE.fullmatch(merge_oid) is None
+            or not _github_v2_merge_group_bindings_valid(
+                repo,
+                pr,
+                head_ref=head_ref,
+                head_sha=head,
+                base_ref=base_ref,
+                base_sha=base,
+                merge_sha=merge_oid,
+                checks=merge_group_checks,
+                deadline_monotonic=deadline_monotonic,
+            )
+        ):
+            return None
+        effective_checks = _effective_github_v2_checks(merge_gate_checks)
+    else:
+        if not _github_v2_rerun_pr_bindings_valid(
+            repo,
+            pr,
+            head_ref=head_ref,
+            head_sha=head,
+            base_ref=base_ref,
+            base_sha=base,
+            merged=merged,
+            checks=head_check_nodes,
+            deadline_monotonic=deadline_monotonic,
+        ):
+            return None
+        effective_checks = _effective_github_v2_checks(head_check_nodes)
+    if effective_checks is None or not effective_checks:
         return None
     return {
         "state": pull_request.get("state"),
@@ -862,7 +1096,6 @@ def _github_v2_snapshot(
         "merge_oid": merge_oid,
         "effective_checks": effective_checks,
     }
-
 
 def _github_check_success(check: Mapping[str, Any]) -> bool:
     typename = check.get("__typename")

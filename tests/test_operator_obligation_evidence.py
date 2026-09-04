@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -168,7 +169,18 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         has_next_page: bool = False,
         head_ref: str = "feature/test",
         base_ref: str = "main",
+        merge_checks: list[dict[str, object]] | None = None,
+        merge_has_next_page: bool = False,
     ) -> dict[str, object]:
+        merge_commit: dict[str, object] = {"oid": merge}
+        if merge_checks is not None:
+            merge_commit["statusCheckRollup"] = {
+                "contexts": {
+                    "totalCount": len(merge_checks),
+                    "pageInfo": {"hasNextPage": merge_has_next_page},
+                    "nodes": merge_checks,
+                }
+            }
         return {
             "data": {
                 "repository": {
@@ -179,7 +191,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                         "baseRefName": base_ref,
                         "headRefOid": head,
                         "headRefName": head_ref,
-                        "mergeCommit": {"oid": merge},
+                        "mergeCommit": merge_commit,
                         "commits": {
                             "nodes": [
                                 {
@@ -210,6 +222,9 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         pr: int,
         run_pr_overrides: dict[int, int] | None = None,
         run_head_sha_overrides: dict[int, str] | None = None,
+        run_pull_requests_empty: set[int] | None = None,
+        run_pull_requests_overrides: dict[int, list[dict[str, object]]] | None = None,
+        run_head_branch_overrides: dict[int, str] | None = None,
     ):
         repository = payload["data"]["repository"]
         pull_request = repository["pullRequest"]
@@ -217,7 +232,22 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         head_ref = pull_request["headRefName"]
         base = pull_request["baseRefOid"]
         base_ref = pull_request["baseRefName"]
-        checks = pull_request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]
+        merge = pull_request["mergeCommit"]["oid"]
+        head_commit = pull_request["commits"]["nodes"][0]["commit"]
+        head_rollup = head_commit.get("statusCheckRollup")
+        head_contexts = (
+            head_rollup.get("contexts") if isinstance(head_rollup, dict) else None
+        )
+        head_nodes = (
+            head_contexts.get("nodes") if isinstance(head_contexts, dict) else None
+        )
+        checks = list(head_nodes) if isinstance(head_nodes, list) else []
+        merge_commit = pull_request.get("mergeCommit")
+        merge_rollup = merge_commit.get("statusCheckRollup") if isinstance(merge_commit, dict) else None
+        merge_contexts = merge_rollup.get("contexts") if isinstance(merge_rollup, dict) else None
+        merge_nodes = merge_contexts.get("nodes") if isinstance(merge_contexts, dict) else None
+        if isinstance(merge_nodes, list):
+            checks.extend(merge_nodes)
         workflow_events: dict[int, str] = {}
         for check in checks:
             if not isinstance(check, dict):
@@ -233,10 +263,62 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
         encoded_graphql = json.dumps(payload).encode("utf-8")
         pr_overrides = run_pr_overrides or {}
         sha_overrides = run_head_sha_overrides or {}
+        empty_pull_runs = run_pull_requests_empty or set()
+        pull_overrides = run_pull_requests_overrides or {}
+        branch_overrides = run_head_branch_overrides or {}
 
         def run(argv, **_kwargs):
             if argv[:3] == ["gh", "api", "graphql"]:
                 return 0, encoded_graphql, b""
+            exact_endpoint = next(
+                (
+                    part
+                    for part in argv
+                    if isinstance(part, str)
+                    and part.startswith("repos/")
+                    and "/actions/runs/" in part
+                    and part.rsplit("/", 1)[-1].isdigit()
+                ),
+                None,
+            )
+            if argv[:2] == ["gh", "api"] and exact_endpoint is not None:
+                prefix, run_id_text = exact_endpoint.rsplit("/", 1)
+                repo_slug = prefix[len("repos/") : -len("/actions/runs")]
+                run_id = int(run_id_text)
+                event = workflow_events.get(run_id)
+                if event is None:
+                    return 1, b"", b"unknown run"
+                default_run_head = merge if event == "merge_group" else head
+                run_head_sha = sha_overrides.get(run_id, default_run_head)
+                bound_pr = pr_overrides.get(run_id, pr)
+                if event == "merge_group":
+                    default_branch = f"gh-readonly-queue/{base_ref}/pr-{bound_pr}-{base}"
+                else:
+                    default_branch = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
+                bound_head_ref = branch_overrides.get(run_id, default_branch)
+                pull_requests: list[dict[str, object]] = []
+                if run_id in pull_overrides:
+                    pull_requests = deepcopy(pull_overrides[run_id])
+                elif run_id not in empty_pull_runs and event != "merge_group":
+                    pull_requests = [
+                        {
+                            "number": bound_pr,
+                            "head": {
+                                "ref": head_ref if bound_pr == pr else f"feature/pr-{bound_pr}",
+                                "sha": head,
+                            },
+                            "base": {"ref": base_ref, "sha": base},
+                        }
+                    ]
+                run_payload = {
+                    "id": run_id,
+                    "event": event,
+                    "head_sha": run_head_sha,
+                    "head_branch": bound_head_ref,
+                    "repository": {"full_name": repo_slug},
+                    "pull_requests": pull_requests,
+                }
+                return 0, json.dumps(run_payload).encode("utf-8"), b""
             endpoint = next(
                 (
                     part
@@ -259,11 +341,30 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 repo_slug = endpoint[len("repos/") : -len("/actions/runs")]
                 run_payloads: list[dict[str, object]] = []
                 for run_id, event in workflow_events.items():
-                    run_head_sha = sha_overrides.get(run_id, head)
+                    default_run_head = merge if event == "merge_group" else head
+                    run_head_sha = sha_overrides.get(run_id, default_run_head)
                     if queried_head_sha != run_head_sha:
                         continue
                     bound_pr = pr_overrides.get(run_id, pr)
-                    bound_head_ref = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
+                    if event == "merge_group":
+                        default_branch = f"gh-readonly-queue/{base_ref}/pr-{bound_pr}-{base}"
+                    else:
+                        default_branch = head_ref if bound_pr == pr else f"feature/pr-{bound_pr}"
+                    bound_head_ref = branch_overrides.get(run_id, default_branch)
+                    pull_requests: list[dict[str, object]] = []
+                    if run_id in pull_overrides:
+                        pull_requests = deepcopy(pull_overrides[run_id])
+                    elif run_id not in empty_pull_runs and event != "merge_group":
+                        pull_requests = [
+                            {
+                                "number": bound_pr,
+                                "head": {
+                                    "ref": head_ref if bound_pr == pr else f"feature/pr-{bound_pr}",
+                                    "sha": head,
+                                },
+                                "base": {"ref": base_ref, "sha": base},
+                            }
+                        ]
                     run_payloads.append(
                         {
                             "id": run_id,
@@ -271,13 +372,7 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                             "head_sha": run_head_sha,
                             "head_branch": bound_head_ref,
                             "repository": {"full_name": repo_slug},
-                            "pull_requests": [
-                                {
-                                    "number": bound_pr,
-                                    "head": {"ref": bound_head_ref, "sha": head},
-                                    "base": {"ref": base_ref, "sha": base},
-                                }
-                            ],
+                            "pull_requests": pull_requests,
                         }
                     )
                 encoded_runs = b"\n".join(
@@ -959,6 +1054,546 @@ class OperatorObligationEvidenceTests(unittest.TestCase):
                 "receipt",
                 {"reference": "grip:any:receipt:" + "a" * 64},
             )
+
+    def test_prepare_github_accepts_empty_terminal_pr_backlink_when_run_head_is_exact(self) -> None:
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        run_id = 32860034363
+        checks = [
+            self._github_v2_workflow_check(
+                database_id=101,
+                name="validate",
+                started_at="2026-08-25T14:31:01Z",
+                workflow_id=7001,
+                workflow_run_id=run_id,
+                event="pull_request",
+                run_number=1,
+            )
+        ]
+        payload = self._github_v2_payload(
+            head=head, base=base, merge=merge, checks=checks
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=943,
+                run_pull_requests_empty={run_id},
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 943}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith("checks=1/1-effective-success")
+        )
+
+    def test_prepare_github_uses_exact_merge_group_checks_for_merge_queue(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        head_checks = [
+            self._github_v2_external_check(
+                database_id=201,
+                name="CodeQL",
+                started_at="2026-08-25T14:30:01Z",
+            )
+        ]
+        merge_checks = [
+            self._github_v2_workflow_check(
+                database_id=301,
+                name="validate (3.10)",
+                started_at="2026-08-25T14:40:01Z",
+                workflow_id=8001,
+                workflow_name="validate",
+                workflow_run_id=9001,
+                event="merge_group",
+                run_number=7,
+            ),
+            self._github_v2_workflow_check(
+                database_id=302,
+                name="validate (3.12)",
+                started_at="2026-08-25T14:40:02Z",
+                workflow_id=8001,
+                workflow_name="validate",
+                workflow_run_id=9001,
+                event="merge_group",
+                run_number=7,
+            ),
+        ]
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=head_checks,
+            merge_checks=merge_checks,
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=943),
+        ) as run_command:
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 943}
+            )
+            item = prepared["evidence"]
+            assert item is not None
+            observed = evidence._github_observation(item)
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertEqual(
+            f"github-pr-v2:{repo}#943@{head}:base={base}:merge={merge}:checks=2/2-effective-success",
+            item["reference"],
+        )
+        assert observed is not None
+        self.assertEqual("verified", observed["status"])
+        self.assertEqual(item["sha256"], observed["sha256"])
+        actions_calls = [
+            call
+            for call in run_command.call_args_list
+            if any(
+                isinstance(part, str) and part.endswith("/actions/runs/9001")
+                for part in call.args[0]
+            )
+        ]
+        self.assertEqual(2, len(actions_calls))
+        self.assertTrue(
+            all(
+                not any(
+                    isinstance(part, str) and part.startswith("head_sha=")
+                    for part in call.args[0]
+                )
+                for call in actions_calls
+            )
+        )
+
+    def test_prepare_github_uses_merge_group_checks_without_head_rollup(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        merge_run = 9041
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=341,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8041,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=7,
+                )
+            ],
+        )
+        del payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=948),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 948}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith(
+                "checks=1/1-effective-success"
+            )
+        )
+
+    def test_prepare_github_accepts_expected_pr_inside_batched_merge_group(self) -> None:
+        repo = "heimgewebe/grabowski"
+        pr = 949
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        merge_run = 9049
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=349,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8049,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=7,
+                )
+            ],
+        )
+        batch_pulls = [
+            {
+                "number": pr,
+                "head": {"ref": "feature/expected", "sha": head},
+                "base": {"ref": "main", "sha": base},
+            },
+            {
+                "number": 950,
+                "head": {"ref": "feature/peer", "sha": "4" * 40},
+                "base": {"ref": "main", "sha": base},
+            },
+        ]
+        payload["data"]["repository"]["pullRequest"]["headRefName"] = "feature/expected"
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=pr,
+                run_head_sha_overrides={merge_run: "6" * 40},
+                run_pull_requests_overrides={merge_run: batch_pulls},
+                run_head_branch_overrides={
+                    merge_run: f"gh-readonly-queue/main/pr-950-{base}"
+                },
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": pr}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith(
+                "checks=1/1-effective-success"
+            )
+        )
+
+    def test_prepare_github_accepts_empty_batched_merge_group_backlink_with_group_base_sha(self) -> None:
+        repo = "heimgewebe/grabowski"
+        pr = 950
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        group_base = "4" * 40
+        merge_run = 9052
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=354,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8052,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                )
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=pr,
+                run_head_branch_overrides={
+                    merge_run: f"gh-readonly-queue/main/pr-{pr}-{group_base}"
+                },
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": pr}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith(
+                "checks=1/1-effective-success"
+            )
+        )
+
+    def test_prepare_github_rejects_empty_merge_group_backlink_with_malformed_group_base(self) -> None:
+        repo = "heimgewebe/grabowski"
+        pr = 953
+        merge_run = 9053
+        payload = self._github_v2_payload(
+            head="1" * 40,
+            base="2" * 40,
+            merge="3" * 40,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=355,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8053,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                )
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=pr,
+                run_head_branch_overrides={
+                    merge_run: f"gh-readonly-queue/main/pr-{pr}-not-a-sha"
+                },
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": pr}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_rejects_mismatched_expected_pr_inside_batched_merge_group(self) -> None:
+        repo = "heimgewebe/grabowski"
+        pr = 951
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        merge_run = 9050
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=350,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8050,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                )
+            ],
+        )
+        payload["data"]["repository"]["pullRequest"]["headRefName"] = "feature/expected"
+        batch_pulls = [
+            {
+                "number": pr,
+                "head": {"ref": "feature/expected", "sha": "4" * 40},
+                "base": {"ref": "main", "sha": base},
+            },
+            {
+                "number": 952,
+                "head": {"ref": "feature/peer", "sha": "5" * 40},
+                "base": {"ref": "main", "sha": base},
+            },
+        ]
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=pr,
+                run_pull_requests_overrides={merge_run: batch_pulls},
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": pr}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_merge_queue_includes_successful_non_workflow_checks(self) -> None:
+        repo = "heimgewebe/grabowski"
+        head = "1" * 40
+        base = "2" * 40
+        merge = "3" * 40
+        merge_run = 9051
+        payload = self._github_v2_payload(
+            head=head,
+            base=base,
+            merge=merge,
+            checks=[
+                self._github_v2_external_check(
+                    database_id=351,
+                    name="head-codeql",
+                    started_at="2026-08-25T14:30:01Z",
+                )
+            ],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=352,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8051,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                ),
+                self._github_v2_external_check(
+                    database_id=353,
+                    name="external-security",
+                    started_at="2026-08-25T14:40:02Z",
+                ),
+                self._github_v2_status_context(
+                    node_id="SC_merge_gate",
+                    context="external-status",
+                    created_at="2026-08-25T14:40:03Z",
+                ),
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=946),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": repo, "pr": 946}
+            )
+
+        self.assertEqual("prepared", prepared["status"])
+        self.assertTrue(
+            prepared["evidence"]["reference"].endswith(
+                "checks=3/3-effective-success"
+            )
+        )
+
+    def test_prepare_github_merge_queue_non_workflow_failure_fails_closed(self) -> None:
+        merge_run = 9061
+        payload = self._github_v2_payload(
+            head="1" * 40,
+            base="2" * 40,
+            merge="3" * 40,
+            checks=[
+                self._github_v2_external_check(
+                    database_id=361,
+                    name="head-codeql",
+                    started_at="2026-08-25T14:30:01Z",
+                )
+            ],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=362,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8061,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=9,
+                ),
+                self._github_v2_external_check(
+                    database_id=363,
+                    name="external-security",
+                    started_at="2026-08-25T14:40:02Z",
+                    conclusion="FAILURE",
+                ),
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=947),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 947}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+        self.assertIsNone(prepared["evidence"])
+
+    def test_prepare_github_merge_queue_failed_check_fails_closed(self) -> None:
+        merge_run = 9101
+        payload = self._github_v2_payload(
+            head="1" * 40,
+            base="2" * 40,
+            merge="3" * 40,
+            checks=[
+                self._github_v2_external_check(
+                    database_id=401,
+                    name="CodeQL",
+                    started_at="2026-08-25T14:30:01Z",
+                )
+            ],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=402,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    conclusion="FAILURE",
+                    workflow_id=8101,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=8,
+                )
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(payload, pr=944),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 944}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_checks_not_all_successful", prepared["reason"])
+
+    def test_prepare_github_merge_queue_ref_drift_fails_closed(self) -> None:
+        merge_run = 9201
+        base = "2" * 40
+        payload = self._github_v2_payload(
+            head="1" * 40,
+            base=base,
+            merge="3" * 40,
+            checks=[
+                self._github_v2_external_check(
+                    database_id=501,
+                    name="CodeQL",
+                    started_at="2026-08-25T14:30:01Z",
+                )
+            ],
+            merge_checks=[
+                self._github_v2_workflow_check(
+                    database_id=502,
+                    name="validate",
+                    started_at="2026-08-25T14:40:01Z",
+                    workflow_id=8201,
+                    workflow_run_id=merge_run,
+                    event="merge_group",
+                    run_number=9,
+                )
+            ],
+        )
+        with patch.object(
+            evidence,
+            "_run_command",
+            side_effect=self._github_v2_command_side_effect(
+                payload,
+                pr=945,
+                run_head_branch_overrides={
+                    merge_run: f"gh-readonly-queue/main/pr-999-{base}"
+                },
+            ),
+        ):
+            prepared = evidence.prepare_evidence(
+                "merge", "github", {"repo": "heimgewebe/grabowski", "pr": 945}
+            )
+
+        self.assertEqual("mismatch", prepared["status"])
+        self.assertEqual("github_check_shape_invalid", prepared["reason"])
 
     def test_prepare_github_latest_effective_failure_fails_closed(self) -> None:
         checks = [
