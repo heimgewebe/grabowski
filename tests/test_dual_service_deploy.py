@@ -1869,7 +1869,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(11, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(12, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
@@ -1877,6 +1877,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "tools/grabowski_transport_ingress.py",
                 "systemd/grabowski-transport-ingress.service.example",
                 "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
+                "systemd/grabowski-operator.service.d/90-recovery-target.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
                 "systemd/grabowski-operator-watchdog.timer.example",
                 "systemd/grabowski-tunnel-watchdog.service.example",
@@ -1924,6 +1925,28 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         self.assertTrue(asset.reloads_systemd)
         self.assertIsNone(asset.unit)
         self.assertEqual(dual.TUNNEL_OPERATOR_DEPENDENCY_PATH, asset.target)
+
+    def test_recovery_target_dropin_is_versioned_and_reload_bound(self) -> None:
+        asset = next(
+            item
+            for item in dual.WATCHDOG_HOST_ASSETS
+            if item.source == dual.OPERATOR_RECOVERY_TARGET_RELATIVE
+        )
+        self.assertTrue(asset.reloads_systemd)
+        self.assertIsNone(asset.unit)
+        self.assertEqual(dual.OPERATOR_RECOVERY_TARGET_PATH, asset.target)
+        self.assertEqual("90-recovery-target.conf", asset.target.name)
+        content = (ROOT / dual.OPERATOR_RECOVERY_TARGET_RELATIVE).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "Environment=GRABOWSKI_SERVER_RECOVERY_TARGET="
+            "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc",
+            content,
+        )
+        self.assertIn(
+            "UnsetEnvironment=GRABOWSKI_SERVER_RECOVERY_HOST", content
+        )
 
     def dependency_bytes(self) -> bytes:
         return (ROOT / dual.TUNNEL_OPERATOR_DEPENDENCY_RELATIVE).read_bytes()
