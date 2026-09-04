@@ -117,22 +117,41 @@ def _load_gateway_policy(path: Path, connector_id: str) -> dict[str, Any]:
     return policy
 
 
-def _external_client_authenticated(headers: Any, token: str) -> bool:
-    candidates: list[str] = []
+def _header_values(headers: Any, name: str) -> list[str] | None:
     try:
-        authorization = headers.get("authorization")
-        api_key = headers.get("x-api-key")
+        getlist = getattr(headers, "getlist", None)
+        if callable(getlist):
+            values = getlist(name)
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values
+            ):
+                return None
+            return values
+        value = headers.get(name)
     except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if value is None:
+        return []
+    return [value] if isinstance(value, str) else None
+
+
+def _external_client_authenticated(headers: Any, token: str) -> bool:
+    authorization_values = _header_values(headers, "authorization")
+    api_key_values = _header_values(headers, "x-api-key")
+    if authorization_values is None or api_key_values is None:
         return False
-    if isinstance(authorization, str):
-        scheme, separator, credential = authorization.partition(" ")
-        if separator and scheme.casefold() == "bearer" and credential:
-            candidates.append(credential)
-    if isinstance(api_key, str):
-        candidates.append(api_key)
-    if len(candidates) != 1:
+    if len(authorization_values) + len(api_key_values) != 1:
         return False
-    return hmac.compare_digest(candidates[0], token)
+    if authorization_values:
+        scheme, separator, credential = authorization_values[0].partition(" ")
+        if not separator or scheme.casefold() != "bearer" or not credential:
+            return False
+        candidate = credential
+    else:
+        candidate = api_key_values[0]
+        if not candidate:
+            return False
+    return hmac.compare_digest(candidate, token)
 
 
 def _forward_headers(request: Any, internal_token: str) -> dict[str, str]:

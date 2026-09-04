@@ -25,6 +25,17 @@ class _Headers(dict[str, str]):
     pass
 
 
+class _MultiHeaders(_Headers):
+    def __init__(self, values: dict[str, list[str]]) -> None:
+        super().__init__(
+            {name: items[0] for name, items in values.items() if items}
+        )
+        self._values = values
+
+    def getlist(self, name: str) -> list[str]:
+        return list(self._values.get(name, []))
+
+
 class ExternalConnectorGatewayTests(unittest.TestCase):
     EXTERNAL = "E" * 43
     INTERNAL = "I" * 43
@@ -39,6 +50,29 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
                 self.assertTrue(
                     gateway._external_client_authenticated(headers, self.EXTERNAL)
                 )
+
+    def test_duplicate_auth_headers_are_rejected(self) -> None:
+        self.assertFalse(
+            gateway._external_client_authenticated(
+                _MultiHeaders(
+                    {
+                        "authorization": [
+                            f"Bearer {self.EXTERNAL}",
+                            f"Bearer {'X' * 43}",
+                        ]
+                    }
+                ),
+                self.EXTERNAL,
+            )
+        )
+        self.assertFalse(
+            gateway._external_client_authenticated(
+                _MultiHeaders(
+                    {"x-api-key": [self.EXTERNAL, self.EXTERNAL]}
+                ),
+                self.EXTERNAL,
+            )
+        )
 
     def test_api_key_auth_is_accepted(self) -> None:
         headers = _Headers({"x-api-key": self.EXTERNAL})
