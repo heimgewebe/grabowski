@@ -3277,6 +3277,10 @@
         "source": "src/grabowski_git_preimage.py"
       },
       {
+        "module": "grabowski_physical_checkout",
+        "source": "src/grabowski_physical_checkout.py"
+      },
+      {
         "module": "grabowski_self_deploy",
         "source": "src/grabowski_self_deploy.py"
       },
@@ -3606,7 +3610,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "2ac459a3206001f36f9a5bc5051d98ccc1ed8ec1a3e61de47c5403fe5f215dd8"
+      "sha256": "d9d1a1077ce221cc8879c1a15da4fccd1ed75c356832251964d9477591e347d8"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3696,6 +3700,7 @@
       "src/grabowski_operator_optimization.py": "6e21534f87f9646f957c40c7607554b7f54b165b47516170f09fdc9314cd1dbf",
       "src/grabowski_operator_relay.py": "24a9187ef0f7f858a21eb9a7a0bb808b01b8b66b2943be8f9ce2845940916ca5",
       "src/grabowski_operator_routing_shadow_capture.py": "127306dc8dce2a9abf62b128a03a5e7936d1ad7e0838793549e3142d4d9b4f43",
+      "src/grabowski_physical_checkout.py": "bb1b926b61d02b0d690b8e62de5afbceb3b12a5c1714406a6e218ca1fa6527c4",
       "src/grabowski_pr_diff.py": "cf6194a892b34f8f20ddafd3b293a76db57d73dbe6ec6e5324d2fdd39ce7f242",
       "src/grabowski_private_io.py": "6250c583bdc1614a6265123604161d3668587191b94932faf2912b03140e3d6f",
       "src/grabowski_privileged.py": "70b7c434b60f3dc7a5f08f650f21db9f598a0b2fa9747d7679f396b00a47a7eb",

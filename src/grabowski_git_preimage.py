@@ -9,6 +9,7 @@ import subprocess
 from typing import Any, Callable
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_physical_checkout as physical_checkout
 
 
 def _frame(digest: Any, tag: bytes, payload: bytes = b"") -> None:
@@ -182,12 +183,20 @@ def _tracked_worktree_sha256(repo: Path, index_bytes: bytes) -> str:
 
 def capture_branch_preimage(
     repo: Path,
-    probe: Callable[[list[str]], subprocess.CompletedProcess[bytes]],
+    probe: Callable[[Path, list[str]], subprocess.CompletedProcess[bytes]],
     *,
     require_attached: bool = True,
 ) -> dict[str, Any]:
-    """Build one exact branch/index/raw-worktree CAS preimage from safe observations."""
-    branch_probe = probe(["symbolic-ref", "--quiet", "--short", "HEAD"])
+    """Build one exact branch/index/raw-worktree CAS preimage from safe observations.
+
+    Physical identity brackets the capture and detects persistent checkout replacement.
+    The injected Git probe is caller-owned and is not descriptor-pinned against a
+    transient same-UID swap-and-restore race during an individual subprocess probe.
+    """
+    requested_repo = Path(os.path.abspath(os.fspath(repo)))
+    physical_before = physical_checkout.capture_physical_checkout_identity(requested_repo)
+    repo = Path(physical_before["root"]["path"])
+    branch_probe = probe(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"])
     branch: str | None = None
     if branch_probe.returncode == 0:
         branch = branch_probe.stdout.decode("utf-8", errors="strict").strip()
@@ -198,7 +207,7 @@ def capture_branch_preimage(
     if require_attached and branch is None:
         raise PermissionError("Local branch mutation requires an attached Git branch")
 
-    head_probe = probe(["rev-parse", "--verify", "--quiet", "HEAD"])
+    head_probe = probe(repo, ["rev-parse", "--verify", "--quiet", "HEAD"])
     head: str | None
     head_state: str
     if head_probe.returncode == 0:
@@ -212,7 +221,7 @@ def capture_branch_preimage(
     else:
         raise RuntimeError("Git HEAD observation failed")
 
-    index_probe = probe(["ls-files", "--stage", "-z"])
+    index_probe = probe(repo, ["ls-files", "--stage", "-z"])
     if index_probe.returncode != 0:
         raise RuntimeError("Git index observation failed")
     index_sha256 = hashlib.sha256(index_probe.stdout).hexdigest()
@@ -220,7 +229,7 @@ def capture_branch_preimage(
 
     operation_refs: dict[str, str] = {}
     for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
-        ref_probe = probe(["rev-parse", "--verify", "--quiet", name])
+        ref_probe = probe(repo, ["rev-parse", "--verify", "--quiet", name])
         if ref_probe.returncode == 0:
             value = ref_probe.stdout.decode("ascii", errors="strict").strip()
             if value:
@@ -228,9 +237,17 @@ def capture_branch_preimage(
         elif ref_probe.returncode != 1:
             raise RuntimeError(f"Git operation-state observation failed: {name}")
 
+    try:
+        physical_checkout.verify_physical_checkout_identity(physical_before)
+    except physical_checkout.PhysicalCheckoutIdentityError as exc:
+        raise physical_checkout.PhysicalCheckoutIdentityError(
+            "physical checkout identity changed during preimage capture"
+        ) from exc
+
     material: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": str(repo),
+        "physical_checkout": physical_before,
         "branch": branch,
         "head": head,
         "head_state": head_state,

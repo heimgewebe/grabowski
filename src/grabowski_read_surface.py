@@ -1994,7 +1994,7 @@ def grabowski_git_status(
             "kind": "grabowski_git_branch_preimage",
             **grabowski_git_preimage.capture_branch_preimage(
                 repository,
-                lambda arguments: _git_preimage_probe(repository, arguments),
+                lambda checkout_root, arguments: _git_preimage_probe(checkout_root, arguments),
             ),
         }
     return result
