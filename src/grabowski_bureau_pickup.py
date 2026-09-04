@@ -80,6 +80,7 @@ TERMINAL_EXECUTION_STATES = frozenset({"succeeded", "failed", "cancelled", "orph
 EXECUTION_HEARTBEAT_MAX_AGE_SECONDS = 900
 EXTERNAL_BINDING_FIELDS = ("external_system", "external_id", "external_state")
 ACTIVE_EXTERNAL_STATES = frozenset({"queued", "running", "succeeded"})
+BOUND_ACTIVITY_SUCCESSFUL_EXTERNAL_STATES = frozenset({"running", "succeeded"})
 ORPHAN_RECONCILE_ERROR = "orphan-reconcile:stale-or-unbound-execution"
 ORPHAN_RESUME_ERROR = "stale worker without external executor"
 REGISTRY_BINDING_RECOVERY_KIND = "grabowski_bureau_pickup_registry_binding_recovery"
@@ -4998,6 +4999,7 @@ def _validate_lease_repair_activity_status(
         "source",
         "outcome",
         "activity",
+        "evidence",
         "heartbeat_at",
     }
     expected_event_binding = {
@@ -5038,6 +5040,90 @@ def _validate_lease_repair_activity_status(
                 "run_id": intent["run_id"],
                 "activity_id": activity_id,
                 "mismatches": activity_mismatches,
+            },
+        )
+    evidence = bound_activity["evidence"]
+    evidence_error: str | None = None
+    evidence_mismatches: dict[str, Any] = {}
+    if not isinstance(evidence, dict):
+        evidence_error = "evidence-not-object"
+    elif external["external_unbound"]:
+        expected_evidence = {
+            "source": "exact-run-binding",
+            "binding_status": "explicitly-unbound",
+        }
+        if evidence != expected_evidence:
+            evidence_error = "unbound-evidence-mismatch"
+            evidence_mismatches = {
+                key: {"expected": value, "observed": evidence.get(key)}
+                for key, value in expected_evidence.items()
+                if evidence.get(key) != value
+            }
+            if set(evidence) != set(expected_evidence):
+                evidence_mismatches["fields"] = {
+                    "expected": sorted(expected_evidence),
+                    "observed": sorted(evidence),
+                }
+    else:
+        expected_evidence_keys = {
+            "source",
+            "external_system",
+            "external_id",
+            "observed_state",
+            "observed_at",
+        }
+        if set(evidence) != expected_evidence_keys:
+            evidence_error = "bound-evidence-fields-mismatch"
+            evidence_mismatches["fields"] = {
+                "expected": sorted(expected_evidence_keys),
+                "observed": sorted(evidence),
+            }
+        expected_evidence_binding = {
+            "source": "adapter.observe",
+            "external_system": external["external_system"],
+            "external_id": external["external_id"],
+        }
+        binding_mismatches = {
+            key: {"expected": value, "observed": evidence.get(key)}
+            for key, value in expected_evidence_binding.items()
+            if evidence.get(key) != value
+        }
+        if binding_mismatches:
+            evidence_error = evidence_error or "bound-evidence-binding-mismatch"
+            evidence_mismatches.update(binding_mismatches)
+        observed_state = evidence.get("observed_state")
+        if observed_state not in BOUND_ACTIVITY_SUCCESSFUL_EXTERNAL_STATES:
+            evidence_error = evidence_error or "bound-evidence-state-invalid"
+            evidence_mismatches["observed_state"] = {
+                "expected": sorted(BOUND_ACTIVITY_SUCCESSFUL_EXTERNAL_STATES),
+                "observed": observed_state,
+            }
+        observed_at = evidence.get("observed_at")
+        _, observed_at_parse_error = _parse_utc_timestamp(observed_at)
+        if (
+            observed_at_parse_error is not None
+            or not isinstance(observed_at, str)
+            or observed_at != observed_at.strip()
+        ):
+            evidence_error = evidence_error or "bound-evidence-observed-at-invalid"
+            evidence_mismatches["observed_at"] = {
+                "expected": "valid trimmed UTC timestamp",
+                "observed": observed_at,
+            }
+        elif observed_at == external["external_observed_at"]:
+            evidence_error = evidence_error or "bound-evidence-observed-at-stale"
+            evidence_mismatches["observed_at"] = {
+                "expected": "fresh timestamp distinct from external_observed_at",
+                "observed": observed_at,
+            }
+    if evidence_error is not None:
+        raise BureauPickupError(
+            "existing-assignment-lease-repair-heartbeat-readback-conflict",
+            details={
+                "run_id": intent["run_id"],
+                "activity_id": activity_id,
+                "evidence_error": evidence_error,
+                "mismatches": evidence_mismatches,
             },
         )
     heartbeat_at = bound_activity["heartbeat_at"]

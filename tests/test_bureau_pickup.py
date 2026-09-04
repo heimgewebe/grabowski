@@ -535,6 +535,26 @@ class BureauPickupTests(unittest.TestCase):
     ):
         bound_activity = None
         if status == "recorded":
+            if external["external_unbound"]:
+                evidence = {
+                    "source": "exact-run-binding",
+                    "binding_status": "explicitly-unbound",
+                }
+            else:
+                observed_at = "2026-07-24T12:59:59Z"
+                if observed_at == external["external_observed_at"]:
+                    observed_at = "2026-07-24T13:00:00Z"
+                evidence = {
+                    "source": "adapter.observe",
+                    "external_system": external["external_system"],
+                    "external_id": external["external_id"],
+                    "observed_state": (
+                        external["external_state"]
+                        if external["external_state"] in {"running", "succeeded"}
+                        else "running"
+                    ),
+                    "observed_at": observed_at,
+                }
             bound_activity = {
                 "kind": "bureau.bound_activity_heartbeat",
                 "source": "bound-activity",
@@ -542,6 +562,7 @@ class BureauPickupTests(unittest.TestCase):
                 "activity": pickup._bound_activity_binding(
                     intent, journal_identity, external, activity_id
                 ),
+                "evidence": evidence,
                 "heartbeat_at": self.utc_heartbeat(),
             }
         return {
@@ -7108,6 +7129,8 @@ class BureauPickupTests(unittest.TestCase):
             "wrapper-run-drift",
             "recorded-null-payload",
             "event-source-drift",
+            "event-evidence-missing",
+            "event-evidence-source-drift",
             "event-heartbeat-malformed",
             "activity-worker-drift",
         )
@@ -7129,6 +7152,10 @@ class BureauPickupTests(unittest.TestCase):
                     status["bound_activity"] = None
                 elif case == "event-source-drift":
                     status["bound_activity"]["source"] = "heartbeat"
+                elif case == "event-evidence-missing":
+                    del status["bound_activity"]["evidence"]
+                elif case == "event-evidence-source-drift":
+                    status["bound_activity"]["evidence"]["source"] = "adapter.observe"
                 elif case == "event-heartbeat-malformed":
                     status["bound_activity"]["heartbeat_at"] = "not-a-timestamp"
                 else:
@@ -7169,6 +7196,84 @@ class BureauPickupTests(unittest.TestCase):
                         "heartbeat" in call.args[0]
                         for call in invoke.call_args_list
                     ),
+                )
+
+    def test_bound_activity_readback_requires_fresh_canonical_adapter_evidence(self) -> None:
+        (
+            intent,
+            request,
+            acquisition,
+            run_dir,
+            _blocking,
+            _original,
+            _key,
+        ) = self._repair_fixture(
+            include_heartbeat=True,
+            external={
+                "external_system": "test-system",
+                "external_id": "job-123",
+                "external_state": "running",
+                "external_observed_at": "2026-07-24T12:00:00Z",
+            },
+        )
+        del request
+        journal_identity = pickup._journal_run_identity(run_dir, intent)
+        external = {
+            "external_unbound": False,
+            "external_system": "test-system",
+            "external_id": "job-123",
+            "external_state": "running",
+            "external_observed_at": "2026-07-24T12:00:00Z",
+        }
+        receipt = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup_lease_reacquire",
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "resource_keys": intent["required_resource_keys"],
+        }
+        receipt["receipt_sha256"] = pickup._sha256(receipt)
+        receipt = pickup._validated_lease_repair_receipt(
+            run_dir, "lease-reacquire.json", receipt
+        )
+        activity_id = pickup._lease_repair_activity_id(receipt["receipt_sha256"])
+        canonical = self._matching_activity_readback(
+            intent, journal_identity, external, activity_id
+        )
+        accepted = pickup._validate_lease_repair_activity_status(
+            canonical,
+            intent,
+            acquisition,
+            journal_identity,
+            external,
+            activity_id,
+            action="repair",
+        )
+        self.assertIs(accepted, canonical)
+
+        for field, value in (
+            ("observed_state", "queued"),
+            ("observed_at", external["external_observed_at"]),
+            ("external_id", "other-job"),
+        ):
+            with self.subTest(field=field):
+                conflicting = self._matching_activity_readback(
+                    intent, journal_identity, external, activity_id
+                )
+                conflicting["bound_activity"]["bound_activity"]["evidence"][field] = value
+                with self.assertRaises(pickup.BureauPickupError) as raised:
+                    pickup._validate_lease_repair_activity_status(
+                        conflicting,
+                        intent,
+                        acquisition,
+                        journal_identity,
+                        external,
+                        activity_id,
+                        action="repair",
+                    )
+                self.assertEqual(
+                    "existing-assignment-lease-repair-heartbeat-readback-conflict",
+                    raised.exception.code,
                 )
 
     def test_ambiguous_heartbeat_missing_readback_blocks_without_retry(self) -> None:
