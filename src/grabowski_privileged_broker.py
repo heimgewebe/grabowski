@@ -11,7 +11,7 @@ import tempfile
 import time
 from typing import Any
 
-from grabowski_blockade_authority import resolve_lifecycle
+from grabowski_blockade_authority import read_authority_marker, resolve_lifecycle
 import grabowski_command_identity as command_identity
 
 MAX_INPUT_BYTES = 64 * 1024
@@ -635,6 +635,52 @@ def _atomic_write_recovery_record(
     return hashlib.sha256(raw).hexdigest()
 
 
+def _recovery_publication_kill_switch_binding(path: Path) -> dict[str, Any]:
+    if not os.path.lexists(path):
+        return {"state": "clear"}
+    try:
+        snapshot = read_authority_marker(path, authority_uid=0)
+    except Exception as exc:
+        raise PermissionError("recovery marker publication is blocked by an unsafe kill-switch") from exc
+    record = snapshot.record
+    if record.source != "typed" or record.disarm_policy != "in_band":
+        raise PermissionError("recovery marker publication requires a typed in-band kill-switch")
+    return {
+        "state": "typed_in_band", "marker_file_sha256": snapshot.file_sha256,
+        "record_sha256": snapshot.record_sha256, "device": snapshot.device,
+        "inode": snapshot.inode, "blockade_id": record.blockade_id,
+        "posture": record.posture, "scope_kind": record.scope.kind,
+        "scope_value": record.scope.value,
+    }
+
+
+def _validated_recovery_publication_kill_switch_binding(value: Any) -> dict[str, Any]:
+    if value == {"state": "clear"}:
+        return {"state": "clear"}
+    required = {"state", "marker_file_sha256", "record_sha256", "device", "inode", "blockade_id", "posture", "scope_kind", "scope_value"}
+    if not isinstance(value, dict) or set(value) != required or value.get("state") != "typed_in_band":
+        raise ValueError("recovery publication kill-switch binding is invalid")
+    for key in ("marker_file_sha256", "record_sha256"):
+        digest = value.get(key)
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ValueError(f"recovery publication {key} is invalid")
+    for key in ("device", "inode"):
+        number = value.get(key)
+        if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+            raise ValueError(f"recovery publication {key} is invalid")
+    for key in ("blockade_id", "posture", "scope_kind", "scope_value"):
+        text = value.get(key)
+        if not isinstance(text, str) or not text or "\x00" in text:
+            raise ValueError(f"recovery publication {key} is invalid")
+    return dict(value)
+
+
+def _require_recovery_publication_kill_switch_binding(path: Path, *, expected: dict[str, Any]) -> None:
+    bound = _validated_recovery_publication_kill_switch_binding(expected)
+    if _recovery_publication_kill_switch_binding(path) != bound:
+        raise PermissionError("recovery publication kill-switch identity changed after authorization")
+
+
 def _resolve_recovery_marker_publish_action(
     candidate: dict[str, Any],
     reference: dict[str, Any],
@@ -668,7 +714,7 @@ def _resolve_recovery_marker_publish_action(
         if candidate.get("legacy_kill_switch_path") is not None
         else None
     )
-    _require_kill_switch_clear(kill_switch)
+    kill_switch_binding = _recovery_publication_kill_switch_binding(kill_switch)
     if legacy_switch is not None:
         _require_kill_switch_clear(legacy_switch)
     expected_uid = candidate["expected_source_uid"]
@@ -723,6 +769,8 @@ def _resolve_recovery_marker_publish_action(
         "max_recovery_age_seconds": max_age,
         "configured_target": configured_target,
         "kill_switch_path": str(kill_switch),
+        "kill_switch_binding": kill_switch_binding,
+        "legacy_kill_switch_path": (str(legacy_switch) if legacy_switch is not None else None),
         "require_root_owned_destination": require_root_destination,
     }
 
@@ -812,7 +860,14 @@ def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None
         raise ValueError("recovery marker execution contract is invalid")
     current = int(time.time()) if now is None else now
     kill_switch = Path(execution["kill_switch_path"])
-    _require_kill_switch_clear(kill_switch)
+    kill_switch_binding = _validated_recovery_publication_kill_switch_binding(execution.get("kill_switch_binding"))
+    legacy_switch_value = execution.get("legacy_kill_switch_path")
+    if legacy_switch_value is not None and not isinstance(legacy_switch_value, str):
+        raise ValueError("recovery publication legacy kill-switch path is invalid")
+    legacy_switch = Path(legacy_switch_value) if legacy_switch_value is not None else None
+    _require_recovery_publication_kill_switch_binding(kill_switch, expected=kill_switch_binding)
+    if legacy_switch is not None:
+        _require_kill_switch_clear(legacy_switch)
     destination = Path(execution["destination_path"])
     max_age = execution["max_recovery_age_seconds"]
     configured_target = execution["configured_target"]
@@ -839,7 +894,9 @@ def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None
             require_root_owned=require_root_destination,
         )
         os.fchmod(lock_fd, 0o600)
-        _require_kill_switch_clear(kill_switch)
+        _require_recovery_publication_kill_switch_binding(kill_switch, expected=kill_switch_binding)
+        if legacy_switch is not None:
+            _require_kill_switch_clear(legacy_switch)
 
         validated = _validated_recovery_source_for_execution(execution, now=current)
         source_sha = validated["source_record_sha256"]
@@ -880,7 +937,9 @@ def publish_recovery_marker(execution: dict[str, Any], *, now: int | None = None
                 else:
                     raise PermissionError("recovery generation collision is forbidden")
 
-        _require_kill_switch_clear(kill_switch)
+        _require_recovery_publication_kill_switch_binding(kill_switch, expected=kill_switch_binding)
+        if legacy_switch is not None:
+            _require_kill_switch_clear(legacy_switch)
         final_source = _validated_recovery_source_for_execution(execution, now=current)
         if final_source["source_record_sha256"] != source_sha:
             raise PermissionError("recovery source changed before canonical replace")
