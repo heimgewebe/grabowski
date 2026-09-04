@@ -6591,18 +6591,125 @@ def _run_is_terminal(run: Any) -> bool:
     state = run.get("state")
     return isinstance(state, str) and state in TERMINAL_EXECUTION_STATES
 
-def _read_orphan_pre_effect_coordination_digest(run_dir: Path) -> str | None:
-    path = run_dir / "orphan-pre-effect.json"
+def _orphan_pre_effect_entries(
+    run_dir: Path,
+) -> list[tuple[int, Path, dict[str, Any]]]:
+    primary = run_dir / "orphan-pre-effect.json"
+    paths = [
+        primary,
+        *sorted(run_dir.glob("orphan-pre-effect-retry-*.json")),
+    ]
+    entries: list[tuple[int, Path, dict[str, Any]]] = []
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            continue
+        payload = _read_bound_json(path, label="orphan-pre-effect")
+        if (
+            payload.get("schema_version") != SCHEMA_VERSION
+            or payload.get("kind") != "grabowski_bureau_pickup_orphan_pre_effect"
+        ):
+            raise BureauPickupError("orphan-reconcile-pre-effect-contract-invalid")
+        generation = payload.get("generation", 1 if path == primary else None)
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+        ):
+            raise BureauPickupError("orphan-reconcile-pre-effect-generation-invalid")
+        digest = payload.get("observed_coordination_sha256")
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise BureauPickupError("orphan-reconcile-pre-effect-digest-invalid")
+        if payload.get("expected_coordination_sha256") != digest:
+            raise BureauPickupError("orphan-reconcile-pre-effect-digest-binding-invalid")
+        if path == primary:
+            if generation != 1:
+                raise BureauPickupError("orphan-reconcile-pre-effect-generation-invalid")
+        elif (
+            generation < 2
+            or path.name != f"orphan-pre-effect-retry-{digest}.json"
+        ):
+            raise BureauPickupError("orphan-reconcile-pre-effect-path-binding-invalid")
+        entries.append((generation, path, payload))
+    entries.sort(key=lambda item: item[0])
+    generations = [generation for generation, _path, _payload in entries]
+    if generations != list(range(1, len(entries) + 1)):
+        raise BureauPickupError("orphan-reconcile-pre-effect-generation-conflict")
+    for index in range(1, len(entries)):
+        generation, _path, payload = entries[index]
+        prior_generation, prior_path, prior = entries[index - 1]
+        prior_digest = str(prior["observed_coordination_sha256"])
+        no_effect = _orphan_prior_failure_proves_no_effect(
+            run_dir,
+            observed_coordination_sha256=prior_digest,
+            generation=prior_generation,
+        )
+        if (
+            payload.get("supersedes_pre_effect_path") != prior_path.name
+            or payload.get("supersedes_pre_effect_sha256") != _sha256(prior)
+            or payload.get("prior_no_effect_status") != "stale-runtime-blocked"
+            or no_effect is None
+            or payload.get("prior_no_effect_evidence_sha256") != _sha256(no_effect)
+        ):
+            raise BureauPickupError(
+                "orphan-reconcile-pre-effect-supersession-invalid",
+                details={"generation": generation},
+            )
+    return entries
+
+def _read_orphan_pre_effect_coordination_digests(run_dir: Path) -> set[str]:
+    return {
+        str(payload["observed_coordination_sha256"])
+        for _generation, _path, payload in _orphan_pre_effect_entries(run_dir)
+    }
+
+def _orphan_fail_unknown_path(
+    run_dir: Path, *, observed_coordination_sha256: str, generation: int
+) -> Path:
+    if generation == 1:
+        return run_dir / "orphan-fail-unknown.json"
+    return run_dir / f"orphan-fail-unknown-retry-{observed_coordination_sha256}.json"
+
+def _orphan_prior_failure_proves_no_effect(
+    run_dir: Path, *, observed_coordination_sha256: str, generation: int
+) -> dict[str, Any] | None:
+    path = _orphan_fail_unknown_path(
+        run_dir,
+        observed_coordination_sha256=observed_coordination_sha256,
+        generation=generation,
+    )
     if not path.is_file() or path.is_symlink():
         return None
-    try:
-        payload = _read_bound_json(path, label="orphan-pre-effect")
-    except BureauPickupError:
+    payload = _read_bound_json(path, label="orphan-fail-unknown")
+    if payload.get("effect_started") not in {None, False}:
         return None
-    digest = payload.get("observed_coordination_sha256")
-    if isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None:
-        return digest
-    return None
+    if payload.get("ambiguity") not in {None, False}:
+        return None
+    if payload.get("status") != "stale-runtime-blocked":
+        return None
+    if payload.get("reason_codes") != ["release-registry-identity-mismatch"]:
+        return None
+    runtime_identity = payload.get("runtime_identity")
+    if (
+        not isinstance(runtime_identity, dict)
+        or runtime_identity.get("status") != "stale-runtime-blocked"
+    ):
+        return None
+    compatibility = runtime_identity.get("compatibility")
+    claim_root = runtime_identity.get("claim_root")
+    if (
+        not isinstance(compatibility, dict)
+        or compatibility.get("status") != "stale"
+        or compatibility.get("mutation_allowed") is not False
+    ):
+        return None
+    if (
+        not isinstance(claim_root, dict)
+        or claim_root.get("status") != "blocked"
+        or claim_root.get("mutation_conclusion_allowed") is not False
+        or claim_root.get("claim_authority_established") is not False
+    ):
+        return None
+    return payload
 
 def _write_orphan_pre_effect(
     run_dir: Path,
@@ -6610,20 +6717,97 @@ def _write_orphan_pre_effect(
     run_id: str,
     observed_coordination_sha256: str,
     normalized: dict[str, str],
-) -> None:
-    _write_bound_json(
-        run_dir / "orphan-pre-effect.json",
+) -> Path:
+    entries = _orphan_pre_effect_entries(run_dir)
+    for _generation, path, payload in entries:
+        if payload.get("observed_coordination_sha256") == observed_coordination_sha256:
+            if (
+                payload.get("run_id") != run_id
+                or payload.get("expected_registry_binding_sha256")
+                != normalized["expected_registry_binding_sha256"]
+                or payload.get("expected_lease_sha256")
+                != normalized["expected_lease_sha256"]
+            ):
+                raise BureauPickupError("orphan-reconcile-pre-effect-lineage-mismatch")
+            return path
+
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_orphan_pre_effect",
+        "run_id": run_id,
+        "observed_coordination_sha256": observed_coordination_sha256,
+        "expected_coordination_sha256": normalized["expected_coordination_sha256"],
+        "expected_registry_binding_sha256": normalized[
+            "expected_registry_binding_sha256"
+        ],
+        "expected_lease_sha256": normalized["expected_lease_sha256"],
+    }
+    if not entries:
+        path = run_dir / "orphan-pre-effect.json"
+        _write_bound_json(path, payload)
+        return path
+
+    generation, prior_path, prior = entries[-1]
+    if (
+        prior.get("run_id") != run_id
+        or prior.get("expected_registry_binding_sha256")
+        != normalized["expected_registry_binding_sha256"]
+        or prior.get("expected_lease_sha256") != normalized["expected_lease_sha256"]
+    ):
+        raise BureauPickupError("orphan-reconcile-pre-effect-lineage-mismatch")
+    prior_digest = str(prior["observed_coordination_sha256"])
+    no_effect = _orphan_prior_failure_proves_no_effect(
+        run_dir,
+        observed_coordination_sha256=prior_digest,
+        generation=generation,
+    )
+    if no_effect is None:
+        raise BureauPickupError(
+            "orphan-reconcile-pre-effect-retry-unproven",
+            details={
+                "prior_generation": generation,
+                "prior_coordination_sha256": prior_digest,
+                "effect_started": False,
+            },
+        )
+    next_generation = generation + 1
+    payload.update(
         {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "grabowski_bureau_pickup_orphan_pre_effect",
-            "run_id": run_id,
-            "observed_coordination_sha256": observed_coordination_sha256,
-            "expected_coordination_sha256": normalized["expected_coordination_sha256"],
-            "expected_registry_binding_sha256": normalized[
-                "expected_registry_binding_sha256"
-            ],
-            "expected_lease_sha256": normalized["expected_lease_sha256"],
-        },
+            "generation": next_generation,
+            "supersedes_pre_effect_sha256": _sha256(prior),
+            "supersedes_pre_effect_path": prior_path.name,
+            "prior_no_effect_evidence_sha256": _sha256(no_effect),
+            "prior_no_effect_status": "stale-runtime-blocked",
+        }
+    )
+    path = run_dir / f"orphan-pre-effect-retry-{observed_coordination_sha256}.json"
+    _write_bound_json(path, payload)
+    return path
+
+def _write_orphan_fail_unknown(
+    run_dir: Path,
+    *,
+    fail_result: dict[str, Any],
+    pre_effect_path: Path,
+    observed_coordination_sha256: str,
+) -> None:
+    generation = next(
+        (
+            entry_generation
+            for entry_generation, entry_path, _payload in _orphan_pre_effect_entries(run_dir)
+            if entry_path == pre_effect_path
+        ),
+        None,
+    )
+    if generation is None:
+        raise BureauPickupError("orphan-reconcile-pre-effect-path-unbound")
+    _write_bound_json(
+        _orphan_fail_unknown_path(
+            run_dir,
+            observed_coordination_sha256=observed_coordination_sha256,
+            generation=generation,
+        ),
+        fail_result,
     )
 
 def _assert_owner_leases_same_lineage_or_absent(
@@ -6826,7 +7010,7 @@ def grabowski_bureau_pickup_orphan_reconcile(
             )
         _assert_owner_leases_same_lineage_or_absent(acquisition)
         # Persist pre-effect digest before any fail mutation for later terminal CAS.
-        _write_orphan_pre_effect(
+        pre_effect_path = _write_orphan_pre_effect(
             run_dir,
             run_id=run_id,
             observed_coordination_sha256=observed_coordination_sha256,
@@ -6853,7 +7037,12 @@ def grabowski_bureau_pickup_orphan_reconcile(
                 "does_not_establish": _execution_binding_does_not_establish(),
             }
         if _adapter_outcome_unknown(fail_result, run_id=run_id):
-            _write_bound_json(run_dir / "orphan-fail-unknown.json", fail_result)
+            _write_orphan_fail_unknown(
+                run_dir,
+                fail_result=fail_result,
+                pre_effect_path=pre_effect_path,
+                observed_coordination_sha256=observed_coordination_sha256,
+            )
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "grabowski_bureau_pickup_orphan_reconcile",
@@ -6870,7 +7059,12 @@ def grabowski_bureau_pickup_orphan_reconcile(
             }
         if not (fail_result.get("run_id") == run_id and _run_is_terminal(fail_result)):
             # Authoritative fail must yield an explicit terminal state.
-            _write_bound_json(run_dir / "orphan-fail-unknown.json", fail_result)
+            _write_orphan_fail_unknown(
+                run_dir,
+                fail_result=fail_result,
+                pre_effect_path=pre_effect_path,
+                observed_coordination_sha256=observed_coordination_sha256,
+            )
             return {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "grabowski_bureau_pickup_orphan_reconcile",
@@ -6913,9 +7107,9 @@ def grabowski_bureau_pickup_orphan_reconcile(
                 },
             )
         allowed_coordination_digests = {observed_coordination_sha256}
-        pre_effect_digest = _read_orphan_pre_effect_coordination_digest(run_dir)
-        if pre_effect_digest is not None:
-            allowed_coordination_digests.add(pre_effect_digest)
+        allowed_coordination_digests.update(
+            _read_orphan_pre_effect_coordination_digests(run_dir)
+        )
         if (
             normalized["expected_coordination_sha256"]
             not in allowed_coordination_digests
