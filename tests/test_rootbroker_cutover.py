@@ -99,16 +99,34 @@ def _bound_action(name: str) -> dict[str, object]:
     return json.loads(json.dumps(example["actions"][name]))
 
 
-def _canonical_publisher() -> dict[str, object]:
+def _bridge_publisher() -> dict[str, object]:
     return _bound_action(cutover.PUBLISH_ACTION)
 
 
-def _lifecycle() -> dict[str, object]:
+def _bridge_lifecycle() -> dict[str, object]:
     return _bound_action(cutover.BLOCKADE_LIFECYCLE_ACTION)
 
 
-def _root_task_action() -> dict[str, object]:
+def _bridge_root_task_action() -> dict[str, object]:
     return _bound_action(cutover.ROOT_TASK_ACTION)
+
+
+def _canonical_publisher() -> dict[str, object]:
+    value = _bridge_publisher()
+    value["configured_target"] = cutover.CONFIGURED_TARGET
+    return value
+
+
+def _lifecycle() -> dict[str, object]:
+    value = _bridge_lifecycle()
+    value["recovery_gate"]["configured_target"] = cutover.CONFIGURED_TARGET
+    return value
+
+
+def _root_task_action() -> dict[str, object]:
+    value = _bridge_root_task_action()
+    value["start_gate"]["configured_target"] = cutover.CONFIGURED_TARGET
+    return value
 
 
 def _bootstrap_recovery_action() -> dict[str, object]:
@@ -1185,6 +1203,51 @@ class RootbrokerCutoverTests(unittest.TestCase):
                     f"{HEAD}:config/privileged-actions.example.json",
                 ),
                 runner.calls,
+            )
+
+    def test_automatic_repository_load_accepts_only_exact_legacy_bridge_target(self) -> None:
+        bridge_text = (ROOT / "config" / "privileged-actions.example.json").read_text(
+            encoding="utf-8"
+        )
+        runner = FakeRunner(
+            blobs={"config/privileged-actions.example.json": bridge_text}
+        )
+        repository = ROOT
+
+        publisher = cutover._publisher_from_repository(
+            repository, expected_head=HEAD, runner=runner, automatic=True
+        )
+        lifecycle = cutover._lifecycle_from_repository(
+            repository, expected_head=HEAD, runner=runner, automatic=True
+        )
+        root_task = cutover._root_task_action_from_repository(
+            repository, expected_head=HEAD, runner=runner, automatic=True
+        )
+        self.assertEqual(
+            publisher["configured_target"], cutover.LEGACY_CONFIGURED_TARGET
+        )
+        self.assertEqual(
+            lifecycle["recovery_gate"]["configured_target"],
+            cutover.LEGACY_CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            root_task["start_gate"]["configured_target"],
+            cutover.LEGACY_CONFIGURED_TARGET,
+        )
+        merged, _evidence = cutover.merge_privileged_config(
+            _installed_config(),
+            publisher=publisher,
+            lifecycle=lifecycle,
+            root_task=root_task,
+            allow_controlled_updates=True,
+        )
+        self.assertEqual(
+            merged["actions"][cutover.POWER_ACTION]["gate"]["configured_target"],
+            cutover.LEGACY_CONFIGURED_TARGET,
+        )
+        with self.assertRaisesRegex(cutover.CutoverError, "differs from host contract"):
+            cutover._publisher_from_repository(
+                repository, expected_head=HEAD, runner=runner, automatic=False
             )
 
     def _layout(self, root: Path) -> dict[str, object]:
