@@ -57,9 +57,6 @@ class BlockadeStorePermissionTests(unittest.TestCase):
                     pass
                 else:
                     os.close(descriptor)
-                    self.skipTest(
-                        "test process can bypass execute-only directory read permissions"
-                    )
 
                 snapshot = store.read_blockade_marker(
                     marker,

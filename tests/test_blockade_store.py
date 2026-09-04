@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import errno
 import json
 import os
 from pathlib import Path
@@ -185,11 +186,12 @@ class BlockadeStoreTests(unittest.TestCase):
         linked_parent = self.root / "linked-parent"
         linked_parent.symlink_to(actual_parent, target_is_directory=True)
         linked_marker = linked_parent / marker.name
-        with self.assertRaises(OSError):
+        with self.assertRaises(OSError) as direct_error:
             read_blockade_marker(
                 linked_marker,
                 expected_marker_path=linked_marker,
             )
+        self.assertIn(direct_error.exception.errno, {errno.ENOTDIR, errno.ELOOP})
 
         actual_outer = self.root / "actual-outer"
         actual_inner = actual_outer / "inner"
@@ -205,11 +207,12 @@ class BlockadeStoreTests(unittest.TestCase):
         linked_outer = self.root / "linked-outer"
         linked_outer.symlink_to(actual_outer, target_is_directory=True)
         linked_nested_marker = linked_outer / "inner" / nested_marker.name
-        with self.assertRaises(OSError):
+        with self.assertRaises(OSError) as nested_error:
             read_blockade_marker(
                 linked_nested_marker,
                 expected_marker_path=linked_nested_marker,
             )
+        self.assertIn(nested_error.exception.errno, {errno.ENOTDIR, errno.ELOOP})
 
     def test_exact_engage_rollback_removes_only_matching_marker(self) -> None:
         receipt = self.engage()
