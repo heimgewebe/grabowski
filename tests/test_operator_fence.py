@@ -504,12 +504,12 @@ class OperatorFenceStoreTests(unittest.TestCase):
         self.assertEqual(self.database.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.database.parent.stat().st_mode & 0o777, 0o700)
 
-    def test_fencing_token_contains_persistent_instance_identity(self) -> None:
+    def test_fencing_mark_contains_persistent_instance_identity(self) -> None:
         initial = self.store.status()
         grant = self.acquire_primary()
         self.assertEqual(len(initial["instance_id"]), 32)
         self.assertEqual(grant["instance_id"], initial["instance_id"])
-        self.assertEqual(grant["fencing_token"]["instance_id"], initial["instance_id"])
+        self.assertEqual(grant["fencing_mark"]["instance_id"], initial["instance_id"])
         reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
         self.assertEqual(reopened.status()["instance_id"], initial["instance_id"])
 
@@ -580,10 +580,10 @@ class OperatorFenceStoreTests(unittest.TestCase):
         reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
         self.assertEqual(reopened.status()["last_event"]["evidence_sha256"], EVIDENCE_A)
 
-    def test_fencing_token_validator_rejects_stale_generation_and_tamper(self) -> None:
+    def test_fencing_mark_validator_rejects_stale_generation_and_tamper(self) -> None:
         grant = self.acquire_primary()
-        token = grant["fencing_token"]
-        validated = self.store.validate_fencing_token(
+        token = grant["fencing_mark"]
+        validated = self.store.validate_fencing_mark(
             token,
             expected_instance_id=grant["instance_id"],
             minimum_generation_seen=1,
@@ -592,19 +592,37 @@ class OperatorFenceStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(
             fence.OperatorFenceDenied, "generation_rollback_detected"
         ):
-            self.store.validate_fencing_token(
+            self.store.validate_fencing_mark(
                 token,
                 expected_instance_id=grant["instance_id"],
                 minimum_generation_seen=2,
             )
         tampered = dict(token)
-        tampered["token_sha256"] = "0" * 64
-        with self.assertRaisesRegex(fence.OperatorFenceDenied, "invalid_fencing_token"):
-            self.store.validate_fencing_token(
+        tampered["mark_sha256"] = "0" * 64
+        with self.assertRaisesRegex(fence.OperatorFenceDenied, "invalid_fencing_mark"):
+            self.store.validate_fencing_mark(
                 tampered,
                 expected_instance_id=grant["instance_id"],
                 minimum_generation_seen=1,
             )
+
+    def test_fencing_mark_is_not_an_authentication_credential(self) -> None:
+        grant = self.acquire_primary()
+        instance = grant["instance_id"]
+        forged_generation = 2**40
+        material = {"instance_id": instance, "generation": forged_generation}
+        forged = {
+            **material,
+            "mark_sha256": fence._sha256_json(material),
+            "does_not_establish": list(fence.FENCING_MARK_DOES_NOT_ESTABLISH),
+        }
+        validated = self.store.validate_fencing_mark(
+            forged,
+            expected_instance_id=instance,
+            minimum_generation_seen=1,
+        )
+        self.assertEqual(validated["generation"], forged_generation)
+        self.assertIn("coordinator_authenticity", validated["does_not_establish"])
 
     def test_forward_clock_jump_cannot_authorize_stale_primary_effect(self) -> None:
         self.acquire_primary(lease_seconds=30)
@@ -718,6 +736,43 @@ class OperatorFenceStoreTests(unittest.TestCase):
                 reason="failback", lease_seconds=30,
                 expected_instance_id=instance, minimum_generation_seen=2,
             )
+        rollback_calls = [
+            lambda: reopened.renew(
+                owner_id="grabowski", session_id="primary-session", generation=1,
+                lease_seconds=30, expected_instance_id=instance,
+                minimum_generation_seen=2,
+            ),
+            lambda: reopened.begin_effect(
+                owner_id="grabowski", session_id="primary-session", generation=1,
+                operation_id="rollback-begin", operation_name="grabowski_git",
+                intent_sha256=INTENT_A, expected_instance_id=instance,
+                minimum_generation_seen=2,
+            ),
+            lambda: reopened.settle_effect(
+                owner_id="grabowski", session_id="primary-session", generation=1,
+                operation_id="rollback-settle", operation_name="grabowski_git",
+                intent_sha256=INTENT_A, outcome="effect_applied",
+                evidence_sha256=EVIDENCE_A, expected_instance_id=instance,
+                minimum_generation_seen=2,
+            ),
+            lambda: reopened.reconcile_effect(
+                reconciler_id="der-kleine-maulwurf", generation=1,
+                operation_id="rollback-reconcile", operation_name="grabowski_git",
+                intent_sha256=INTENT_A, outcome="effect_applied",
+                evidence_sha256=EVIDENCE_B, expected_instance_id=instance,
+                minimum_generation_seen=2,
+            ),
+            lambda: reopened.release(
+                owner_id="grabowski", session_id="primary-session", generation=1,
+                expected_instance_id=instance, minimum_generation_seen=2,
+            ),
+        ]
+        for call in rollback_calls:
+            with self.assertRaisesRegex(
+                fence.OperatorFenceDenied, "generation_rollback_detected"
+            ):
+                call()
+        self.assertEqual(reopened.status()["generation"], 1)
 
     def test_stale_fence_instance_is_denied(self) -> None:
         self.acquire_primary()

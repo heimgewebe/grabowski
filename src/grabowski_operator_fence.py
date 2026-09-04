@@ -34,6 +34,11 @@ MAX_LEASE_SECONDS = 600
 SESSION_KEY_BYTES = 32
 MAX_ANCHOR_BYTES = 4096
 SQLITE_BUSY_TIMEOUT_MS = 1000
+FENCING_MARK_DOES_NOT_ESTABLISH = (
+    "coordinator_authenticity",
+    "transport_authenticity",
+    "caller_authorization",
+)
 INSTANCE_RE = re.compile(r"[0-9a-f]{32}\Z")
 TERMINAL_OUTCOMES = frozenset({"effect_applied", "effect_not_applied"})
 EFFECT_OUTCOMES = frozenset({*TERMINAL_OUTCOMES, "outcome_unknown"})
@@ -661,9 +666,14 @@ class OperatorFenceStore:
         }
 
     @staticmethod
-    def _fencing_token(instance_id: str, generation: int) -> dict[str, Any]:
+    def _fencing_mark(instance_id: str, generation: int) -> dict[str, Any]:
+        """Return a checksum-bound mark, never an authentication credential."""
         material = {"instance_id": instance_id, "generation": generation}
-        return {**material, "token_sha256": _sha256_json(material)}
+        return {
+            **material,
+            "mark_sha256": _sha256_json(material),
+            "does_not_establish": list(FENCING_MARK_DOES_NOT_ESTABLISH),
+        }
 
     @staticmethod
     def _require_instance(
@@ -674,6 +684,14 @@ class OperatorFenceStore:
         expected = _instance_id(expected_instance_id, "expected_instance_id")
         if str(meta["instance_id"]) != expected:
             raise OperatorFenceDenied("stale_fence_instance")
+
+    @staticmethod
+    def _require_minimum_generation(
+        row: sqlite3.Row, minimum_generation_seen: int
+    ) -> None:
+        minimum_seen = _minimum_generation(minimum_generation_seen)
+        if int(row["generation"]) < minimum_seen:
+            raise OperatorFenceDenied("generation_rollback_detected")
 
     def _status_from_connection(
         self, connection: sqlite3.Connection, *, now: int
@@ -712,7 +730,7 @@ class OperatorFenceStore:
             "observed_at_unix": now,
             "instance_id": instance,
             "generation": generation,
-            "fencing_token": self._fencing_token(instance, generation),
+            "fencing_mark": self._fencing_mark(instance, generation),
             "clock_regressed": now < int(row["updated_at_unix"]),
             "writer": writer,
             "inflight": inflight,
@@ -726,24 +744,34 @@ class OperatorFenceStore:
             return self._status_from_connection(connection, now=now)
 
     @staticmethod
-    def validate_fencing_token(
-        token: Mapping[str, Any],
+    def validate_fencing_mark(
+        mark: Mapping[str, Any],
         *,
         expected_instance_id: str,
         minimum_generation_seen: int,
     ) -> dict[str, Any]:
-        if not isinstance(token, Mapping) or set(token) != {
-            "instance_id", "generation", "token_sha256"
-        }:
-            raise OperatorFenceDenied("invalid_fencing_token")
-        instance = _instance_id(token.get("instance_id"), "token.instance_id")
-        generation = _minimum_generation(token.get("generation"))
-        supplied = _sha256(token.get("token_sha256"), "token.token_sha256")
+        """Validate self-consistency/non-regression, not source authenticity.
+
+        The mark is deliberately unkeyed because downstream clients do not hold
+        coordinator secrets.  Callers MUST establish coordinator and transport
+        authenticity separately (G6.3 uses a pinned SSH host identity) before a
+        validated mark may advance durable client high-water state.
+        """
+        expected_fields = {
+            "instance_id", "generation", "mark_sha256", "does_not_establish"
+        }
+        if not isinstance(mark, Mapping) or set(mark) != expected_fields:
+            raise OperatorFenceDenied("invalid_fencing_mark")
+        if mark.get("does_not_establish") != list(FENCING_MARK_DOES_NOT_ESTABLISH):
+            raise OperatorFenceDenied("invalid_fencing_mark")
+        instance = _instance_id(mark.get("instance_id"), "mark.instance_id")
+        generation = _minimum_generation(mark.get("generation"))
+        supplied = _sha256(mark.get("mark_sha256"), "mark.mark_sha256")
         expected_digest = _sha256_json(
             {"instance_id": instance, "generation": generation}
         )
-        if not hmac.compare_digest(supplied, expected_digest):
-            raise OperatorFenceDenied("invalid_fencing_token")
+        if supplied != expected_digest:
+            raise OperatorFenceDenied("invalid_fencing_mark")
         expected_instance = _instance_id(expected_instance_id, "expected_instance_id")
         if instance != expected_instance:
             raise OperatorFenceDenied("stale_fence_instance")
@@ -753,7 +781,8 @@ class OperatorFenceStore:
         return {
             "instance_id": instance,
             "generation": generation,
-            "token_sha256": supplied,
+            "mark_sha256": supplied,
+            "does_not_establish": list(FENCING_MARK_DOES_NOT_ESTABLISH),
         }
 
     def acquire(
@@ -782,8 +811,7 @@ class OperatorFenceStore:
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
             self._require_clock_not_backward(row, now)
-            if int(row["generation"]) < minimum_seen:
-                raise OperatorFenceDenied("generation_rollback_detected")
+            self._require_minimum_generation(row, minimum_seen)
             current_owner = row["owner_id"]
             lease_active = (
                 current_owner is not None and int(row["lease_until_unix"]) > now
@@ -806,7 +834,7 @@ class OperatorFenceStore:
                         "owner_id": owner,
                         "session_id_sha256": session_digest,
                         "lease_until_unix": int(row["lease_until_unix"]),
-                        "fencing_token": status["fencing_token"],
+                        "fencing_mark": status["fencing_mark"],
                         "status": status,
                     }
                 if same_holder:
@@ -846,7 +874,7 @@ class OperatorFenceStore:
                 "owner_id": owner,
                 "session_id_sha256": session_digest,
                 "lease_until_unix": lease_until,
-                "fencing_token": status["fencing_token"],
+                "fencing_mark": status["fencing_mark"],
                 "status": status,
             }
 
@@ -858,6 +886,7 @@ class OperatorFenceStore:
         generation: int,
         lease_seconds: int,
         expected_instance_id: str | None = None,
+        minimum_generation_seen: int = 0,
     ) -> dict[str, Any]:
         owner = _bounded_identity(owner_id, "owner_id", maximum=MAX_OWNER_BYTES)
         session = _bounded_identity(
@@ -871,6 +900,7 @@ class OperatorFenceStore:
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
             self._require_clock_not_backward(row, now)
+            self._require_minimum_generation(row, minimum_generation_seen)
             self._require_holder(
                 row, owner=owner, session=session, generation=expected_generation
             )
@@ -911,6 +941,7 @@ class OperatorFenceStore:
         operation_name: str,
         intent_sha256: str,
         expected_instance_id: str | None = None,
+        minimum_generation_seen: int = 0,
     ) -> dict[str, Any]:
         owner = _bounded_identity(owner_id, "owner_id", maximum=MAX_OWNER_BYTES)
         session = _bounded_identity(
@@ -930,6 +961,7 @@ class OperatorFenceStore:
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
             self._require_clock_not_backward(row, now)
+            self._require_minimum_generation(row, minimum_generation_seen)
             self._require_holder(
                 row, owner=owner, session=session, generation=expected_generation
             )
@@ -1105,6 +1137,7 @@ class OperatorFenceStore:
         outcome: str,
         evidence_sha256: str,
         expected_instance_id: str | None = None,
+        minimum_generation_seen: int = 0,
     ) -> dict[str, Any]:
         owner = _bounded_identity(owner_id, "owner_id", maximum=MAX_OWNER_BYTES)
         session = _bounded_identity(
@@ -1127,6 +1160,7 @@ class OperatorFenceStore:
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
+            self._require_minimum_generation(row, minimum_generation_seen)
             settled = self._settlement_for_operation(connection, operation)
             if settled is not None:
                 same_actor = (
@@ -1255,6 +1289,7 @@ class OperatorFenceStore:
         outcome: str,
         evidence_sha256: str,
         expected_instance_id: str | None = None,
+        minimum_generation_seen: int = 0,
     ) -> dict[str, Any]:
         reconciler = _bounded_identity(
             reconciler_id, "reconciler_id", maximum=MAX_RECONCILER_BYTES
@@ -1275,6 +1310,7 @@ class OperatorFenceStore:
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
+            self._require_minimum_generation(row, minimum_generation_seen)
             settled = self._settlement_for_operation(connection, operation)
             if settled is not None:
                 if (
@@ -1364,6 +1400,7 @@ class OperatorFenceStore:
         session_id: str,
         generation: int,
         expected_instance_id: str | None = None,
+        minimum_generation_seen: int = 0,
     ) -> dict[str, Any]:
         owner = _bounded_identity(owner_id, "owner_id", maximum=MAX_OWNER_BYTES)
         session = _bounded_identity(
@@ -1376,6 +1413,7 @@ class OperatorFenceStore:
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
             self._require_clock_not_backward(row, now)
+            self._require_minimum_generation(row, minimum_generation_seen)
             self._require_holder(
                 row, owner=owner, session=session, generation=expected_generation
             )
