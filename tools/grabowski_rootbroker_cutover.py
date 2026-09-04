@@ -48,7 +48,7 @@ CUTOVER_LOCK = Path("/run/grabowski/rootbroker-cutover.lock")
 SOCKET_UNIT = "grabowski-privileged-broker.socket"
 OPERATOR_UNIT = "grabowski-operator.service"
 LEGACY_OPERATOR_WATCHDOG_TIMER = "grabowski-operator-watchdog.timer"
-CONFIGURED_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
+CONFIGURED_TARGET = "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc"
 CANONICAL_REPOSITORY = Path("/home/alex/repos/grabowski")
 CANONICAL_ORIGIN_URL = "git@github.com:heimgewebe/grabowski.git"
 CANONICAL_REMOTE_READ_URL = "https://github.com/heimgewebe/grabowski.git"

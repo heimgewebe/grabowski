@@ -48,7 +48,7 @@
       "destination_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
       "expected_source_uid": 1000,
       "max_recovery_age_seconds": 86400,
-      "configured_target": "heimberry:rest-server/grabowski-recovery-probe",
+      "configured_target": "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc",
       "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
       "require_root_owned_destination": true,
       "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
@@ -106,7 +106,7 @@
         "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
         "max_recovery_age_seconds": 86400,
         "require_root_owned_gate_files": true,
-        "configured_target": "heimberry:rest-server/grabowski-recovery-probe",
+        "configured_target": "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc",
         "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
       },
       "allowed_peer_unit": "grabowski-operator.service",
@@ -153,7 +153,7 @@
         "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
         "max_recovery_age_seconds": 86400,
         "require_root_owned_gate_files": true,
-        "configured_target": "heimberry:rest-server/grabowski-recovery-probe"
+        "configured_target": "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc"
       },
       "allowed_peer_unit": "grabowski-operator.service",
       "allowed_peer_uid": 1000
@@ -183,7 +183,7 @@
         "recovery_marker_path": "/var/lib/grabowski/power-worker-recovery-gate.json",
         "max_recovery_age_seconds": 86400,
         "require_root_owned_gate_files": true,
-        "configured_target": "heimberry:rest-server/grabowski-recovery-probe",
+        "configured_target": "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc",
         "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
       }
     }
