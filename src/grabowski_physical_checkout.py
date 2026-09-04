@@ -230,6 +230,132 @@ def _open_relative_directory(
         raise
 
 
+def _open_pointer_directory(
+    base_path: Path,
+    base_descriptor: int,
+    value: str,
+    *,
+    label: str,
+) -> tuple[Path, int, os.stat_result]:
+    """Open one Git pointer target component-by-component without hiding symlinks."""
+    if not value or "\x00" in value:
+        raise PhysicalCheckoutIdentityError(f"{label} target is invalid")
+
+    flags = _directory_flags()
+    if value.startswith("/"):
+        current_path = Path("/")
+        descriptor, _ = _open_absolute_directory(current_path, label=label)
+        components = value.split("/")[1:]
+    else:
+        current_path = base_path
+        descriptor = os.dup(base_descriptor)
+        components = value.split("/")
+
+    try:
+        for component in components:
+            if component in {"", "."}:
+                continue
+            if component == "..":
+                try:
+                    linked = os.stat("..", dir_fd=descriptor, follow_symlinks=False)
+                    parent = os.open("..", flags, dir_fd=descriptor)
+                except OSError as exc:
+                    raise PhysicalCheckoutIdentityError(
+                        f"{label} parent component could not be opened safely"
+                    ) from exc
+                try:
+                    opened = os.fstat(parent)
+                    if not stat.S_ISDIR(opened.st_mode) or not _same_node(opened, linked):
+                        raise PhysicalCheckoutIdentityError(
+                            f"{label} parent component changed during descriptor binding"
+                        )
+                except BaseException:
+                    os.close(parent)
+                    raise
+                os.close(descriptor)
+                descriptor = parent
+                current_path = current_path.parent
+                continue
+
+            _validate_component(component, label=label)
+            try:
+                linked = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            except OSError as exc:
+                raise PhysicalCheckoutIdentityError(
+                    f"{label} component could not be inspected safely"
+                ) from exc
+            if not stat.S_ISDIR(linked.st_mode) or stat.S_ISLNK(linked.st_mode):
+                raise PhysicalCheckoutIdentityError(
+                    f"{label} may not traverse a symlink or non-directory component"
+                )
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise PhysicalCheckoutIdentityError(
+                    f"{label} component could not be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(child)
+                if not stat.S_ISDIR(opened.st_mode) or not _same_node(opened, linked):
+                    raise PhysicalCheckoutIdentityError(
+                        f"{label} component changed during descriptor binding"
+                    )
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+            current_path = current_path / component
+
+        return current_path, descriptor, os.fstat(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _find_checkout_root(path: Path) -> Path:
+    """Find the nearest .git-bearing ancestor without following path symlinks."""
+    current_path = _absolute_lexical(path)
+    descriptor, _ = _open_absolute_directory(current_path, label="checkout path")
+    flags = _directory_flags()
+    try:
+        while True:
+            try:
+                os.stat(".git", dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                if current_path == Path(current_path.anchor):
+                    raise PhysicalCheckoutIdentityError(
+                        "checkout path is not inside a .git-bearing worktree"
+                    )
+                try:
+                    linked = os.stat("..", dir_fd=descriptor, follow_symlinks=False)
+                    parent = os.open("..", flags, dir_fd=descriptor)
+                except OSError as exc:
+                    raise PhysicalCheckoutIdentityError(
+                        "checkout parent could not be opened safely"
+                    ) from exc
+                try:
+                    opened = os.fstat(parent)
+                    if not stat.S_ISDIR(opened.st_mode) or not _same_node(opened, linked):
+                        raise PhysicalCheckoutIdentityError(
+                            "checkout parent changed during descriptor binding"
+                        )
+                except BaseException:
+                    os.close(parent)
+                    raise
+                os.close(descriptor)
+                descriptor = parent
+                current_path = current_path.parent
+            except OSError as exc:
+                raise PhysicalCheckoutIdentityError(
+                    "checkout .git entry could not be inspected safely"
+                ) from exc
+            else:
+                return current_path
+    finally:
+        os.close(descriptor)
+
+
 def _read_relative_regular(
     parent_descriptor: int,
     name: str,
@@ -339,15 +465,6 @@ def _single_line_pointer(payload: bytes, *, prefix: str, label: str) -> str:
     return target
 
 
-def _pointer_target(base: Path, value: str, *, label: str) -> Path:
-    candidate = Path(value)
-    target = candidate if candidate.is_absolute() else base / candidate
-    target = _absolute_lexical(target)
-    if not target.is_absolute():
-        raise PhysicalCheckoutIdentityError(f"{label} target must resolve lexically absolute")
-    return target
-
-
 def _assert_absolute_directory_node(
     path: Path,
     expected: os.stat_result,
@@ -367,11 +484,13 @@ def capture_physical_checkout_identity(
 ) -> dict[str, Any]:
     """Capture only physical checkout identity: paths plus device/inode triples.
 
-    The observation rejects symlink traversal in every lexical path component and
-    revalidates every bound path after capture. It intentionally excludes branch, HEAD, remote, purpose, role, task and
-    lease semantics.
+    The observation locates the nearest checkout root without following symlinks,
+    resolves Git pointer targets component-by-component, and revalidates every bound
+    path after capture. It intentionally excludes branch, HEAD, remote, purpose, role,
+    task and lease semantics.
     """
-    root_path = _absolute_lexical(worktree_root)
+    requested_path = _absolute_lexical(worktree_root)
+    root_path = _find_checkout_root(requested_path)
     root_descriptor, root_metadata = _open_absolute_directory(
         root_path, label="checkout root"
     )
@@ -401,9 +520,8 @@ def capture_physical_checkout_identity(
             target = _single_line_pointer(
                 payload, prefix="gitdir: ", label="gitdir pointer"
             )
-            git_path = _pointer_target(root_path, target, label="gitdir pointer")
-            git_descriptor, git_metadata = _open_absolute_directory(
-                git_path, label="git directory"
+            git_path, git_descriptor, git_metadata = _open_pointer_directory(
+                root_path, root_descriptor, target, label="gitdir pointer"
             )
             git_entry_kind = "pointer"
         else:
@@ -439,11 +557,8 @@ def capture_physical_checkout_identity(
             target = _single_line_pointer(
                 payload, prefix="", label="commondir pointer"
             )
-            common_path = _pointer_target(
-                git_path, target, label="commondir pointer"
-            )
-            common_descriptor, common_metadata = _open_absolute_directory(
-                common_path, label="git common directory"
+            common_path, common_descriptor, common_metadata = _open_pointer_directory(
+                git_path, git_descriptor, target, label="commondir pointer"
             )
 
         material = _identity_material(

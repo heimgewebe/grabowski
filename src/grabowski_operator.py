@@ -4598,7 +4598,7 @@ def _git_probe_bytes(repo: Path, arguments: list[str]) -> subprocess.CompletedPr
 def _git_branch_preimage(repo: Path, *, require_attached: bool = True) -> dict[str, Any]:
     return grabowski_git_preimage.capture_branch_preimage(
         repo,
-        lambda arguments: _git_probe_bytes(repo, arguments),
+        lambda repository, arguments: _git_probe_bytes(repository, arguments),
         require_attached=require_attached,
     )
 

@@ -36,10 +36,12 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
         self._run("git", "add", "README.md", cwd=path)
         self._run("git", "commit", "-q", "-m", "baseline", cwd=path)
 
-    def _probe(self, repo: Path):
-        def run(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    def _probe(self, _repo: Path):
+        def run(
+            checkout_root: Path, arguments: list[str]
+        ) -> subprocess.CompletedProcess[bytes]:
             return subprocess.run(
-                ["git", "-C", str(repo), *arguments],
+                ["git", "-C", str(checkout_root), *arguments],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
@@ -261,6 +263,61 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
 
             self.assertEqual(str(metadata), identity["git_dir"]["path"])
             physical_checkout.verify_physical_checkout_identity(identity)
+
+    def test_gitdir_pointer_symlink_before_parent_is_rejected_before_collapse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            deep = root / "deep"
+            real2 = deep / "real2"
+            actual_metadata = deep / "m2"
+            decoy_metadata = root / "m2"
+            link = root / "link"
+            self._init_committed_repo(checkout)
+            deep.mkdir()
+            real2.mkdir()
+            shutil.move(str(checkout / ".git"), str(actual_metadata))
+            decoy_metadata.mkdir()
+            link.symlink_to(real2, target_is_directory=True)
+            (checkout / ".git").write_text(
+                "gitdir: ../link/../m2\n", encoding="utf-8"
+            )
+
+            git_probe = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "--absolute-git-dir"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                text=True,
+            )
+            self.assertEqual(0, git_probe.returncode, git_probe.stderr)
+            self.assertEqual(str(actual_metadata), git_probe.stdout.strip())
+            with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
+                physical_checkout.capture_physical_checkout_identity(checkout)
+
+    def test_subdirectory_capture_and_branch_preimage_bind_checkout_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            subdir = repo / "nested"
+            self._init_committed_repo(repo)
+            subdir.mkdir()
+            (subdir / "tracked.txt").write_text("nested\n", encoding="utf-8")
+            self._run("git", "add", "nested/tracked.txt", cwd=repo)
+            self._run("git", "commit", "-q", "-m", "nested", cwd=repo)
+
+            root_identity = physical_checkout.capture_physical_checkout_identity(repo)
+            nested_identity = physical_checkout.capture_physical_checkout_identity(subdir)
+            self.assertEqual(root_identity, nested_identity)
+
+            root_preimage = git_preimage.capture_branch_preimage(
+                repo, self._probe(repo)
+            )
+            nested_preimage = git_preimage.capture_branch_preimage(
+                subdir, self._probe(subdir)
+            )
+            self.assertEqual(root_preimage, nested_preimage)
+            self.assertEqual(str(repo), nested_preimage["repository"])
+            self.assertEqual(str(repo), nested_preimage["physical_checkout"]["root"]["path"])
 
     def test_intermediate_symlink_component_is_rejected_by_current_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
