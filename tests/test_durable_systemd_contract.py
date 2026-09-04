@@ -118,6 +118,46 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("PartOf=grabowski-transport-ingress.service", text)
         self.assertNotIn("BindsTo=", text)
 
+    def test_maulwurf_x_services_follow_primary_transport_lifecycle_one_way(self) -> None:
+        ingress = (
+            ROOT
+            / "systemd"
+            / "grabowski-transport-ingress-maulwurf-x.service.example"
+        ).read_text(encoding="utf-8")
+        gateway = (
+            ROOT
+            / "systemd"
+            / "grabowski-external-connector-maulwurf-x.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("PartOf=grabowski-transport-ingress.service", ingress)
+        self.assertIn("After=network.target grabowski-transport-ingress.service", ingress)
+        self.assertNotIn("Wants=grabowski-transport-ingress.service", ingress)
+        self.assertIn(
+            "WantedBy=grabowski-transport-ingress.service", ingress
+        )
+        self.assertIn(
+            "PartOf=grabowski-transport-ingress-maulwurf-x.service", gateway
+        )
+        self.assertIn(
+            "Wants=grabowski-transport-ingress-maulwurf-x.service", gateway
+        )
+        self.assertIn(
+            "WantedBy=grabowski-transport-ingress-maulwurf-x.service", gateway
+        )
+        for required_path in (
+            "%h/.local/state/grabowski/transport-connectors/maulwurf-x.token",
+            "%h/.local/state/grabowski/transport-connectors/maulwurf-x.tools.json",
+            "%h/.local/state/grabowski/transport-connectors/require-tool-policy",
+        ):
+            self.assertIn(f"ConditionPathExists={required_path}", ingress)
+            self.assertIn(f"ConditionPathExists={required_path}", gateway)
+        self.assertIn(
+            "ConditionPathExists=%h/.local/state/grabowski/external-connectors/maulwurf-x.token",
+            gateway,
+        )
+        self.assertNotIn("BindsTo=", ingress)
+        self.assertNotIn("BindsTo=", gateway)
+
     def test_watchdog_cadence_matches_probe_cost(self) -> None:
         operator = (
             ROOT / "systemd" / "grabowski-operator-watchdog.timer.example"

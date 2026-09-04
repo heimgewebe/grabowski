@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "connector_id": "maulwurf-x",
+  "mode": "allowlist",
+  "read_only_only": true,
+  "allowed_tools": [
+    "grabowski_status",
+    "grabowski_runtime_health",
+    "grabowski_deployment_identity",
+    "grabowski_contract_drift",
+    "grabowski_systemkatalog_query",
+    "grabowski_audit_projection"
+  ]
+}
