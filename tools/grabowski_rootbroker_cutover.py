@@ -556,7 +556,12 @@ def _automatic_typed_blockade_scope(value: Any) -> tuple[str, str, bool]:
     }
     if set(value) - required - {"expires_at"} or not required.issubset(value):
         raise CutoverError("canonical operator kill-switch keys are invalid")
-    if value.get("schema_version") != 1:
+    schema_version = value.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
         raise CutoverError("canonical operator kill-switch schema is unsupported")
     if value.get("source") != "typed" or value.get("disarm_policy") != "in_band":
         raise CutoverError("canonical operator kill-switch is not typed in-band authority")
@@ -654,6 +659,15 @@ def _path_scope_matches(base: str, candidate: Path) -> bool:
     return candidate == base_path or base_path in candidate.parents
 
 
+def _path_scope_overlaps_tree(base: str, root: Path) -> bool:
+    base_path = Path(base)
+    return (
+        base_path == root
+        or base_path in root.parents
+        or root in base_path.parents
+    )
+
+
 def _automatic_blockade_matches_cutover(value: Any) -> bool:
     kind, scope_value, active = _automatic_typed_blockade_scope(value)
     if not active:
@@ -684,7 +698,7 @@ def _automatic_blockade_matches_cutover(value: Any) -> bool:
     if kind == "host":
         return scope_value == os.uname().nodename
     if kind == "path":
-        cutover_paths = (
+        fixed_cutover_paths = (
             CONFIG_TARGET,
             RUNTIME_CONTRACT_SCHEMA_TARGET,
             BLOCKADES_MODULE_TARGET,
@@ -701,12 +715,20 @@ def _automatic_blockade_matches_cutover(value: Any) -> bool:
             OPERATOR_SERVICE_TARGET,
             RECOVERY_SOURCE_DROPIN_TARGET,
             OPERATOR_AUTHORITY_ATTESTATION_TARGET,
+            CUTOVER_LOCK,
+        )
+        dynamic_cutover_roots = (
             AUTOMATIC_STAGING_ROOT,
             BACKUP_ROOT,
             RECEIPT_ROOT,
-            CUTOVER_LOCK,
         )
-        return any(_path_scope_matches(scope_value, path) for path in cutover_paths)
+        return (
+            any(_path_scope_matches(scope_value, path) for path in fixed_cutover_paths)
+            or any(
+                _path_scope_overlaps_tree(scope_value, path)
+                for path in dynamic_cutover_roots
+            )
+        )
     raise CutoverError("canonical operator kill-switch scope is unsupported")
 
 

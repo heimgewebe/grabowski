@@ -463,6 +463,16 @@ class RootbrokerCutoverTests(unittest.TestCase):
             ),
             self._typed_blockade_marker(kind="host", value=os.uname().nodename),
             self._typed_blockade_marker(kind="path", value="/etc/grabowski"),
+            self._typed_blockade_marker(
+                kind="path",
+                value=str(cutover.AUTOMATIC_STAGING_ROOT / "future-helper.py"),
+            ),
+            self._typed_blockade_marker(
+                kind="path", value=str(cutover.BACKUP_ROOT / "future-backup")
+            ),
+            self._typed_blockade_marker(
+                kind="path", value=str(cutover.RECEIPT_ROOT / "future-receipt.json")
+            ),
         )
         for marker in matching:
             self.assertTrue(cutover._automatic_blockade_matches_cutover(marker))
@@ -481,6 +491,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
     def test_automatic_cutover_marker_validation_fails_closed(self) -> None:
         marker = self._typed_blockade_marker()
         invalid = (
+            {**marker, "schema_version": True},
             {**marker, "source": "legacy_file"},
             {**marker, "disarm_policy": "external_only"},
             {**marker, "scope": {"kind": "global", "value": "wrong"}},
