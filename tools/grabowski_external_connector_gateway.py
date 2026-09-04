@@ -277,7 +277,6 @@ class ExternalConnectorGateway:
 
 
     async def proxy(self, request: Any) -> Any:
-        import httpx
         from starlette.background import BackgroundTask
         from starlette.responses import JSONResponse, Response, StreamingResponse
 
@@ -322,6 +321,8 @@ class ExternalConnectorGateway:
         tool_name = _tool_call_name(payload)
         if tool_name is not None and tool_name not in self._allowed_tools:
             return JSONResponse(_tool_not_available_response(payload), status_code=200)
+
+        import httpx
 
         query = request.url.query
         url = self._upstream + (f"?{query}" if query else "")
