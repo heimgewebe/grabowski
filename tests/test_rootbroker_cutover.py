@@ -1205,10 +1205,50 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 runner.calls,
             )
 
-    def test_automatic_repository_load_accepts_only_exact_legacy_bridge_target(self) -> None:
-        bridge_text = (ROOT / "config" / "privileged-actions.example.json").read_text(
-            encoding="utf-8"
+    def test_repository_catalog_is_final_backup_target(self) -> None:
+        example = json.loads(
+            (ROOT / "config" / "privileged-actions.example.json").read_text(
+                encoding="utf-8"
+            )
         )
+        actions = example["actions"]
+        self.assertEqual(
+            actions[cutover.PUBLISH_ACTION]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            actions[cutover.POWER_ACTION]["gate"]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            actions[cutover.BLOCKADE_LIFECYCLE_ACTION]["recovery_gate"]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+        self.assertEqual(
+            actions[cutover.ROOT_TASK_ACTION]["start_gate"]["configured_target"],
+            cutover.CONFIGURED_TARGET,
+        )
+
+    def test_automatic_repository_load_accepts_only_exact_legacy_bridge_target(self) -> None:
+        example = json.loads(
+            (ROOT / "config" / "privileged-actions.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        actions = example["actions"]
+        actions[cutover.PUBLISH_ACTION]["configured_target"] = (
+            cutover.LEGACY_CONFIGURED_TARGET
+        )
+        actions[cutover.POWER_ACTION]["gate"]["configured_target"] = (
+            cutover.LEGACY_CONFIGURED_TARGET
+        )
+        actions[cutover.BLOCKADE_LIFECYCLE_ACTION]["recovery_gate"][
+            "configured_target"
+        ] = cutover.LEGACY_CONFIGURED_TARGET
+        actions[cutover.ROOT_TASK_ACTION]["start_gate"]["configured_target"] = (
+            cutover.LEGACY_CONFIGURED_TARGET
+        )
+        bridge_text = json.dumps(example, sort_keys=True) + "\n"
         runner = FakeRunner(
             blobs={"config/privileged-actions.example.json": bridge_text}
         )
