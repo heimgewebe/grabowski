@@ -233,6 +233,10 @@
       "source": "src/grabowski_operator_fence_shadow.py"
     },
     {
+      "module": "grabowski_operator_fence_shadow_refresh",
+      "source": "src/grabowski_operator_fence_shadow_refresh.py"
+    },
+    {
       "module": "grabowski_lane_closeout",
       "source": "src/grabowski_lane_closeout.py"
     },

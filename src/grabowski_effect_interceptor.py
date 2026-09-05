@@ -8,7 +8,6 @@ import re
 from typing import Any
 
 import grabowski_effect_receipt as receipts
-import grabowski_operator_fence_shadow as fence_shadow
 
 
 LOGGER = logging.getLogger(__name__)
@@ -280,9 +279,22 @@ def _shadow_observation_best_effort(
     append_audit: AuditAppender | None,
 ) -> None:
     try:
+        import grabowski_operator_fence_shadow as fence_shadow
+    except Exception as error:
+        LOGGER.error(
+            "operator-fence shadow import failed: %s",
+            type(error).__name__,
+            exc_info=error,
+        )
+        return None
+    arguments_sha256 = admission.get("arguments_sha256")
+    if not isinstance(arguments_sha256, str):
+        LOGGER.error("operator-fence shadow admission hash is unavailable")
+        return None
+    try:
         observation = fence_shadow.observe(
             tool_name=tool_name,
-            arguments_sha256=str(admission["arguments_sha256"]),
+            arguments_sha256=arguments_sha256,
         )
     except Exception as error:  # shadow must never gate an existing mutation
         LOGGER.error(
@@ -290,29 +302,19 @@ def _shadow_observation_best_effort(
             type(error).__name__,
             exc_info=error,
         )
-        observation = {
-            "schema_version": 1,
-            "kind": fence_shadow.OBSERVATION_KIND,
-            "mode": "shadow",
-            "status": "observer_error",
-            "decision": "unavailable",
-            "reason": type(error).__name__,
-            "peer_id": None,
-            "tool": tool_name,
-            "arguments_sha256": admission.get("arguments_sha256"),
-            "instance_id": None,
-            "snapshot_age_seconds": None,
-            "generation": None,
-            "writer_owner_id": None,
-            "inflight_present": None,
-            "observation_sha256": None,
-            "does_not_establish": [
-                "mutation_authority",
-                "writer_acquisition",
-                "effect_finality",
-                "safe_failover",
-            ],
-        }
+        try:
+            observation = fence_shadow.observation_from_error(
+                tool_name=tool_name,
+                arguments_sha256=arguments_sha256,
+                error=error,
+            )
+        except Exception as fallback_error:
+            LOGGER.error(
+                "operator-fence shadow error observation failed: %s",
+                type(fallback_error).__name__,
+                exc_info=fallback_error,
+            )
+            return None
     if append_audit is not None and observation.get("status") != "disabled":
         try:
             append_audit(
@@ -320,17 +322,7 @@ def _shadow_observation_best_effort(
                     "timestamp_unix": admission["admitted_at_unix"],
                     "operation": "operator-fence-shadow",
                     "admission_sha256": admission["admission_sha256"],
-                    "tool": tool_name,
-                    "mode": observation.get("mode"),
-                    "status": observation.get("status"),
                     "decision": observation.get("decision"),
-                    "reason": observation.get("reason"),
-                    "peer_id": observation.get("peer_id"),
-                    "instance_id": observation.get("instance_id"),
-                    "snapshot_age_seconds": observation.get("snapshot_age_seconds"),
-                    "generation": observation.get("generation"),
-                    "writer_owner_id": observation.get("writer_owner_id"),
-                    "inflight_present": observation.get("inflight_present"),
                     "observation_sha256": observation.get("observation_sha256"),
                 }
             )
