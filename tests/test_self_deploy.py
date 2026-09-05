@@ -1599,6 +1599,12 @@ class SelfDeployToolTests(unittest.TestCase):
             "created_at_unix": 10,
             "updated_at_unix": 10,
         }
+        retention = {
+            "checkout_key": "checkout-key",
+            "owner_id": owner,
+            "created_at_unix": 11,
+            "updated_at_unix": 11,
+        }
         stale = {
             "canonical_repository": str(canonical),
             "current_head": "a" * 40,
@@ -1624,6 +1630,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "operation_lease": operation_lease,
             "path_lease": path_lease,
             "lifecycle": lifecycle,
+            "retention": retention,
             "stale": stale,
             "identity": identity,
         }
@@ -1689,6 +1696,66 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertFalse(receipt["command_outcome"]["reported_success"])
         self.assertEqual(receipt["command_outcome"]["returncode"], 1)
         release.assert_called_once_with(
+            f["owner"], [f["operation_key"]], [f["operation_lease"]]
+        )
+
+    def test_auto_deploy_source_does_not_reblock_completed_obligation_on_audit_failure(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        with patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=[f["stale"], f["stale"]],
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY,
+            "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reserve_auto_deploy_source_lifecycle",
+            return_value=f["lifecycle"],
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", side_effect=[False, False, True]
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=_result("")
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=True
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(
+                f["target"],
+                f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+                f["identity"],
+            ),
+        ), patch.object(
+            SELF_DEPLOY, "_bind_auto_deploy_source_retention", return_value=f["retention"]
+        ), patch.object(
+            SELF_DEPLOY,
+            "_release_auto_deploy_source_resources",
+            return_value={"released": [f["operation_lease"]]},
+        ) as release_resources, patch.object(
+            SELF_DEPLOY,
+            "_close_auto_deploy_source_obligation",
+            return_value={
+                "state": "completed",
+                "obligation_id": f["plan"]["obligation_id"],
+                "close_file_sha256": "c" * 64,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation"
+        ) as block_obligation, patch.object(
+            SELF_DEPLOY, "_append_deploy_audit", side_effect=RuntimeError("audit unavailable")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+        block_obligation.assert_not_called()
+        release_resources.assert_called_once_with(
             f["owner"], [f["operation_key"]], [f["operation_lease"]]
         )
 
@@ -2672,6 +2739,58 @@ class SelfDeployToolTests(unittest.TestCase):
             f["owner"], [f["operation_key"]], [f["operation_lease"]]
         )
 
+    def test_schedule_cleans_auto_source_when_inflight_lookup_fails_before_dispatch(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        source = Path("/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-lookup-fail")
+        runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+        expected = "d" * 40
+        identity = _source_identity(
+            source, expected, kind="detached-worktree", canonical=canonical
+        )
+        materialization = {"owner_id": "runtime-deploy-source:test", "receipt_sha256": "7" * 64}
+        SELF_DEPLOY.operator._start_job.reset_mock()
+        with patch.object(
+            SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("HEAD drift"),
+                RuntimeError("HEAD drift"),
+                (source, runner, identity),
+            ],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            return_value=(source, runner, identity, materialization),
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", side_effect=[expected, expected, expected]
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_matching_inflight_deploy_job",
+            side_effect=RuntimeError("inflight store unavailable"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_cleanup_auto_deploy_source_before_dispatch",
+            return_value={"state": "cleaned"},
+        ) as cleanup, patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ):
+            with self.assertRaisesRegex(RuntimeError, "inflight store unavailable"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        cleanup.assert_called_once_with(expected, identity, materialization)
+        SELF_DEPLOY.operator._start_job.assert_not_called()
+
     def test_cleanup_auto_deploy_source_before_dispatch_removes_exact_unused_source(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
         cleanup_key = (
@@ -2692,6 +2811,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "path_resource_key": f["path_key"],
             "path_lease": f["path_lease"],
             "lifecycle": f["lifecycle"],
+            "retention": f["retention"],
         }
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
@@ -2710,6 +2830,8 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=True
         ) as release_lifecycle, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_retention", return_value=True
+        ) as release_retention, patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_resources",
             return_value={"released": [cleanup_lease, f["path_lease"]]},
         ) as release_resources, patch.object(SELF_DEPLOY, "_append_deploy_audit"):
@@ -2720,6 +2842,7 @@ class SelfDeployToolTests(unittest.TestCase):
             f["canonical"], "worktree", "remove", str(f["target"])
         )
         release_lifecycle.assert_called_once_with(f["lifecycle"])
+        release_retention.assert_called_once_with(f["retention"])
         release_resources.assert_called_once_with(
             f["owner"],
             [cleanup_key, f["path_key"]],
@@ -2746,6 +2869,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "path_resource_key": f["path_key"],
             "path_lease": f["path_lease"],
             "lifecycle": f["lifecycle"],
+            "retention": f["retention"],
         }
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
@@ -2791,6 +2915,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "path_resource_key": f["path_key"],
             "path_lease": f["path_lease"],
             "lifecycle": f["lifecycle"],
+            "retention": f["retention"],
         }
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
@@ -2811,7 +2936,9 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value={"released": [cleanup_lease, f["path_lease"]]},
         ) as release_resources, patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=False
-        ) as release_lifecycle:
+        ) as release_lifecycle, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_retention", return_value=True
+        ) as release_retention:
             with self.assertRaisesRegex(
                 RuntimeError, "state did not fully converge: lifecycle-release"
             ):
@@ -2824,6 +2951,7 @@ class SelfDeployToolTests(unittest.TestCase):
             [cleanup_lease, f["path_lease"]],
         )
         release_lifecycle.assert_called_once_with(f["lifecycle"])
+        release_retention.assert_called_once_with(f["retention"])
 
     def test_cleanup_auto_source_attempts_lifecycle_release_when_lease_release_fails_after_remove(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
@@ -2843,6 +2971,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "path_resource_key": f["path_key"],
             "path_lease": f["path_lease"],
             "lifecycle": f["lifecycle"],
+            "retention": f["retention"],
         }
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
@@ -2863,7 +2992,9 @@ class SelfDeployToolTests(unittest.TestCase):
             side_effect=RuntimeError("lease store unavailable"),
         ) as release_resources, patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=True
-        ) as release_lifecycle:
+        ) as release_lifecycle, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_retention", return_value=True
+        ) as release_retention:
             with self.assertRaisesRegex(
                 RuntimeError, "state did not fully converge: resource-release"
             ):
@@ -2872,6 +3003,7 @@ class SelfDeployToolTests(unittest.TestCase):
                 )
         release_resources.assert_called_once()
         release_lifecycle.assert_called_once_with(f["lifecycle"])
+        release_retention.assert_called_once_with(f["retention"])
 
     def test_schedule_cleans_auto_source_after_proven_job_nonstart(self) -> None:
         canonical_state = tempfile.TemporaryDirectory()

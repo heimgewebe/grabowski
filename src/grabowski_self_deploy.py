@@ -2987,6 +2987,35 @@ def _release_auto_deploy_source_resources(
     )
 
 
+def _release_auto_deploy_source_retention(retention: dict[str, Any]) -> bool:
+    import grabowski_checkouts as checkouts
+
+    required = (
+        retention.get("checkout_key"),
+        retention.get("owner_id"),
+        retention.get("created_at_unix"),
+        retention.get("updated_at_unix"),
+    )
+    if not isinstance(required[0], str) or not isinstance(required[1], str):
+        return False
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in required[2:]
+    ):
+        return False
+    with checkouts._database() as connection:
+        deleted = connection.execute(
+            """
+            DELETE FROM retention
+            WHERE checkout_key=? AND owner_id=?
+              AND created_at_unix=? AND updated_at_unix=?
+            """,
+            required,
+        )
+        connection.commit()
+    return deleted.rowcount == 1
+
+
 def _open_auto_deploy_source_obligation(
     plan: dict[str, Any],
     expected_head: str,
@@ -3204,6 +3233,7 @@ def _materialize_auto_deploy_source(
     recovery_asset_present = False
     lifecycle: dict[str, Any] | None = None
     obligation_opened = False
+    obligation_completed = False
     operation_lease_released = False
     try:
         acquisition = _acquire_auto_deploy_source_resources(plan, expected_head)
@@ -3402,6 +3432,7 @@ def _materialize_auto_deploy_source(
             raise RuntimeError(
                 "automatic deployment source obligation did not close as completed"
             )
+        obligation_completed = True
         materialization["materialization_evidence_sha256"] = evidence_sha256
         materialization["obligation"] = {
             "obligation_id": obligation_close.get("obligation_id"),
@@ -3426,7 +3457,7 @@ def _materialize_auto_deploy_source(
         return repository, runner, source_identity, materialization
     except Exception as exc:
         cleanup_failures: list[tuple[str, Exception]] = []
-        if obligation_opened:
+        if obligation_opened and not obligation_completed:
             try:
                 _block_auto_deploy_source_obligation(plan, exc)
             except Exception as cleanup_error:
@@ -3502,12 +3533,14 @@ def _cleanup_auto_deploy_source_before_dispatch(
     path_key = materialization.get("path_resource_key")
     path_lease = materialization.get("path_lease")
     lifecycle = materialization.get("lifecycle")
+    retention = materialization.get("retention")
     if (
         not isinstance(owner_id, str)
         or not isinstance(repository_text, str)
         or not isinstance(path_key, str)
         or not isinstance(path_lease, dict)
         or not isinstance(lifecycle, dict)
+        or not isinstance(retention, dict)
     ):
         raise RuntimeError("automatic deployment source cleanup receipt is malformed")
     repository = Path(repository_text)
@@ -3607,6 +3640,18 @@ def _cleanup_auto_deploy_source_before_dispatch(
                 )
         except Exception as cleanup_error:
             post_remove_failures.append(("lifecycle-release", cleanup_error))
+        try:
+            if not _release_auto_deploy_source_retention(retention):
+                post_remove_failures.append(
+                    (
+                        "retention-release",
+                        RuntimeError(
+                            "automatic deployment source cleanup retention release failed"
+                        ),
+                    )
+                )
+        except Exception as cleanup_error:
+            post_remove_failures.append(("retention-release", cleanup_error))
         if post_remove_failures:
             raise RuntimeError(
                 "automatic deployment source worktree removal was proven, but cleanup "
@@ -4079,17 +4124,32 @@ def grabowski_runtime_deploy_schedule(
         repository = repository_after
         runner = runner_after
         source_identity = source_identity_after
-        canonical_repository = Path(source_identity["canonical_repository"])
-        command = _deploy_command(
-            repository,
-            runner,
-            expected_head,
-            delay_seconds,
-            canonical_repository=canonical_repository,
-            source_kind=source_identity["source_kind"],
-            source_identity_sha256=source_identity["identity_sha256"],
-        )
-        existing = _matching_inflight_deploy_job(command, repository)
+        try:
+            canonical_repository = Path(source_identity["canonical_repository"])
+            command = _deploy_command(
+                repository,
+                runner,
+                expected_head,
+                delay_seconds,
+                canonical_repository=canonical_repository,
+                source_kind=source_identity["source_kind"],
+                source_identity_sha256=source_identity["identity_sha256"],
+            )
+            existing = _matching_inflight_deploy_job(command, repository)
+        except Exception as exc:
+            if automatic_source is not None:
+                try:
+                    _cleanup_auto_deploy_source_before_dispatch(
+                        expected_head, source_identity, automatic_source
+                    )
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"{type(exc).__name__}: {exc}; cleanup failures: "
+                        + _cleanup_failure_text(
+                            [("automatic-source-cleanup", cleanup_error)]
+                        )
+                    ) from exc
+            raise
         if existing is not None:
             if (
                 automatic_source is not None
