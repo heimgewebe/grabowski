@@ -32,13 +32,13 @@ The production deployment therefore uses a dedicated OS identity, named here `op
 The login home and mutable fence state MUST be different directories. A suitable layout is:
 
 ```text
-/var/lib/operator-fence-home/           root:root 0755
-/var/lib/operator-fence-home/.ssh/      root:root 0700
-/var/lib/operator-fence-home/.ssh/authorized_keys  root:root 0600
+/var/lib/operator-fence-home/           root:operator-fence 0750
+/var/lib/operator-fence-home/.ssh/      root:operator-fence 0750
+/var/lib/operator-fence-home/.ssh/authorized_keys  root:operator-fence 0640
 /var/lib/operator-fence/                operator-fence:operator-fence 0700
 ```
 
-This prevents the forced-command account from replacing its own `authorized_keys` policy. The account needs an executable shell such as `/bin/sh` because `sshd` uses the login shell to start the forced command; the locked password and root-owned authorization home, not a `nologin` shell, enforce the non-interactive boundary.
+This prevents the forced-command account from replacing its own `authorized_keys` policy while still allowing `sshd` to read the root-owned authorization file under `StrictModes`; the `operator-fence` group has read/traverse access but no write bit. The account needs an executable shell such as `/bin/sh` because `sshd` uses the login shell to start the forced command; the locked password and root-owned authorization home, not a `nologin` shell, enforce the non-interactive boundary.
 
 Root remains capable of repairing the host and is outside the normal online writer model. Such repair is recovery/break-glass, not ordinary failover authority. G6.4 must ensure that operator-originated mutating fleet/root paths cannot be used to bypass the fence.
 
