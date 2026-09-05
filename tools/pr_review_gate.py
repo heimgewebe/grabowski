@@ -633,6 +633,164 @@ def _attach_registry_freshness_binding_evidence(
     return enriched
 
 
+GITHUB_PR_DIFF_MAX_FILES = 300
+GITHUB_PR_DIFF_TOO_LARGE_MARKERS = (
+    b"PullRequest.diff too_large",
+    b"diff exceeded the maximum number of files",
+)
+
+
+def _complete_pr_diff_paths(view: Any) -> list[str] | None:
+    if not isinstance(view, dict) or view.get("pullFilesEvidenceComplete") is not True:
+        return None
+    files = view.get("files")
+    if not isinstance(files, list):
+        return None
+    paths: list[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            return None
+        status = item.get("status")
+        if status not in {"added", "modified", "removed", "renamed", "copied"}:
+            return None
+        path = item.get("path")
+        if (
+            not isinstance(path, str)
+            or not path
+            or _normalized_review_path(path) != path
+        ):
+            return None
+        paths.append(path)
+        previous = item.get("previousPath")
+        if status in {"renamed", "copied"}:
+            if (
+                not isinstance(previous, str)
+                or not previous
+                or _normalized_review_path(previous) != previous
+                or previous == path
+            ):
+                return None
+            if status == "renamed":
+                paths.append(previous)
+        elif previous is not None:
+            return None
+    if len(paths) != len(set(paths)):
+        return None
+    return sorted(paths)
+
+
+def _local_diff_git_argv(*arguments: str) -> list[str]:
+    return [
+        "git",
+        "-c",
+        "core.pager=cat",
+        "-c",
+        "pager.diff=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "diff.trustExitCode=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.file.allow=never",
+        *arguments,
+    ]
+
+
+def _current_pr_diff_bytes(
+    repo: Path, pr: int, *, changed_files: Any
+) -> tuple[bytes | None, str | None, bool]:
+    argv = ["gh", "pr", "diff", str(pr)]
+    if shutil.which("gh") is None:
+        raise GateInputError("gh CLI is not available in PATH")
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=repo,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            env=_env(),
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired as exc:
+        timeout = int(exc.timeout or 90)
+        raise RuntimeError(
+            f"command timed out after {timeout}s: {_command_label(argv)}"
+        ) from exc
+    if completed.returncode == 0:
+        return completed.stdout, None, False
+    diagnostic = completed.stderr + b"\n" + completed.stdout
+    too_large = (
+        isinstance(changed_files, int)
+        and not isinstance(changed_files, bool)
+        and changed_files > GITHUB_PR_DIFF_MAX_FILES
+        and any(marker in diagnostic for marker in GITHUB_PR_DIFF_TOO_LARGE_MARKERS)
+    )
+    return None, f"command failed: {_command_label(argv)}", too_large
+
+
+def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
+    if not isinstance(view, dict):
+        raise RuntimeError("local PR diff fallback requires PR metadata")
+    base = view.get("baseRefOid")
+    head = view.get("headRefOid")
+    if (
+        not isinstance(base, str)
+        or re.fullmatch(r"[0-9a-f]{40}", base) is None
+        or not isinstance(head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", head) is None
+    ):
+        raise RuntimeError("local PR diff fallback requires exact base/head commits")
+    expected_paths = _complete_pr_diff_paths(view)
+    if expected_paths is None:
+        raise RuntimeError("local PR diff fallback requires complete GitHub file evidence")
+    raw_paths = _run_bytes(
+        repo,
+        _local_diff_git_argv(
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-color",
+            base,
+            head,
+            "--",
+        ),
+    )
+    try:
+        local_paths = sorted(
+            item.decode("utf-8") for item in raw_paths.split(b"\0") if item
+        )
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("local PR diff paths are not valid UTF-8") from exc
+    if len(local_paths) != len(set(local_paths)) or local_paths != expected_paths:
+        raise RuntimeError("local PR diff changed paths do not match GitHub file evidence")
+    raw_diff = _run_bytes(
+        repo,
+        _local_diff_git_argv(
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-color",
+            base,
+            head,
+            "--",
+        ),
+    )
+    if not raw_diff:
+        raise RuntimeError("local PR diff fallback produced an empty diff")
+    return raw_diff
+
+
 def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     view = _run_json(repo, ["gh", "pr", "view", str(pr), "--json", ",".join(PR_FIELDS)])
     checks = _run_json(repo, ["gh", "pr", "checks", str(pr), "--json", ",".join(CHECK_FIELDS)], allow_nonzero=True)
@@ -669,16 +827,36 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
     pr_diff_sha256: str | None = None
     pr_diff_text: str | None = None
     pr_diff_error: str | None = None
+    pr_diff_source: str | None = None
+    pr_diff_provider_error: str | None = None
+    raw_pr_diff_bytes: bytes | None = None
     try:
-        raw_pr_diff_bytes = _run_bytes(repo, ["gh", "pr", "diff", str(pr)])
+        raw_pr_diff_bytes, pr_diff_provider_error, provider_too_large = (
+            _current_pr_diff_bytes(repo, pr, changed_files=view.get("changedFiles"))
+        )
+    except RuntimeError as exc:
+        pr_diff_error = _brief_error(str(exc))
+    else:
+        if raw_pr_diff_bytes is not None:
+            pr_diff_source = "github-pr-diff"
+        elif provider_too_large:
+            try:
+                raw_pr_diff_bytes = _local_bound_pr_diff_bytes(repo, view)
+                pr_diff_source = "local-bound-git-diff-after-github-too-large"
+            except RuntimeError as fallback_exc:
+                pr_diff_error = (
+                    f"{pr_diff_provider_error}; local PR diff fallback unavailable: "
+                    f"{_brief_error(str(fallback_exc))}"
+                )
+        else:
+            pr_diff_error = pr_diff_provider_error
+    if raw_pr_diff_bytes is not None:
         pr_diff_bytes = canonicalize_github_pr_diff_identity(raw_pr_diff_bytes)
         pr_diff_sha256 = github_pr_diff_identity_sha256(raw_pr_diff_bytes)
         try:
             pr_diff_text = pr_diff_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
             pr_diff_error = f"current PR diff is not valid UTF-8: {exc}"
-    except RuntimeError as exc:
-        pr_diff_error = _brief_error(str(exc))
     head_repository = view.get("headRepository") if isinstance(view, dict) else None
     head_repo_name = (
         _canonical_repo_slug(head_repository.get("nameWithOwner"))
@@ -694,6 +872,8 @@ def load_pr_state(repo: Path, pr: int) -> dict[str, Any]:
         "pr_diff_sha256": pr_diff_sha256,
         "pr_diff_text": pr_diff_text,
         "pr_diff_error": pr_diff_error,
+        "pr_diff_source": pr_diff_source,
+        "pr_diff_provider_error": pr_diff_provider_error,
     }
 
 
@@ -2805,6 +2985,27 @@ def _write_private_packet_file(
                 pass
 
 
+def _bound_pr_diff_bytes_from_state(state: dict[str, Any]) -> bytes:
+    diff_text = state.get("pr_diff_text")
+    diff_sha256 = _normalize_sha256(state.get("pr_diff_sha256"))
+    if not isinstance(diff_text, str) or not diff_text or diff_sha256 is None:
+        detail = state.get("pr_diff_error")
+        suffix = (
+            f": {_brief_error(detail)}"
+            if isinstance(detail, str) and detail.strip()
+            else ""
+        )
+        raise GateInputError(
+            f"current PR diff is unavailable for external review packet{suffix}"
+        )
+    payload = diff_text.encode("utf-8")
+    if _sha256_bytes(payload) != diff_sha256:
+        raise GateInputError(
+            "current PR diff text does not match its bound SHA-256"
+        )
+    return payload
+
+
 def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_diff: bytes) -> dict[str, Any]:
     repo_name = _canonical_repo_slug(state.get("repoName"))
     if repo_name is None:
@@ -3954,7 +4155,9 @@ def main(argv: list[str] | None = None) -> int:
             packet_dir = resolve_inside_repo(repo, args.write_external_review_packet, label="external review packet")
             if packet_dir is None:
                 raise GateInputError("external review packet path is required")
-            packet = write_external_review_packet(packet_dir, state, _run_bytes(repo, ["gh", "pr", "diff", str(args.pr)]))
+            packet = write_external_review_packet(
+                packet_dir, state, _bound_pr_diff_bytes_from_state(state)
+            )
         result = evaluate_review_gate(
             state,
             self_review=self_review,
