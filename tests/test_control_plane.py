@@ -821,6 +821,94 @@ class PrivilegedBrokerTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
                 privileged_broker.resolve_execution(config, parsed)
 
+    def test_local_backup_ntfs_actions_allow_only_typed_task_marker(self) -> None:
+        marker = Path(self.tmp.name) / "operator-stop"
+        marker.write_text("typed-placeholder\n", encoding="utf-8")
+        legacy = Path(self.tmp.name) / "legacy-stop"
+
+        def snapshot(kind: str, *, source: str = "typed", disarm_policy: str = "in_band"):
+            record = types.SimpleNamespace(
+                source=source,
+                disarm_policy=disarm_policy,
+                posture="mutation_freeze",
+                scope=types.SimpleNamespace(kind=kind),
+                active_at=lambda: True,
+            )
+            return types.SimpleNamespace(record=record)
+
+        for action, target, flag in (
+            ("local_backup_ntfs_check", "check", "-n"),
+            ("local_backup_ntfs_clear_dirty", "clear-dirty", "-d"),
+        ):
+            reference = self._reference()
+            reference["action"] = action
+            reference["target"] = target
+            reference.pop("reference_sha256")
+            reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+            parsed = privileged_broker.parse_reference(
+                json.dumps(reference).encode("utf-8"), now=1000
+            )
+            contract = {
+                "enabled": True,
+                "mode": "template",
+                "target_pattern": target,
+                "argv": [
+                    "/usr/bin/ntfsfix",
+                    flag,
+                    "/dev/disk/by-uuid/249180DA265E8DE0",
+                ],
+                "timeout_seconds": 120,
+                "kill_switch_path": str(marker),
+                "legacy_kill_switch_path": str(legacy),
+                "allowed_peer_uid": 1000,
+                "allowed_peer_unit": "grabowski-operator.service",
+            }
+            config = {"schema_version": 2, "actions": {action: contract}}
+            with self.subTest(action=action, allowed="task"), patch.object(
+                privileged_broker, "read_authority_marker", return_value=snapshot("task")
+            ):
+                execution = privileged_broker.resolve_execution(config, parsed)
+                self.assertEqual(
+                    execution["argv"],
+                    ["/usr/bin/ntfsfix", flag, "/dev/disk/by-uuid/249180DA265E8DE0"],
+                )
+
+            for kind in ("owner", "global", "host", "capability", "path"):
+                with self.subTest(action=action, blocked=kind), patch.object(
+                    privileged_broker, "read_authority_marker", return_value=snapshot(kind)
+                ):
+                    with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
+                        privileged_broker.resolve_execution(config, parsed)
+
+            incomplete = dict(contract)
+            incomplete.pop("allowed_peer_unit")
+            with self.subTest(action=action, incomplete=True):
+                with self.assertRaisesRegex(PermissionError, "authority contract is incomplete"):
+                    privileged_broker.resolve_execution(
+                        {"schema_version": 2, "actions": {action: incomplete}}, parsed
+                    )
+
+        with patch.object(
+            privileged_broker, "read_authority_marker", side_effect=PermissionError("unsafe marker")
+        ):
+            reference = self._reference()
+            reference["action"] = "local_backup_ntfs_check"
+            reference["target"] = "check"
+            reference.pop("reference_sha256")
+            reference["reference_sha256"] = privileged_broker.canonical_sha256(reference)
+            parsed = privileged_broker.parse_reference(json.dumps(reference).encode(), now=1000)
+            contract = {
+                "enabled": True, "mode": "template", "target_pattern": "check",
+                "argv": ["/usr/bin/ntfsfix", "-n", "/dev/disk/by-uuid/249180DA265E8DE0"],
+                "timeout_seconds": 120, "kill_switch_path": str(marker),
+                "legacy_kill_switch_path": str(legacy), "allowed_peer_uid": 1000,
+                "allowed_peer_unit": "grabowski-operator.service",
+            }
+            with self.assertRaisesRegex(PermissionError, "kill-switch is engaged"):
+                privileged_broker.resolve_execution(
+                    {"schema_version": 2, "actions": {"local_backup_ntfs_check": contract}}, parsed
+                )
+
     def test_non_rootbroker_template_still_blocks_typed_task_marker(self) -> None:
         reference = self._reference()
         parsed = privileged_broker.parse_reference(

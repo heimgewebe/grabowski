@@ -4180,6 +4180,175 @@ class TaskTests(unittest.TestCase):
         )
         self.reposkop_attestation_mock.assert_not_called()
         self.reposkop_shadow_before_mock.assert_not_called()
+        self.assertNotIn("read_routing_advisory", result)
+        self.assertNotIn("read_routing_advisory", result["audit"])
+
+    def test_explicit_read_only_bounded_direct_task_reports_synchronous_route(self) -> None:
+        argv = ["git", "status", "--short"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 154}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["status"], "assessed")
+        self.assertEqual(advisory["classification"], "avoidable_bounded_read")
+        self.assertEqual(advisory["recommended_route"], "grabowski_git")
+        self.assertIs(advisory["synchronous_shape"]["allowed"], True)
+        self.assertEqual(advisory["durable_signals"], [])
+        self.assertEqual(
+            advisory["server_read_verification"],
+            {
+                "schema_version": 1,
+                "kind": "grabowski_task_server_read_verification",
+                "status": "verified",
+                "reason": "guarded_local_git_read",
+                "git_subcommand": "status",
+                "recommended_route": "grabowski_git",
+                "authority": "grabowski_git_guard",
+            },
+        )
+        self.assertEqual(result["audit"]["read_routing_advisory"], advisory)
+
+    def test_explicit_read_only_default_resume_policy_still_reports_bounded_sync_route(self) -> None:
+        argv = ["git", "status", "--short"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "avoidable_bounded_read")
+        self.assertEqual(advisory["recommended_route"], "grabowski_git")
+        self.assertEqual(advisory["resume_policy"], "verify-then-retry")
+        self.assertIs(advisory["default_verify_then_retry_is_advisory_only"], True)
+        self.assertEqual(advisory["durable_signals"], [])
+
+    def test_explicit_read_only_manual_resume_keeps_durable_route(self) -> None:
+        argv = ["git", "status", "--short"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="manual",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "durable_read_justified")
+        self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
+        self.assertEqual(advisory["durable_signals"], ["resume_policy:manual"])
+
+    def test_explicit_read_only_long_direct_task_reports_synchronous_first_candidate(self) -> None:
+        argv = ["git", "status", "--short"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 155}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=120,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "synchronous_first_candidate")
+        self.assertEqual(advisory["recommended_route"], "grabowski_git")
+        self.assertIs(advisory["runtime_exceeds_synchronous_ceiling"], True)
+        self.assertEqual(advisory["durable_signals"], [])
+
+    def test_explicit_read_only_unverified_direct_command_keeps_durable_route(self) -> None:
+        argv = ["rm", "-f", "not-a-real-file"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 159}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "durable_read_justified")
+        self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
+        self.assertIn("server_read_verification_missing", advisory["durable_signals"])
+        verification = advisory["server_read_verification"]
+        self.assertEqual(verification["status"], "unverified")
+        self.assertEqual(
+            verification["reason"],
+            "direct_command_has_no_server_owned_read_classifier",
+        )
+
+    def test_explicit_read_only_shell_task_keeps_durable_route(self) -> None:
+        argv = ["bash", "-lc", "git status --short"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 156}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=120,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "durable_read_justified")
+        self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
+        self.assertIs(advisory["synchronous_shape"]["allowed"], False)
+        self.assertTrue(
+            any(
+                signal.startswith("synchronous_shape:")
+                for signal in advisory["durable_signals"]
+            )
+        )
 
     def test_remote_writer_is_not_forced_through_checkout_shadow(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]

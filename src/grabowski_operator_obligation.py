@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import importlib
@@ -47,6 +47,9 @@ MAX_EVIDENCE = 128
 MAX_BLOCKERS = 32
 MAX_LIST_LIMIT = 100
 MAX_LIST_SCAN = 1_000
+DEFAULT_ATTENTION_DUE_SECONDS = 86_400
+MIN_ATTENTION_DUE_SECONDS = 60
+MAX_ATTENTION_DUE_SECONDS = 31_557_600
 MAX_RESOLUTION_REVISIONS = 128
 MAX_TEXT = 4_096
 LOCK_TIMEOUT_SECONDS = 5.0
@@ -1951,11 +1954,56 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
 
 
 
+def _attention_resurfacing_projection(
+    status: dict[str, Any],
+    *,
+    as_of: datetime,
+    due_after_seconds: int,
+    requires_attention: bool,
+) -> dict[str, Any]:
+    anchor_text = (
+        status.get("closed_at")
+        if status.get("state") in {"blocked", "delegated"}
+        and status.get("closed_at") is not None
+        else status.get("created_at")
+    )
+    anchor_canonical = _validate_timestamp(
+        anchor_text, label="attention resurfacing anchor"
+    )
+    anchor = datetime.fromisoformat(
+        anchor_canonical.removesuffix("Z") + "+00:00"
+    )
+    age_seconds = max(0, int((as_of - anchor).total_seconds()))
+    due_at = anchor + timedelta(seconds=due_after_seconds)
+    due = requires_attention and as_of >= due_at
+    return {
+        "attention_anchor_at": anchor_canonical,
+        "attention_age_seconds": age_seconds,
+        "attention_due_at": due_at.isoformat().replace("+00:00", "Z"),
+        "attention_due": due,
+        "attention_priority": (
+            "due"
+            if due
+            else "recent"
+            if requires_attention
+            else "historical"
+        ),
+    }
+
+
 def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]:
     parameters = dict(parameters or {})
     _validate_exact_keys(
         parameters,
-        allowed={"state", "repo", "thread_id", "limit", "summary_only"},
+        allowed={
+            "state",
+            "repo",
+            "thread_id",
+            "limit",
+            "summary_only",
+            "as_of",
+            "attention_due_after_seconds",
+        },
         required=set(),
         label="list parameters",
     )
@@ -1982,6 +2030,47 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
         raise OperatorObligationInputError(
             f"limit must be an integer from 1 to {MAX_LIST_LIMIT}"
         )
+    due_after_seconds = parameters.get(
+        "attention_due_after_seconds", DEFAULT_ATTENTION_DUE_SECONDS
+    )
+    if (
+        isinstance(due_after_seconds, bool)
+        or not isinstance(due_after_seconds, int)
+        or not MIN_ATTENTION_DUE_SECONDS
+        <= due_after_seconds
+        <= MAX_ATTENTION_DUE_SECONDS
+    ):
+        raise OperatorObligationInputError(
+            "attention_due_after_seconds must be an integer from "
+            f"{MIN_ATTENTION_DUE_SECONDS} to {MAX_ATTENTION_DUE_SECONDS}"
+        )
+    as_of_text = _validate_timestamp(
+        parameters.get("as_of", _utc_now()), label="as_of"
+    )
+    as_of = datetime.fromisoformat(as_of_text.removesuffix("Z") + "+00:00")
+
+    def resurfacing_summary(
+        candidates: list[dict[str, Any]], *, ordering: str
+    ) -> dict[str, Any]:
+        due_count = sum(1 for item in candidates if item["attention_due"])
+        recent_count = sum(
+            1
+            for item in candidates
+            if item["continuation_required"] and not item["attention_due"]
+        )
+        return {
+            "as_of": as_of_text,
+            "due_after_seconds": due_after_seconds,
+            "due_count": due_count,
+            "recent_count": recent_count,
+            "ordering": ordering,
+            "does_not_establish": [
+                "completion",
+                "supersession",
+                "queue_or_dispatch_authority",
+                "automatic_reassessment",
+            ],
+        }
 
     root = _state_root()
     try:
@@ -1996,22 +2085,26 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
             "integrity_errors": [],
             "scan_truncated": False,
             "attention_required": False,
+            "attention_resurfacing": resurfacing_summary(
+                [], ordering="due_then_oldest_first"
+                if state_filter == "attention"
+                else "obligation_id"
+            ),
             "recommended_next_action": "no matching operator obligation exists",
         }
 
-    records: list[dict[str, Any]] = []
-    record_count = 0
+    candidates: list[dict[str, Any]] = []
     matching_attention = False
     integrity_errors: list[dict[str, str]] = []
     entries: list[Path] = []
-    scan_truncated = False
+    root_scan_truncated = False
     for index, child in enumerate(root.iterdir()):
         if index >= MAX_LIST_SCAN:
-            scan_truncated = True
+            root_scan_truncated = True
             break
         entries.append(child)
     entries.sort(key=lambda item: item.name)
-    for index, child in enumerate(entries):
+    for child in entries:
         if child.name == ".lock":
             continue
         if OBLIGATION_ID_RE.fullmatch(child.name) is None:
@@ -2038,36 +2131,58 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
             continue
         if thread_filter is not None and origin.get("thread_id") != thread_filter:
             continue
-        record_count += 1
         matching_attention = matching_attention or requires_attention
-        if not summary_only:
-            records.append(
-                {
-                    "obligation_id": status["obligation_id"],
-                    "state": status["state"],
-                    "objective": status["objective"],
-                    "origin": origin,
-                    "created_at": status["created_at"],
-                    "closed_at": status["closed_at"],
-                    "continuation_required": requires_attention,
-                    "response_may_end": status["response_may_end"],
-                    "work_complete": status["work_complete"],
-                    "completion_scope": status.get("completion_scope"),
-                    "systemic_convergence_claim": status.get("systemic_convergence_claim"),
-                    "convergence_gate_outcome": status.get("convergence_gate_outcome"),
-                    "recommended_next_action": status["recommended_next_action"],
-                }
-            )
-        if record_count >= limit:
-            scan_truncated = any(
-                remaining.name != ".lock"
-                for remaining in entries[index + 1 :]
-            ) or scan_truncated
-            break
+        resurfacing = _attention_resurfacing_projection(
+            status,
+            as_of=as_of,
+            due_after_seconds=due_after_seconds,
+            requires_attention=requires_attention,
+        )
+        candidates.append(
+            {
+                "obligation_id": status["obligation_id"],
+                "state": status["state"],
+                "objective": status["objective"],
+                "origin": origin,
+                "created_at": status["created_at"],
+                "closed_at": status["closed_at"],
+                "continuation_required": requires_attention,
+                "response_may_end": status["response_may_end"],
+                "work_complete": status["work_complete"],
+                "completion_scope": status.get("completion_scope"),
+                "systemic_convergence_claim": status.get("systemic_convergence_claim"),
+                "convergence_gate_outcome": status.get("convergence_gate_outcome"),
+                "recommended_next_action": status["recommended_next_action"],
+                **resurfacing,
+            }
+        )
 
+    if state_filter == "attention":
+        candidates.sort(
+            key=lambda item: (
+                not item["attention_due"],
+                -item["attention_age_seconds"],
+                item["obligation_id"],
+            )
+        )
+        ordering = "due_then_oldest_first"
+    else:
+        candidates.sort(key=lambda item: item["obligation_id"])
+        ordering = "obligation_id"
+
+    selected = candidates[:limit]
+    scan_truncated = root_scan_truncated or len(candidates) > limit
+    records = [] if summary_only else selected
+    record_count = len(selected)
+    resurfacing = resurfacing_summary(candidates, ordering=ordering)
     attention_required = bool(integrity_errors or scan_truncated or matching_attention)
     if integrity_errors:
         next_action = "inspect integrity errors before relying on the affected obligations"
+    elif resurfacing["due_count"]:
+        next_action = (
+            "resume or explicitly reassess the oldest due unfinished obligation before "
+            "starting unrelated work"
+        )
     elif matching_attention:
         next_action = "resume or explicitly supersede the matching unfinished obligation before starting unrelated work"
     elif scan_truncated:
@@ -2083,10 +2198,12 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
         "integrity_errors": integrity_errors,
         "scan_truncated": scan_truncated,
         "attention_required": attention_required,
+        "attention_resurfacing": resurfacing,
         "recommended_next_action": next_action,
         "non_claims": [
             "listing does not live-observe delegated tasks, workspaces, jobs, pull requests, or runtimes",
             "a terminal delegated or blocked record does not establish completed work",
+            "attention due time is a derived resurfacing aid, not a lifecycle or dispatch authority",
         ],
     }
 

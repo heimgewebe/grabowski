@@ -168,6 +168,98 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
         attestation["attestation_sha256"] = dual._canonical_line_sha256(attestation)
         return attestation, blobs
 
+    def _fixture_with_backup_ntfs(
+        self,
+    ) -> tuple[dict[str, object], dict[Path, bytes]]:
+        attestation, blobs = self._fixture()
+        config_path = Path("config/privileged-actions.example.json")
+        config = json.loads(blobs[config_path].decode("utf-8"))
+        actions = config["actions"]
+        check = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": "check",
+            "argv": ["/usr/bin/ntfsfix", "-n", "/dev/disk/by-uuid/249180DA265E8DE0"],
+            "timeout_seconds": 120,
+            "kill_switch_path": "/var/lib/grabowski/operator-blockade/" + "operator-kill-switch",
+            "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/" + "operator-kill-switch",
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
+        clear_dirty = {
+            **check,
+            "target_pattern": "clear-dirty",
+            "argv": ["/usr/bin/ntfsfix", "-d", "/dev/disk/by-uuid/249180DA265E8DE0"],
+        }
+        actions[dual.LOCAL_BACKUP_NTFS_CHECK_ACTION] = check
+        actions[dual.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION] = clear_dirty
+        blobs[config_path] = (json.dumps(config, sort_keys=True) + "\n").encode("utf-8")
+        action_sha256 = attestation["action_sha256"]
+        assert isinstance(action_sha256, dict)
+        action_sha256[dual.LOCAL_BACKUP_NTFS_CHECK_ACTION] = dual._canonical_line_sha256(check)
+        action_sha256[dual.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION] = (
+            dual._canonical_line_sha256(clear_dirty)
+        )
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        return attestation, blobs
+
+    def test_commit_bound_attestation_with_backup_ntfs_actions_is_accepted(self) -> None:
+        attestation, blobs = self._fixture_with_backup_ntfs()
+        with (
+            mock.patch.object(
+                dual, "_read_root_owned_public_json", return_value=attestation
+            ),
+            mock.patch.object(
+                dual.core,
+                "git_show",
+                side_effect=lambda _repo, head, path: blobs[path]
+                if head == self.HEAD
+                else (_ for _ in ()).throw(AssertionError(head)),
+            ),
+        ):
+            observed = dual.require_operator_authority_anchored(
+                ROOT, self.HEAD, path=Path("/ignored")
+            )
+        self.assertEqual(observed["expected_head"], self.HEAD)
+
+    def test_backup_ntfs_target_contract_must_be_pairwise_complete(self) -> None:
+        attestation, blobs = self._fixture_with_backup_ntfs()
+        config_path = Path("config/privileged-actions.example.json")
+        config = json.loads(blobs[config_path].decode("utf-8"))
+        config["actions"].pop(dual.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION)
+        blobs[config_path] = (json.dumps(config, sort_keys=True) + "\n").encode("utf-8")
+        with (
+            mock.patch.object(
+                dual, "_read_root_owned_public_json", return_value=attestation
+            ),
+            mock.patch.object(dual.core, "git_show", side_effect=lambda _repo, _head, path: blobs[path]),
+        ):
+            with self.assertRaisesRegex(core.DeployError, "unvollständigen BACKUP-NTFS"):
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored")
+                )
+
+    def test_backup_ntfs_attestation_digest_drift_is_rejected(self) -> None:
+        attestation, blobs = self._fixture_with_backup_ntfs()
+        action_sha256 = attestation["action_sha256"]
+        assert isinstance(action_sha256, dict)
+        action_sha256[dual.LOCAL_BACKUP_NTFS_CHECK_ACTION] = "f" * 64
+        unsigned = dict(attestation)
+        unsigned.pop("attestation_sha256", None)
+        attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
+        with (
+            mock.patch.object(
+                dual, "_read_root_owned_public_json", return_value=attestation
+            ),
+            mock.patch.object(dual.core, "git_show", side_effect=lambda _repo, _head, path: blobs[path]),
+        ):
+            with self.assertRaisesRegex(core.DeployError, "Aktionsdigests"):
+                dual.require_operator_authority_anchored(
+                    ROOT, self.HEAD, path=Path("/ignored")
+                )
+
     def test_commit_bound_attestation_is_accepted(self) -> None:
         attestation, blobs = self._fixture()
         with (

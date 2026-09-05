@@ -7,10 +7,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -141,6 +143,17 @@ def _rootbroker_cutover_action() -> dict[str, object]:
     return _bound_action(cutover.ROOTBROKER_CUTOVER_ACTION)
 
 
+def _local_backup_ntfs_actions() -> dict[str, dict[str, object]]:
+    return {
+        cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION: _bound_action(
+            cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION
+        ),
+        cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION: _bound_action(
+            cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION
+        ),
+    }
+
+
 def _power_action() -> dict[str, object]:
     return {
         "enabled": True,
@@ -186,6 +199,7 @@ def _example_config_text() -> str:
                 cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
+                **_local_backup_ntfs_actions(),
             },
         },
         sort_keys=True,
@@ -351,6 +365,66 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover._automatic_staged_helper_path(HEAD),
                 Path("/root/staging") / f"{HEAD}.py",
             )
+
+    def test_automatic_continuation_helper_revalidates_root_owned_commit_bytes(self) -> None:
+        staged = Path("/root/staging") / f"{HEAD}.py"
+        expected_data = b"print('reviewed helper')\n"
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o700, st_uid=0, st_gid=0, st_nlink=1
+        )
+        repository = Path("/home/alex/repos/grabowski")
+        with patch.object(cutover, "AUTOMATIC_STAGING_ROOT", staged.parent), patch.object(
+            cutover.Path, "resolve", return_value=staged
+        ), patch.object(cutover.os, "geteuid", return_value=0), patch.object(
+            cutover, "_read_regular_file", return_value=(expected_data, metadata)
+        ), patch.object(
+            cutover, "_repository_blob", return_value=expected_data
+        ), patch.object(cutover, "__file__", str(staged)):
+            result = cutover._verify_automatic_continuation_helper(
+                staged, repository=repository, expected_head=HEAD
+            )
+        self.assertEqual(result["path"], str(staged))
+        self.assertEqual(result["sha256"], hashlib.sha256(expected_data).hexdigest())
+        self.assertEqual(result["expected_head"], HEAD)
+
+    def test_automatic_continuation_helper_rejects_commit_byte_drift(self) -> None:
+        staged = Path("/root/staging") / f"{HEAD}.py"
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o700, st_uid=0, st_gid=0, st_nlink=1
+        )
+        with patch.object(cutover, "AUTOMATIC_STAGING_ROOT", staged.parent), patch.object(
+            cutover.Path, "resolve", return_value=staged
+        ), patch.object(cutover.os, "geteuid", return_value=0), patch.object(
+            cutover, "_read_regular_file", return_value=(b"staged\n", metadata)
+        ), patch.object(
+            cutover, "_repository_blob", return_value=b"reviewed\n"
+        ), patch.object(cutover, "__file__", str(staged)):
+            with self.assertRaisesRegex(cutover.CutoverError, "differs from expected commit"):
+                cutover._verify_automatic_continuation_helper(
+                    staged, repository=Path("/repo"), expected_head=HEAD
+                )
+
+    def test_automatic_continuation_helper_rejects_noncanonical_root_identity(self) -> None:
+        staged = Path("/root/staging") / f"{HEAD}.py"
+        for mode, uid, gid, links in (
+            (0o600, 0, 0, 1),
+            (0o700, 0, 1, 1),
+            (0o700, 0, 0, 2),
+        ):
+            metadata = SimpleNamespace(
+                st_mode=stat.S_IFREG | mode, st_uid=uid, st_gid=gid, st_nlink=links
+            )
+            with self.subTest(mode=mode, uid=uid, gid=gid, links=links), patch.object(
+                cutover, "AUTOMATIC_STAGING_ROOT", staged.parent
+            ), patch.object(cutover.Path, "resolve", return_value=staged), patch.object(
+                cutover.os, "geteuid", return_value=0
+            ), patch.object(
+                cutover, "_read_regular_file", return_value=(b"helper\n", metadata)
+            ), patch.object(cutover, "__file__", str(staged)):
+                with self.assertRaisesRegex(cutover.CutoverError, "identity is invalid"):
+                    cutover._verify_automatic_continuation_helper(
+                        staged, repository=Path("/repo"), expected_head=HEAD
+                    )
 
     def test_automatic_staged_exec_preserves_broker_parent_and_continuation_contract(self) -> None:
         with patch.object(cutover, "AUTOMATIC_STAGING_ROOT", Path("/root/staging")):
@@ -679,6 +753,30 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 ROOT, expected_head=HEAD, runner=bad
             )
 
+    def test_local_backup_ntfs_action_contracts_are_exact(self) -> None:
+        expected = _local_backup_ntfs_actions()
+        observed = cutover._local_backup_ntfs_actions_from_repository(
+            ROOT, expected_head=HEAD, runner=FakeRunner()
+        )
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            observed[cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION]["argv"],
+            ["/usr/bin/ntfsfix", "-n", cutover.LOCAL_BACKUP_NTFS_DEVICE],
+        )
+        self.assertEqual(
+            observed[cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION]["argv"],
+            ["/usr/bin/ntfsfix", "-d", cutover.LOCAL_BACKUP_NTFS_DEVICE],
+        )
+        drifted = json.loads(_example_config_text())
+        drifted["actions"][cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION]["argv"][-1] = "/dev/sda1"
+        bad = FakeRunner(
+            blobs={"config/privileged-actions.example.json": json.dumps(drifted) + "\n"}
+        )
+        with self.assertRaisesRegex(cutover.CutoverError, "argv"):
+            cutover._local_backup_ntfs_actions_from_repository(
+                ROOT, expected_head=HEAD, runner=bad
+            )
+
     def test_cutover_artifacts_include_runtime_contract_trust_anchor(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 
@@ -719,6 +817,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.BLOCKADE_LIFECYCLE_ACTION: lifecycle,
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: service_control,
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
+                **_local_backup_ntfs_actions(),
             },
         }
         source_artifacts = {}
@@ -747,6 +846,13 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(
             attestation["artifact_sha256"]["operator_service"],
             source_artifacts[cutover.OPERATOR_SERVICE_TARGET][2],
+        )
+        self.assertIn(
+            cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION, attestation["action_sha256"]
+        )
+        self.assertIn(
+            cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION,
+            attestation["action_sha256"],
         )
         unsigned = dict(attestation)
         digest = unsigned.pop("attestation_sha256")

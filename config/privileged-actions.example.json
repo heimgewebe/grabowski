@@ -186,6 +186,36 @@
         "configured_target": "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc",
         "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch"
       }
+    },
+    "local_backup_ntfs_check": {
+      "enabled": true,
+      "mode": "template",
+      "timeout_seconds": 120,
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000,
+      "target_pattern": "check",
+      "argv": [
+        "/usr/bin/ntfsfix",
+        "-n",
+        "/dev/disk/by-uuid/249180DA265E8DE0"
+      ]
+    },
+    "local_backup_ntfs_clear_dirty": {
+      "enabled": true,
+      "mode": "template",
+      "timeout_seconds": 120,
+      "kill_switch_path": "/var/lib/grabowski/operator-blockade/operator-kill-switch",
+      "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/operator-kill-switch",
+      "allowed_peer_unit": "grabowski-operator.service",
+      "allowed_peer_uid": 1000,
+      "target_pattern": "clear-dirty",
+      "argv": [
+        "/usr/bin/ntfsfix",
+        "-d",
+        "/dev/disk/by-uuid/249180DA265E8DE0"
+      ]
     }
   }
 }

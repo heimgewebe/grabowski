@@ -367,6 +367,65 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertEqual([], summary["records"])
         self.assertTrue(summary["attention_required"])
 
+    def test_attention_resurfacing_orders_due_work_before_recent_work(self) -> None:
+        with patch.object(
+            obligation, "_utc_now", return_value="2026-09-01T00:00:00Z"
+        ):
+            obligation.open_obligation(
+                self._open_parameters("goo-zzz-overdue-0002")
+            )
+        with patch.object(
+            obligation, "_utc_now", return_value="2026-09-02T18:00:00Z"
+        ):
+            obligation.open_obligation(
+                self._open_parameters("goo-aaa-recent-0001")
+            )
+
+        result = obligation.list_obligations(
+            {
+                "state": "attention",
+                "as_of": "2026-09-03T00:00:00Z",
+                "attention_due_after_seconds": 86_400,
+                "limit": 2,
+            }
+        )
+
+        self.assertEqual(
+            ["goo-zzz-overdue-0002", "goo-aaa-recent-0001"],
+            [item["obligation_id"] for item in result["records"]],
+        )
+        overdue, recent = result["records"]
+        self.assertTrue(overdue["attention_due"])
+        self.assertEqual("due", overdue["attention_priority"])
+        self.assertEqual(172_800, overdue["attention_age_seconds"])
+        self.assertEqual("2026-09-02T00:00:00Z", overdue["attention_due_at"])
+        self.assertFalse(recent["attention_due"])
+        self.assertEqual("recent", recent["attention_priority"])
+        self.assertEqual(21_600, recent["attention_age_seconds"])
+        self.assertEqual(1, result["attention_resurfacing"]["due_count"])
+        self.assertEqual(1, result["attention_resurfacing"]["recent_count"])
+        self.assertEqual(
+            "due_then_oldest_first",
+            result["attention_resurfacing"]["ordering"],
+        )
+        self.assertIn(
+            "oldest due", result["recommended_next_action"]
+        )
+
+    def test_attention_resurfacing_inputs_are_bounded_and_canonical(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationInputError,
+            "attention_due_after_seconds",
+        ):
+            obligation.list_obligations(
+                {"attention_due_after_seconds": 59}
+            )
+        with self.assertRaisesRegex(
+            obligation.OperatorObligationInputError, "as_of"
+        ):
+            obligation.list_obligations({"as_of": "2026-09-03 00:00:00"})
+
     def test_list_reports_projection_drift_as_attention_integrity_error(self) -> None:
         obligation.open_obligation(self._open_parameters())
         original_status = obligation.status_obligation

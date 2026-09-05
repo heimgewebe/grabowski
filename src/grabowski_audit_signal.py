@@ -10,6 +10,7 @@ import grabowski_consumer_surface as consumer_surface
 
 AUDIT_FUTURE_TOLERANCE_SECONDS = 300
 AUDIT_PROJECTION_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,79}")
+AUDIT_TASK_ATTEMPT_UNIT_RE = re.compile(r".+-a(?P<attempt>[1-9][0-9]*)\.service\Z")
 AUDIT_SIGNAL_WINDOW_SECONDS = 604_800
 AUDIT_SIGNAL_GRACE_SECONDS = 300
 AUDIT_SIGNAL_MAX_EVIDENCE_REFS = 20
@@ -1089,15 +1090,80 @@ def findings_payload(signal_projection: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _uncertain_terminal_resolution(
+    record: dict[str, Any],
+    *,
+    audit_timestamp_unix: int | None,
+    task_terminal_provider: Any,
+) -> dict[str, Any] | None:
+    """Resolve current uncertainty only from exact later completed-task evidence."""
+    if task_terminal_provider is None or not callable(task_terminal_provider):
+        return None
+    if (
+        isinstance(audit_timestamp_unix, bool)
+        or not isinstance(audit_timestamp_unix, int)
+        or audit_timestamp_unix < 0
+    ):
+        return None
+    task_id = record.get("task_id")
+    if not isinstance(task_id, str) or re.fullmatch(r"[0-9a-f]{24}", task_id) is None:
+        return None
+    audit_unit = record.get("authoritative_unit") or record.get("unit")
+    if not isinstance(audit_unit, str):
+        return None
+    attempt_match = AUDIT_TASK_ATTEMPT_UNIT_RE.fullmatch(audit_unit)
+    if attempt_match is None:
+        return None
+    audit_attempt = int(attempt_match.group("attempt"))
+    try:
+        current = task_terminal_provider(task_id)
+    except Exception:
+        return None
+    if not isinstance(current, dict) or current.get("task_id") != task_id:
+        return None
+    current_unit = current.get("authoritative_unit") or current.get("unit")
+    attempt = current.get("attempt")
+    if (
+        current_unit != audit_unit
+        or isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt != audit_attempt
+        or current.get("state") != "completed"
+        or current.get("terminal_evidence_valid") is not True
+    ):
+        return None
+    lifecycle_receipt = current.get("lifecycle_receipt_sha256")
+    terminalization = current.get("terminalization_sha256")
+    terminalized_at = current.get("terminalized_at_unix")
+    if not _audit_sha256_valid(lifecycle_receipt) or not _audit_sha256_valid(terminalization):
+        return None
+    if (
+        isinstance(terminalized_at, bool)
+        or not isinstance(terminalized_at, int)
+        or terminalized_at < audit_timestamp_unix
+    ):
+        return None
+    return {
+        "task_id": task_id,
+        "attempt": attempt,
+        "state": "completed",
+        "authoritative_unit": current_unit,
+        "lifecycle_receipt_sha256": lifecycle_receipt,
+        "terminalization_sha256": terminalization,
+        "terminalized_at_unix": terminalized_at,
+    }
+
+
 def build_projection(
     prepared_records: list[tuple[dict[str, Any], int | None]],
     *,
     as_of_unix: int,
     audit_source_binding: dict[str, Any],
     runtime_status_provider: Any = None,
+    task_terminal_provider: Any = None,
 ) -> dict[str, Any]:
     start_unix = as_of_unix - AUDIT_SIGNAL_WINDOW_SECONDS
-    uncertain_records: list[dict[str, Any]] = []
+    uncertain_records: list[tuple[dict[str, Any], int]] = []
     for record, timestamp_unix in prepared_records:
         if (
             timestamp_unix is None
@@ -1110,25 +1176,65 @@ def build_projection(
             or record.get("launcher_outcome_unknown") is True
             or record.get("recovery_required") is True
         ):
-            uncertain_records.append(record)
+            uncertain_records.append((record, timestamp_unix))
+    terminal_resolutions: list[dict[str, Any]] = []
+    unresolved_records: list[dict[str, Any]] = []
+    for record, timestamp_unix in uncertain_records:
+        resolution = _uncertain_terminal_resolution(
+            record,
+            audit_timestamp_unix=timestamp_unix,
+            task_terminal_provider=task_terminal_provider,
+        )
+        if resolution is None:
+            unresolved_records.append(record)
+        else:
+            terminal_resolutions.append(resolution)
     uncertain_refs = [
-        ref for record in uncertain_records if (ref := _audit_record_ref(record))
+        ref for record, _timestamp_unix in uncertain_records if (ref := _audit_record_ref(record))
+    ]
+    unresolved_count = len(unresolved_records)
+    resolution_details = [
+        {
+            "task_id": item["task_id"],
+            "attempt": item["attempt"],
+            "state": item["state"],
+            "lifecycle_receipt_sha256": item["lifecycle_receipt_sha256"],
+            "terminalization_sha256": item["terminalization_sha256"],
+            "terminalized_at_unix": item["terminalized_at_unix"],
+        }
+        for item in terminal_resolutions[:AUDIT_SIGNAL_MAX_EVIDENCE_REFS]
     ]
     uncertain_outcome = _audit_signal_entry(
         "uncertain_outcome",
-        status="observed" if uncertain_records else "clear",
-        severity="critical" if uncertain_records else "none",
-        count=len(uncertain_records),
+        status="observed" if unresolved_count else "clear",
+        severity="critical" if unresolved_count else "none",
+        count=unresolved_count,
         observed_count=len(uncertain_records),
         evidence_refs=uncertain_refs,
-        evidence_quality="direct_verified_audit_fields",
+        evidence_quality=(
+            "direct_verified_audit_fields_plus_exact_task_terminality"
+            if terminal_resolutions
+            else "direct_verified_audit_fields"
+        ),
         recommended_action=(
             "read the exact target state and recovery evidence before any retry"
-            if uncertain_records
+            if unresolved_count
             else "none"
         ),
-        details={"window_seconds": AUDIT_SIGNAL_WINDOW_SECONDS},
-        does_not_establish=["mutation_failure", "safe_retry", "root_cause"],
+        details={
+            "window_seconds": AUDIT_SIGNAL_WINDOW_SECONDS,
+            "historical_observed_count": len(uncertain_records),
+            "terminally_resolved_count": len(terminal_resolutions),
+            "unresolved_current_count": unresolved_count,
+            "terminal_resolutions": resolution_details,
+        },
+        does_not_establish=[
+            "mutation_failure",
+            "safe_retry",
+            "root_cause",
+            "historical_uncertainty_was_false",
+            "completion_of_one_task_authorizes_any_new_effect",
+        ],
     )
     transition_gap = _audit_transition_gap_signal(
         prepared_records,

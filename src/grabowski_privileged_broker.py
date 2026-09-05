@@ -132,17 +132,20 @@ def parse_reference(data: bytes, *, now: int | None = None) -> dict[str, Any]:
 
 
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+LOCAL_BACKUP_NTFS_ACTIONS = frozenset({
+    "local_backup_ntfs_check",
+    "local_backup_ntfs_clear_dirty",
+})
 
 
-def _rootbroker_cutover_template_marker_allows_dispatch(path: Path) -> bool:
-    """Admit only canonical typed markers that cannot govern this cutover.
+def _scoped_template_marker_allows_dispatch(path: Path, *, action: str) -> bool:
+    """Admit only canonical typed markers that cannot govern this action.
 
-    The rootbroker helper performs the complete cutover-footprint evaluation and
-    revalidates the marker during every critical phase.  This broker-side gate
-    is deliberately narrower: it only prevents an unrelated task/owner marker
-    (or an observe-only marker) from being promoted to a host-global stop before
-    the helper can run.  Unknown, unsafe, legacy and every other active scope
-    remain fail-closed here.
+    Rootbroker cutover may cross task/owner markers because its helper performs
+    the complete footprint evaluation and repeated revalidation.  The fixed
+    local BACKUP NTFS maintenance actions may cross only task-scoped markers;
+    owner/global/host/capability and every unknown or unsafe state remain
+    fail-closed.
     """
     if not os.path.lexists(path):
         return True
@@ -155,7 +158,11 @@ def _rootbroker_cutover_template_marker_allows_dispatch(path: Path) -> bool:
             return True
         if record.posture == "observe":
             return True
-        return record.scope.kind in {"task", "owner"}
+        if action == ROOTBROKER_CUTOVER_ACTION:
+            return record.scope.kind in {"task", "owner"}
+        if action in LOCAL_BACKUP_NTFS_ACTIONS:
+            return record.scope.kind == "task"
+        return False
     except Exception:
         return False
 
@@ -217,6 +224,13 @@ def _resolve_template_action(
         or peer_unit is None
     ):
         raise PermissionError("automatic Rootbroker cutover authority contract is incomplete")
+    if reference.get("action") in LOCAL_BACKUP_NTFS_ACTIONS and (
+        kill_switch_value is None
+        or legacy_kill_switch_value is None
+        or peer_uid is None
+        or peer_unit is None
+    ):
+        raise PermissionError("local BACKUP NTFS authority contract is incomplete")
     if legacy_kill_switch_value is not None and kill_switch_value is None:
         raise PermissionError("template kill-switch contract is malformed")
     if kill_switch_value is not None:
@@ -237,9 +251,8 @@ def _resolve_template_action(
         canonical_engaged = os.path.lexists(kill_switch)
         if legacy_engaged:
             raise PermissionError("template kill-switch is engaged")
-        if canonical_engaged and (
-            reference.get("action") != ROOTBROKER_CUTOVER_ACTION
-            or not _rootbroker_cutover_template_marker_allows_dispatch(kill_switch)
+        if canonical_engaged and not _scoped_template_marker_allows_dispatch(
+            kill_switch, action=str(reference.get("action") or "")
         ):
             raise PermissionError("template kill-switch is engaged")
         execution["kill_switch_path"] = str(kill_switch)
