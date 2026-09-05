@@ -42,10 +42,10 @@ BACKUP_NTFS_TYPED_OPERATIONS = {
         "effect": "read_only",
     },
     BACKUP_NTFS_CLEAR_DIRTY_OPERATION: {
-        "description": "Clear only the dirty flag on the fixed configured BACKUP volume after separate check evidence.",
+        "description": "Run the fixed ntfsfix -d repair/clear-dirty path on the configured BACKUP volume after an exact successful check.",
         "action": "local_backup_ntfs_clear_dirty",
         "target": "clear-dirty",
-        "effect": "filesystem_metadata_write",
+        "effect": "filesystem_repair_write",
     },
 }
 RESERVED_TYPED_OPERATIONS = frozenset({FLEET_MUTATION_OPERATION, *BACKUP_NTFS_TYPED_OPERATIONS})
@@ -235,7 +235,7 @@ def _backup_ntfs_operation_plan(
         "privileged_action": spec["action"],
         "target": spec["target"],
         "effect": spec["effect"],
-        "rollback": "none; the check is read-only and clear-dirty is separately operator-gated",
+        "rollback": "none; the check is read-only and ntfsfix repair/clear-dirty is separately operator-gated",
     }
 
 
@@ -373,6 +373,12 @@ def _record_backup_ntfs_check_evidence(invocation: dict[str, Any]) -> dict[str, 
         "response_sha256": invocation["response_sha256"],
         "reference_sha256": invocation["reference_sha256"],
         "root_audit_sha256": audit_sha256,
+        "write_admissible": invocation.get("success") is True,
+        "check_returncode": (
+            invocation["broker_response"].get("returncode")
+            if isinstance(invocation.get("broker_response"), dict)
+            else None
+        ),
     }
     _BACKUP_NTFS_LAST_CHECK = dict(evidence)
     return evidence
@@ -386,6 +392,8 @@ def _consume_backup_ntfs_check_evidence(parameters: dict[str, str] | None) -> di
     _BACKUP_NTFS_LAST_CHECK = None
     if not isinstance(evidence, dict) or expected != evidence.get("response_sha256"):
         raise PermissionError("clear-dirty requires the exact latest BACKUP NTFS check evidence")
+    if evidence.get("write_admissible") is not True:
+        raise PermissionError("BACKUP NTFS check did not authorize repair write")
     checked_at = evidence.get("checked_at_unix")
     now = int(time.time())
     if (
@@ -412,7 +420,7 @@ def _run_backup_ntfs_operation(
     justification = (
         "Root-read-only ntfsfix check for the exact configured BACKUP volume before any filesystem metadata mutation."
         if operation == BACKUP_NTFS_CHECK_OPERATION
-        else "Clear only the NTFS dirty flag on the exact configured BACKUP volume after separate root check evidence; no force mount."
+        else "Run the fixed ntfsfix -d repair/clear-dirty path on the exact configured BACKUP volume after an exact successful root check; no force mount."
     )
     invocation = _invoke_mainpid_privileged_action(
         action=str(plan["privileged_action"]),
