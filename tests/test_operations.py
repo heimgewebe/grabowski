@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -96,6 +97,14 @@ class BackupNtfsOperationTests(unittest.TestCase):
                 result["operations"][operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION]["effect"],
                 "filesystem_repair_write",
             )
+            self.assertEqual(
+                result["operations"][operations.BACKUP_SMART_READ_OPERATION]["effect"],
+                "read_only",
+            )
+            self.assertEqual(
+                result["operations"][operations.BACKUP_SMART_READ_OPERATION]["parameters"],
+                [],
+            )
 
             path.write_text(
                 json.dumps(
@@ -125,12 +134,15 @@ class BackupNtfsOperationTests(unittest.TestCase):
                     operations.grabowski_operation_list()
 
     def test_plans_are_parameterless_and_exactly_action_bound(self) -> None:
-        check = operations._backup_ntfs_operation_plan(
+        check = operations._backup_storage_operation_plan(
             operations.BACKUP_NTFS_CHECK_OPERATION, None
         )
-        clear = operations._backup_ntfs_operation_plan(
+        clear = operations._backup_storage_operation_plan(
             operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION,
             {"check_response_sha256": "e" * 64},
+        )
+        smart = operations._backup_storage_operation_plan(
+            operations.BACKUP_SMART_READ_OPERATION, None
         )
         self.assertEqual(check["privileged_action"], "local_backup_ntfs_check")
         self.assertEqual(check["target"], "check")
@@ -140,9 +152,17 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertEqual(clear["parameter_names"], ["check_response_sha256"])
         self.assertEqual(clear["effect"], "filesystem_repair_write")
         self.assertIn("ntfsfix -d repair/clear-dirty", clear["description"])
+        self.assertEqual(smart["privileged_action"], "local_backup_smart_read")
+        self.assertEqual(smart["target"], "smart-read")
+        self.assertEqual(smart["parameter_names"], [])
+        self.assertEqual(smart["effect"], "read_only")
         with self.assertRaisesRegex(ValueError, "parameter mismatch"):
-            operations._backup_ntfs_operation_plan(
+            operations._backup_storage_operation_plan(
                 operations.BACKUP_NTFS_CHECK_OPERATION, {"device": "/dev/sda1"}
+            )
+        with self.assertRaisesRegex(ValueError, "parameter mismatch"):
+            operations._backup_storage_operation_plan(
+                operations.BACKUP_SMART_READ_OPERATION, {"device": "/dev/sda"}
             )
 
     def test_direct_invocation_uses_main_process_socket_and_structured_response(self) -> None:
@@ -249,7 +269,7 @@ class BackupNtfsOperationTests(unittest.TestCase):
         ) as mutation, patch.object(
             operations, "_invoke_mainpid_privileged_action", return_value=invocation
         ) as invoke, patch.object(operations.base, "_append_audit") as append:
-            result = operations._run_backup_ntfs_operation(
+            result = operations._run_backup_storage_operation(
                 operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION,
                 {"check_response_sha256": "e" * 64},
             )
@@ -265,7 +285,7 @@ class BackupNtfsOperationTests(unittest.TestCase):
     def test_clear_dirty_requires_exact_latest_check_before_root_invocation(self) -> None:
         with patch.object(operations, "_invoke_mainpid_privileged_action") as invoke:
             with self.assertRaisesRegex(PermissionError, "exact latest BACKUP NTFS check"):
-                operations._run_backup_ntfs_operation(
+                operations._run_backup_storage_operation(
                     operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION,
                     {"check_response_sha256": "e" * 64},
                 )
@@ -276,12 +296,14 @@ class BackupNtfsOperationTests(unittest.TestCase):
             "response_sha256": "d" * 64,
             "reference_sha256": "f" * 64,
             "root_audit_sha256": "1" * 64,
+            "write_admissible": True,
+            "check_returncode": 0,
         }
         with patch.object(operations.time, "time", return_value=1001), patch.object(
             operations, "_invoke_mainpid_privileged_action"
         ) as invoke:
             with self.assertRaisesRegex(PermissionError, "exact latest BACKUP NTFS check"):
-                operations._run_backup_ntfs_operation(
+                operations._run_backup_storage_operation(
                     operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION,
                     {"check_response_sha256": "e" * 64},
                 )
@@ -301,16 +323,75 @@ class BackupNtfsOperationTests(unittest.TestCase):
             operations, "_invoke_mainpid_privileged_action"
         ) as invoke:
             with self.assertRaisesRegex(PermissionError, "did not authorize repair write"):
-                operations._run_backup_ntfs_operation(
+                operations._run_backup_storage_operation(
                     operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION,
                     {"check_response_sha256": "e" * 64},
                 )
         invoke.assert_not_called()
         self.assertIsNone(operations._BACKUP_NTFS_LAST_CHECK)
 
+    def test_smart_root_audit_binds_exact_public_output(self) -> None:
+        stdout = "SMART data\n"
+        stderr = ""
+        audit = {
+            **self._audit(action="local_backup_smart_read", returncode=4),
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "smart_stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            "smart_stdout_bytes": len(stdout.encode("utf-8")),
+            "smart_stderr_sha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+            "smart_stderr_bytes": 0,
+        }
+        invocation = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": "local_backup_smart_read",
+            "broker_response": {
+                "returncode": 4,
+                "stdout": stdout,
+                "stderr": stderr,
+                "audit": audit,
+            },
+        }
+        self.assertRegex(operations._root_audit_sha256(invocation) or "", r"[0-9a-f]{64}")
+        invocation["broker_response"]["stdout"] = "tampered\n"
+        self.assertIsNone(operations._root_audit_sha256(invocation))
+
+    def test_smart_read_is_parameterless_and_does_not_touch_ntfs_check_evidence(self) -> None:
+        invocation = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": "local_backup_smart_read",
+            "target": "smart-read",
+            "success": True,
+            "outcome": "succeeded",
+            "timed_out": False,
+            "transport_error": None,
+            "broker_response": {"returncode": 0},
+            "response_sha256": "d" * 64,
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations, "_invoke_mainpid_privileged_action", return_value=invocation
+        ) as invoke, patch.object(operations.base, "_append_audit"):
+            result = operations._run_backup_storage_operation(
+                operations.BACKUP_SMART_READ_OPERATION, None
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["effect"], "read_only")
+        self.assertIsNone(result["check_evidence"])
+        self.assertIsNone(result["consumed_check_evidence"])
+        self.assertIsNone(operations._BACKUP_NTFS_LAST_CHECK)
+        self.assertEqual(invoke.call_args.kwargs["action"], "local_backup_smart_read")
+        self.assertEqual(invoke.call_args.kwargs["target"], "smart-read")
+        self.assertIn("no caller-selected device or flags", invoke.call_args.kwargs["justification"])
+
     def test_direct_invocation_rejects_non_backup_action_before_broker(self) -> None:
         with patch.object(operations.privileged, "_privileged_broker_status") as broker:
-            with self.assertRaisesRegex(ValueError, "outside the BACKUP NTFS allowlist"):
+            with self.assertRaisesRegex(ValueError, "outside the BACKUP storage allowlist"):
                 operations._invoke_mainpid_privileged_action(
                     action="operator_power_argv",
                     target="anything",
@@ -379,7 +460,7 @@ class BackupNtfsOperationTests(unittest.TestCase):
         ), patch.object(
             operations.base, "_append_audit", side_effect=RuntimeError("audit unavailable")
         ):
-            result = operations._run_backup_ntfs_operation(
+            result = operations._run_backup_storage_operation(
                 operations.BACKUP_NTFS_CHECK_OPERATION, None
             )
         self.assertTrue(result["success"])

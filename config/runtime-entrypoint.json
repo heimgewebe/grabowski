@@ -221,6 +221,22 @@
       "source": "src/grabowski_effect_interceptor.py"
     },
     {
+      "module": "grabowski_operator_fence",
+      "source": "src/grabowski_operator_fence.py"
+    },
+    {
+      "module": "grabowski_operator_fence_rpc",
+      "source": "src/grabowski_operator_fence_rpc.py"
+    },
+    {
+      "module": "grabowski_operator_fence_shadow",
+      "source": "src/grabowski_operator_fence_shadow.py"
+    },
+    {
+      "module": "grabowski_operator_fence_shadow_refresh",
+      "source": "src/grabowski_operator_fence_shadow_refresh.py"
+    },
+    {
       "module": "grabowski_lane_closeout",
       "source": "src/grabowski_lane_closeout.py"
     },

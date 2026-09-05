@@ -144,14 +144,7 @@ def _rootbroker_cutover_action() -> dict[str, object]:
 
 
 def _local_backup_ntfs_actions() -> dict[str, dict[str, object]]:
-    return {
-        cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION: _bound_action(
-            cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION
-        ),
-        cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION: _bound_action(
-            cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION
-        ),
-    }
+    return {name: _bound_action(name) for name in cutover.LOCAL_BACKUP_STORAGE_ACTIONS}
 
 
 def _power_action() -> dict[str, object]:
@@ -767,6 +760,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             observed[cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION]["argv"],
             ["/usr/bin/ntfsfix", "-d", cutover.LOCAL_BACKUP_NTFS_DEVICE],
         )
+        self.assertEqual(
+            observed[cutover.LOCAL_BACKUP_SMART_READ_ACTION]["argv"],
+            ["/usr/sbin/smartctl", "-d", "sat", "-a", cutover.LOCAL_BACKUP_SMART_DEVICE],
+        )
         drifted = json.loads(_example_config_text())
         drifted["actions"][cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION]["argv"][-1] = "/dev/sda1"
         bad = FakeRunner(
@@ -852,6 +849,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
         )
         self.assertIn(
             cutover.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION,
+            attestation["action_sha256"],
+        )
+        self.assertIn(
+            cutover.LOCAL_BACKUP_SMART_READ_ACTION,
             attestation["action_sha256"],
         )
         unsigned = dict(attestation)

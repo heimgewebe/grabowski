@@ -272,6 +272,69 @@ def _runtime_digest(evidence: Mapping[str, Any]) -> str:
     return value
 
 
+def _shadow_observation_best_effort(
+    *,
+    admission: Mapping[str, Any],
+    tool_name: str,
+    append_audit: AuditAppender | None,
+) -> None:
+    try:
+        import grabowski_operator_fence_shadow as fence_shadow
+    except Exception as error:
+        LOGGER.error(
+            "operator-fence shadow import failed: %s",
+            type(error).__name__,
+            exc_info=error,
+        )
+        return None
+    arguments_sha256 = admission.get("arguments_sha256")
+    if not isinstance(arguments_sha256, str):
+        LOGGER.error("operator-fence shadow admission hash is unavailable")
+        return None
+    try:
+        observation = fence_shadow.observe(
+            tool_name=tool_name,
+            arguments_sha256=arguments_sha256,
+        )
+    except Exception as error:  # shadow must never gate an existing mutation
+        LOGGER.error(
+            "operator-fence shadow observation failed: %s",
+            type(error).__name__,
+            exc_info=error,
+        )
+        try:
+            observation = fence_shadow.observation_from_error(
+                tool_name=tool_name,
+                arguments_sha256=arguments_sha256,
+                error=error,
+            )
+        except Exception as fallback_error:
+            LOGGER.error(
+                "operator-fence shadow error observation failed: %s",
+                type(fallback_error).__name__,
+                exc_info=fallback_error,
+            )
+            return None
+    if append_audit is not None and observation.get("status") != "disabled":
+        try:
+            append_audit(
+                {
+                    "timestamp_unix": admission["admitted_at_unix"],
+                    "operation": "operator-fence-shadow",
+                    "admission_sha256": admission["admission_sha256"],
+                    "decision": observation.get("decision"),
+                    "observation_sha256": observation.get("observation_sha256"),
+                }
+            )
+        except Exception as error:  # audit correlation is also shadow-only here
+            LOGGER.error(
+                "operator-fence shadow audit append failed: %s",
+                type(error).__name__,
+                exc_info=error,
+            )
+    return None
+
+
 def admit_mutation(
     *,
     tool_name: str,
@@ -282,7 +345,7 @@ def admit_mutation(
     resource_inspector: ResourceInspector | None = None,
     lane_inputs_reader: LaneInputsReader | None = None,
 ) -> dict[str, Any]:
-    return receipts.admit(
+    admission = receipts.admit(
         tool=tool_name,
         arguments=arguments if arguments is not None else {},
         runtime_sha256=_runtime_digest(transport_evidence),
@@ -297,6 +360,12 @@ def admit_mutation(
         resource_keys=resource_keys(arguments),
         append_audit=append_audit,
     )
+    _shadow_observation_best_effort(
+        admission=admission,
+        tool_name=tool_name,
+        append_audit=append_audit,
+    )
+    return admission
 
 
 def _positive_deduplicated_reuse(value: Any) -> bool:
