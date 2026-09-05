@@ -448,6 +448,35 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             self.assertEqual(binding["claude"]["path"], str(executable.resolve()))
             self.assertEqual(binding["claude"]["sha256"], digest)
             self.assertEqual(binding["credential"]["mode"], "0o600")
+            self.assertEqual(binding["quota_readiness"]["status"], "unknown")
+            self.assertIsNone(binding["quota_readiness"]["provider_available"])
+            self.assertFalse(
+                binding["quota_readiness"]["authentication_is_quota_evidence"]
+            )
+            self.assertIn(
+                "provider_availability",
+                binding["quota_readiness"]["does_not_establish"],
+            )
+
+    def test_quota_readiness_is_explicitly_unknown_without_provider_probe(self) -> None:
+        with mock.patch("subprocess.run") as provider_call:
+            readiness = support.preflight._claude_quota_readiness()
+
+        provider_call.assert_not_called()
+        self.assertEqual(readiness["status"], "unknown")
+        self.assertEqual(readiness["source"], "non_consuming_quota_surface_not_configured")
+        self.assertFalse(readiness["authentication_is_quota_evidence"])
+        self.assertIsNone(readiness["provider_available"])
+        self.assertIsNone(readiness["remaining_five_hour_quota"])
+        self.assertIsNone(readiness["remaining_weekly_quota"])
+        self.assertEqual(
+            readiness["does_not_establish"],
+            [
+                "remaining_five_hour_quota",
+                "remaining_weekly_quota",
+                "provider_availability",
+            ],
+        )
 
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
