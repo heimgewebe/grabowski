@@ -31,6 +31,7 @@ SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
 DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
+BUREAU_RUN_SOURCE_KIND = "bureau_run"
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
@@ -563,7 +564,9 @@ def _terminal_lane_resource_observation(
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane resource key set is invalid"
         )
-    registered_resource_keys = resources.normalize_resource_keys(raw_keys)
+    registered_resource_keys = (
+        resources.normalize_resource_keys(raw_keys) if raw_keys else []
+    )
     leases = resources.list_resources(
         owner_id=owner_id,
         include_expired=False,
@@ -1063,9 +1066,36 @@ def _normalize(
             "scoped_writer_runtime_seconds must be between 120 and 86400"
         )
     required = [f"path:{target}", f"repo:{repo}:branch:{branch}"]
-    resource_keys = resources.normalize_resource_keys(
-        [*requested, *path_resources, *required]
-    )
+    delegated_write_resource_keys: list[str] = []
+    if source_kind == BUREAU_RUN_SOURCE_KIND:
+        if any(
+            key in parameters
+            for key in ("delegation_receipt", "delegation_receipt_sha256", "parent_delegation")
+        ):
+            raise ValueError("bureau_run delegation authority is server-derived; caller receipt fields are forbidden")
+        if writer is None or writer_argv is None:
+            raise ValueError(
+                "bureau_run work lanes require scoped_writer_actor and scoped_writer_argv"
+            )
+        delegated_write_resource_keys = (
+            resources.normalize_resource_keys(path_resources) if path_resources else []
+        )
+        if not delegated_write_resource_keys:
+            raise ValueError("bureau_run work lanes require non-empty write_paths")
+        independent_resource_keys = (
+            resources.normalize_resource_keys(requested) if requested else []
+        )
+        parent_derived_keys = set(delegated_write_resource_keys) | set(required)
+        overlap = sorted(parent_derived_keys.intersection(independent_resource_keys))
+        if overlap:
+            raise ValueError(
+                "bureau_run independent resource_keys may not duplicate parent-derived scope"
+            )
+        resource_keys = independent_resource_keys
+    else:
+        resource_keys = resources.normalize_resource_keys(
+            [*requested, *path_resources, *required]
+        )
     identity = {
         "source": {"kind": source_kind, "id": source_id},
         "controller": {"actor": controller_actor, "role": "controller"},
@@ -1078,6 +1108,11 @@ def _normalize(
         "artifact_class": artifact_class,
         "retention_until_unix": retention,
         "resource_keys": resource_keys,
+        **(
+            {"delegated_write_resource_keys": delegated_write_resource_keys}
+            if source_kind == BUREAU_RUN_SOURCE_KIND
+            else {}
+        ),
         "idempotency_key": idempotency_key,
         "system_convergence": normalized_system_convergence,
         "system_convergence_plan": normalized_system_convergence_plan,
@@ -1141,7 +1176,7 @@ def _effect_observed(output: dict[str, Any]) -> bool:
 
 
 def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]:
-    keys = resources.normalize_resource_keys(resource_keys)
+    keys = resources.normalize_resource_keys(resource_keys) if resource_keys else []
     bureau_keys = resources.bureau_leases.bureau_resource_keys(keys)
     if (
         not isinstance(bureau_keys, list)
@@ -1428,6 +1463,377 @@ def _compensate_acquisitions(
     )
 
 
+def _authorize_bureau_run_delegation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    import grabowski_bureau_pickup as bureau_pickup
+
+    return bureau_pickup.authorize_scoped_writer_delegation(*args, **kwargs)
+
+
+def _revalidate_bureau_run_delegation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    import grabowski_bureau_pickup as bureau_pickup
+
+    return bureau_pickup.revalidate_scoped_writer_delegation(*args, **kwargs)
+
+
+def _bureau_run_write_paths(inputs: dict[str, Any]) -> list[str]:
+    raw = inputs.get("delegated_write_resource_keys")
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError("bureau_run lane lost its delegated write scope")
+    paths: list[str] = []
+    for resource_key in raw:
+        if not isinstance(resource_key, str) or not resource_key.startswith("path:"):
+            raise RuntimeError("bureau_run delegated write scope is invalid")
+        paths.append(resource_key.removeprefix("path:"))
+    return paths
+
+
+def _bureau_lane_acquire_independent_resources(
+    inputs: dict[str, Any],
+    *,
+    receipt_path: Path,
+    base_record: dict[str, Any],
+    acquire_resources_fn: Callable[..., dict[str, Any]],
+    release_resources_fn: Callable[..., dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    plan = _resource_acquisition_plan(inputs["resource_keys"])
+    acquisitions: list[dict[str, Any]] = []
+    metadata = {
+        "schema_version": 1,
+        "kind": LANE_KIND,
+        "lane_id": inputs["lane_id"],
+        "controller_actor": inputs["controller"]["actor"],
+        "controller_role": "controller",
+        "scoped_writer_actor": (inputs["scoped_writer"] or {}).get("actor"),
+        "source": inputs["source"],
+        "lifecycle_source": _lifecycle_source(inputs),
+        "repo": inputs["repo"],
+        "branch": inputs["branch"],
+        "target_path": inputs["target_path"],
+        "authority_class": "independent-child-resource",
+    }
+    for group_index, group in enumerate(plan):
+        _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "acquiring",
+                **_group_evidence_fields(plan, acquisitions),
+                "acquisition": {
+                    "state": "group_in_flight",
+                    "group_index": group_index,
+                    "contract_group": group["contract_group"],
+                    "resource_keys": group["resource_keys"],
+                    "completed_group_count": len(acquisitions),
+                },
+                "next_action": "acquire_independent_child_resource_group",
+            },
+        )
+        try:
+            receipt = acquire_resources_fn(
+                inputs["lease_owner_id"],
+                group["resource_keys"],
+                purpose=inputs["purpose"],
+                ttl_seconds=inputs["ttl_seconds"],
+                metadata=metadata,
+            )
+            acquisitions.append(
+                _acquisition_evidence(
+                    group, receipt, owner_id=inputs["lease_owner_id"]
+                )
+            )
+        except Exception as exc:
+            if acquisitions:
+                lease_receipt = _acquisition_bundle(
+                    inputs["lease_owner_id"], plan, acquisitions
+                )
+                _compensation, compensation_complete = _compensate_acquisitions(
+                    owner_id=inputs["lease_owner_id"],
+                    plan=plan,
+                    acquisitions=acquisitions,
+                    release_resources_fn=release_resources_fn,
+                    receipt_path=receipt_path,
+                    base_record=base_record,
+                    lease_receipt=lease_receipt,
+                )
+                if not compensation_complete:
+                    raise LeaseCompensationOutcomeUnknown(
+                        "independent child lease compensation outcome is unknown"
+                    ) from exc
+            raise
+    bundle = _acquisition_bundle(inputs["lease_owner_id"], plan, acquisitions)
+    return plan, acquisitions, bundle
+
+
+def _acquire_bureau_run_delegated_work(
+    inputs: dict[str, Any],
+    *,
+    writer_argv: list[str],
+    receipt_path: Path,
+    base_record: dict[str, Any],
+    existing: dict[str, Any] | None,
+    acquire_resources_fn: Callable[..., dict[str, Any]],
+    release_resources_fn: Callable[..., dict[str, Any]],
+    start_writer_fn: Callable[..., dict[str, Any]],
+    audit_fn: Callable[[dict[str, Any]], None] | None,
+) -> dict[str, Any]:
+    lane_id = inputs["lane_id"]
+    writer = inputs.get("scoped_writer")
+    command = inputs.get("scoped_writer_command")
+    if not isinstance(writer, dict) or not isinstance(command, dict):
+        raise RuntimeError("bureau_run lane lost its required scoped writer binding")
+    write_paths = _bureau_run_write_paths(inputs)
+
+    try:
+        delegation = _authorize_bureau_run_delegation(
+            inputs["source"]["id"],
+            child_lane_id=lane_id,
+            repository=inputs["repo"],
+            workspace_path=inputs["target_path"],
+            workspace_branch=inputs["branch"],
+            expected_head=inputs["base_head"],
+            write_paths=write_paths,
+            scoped_writer_actor=writer["actor"],
+            scoped_writer_argv_sha256=command["argv_sha256"],
+        )
+    except Exception as exc:
+        record = _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "blocked",
+                "decision": "HARD_BLOCK",
+                "error_class": type(exc).__name__,
+                "error": str(exc)[:2048],
+                "effect_observed": False,
+                "next_action": "repair_parent_bureau_delegation_authority",
+            },
+        )
+        return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+
+    plan: list[dict[str, Any]] = []
+    acquisitions: list[dict[str, Any]] = []
+    lane_lease_receipt = _acquisition_bundle(inputs["lease_owner_id"], plan, acquisitions)
+    try:
+        plan, acquisitions, lane_lease_receipt = _bureau_lane_acquire_independent_resources(
+            inputs,
+            receipt_path=receipt_path,
+            base_record=base_record,
+            acquire_resources_fn=acquire_resources_fn,
+            release_resources_fn=release_resources_fn,
+        )
+    except Exception as exc:
+        record = _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "blocked" if _definite_acquisition_failure(exc) else "outcome_unknown",
+                "decision": "HARD_BLOCK",
+                "parent_delegation": delegation,
+                "error_class": type(exc).__name__,
+                "error": str(exc)[:2048],
+                "effect_observed": False if _definite_acquisition_failure(exc) else None,
+                "next_action": "repair_independent_child_resource_acquisition",
+            },
+        )
+        return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+
+    worktree_receipt = {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane.delegated_parent_workspace",
+        "result_state": "ALREADY_CORRECT",
+        "durable_receipt_sha256": delegation["artifact_sha256"],
+        "repository": inputs["repo"],
+        "target_path": inputs["target_path"],
+        "branch": inputs["branch"],
+        "head": inputs["base_head"],
+        "parent_run_id": inputs["source"]["id"],
+        "post_state": {
+            "target_registered": True,
+            "target_path_exists": True,
+            "branch_ref_head": inputs["base_head"],
+        },
+    }
+    authority = {
+        "controller": inputs["controller"],
+        "scoped_writer": writer,
+        "source": inputs["source"],
+        "lifecycle_source": _lifecycle_source(inputs),
+        "parent_delegation": {
+            "receipt_sha256": delegation["receipt_sha256"],
+            "artifact_sha256": delegation["artifact_sha256"],
+            "parent_owner_id": delegation["parent_owner_id"],
+            "claim_intent_sha256": delegation["claim_intent_sha256"],
+            "delegation_expires_at_unix": delegation["delegation_expires_at_unix"],
+        },
+        "lane_owned_resource_keys": list(inputs["resource_keys"]),
+        "writer_effects": ["implement", "test", "commit"],
+        "controller_only_effects": [
+            "push", "pull-request-create-or-update", "merge", "deployment",
+            "bureau-terminalization", "closeout",
+        ],
+        "single_writer_scope": "parent-bureau-run-derived-exact-write-paths",
+    }
+    evidence = {
+        **({"lease_receipt": lane_lease_receipt} if acquisitions else {}),
+        **_group_evidence_fields(plan, acquisitions),
+    }
+    _write_state(
+        receipt_path,
+        {
+            **base_record,
+            "state": "writer_starting",
+            "decision": "DELEGATED_EXECUTE",
+            "parent_delegation": delegation,
+            **evidence,
+            "worktree_receipt": worktree_receipt,
+            "authority": authority,
+            "writer_start": {"state": "starting"},
+            "next_action": "revalidate_parent_delegation_before_writer_start",
+        },
+    )
+    try:
+        revalidation = _revalidate_bureau_run_delegation(
+            inputs["source"]["id"],
+            expected_receipt_sha256=delegation["receipt_sha256"],
+            child_lane_id=lane_id,
+            repository=inputs["repo"],
+            workspace_path=inputs["target_path"],
+            workspace_branch=inputs["branch"],
+            expected_head=inputs["base_head"],
+            write_paths=write_paths,
+            scoped_writer_actor=writer["actor"],
+            scoped_writer_argv_sha256=command["argv_sha256"],
+            writer_runtime_seconds=command["runtime_seconds"],
+        )
+    except Exception as exc:
+        compensation, complete = _compensate_acquisitions(
+            owner_id=inputs["lease_owner_id"],
+            plan=plan,
+            acquisitions=acquisitions,
+            release_resources_fn=release_resources_fn,
+            receipt_path=receipt_path,
+            base_record=base_record,
+            lease_receipt=lane_lease_receipt,
+        )
+        record = _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "blocked" if complete else "outcome_unknown",
+                "decision": "HARD_BLOCK",
+                "parent_delegation": delegation,
+                **evidence,
+                "worktree_receipt": worktree_receipt,
+                "authority": authority,
+                "error_class": type(exc).__name__,
+                "error": str(exc)[:2048],
+                "effect_observed": False,
+                "compensation": compensation,
+                "next_action": (
+                    "repair_parent_bureau_delegation_authority"
+                    if complete
+                    else "reconcile_lease_compensation_before_retry"
+                ),
+            },
+        )
+        return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+
+    try:
+        writer_result = start_writer_fn(
+            writer_argv, cwd=inputs["target_path"], runtime_seconds=command["runtime_seconds"]
+        )
+    except ScopedWriterStartPreflight as exc:
+        compensation, complete = _compensate_acquisitions(
+            owner_id=inputs["lease_owner_id"], plan=plan, acquisitions=acquisitions,
+            release_resources_fn=release_resources_fn, receipt_path=receipt_path,
+            base_record=base_record, lease_receipt=lane_lease_receipt,
+        )
+        record = _write_state(
+            receipt_path,
+            {
+                **base_record, "state": "blocked" if complete else "outcome_unknown",
+                "decision": "HARD_BLOCK", "parent_delegation": delegation, **evidence,
+                "worktree_receipt": worktree_receipt, "authority": authority,
+                "delegation_revalidation": revalidation,
+                "writer_start": {
+                    "state": "preflight_failed", "error_class": type(exc).__name__,
+                    "error": str(exc)[:2048],
+                },
+                "effect_observed": False, "compensation": compensation,
+                "next_action": "fix_scoped_writer_start_preflight" if complete else "reconcile_lease_compensation_before_retry",
+            },
+        )
+        return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+    except Exception as exc:
+        record = _write_state(
+            receipt_path,
+            {
+                **base_record, "state": "outcome_unknown", "decision": "HARD_BLOCK",
+                "parent_delegation": delegation, **evidence, "worktree_receipt": worktree_receipt,
+                "authority": authority, "delegation_revalidation": revalidation,
+                "writer_start": {
+                    "state": "outcome_unknown", "error_class": type(exc).__name__,
+                    "error": str(exc)[:2048],
+                },
+                "next_action": "readback_scoped_writer_before_retry",
+            },
+        )
+        return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+    if not isinstance(writer_result, dict):
+        record = _write_state(
+            receipt_path,
+            {
+                **base_record, "state": "outcome_unknown", "decision": "HARD_BLOCK",
+                "parent_delegation": delegation, **evidence, "worktree_receipt": worktree_receipt,
+                "authority": authority, "delegation_revalidation": revalidation,
+                "writer_start": {
+                    "state": "outcome_unknown",
+                    "error_class": "InvalidScopedWriterStartResult",
+                    "error": "scoped writer start returned a non-object result",
+                },
+                "next_action": "readback_scoped_writer_before_retry",
+            },
+        )
+        return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+    try:
+        writer_job = _writer_job_receipt(writer_result)
+    except Exception as exc:
+        record = _write_state(
+            receipt_path,
+            {
+                **base_record, "state": "outcome_unknown", "decision": "HARD_BLOCK",
+                "parent_delegation": delegation, **evidence, "worktree_receipt": worktree_receipt,
+                "authority": authority, "delegation_revalidation": revalidation,
+                "writer_start": {
+                    "state": "outcome_unknown", "error_class": type(exc).__name__,
+                    "error": str(exc)[:2048],
+                },
+                "next_action": "readback_scoped_writer_before_retry",
+            },
+        )
+        return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+    record = _write_state(
+        receipt_path,
+        {
+            **base_record, "state": "ready", "decision": "DELEGATED_EXECUTE",
+            "parent_delegation": delegation, **evidence, "worktree_receipt": worktree_receipt,
+            "authority": authority, "delegation_revalidation": revalidation,
+            "writer_job": writer_job,
+            "writer_start": {"state": "started", "job_receipt_sha256": writer_job["receipt_sha256"]},
+            "next_action": "writer_started",
+        },
+    )
+    if audit_fn is not None:
+        audit_fn({
+            "operation": "work-acquire-bureau-run-delegation", "lane_id": lane_id,
+            "state": "ready", "decision": "DELEGATED_EXECUTE",
+            "inputs_sha256": base_record["inputs_sha256"],
+            "parent_delegation_receipt_sha256": delegation["receipt_sha256"],
+            "writer_job_receipt_sha256": writer_job["receipt_sha256"],
+        })
+    return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+
+
 def acquire_work(
     parameters: dict[str, Any],
     *,
@@ -1471,6 +1877,17 @@ def acquire_work(
         existing_writer_start = (
             existing.get("writer_start") if isinstance(existing, dict) else None
         )
+        if (
+            inputs["source"]["kind"] == BUREAU_RUN_SOURCE_KIND
+            and existing is not None
+            and existing.get("state") == "ready"
+            and existing_writer_job is not None
+        ):
+            return {
+                **existing,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": True,
+            }
         ambiguous_writer_start = (
             writer_argv is not None
             and existing is not None
@@ -1572,6 +1989,20 @@ def acquire_work(
             "branch": inputs["branch"],
             "target_path": inputs["target_path"],
         }
+        if source["kind"] == BUREAU_RUN_SOURCE_KIND:
+            assert writer_argv is not None
+            return _acquire_bureau_run_delegated_work(
+                inputs,
+                writer_argv=writer_argv,
+                receipt_path=receipt_path,
+                base_record=base_record,
+                existing=existing,
+                acquire_resources_fn=acquire_resources_fn,
+                release_resources_fn=release_resources_fn,
+                start_writer_fn=start_writer_fn,
+                audit_fn=audit_fn,
+            )
+
         acquisitions: list[dict[str, Any]] = []
         for group_index, group in enumerate(acquisition_plan):
             _write_state(
