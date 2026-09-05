@@ -1622,6 +1622,7 @@ class SelfDeployToolTests(unittest.TestCase):
             (expected, str(source), owner),
         )
         self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
+        self.assertEqual(result["automatic_source"], materialization)
 
     def test_auto_deploy_source_blocks_target_appearance_after_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -2328,6 +2328,7 @@ def _schedule_result(
     scheduled: dict[str, Any],
     already_scheduled: bool,
     source_identity: dict[str, Any],
+    automatic_source: dict[str, Any] | None = None,
     deployment_observer_capability: str | None = None,
 ) -> dict[str, Any]:
     contract = job.get("deployment_observer_contract")
@@ -2343,6 +2344,7 @@ def _schedule_result(
         "delay_seconds": effective_delay_seconds,
         "source_identity": source_identity,
         "source_identity_sha256": source_identity["identity_sha256"],
+        "automatic_source": automatic_source,
         "effective_source_identity_sha256": job.get(
             "source_identity_sha256", source_identity["identity_sha256"]
         ),
@@ -3380,6 +3382,7 @@ def grabowski_runtime_deploy_schedule(
                 scheduled=observed,
                 already_scheduled=True,
                 source_identity=source_identity,
+                automatic_source=automatic_source,
             )
 
         intent = {
@@ -3478,5 +3481,6 @@ def grabowski_runtime_deploy_schedule(
             scheduled=scheduled,
             already_scheduled=False,
             source_identity=source_identity,
+            automatic_source=automatic_source,
             deployment_observer_capability=observer_capability,
         )

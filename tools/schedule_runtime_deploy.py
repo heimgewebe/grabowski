@@ -10,6 +10,14 @@ import sys
 from typing import Any, Callable
 
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
+LEASE_FIELDS = (
+    "resource_key",
+    "owner_id",
+    "acquired_at_unix",
+    "updated_at_unix",
+    "expires_at_unix",
+    "metadata_sha256",
+)
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 
@@ -18,7 +26,9 @@ def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def _load_runtime_scheduler() -> Callable[[str, int, str | None, str | None], dict[str, Any]]:
+def _load_runtime_scheduler() -> Callable[
+    [str, int, str | None, str | None], dict[str, Any]
+]:
     source = str(SRC)
     if source not in sys.path:
         sys.path.insert(0, source)
@@ -35,7 +45,11 @@ def schedule(
 ) -> dict[str, Any]:
     if not isinstance(expected_head, str) or not OBJECT_ID_RE.fullmatch(expected_head):
         raise ValueError("expected_head must be a lowercase Git object ID")
-    if not isinstance(delay_seconds, int) or isinstance(delay_seconds, bool) or not 5 <= delay_seconds <= 60:
+    if (
+        not isinstance(delay_seconds, int)
+        or isinstance(delay_seconds, bool)
+        or not 5 <= delay_seconds <= 60
+    ):
         raise ValueError("delay_seconds must be between 5 and 60")
     if source_repository is not None:
         if (
@@ -45,9 +59,10 @@ def schedule(
             or not Path(source_repository).is_absolute()
         ):
             raise ValueError("source_repository must be a bounded absolute path")
-    if source_lease_owner_id is not None and re.fullmatch(
-        r"[A-Za-z0-9._:@-]{1,128}", source_lease_owner_id
-    ) is None:
+    if (
+        source_lease_owner_id is not None
+        and re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", source_lease_owner_id) is None
+    ):
         raise ValueError("source_lease_owner_id is invalid")
     result = _load_runtime_scheduler()(
         expected_head,
@@ -80,38 +95,99 @@ def schedule(
         or computed_identity_sha256 != identity_sha256
     ):
         raise RuntimeError("runtime deploy scheduler returned an unbound receipt")
-    if source_repository is not None and identity.get("repository") != source_repository:
-        raise RuntimeError("runtime deploy scheduler returned a different source repository")
+    if (
+        source_repository is not None
+        and identity.get("repository") != source_repository
+    ):
+        raise RuntimeError(
+            "runtime deploy scheduler returned a different source repository"
+        )
     repository = identity.get("repository")
     canonical_repository = identity.get("canonical_repository")
     source_kind = identity.get("source_kind")
     if not isinstance(repository, str) or not isinstance(canonical_repository, str):
         raise RuntimeError("runtime deploy scheduler returned malformed source paths")
     expected_source_kind = (
-        "canonical-main"
-        if repository == canonical_repository
-        else "detached-worktree"
+        "canonical-main" if repository == canonical_repository else "detached-worktree"
     )
     if source_kind != expected_source_kind:
-        raise RuntimeError("runtime deploy scheduler returned an inconsistent source kind")
-    if source_repository is None and expected_source_kind != "canonical-main":
-        raise RuntimeError("runtime deploy scheduler returned a noncanonical default source")
+        raise RuntimeError(
+            "runtime deploy scheduler returned an inconsistent source kind"
+        )
+
+    resource_key = f"path:{repository}"
+    automatic_source = result.get("automatic_source")
+    automatic_owner: str | None = None
+    if source_repository is None:
+        if expected_source_kind == "canonical-main":
+            if automatic_source is not None:
+                raise RuntimeError(
+                    "runtime deploy scheduler returned an unexpected automatic source"
+                )
+        else:
+            if not isinstance(automatic_source, dict):
+                raise RuntimeError(
+                    "runtime deploy scheduler returned an unbound automatic source"
+                )
+            automatic_owner_value = automatic_source.get("owner_id")
+            if (
+                automatic_source.get("repository") != repository
+                or automatic_source.get("expected_head") != expected_head
+                or automatic_source.get("path_resource_key") != resource_key
+                or not isinstance(automatic_owner_value, str)
+                or re.fullmatch(r"[A-Za-z0-9._:@-]{1,128}", automatic_owner_value)
+                is None
+            ):
+                raise RuntimeError(
+                    "runtime deploy scheduler returned an unbound automatic source"
+                )
+            automatic_owner = automatic_owner_value
+    elif automatic_source is not None:
+        raise RuntimeError(
+            "runtime deploy scheduler returned an unexpected automatic source"
+        )
+
     lease_evidence = identity.get("lease_evidence")
     if not isinstance(lease_evidence, dict):
         raise RuntimeError("runtime deploy scheduler returned malformed lease evidence")
-    resource_key = f"path:{repository}"
     if lease_evidence.get("resource_key") != resource_key:
-        raise RuntimeError("runtime deploy scheduler returned lease evidence for another source")
+        raise RuntimeError(
+            "runtime deploy scheduler returned lease evidence for another source"
+        )
     lease = lease_evidence.get("lease")
-    if source_lease_owner_id is None:
+    expected_lease_owner = (
+        automatic_owner
+        if source_repository is None and expected_source_kind == "detached-worktree"
+        else source_lease_owner_id
+    )
+    if expected_lease_owner is None:
         if lease is not None:
-            raise RuntimeError("runtime deploy scheduler returned an unexpected source lease")
+            raise RuntimeError(
+                "runtime deploy scheduler returned an unexpected source lease"
+            )
     elif (
         not isinstance(lease, dict)
         or lease.get("resource_key") != resource_key
-        or lease.get("owner_id") != source_lease_owner_id
+        or lease.get("owner_id") != expected_lease_owner
     ):
-        raise RuntimeError("runtime deploy scheduler returned a different source lease owner")
+        raise RuntimeError(
+            "runtime deploy scheduler returned a different source lease owner"
+        )
+
+    if automatic_owner is not None:
+        materialized_lease = automatic_source.get("path_lease")
+        if not isinstance(materialized_lease, dict) or not isinstance(lease, dict):
+            raise RuntimeError(
+                "runtime deploy scheduler returned a different automatic source lease"
+            )
+        materialized_snapshot = {
+            field: materialized_lease.get(field) for field in LEASE_FIELDS
+        }
+        observed_snapshot = {field: lease.get(field) for field in LEASE_FIELDS}
+        if materialized_snapshot != observed_snapshot:
+            raise RuntimeError(
+                "runtime deploy scheduler returned a different automatic source lease"
+            )
     return result
 
 
