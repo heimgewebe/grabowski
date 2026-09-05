@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import grabowski_operator_fence as fence
 
@@ -863,6 +864,218 @@ class OperatorFenceStoreTests(unittest.TestCase):
                 intent_sha256="not-a-digest",
             )
         self.assertIsNone(self.store.status()["inflight"])
+
+    def test_reconcile_reads_anchor_only_after_writer_lock(self) -> None:
+        acquire_started = threading.Event()
+        acquire_done = threading.Event()
+        acquire_errors: list[BaseException] = []
+
+        class ReopeningStore(fence.OperatorFenceStore):
+            def _load_anchor(inner_self) -> dict[str, object]:
+                anchor = super()._load_anchor()
+
+                def acquire_while_reopening() -> None:
+                    acquire_started.set()
+                    try:
+                        self.store.acquire(
+                            owner_id="parallel-writer",
+                            session_id="parallel-session",
+                            reason="parallel_open_race",
+                            lease_seconds=30,
+                        )
+                    except BaseException as exc:  # pragma: no cover - assertion path
+                        acquire_errors.append(exc)
+                    finally:
+                        acquire_done.set()
+
+                worker = threading.Thread(target=acquire_while_reopening)
+                inner_self._race_worker = worker
+                worker.start()
+                self.assertTrue(acquire_started.wait(timeout=1))
+                inner_self._writer_finished_during_anchor_read = acquire_done.wait(
+                    timeout=0.1
+                )
+                return anchor
+
+        reopened = ReopeningStore(self.database, clock=self.clock)
+        reopened._race_worker.join(timeout=2)
+        self.assertFalse(reopened._race_worker.is_alive())
+        self.assertFalse(reopened._writer_finished_during_anchor_read)
+        self.assertEqual(acquire_errors, [])
+        self.assertEqual(self.store.status()["generation"], 1)
+
+    def test_concurrent_first_open_serializes_initialization(self) -> None:
+        database = (
+            Path(self.temporary.name)
+            / "parallel-init"
+            / "operator-fence.sqlite3"
+        )
+        barrier = threading.Barrier(12)
+        errors: list[str] = []
+        errors_lock = threading.Lock()
+
+        def open_store() -> None:
+            barrier.wait(timeout=5)
+            try:
+                store = fence.OperatorFenceStore(database)
+                self.assertEqual(store.status()["generation"], 0)
+            except BaseException as exc:  # pragma: no cover - assertion path
+                with errors_lock:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            futures = [executor.submit(open_store) for _ in range(12)]
+            for future in futures:
+                future.result(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertFalse(
+            database.with_name(database.name + ".initializing").exists()
+        )
+
+    def test_interrupted_initialization_marker_recovers_cleanly(self) -> None:
+        database = (
+            Path(self.temporary.name)
+            / "interrupted-init"
+            / "operator-fence.sqlite3"
+        )
+        database.parent.mkdir(mode=0o700)
+        database.write_bytes(b"")
+        os.chmod(database, 0o600)
+        session_key = database.with_name(database.name + ".session-key")
+        session_key.write_bytes(b"x" * fence.SESSION_KEY_BYTES)
+        os.chmod(session_key, 0o600)
+        marker = database.with_name(database.name + ".initializing")
+        marker.write_bytes(fence.INITIALIZATION_MARKER)
+        os.chmod(marker, 0o600)
+
+        store = fence.OperatorFenceStore(database)
+
+        self.assertEqual(store.status()["generation"], 0)
+        self.assertFalse(marker.exists())
+        self.assertEqual(session_key.stat().st_size, fence.SESSION_KEY_BYTES)
+        self.assertNotEqual(session_key.read_bytes(), b"x" * fence.SESSION_KEY_BYTES)
+
+    def test_atomic_private_write_removes_tempfile_after_write_failure(self) -> None:
+        target = self.database.parent / "atomic-write-test"
+        with mock.patch.object(
+            fence.os, "write", side_effect=OSError("simulated disk full")
+        ):
+            with self.assertRaisesRegex(OSError, "simulated disk full"):
+                fence._atomic_private_write(target, b"payload")
+
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            list(target.parent.glob(f".{target.name}.*.tmp")),
+            [],
+        )
+
+    def test_mutation_clock_is_sampled_after_writer_lock(self) -> None:
+        clock_called = threading.Event()
+        original_clock = self.store._clock
+
+        def signaling_clock() -> int:
+            clock_called.set()
+            return original_clock()
+
+        self.store._clock = signaling_clock
+        raw = sqlite3.connect(self.database, isolation_level=None)
+        raw.execute("BEGIN IMMEDIATE")
+        result: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        def acquire() -> None:
+            try:
+                result.append(
+                    self.store.acquire(
+                        owner_id="delayed-writer",
+                        session_id="delayed-session",
+                        reason="lock_wait",
+                        lease_seconds=30,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - assertion path
+                errors.append(exc)
+
+        worker = threading.Thread(target=acquire)
+        worker.start()
+        try:
+            self.assertFalse(clock_called.wait(timeout=0.1))
+            self.clock.advance(10)
+        finally:
+            raw.execute("ROLLBACK")
+            raw.close()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["lease_until_unix"], 1_040)
+
+    def test_quick_check_is_not_repeated_on_hot_connections(self) -> None:
+        calls = 0
+        real_validate_integrity = fence.OperatorFenceStore._validate_integrity
+
+        def tracking_validate_integrity(connection: sqlite3.Connection) -> None:
+            nonlocal calls
+            calls += 1
+            real_validate_integrity(connection)
+
+        with mock.patch.object(
+            fence.OperatorFenceStore,
+            "_validate_integrity",
+            new=staticmethod(tracking_validate_integrity),
+        ):
+            self.store.status()
+            self.acquire_primary()
+            self.store.status()
+            self.assertEqual(calls, 0)
+            reopened = fence.OperatorFenceStore(self.database, clock=self.clock)
+            self.assertEqual(reopened.status()["generation"], 1)
+            self.assertEqual(calls, 1)
+
+    def test_connect_closes_connection_when_schema_validation_fails(self) -> None:
+        raw = sqlite3.connect(self.database)
+        try:
+            raw.execute("CREATE TABLE unexpected(value TEXT)")
+            raw.commit()
+        finally:
+            raw.close()
+
+        real_connect = sqlite3.connect
+        opened: list[sqlite3.Connection] = []
+
+        class TrackingConnection(sqlite3.Connection):
+            was_closed = False
+
+            def close(self) -> None:
+                self.was_closed = True
+                super().close()
+
+        def tracking_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+            kwargs["factory"] = TrackingConnection
+            connection = real_connect(*args, **kwargs)
+            opened.append(connection)
+            return connection
+
+        with mock.patch.object(fence.sqlite3, "connect", side_effect=tracking_connect):
+            with self.assertRaisesRegex(fence.OperatorFenceError, "table set"):
+                self.store.status()
+
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].was_closed)
+
+    def test_event_schema_requires_observed_outcome(self) -> None:
+        raw = sqlite3.connect(self.database)
+        try:
+            columns = {
+                row[1]: row
+                for row in raw.execute("PRAGMA table_info(effect_events)")
+            }
+        finally:
+            raw.close()
+
+        self.assertEqual(columns["observed_outcome"][3], 1)
+
 
 
 if __name__ == "__main__":

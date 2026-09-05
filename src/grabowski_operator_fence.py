@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+import fcntl
 import hashlib
 import hmac
 import json
@@ -33,6 +34,7 @@ MIN_LEASE_SECONDS = 1
 MAX_LEASE_SECONDS = 600
 SESSION_KEY_BYTES = 32
 MAX_ANCHOR_BYTES = 4096
+INITIALIZATION_MARKER = b"operator-fence-initializing-v1\n"
 SQLITE_BUSY_TIMEOUT_MS = 1000
 FENCING_MARK_DOES_NOT_ESTABLISH = (
     "coordinator_authenticity",
@@ -125,15 +127,28 @@ def _read_private_regular(path: Path, *, maximum: int) -> bytes:
             or info.st_uid != os.geteuid()
             or info.st_nlink != 1
             or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_size > maximum
         ):
             raise PermissionError(f"operator fence private file is unsafe: {path.name}")
+        if info.st_size > maximum:
+            raise OperatorFenceError(
+                f"operator fence private file is too large: {path.name}"
+            )
         data = os.read(descriptor, maximum + 1)
         if len(data) != info.st_size:
             raise OperatorFenceError(
                 f"operator fence private file changed while read: {path.name}"
             )
         return data
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
@@ -150,25 +165,29 @@ def _atomic_private_write(path: Path, data: bytes) -> None:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptor = os.open(temporary, flags, 0o600)
+    replaced = False
     try:
-        view = memoryview(data)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short operator fence private-file write")
-            view = view[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("short operator fence private-file write")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+        replaced = True
+    except BaseException:
+        if not replaced:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        raise
     os.chmod(path, 0o600)
-    directory = os.open(
-        path.parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
-    )
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    _fsync_directory(path.parent)
 
 
 class OperatorFenceStore:
@@ -193,26 +212,38 @@ class OperatorFenceStore:
             self.path.name + ".generation-anchor.json"
         )
         self.session_key_path = self.path.with_name(self.path.name + ".session-key")
+        self.initialization_marker_path = self.path.with_name(
+            self.path.name + ".initializing"
+        )
+        self.initialization_lock_path = self.path.with_name(
+            self.path.name + ".init.lock"
+        )
         self._clock = clock or (lambda: int(time.time()))
         self._database_identity: tuple[int, int] | None = None
         self._schema_ready = False
-        created = self._prepare_storage()
-        if created:
-            self._session_key = os.urandom(SESSION_KEY_BYTES)
-            _atomic_private_write(self.session_key_path, self._session_key)
-            self._new_instance_id = secrets.token_hex(16)
-        else:
-            self._session_key = _read_private_regular(
-                self.session_key_path, maximum=SESSION_KEY_BYTES
-            )
-            if len(self._session_key) != SESSION_KEY_BYTES:
-                raise OperatorFenceError("operator fence session key length is invalid")
-            self._new_instance_id = None
-        self._initialize(created=created)
-        self._schema_ready = True
-        status = self.path.lstat()
-        self._database_identity = (status.st_dev, status.st_ino)
-        self._validate_no_wal_sidecars()
+        self._prepare_state_directory()
+        with self._initialization_lock():
+            created = self._prepare_storage()
+            if created:
+                self._session_key = os.urandom(SESSION_KEY_BYTES)
+                _atomic_private_write(self.session_key_path, self._session_key)
+                self._new_instance_id = secrets.token_hex(16)
+            else:
+                self._session_key = _read_private_regular(
+                    self.session_key_path, maximum=SESSION_KEY_BYTES
+                )
+                if len(self._session_key) != SESSION_KEY_BYTES:
+                    raise OperatorFenceError(
+                        "operator fence session key length is invalid"
+                    )
+                self._new_instance_id = None
+            self._initialize(created=created)
+            self._schema_ready = True
+            status = self.path.lstat()
+            self._database_identity = (status.st_dev, status.st_ino)
+            self._validate_no_wal_sidecars()
+            if created:
+                self._finish_initialization()
 
     def _now(self) -> int:
         value = self._clock()
@@ -225,7 +256,7 @@ class OperatorFenceStore:
             self._session_key, session_id.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
-    def _prepare_storage(self) -> bool:
+    def _prepare_state_directory(self) -> None:
         parent = self.path.parent
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         parent_status = parent.lstat()
@@ -235,14 +266,94 @@ class OperatorFenceStore:
             or parent_status.st_mode & 0o077
         ):
             raise PermissionError("operator fence state directory must be private")
-        existed = self.path.exists() or self.path.is_symlink()
-        if not existed and (
-            self.anchor_path.exists() or self.session_key_path.exists()
+
+    @contextmanager
+    def _initialization_lock(self) -> Iterator[None]:
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(self.initialization_lock_path, flags, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise PermissionError(
+                    "operator fence initialization lock is unsafe"
+                )
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _remove_private_initialization_artifact(path: Path) -> bool:
+        if not path.exists() and not path.is_symlink():
+            return False
+        status = path.lstat()
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or status.st_nlink != 1
+            or stat.S_IMODE(status.st_mode) != 0o600
         ):
-            raise OperatorFenceError(
-                "operator fence database is missing while durable sidecars remain"
+            raise PermissionError(
+                f"operator fence incomplete initialization artifact is unsafe: {path.name}"
             )
-        if not existed:
+        path.unlink()
+        return True
+
+    def _discard_incomplete_initialization(self) -> None:
+        changed = False
+        for candidate in (self.path, self.anchor_path, self.session_key_path):
+            changed = (
+                self._remove_private_initialization_artifact(candidate) or changed
+            )
+        if changed:
+            _fsync_directory(self.path.parent)
+
+    def _prepare_storage(self) -> bool:
+        marker_exists = (
+            self.initialization_marker_path.exists()
+            or self.initialization_marker_path.is_symlink()
+        )
+        if marker_exists:
+            marker = _read_private_regular(
+                self.initialization_marker_path, maximum=len(INITIALIZATION_MARKER)
+            )
+            if marker != INITIALIZATION_MARKER:
+                raise OperatorFenceError(
+                    "operator fence initialization marker is invalid"
+                )
+            self._discard_incomplete_initialization()
+            created = True
+        else:
+            existed = self.path.exists() or self.path.is_symlink()
+            if not existed and (
+                self.anchor_path.exists()
+                or self.anchor_path.is_symlink()
+                or self.session_key_path.exists()
+                or self.session_key_path.is_symlink()
+            ):
+                raise OperatorFenceError(
+                    "operator fence database is missing while durable sidecars remain"
+                )
+            created = not existed
+            if created:
+                _atomic_private_write(
+                    self.initialization_marker_path, INITIALIZATION_MARKER
+                )
+
+        if created:
             flags = (
                 os.O_RDWR
                 | os.O_CREAT
@@ -252,13 +363,17 @@ class OperatorFenceStore:
             )
             descriptor = os.open(self.path, flags, 0o600)
             os.close(descriptor)
-        if existed:
+        else:
             for sidecar in (self.anchor_path, self.session_key_path):
                 if not sidecar.exists() or sidecar.is_symlink():
                     raise OperatorFenceError(
                         f"operator fence durable sidecar is missing: {sidecar.name}"
                     )
-        return not existed
+        return created
+
+    def _finish_initialization(self) -> None:
+        self.initialization_marker_path.unlink()
+        _fsync_directory(self.path.parent)
 
     def _validate_database_file(self) -> None:
         status = self.path.lstat()
@@ -285,27 +400,45 @@ class OperatorFenceStore:
 
     def _connect(self) -> sqlite3.Connection:
         self._validate_database_file()
+        connection: sqlite3.Connection | None = None
         try:
             connection = sqlite3.connect(
-                self.path, timeout=5, isolation_level=None
+                self.path,
+                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+                isolation_level=None,
             )
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA trusted_schema=OFF")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             connection.execute("PRAGMA synchronous=FULL")
+            self._validate_database_file()
+            if self._schema_ready:
+                self._validate_schema(connection)
+                mode = str(
+                    connection.execute("PRAGMA journal_mode").fetchone()[0]
+                ).lower()
+                if mode != "delete":
+                    raise OperatorFenceError(
+                        "operator fence database journal mode is not DELETE"
+                    )
+            return connection
         except sqlite3.Error as exc:
-            raise OperatorFenceError("operator fence SQLite connection failed") from exc
-        self._validate_database_file()
-        if self._schema_ready:
-            self._validate_schema(connection)
-            mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-            if mode != "delete":
-                connection.close()
-                raise OperatorFenceError(
-                    "operator fence database journal mode is not DELETE"
-                )
-        return connection
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+            raise OperatorFenceError(
+                "operator fence SQLite connection failed"
+            ) from exc
+        except BaseException:
+            if connection is not None:
+                try:
+                    connection.close()
+                except sqlite3.Error:
+                    pass
+            raise
 
     @staticmethod
     def _sqlite_error(exc: sqlite3.Error) -> OperatorFenceError:
@@ -442,7 +575,7 @@ class OperatorFenceStore:
                 event_type TEXT NOT NULL CHECK (
                     event_type IN ('outcome_unknown', 'reconcile', 'writer_dispute')
                 ),
-                observed_outcome TEXT,
+                observed_outcome TEXT NOT NULL,
                 evidence_sha256 TEXT NOT NULL,
                 actor_id TEXT NOT NULL,
                 observed_at_unix INTEGER NOT NULL,
@@ -484,9 +617,17 @@ class OperatorFenceStore:
             or INSTANCE_RE.fullmatch(str(meta["instance_id"])) is None
         ):
             raise OperatorFenceError("operator fence database metadata is invalid")
-        values = [str(row[0]).lower() for row in connection.execute("PRAGMA quick_check")]
+
+    @staticmethod
+    def _validate_integrity(connection: sqlite3.Connection) -> None:
+        values = [
+            str(row[0]).lower()
+            for row in connection.execute("PRAGMA quick_check")
+        ]
         if values != ["ok"]:
-            raise OperatorFenceError("operator fence database integrity check failed")
+            raise OperatorFenceError(
+                "operator fence database integrity check failed"
+            )
 
     @staticmethod
     def _meta(connection: sqlite3.Connection) -> sqlite3.Row:
@@ -553,6 +694,7 @@ class OperatorFenceStore:
                         pass
                     raise
             self._validate_schema(connection)
+            self._validate_integrity(connection)
             if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "delete":
                 raise OperatorFenceError("operator fence database journal mode is not DELETE")
         finally:
@@ -569,30 +711,43 @@ class OperatorFenceStore:
             raise OperatorFenceDenied("clock_moved_backward")
 
     def _reconcile_generation_anchor(self) -> None:
-        anchor = self._load_anchor()
         connection = self._connect()
         try:
             self._validate_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
             try:
+                anchor = self._load_anchor()
                 meta = self._meta(connection)
                 row = self._state(connection)
                 instance = str(meta["instance_id"])
                 if anchor["instance_id"] != instance:
-                    raise OperatorFenceError("operator fence generation anchor instance mismatch")
+                    raise OperatorFenceError(
+                        "operator fence generation anchor instance mismatch"
+                    )
                 db_generation = int(row["generation"])
                 anchor_generation = int(anchor["generation"])
                 if db_generation > anchor_generation:
-                    raise OperatorFenceError("operator fence generation anchor rolled back")
+                    raise OperatorFenceError(
+                        "operator fence generation anchor rolled back"
+                    )
                 if anchor_generation > db_generation:
                     now = self._now()
                     self._require_clock_not_backward(row, now)
                     if row["inflight_operation_id"] is not None:
-                        raise OperatorFenceError("operator fence generation anchor is ahead of unresolved state")
-                    if row["owner_id"] is not None and int(row["lease_until_unix"]) > now:
-                        raise OperatorFenceError("operator fence generation anchor is ahead of a live grant")
+                        raise OperatorFenceError(
+                            "operator fence generation anchor is ahead of unresolved state"
+                        )
+                    if (
+                        row["owner_id"] is not None
+                        and int(row["lease_until_unix"]) > now
+                    ):
+                        raise OperatorFenceError(
+                            "operator fence generation anchor is ahead of a live grant"
+                        )
                     connection.execute(
-                        "UPDATE fence_state SET generation=?, owner_id=NULL, session_digest=NULL, acquire_reason=NULL, lease_until_unix=NULL, updated_at_unix=? WHERE singleton=1",
+                        "UPDATE fence_state SET generation=?, owner_id=NULL, "
+                        "session_digest=NULL, acquire_reason=NULL, "
+                        "lease_until_unix=NULL, updated_at_unix=? WHERE singleton=1",
                         (anchor_generation, now),
                     )
                 connection.execute("COMMIT")
@@ -739,8 +894,8 @@ class OperatorFenceStore:
         }
 
     def status(self) -> dict[str, Any]:
-        now = self._now()
         with self._read_transaction() as connection:
+            now = self._now()
             return self._status_from_connection(connection, now=now)
 
     @staticmethod
@@ -805,8 +960,8 @@ class OperatorFenceStore:
         )
         ttl = _lease_seconds(lease_seconds)
         minimum_seen = _minimum_generation(minimum_generation_seen)
-        now = self._now()
         with self._write_transaction() as connection:
+            now = self._now()
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
@@ -894,8 +1049,8 @@ class OperatorFenceStore:
         )
         expected_generation = _generation(generation)
         ttl = _lease_seconds(lease_seconds)
-        now = self._now()
         with self._write_transaction() as connection:
+            now = self._now()
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
@@ -955,8 +1110,8 @@ class OperatorFenceStore:
             operation_name, "operation_name", maximum=MAX_OPERATION_BYTES
         )
         intent = _sha256(intent_sha256, "intent_sha256")
-        now = self._now()
         with self._write_transaction() as connection:
+            now = self._now()
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
@@ -1081,7 +1236,7 @@ class OperatorFenceStore:
         session_digest: str,
         operation_id: str,
         event_type: str,
-        observed_outcome: str | None,
+        observed_outcome: str,
         evidence_sha256: str,
         actor_id: str,
         observed_at_unix: int,
@@ -1104,7 +1259,7 @@ class OperatorFenceStore:
             """
             SELECT event_id FROM effect_events
             WHERE event_type=? AND operation_id=? AND actor_id=?
-              AND observed_outcome IS ? AND evidence_sha256=?
+              AND observed_outcome=? AND evidence_sha256=?
             """,
             (event_type, operation_id, actor_id, observed_outcome, evidence_sha256),
         ).fetchone()
@@ -1155,8 +1310,8 @@ class OperatorFenceStore:
         evidence = _sha256(evidence_sha256, "evidence_sha256")
         if outcome not in EFFECT_OUTCOMES:
             raise ValueError("outcome is not a supported fence effect outcome")
-        now = self._now()
         with self._write_transaction() as connection:
+            now = self._now()
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
@@ -1305,8 +1460,8 @@ class OperatorFenceStore:
         evidence = _sha256(evidence_sha256, "evidence_sha256")
         if outcome not in TERMINAL_OUTCOMES:
             raise ValueError("reconciliation must resolve to a terminal effect outcome")
-        now = self._now()
         with self._write_transaction() as connection:
+            now = self._now()
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
@@ -1407,8 +1562,8 @@ class OperatorFenceStore:
             session_id, "session_id", maximum=MAX_SESSION_BYTES
         )
         expected_generation = _generation(generation)
-        now = self._now()
         with self._write_transaction() as connection:
+            now = self._now()
             meta = self._meta(connection)
             self._require_instance(meta, expected_instance_id)
             row = self._state(connection)
