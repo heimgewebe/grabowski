@@ -128,6 +128,132 @@ class AuditSignalTests(unittest.TestCase):
         self.assertNotIn("producer and consumer contract mismatch", encoded)
         self.assertNotIn("gate evidence missing", encoded)
 
+    def test_uncertain_outcome_resolves_current_severity_from_exact_completed_task(self) -> None:
+        now = 1_800_000_000
+        task_id = "1" * 24
+        unit = f"grabowski-task-{task_id}-a1.service"
+        record = {
+            "operation": "task-start",
+            "record_sha256": "a" * 64,
+            "task_id": task_id,
+            "authoritative_unit": unit,
+            "launcher_outcome_unknown": True,
+            "recovery_required": True,
+        }
+        current = {
+            "task_id": task_id,
+            "attempt": 1,
+            "state": "completed",
+            "authoritative_unit": unit,
+            "lifecycle_receipt_sha256": "b" * 64,
+            "terminalization_sha256": "c" * 64,
+            "terminalized_at_unix": now - 100,
+            "terminal_evidence_valid": True,
+        }
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                [(record, now - 500)],
+                as_of_unix=now,
+                audit_source_binding={
+                    "snapshot_sha256": "d" * 64,
+                    "last_record_sha256": "a" * 64,
+                },
+                task_terminal_provider=lambda observed_task_id: (
+                    current if observed_task_id == task_id else None
+                ),
+            )
+        uncertain = result["signals"][0]
+        self.assertEqual(uncertain["id"], "uncertain_outcome")
+        self.assertEqual(uncertain["status"], "clear")
+        self.assertEqual(uncertain["severity"], "none")
+        self.assertEqual(uncertain["count"], 0)
+        self.assertEqual(uncertain["observed_count"], 1)
+        self.assertEqual(
+            uncertain["evidence_refs"],
+            ["audit-record-sha256:" + "a" * 64],
+        )
+        self.assertEqual(uncertain["details"]["historical_observed_count"], 1)
+        self.assertEqual(uncertain["details"]["terminally_resolved_count"], 1)
+        self.assertEqual(uncertain["details"]["unresolved_current_count"], 0)
+        resolution = uncertain["details"]["terminal_resolutions"][0]
+        self.assertEqual(resolution["task_id"], task_id)
+        self.assertEqual(resolution["attempt"], 1)
+        self.assertEqual(resolution["lifecycle_receipt_sha256"], "b" * 64)
+        self.assertIn("historical_uncertainty_was_false", uncertain["does_not_establish"])
+
+    def test_uncertain_outcome_resolution_fails_closed_on_terminal_evidence_drift(self) -> None:
+        now = 1_800_000_000
+        task_id = "2" * 24
+        unit = f"grabowski-task-{task_id}-a1.service"
+        record = {
+            "operation": "task-start",
+            "record_sha256": "d" * 64,
+            "task_id": task_id,
+            "authoritative_unit": unit,
+            "launcher_outcome_unknown": True,
+        }
+        valid = {
+            "task_id": task_id,
+            "attempt": 1,
+            "state": "completed",
+            "authoritative_unit": unit,
+            "lifecycle_receipt_sha256": "e" * 64,
+            "terminalization_sha256": "f" * 64,
+            "terminalized_at_unix": now - 100,
+            "terminal_evidence_valid": True,
+        }
+        variants = {
+            "task_id": {**valid, "task_id": "3" * 24},
+            "unit": {**valid, "authoritative_unit": unit.replace("-a1.service", "-a2.service")},
+            "attempt": {**valid, "attempt": 2},
+            "state": {**valid, "state": "failed"},
+            "unverified_terminal_evidence": {**valid, "terminal_evidence_valid": False},
+            "lifecycle_receipt": {**valid, "lifecycle_receipt_sha256": "invalid"},
+            "terminalization": {**valid, "terminalization_sha256": "invalid"},
+            "terminal_time": {**valid, "terminalized_at_unix": now - 600},
+        }
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            for name, current in variants.items():
+                with self.subTest(name=name):
+                    result = signal.build_projection(
+                        [(record, now - 500)],
+                        as_of_unix=now,
+                        audit_source_binding={},
+                        task_terminal_provider=lambda _task_id, value=current: value,
+                    )
+                    uncertain = result["signals"][0]
+                    self.assertEqual(uncertain["status"], "observed")
+                    self.assertEqual(uncertain["severity"], "critical")
+                    self.assertEqual(uncertain["count"], 1)
+                    self.assertEqual(uncertain["observed_count"], 1)
+                    self.assertEqual(uncertain["details"]["terminally_resolved_count"], 0)
+
+    def test_uncertain_outcome_provider_failure_preserves_critical_signal(self) -> None:
+        now = 1_800_000_000
+        task_id = "4" * 24
+        record = {
+            "operation": "task-start",
+            "record_sha256": "1" * 64,
+            "task_id": task_id,
+            "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
+            "launcher_outcome_unknown": True,
+        }
+
+        def fail_provider(_task_id: str) -> dict[str, object]:
+            raise RuntimeError("task store unavailable")
+
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                [(record, now - 500)],
+                as_of_unix=now,
+                audit_source_binding={},
+                task_terminal_provider=fail_provider,
+            )
+        uncertain = result["signals"][0]
+        self.assertEqual(uncertain["status"], "observed")
+        self.assertEqual(uncertain["severity"], "critical")
+        self.assertEqual(uncertain["count"], 1)
+
     def test_contract_contradiction_requires_conflict_language(self) -> None:
         normal = {
             "failure_class": "contract_error",
