@@ -84,6 +84,29 @@ def _validated_credential_data_adapter(
     return data
 
 
+def _claude_quota_readiness() -> dict[str, Any]:
+    """Bind the fact that remaining Claude subscription quota is not observable here.
+
+    Authentication and an intact local credential prove only that Claude Code can
+    attempt provider access. They do not prove remaining five-hour or weekly quota.
+    The benchmark must never spend a model request merely to discover that state.
+    """
+
+    return {
+        "status": "unknown",
+        "source": "non_consuming_quota_surface_not_configured",
+        "authentication_is_quota_evidence": False,
+        "provider_available": None,
+        "remaining_five_hour_quota": None,
+        "remaining_weekly_quota": None,
+        "does_not_establish": [
+            "remaining_five_hour_quota",
+            "remaining_weekly_quota",
+            "provider_availability",
+        ],
+    }
+
+
 def _dispatch_provider_binding_adapter(
     claude: str, synthetic: bool
 ) -> dict[str, Any]:
@@ -141,6 +164,7 @@ def _dispatch_provider_binding_adapter(
             "sha256": credential_sha256,
             "mode": oct(credential_metadata.st_mode & 0o777),
         },
+        "quota_readiness": _claude_quota_readiness(),
     }
 
 
