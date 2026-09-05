@@ -6,9 +6,11 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import stat
 import subprocess
 import sys
+import time
 from typing import Any, BinaryIO
 
 from grabowski_operator_fence import (
@@ -24,6 +26,7 @@ RESPONSE_KIND = "grabowski.operator_fence_rpc_response"
 MAX_REQUEST_BYTES = 32 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 10
+SERVER_REQUEST_TIMEOUT_SECONDS = 5
 REMOTE_COMMAND = "operator-fence-rpc-v1"
 IDENTITY_RE = re.compile(r"[A-Za-z0-9._:@/-]+\Z")
 ALLOWED_PEERS = frozenset({"grabowski", "der-kleine-maulwurf"})
@@ -160,6 +163,59 @@ def _request_from_bytes(raw: bytes) -> dict[str, Any]:
     return _canonical_request(value)
 
 
+def _read_request_frame(
+    input_stream: BinaryIO, *, timeout_seconds: float = SERVER_REQUEST_TIMEOUT_SECONDS
+) -> bytes:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or timeout_seconds <= 0
+        or timeout_seconds > 60
+    ):
+        raise OperatorFenceRpcError("invalid_request_timeout")
+    try:
+        descriptor = input_stream.fileno()
+    except (AttributeError, OSError):
+        raw = input_stream.read(MAX_REQUEST_BYTES + 1)
+        newline = raw.find(b"\n")
+        if newline < 0:
+            if len(raw) > MAX_REQUEST_BYTES:
+                raise OperatorFenceRpcError("invalid_request_bytes")
+            raise OperatorFenceRpcError("request_frame_incomplete")
+        frame = raw[: newline + 1]
+        if len(frame) > MAX_REQUEST_BYTES or raw[newline + 1 :].strip():
+            raise OperatorFenceRpcError("invalid_request_bytes")
+        return frame
+
+    deadline = time.monotonic() + float(timeout_seconds)
+    buffered = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OperatorFenceRpcError("request_timeout")
+        try:
+            readable, _, _ = select.select([descriptor], [], [], remaining)
+        except (OSError, ValueError) as exc:
+            raise OperatorFenceRpcError("request_read_failed") from exc
+        if not readable:
+            raise OperatorFenceRpcError("request_timeout")
+        try:
+            chunk = os.read(descriptor, min(4096, MAX_REQUEST_BYTES + 1 - len(buffered)))
+        except OSError as exc:
+            raise OperatorFenceRpcError("request_read_failed") from exc
+        if not chunk:
+            raise OperatorFenceRpcError("request_frame_incomplete")
+        newline = chunk.find(b"\n")
+        if newline >= 0:
+            buffered.extend(chunk[: newline + 1])
+            if len(buffered) > MAX_REQUEST_BYTES or chunk[newline + 1 :].strip():
+                raise OperatorFenceRpcError("invalid_request_bytes")
+            return bytes(buffered)
+        buffered.extend(chunk)
+        if len(buffered) >= MAX_REQUEST_BYTES:
+            raise OperatorFenceRpcError("invalid_request_bytes")
+
+
 def _success_response(*, request_id: str, peer_id: str, result: Any) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -260,9 +316,9 @@ def serve_once(
             output_stream.write(_canonical_json_bytes(response) + b"\n")
             output_stream.flush()
             return 0
-    raw = input_stream.read(MAX_REQUEST_BYTES + 1)
     request_id = "invalid"
     try:
+        raw = _read_request_frame(input_stream)
         request = _request_from_bytes(raw)
         request_id = request["request_id"]
         store = OperatorFenceStore(_validate_state_path(state_path))
@@ -327,6 +383,25 @@ def _validate_identity_file(path_value: str | os.PathLike[str]) -> Path:
     )
 
 
+def _validate_ssh_executable(path_value: str | os.PathLike[str]) -> Path:
+    path = Path(path_value)
+    if not path.is_absolute() or path.is_symlink():
+        raise OperatorFenceRpcError("unsafe_ssh_executable")
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise OperatorFenceRpcError("unsafe_ssh_executable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_nlink < 1
+        or info.st_mode & 0o022
+        or not info.st_mode & 0o111
+    ):
+        raise OperatorFenceRpcError("unsafe_ssh_executable")
+    return path
+
+
 class OperatorFenceSshClient:
     def __init__(
         self,
@@ -352,10 +427,7 @@ class OperatorFenceSshClient:
         self.host_key_alias = _bounded_identity(
             host_key_alias or self.host, "host_key_alias", maximum=255
         )
-        executable = Path(ssh_executable)
-        if not executable.is_absolute():
-            raise OperatorFenceRpcError("ssh_executable_not_absolute")
-        self.ssh_executable = str(executable)
+        self.ssh_executable = str(_validate_ssh_executable(ssh_executable))
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
             raise OperatorFenceRpcError("invalid_timeout")
         if timeout_seconds < 1 or timeout_seconds > 60:
@@ -546,6 +618,7 @@ __all__ = [
     "REQUEST_KIND",
     "RESPONSE_KIND",
     "SCHEMA_VERSION",
+    "SERVER_REQUEST_TIMEOUT_SECONDS",
     "dispatch_request",
     "main",
     "request_document",

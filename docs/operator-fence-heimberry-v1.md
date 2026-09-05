@@ -22,13 +22,25 @@ A production fence MUST NOT run as the ordinary Heimberry `alex` account. Grabow
 The production deployment therefore uses a dedicated OS identity, named here `operator-fence`, with these properties:
 
 - no sudo/admin membership;
-- no interactive password login;
+- a locked password and no interactive password login;
 - no ordinary shell-authorized SSH key;
 - only the two dedicated forced-command public keys;
-- a private state directory owned by `operator-fence` and not writable by `alex`;
+- a root-owned, non-writable login home and SSH authorization policy;
+- a separate private state directory owned by `operator-fence` and not writable by `alex` without root escalation;
 - an immutable/versioned reviewed runtime path that `operator-fence` can execute but cannot rewrite.
 
-Root remains capable of repairing the host and is outside the normal online writer model. Such repair is recovery/break-glass, not ordinary failover authority.
+The login home and mutable fence state MUST be different directories. A suitable layout is:
+
+```text
+/var/lib/operator-fence-home/           root:root 0755
+/var/lib/operator-fence-home/.ssh/      root:root 0700
+/var/lib/operator-fence-home/.ssh/authorized_keys  root:root 0600
+/var/lib/operator-fence/                operator-fence:operator-fence 0700
+```
+
+This prevents the forced-command account from replacing its own `authorized_keys` policy. The account needs an executable shell such as `/bin/sh` because `sshd` uses the login shell to start the forced command; the locked password and root-owned authorization home, not a `nologin` shell, enforce the non-interactive boundary.
+
+Root remains capable of repairing the host and is outside the normal online writer model. Such repair is recovery/break-glass, not ordinary failover authority. G6.4 must ensure that operator-originated mutating fleet/root paths cannot be used to bypass the fence.
 
 A temporary `alex`-owned deployment may be used only as a clearly separate G6.3 canary to prove wire behavior. Its generation/state must never be promoted as production authority.
 
@@ -58,7 +70,7 @@ Recommended production state path:
 /var/lib/operator-fence/fence.sqlite3
 ```
 
-The directory and all durable state are owned by `operator-fence`. The ordinary `alex` account must have no write permission there.
+The directory and all durable state are owned by `operator-fence`. The ordinary `alex` account must have no write permission there without explicit root escalation.
 
 `OperatorFenceStore` owns the SQLite database and its private durable sidecars. Generation/anchor reconciliation, in-flight state, settlements and replay protection remain properties of the G6.2 core; the RPC layer does not create a second truth.
 
@@ -80,7 +92,7 @@ Install the exact reviewed files from one commit-bound Grabowski source under a 
 /opt/grabowski-operator-fence/<commit>/tools/grabowski_operator_fence_rpc.py
 ```
 
-The wrapper adds its sibling release `src/` to `sys.path`. Do not run production authority from a mutable checkout.
+The wrapper adds its sibling release `src/` to `sys.path`. Do not run production authority from a mutable checkout. The repository wrapper is intentionally not required to be executable; the forced command invokes the fixed system interpreter `/usr/bin/python3 -I` explicitly. Isolated mode ignores Python environment variables and the user site before the wrapper pins the reviewed release `src/` path.
 
 No service needs to listen. `sshd` starts the forced command on demand.
 
@@ -88,13 +100,13 @@ No service needs to listen. `sshd` starts the forced command on demand.
 
 Use a different client key for each operator. Do not reuse either operator's normal administrative SSH identity.
 
-Each client private key must be owned by its operator account and mode `0600`. The client helper uses `IdentitiesOnly=yes`, so an agent-loaded administrative key cannot silently replace the selected fence identity.
+Each client private key must be owned by its operator account and mode `0600`. The client helper uses `IdentitiesOnly=yes` and `IdentityAgent=none`, so an agent-loaded administrative key cannot silently replace the selected fence identity.
 
-The public halves are the only SSH keys authorized for `operator-fence`, with separate forced commands. Schematic entries:
+The public halves are the only SSH keys authorized for `operator-fence`, with separate forced commands. The authorization file is root-owned as described above. Schematic entries:
 
 ```text
-restrict,command="/opt/grabowski-operator-fence/<commit>/tools/grabowski_operator_fence_rpc.py serve --state-path /var/lib/operator-fence/fence.sqlite3 --peer-id grabowski" ssh-ed25519 <PRIMARY-PUBLIC-KEY>
-restrict,command="/opt/grabowski-operator-fence/<commit>/tools/grabowski_operator_fence_rpc.py serve --state-path /var/lib/operator-fence/fence.sqlite3 --peer-id der-kleine-maulwurf" ssh-ed25519 <SECONDARY-PUBLIC-KEY>
+restrict,command="/usr/bin/python3 -I /opt/grabowski-operator-fence/<commit>/tools/grabowski_operator_fence_rpc.py serve --state-path /var/lib/operator-fence/fence.sqlite3 --peer-id grabowski" ssh-ed25519 <PRIMARY-PUBLIC-KEY>
+restrict,command="/usr/bin/python3 -I /opt/grabowski-operator-fence/<commit>/tools/grabowski_operator_fence_rpc.py serve --state-path /var/lib/operator-fence/fence.sqlite3 --peer-id der-kleine-maulwurf" ssh-ed25519 <SECONDARY-PUBLIC-KEY>
 ```
 
 `restrict` denies forwarding, PTY and related SSH side channels. The RPC server additionally requires the client-supplied original command to be exactly:
@@ -114,7 +126,7 @@ Each operator uses a dedicated private `known_hosts` file containing the trusted
 - one hard link;
 - no group/world write permission.
 
-`ssh` is invoked with `StrictHostKeyChecking=yes`, an explicit `UserKnownHostsFile`, and an explicit `HostKeyAlias`. DNS/Tailscale name resolution therefore does not replace host-key verification.
+`ssh` is invoked with `-F /dev/null`, `StrictHostKeyChecking=yes`, an explicit `UserKnownHostsFile`, `GlobalKnownHostsFile=/dev/null`, disabled proxy/jump/multiplexing/agent paths and an explicit `HostKeyAlias`. DNS/Tailscale name resolution therefore does not replace host-key verification.
 
 ## RPC contract
 
@@ -144,6 +156,8 @@ The request shape is exact:
 
 The response is bound to both `request_id` and the expected authenticated `peer_id`. A mismatching peer or request is a transport-contract failure, not an application result.
 
+Authentication establishes which operator made the request; it does not by itself prove an external effect. In particular, `reconcile` still consumes the G6.2 evidence digest contract. G6.4 must bind reconciliation to an actual target-state readback/typed proof before automatic failover may rely on it.
+
 ## Failure semantics
 
 If Heimberry or SSH is unavailable, the RPC client fails closed. G6.4 must interpret that as **no mutation authority**. It must not fall back to a local fence, stale cached lease or the other operator.
@@ -155,7 +169,7 @@ READ  = allowed by the normal local read policy
 WRITE = denied because no fresh global fence decision exists
 ```
 
-A live writer lease denies the other peer. An unresolved in-flight effect continues to deny takeover after lease expiry. `outcome_unknown` must be reconciled through the same authoritative Heimberry store before a new writer can be acquired.
+A live writer lease denies the other peer. An unresolved in-flight effect continues to deny takeover after lease expiry. `outcome_unknown` must be reconciled through the same authoritative Heimberry store before a new writer can be acquired. Authentication alone is insufficient evidence to settle the effect; automatic reconciliation belongs to G6.4's typed readback integration.
 
 ## Recovery boundary
 
@@ -169,19 +183,20 @@ G6.3 is complete only when all of these are evidenced:
 
 1. the RPC and G6.2 core tests pass together;
 2. production state is owned by the dedicated `operator-fence` identity, not `alex`;
-3. each peer identity is forced by a distinct SSH key;
-4. Heimberry host identity is pinned by each client;
-5. a real primary `status/acquire/release` round trip succeeds against Heimberry;
-6. a second client cannot acquire while the first writer lease is live;
-7. an unresolved in-flight operation prevents takeover after lease expiry;
-8. the normal `alex` account cannot write the production fence state;
-9. no new public listener exists on Heimberry.
+3. the account cannot rewrite its own SSH authorization policy or reviewed runtime;
+4. each peer identity is forced by a distinct SSH key;
+5. Heimberry host identity is pinned by each client;
+6. a real primary `status/acquire/release` round trip succeeds against Heimberry;
+7. a second client cannot acquire while the first writer lease is live;
+8. an unresolved in-flight operation prevents takeover after lease expiry;
+9. the normal `alex` account cannot write the production fence state without root escalation;
+10. no new public listener exists on Heimberry.
 
 Secondary credential provisioning may be completed with G6.5 only if G6.3 remains explicitly non-production. Production authority is not declared until both peer identities and the dedicated service-account boundary have real host evidence.
 
 ## Next slices
 
-- **G6.4:** insert this authority into the central EffectInterceptor in shadow mode, then enforce it for every mutating effect.
+- **G6.4:** insert this authority into the central EffectInterceptor in shadow mode, bind reconciliation to typed target-state proof, and then enforce it for every mutating effect including fleet/root paths.
 - **G6.5:** provision der kleine Maulwurf's dedicated fence/GitHub credentials and a minimal `failover-mutate` capability profile.
 - **G6.6:** implement classified failover/failback routing; policy or safety denials are never failover triggers.
 - **G6.7:** adversarial race, partition, stale-generation, response-loss, in-flight-death and coordinator-death drills.

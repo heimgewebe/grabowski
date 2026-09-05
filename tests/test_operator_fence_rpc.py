@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -15,6 +16,7 @@ import grabowski_operator_fence_rpc as rpc
 
 INTENT = "a" * 64
 EVIDENCE = "b" * 64
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class Clock:
@@ -273,6 +275,37 @@ class OperatorFenceRpcTests(unittest.TestCase):
         with self.assertRaises(rpc.OperatorFenceRpcError):
             rpc._request_from_bytes(b"x" * (rpc.MAX_REQUEST_BYTES + 1))
 
+    def test_request_frame_requires_newline_and_has_absolute_read_timeout(self) -> None:
+        with self.assertRaises(rpc.OperatorFenceRpcError) as incomplete:
+            rpc._read_request_frame(BytesIO(b"{}"))
+        self.assertEqual(incomplete.exception.code, "request_frame_incomplete")
+
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(read_fd, "rb", buffering=0) as reader:
+                with self.assertRaises(rpc.OperatorFenceRpcError) as timed_out:
+                    rpc._read_request_frame(reader, timeout_seconds=0.01)
+            self.assertEqual(timed_out.exception.code, "request_timeout")
+        finally:
+            os.close(write_fd)
+
+        framed = rpc._canonical_json_bytes(request("frame-1", "status")) + b"\n"
+        self.assertEqual(rpc._read_request_frame(BytesIO(framed)), framed)
+        with self.assertRaises(rpc.OperatorFenceRpcError) as trailing:
+            rpc._read_request_frame(BytesIO(framed + b"unexpected"))
+        self.assertEqual(trailing.exception.code, "invalid_request_bytes")
+
+    def test_documented_production_identity_boundary_is_not_self_mutable(self) -> None:
+        text = (ROOT / "docs" / "operator-fence-heimberry-v1.md").read_text(encoding="utf-8")
+        self.assertIn("/var/lib/operator-fence-home/", text)
+        self.assertIn("root:root 0600", text)
+        self.assertIn("/var/lib/operator-fence/", text)
+        self.assertIn("operator-fence:operator-fence 0700", text)
+        self.assertIn(
+            'restrict,command="/usr/bin/python3 -I /opt/grabowski-operator-fence/<commit>/tools/grabowski_operator_fence_rpc.py',
+            text,
+        )
+
     def test_ssh_client_requires_pinned_host_and_dedicated_private_identity(self) -> None:
         known_hosts, identity_file = self.ssh_material()
         client = rpc.OperatorFenceSshClient(
@@ -353,6 +386,45 @@ class OperatorFenceRpcTests(unittest.TestCase):
                 identity_file=identity_file,
             )
         self.assertEqual(invalid_user.exception.code, "invalid_remote_user")
+
+        fake_ssh = self.root / "ssh"
+        fake_ssh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(fake_ssh, 0o755)
+        with self.assertRaises(rpc.OperatorFenceRpcError) as unsafe_ssh:
+            rpc.OperatorFenceSshClient(
+                host="heimberry",
+                remote_user="alex",
+                expected_peer_id="grabowski",
+                known_hosts_path=known_hosts,
+                identity_file=identity_file,
+                ssh_executable=str(fake_ssh),
+            )
+        self.assertEqual(unsafe_ssh.exception.code, "unsafe_ssh_executable")
+
+    def test_wrapper_runs_under_python_isolated_mode(self) -> None:
+        payload = rpc._canonical_json_bytes(request("isolated-1", "status")) + b"\n"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(ROOT / "tools" / "grabowski_operator_fence_rpc.py"),
+                "local",
+                "--state-path",
+                str(self.root / "isolated" / "fence.sqlite3"),
+                "--peer-id",
+                "grabowski",
+            ],
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+        response = json.loads(completed.stdout)
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["peer_id"], "grabowski")
+        self.assertEqual(response["result"]["generation"], 0)
 
     def test_ssh_client_rejects_response_for_wrong_forced_peer(self) -> None:
         client = self.ssh_client()
