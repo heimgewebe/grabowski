@@ -717,6 +717,7 @@ _PLAN_LIMIT_403 = (
 _CAS_BASE = "a" * 40
 _CAS_HEAD = "b" * 40
 _CAS_MERGE = "c" * 40
+_CAS_TREE = "e" * 40
 _CAS_OTHER = "d" * 40
 _CAS_REF = "refs/heads/main"
 _CAS_HEAD_BRANCH = "feature/cas"
@@ -753,6 +754,43 @@ class _PlanLimitedRulesGh:
                 "stderr": "",
             }
         return {"returncode": 1, "stdout": "", "stderr": "unexpected call"}
+
+
+class _AuthenticatedUserGh:
+    def __init__(
+        self,
+        *,
+        login: str = "captain-owner",
+        account_id: int = 123456,
+        account_type: str = "User",
+        created_at: str = "2024-01-02T03:04:05Z",
+        returncode: int = 0,
+    ) -> None:
+        self.login = login
+        self.account_id = account_id
+        self.account_type = account_type
+        self.created_at = created_at
+        self.returncode = returncode
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, _repo: Path, args: list[str]) -> dict[str, object]:
+        self.calls.append(tuple(args))
+        if args != ["api", "user"]:
+            raise AssertionError(f"unexpected GitHub call: {args!r}")
+        if self.returncode != 0:
+            return {"returncode": self.returncode, "stdout": "", "stderr": "auth failed"}
+        return {
+            "returncode": 0,
+            "stdout": json.dumps(
+                {
+                    "login": self.login,
+                    "id": self.account_id,
+                    "type": self.account_type,
+                    "created_at": self.created_at,
+                }
+            ),
+            "stderr": "",
+        }
 
 
 class _ScriptedCasGit:
@@ -807,6 +845,8 @@ class _ScriptedCasGit:
                 "stdout": f"{_CAS_MERGE} {_CAS_BASE} {_CAS_HEAD}\n",
                 "stderr": "",
             }
+        if args == ["rev-parse", "HEAD^{tree}"]:
+            return {"returncode": 0, "stdout": _CAS_TREE + "\n", "stderr": ""}
         if args == ["ls-remote", "origin", _CAS_HEAD_REF]:
             if self.pushed:
                 return {"returncode": 0, "stdout": "", "stderr": ""}
@@ -932,6 +972,7 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
             head_sha=_CAS_HEAD,
             head_branch=_CAS_HEAD_BRANCH,
             pr_number=153,
+            github_runner=_AuthenticatedUserGh(),
             git_runner=git,
             on_dispatch=lambda: dispatched.append(True),
         )
@@ -947,6 +988,84 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
         self.assertNotIn(f"--force-with-lease={_CAS_REF}:{_CAS_BASE}", push)
         self.assertIn(f"HEAD:{_CAS_REF}", push)
         self.assertEqual(f":{_CAS_HEAD_REF}", push[-1])
+        merge_call = next(call for call in git.calls if "merge" in call)
+        self.assertIn("user.name=captain-owner", merge_call)
+        self.assertIn(
+            "user.email=123456+captain-owner@users.noreply.github.com", merge_call
+        )
+        self.assertNotIn("grabowski@localhost", " ".join(merge_call))
+        self.assertEqual(_CAS_TREE, evidence["merge_tree_sha"])
+        self.assertEqual("resolved", evidence["commit_identity"]["status"])
+        self.assertEqual(
+            "github_authenticated_user_api", evidence["commit_identity"]["source"]
+        )
+        self.assertEqual("id_plus_login", evidence["commit_identity"]["noreply_format"])
+        self.assertNotIn(
+            "@users.noreply.github.com", json.dumps(evidence["commit_identity"], sort_keys=True)
+        )
+
+    def test_exact_base_cas_commit_identity_does_not_change_observed_merge_tree(self) -> None:
+        observed_trees: list[str] = []
+        merge_calls: list[tuple[str, ...]] = []
+        for login, account_id in (("captain-one", 1001), ("captain-two", 1002)):
+            git = _ScriptedCasGit()
+            result, evidence = merge_guard._exact_base_git_cas_merge(
+                Path.cwd(),
+                repo_slug="heimgewebe/infra",
+                base_branch="main",
+                base_sha=_CAS_BASE,
+                head_sha=_CAS_HEAD,
+                head_branch=_CAS_HEAD_BRANCH,
+                pr_number=153,
+                github_runner=_AuthenticatedUserGh(login=login, account_id=account_id),
+                git_runner=git,
+            )
+            self.assertEqual(0, result["returncode"])
+            observed_trees.append(str(evidence["merge_tree_sha"]))
+            merge_calls.append(next(call for call in git.calls if "merge" in call))
+
+        self.assertEqual([_CAS_TREE, _CAS_TREE], observed_trees)
+        self.assertNotEqual(merge_calls[0], merge_calls[1])
+
+    def test_exact_base_cas_fails_closed_without_proven_github_noreply_identity(self) -> None:
+        git = _ScriptedCasGit()
+        github = _AuthenticatedUserGh(created_at="2016-01-02T03:04:05Z")
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot resolve provider-compatible GitHub commit identity"
+        ):
+            merge_guard._exact_base_git_cas_merge(
+                Path.cwd(),
+                repo_slug="heimgewebe/infra",
+                base_branch="main",
+                base_sha=_CAS_BASE,
+                head_sha=_CAS_HEAD,
+                head_branch=_CAS_HEAD_BRANCH,
+                pr_number=153,
+                github_runner=github,
+                git_runner=git,
+            )
+        self.assertEqual([("api", "user")], github.calls)
+        self.assertFalse(any(call[:1] == ("fetch",) for call in git.calls))
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
+
+    def test_exact_base_cas_blocks_authenticated_user_query_failure(self) -> None:
+        git = _ScriptedCasGit()
+        with self.assertRaisesRegex(
+            RuntimeError, "cannot resolve provider-compatible GitHub commit identity"
+        ):
+            merge_guard._exact_base_git_cas_merge(
+                Path.cwd(),
+                repo_slug="heimgewebe/infra",
+                base_branch="main",
+                base_sha=_CAS_BASE,
+                head_sha=_CAS_HEAD,
+                head_branch=_CAS_HEAD_BRANCH,
+                pr_number=153,
+                github_runner=_AuthenticatedUserGh(returncode=1),
+                git_runner=git,
+            )
+        self.assertFalse(any(call[:1] == ("fetch",) for call in git.calls))
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
 
     def test_exact_base_cas_blocks_head_drift_before_dispatch(self) -> None:
         git = _ScriptedCasGit(remote_head_before=_CAS_OTHER)
@@ -960,6 +1079,7 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
                 head_sha=_CAS_HEAD,
                 head_branch=_CAS_HEAD_BRANCH,
                 pr_number=153,
+                github_runner=_AuthenticatedUserGh(),
                 git_runner=git,
                 on_dispatch=lambda: dispatched.append(True),
             )
@@ -977,6 +1097,7 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
             head_sha=_CAS_HEAD,
             head_branch=_CAS_HEAD_BRANCH,
             pr_number=153,
+            github_runner=_AuthenticatedUserGh(),
             git_runner=git,
             on_dispatch=lambda: dispatched.append(True),
         )
@@ -996,6 +1117,7 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
                 head_sha=_CAS_HEAD,
                 head_branch=_CAS_HEAD_BRANCH,
                 pr_number=153,
+                github_runner=_AuthenticatedUserGh(),
                 git_runner=git,
                 on_dispatch=lambda: dispatched.append(True),
             )
@@ -1013,6 +1135,7 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
                 head_sha=_CAS_HEAD,
                 head_branch=_CAS_HEAD_BRANCH,
                 pr_number=153,
+                github_runner=_AuthenticatedUserGh(),
                 git_runner=git,
             )
         self.assertFalse(any(call[:1] == ("fetch",) for call in git.calls))
@@ -1028,6 +1151,7 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
                 head_sha=_CAS_HEAD,
                 head_branch=_CAS_HEAD_BRANCH,
                 pr_number=153,
+                github_runner=_AuthenticatedUserGh(),
                 git_runner=git,
             )
         self.assertFalse(any(call[:1] == ("fetch",) for call in git.calls))
@@ -1043,6 +1167,7 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
             head_sha=_CAS_HEAD,
             head_branch=_CAS_HEAD_BRANCH,
             pr_number=153,
+            github_runner=_AuthenticatedUserGh(),
             git_runner=git,
             on_dispatch=lambda: dispatched.append(True),
         )
