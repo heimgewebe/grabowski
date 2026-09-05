@@ -1549,7 +1549,9 @@ class SelfDeployToolTests(unittest.TestCase):
             acquire.assert_not_called()
 
     def test_schedule_materializes_auto_source_only_after_authority_and_main_recheck(self) -> None:
-        canonical = Path("/home/alex/repos/grabowski")
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
         source = Path("/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-test")
         runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
         expected = "d" * 40
@@ -1726,7 +1728,9 @@ class SelfDeployToolTests(unittest.TestCase):
             )
 
     def test_schedule_blocks_if_public_main_drifts_after_auto_source_materialization(self) -> None:
-        canonical = Path("/home/alex/repos/grabowski")
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
         source = Path("/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-test")
         runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
         expected = "d" * 40
@@ -1777,7 +1781,9 @@ class SelfDeployToolTests(unittest.TestCase):
 
     def test_schedule_does_not_materialize_auto_source_when_root_authority_fails(self) -> None:
         expected = "d" * 40
-        canonical = Path("/home/alex/repos/grabowski")
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
         with patch.object(
             SELF_DEPLOY,
             "CANONICAL_REPOSITORY",
@@ -3493,17 +3499,6 @@ class SelfDeployToolTests(unittest.TestCase):
 
 class ScheduledDeployRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.recovery_state = tempfile.TemporaryDirectory()
-        self.addCleanup(self.recovery_state.cleanup)
-        self.recovery_receipt_root = Path(self.recovery_state.name) / "blue-green-receipts"
-        self.recovery_receipt_root.mkdir()
-        self.recovery_root_patch = patch.object(
-            RUNNER.deploy_dual,
-            "BLUE_GREEN_RECEIPT_ROOT",
-            self.recovery_receipt_root,
-        )
-        self.recovery_root_patch.start()
-        self.addCleanup(self.recovery_root_patch.stop)
         self.productive_blue_green = patch.object(
             RUNNER,
             "run_productive_blue_green",
