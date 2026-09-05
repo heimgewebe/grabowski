@@ -618,6 +618,59 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual(request_path.stem, result["adapter_request_sha256"])
         self.assertEqual(str(repository), request["repo"])
 
+    def test_candidate_record_rejects_unresolved_repo_convenience_before_effect(self) -> None:
+        foreign = self._git_repository(
+            "foreign-record", origin="git@github.com:other/foreign.git"
+        )
+        for repo_selector in (str(foreign), "other/bureau", "heimgewebe/bureau/extra"):
+            with self.subTest(repo_selector=repo_selector):
+                request = {
+                    "schema_version": 1,
+                    "idempotency_key": f"conversation:invalid-repo:{hashlib.sha256(repo_selector.encode()).hexdigest()[:12]}",
+                    "title": "Record candidate",
+                    "source_kind": "conversation",
+                    "desired_outcome": "Create one task",
+                    "repo": repo_selector,
+                }
+                with mock.patch.object(intake, "_invoke_bureau") as invoke:
+                    result = intake.grabowski_bureau_candidate_record(request)
+                self.assertEqual(result["code"], "candidate-repo-selector-invalid")
+                self.assertFalse(result["effect_started"])
+                self.assertFalse(result["ambiguity"])
+                self.assertFalse(result["retryable"])
+                self.assertEqual(
+                    result["details"],
+                    {
+                        "reason": "unresolved-adapter-convenience-selector",
+                        "bureau_domain_validation_attempted": False,
+                    },
+                )
+                invoke.assert_not_called()
+                requests = self.artifacts / "requests"
+                self.assertFalse(requests.exists())
+
+    def test_candidate_record_leaves_canonical_repo_resource_to_bureau(self) -> None:
+        request = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:canonical-unknown-repo:1",
+            "title": "Record candidate",
+            "source_kind": "conversation",
+            "desired_outcome": "Create one task",
+            "repo": "repo.future-resource",
+        }
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "kind": "bureau_candidate_record_result",
+                "status": "recorded",
+            },
+        ) as invoke:
+            result = intake.grabowski_bureau_candidate_record(request)
+        request_path = Path(invoke.call_args.args[0][-1])
+        self.assertEqual(json.loads(request_path.read_text()), request)
+        self.assertEqual(result["status"], "recorded")
+
     def test_candidate_repo_path_normalization_accepts_safe_scp_ssh_username(self) -> None:
         repository = self._git_repository(
             "alternate-ssh-user",
