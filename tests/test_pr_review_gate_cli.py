@@ -52,13 +52,228 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
         with (
             mock.patch.object(pr_review_gate, "_run_json", side_effect=fake_run_json),
-            mock.patch.object(pr_review_gate, "_run_bytes", return_value=b"diff --git a/x b/x\n"),
+            mock.patch.object(pr_review_gate, "_current_pr_diff_bytes", return_value=(b"diff --git a/x b/x\n", None, False)),
         ):
             state = pr_review_gate.load_pr_state(Path("/tmp/fork-checkout"), 7)
 
         self.assertEqual(state["repoName"], "heimgewebe/weltgewebe")
         self.assertEqual(state["checkoutRepoName"], "contributor/weltgewebe")
         self.assertFalse(any(call[:2] == ["gh", "api"] for call in calls), calls)
+
+
+    def test_too_large_provider_diff_falls_back_to_exact_local_canonical_diff(self) -> None:
+        head = "a" * 40
+        base = "b" * 40
+        view = {
+            "number": 226,
+            "url": "https://github.com/heimgewebe/commonworld/pull/226",
+            "headRefOid": head,
+            "baseRefOid": base,
+            "changedFiles": 1,
+        }
+        local_diff = (
+            b"diff --git a/assets/a.js b/assets/a.js\n"
+            b"index 123456789abcdef..abcdef0123456789 100644\n"
+            b"--- a/assets/a.js\n"
+            b"+++ b/assets/a.js\n"
+            b"@@ -1 +1 @@\n"
+            b"-old\n"
+            b"+new\n"
+        )
+
+        def fake_run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+            del repo, allow_nonzero
+            if argv[:3] == ["gh", "pr", "view"]:
+                return dict(view)
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return []
+            if argv[:3] == ["gh", "repo", "view"]:
+                return {"nameWithOwner": "heimgewebe/commonworld"}
+            if argv[:2] == ["gh", "api"]:
+                return [[{"filename": "assets/a.js", "status": "modified"}]]
+            raise AssertionError(argv)
+
+        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+            del repo, allow_nonzero
+            if argv[0] == "git" and "--name-only" in argv:
+                return b"assets/a.js\0"
+            if argv[0] == "git" and "diff" in argv:
+                return local_diff
+            raise AssertionError(argv)
+
+        with (
+            mock.patch.object(pr_review_gate, "_run_json", side_effect=fake_run_json),
+            mock.patch.object(
+                pr_review_gate,
+                "_current_pr_diff_bytes",
+                return_value=(None, "command failed: gh pr diff 226", True),
+            ),
+            mock.patch.object(pr_review_gate, "_run_bytes", side_effect=fake_run_bytes),
+        ):
+            state = pr_review_gate.load_pr_state(Path("/tmp/commonworld"), 226)
+
+        self.assertEqual(
+            state["pr_diff_sha256"],
+            pr_review_gate.github_pr_diff_identity_sha256(local_diff),
+        )
+        self.assertEqual(
+            state["pr_diff_text"].encode("utf-8"),
+            pr_review_gate.canonicalize_github_pr_diff_identity(local_diff),
+        )
+        self.assertIsNone(state["pr_diff_error"])
+        self.assertEqual(
+            state["pr_diff_source"], "local-bound-git-diff-after-github-too-large"
+        )
+        self.assertIn("gh pr diff", state["pr_diff_provider_error"])
+
+    def test_non_too_large_provider_failure_stays_fail_closed(self) -> None:
+        view = {
+            "number": 226,
+            "url": "https://github.com/heimgewebe/commonworld/pull/226",
+            "headRefOid": "a" * 40,
+            "baseRefOid": "b" * 40,
+            "changedFiles": 1,
+        }
+
+        def fake_run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+            del repo, allow_nonzero
+            if argv[:3] == ["gh", "pr", "view"]:
+                return dict(view)
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return []
+            if argv[:3] == ["gh", "repo", "view"]:
+                return {"nameWithOwner": "heimgewebe/commonworld"}
+            if argv[:2] == ["gh", "api"]:
+                return [[{"filename": "assets/a.js", "status": "modified"}]]
+            raise AssertionError(argv)
+
+        with (
+            mock.patch.object(pr_review_gate, "_run_json", side_effect=fake_run_json),
+            mock.patch.object(
+                pr_review_gate,
+                "_current_pr_diff_bytes",
+                return_value=(None, "command failed: gh pr diff 226", False),
+            ),
+            mock.patch.object(pr_review_gate, "_run_bytes") as run_bytes,
+        ):
+            state = pr_review_gate.load_pr_state(Path("/tmp/commonworld"), 226)
+
+        run_bytes.assert_not_called()
+        self.assertIsNone(state["pr_diff_sha256"])
+        self.assertIsNone(state["pr_diff_text"])
+        self.assertIsNone(state["pr_diff_source"])
+        self.assertEqual(state["pr_diff_error"], "command failed: gh pr diff 226")
+
+    def test_local_diff_fallback_rejects_changed_path_drift(self) -> None:
+        view = {
+            "number": 226,
+            "url": "https://github.com/heimgewebe/commonworld/pull/226",
+            "headRefOid": "a" * 40,
+            "baseRefOid": "b" * 40,
+            "changedFiles": 1,
+        }
+
+        def fake_run_json(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+            del repo, allow_nonzero
+            if argv[:3] == ["gh", "pr", "view"]:
+                return dict(view)
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return []
+            if argv[:3] == ["gh", "repo", "view"]:
+                return {"nameWithOwner": "heimgewebe/commonworld"}
+            if argv[:2] == ["gh", "api"]:
+                return [[{"filename": "assets/a.js", "status": "modified"}]]
+            raise AssertionError(argv)
+
+        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+            del repo, allow_nonzero
+            if argv[0] == "git" and "--name-only" in argv:
+                return b"assets/other.js\0"
+            raise AssertionError(argv)
+
+        with (
+            mock.patch.object(pr_review_gate, "_run_json", side_effect=fake_run_json),
+            mock.patch.object(
+                pr_review_gate,
+                "_current_pr_diff_bytes",
+                return_value=(None, "command failed: gh pr diff 226", True),
+            ),
+            mock.patch.object(pr_review_gate, "_run_bytes", side_effect=fake_run_bytes),
+        ):
+            state = pr_review_gate.load_pr_state(Path("/tmp/commonworld"), 226)
+
+        self.assertIsNone(state["pr_diff_sha256"])
+        self.assertIsNone(state["pr_diff_text"])
+        self.assertIsNone(state["pr_diff_source"])
+        self.assertIn("changed paths do not match", state["pr_diff_error"])
+
+    def test_too_large_classifier_requires_marker_and_file_threshold(self) -> None:
+        completed = mock.Mock(
+            returncode=1,
+            stdout=b"",
+            stderr=b"GraphQL: PullRequest.diff too_large",
+        )
+        with (
+            mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(pr_review_gate.subprocess, "run", return_value=completed),
+        ):
+            _, _, large = pr_review_gate._current_pr_diff_bytes(
+                Path("/tmp/commonworld"), 226, changed_files=301
+            )
+            _, _, threshold = pr_review_gate._current_pr_diff_bytes(
+                Path("/tmp/commonworld"), 226, changed_files=300
+            )
+
+        self.assertTrue(large)
+        self.assertFalse(threshold)
+
+        import grabowski_merge_guard as merge_guard
+
+        self.assertEqual(
+            pr_review_gate.GITHUB_PR_DIFF_MAX_FILES,
+            merge_guard._MERGE_GUARD_GITHUB_DIFF_MAX_FILES,
+        )
+
+    def test_local_diff_fallback_rejects_untrusted_file_metadata(self) -> None:
+        invalid_path = {
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "../escape.py", "status": "modified"}],
+        }
+        unknown_status = {
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "safe.py", "status": "changed"}],
+        }
+        copied_without_source = {
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "copy.py", "status": "copied"}],
+        }
+
+        self.assertIsNone(pr_review_gate._complete_pr_diff_paths(invalid_path))
+        self.assertIsNone(pr_review_gate._complete_pr_diff_paths(unknown_status))
+        self.assertIsNone(pr_review_gate._complete_pr_diff_paths(copied_without_source))
+
+    def test_external_review_packet_reuses_hash_bound_state_diff(self) -> None:
+        raw = (
+            b"diff --git a/a b/a\n"
+            b"index 123456789abcdef..abcdef0123456789 100644\n"
+            b"--- a/a\n"
+            b"+++ b/a\n"
+        )
+        canonical = pr_review_gate.canonicalize_github_pr_diff_identity(raw)
+        state = {
+            "pr_diff_text": canonical.decode("utf-8"),
+            "pr_diff_sha256": pr_review_gate._sha256_bytes(canonical),
+            "pr_diff_error": None,
+        }
+
+        self.assertEqual(
+            pr_review_gate._bound_pr_diff_bytes_from_state(state), canonical
+        )
+        state["pr_diff_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            pr_review_gate.GateInputError, "does not match its bound SHA-256"
+        ):
+            pr_review_gate._bound_pr_diff_bytes_from_state(state)
 
     def test_malformed_or_mismatched_pr_url_has_no_target_identity(self) -> None:
         self.assertIsNone(pr_review_gate._target_repo_from_pr_url("https://github.com/a/b/pull/8", expected_pr=7))
