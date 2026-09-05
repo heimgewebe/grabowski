@@ -400,6 +400,133 @@ class ExternalConnectorGatewayTests(unittest.TestCase):
         self.assertNotIn("resources/read", gateway.ALLOWED_JSON_RPC_METHODS)
         self.assertNotIn("prompts/get", gateway.ALLOWED_JSON_RPC_METHODS)
 
+    def test_oauth_redirect_uri_is_limited_to_grok_and_xai_https(self) -> None:
+        for value in (
+            "https://grok.com/oauth/callback",
+            "https://accounts.x.ai/connectors/oauth/callback",
+        ):
+            self.assertTrue(gateway._oauth_redirect_uri_allowed(value))
+        for value in (
+            "http://grok.com/oauth/callback",
+            "https://evil.example/oauth/callback",
+            "https://grok.com.evil.example/oauth/callback",
+            "https://user@grok.com/oauth/callback",
+            "https://grok.com/oauth/callback#fragment",
+        ):
+            self.assertFalse(gateway._oauth_redirect_uri_allowed(value))
+
+    def test_oauth_code_is_pkce_bound_expiring_and_single_use(self) -> None:
+        verifier = "A" * 43
+        redirect = "https://grok.com/oauth/callback"
+        client_id = gateway._oauth_client_id("maulwurf-x")
+        code = gateway._oauth_issue_code(
+            secret=self.EXTERNAL,
+            connector_id="maulwurf-x",
+            client_id=client_id,
+            redirect_uri=redirect,
+            code_challenge=gateway._oauth_pkce_s256(verifier),
+            now=1000,
+        )
+        consumed: set[str] = set()
+        self.assertTrue(
+            gateway._oauth_consume_code(
+                code,
+                secret=self.EXTERNAL,
+                connector_id="maulwurf-x",
+                client_id=client_id,
+                redirect_uri=redirect,
+                code_verifier=verifier,
+                consumed=consumed,
+                now=1001,
+            )
+        )
+        self.assertFalse(
+            gateway._oauth_consume_code(
+                code,
+                secret=self.EXTERNAL,
+                connector_id="maulwurf-x",
+                client_id=client_id,
+                redirect_uri=redirect,
+                code_verifier=verifier,
+                consumed=consumed,
+                now=1001,
+            )
+        )
+        self.assertFalse(
+            gateway._oauth_consume_code(
+                code,
+                secret=self.EXTERNAL,
+                connector_id="maulwurf-x",
+                client_id=client_id,
+                redirect_uri=redirect,
+                code_verifier=verifier,
+                consumed=set(),
+                now=1120,
+            )
+        )
+
+    def test_oauth_code_rejects_wrong_verifier_redirect_and_signature(self) -> None:
+        verifier = "B" * 43
+        redirect = "https://grok.com/oauth/callback"
+        client_id = gateway._oauth_client_id("maulwurf-x")
+        code = gateway._oauth_issue_code(
+            secret=self.EXTERNAL,
+            connector_id="maulwurf-x",
+            client_id=client_id,
+            redirect_uri=redirect,
+            code_challenge=gateway._oauth_pkce_s256(verifier),
+            now=2000,
+        )
+        common = {
+            "secret": self.EXTERNAL,
+            "connector_id": "maulwurf-x",
+            "client_id": client_id,
+            "consumed": set(),
+            "now": 2001,
+        }
+        self.assertFalse(
+            gateway._oauth_consume_code(
+                code,
+                redirect_uri=redirect,
+                code_verifier="C" * 43,
+                **common,
+            )
+        )
+        self.assertFalse(
+            gateway._oauth_consume_code(
+                code,
+                redirect_uri="https://grok.com/other",
+                code_verifier=verifier,
+                **common,
+            )
+        )
+        self.assertFalse(
+            gateway._oauth_consume_code(
+                code[:-1] + ("A" if code[-1] != "A" else "B"),
+                redirect_uri=redirect,
+                code_verifier=verifier,
+                **common,
+            )
+        )
+
+    def test_oauth_basic_client_auth_is_unambiguous(self) -> None:
+        client_id = gateway._oauth_client_id("maulwurf-x")
+        encoded = gateway.base64.b64encode(
+            f"{client_id}:{self.EXTERNAL}".encode("utf-8")
+        ).decode("ascii")
+        self.assertEqual(
+            gateway._oauth_basic_client(
+                _Headers({"authorization": f"Basic {encoded}"})
+            ),
+            (client_id, self.EXTERNAL),
+        )
+        self.assertIsNone(gateway._oauth_basic_client(_Headers()))
+        self.assertIsNone(
+            gateway._oauth_basic_client(
+                _Headers({"authorization": f"Bearer {self.EXTERNAL}"})
+            )
+        )
+
     def test_proxy_preflight_rejects_bodies_on_get_and_delete(self) -> None:
         body = json.dumps(
             {

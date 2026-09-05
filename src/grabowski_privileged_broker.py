@@ -136,6 +136,7 @@ LOCAL_BACKUP_NTFS_ACTIONS = frozenset({
     "local_backup_ntfs_check",
     "local_backup_ntfs_clear_dirty",
 })
+LOCAL_BACKUP_STORAGE_ACTIONS = frozenset({*LOCAL_BACKUP_NTFS_ACTIONS, "local_backup_smart_read"})
 
 
 def _scoped_template_marker_allows_dispatch(path: Path, *, action: str) -> bool:
@@ -143,8 +144,8 @@ def _scoped_template_marker_allows_dispatch(path: Path, *, action: str) -> bool:
 
     Rootbroker cutover may cross task/owner markers because its helper performs
     the complete footprint evaluation and repeated revalidation.  The fixed
-    local BACKUP NTFS maintenance actions may cross only task-scoped markers;
-    owner/global/host/capability and every unknown or unsafe state remain
+    local BACKUP storage actions may cross only task-scoped markers; owner,
+    global, host, capability and every unknown or unsafe state remain
     fail-closed.
     """
     if not os.path.lexists(path):
@@ -160,7 +161,7 @@ def _scoped_template_marker_allows_dispatch(path: Path, *, action: str) -> bool:
             return True
         if action == ROOTBROKER_CUTOVER_ACTION:
             return record.scope.kind in {"task", "owner"}
-        if action in LOCAL_BACKUP_NTFS_ACTIONS:
+        if action in LOCAL_BACKUP_STORAGE_ACTIONS:
             return record.scope.kind == "task"
         return False
     except Exception:
@@ -224,13 +225,13 @@ def _resolve_template_action(
         or peer_unit is None
     ):
         raise PermissionError("automatic Rootbroker cutover authority contract is incomplete")
-    if reference.get("action") in LOCAL_BACKUP_NTFS_ACTIONS and (
+    if reference.get("action") in LOCAL_BACKUP_STORAGE_ACTIONS and (
         kill_switch_value is None
         or legacy_kill_switch_value is None
         or peer_uid is None
         or peer_unit is None
     ):
-        raise PermissionError("local BACKUP NTFS authority contract is incomplete")
+        raise PermissionError("local BACKUP storage authority contract is incomplete")
     if legacy_kill_switch_value is not None and kill_switch_value is None:
         raise PermissionError("template kill-switch contract is malformed")
     if kill_switch_value is not None:
