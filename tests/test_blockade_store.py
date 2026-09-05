@@ -162,12 +162,18 @@ class BlockadeStoreTests(unittest.TestCase):
         self.assertTrue(path_only & os.O_DIRECTORY)
         self.assertFalse(readable & os.O_PATH)
 
-    def test_path_only_directory_flags_fall_back_without_o_path(self) -> None:
-        with mock.patch.object(os, "O_PATH", None, create=True):
-            self.assertEqual(
-                blockade_store._directory_flags(path_only=True),
-                blockade_store._directory_flags(),
-            )
+    def test_path_only_directory_flags_fall_back_without_usable_o_path(self) -> None:
+        for unavailable in (None, 0, False, True, "invalid"):
+            with self.subTest(unavailable=unavailable):
+                with mock.patch.object(os, "O_PATH", unavailable, create=True):
+                    self.assertEqual(
+                        blockade_store._directory_flags(path_only=True),
+                        blockade_store._directory_flags(),
+                    )
+                    _, using_read_fallback = blockade_store._directory_open_plan(
+                        path_only=True
+                    )
+                    self.assertTrue(using_read_fallback)
 
     def test_safe_flags_require_o_nofollow(self) -> None:
         builders = (
@@ -183,6 +189,13 @@ class BlockadeStoreTests(unittest.TestCase):
                         with self.subTest(builder=label):
                             with self.assertRaisesRegex(RuntimeError, "O_NOFOLLOW"):
                                 builder()
+
+    def test_file_flags_require_o_nonblock(self) -> None:
+        for missing_value in (None, 0, False, True, "invalid"):
+            with self.subTest(missing_value=missing_value):
+                with mock.patch.object(os, "O_NONBLOCK", missing_value, create=True):
+                    with self.assertRaisesRegex(RuntimeError, "O_NONBLOCK"):
+                        blockade_store._file_flags()
 
     def test_read_no_o_path_permission_failure_is_diagnostic(self) -> None:
         self.engage()
@@ -844,6 +857,196 @@ class BlockadeStoreTests(unittest.TestCase):
         self.assertEqual(production.exists(), before_exists)
         if before_exists:
             self.assertEqual(production.read_bytes(), before_bytes)
+
+    def test_marker_and_receipt_fifo_reads_fail_without_blocking(self) -> None:
+        os.mkfifo(self.marker, 0o600)
+        with self.assertRaisesRegex(PermissionError, "not a regular file"):
+            read_blockade_marker(self.marker, expected_marker_path=self.marker)
+        self.marker.unlink()
+
+        transaction = self.quarantine / "fifo-receipt"
+        transaction.mkdir(mode=0o700)
+        receipt_path = transaction / blockade_store._MARKER_RECEIPT_NAME
+        os.mkfifo(receipt_path, 0o600)
+        transaction_fd = os.open(transaction, blockade_store._directory_flags())
+        try:
+            with self.assertRaisesRegex(PermissionError, "receipt is unsafe"):
+                blockade_store._read_receipt_at(
+                    transaction_fd, blockade_store._MARKER_RECEIPT_NAME
+                )
+        finally:
+            os.close(transaction_fd)
+
+    def test_disarm_preserves_0644_pre_mutation_denial(self) -> None:
+        engage_blockade_marker(
+            self.item,
+            self.marker,
+            expected_marker_path=self.marker,
+            marker_mode=0o644,
+            transaction_id="engage-0644",
+            now=NOW,
+        )
+        other = record(blockade_id="blockade-other")
+        with self.assertRaisesRegex(
+            BlockadeRecoveryDenied, "marker record does not match"
+        ) as raised:
+            disarm_blockade_marker(
+                other,
+                evidence(other, self.marker, marker_mode=0o644),
+                self.marker,
+                self.quarantine,
+                expected_marker_path=self.marker,
+                expected_quarantine_root=self.quarantine,
+                marker_mode=0o644,
+                transaction_id="disarm-0644-denied",
+                now=NOW,
+            )
+        self.assertNotIsInstance(raised.exception, BlockadeRollbackError)
+        self.assertTrue(self.marker.is_file())
+        self.assertEqual(list(self.quarantine.iterdir()), [])
+
+    def test_restore_preserves_0644_pre_mutation_denial(self) -> None:
+        engaged = engage_blockade_marker(
+            self.item,
+            self.marker,
+            expected_marker_path=self.marker,
+            marker_mode=0o644,
+            transaction_id="engage-0644-restore",
+            now=NOW,
+        )
+        disarmed = disarm_blockade_marker(
+            self.item,
+            evidence(self.item, self.marker, marker_mode=0o644),
+            self.marker,
+            self.quarantine,
+            expected_marker_path=self.marker,
+            expected_quarantine_root=self.quarantine,
+            marker_mode=0o644,
+            transaction_id="disarm-0644-restore",
+            now=NOW,
+        )
+        preimage = Path(disarmed.quarantine_path)
+        tampered = record(blockade_id="blockade-tampered")
+        preimage.write_bytes(canonical_json(tampered.to_mapping()))
+        preimage.chmod(0o644)
+
+        with self.assertRaisesRegex(
+            BlockadeRecoveryDenied, "quarantine file hash mismatch"
+        ) as raised:
+            restore_disarmed_marker(
+                disarmed.transaction_id,
+                self.marker,
+                self.quarantine,
+                expected_marker_path=self.marker,
+                expected_quarantine_root=self.quarantine,
+                expected_record_sha256=disarmed.record_sha256,
+                expected_marker_file_sha256=engaged.marker_file_sha256,
+                expected_disarm_receipt_sha256=disarmed.receipt_sha256,
+                marker_mode=0o644,
+                now=NOW,
+            )
+        self.assertNotIsInstance(raised.exception, BlockadeRollbackError)
+        self.assertFalse(self.marker.exists())
+        self.assertTrue(preimage.is_file())
+
+    def test_disarm_persists_destination_before_source_unlink(self) -> None:
+        self.engage()
+        events: list[tuple[object, ...]] = []
+        original_link = os.link
+        original_fsync = os.fsync
+        original_unlink = blockade_store._unlink_same_inode
+
+        def link(*args, **kwargs):
+            result = original_link(*args, **kwargs)
+            events.append(("link", kwargs.get("dst_dir_fd")))
+            return result
+
+        def fsync(descriptor):
+            events.append(("fsync", descriptor))
+            return original_fsync(descriptor)
+
+        def unlink(directory_fd, name, expected_inode):
+            events.append(("unlink", directory_fd, name))
+            return original_unlink(directory_fd, name, expected_inode)
+
+        with (
+            mock.patch("grabowski_blockade_store.os.link", side_effect=link),
+            mock.patch("grabowski_blockade_store.os.fsync", side_effect=fsync),
+            mock.patch(
+                "grabowski_blockade_store._unlink_same_inode", side_effect=unlink
+            ),
+        ):
+            self.disarm()
+
+        link_index = next(i for i, event in enumerate(events) if event[0] == "link")
+        destination_fd = events[link_index][1]
+        unlink_index = next(
+            i
+            for i, event in enumerate(events)
+            if event[0] == "unlink" and event[2] == self.marker.name
+        )
+        self.assertTrue(
+            any(
+                event == ("fsync", destination_fd)
+                for event in events[link_index + 1 : unlink_index]
+            ),
+            events,
+        )
+
+    def test_restore_persists_destination_before_quarantine_unlink(self) -> None:
+        self.engage()
+        disarmed = self.disarm()
+        events: list[tuple[object, ...]] = []
+        original_link = os.link
+        original_fsync = os.fsync
+        original_unlink = blockade_store._unlink_same_inode
+
+        def link(*args, **kwargs):
+            result = original_link(*args, **kwargs)
+            events.append(("link", kwargs.get("dst_dir_fd")))
+            return result
+
+        def fsync(descriptor):
+            events.append(("fsync", descriptor))
+            return original_fsync(descriptor)
+
+        def unlink(directory_fd, name, expected_inode):
+            events.append(("unlink", directory_fd, name))
+            return original_unlink(directory_fd, name, expected_inode)
+
+        with (
+            mock.patch("grabowski_blockade_store.os.link", side_effect=link),
+            mock.patch("grabowski_blockade_store.os.fsync", side_effect=fsync),
+            mock.patch(
+                "grabowski_blockade_store._unlink_same_inode", side_effect=unlink
+            ),
+        ):
+            restore_disarmed_marker(
+                disarmed.transaction_id,
+                self.marker,
+                self.quarantine,
+                expected_marker_path=self.marker,
+                expected_quarantine_root=self.quarantine,
+                expected_record_sha256=disarmed.record_sha256,
+                expected_marker_file_sha256=disarmed.marker_file_sha256,
+                expected_disarm_receipt_sha256=disarmed.receipt_sha256,
+                now=NOW,
+            )
+
+        link_index = next(i for i, event in enumerate(events) if event[0] == "link")
+        destination_fd = events[link_index][1]
+        unlink_index = next(
+            i
+            for i, event in enumerate(events)
+            if event[0] == "unlink" and event[2] == blockade_store._PREIMAGE_NAME
+        )
+        self.assertTrue(
+            any(
+                event == ("fsync", destination_fd)
+                for event in events[link_index + 1 : unlink_index]
+            ),
+            events,
+        )
 
 
 if __name__ == "__main__":
