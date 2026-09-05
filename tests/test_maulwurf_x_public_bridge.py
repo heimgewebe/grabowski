@@ -109,7 +109,7 @@ class MaulwurfXPublicBridgeAsyncTests(unittest.IsolatedAsyncioTestCase):
         request = (
             b"POST /mcp HTTP/1.1\r\n"
             b"Host: wg-prod-1.tail6dbb90.ts.net:10000\r\n"
-            b"Authorization: Bearer sentinel-not-a-secret\r\n"
+            b"Authorization: Bearer mx-test\r\n"
             b"Content-Type: application/json\r\n\r\n{}"
         )
         upstream_writer = _Writer()
