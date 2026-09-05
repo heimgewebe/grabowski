@@ -135,6 +135,37 @@ class RuntimeDeployAutomaticSourceReceiptTests(unittest.TestCase):
             ):
                 SCHEDULER.schedule(head, 8)
 
+    def test_default_detached_source_rejects_missing_lease_schema_field(self) -> None:
+        head = "f" * 40
+        receipt = _automatic_receipt(head)
+        automatic = receipt["automatic_source"]
+        identity = receipt["source_identity"]
+        assert isinstance(automatic, dict)
+        assert isinstance(identity, dict)
+        path_lease = automatic["path_lease"]
+        lease_evidence = identity["lease_evidence"]
+        assert isinstance(path_lease, dict)
+        assert isinstance(lease_evidence, dict)
+        observed_lease = lease_evidence["lease"]
+        assert isinstance(observed_lease, dict)
+        del path_lease["metadata_sha256"]
+        del observed_lease["metadata_sha256"]
+        material = {key: value for key, value in identity.items() if key != "identity_sha256"}
+        digest = hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        identity["identity_sha256"] = digest
+        receipt["source_identity_sha256"] = digest
+        shared = Mock(return_value=receipt)
+        with patch.object(SCHEDULER, "_load_runtime_scheduler", return_value=shared):
+            with self.assertRaises(KeyError):
+                SCHEDULER.schedule(head, 8)
+
     def test_explicit_source_rejects_automatic_source_receipt(self) -> None:
         head = "e" * 40
         repository = "/home/alex/repos/grabowski"

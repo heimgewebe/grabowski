@@ -180,10 +180,8 @@ def schedule(
             raise RuntimeError(
                 "runtime deploy scheduler returned a different automatic source lease"
             )
-        materialized_snapshot = {
-            field: materialized_lease.get(field) for field in LEASE_FIELDS
-        }
-        observed_snapshot = {field: lease.get(field) for field in LEASE_FIELDS}
+        materialized_snapshot = {field: materialized_lease[field] for field in LEASE_FIELDS}
+        observed_snapshot = {field: lease[field] for field in LEASE_FIELDS}
         if materialized_snapshot != observed_snapshot:
             raise RuntimeError(
                 "runtime deploy scheduler returned a different automatic source lease"

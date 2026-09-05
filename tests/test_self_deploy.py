@@ -40,6 +40,9 @@ def _load_self_deploy():
     operator._require_operator_capability = Mock()
     operator.grabowski_job_start = Mock()
     operator._start_job = Mock()
+    class JobDispatchUnknown(RuntimeError):
+        pass
+    operator.JobDispatchUnknown = JobDispatchUnknown
     operator.JOB_PREFIX = "grabowski-job-"
     operator.JOBS_DIR = Path.home() / ".local/state/grabowski/jobs"
     operator._argv_hash = lambda argv: hashlib.sha256(
@@ -889,6 +892,369 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "ancestor"):
                     SELF_DEPLOY._canonical_stale_main_snapshot(expected)
 
+    def test_current_main_refresh_candidate_does_not_require_target_object(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            expected = "c" * 40
+            current = "a" * 40
+            origin = "b" * 40
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+                SELF_DEPLOY,
+                "_resource_inspect",
+                return_value={"resource_key": f"path:{repo}", "lease": None},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(current),
+                    _result("main"),
+                    _result(origin),
+                    _result(""),
+                    _result("false"),
+                ],
+            ) as git_result:
+                snapshot = SELF_DEPLOY._canonical_main_refresh_candidate(expected)
+            self.assertEqual(snapshot["current_head"], current)
+            self.assertEqual(snapshot["origin_main"], origin)
+            self.assertEqual(snapshot["target_head"], expected)
+            self.assertFalse(snapshot["shallow"])
+            flattened = [item for call_item in git_result.call_args_list for item in call_item.args]
+            self.assertNotIn(f"{expected}^{{commit}}", flattened)
+            self.assertFalse(any("merge-base" in call_item.args for call_item in git_result.call_args_list))
+
+    def test_origin_main_refresh_fetches_exact_public_object_then_cas_updates_tracking_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            expected = "c" * 40
+            current = "a" * 40
+            origin = "b" * 40
+            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
+            operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            path_key = f"path:{repo}"
+            plan = {
+                "canonical_repository": repo,
+                "generation": "abc123def456",
+                "owner_id": owner,
+                "operation_key": operation_key,
+                "path_key": path_key,
+            }
+            operation_lease = {
+                "resource_key": operation_key,
+                "owner_id": owner,
+                "acquired_at_unix": 10,
+                "updated_at_unix": 10,
+                "expires_at_unix": 100,
+                "metadata_sha256": "1" * 64,
+            }
+            path_lease = {
+                "resource_key": path_key,
+                "owner_id": owner,
+                "acquired_at_unix": 10,
+                "updated_at_unix": 10,
+                "expires_at_unix": 100,
+                "metadata_sha256": "2" * 64,
+            }
+            initial = {
+                "canonical_repository": str(repo),
+                "current_head": current,
+                "target_head": expected,
+                "origin_main": origin,
+                "clean": True,
+                "shallow": False,
+                "lease_evidence": {"resource_key": path_key, "lease": None},
+            }
+            locked = {
+                **initial,
+                "lease_evidence": {"resource_key": path_key, "lease": path_lease},
+            }
+            after_cas = {**locked, "origin_main": expected}
+            with patch.object(
+                SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
+            ), patch.object(
+                SELF_DEPLOY,
+                "_acquire_origin_main_refresh_resources",
+                return_value={"leases": [operation_lease, path_lease]},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_release_origin_main_refresh_resources",
+                return_value={"released": [operation_lease, path_lease]},
+            ) as release, patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                side_effect=[locked, locked, after_cas],
+            ), patch.object(
+                SELF_DEPLOY,
+                "_fresh_public_github_main",
+                side_effect=[expected, expected, expected],
+            ), patch.object(
+                SELF_DEPLOY,
+                "_mutating_git_result",
+                side_effect=[_result(""), _result("")],
+            ) as mutate, patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(expected),
+                    _result("", 0),
+                    _result("", 0),
+                    _result(expected),
+                ],
+            ), patch.object(SELF_DEPLOY, "_append_deploy_audit"):
+                receipt = SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+            self.assertEqual(receipt["previous_origin_main"], origin)
+            self.assertEqual(receipt["observed_origin_main"], expected)
+            self.assertRegex(receipt["receipt_sha256"], r"[0-9a-f]{64}")
+            self.assertEqual(
+                mutate.call_args_list[0].args,
+                (
+                    repo,
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--no-recurse-submodules",
+                    SELF_DEPLOY.PUBLIC_GITHUB_REPOSITORY_URL,
+                    SELF_DEPLOY.PUBLIC_GITHUB_MAIN_REF,
+                ),
+            )
+            self.assertEqual(
+                mutate.call_args_list[1].args,
+                (
+                    repo,
+                    "update-ref",
+                    "refs/remotes/origin/main",
+                    expected,
+                    origin,
+                ),
+            )
+            release.assert_called_once_with(
+                plan, [operation_key, path_key], [operation_lease, path_lease]
+            )
+
+    def test_origin_main_refresh_malformed_acquisition_releases_live_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            expected = "c" * 40
+            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
+            operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            path_key = f"path:{repo}"
+            plan = {"canonical_repository": repo, "owner_id": owner, "operation_key": operation_key, "path_key": path_key}
+            operation_lease = {"resource_key": operation_key, "owner_id": owner}
+            path_lease = {"resource_key": path_key, "owner_id": owner}
+            initial = {"canonical_repository": str(repo), "current_head": "a" * 40, "target_head": expected, "origin_main": "b" * 40, "clean": True, "shallow": False}
+            with patch.object(SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan), patch.object(SELF_DEPLOY, "_acquire_origin_main_refresh_resources", return_value={"leases": [operation_lease]}), patch.object(SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot", return_value=path_lease) as live_snapshot, patch.object(SELF_DEPLOY, "_release_origin_main_refresh_resources", return_value={"released": [operation_lease, path_lease]}) as release, patch.object(SELF_DEPLOY, "_canonical_main_refresh_candidate") as candidate:
+                with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
+                    SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+            live_snapshot.assert_called_once_with(path_key, owner)
+            release.assert_called_once_with(plan, [operation_key, path_key], [operation_lease, path_lease])
+            candidate.assert_not_called()
+
+    def test_origin_main_refresh_surfaces_cleanup_release_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            expected = "c" * 40
+            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
+            operation_key = (
+                f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            )
+            path_key = f"path:{repo}"
+            plan = {
+                "canonical_repository": repo,
+                "owner_id": owner,
+                "operation_key": operation_key,
+                "path_key": path_key,
+            }
+            operation_lease = {"resource_key": operation_key, "owner_id": owner}
+            path_lease = {"resource_key": path_key, "owner_id": owner}
+            initial = {
+                "canonical_repository": str(repo),
+                "current_head": "a" * 40,
+                "target_head": expected,
+                "origin_main": "b" * 40,
+                "clean": True,
+                "shallow": False,
+            }
+            with patch.object(
+                SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
+            ), patch.object(
+                SELF_DEPLOY,
+                "_acquire_origin_main_refresh_resources",
+                return_value={"leases": [operation_lease]},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_live_auto_deploy_source_lease_snapshot",
+                return_value=path_lease,
+            ), patch.object(
+                SELF_DEPLOY,
+                "_release_origin_main_refresh_resources",
+                side_effect=RuntimeError("lease store unavailable"),
+            ) as release:
+                with self.assertRaisesRegex(
+                    RuntimeError, "cleanup failures: resource-release"
+                ):
+                    SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+            release.assert_called_once_with(
+                plan, [operation_key, path_key], [operation_lease, path_lease]
+            )
+
+    def test_origin_main_refresh_blocks_public_drift_before_tracking_ref_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            expected = "c" * 40
+            current = "a" * 40
+            origin = "b" * 40
+            owner = "runtime-deploy-ref:cccccccccccc:abc123def456"
+            operation_key = f"repo:{repo}:operation:{SELF_DEPLOY.ORIGIN_MAIN_REFRESH_OPERATION}"
+            path_key = f"path:{repo}"
+            plan = {
+                "canonical_repository": repo,
+                "generation": "abc123def456",
+                "owner_id": owner,
+                "operation_key": operation_key,
+                "path_key": path_key,
+            }
+            operation_lease = {"resource_key": operation_key, "owner_id": owner}
+            path_lease = {"resource_key": path_key, "owner_id": owner}
+            initial = {
+                "canonical_repository": str(repo),
+                "current_head": current,
+                "target_head": expected,
+                "origin_main": origin,
+                "clean": True,
+                "shallow": False,
+                "lease_evidence": {"resource_key": path_key, "lease": None},
+            }
+            locked = {
+                **initial,
+                "lease_evidence": {"resource_key": path_key, "lease": path_lease},
+            }
+            with patch.object(
+                SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
+            ), patch.object(
+                SELF_DEPLOY,
+                "_acquire_origin_main_refresh_resources",
+                return_value={"leases": [operation_lease, path_lease]},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_release_origin_main_refresh_resources",
+                return_value={"released": [operation_lease, path_lease]},
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                side_effect=[locked, locked],
+            ), patch.object(
+                SELF_DEPLOY,
+                "_fresh_public_github_main",
+                side_effect=[expected, "d" * 40],
+            ), patch.object(
+                SELF_DEPLOY,
+                "_mutating_git_result",
+                return_value=_result(""),
+            ) as mutate, patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(expected),
+                    _result("", 0),
+                    _result("", 0),
+                ],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "drifted after exact object fetch"):
+                    SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+            self.assertEqual(mutate.call_count, 1)
+            self.assertEqual(mutate.call_args.args[1], "fetch")
+
+    def test_schedule_refreshes_stale_origin_before_auto_source_materialization(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        source = Path("/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-refresh-test")
+        runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+        expected = "d" * 40
+        current = "a" * 40
+        origin = "b" * 40
+        identity = _source_identity(
+            source,
+            expected,
+            kind="detached-worktree",
+            canonical=canonical,
+        )
+        owner = "runtime-deploy-source:" + expected[:24]
+        refresh_candidate = {
+            "canonical_repository": str(canonical),
+            "current_head": current,
+            "target_head": expected,
+            "origin_main": origin,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {"resource_key": f"path:{canonical}", "lease": None},
+        }
+        refresh_receipt = {"receipt_sha256": "6" * 64}
+        materialization = {"owner_id": owner, "receipt_sha256": "7" * 64}
+        existing = {
+            "unit": "grabowski-job-abcdef012345",
+            "argv_sha256": "8" * 64,
+            "delay_seconds": 8,
+            "metadata_path": "/state/meta",
+            "stdout_path": "/state/out",
+            "stderr_path": "/state/err",
+            "final_status": "running",
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        sequence: list[str] = []
+        with patch.object(
+            SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("origin/main drift"),
+                RuntimeError("HEAD drift"),
+                (source, runner, identity),
+            ],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=[
+                RuntimeError("origin/main drift"),
+                {"current_head": current, "target_head": expected},
+            ],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value=refresh_candidate,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_refresh_canonical_origin_main",
+            side_effect=lambda *_args: sequence.append("refresh") or refresh_receipt,
+        ) as refresh, patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            side_effect=lambda *_args: sequence.append("materialize")
+            or (source, runner, identity, materialization),
+        ) as materialize, patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, expected, expected],
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_matching_inflight_deploy_job",
+            return_value=existing,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deploy_schedule_lock",
+            return_value=nullcontext(),
+        ), patch.object(SELF_DEPLOY, "_append_deploy_audit"):
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertEqual(sequence, ["refresh", "materialize"])
+        refresh.assert_called_once_with(expected, refresh_candidate)
+        materialize.assert_called_once_with(expected)
+        self.assertTrue(result["already_scheduled"])
+        self.assertEqual(result["automatic_source"], materialization)
+
     def test_auto_deploy_source_plan_uses_fresh_generation_for_same_head(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -1171,7 +1537,11 @@ class SelfDeployToolTests(unittest.TestCase):
                 str(target),
                 expected,
             )
-            preflight.assert_called_once_with(expected, str(target), owner)
+            self.assertEqual(preflight.call_count, 2)
+            self.assertEqual(
+                preflight.call_args_list,
+                [call(expected, str(target), owner), call(expected, str(target), owner)],
+            )
             bind_retention.assert_called_once_with(plan, lifecycle, expected)
             self.assertEqual(close_obligation.call_count, 1)
             self.assertEqual(close_obligation.call_args.args[0], plan)
@@ -1314,7 +1684,8 @@ class SelfDeployToolTests(unittest.TestCase):
         ) as release, patch.object(SELF_DEPLOY, "_append_deploy_audit"):
             _, _, _, receipt = SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
         self.assertTrue(receipt["effect_observed"])
-        self.assertFalse(receipt["created"])
+        self.assertTrue(receipt["created"])
+        self.assertTrue(receipt["usable"])
         self.assertFalse(receipt["command_outcome"]["reported_success"])
         self.assertEqual(receipt["command_outcome"]["returncode"], 1)
         release.assert_called_once_with(
@@ -1348,7 +1719,7 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY,
             "_mutating_git_result",
-            side_effect=RuntimeError("transport interrupted"),
+            return_value=_result("command reported failure", 1),
         ), patch.object(
             SELF_DEPLOY, "_worktree_registration_present", return_value=False
         ), patch.object(
@@ -1368,6 +1739,199 @@ class SelfDeployToolTests(unittest.TestCase):
             [f["operation_key"], f["path_key"]],
             [f["operation_lease"], f["path_lease"]],
         )
+
+    def test_auto_deploy_source_timeout_never_proves_no_effect(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        timed_out = _result("timed out", 1)
+        timed_out["timed_out"] = True
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", side_effect=[f["stale"], f["stale"]]
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY, "_reserve_auto_deploy_source_lifecycle", return_value=f["lifecycle"]
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", side_effect=[False, False, False]
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=timed_out
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation", return_value={"state": "blocked"}
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle"
+        ) as release_lifecycle, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [f["operation_lease"]]},
+        ) as release_resources:
+            with self.assertRaisesRegex(RuntimeError, "outcome is uncertain"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+        release_lifecycle.assert_not_called()
+        release_resources.assert_called_once_with(
+            f["owner"], [f["operation_key"]], [f["operation_lease"]]
+        )
+
+    def test_auto_deploy_source_timeout_rejects_even_exact_momentary_poststate(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        timed_out = _result("timed out", 1)
+        timed_out["timed_out"] = True
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", side_effect=[f["stale"], f["stale"]]
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY, "_reserve_auto_deploy_source_lifecycle", return_value=f["lifecycle"]
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", side_effect=[False, False, True]
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=timed_out
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=True
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
+        ), patch.object(
+            SELF_DEPLOY, "_bind_auto_deploy_source_retention"
+        ) as bind_retention, patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation", return_value={"state": "blocked"}
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle"
+        ) as release_lifecycle, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [f["operation_lease"]]},
+        ) as release_resources:
+            with self.assertRaisesRegex(RuntimeError, "outcome is uncertain"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+        bind_retention.assert_not_called()
+        release_lifecycle.assert_not_called()
+        release_resources.assert_called_once_with(
+            f["owner"], [f["operation_key"]], [f["operation_lease"]]
+        )
+
+    def test_auto_deploy_source_open_failure_does_not_close_unopened_obligation(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=f["stale"]
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation",
+            side_effect=RuntimeError("open failed"),
+        ), patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation"
+        ) as block_obligation, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [f["operation_lease"], f["path_lease"]]},
+        ) as release_resources:
+            with self.assertRaisesRegex(RuntimeError, "open failed"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+        block_obligation.assert_not_called()
+        release_resources.assert_called_once_with(
+            f["owner"],
+            [f["operation_key"], f["path_key"]],
+            [f["operation_lease"], f["path_lease"]],
+        )
+
+    def test_auto_deploy_source_malformed_acquisition_uses_live_snapshot_cleanup(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=f["stale"]
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot",
+            side_effect=lambda key, owner: f["path_lease"] if key == f["path_key"] else None,
+        ) as live_snapshot, patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation"
+        ) as open_obligation, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [f["operation_lease"], f["path_lease"]]},
+        ) as release_resources:
+            with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+        open_obligation.assert_not_called()
+        live_snapshot.assert_called_once_with(f["path_key"], f["owner"])
+        release_resources.assert_called_once_with(
+            f["owner"],
+            [f["operation_key"], f["path_key"]],
+            [f["operation_lease"], f["path_lease"]],
+        )
+
+    def test_auto_deploy_source_snapshot_comparison_ignores_lease_evidence_churn(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        stale_before = dict(f["stale"])
+        stale_after = dict(f["stale"])
+        stale_after["lease_evidence"] = {
+            "resource_key": f"path:{f['canonical']}",
+            "lease": {"updated_at_unix": 99},
+        }
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", side_effect=[stale_before, stale_after]
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY, "_reserve_auto_deploy_source_lifecycle", return_value=f["lifecycle"]
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", side_effect=[False, False, False]
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=_result("failed", 1)
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation", return_value={"state": "blocked"}
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=True
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [f["operation_lease"], f["path_lease"]]},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no observed effect"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+
+    def test_auto_deploy_source_surfaces_resource_release_cleanup_failure(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=f["stale"]
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation",
+            side_effect=RuntimeError("open failed"),
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            side_effect=RuntimeError("lease store unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "open failed; cleanup failures: resource-release"
+            ):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
 
     def test_auto_deploy_source_preserves_registration_only_partial_effect(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
@@ -1406,7 +1970,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "_release_auto_deploy_source_resources",
             return_value={"released": [f["operation_lease"]]},
         ) as release_resources:
-            with self.assertRaisesRegex(RuntimeError, "incomplete post-state"):
+            with self.assertRaisesRegex(RuntimeError, "outcome is uncertain"):
                 SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
         release_lifecycle.assert_not_called()
         release_resources.assert_called_once_with(
@@ -1548,6 +2112,36 @@ class SelfDeployToolTests(unittest.TestCase):
                     SELF_DEPLOY._materialize_auto_deploy_source(expected)
             acquire.assert_not_called()
 
+    def test_schedule_does_not_refresh_when_stale_snapshot_fails_with_current_origin(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        refresh = Mock()
+        with patch.object(
+            SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=RuntimeError("HEAD drift"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=RuntimeError("automatic deployment source requires fast-forward ancestry"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={
+                "current_head": "a" * 40,
+                "origin_main": expected,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_refresh_canonical_origin_main", refresh
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HEAD drift"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        refresh.assert_not_called()
+
     def test_schedule_blocks_preexisting_job_before_auto_source_materialization(self) -> None:
         canonical_state = tempfile.TemporaryDirectory()
         self.addCleanup(canonical_state.cleanup)
@@ -1560,6 +2154,10 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY,
             "CANONICAL_REPOSITORY",
             canonical,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
         ), patch.object(
             SELF_DEPLOY,
             "_deployment_source_preflight",
@@ -1633,8 +2231,13 @@ class SelfDeployToolTests(unittest.TestCase):
             canonical,
         ), patch.object(
             SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY,
             "_deployment_source_preflight",
             side_effect=[
+                RuntimeError("HEAD drift"),
                 RuntimeError("HEAD drift"),
                 (source, runner, identity),
             ],
@@ -1681,6 +2284,59 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
         self.assertEqual(result["automatic_source"], materialization)
 
+    def test_schedule_rechecks_canonical_and_skips_auto_source_if_it_converged(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        identity = _source_identity(canonical, expected, canonical=canonical)
+        existing = {
+            "unit": "grabowski-job-converged001",
+            "argv_sha256": "8" * 64,
+            "delay_seconds": 8,
+            "metadata_path": "/state/meta",
+            "stdout_path": "/state/out",
+            "stderr_path": "/state/err",
+            "final_status": "running",
+            "source_identity_sha256": identity["identity_sha256"],
+        }
+        materialize = Mock()
+        inflight = Mock()
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("HEAD drift"),
+                (canonical, canonical / SELF_DEPLOY.RUNNER_RELATIVE_PATH, identity),
+                (canonical, canonical / SELF_DEPLOY.RUNNER_RELATIVE_PATH, identity),
+            ],
+        ) as preflight, patch.object(
+            SELF_DEPLOY, "_materialize_auto_deploy_source", materialize
+        ), patch.object(
+            SELF_DEPLOY, "inflight_runtime_job_evidence", inflight
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", side_effect=[expected, expected]
+        ) as public_main, patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(SELF_DEPLOY, "_append_deploy_audit"):
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertTrue(result["already_scheduled"])
+        self.assertIsNone(result["automatic_source"])
+        self.assertEqual(preflight.call_count, 3)
+        materialize.assert_not_called()
+        inflight.assert_not_called()
+        self.assertEqual(public_main.call_count, 2)
+
     def test_schedule_blocks_different_source_job_after_auto_materialization(self) -> None:
         canonical_state = tempfile.TemporaryDirectory()
         self.addCleanup(canonical_state.cleanup)
@@ -1713,8 +2369,16 @@ class SelfDeployToolTests(unittest.TestCase):
             canonical,
         ), patch.object(
             SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY,
             "_deployment_source_preflight",
-            side_effect=[RuntimeError("HEAD drift"), (source, runner, identity)],
+            side_effect=[
+                RuntimeError("HEAD drift"),
+                RuntimeError("HEAD drift"),
+                (source, runner, identity),
+            ],
         ), patch.object(
             SELF_DEPLOY,
             "_canonical_stale_main_snapshot",
@@ -1737,11 +2401,16 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value=existing,
         ), patch.object(
             SELF_DEPLOY,
+            "_cleanup_auto_deploy_source_before_dispatch",
+            return_value={"state": "cleaned"},
+        ) as cleanup, patch.object(
+            SELF_DEPLOY,
             "_deploy_schedule_lock",
             return_value=nullcontext(),
         ):
             with self.assertRaisesRegex(RuntimeError, "different-source runtime job"):
                 SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        cleanup.assert_called_once_with(expected, identity, materialization)
         SELF_DEPLOY.operator._start_job.assert_not_called()
 
     def test_auto_deploy_source_blocks_target_appearance_after_lease(self) -> None:
@@ -1870,8 +2539,13 @@ class SelfDeployToolTests(unittest.TestCase):
             canonical,
         ), patch.object(
             SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY,
             "_deployment_source_preflight",
             side_effect=[
+                RuntimeError("HEAD drift"),
                 RuntimeError("HEAD drift"),
                 (source, runner, identity),
             ],
@@ -1893,6 +2567,10 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value={"error": None, "inflight_units": []},
         ), patch.object(
             SELF_DEPLOY,
+            "_cleanup_auto_deploy_source_before_dispatch",
+            return_value={"state": "cleaned"},
+        ) as cleanup, patch.object(
+            SELF_DEPLOY,
             "_deploy_schedule_lock",
             return_value=nullcontext(),
         ), patch.object(
@@ -1901,6 +2579,7 @@ class SelfDeployToolTests(unittest.TestCase):
         ) as lookup:
             with self.assertRaisesRegex(RuntimeError, "drifted during automatic"):
                 SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        cleanup.assert_called_once_with(expected, identity, materialization)
         lookup.assert_not_called()
         SELF_DEPLOY.operator._start_job.assert_not_called()
 
@@ -1913,6 +2592,10 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY,
             "CANONICAL_REPOSITORY",
             canonical,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
         ), patch.object(
             SELF_DEPLOY,
             "_deployment_source_preflight",
@@ -1944,6 +2627,417 @@ class SelfDeployToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "authority refresh failed"):
                 SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
         materialize.assert_not_called()
+
+    def test_auto_deploy_source_close_failure_does_not_double_release_operation_lease(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        retention = {"checkout_key": "checkout-key", "owner_id": f["owner"]}
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", side_effect=[f["stale"], f["stale"]]
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY, "_reserve_auto_deploy_source_lifecycle", return_value=f["lifecycle"]
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", side_effect=[False, False, True]
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=_result("")
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=True
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
+        ), patch.object(
+            SELF_DEPLOY, "_bind_auto_deploy_source_retention", return_value=retention
+        ), patch.object(
+            SELF_DEPLOY, "_close_auto_deploy_source_obligation",
+            side_effect=RuntimeError("close failed"),
+        ), patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation", return_value={"state": "blocked"}
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle"
+        ) as release_lifecycle, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [f["operation_lease"]]},
+        ) as release_resources, patch.object(SELF_DEPLOY, "_append_deploy_audit"):
+            with self.assertRaisesRegex(RuntimeError, "close failed"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+        release_lifecycle.assert_not_called()
+        release_resources.assert_called_once_with(
+            f["owner"], [f["operation_key"]], [f["operation_lease"]]
+        )
+
+    def test_cleanup_auto_deploy_source_before_dispatch_removes_exact_unused_source(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        cleanup_key = (
+            f"repo:{f['canonical']}:operation:worktree-remove:{f['target'].name}"
+        )
+        cleanup_lease = {
+            "resource_key": cleanup_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "3" * 64,
+        }
+        materialization = {
+            "expected_head": f["expected"],
+            "repository": str(f["target"]),
+            "owner_id": f["owner"],
+            "path_resource_key": f["path_key"],
+            "path_lease": f["path_lease"],
+            "lifecycle": f["lifecycle"],
+        }
+        resources = types.ModuleType("grabowski_resources")
+        resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
+        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease]})
+        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+            SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=_result("")
+        ) as mutate, patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=True
+        ) as release_lifecycle, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [cleanup_lease, f["path_lease"]]},
+        ) as release_resources, patch.object(SELF_DEPLOY, "_append_deploy_audit"):
+            receipt = SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
+                f["expected"], f["identity"], materialization
+            )
+        mutate.assert_called_once_with(
+            f["canonical"], "worktree", "remove", str(f["target"])
+        )
+        release_lifecycle.assert_called_once_with(f["lifecycle"])
+        release_resources.assert_called_once_with(
+            f["owner"],
+            [cleanup_key, f["path_key"]],
+            [cleanup_lease, f["path_lease"]],
+        )
+        self.assertEqual(receipt["kind"], "grabowski_auto_runtime_deploy_source_cleanup")
+        self.assertRegex(receipt["receipt_sha256"], r"[0-9a-f]{64}")
+
+    def test_cleanup_auto_deploy_source_malformed_cleanup_receipt_releases_live_cleanup_lease_only(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        cleanup_key = f"repo:{f['canonical']}:operation:worktree-remove:{f['target'].name}"
+        cleanup_lease = {
+            "resource_key": cleanup_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "3" * 64,
+        }
+        materialization = {
+            "expected_head": f["expected"],
+            "repository": str(f["target"]),
+            "owner_id": f["owner"],
+            "path_resource_key": f["path_key"],
+            "path_lease": f["path_lease"],
+            "lifecycle": f["lifecycle"],
+        }
+        resources = types.ModuleType("grabowski_resources")
+        resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
+        resources.acquire_resources = Mock(return_value={"leases": []})
+        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+            SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
+        ), patch.object(
+            SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot", return_value=cleanup_lease
+        ) as live_snapshot, patch.object(
+            SELF_DEPLOY, "_mutating_git_result"
+        ) as mutate, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [cleanup_lease]},
+        ) as release_resources:
+            with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
+                SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
+                    f["expected"], f["identity"], materialization
+                )
+        live_snapshot.assert_called_once_with(cleanup_key, f["owner"])
+        mutate.assert_not_called()
+        release_resources.assert_called_once_with(
+            f["owner"], [cleanup_key], [cleanup_lease]
+        )
+
+    def test_cleanup_auto_source_releases_leases_even_when_lifecycle_release_fails_after_remove(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        cleanup_key = f"repo:{f['canonical']}:operation:worktree-remove:{f['target'].name}"
+        cleanup_lease = {
+            "resource_key": cleanup_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "3" * 64,
+        }
+        materialization = {
+            "expected_head": f["expected"],
+            "repository": str(f["target"]),
+            "owner_id": f["owner"],
+            "path_resource_key": f["path_key"],
+            "path_lease": f["path_lease"],
+            "lifecycle": f["lifecycle"],
+        }
+        resources = types.ModuleType("grabowski_resources")
+        resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
+        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease]})
+        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+            SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=_result("")
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            return_value={"released": [cleanup_lease, f["path_lease"]]},
+        ) as release_resources, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=False
+        ) as release_lifecycle:
+            with self.assertRaisesRegex(
+                RuntimeError, "state did not fully converge: lifecycle-release"
+            ):
+                SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
+                    f["expected"], f["identity"], materialization
+                )
+        release_resources.assert_called_once_with(
+            f["owner"],
+            [cleanup_key, f["path_key"]],
+            [cleanup_lease, f["path_lease"]],
+        )
+        release_lifecycle.assert_called_once_with(f["lifecycle"])
+
+    def test_cleanup_auto_source_attempts_lifecycle_release_when_lease_release_fails_after_remove(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        cleanup_key = f"repo:{f['canonical']}:operation:worktree-remove:{f['target'].name}"
+        cleanup_lease = {
+            "resource_key": cleanup_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "3" * 64,
+        }
+        materialization = {
+            "expected_head": f["expected"],
+            "repository": str(f["target"]),
+            "owner_id": f["owner"],
+            "path_resource_key": f["path_key"],
+            "path_lease": f["path_lease"],
+            "lifecycle": f["lifecycle"],
+        }
+        resources = types.ModuleType("grabowski_resources")
+        resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
+        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease]})
+        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+            SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=_result("")
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources",
+            side_effect=RuntimeError("lease store unavailable"),
+        ) as release_resources, patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=True
+        ) as release_lifecycle:
+            with self.assertRaisesRegex(
+                RuntimeError, "state did not fully converge: resource-release"
+            ):
+                SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
+                    f["expected"], f["identity"], materialization
+                )
+        release_resources.assert_called_once()
+        release_lifecycle.assert_called_once_with(f["lifecycle"])
+
+    def test_schedule_cleans_auto_source_after_proven_job_nonstart(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        source = Path("/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-nonstart")
+        runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+        expected = "d" * 40
+        identity = _source_identity(source, expected, kind="detached-worktree", canonical=canonical)
+        owner = "runtime-deploy-source:" + expected[:24]
+        materialization = {"owner_id": owner, "receipt_sha256": "7" * 64}
+        writes = Mock()
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("HEAD drift"),
+                RuntimeError("HEAD drift"),
+                (source, runner, identity),
+            ],
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY, "_materialize_auto_deploy_source",
+            return_value=(source, runner, identity, materialization),
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", side_effect=[expected, expected, expected]
+        ), patch.object(
+            SELF_DEPLOY, "inflight_runtime_job_evidence", return_value={"error": None, "inflight_units": []}
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None
+        ), patch.object(
+            SELF_DEPLOY, "_cleanup_auto_deploy_source_before_dispatch", return_value={"state": "cleaned"}
+        ) as cleanup, patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_append_deploy_audit"
+        ), patch.object(
+            SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_index", return_value={"units": []}
+        ), patch.object(
+            SELF_DEPLOY, "_write_deploy_index", writes
+        ), patch.object(
+            SELF_DEPLOY.operator, "_start_job", side_effect=RuntimeError("launch failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "launch failed"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertEqual(writes.call_count, 2)
+        self.assertIsNotNone(writes.call_args_list[0].kwargs["pending_unit"])
+        self.assertIsNone(writes.call_args_list[1].kwargs["pending_unit"])
+        cleanup.assert_called_once_with(expected, identity, materialization)
+
+    def test_schedule_preserves_auto_source_when_job_dispatch_is_unknown(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        source = Path("/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-unknown")
+        runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+        expected = "d" * 40
+        identity = _source_identity(source, expected, kind="detached-worktree", canonical=canonical)
+        owner = "runtime-deploy-source:" + expected[:24]
+        materialization = {"owner_id": owner, "receipt_sha256": "7" * 64}
+        writes = Mock()
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("HEAD drift"),
+                RuntimeError("HEAD drift"),
+                (source, runner, identity),
+            ],
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY, "_materialize_auto_deploy_source",
+            return_value=(source, runner, identity, materialization),
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", side_effect=[expected, expected, expected]
+        ), patch.object(
+            SELF_DEPLOY, "inflight_runtime_job_evidence", return_value={"error": None, "inflight_units": []}
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None
+        ), patch.object(
+            SELF_DEPLOY, "_cleanup_auto_deploy_source_before_dispatch"
+        ) as cleanup, patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_append_deploy_audit"
+        ), patch.object(
+            SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_index", return_value={"units": []}
+        ), patch.object(
+            SELF_DEPLOY, "_write_deploy_index", writes
+        ), patch.object(
+            SELF_DEPLOY.operator, "_start_job",
+            side_effect=SELF_DEPLOY.operator.JobDispatchUnknown("dispatch unknown"),
+        ):
+            with self.assertRaisesRegex(SELF_DEPLOY.operator.JobDispatchUnknown, "dispatch unknown"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertEqual(writes.call_count, 1)
+        cleanup.assert_not_called()
+
+    def test_schedule_preserves_auto_source_after_started_job_if_final_index_write_fails(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        source = Path("/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-index-fail")
+        runner = source / SELF_DEPLOY.RUNNER_RELATIVE_PATH
+        expected = "d" * 40
+        identity = _source_identity(source, expected, kind="detached-worktree", canonical=canonical)
+        owner = "runtime-deploy-source:" + expected[:24]
+        materialization = {"owner_id": owner, "receipt_sha256": "7" * 64}
+        job = {"unit": "grabowski-job-indexfail001", "argv_sha256": "8" * 64}
+        writes = Mock(side_effect=[None, RuntimeError("final index failed")])
+        with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value={"current_head": "a" * 40, "origin_main": expected},
+        ), patch.object(
+            SELF_DEPLOY, "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("HEAD drift"),
+                RuntimeError("HEAD drift"),
+                (source, runner, identity),
+            ],
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot",
+            return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY, "_materialize_auto_deploy_source",
+            return_value=(source, runner, identity, materialization),
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", side_effect=[expected, expected, expected]
+        ), patch.object(
+            SELF_DEPLOY, "inflight_runtime_job_evidence", return_value={"error": None, "inflight_units": []}
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None
+        ), patch.object(
+            SELF_DEPLOY, "_cleanup_auto_deploy_source_before_dispatch"
+        ) as cleanup, patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_append_deploy_audit"
+        ), patch.object(
+            SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_index", return_value={"units": []}
+        ), patch.object(
+            SELF_DEPLOY, "_write_deploy_index", writes
+        ), patch.object(
+            SELF_DEPLOY.operator, "_start_job", return_value=job
+        ):
+            with self.assertRaisesRegex(RuntimeError, "final index failed"):
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertEqual(writes.call_count, 2)
+        cleanup.assert_not_called()
 
     def test_schedule_uses_fixed_delayed_runner(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
