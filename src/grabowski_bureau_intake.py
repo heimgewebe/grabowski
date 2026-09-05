@@ -709,6 +709,16 @@ def _candidate_request_operation(request: dict[str, Any]) -> str:
     return "close" if operation == "close" else "record"
 
 
+class CandidateRepositorySelectorError(ValueError):
+    """Raised only when Grabowski convenience repo syntax cannot be resolved."""
+
+
+def _candidate_repo_selector_uses_convenience_syntax(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    return value.startswith("heimgewebe/") or Path(value).is_absolute() or "/" in value
+
+
 def _normalize_candidate_request(request: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(request)
     if _candidate_request_operation(normalized) == "close":
@@ -716,9 +726,24 @@ def _normalize_candidate_request(request: dict[str, Any]) -> dict[str, Any]:
         # repository selector. Preserve their bytes semantically so Bureau owns
         # the complete close-contract validation.
         return normalized
-    resource = _canonical_bureau_repo_resource(normalized.get("repo"))
+    repo_selector = normalized.get("repo")
+    resource = _canonical_bureau_repo_resource(repo_selector)
     if resource is not None:
         normalized["repo"] = resource
+    elif (
+        isinstance(repo_selector, str)
+        and not repo_selector.startswith("repo.")
+        and _candidate_repo_selector_uses_convenience_syntax(repo_selector)
+    ):
+        # Absolute paths and owner/repository slugs are Grabowski conveniences,
+        # not Bureau domain identifiers. If Grabowski cannot resolve one to the
+        # exact canonical repo.* resource, fail before persisting request bytes
+        # or entering Bureau's mutating candidate-record path. Canonical repo.*
+        # values remain Bureau-owned so resource existence is never duplicated
+        # in this adapter.
+        raise CandidateRepositorySelectorError(
+            "candidate repository convenience selector is not canonicalizable"
+        )
     return normalized
 
 
@@ -1219,7 +1244,20 @@ def grabowski_bureau_candidate_record(
     operator._require_operator_mutation("terminal_execute")
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
-    request = _normalize_candidate_request(request)
+    try:
+        request = _normalize_candidate_request(request)
+    except CandidateRepositorySelectorError:
+        request_id = _sha256(_canonical_json(request))
+        payload = _adapter_failure(
+            "candidate-repo-selector-invalid",
+            details={
+                "reason": "unresolved-adapter-convenience-selector",
+                "bureau_domain_validation_attempted": False,
+            },
+            retryable=False,
+        )
+        _audit("bureau-candidate-record", payload, request_sha256=request_id)
+        return {**payload, "adapter_request_sha256": request_id}
     operation = _candidate_request_operation(request)
     raw = _canonical_json(request)
     request_id = _sha256(raw)
