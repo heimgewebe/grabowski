@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
 import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
+import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import grabowski_connector_policy
 import grabowski_transport_ingress as signed_ingress
@@ -39,6 +44,12 @@ ALLOWED_JSON_RPC_METHODS = frozenset(
         "tools/call",
     }
 )
+OAUTH_SCOPE = "mcp"
+OAUTH_CODE_TTL_SECONDS = 120
+OAUTH_CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+OAUTH_CODE_VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
+OAUTH_B64URL_RE = re.compile(r"[A-Za-z0-9_-]+")
+OAUTH_CODE_PREFIX = "mxc1"
 
 
 class GatewayConfigurationError(RuntimeError):
@@ -134,6 +145,175 @@ def _header_values(headers: Any, name: str) -> list[str] | None:
     if value is None:
         return []
     return [value] if isinstance(value, str) else None
+
+
+def _oauth_client_id(connector_id: str) -> str:
+    return f"{connector_id}-grok"
+
+
+def _oauth_redirect_uri_allowed(value: str) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 2048 or "\x00" in value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").casefold()
+    trusted_host = (
+        host == "grok.com"
+        or host.endswith(".grok.com")
+        or host == "x.ai"
+        or host.endswith(".x.ai")
+    )
+    return bool(
+        parsed.scheme == "https"
+        and trusted_host
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and parsed.path.startswith("/")
+    )
+
+
+def _oauth_b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _oauth_b64url_decode(value: str) -> bytes:
+    if not isinstance(value, str) or OAUTH_B64URL_RE.fullmatch(value) is None:
+        raise ValueError("invalid base64url value")
+    padding = "=" * ((4 - len(value) % 4) % 4)
+    try:
+        return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("invalid base64url value") from exc
+
+
+def _oauth_pkce_s256(verifier: str) -> str:
+    if OAUTH_CODE_VERIFIER_RE.fullmatch(verifier or "") is None:
+        raise ValueError("invalid PKCE verifier")
+    return _oauth_b64url_encode(hashlib.sha256(verifier.encode("ascii")).digest())
+
+
+def _oauth_issue_code(
+    *,
+    secret: str,
+    connector_id: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    now: int | None = None,
+) -> str:
+    if (
+        client_id != _oauth_client_id(connector_id)
+        or not _oauth_redirect_uri_allowed(redirect_uri)
+        or OAUTH_CODE_CHALLENGE_RE.fullmatch(code_challenge or "") is None
+    ):
+        raise GatewayConfigurationError("OAuth authorization request is invalid")
+    issued = int(time.time()) if now is None else int(now)
+    payload = {
+        "v": 1,
+        "aud": connector_id,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "exp": issued + OAUTH_CODE_TTL_SECONDS,
+        "nonce": secrets.token_urlsafe(18),
+    }
+    encoded = _oauth_b64url_encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    signature = _oauth_b64url_encode(
+        hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).digest()
+    )
+    return f"{OAUTH_CODE_PREFIX}.{encoded}.{signature}"
+
+
+def _oauth_consume_code(
+    code: str,
+    *,
+    secret: str,
+    connector_id: str,
+    client_id: str,
+    redirect_uri: str,
+    code_verifier: str,
+    consumed: set[str],
+    now: int | None = None,
+) -> bool:
+    try:
+        prefix, encoded, signature = code.split(".")
+    except (AttributeError, ValueError):
+        return False
+    if prefix != OAUTH_CODE_PREFIX:
+        return False
+    expected = _oauth_b64url_encode(
+        hmac.new(secret.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256).digest()
+    )
+    if not hmac.compare_digest(signature, expected):
+        return False
+    try:
+        payload = json.loads(_oauth_b64url_decode(encoded).decode("utf-8"))
+        challenge = _oauth_pkce_s256(code_verifier)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
+    current = int(time.time()) if now is None else int(now)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != 1
+        or payload.get("aud") != connector_id
+        or payload.get("client_id") != client_id
+        or payload.get("redirect_uri") != redirect_uri
+        or not _oauth_redirect_uri_allowed(redirect_uri)
+        or payload.get("code_challenge") != challenge
+        or not isinstance(payload.get("exp"), int)
+        or isinstance(payload.get("exp"), bool)
+        or payload["exp"] <= current
+    ):
+        return False
+    digest = hashlib.sha256(code.encode("ascii")).hexdigest()
+    if digest in consumed:
+        return False
+    consumed.add(digest)
+    return True
+
+
+def _oauth_basic_client(headers: Any) -> tuple[str, str] | None:
+    values = _header_values(headers, "authorization")
+    if values is None or len(values) != 1:
+        return None
+    scheme, separator, encoded = values[0].partition(" ")
+    if not separator or scheme.casefold() != "basic" or not encoded:
+        return None
+    try:
+        decoded = base64.b64decode(encoded.encode("ascii"), validate=True).decode("utf-8")
+    except (UnicodeDecodeError, ValueError, binascii.Error):
+        return None
+    client_id, separator, client_secret = decoded.partition(":")
+    if not separator or not client_id or not client_secret:
+        return None
+    return client_id, client_secret
+
+
+async def _oauth_form(request: Any) -> dict[str, list[str]]:
+    if (
+        request.headers.get("content-type", "").partition(";")[0].strip().lower()
+        != "application/x-www-form-urlencoded"
+    ):
+        raise ValueError("OAuth token request content type is invalid")
+    body = await signed_ingress._read_bounded_request_body(request)
+    try:
+        form = parse_qs(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+            max_num_fields=20,
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("OAuth token request body is invalid") from exc
+    if any(len(values) != 1 for values in form.values()):
+        raise ValueError("OAuth token request contains duplicate fields")
+    return form
 
 
 def _external_client_authenticated(headers: Any, token: str) -> bool:
@@ -401,6 +581,7 @@ class ExternalConnectorGateway:
         self._internal_token = internal_token
         self._allowed_tools = frozenset(allowed_tools)
         self._upstream = _validate_upstream(upstream)
+        self._oauth_used_codes: set[str] = set()
 
     async def health(self, _request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -417,6 +598,99 @@ class ExternalConnectorGateway:
             headers={"Cache-Control": "no-store"},
         )
 
+
+    async def oauth_authorize(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse, RedirectResponse
+
+        def one(name: str, *, required: bool = True) -> str | None:
+            values = request.query_params.getlist(name)
+            if len(values) == 1:
+                return values[0]
+            return None if not required and not values else ""
+
+        response_type = one("response_type")
+        client_id = one("client_id")
+        redirect_uri = one("redirect_uri")
+        scope = one("scope")
+        code_challenge = one("code_challenge")
+        code_challenge_method = one("code_challenge_method")
+        state = one("state", required=False)
+        if (
+            response_type != "code"
+            or client_id != _oauth_client_id(self._connector_id)
+            or redirect_uri is None
+            or not _oauth_redirect_uri_allowed(redirect_uri)
+            or scope != OAUTH_SCOPE
+            or code_challenge_method != "S256"
+            or OAUTH_CODE_CHALLENGE_RE.fullmatch(code_challenge or "") is None
+            or state == ""
+            or (state is not None and len(state) > 1024)
+        ):
+            return JSONResponse(
+                {"error": "invalid_request"},
+                status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        code = _oauth_issue_code(
+            secret=self._external_token,
+            connector_id=self._connector_id,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+        )
+        query = {"code": code}
+        if state is not None:
+            query["state"] = state
+        separator = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(
+            f"{redirect_uri}{separator}{urlencode(query)}",
+            status_code=302,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def oauth_token(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        def error(name: str, status_code: int = 400) -> Any:
+            headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+            if status_code == 401:
+                headers["WWW-Authenticate"] = 'Basic realm="maulwurf-x-oauth"'
+            return JSONResponse({"error": name}, status_code=status_code, headers=headers)
+
+        try:
+            form = await _oauth_form(request)
+        except (signed_ingress.RequestBodyTooLarge, ValueError):
+            return error("invalid_request")
+        credentials = _oauth_basic_client(request.headers)
+        if credentials is None:
+            return error("invalid_client", 401)
+        client_id, client_secret = credentials
+        if (
+            client_id != _oauth_client_id(self._connector_id)
+            or not hmac.compare_digest(client_secret, self._external_token)
+        ):
+            return error("invalid_client", 401)
+        if form.get("grant_type", [""])[0] != "authorization_code":
+            return error("unsupported_grant_type")
+        redirect_uri = form.get("redirect_uri", [""])[0]
+        if not _oauth_consume_code(
+            form.get("code", [""])[0],
+            secret=self._external_token,
+            connector_id=self._connector_id,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            code_verifier=form.get("code_verifier", [""])[0],
+            consumed=self._oauth_used_codes,
+        ):
+            return error("invalid_grant")
+        return JSONResponse(
+            {
+                "access_token": self._external_token,
+                "token_type": "Bearer",
+                "scope": OAUTH_SCOPE,
+            },
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     async def proxy(self, request: Any) -> Any:
         from starlette.background import BackgroundTask
@@ -538,6 +812,8 @@ def build_app(
     return Starlette(
         routes=[
             Route("/_grabowski/external-connector", gateway.health, methods=["GET"]),
+            Route("/oauth/authorize", gateway.oauth_authorize, methods=["GET"]),
+            Route("/oauth/token", gateway.oauth_token, methods=["POST"]),
             Route("/mcp", gateway.proxy, methods=["GET", "POST", "DELETE"]),
         ]
     )
