@@ -836,9 +836,28 @@ class PrivilegedBrokerTests(unittest.TestCase):
             )
             return types.SimpleNamespace(record=record)
 
-        for action, target, flag in (
-            ("local_backup_ntfs_check", "check", "-n"),
-            ("local_backup_ntfs_clear_dirty", "clear-dirty", "-d"),
+        for action, target, argv in (
+            (
+                "local_backup_ntfs_check",
+                "check",
+                ["/usr/bin/ntfsfix", "-n", "/dev/disk/by-uuid/249180DA265E8DE0"],
+            ),
+            (
+                "local_backup_ntfs_clear_dirty",
+                "clear-dirty",
+                ["/usr/bin/ntfsfix", "-d", "/dev/disk/by-uuid/249180DA265E8DE0"],
+            ),
+            (
+                "local_backup_smart_read",
+                "smart-read",
+                [
+                    "/usr/sbin/smartctl",
+                    "-d",
+                    "sat",
+                    "-a",
+                    "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0",
+                ],
+            ),
         ):
             reference = self._reference()
             reference["action"] = action
@@ -852,11 +871,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                 "enabled": True,
                 "mode": "template",
                 "target_pattern": target,
-                "argv": [
-                    "/usr/bin/ntfsfix",
-                    flag,
-                    "/dev/disk/by-uuid/249180DA265E8DE0",
-                ],
+                "argv": argv,
                 "timeout_seconds": 120,
                 "kill_switch_path": str(marker),
                 "legacy_kill_switch_path": str(legacy),
@@ -868,10 +883,7 @@ class PrivilegedBrokerTests(unittest.TestCase):
                 privileged_broker, "read_authority_marker", return_value=snapshot("task")
             ):
                 execution = privileged_broker.resolve_execution(config, parsed)
-                self.assertEqual(
-                    execution["argv"],
-                    ["/usr/bin/ntfsfix", flag, "/dev/disk/by-uuid/249180DA265E8DE0"],
-                )
+                self.assertEqual(execution["argv"], argv)
 
             for kind in ("owner", "global", "host", "capability", "path"):
                 with self.subTest(action=action, blocked=kind), patch.object(

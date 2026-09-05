@@ -73,6 +73,12 @@ OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
+LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
+LOCAL_BACKUP_STORAGE_ACTIONS = (
+    LOCAL_BACKUP_NTFS_CHECK_ACTION,
+    LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION,
+    LOCAL_BACKUP_SMART_READ_ACTION,
+)
 PRIVILEGED_BROKER_SOCKET = Path("/run/grabowski/privileged-broker.sock")
 PRIVILEGED_REFERENCE_TTL_SECONDS = 300
 PRIVILEGED_RESPONSE_MAX_BYTES = 512 * 1024
@@ -4740,8 +4746,9 @@ def require_operator_authority_anchored(
     lifecycle = actions.get("operator_blockade_marker_lifecycle")
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
-    backup_ntfs_check = actions.get(LOCAL_BACKUP_NTFS_CHECK_ACTION)
-    backup_ntfs_clear_dirty = actions.get(LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION)
+    backup_storage = {
+        name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
+    }
     if not all(
         isinstance(item, dict)
         for item in (lifecycle, service_control, rootbroker_cutover)
@@ -4750,19 +4757,17 @@ def require_operator_authority_anchored(
             "Ziel-Commit besitzt keinen vollständigen Operator-Authority-Vertrag",
             phase="operator-authority-attestation",
         )
-    if (backup_ntfs_check is None) != (backup_ntfs_clear_dirty is None):
+    present_backup_storage = {
+        name: action for name, action in backup_storage.items() if action is not None
+    }
+    if present_backup_storage and set(present_backup_storage) != set(LOCAL_BACKUP_STORAGE_ACTIONS):
         core.fail(
-            "Ziel-Commit besitzt einen unvollständigen BACKUP-NTFS-Authority-Vertrag",
+            "Ziel-Commit besitzt einen unvollständigen BACKUP-Storage-Authority-Vertrag",
             phase="operator-authority-attestation",
         )
-    if backup_ntfs_check is not None and not isinstance(backup_ntfs_check, dict):
+    if any(not isinstance(action, dict) for action in present_backup_storage.values()):
         core.fail(
-            "Ziel-Commit besitzt einen ungültigen BACKUP-NTFS-Check-Vertrag",
-            phase="operator-authority-attestation",
-        )
-    if backup_ntfs_clear_dirty is not None and not isinstance(backup_ntfs_clear_dirty, dict):
-        core.fail(
-            "Ziel-Commit besitzt einen ungültigen BACKUP-NTFS-Clear-Dirty-Vertrag",
+            "Ziel-Commit besitzt einen ungültigen BACKUP-Storage-Authority-Vertrag",
             phase="operator-authority-attestation",
         )
     assert isinstance(lifecycle, dict)
@@ -4782,11 +4787,13 @@ def require_operator_authority_anchored(
         OPERATOR_SERVICE_CONTROL_ACTION: service_control,
         ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
     }
-    if isinstance(backup_ntfs_check, dict) and isinstance(backup_ntfs_clear_dirty, dict):
-        expected_action_contracts[LOCAL_BACKUP_NTFS_CHECK_ACTION] = backup_ntfs_check
-        expected_action_contracts[LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION] = (
-            backup_ntfs_clear_dirty
-        )
+    expected_action_contracts.update(
+        {
+            name: action
+            for name, action in present_backup_storage.items()
+            if isinstance(action, dict)
+        }
+    )
     expected_action_names = {"operator_power_argv", *expected_action_contracts}
     observed_actions = attestation.get("action_sha256")
     if (
