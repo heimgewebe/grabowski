@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -275,31 +276,55 @@ def _transaction_id(value: str | None, *, now: datetime | None) -> str:
     return f"{prefix}-{secrets.token_hex(8)}"
 
 
-def _directory_flags(*, path_only: bool = False) -> int:
-    if path_only:
-        path_flag = getattr(os, "O_PATH", None)
-        if path_flag is None:
-            raise RuntimeError("O_PATH is required for path-only directory traversal")
+def _nofollow_flag() -> int:
+    flag = getattr(os, "O_NOFOLLOW", None)
+    if isinstance(flag, bool) or not isinstance(flag, int) or flag <= 0:
+        raise RuntimeError("O_NOFOLLOW is required for safe blockade filesystem access")
+    return flag
+
+
+def _directory_open_plan(*, path_only: bool = False) -> tuple[int, bool]:
+    nofollow_flag = _nofollow_flag()
+    path_flag = getattr(os, "O_PATH", None) if path_only else None
+    use_path_flag = (
+        isinstance(path_flag, int)
+        and not isinstance(path_flag, bool)
+        and path_flag > 0
+    )
+    if use_path_flag:
+        # O_PATH changes O_NOFOLLOW semantics: a symlink itself may be opened.
+        # O_DIRECTORY is therefore also required so every traversed component
+        # must be a directory rather than a symlink.
         flags = path_flag | os.O_DIRECTORY | os.O_CLOEXEC
     else:
+        # Platforms without a usable O_PATH retain the previous O_RDONLY
+        # behavior while still requiring the store-wide no-symlink traversal
+        # guard. This is a safe fallback, but it cannot traverse execute-only
+        # directories.
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    return flags | nofollow_flag, path_only and not use_path_flag
+
+
+def _directory_flags(*, path_only: bool = False) -> int:
+    flags, _ = _directory_open_plan(path_only=path_only)
     return flags
 
 
 def _file_flags() -> int:
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return flags
+    nonblock_flag = getattr(os, "O_NONBLOCK", None)
+    if (
+        isinstance(nonblock_flag, bool)
+        or not isinstance(nonblock_flag, int)
+        or nonblock_flag <= 0
+    ):
+        raise RuntimeError(
+            "O_NONBLOCK is required for non-blocking blockade filesystem reads"
+        )
+    return os.O_RDONLY | os.O_CLOEXEC | _nofollow_flag() | nonblock_flag
 
 
 def _create_flags() -> int:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    return flags
+    return os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | _nofollow_flag()
 
 
 def _open_directory_chain(
@@ -311,12 +336,29 @@ def _open_directory_chain(
     path_only: bool = False,
 ) -> int:
     path = _canonical_absolute_path(path, label=label)
-    descriptor = os.open("/", _directory_flags(path_only=path_only))
+    flags, using_read_fallback = _directory_open_plan(path_only=path_only)
+
+    def open_component(component: str, *, dir_fd: int | None = None) -> int:
+        try:
+            if dir_fd is None:
+                return os.open(component, flags)
+            return os.open(component, flags, dir_fd=dir_fd)
+        except PermissionError as exc:
+            if using_read_fallback and exc.errno == errno.EACCES:
+                detail = exc.strerror or "permission denied"
+                raise PermissionError(
+                    exc.errno,
+                    f"{detail}; O_PATH is unavailable or unusable, so path-only "
+                    "directory traversal falls back to O_RDONLY and that directory "
+                    "open was denied",
+                    exc.filename,
+                ) from exc
+            raise
+
+    descriptor = open_component("/")
     try:
         for part in path.parts[1:]:
-            next_descriptor = os.open(
-                part, _directory_flags(path_only=path_only), dir_fd=descriptor
-            )
+            next_descriptor = open_component(part, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
         _assert_directory_binding(
@@ -640,6 +682,10 @@ def read_blockade_marker(
     if not isinstance(require_private_parent, bool):
         raise ValueError("require_private_parent must be boolean")
     max_bytes = _positive_max_bytes(max_bytes)
+    # Marker reads use O_PATH where available so execute-only authority
+    # directories remain traversable. Mutating store paths deliberately retain
+    # O_RDONLY directory descriptors because their durability contract fsyncs
+    # the parent directory.
     parent_fd = _open_directory_chain(
         path.parent,
         expected_uid=uid,
@@ -996,11 +1042,11 @@ def disarm_blockade_marker(
             expected_mode=mode,
             max_bytes=max_bytes,
         )
-        source_snapshot = snapshot
         if snapshot.record != record:
             raise BlockadeRecoveryDenied("marker record does not match disarm target")
         if snapshot.record_sha256 != evidence.record_sha256:
             raise BlockadeRecoveryDenied("marker record hash changed before disarm")
+        source_snapshot = snapshot
         transaction_path, transaction_fd = _create_private_transaction_directory(
             quarantine_root_fd,
             quarantine,
@@ -1028,11 +1074,13 @@ def disarm_blockade_marker(
             or source_after_link.st_nlink != 2
         ):
             raise BlockadeStoreError("quarantine link identity validation failed")
+        # Make the new quarantine name durable before removing the last source
+        # name. A crash can then leave two names for the inode, never zero.
+        os.fsync(transaction_fd)
         if not _unlink_same_inode(marker_parent_fd, marker_name, source_inode):
             raise BlockadeStoreError("source marker changed before unlink")
         source_unlinked = True
         os.fsync(marker_parent_fd)
-        os.fsync(transaction_fd)
         if not _path_absent_at(marker_parent_fd, marker_name):
             raise BlockadeStoreError("source marker remains after quarantine")
         moved = _snapshot_from_open_file(
@@ -1454,13 +1502,13 @@ def restore_disarmed_marker(
             expected_mode=mode,
             max_bytes=max_bytes,
         )
-        preimage_snapshot = preimage
         if preimage.file_sha256 != expected_marker_file_sha256:
             raise BlockadeRecoveryDenied("quarantine file hash mismatch")
         if preimage.record_sha256 != expected_record_sha256:
             raise BlockadeRecoveryDenied("quarantine record hash mismatch")
         if preimage.record != receipt_record:
             raise BlockadeRecoveryDenied("receipt and quarantine records differ")
+        preimage_snapshot = preimage
         preimage_inode = (preimage.device, preimage.inode)
         os.link(
             _PREIMAGE_NAME,
@@ -1473,11 +1521,13 @@ def restore_disarmed_marker(
         linked = _stat_at(marker_parent_fd, marker_name)
         if _identity(linked) != preimage_inode or linked.st_nlink != 2:
             raise BlockadeStoreError("restore link identity validation failed")
+        # Persist the restored source name before deleting the quarantine name.
+        # A crash can then leave two names for the inode, never zero.
+        os.fsync(marker_parent_fd)
         if not _unlink_same_inode(transaction_fd, _PREIMAGE_NAME, preimage_inode):
             raise BlockadeStoreError("quarantine preimage changed before restore")
         preimage_unlinked = True
         os.fsync(transaction_fd)
-        os.fsync(marker_parent_fd)
         restored = _snapshot_from_open_file(
             marker_parent_fd,
             marker_name,
