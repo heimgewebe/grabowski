@@ -182,7 +182,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 200)
+        self.assertEqual(len(tools), 198)
         self.assertIn("grabowski_operational_guidance", tools)
         self.assertNotIn("grabowski_agent_workspace_adopt", tools)
         self.assertIn("grabowski_browser_worker_semantic", tools)
@@ -258,14 +258,12 @@ class RepositoryContractTests(unittest.TestCase):
                 "grabowski_context_fabric_compare",
             }.issubset(tools)
         )
-        self.assertIn("grabowski_reposkop_context", tools)
         self.assertIn("grabowski_systemkatalog_query", tools)
         self.assertTrue(
             {
                 "grabowski_audit_query",
                 "grabowski_audit_trace",
                 "grabowski_audit_analyze",
-                "grabowski_reposkop_effectiveness",
             }.issubset(tools)
         )
         supporting = {
@@ -314,7 +312,6 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_checkouts",
             "grabowski_fleet",
             "grabowski_operations",
-            "grabowski_reposkop_context",
             "grabowski_privileged",
             "grabowski_privileged_broker",
             "grabowski_tasks",

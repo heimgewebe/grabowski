@@ -151,7 +151,7 @@ besitzt, wird die frisch beobachtete Checkout-Abwesenheit als `archived_cleaned`
 terminal und nicht blockierend projiziert. Daraus entsteht weiterhin keine neue
 Cleanup-, Branch-Lösch- oder Binding-Löschautorität.
 
-Reposkop-, Bureau- oder GitHub-Signale können helfen, die `unknown`-Fälle zu
+Bureau-, GitHub- oder native Git-/Checkout-Signale können helfen, die `unknown`-Fälle zu
 priorisieren. Sie ersetzen aber nicht Recovery-Ref, Dirty-State-Prüfung,
 Owner-Entscheidung und Dry-Run-Plan-Hash. Der Name `obsolete` bedeutet hier
 nicht: Branch löschen. Er bedeutet: lokal cleanupfähig wirkende Arbeitskopie,

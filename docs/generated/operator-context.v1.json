@@ -354,17 +354,6 @@
       "tool": "grabowski_audit_analyze"
     },
     {
-      "category": "audit",
-      "description": "Project bounded Reposkop coverage, technical outcomes and improvement signals.",
-      "effects": [],
-      "id": "grabowski_reposkop_effectiveness",
-      "purpose": "Project bounded Reposkop coverage, technical outcomes, latency and evidence-bound improvement candidates from the verified audit chain.",
-      "read_only": true,
-      "reversibility": "not-applicable",
-      "risk_class": "low",
-      "tool": "grabowski_reposkop_effectiveness"
-    },
-    {
       "category": "knowledge",
       "description": "Return latest healthy RepoGround publications from one catalog resolution.",
       "effects": [],
@@ -601,20 +590,6 @@
       "reversibility": "pre-effect lease compensation; terminal receipt/audit are forward-only, retry-recoverable evidence",
       "risk_class": "high",
       "tool": "grabowski_work_acquire"
-    },
-    {
-      "category": "repository-observation",
-      "description": "Run one target-bound Reposkop report and persist a deduplicated usage receipt.",
-      "effects": [
-        "repository-read",
-        "state-create"
-      ],
-      "id": "grabowski_reposkop_context",
-      "purpose": "Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt.",
-      "read_only": false,
-      "reversibility": "idempotent-create-only",
-      "risk_class": "low",
-      "tool": "grabowski_reposkop_context"
     },
     {
       "category": "operations-observability",
@@ -2719,8 +2694,7 @@
       "automatic_deploy",
       "model_identity_authority",
       "free_shell_as_default_path",
-      "durable_agent_autonomy_without_lane_binding",
-      "reposkop_report_action_approval"
+      "durable_agent_autonomy_without_lane_binding"
     ],
     "execution_priority": [
       "chatgpt_operator",
@@ -2767,7 +2741,7 @@
       "patch_fallback": "controller",
       "patch_file_relay": "operator_patch_relay",
       "quick_light_reasoning": "controller",
-      "repo_state_context": "reposkop_target_bound_report",
+      "repo_state_context": "typed_git_checkout_reads",
       "security_or_architecture_review": "independent_reviewer_then_controller_verification",
       "session_resume": "controller",
       "shell_or_git_grip": "grabowski_task"
@@ -2883,7 +2857,6 @@
       "grabowski_audit_query",
       "grabowski_audit_trace",
       "grabowski_audit_analyze",
-      "grabowski_reposkop_effectiveness",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -2905,7 +2878,6 @@
       "grabowski_checkout_summary",
       "grabowski_current_work",
       "grabowski_work_acquire",
-      "grabowski_reposkop_context",
       "grabowski_operator_optimization_report",
       "grabowski_git_status",
       "grabowski_git_diff",
@@ -3301,14 +3273,6 @@
         "source": "src/grabowski_audit_query.py"
       },
       {
-        "module": "grabowski_reposkop_effectiveness",
-        "source": "src/grabowski_reposkop_effectiveness.py"
-      },
-      {
-        "module": "grabowski_reposkop_shadow",
-        "source": "src/grabowski_reposkop_shadow.py"
-      },
-      {
         "module": "grabowski_checkouts",
         "source": "src/grabowski_checkouts.py"
       },
@@ -3351,10 +3315,6 @@
       {
         "module": "grabowski_operations",
         "source": "src/grabowski_operations.py"
-      },
-      {
-        "module": "grabowski_reposkop_context",
-        "source": "src/grabowski_reposkop_context.py"
       },
       {
         "module": "grabowski_privileged",
@@ -3602,11 +3562,11 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "f65605ffd172e556061ccf0ffcec7c4d7bfc3e6db5352a8dffd483bf960a3989"
+      "sha256": "db759103e42405d76a0312a2f9a7684ca8c1f02f094fa2f745581121e7f93c51"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "1011ba805286ba13173643c9a4a0fc9fefb96a7a58105a8b217d51d9ed642eb1"
+      "sha256": "c89aa9c07dd4ac22cdbfd893aef19d6b4f47f5a7b3deee70057d3b375fc08ccd"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3614,7 +3574,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b7fa14455c1a13713a33912fd329011808529e66a47e4d60d49680c28f6496e0"
+      "sha256": "46181c6c4588c9d8bb4f5d43d3d260abf5306fce8dd7abf4cb4aa2aed614d3fd"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3716,9 +3676,6 @@
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
-      "src/grabowski_reposkop_context.py": "c27482b00c4085c03eb3c417ea1dc3df514b3c375ec37d27ca77dbb4e4835f21",
-      "src/grabowski_reposkop_effectiveness.py": "4c24196d75374ca0a979d3138086da0b885f5525960ba4a32b401db514662331",
-      "src/grabowski_reposkop_shadow.py": "8d21fdff7cbb524b72ca8d078a3a318cd0db60cc103518eeff02ad25fb89912e",
       "src/grabowski_resources.py": "8d548a506111961be313af96f25917b2b25c15582c032626814f0965436aeb58",
       "src/grabowski_runtime.py": "832c895ec4660801dc63f4e68dfa4d75ee80a4646f22fa99d0d7a4ead8432582",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
