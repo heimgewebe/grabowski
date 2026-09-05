@@ -372,6 +372,59 @@ class EffectInterceptorTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], RuntimeError)
 
+    def test_shadow_observation_is_separate_audit_evidence(self) -> None:
+        records = []
+        shadow_observation = {
+            "schema_version": 1,
+            "kind": "grabowski.operator_fence_shadow_observation",
+            "mode": "shadow",
+            "status": "observed",
+            "decision": "would_acquire",
+            "reason": "writer_idle_or_expired",
+            "peer_id": "grabowski",
+            "instance_id": "instance-a",
+            "snapshot_age_seconds": 4,
+            "generation": 3,
+            "writer_owner_id": None,
+            "inflight_present": False,
+            "observation_sha256": "9" * 64,
+        }
+        with patch.object(
+            interceptor.fence_shadow, "observe", return_value=shadow_observation
+        ) as observe:
+            admission = interceptor.admit_mutation(
+                tool_name="grabowski_git",
+                arguments={"repo": "/tmp/repo"},
+                transport_evidence=self.transport(),
+                append_audit=lambda record: records.append(record) or "d" * 64,
+            )
+        interceptor.receipts.validate_admission(admission)
+        self.assertNotIn("operator_fence_shadow", admission)
+        observe.assert_called_once_with(
+            tool_name="grabowski_git",
+            arguments_sha256=admission["arguments_sha256"],
+        )
+        self.assertEqual(
+            [record["operation"] for record in records],
+            ["effect-admission", "operator-fence-shadow"],
+        )
+        self.assertEqual(records[1]["admission_sha256"], admission["admission_sha256"])
+        self.assertEqual(records[1]["observation_sha256"], "9" * 64)
+        self.assertEqual(records[1]["instance_id"], "instance-a")
+        self.assertEqual(records[1]["snapshot_age_seconds"], 4)
+
+    def test_shadow_failure_does_not_gate_existing_mutation_admission(self) -> None:
+        with patch.object(
+            interceptor.fence_shadow, "observe", side_effect=RuntimeError("shadow unavailable")
+        ):
+            admission = interceptor.admit_mutation(
+                tool_name="grabowski_git",
+                arguments={},
+                transport_evidence=self.transport(),
+            )
+        self.assertEqual(admission["tool"], "grabowski_git")
+        interceptor.receipts.validate_admission(admission)
+
     def test_missing_transport_receipt_fails_before_admission(self) -> None:
         with self.assertRaisesRegex(ValueError, "consumption receipt"):
             interceptor.admit_mutation(
