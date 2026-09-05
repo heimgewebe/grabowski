@@ -3101,6 +3101,22 @@
         "source": "src/grabowski_effect_interceptor.py"
       },
       {
+        "module": "grabowski_operator_fence",
+        "source": "src/grabowski_operator_fence.py"
+      },
+      {
+        "module": "grabowski_operator_fence_rpc",
+        "source": "src/grabowski_operator_fence_rpc.py"
+      },
+      {
+        "module": "grabowski_operator_fence_shadow",
+        "source": "src/grabowski_operator_fence_shadow.py"
+      },
+      {
+        "module": "grabowski_operator_fence_shadow_refresh",
+        "source": "src/grabowski_operator_fence_shadow_refresh.py"
+      },
+      {
         "module": "grabowski_lane_closeout",
         "source": "src/grabowski_lane_closeout.py"
       },
@@ -3574,7 +3590,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "46181c6c4588c9d8bb4f5d43d3d260abf5306fce8dd7abf4cb4aa2aed614d3fd"
+      "sha256": "489c0901982d7f6b4c61ba9b1bea7994c955b3b8d5e8f43a98b21627d1ef3170"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3660,6 +3676,10 @@
       "src/grabowski_ntfy_dispatch.py": "baf5c167603f442fb2672dd108611aa448d9414c59a8a97fad27ab3bc4aea363",
       "src/grabowski_operations.py": "dbefeb9b7623d5ef8e42025b9b9afe604e0c2378fcbb7dcde45eb30ef3fff232",
       "src/grabowski_operator.py": "06a361c2bcc2ccf825fd44218ebd4bc9534fc771586ee38246bb0bead8ff102f",
+      "src/grabowski_operator_fence.py": "3aa93fd4bb690642526e5b263ffcb21d92f28b4d826ee3a5737df13b9b9976f5",
+      "src/grabowski_operator_fence_rpc.py": "9e60fe4a59de4c142cf670c14646aa9d8fa54e3de55f8fca8b201c5f37f75bba",
+      "src/grabowski_operator_fence_shadow.py": "2c9bc3c1e3ccc537a9009b847994cc77cfe8ebf6d76f1309e81ef7f688c9956b",
+      "src/grabowski_operator_fence_shadow_refresh.py": "12ec5f560d76ac1efa00be61a097f51a81cdda331d69e24fe52be2ea95712557",
       "src/grabowski_operator_obligation.py": "2eec8a842f934aeb6cb4d03f507f61be586c82729414575dacf2b10601649586",
       "src/grabowski_operator_obligation_evidence.py": "ebdeccbb31fe3744881a566a537f3ff5bb83b03a4f45d4cf64fe52f4b027ddf6",
       "src/grabowski_operator_optimization.py": "6e21534f87f9646f957c40c7607554b7f54b165b47516170f09fdc9314cd1dbf",
