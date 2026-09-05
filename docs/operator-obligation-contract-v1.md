@@ -68,9 +68,17 @@ Verzeichnisse sind eigentümergebunden mit Modus `0700`, Datensätze mit `0600`.
 
 Ein Interprozess-Lock serialisiert Öffnung und Abschluss. Wiederholung desselben Materials ist idempotent. Wird eine bereits terminal geschlossene Verpflichtung erneut geöffnet, bleibt ihr terminaler Status erhalten; sie wird nicht semantisch wieder auf `open` gesetzt. Dieselbe ID mit anderem Material oder ein abweichender zweiter Terminalzustand ist ein Konflikt. Zeitstempel müssen kanonisches UTC sein.
 
+## Attention- und Due-Resurfacing
+
+`operator-obligation-list` bleibt eine reine Projektion über die unveränderten Obligation-Datensätze. Für aktuelle Attention kann der Aufrufer einen kanonischen `as_of`-Zeitpunkt und einen begrenzten `attention_due_after_seconds`-Wert angeben; ohne Angabe gilt ein 24-Stunden-Fenster. Die Projektion verwendet bei `open` den Öffnungszeitpunkt und bei `blocked`/`delegated` den Abschlusszeitpunkt als Attention-Anker.
+
+Jeder gelistete Datensatz erhält daraus `attention_anchor_at`, `attention_age_seconds`, `attention_due_at`, `attention_due` und `attention_priority`. Beim Standardfilter `attention` werden fällige Verpflichtungen zuerst, innerhalb derselben Klasse die ältesten zuerst ausgegeben. Die Top-Level-Projektion `attention_resurfacing` meldet Fälligkeitsfenster, Anzahl fälliger und noch frischer Current-Attention-Datensätze sowie die verwendete Ordnung. Scan- und Ergebnisgrenzen bleiben bestehen; die Due-Projektion führt keine neue persistente Zustandsquelle ein.
+
+Diese Fälligkeit ist ausschließlich ein Wiederaufnahmehinweis. Sie setzt keine Obligation auf `completed`, `resolved`, `superseded` oder `deferred`, beobachtet keine referenzierten Tasks/Jobs/PRs live und erteilt weder Queue-, Claim-, Dispatch-, Retry- noch Mutationsautorität. Eine fällige Verpflichtung muss anhand ihrer zuständigen Primärquellen neu bewertet werden.
+
 ## Grip-Oberfläche
 
-- `operator-obligation-list` – read-only; verwendet standardmäßig den Filter `attention` und findet damit aktuelle Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder. `resolved`, `superseded` und evidenzgebunden **v2-`deferred`** resolvte Datensätze sind historisch und erscheinen dort nicht; grandfathered v1-`deferred` bleibt dagegen current. Der ursprüngliche Zustand bleibt über explizite Filter wie `state="blocked"` lesbar. Der frühere reine Open-Blick bleibt über `state="open"` unverändert verfügbar.
+- `operator-obligation-list` – read-only; verwendet standardmäßig den Filter `attention` und findet damit aktuelle Verpflichtungen (`open`, `blocked`, `delegated`) begrenzt und nach Repository oder Thread gefiltert wieder. Aktuelle Attention wird über eine rein abgeleitete Due-Projektion standardmäßig nach fällig/ältest sortiert; `as_of` und `attention_due_after_seconds` machen diese Projektion deterministisch und bounded. `resolved`, `superseded` und evidenzgebunden **v2-`deferred`** resolvte Datensätze sind historisch und erscheinen dort nicht; grandfathered v1-`deferred` bleibt dagegen current. Der ursprüngliche Zustand bleibt über explizite Filter wie `state="blocked"` lesbar. Der frühere reine Open-Blick bleibt über `state="open"` unverändert verfügbar.
 - `operator-obligation-open` – mutierend; legt die unveränderliche Verpflichtung an.
 - `operator-obligation-status` – read-only; entscheidet, ob Fortsetzung erforderlich ist und ob die Antwort enden darf.
 - `operator-obligation-close` – mutierend; akzeptiert nur `completed`, `blocked` oder `delegated` unter den beschriebenen Evidenzregeln.

@@ -1,0 +1,34 @@
+[Unit]
+Description=Grabowski signed transport ingress for Maulwurf X
+After=network.target grabowski-transport-ingress.service
+PartOf=grabowski-transport-ingress.service
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.token
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/maulwurf-x.tools.json
+ConditionPathExists=%h/.local/state/grabowski/transport-connectors/require-tool-policy
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/libexec/grabowski/grabowski_transport_ingress.py --host 127.0.0.1 --port 18183 --selector-file %h/.local/state/grabowski/transport-connectors/operator-routing-selector.json --token-file %h/.local/state/grabowski/transport-connectors/maulwurf-x.token
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=20
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+LimitCORE=0
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=grabowski-transport-ingress.service

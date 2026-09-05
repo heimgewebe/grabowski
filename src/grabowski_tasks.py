@@ -3702,6 +3702,166 @@ def _record_task_effect_classification(
     return dict(value) if isinstance(value, dict) else None
 
 
+def _server_verified_task_read_route(
+    *,
+    target: dict[str, Any],
+    command: list[str],
+    working_directory: str,
+) -> dict[str, Any]:
+    base = {
+        "schema_version": 1,
+        "kind": "grabowski_task_server_read_verification",
+    }
+    if target.get("transport") != "local":
+        return {
+            **base,
+            "status": "unverified",
+            "reason": "nonlocal_read_not_server_classified",
+            "recommended_route": None,
+        }
+    if not command or Path(command[0]).name.lower() != "git":
+        return {
+            **base,
+            "status": "unverified",
+            "reason": "direct_command_has_no_server_owned_read_classifier",
+            "recommended_route": None,
+        }
+    arguments = command[1:]
+    try:
+        operator._guard_git(arguments, Path(working_directory))
+        subcommand, _command_arguments, _configurations = (
+            operator._split_git_invocation(arguments)
+        )
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        return {
+            **base,
+            "status": "unverified",
+            "reason": "guarded_git_read_rejected",
+            "error_type": type(exc).__name__,
+            "recommended_route": None,
+        }
+    if subcommand not in operator.GIT_LOCAL_READ_ONLY_SUBCOMMANDS:
+        return {
+            **base,
+            "status": "unverified",
+            "reason": "git_subcommand_not_read_only",
+            "git_subcommand": subcommand,
+            "recommended_route": None,
+        }
+    return {
+        **base,
+        "status": "verified",
+        "reason": "guarded_local_git_read",
+        "git_subcommand": subcommand,
+        "recommended_route": "grabowski_git",
+        "authority": "grabowski_git_guard",
+    }
+
+
+def _task_read_routing_advisory(
+    *,
+    target: dict[str, Any],
+    command: list[str],
+    working_directory: str,
+    runtime_seconds: int,
+    resume_policy: ResumePolicy,
+    task_resources: list[str],
+    chronik_enabled: bool,
+    operation_identity: dict[str, Any] | None,
+    classification: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        classification.get("effect_profile") != "read_only"
+        or classification.get("agent_executable") is not None
+    ):
+        raise ValueError("read routing advisory requires a non-agent read_only task")
+    base = {
+        "schema_version": 1,
+        "kind": "grabowski_task_read_routing_advisory",
+        "effect_profile": "read_only",
+        "agent_executable": None,
+    }
+
+    server_read_verification = _server_verified_task_read_route(
+        target=target,
+        command=command,
+        working_directory=working_directory,
+    )
+    shape = operator._synchronous_call_shape_receipt(
+        command,
+        timeout_seconds=operator.SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS,
+        max_output_bytes=operator.SYNCHRONOUS_TRANSPORT_OUTPUT_BYTES,
+        surface="grabowski_task_start.read_routing",
+    )
+    durable_signals: list[str] = []
+    if server_read_verification.get("status") != "verified":
+        durable_signals.append("server_read_verification_missing")
+    if task_resources:
+        durable_signals.append("resource_leases_requested")
+    if chronik_enabled:
+        durable_signals.append("chronik_outbox_requested")
+    if operation_identity is not None:
+        durable_signals.append("operation_identity_requested")
+    if resume_policy in {"manual", "retry-safe"}:
+        durable_signals.append(f"resume_policy:{resume_policy}")
+    if shape.get("allowed") is not True:
+        durable_signals.extend(
+            f"synchronous_shape:{reason}"
+            for reason in shape.get("reason_codes", [])
+            if isinstance(reason, str)
+        )
+
+    runtime_exceeds = (
+        runtime_seconds > operator.SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
+    )
+    if (
+        server_read_verification.get("status") == "verified"
+        and shape.get("allowed") is True
+        and not durable_signals
+    ):
+        route_classification = (
+            "synchronous_first_candidate"
+            if runtime_exceeds
+            else "avoidable_bounded_read"
+        )
+        recommended_route = server_read_verification["recommended_route"]
+    else:
+        route_classification = "durable_read_justified"
+        recommended_route = "grabowski_task_start"
+
+    return {
+        **base,
+        "status": "assessed",
+        "classification": route_classification,
+        "recommended_route": recommended_route,
+        "fallback_route": "grabowski_task_start",
+        "requested_runtime_seconds": runtime_seconds,
+        "resume_policy": resume_policy,
+        "default_verify_then_retry_is_advisory_only": (
+            resume_policy == "verify-then-retry"
+        ),
+        "synchronous_runtime_ceiling_seconds": (
+            operator.SYNCHRONOUS_TRANSPORT_TIMEOUT_SECONDS
+        ),
+        "runtime_exceeds_synchronous_ceiling": runtime_exceeds,
+        "durable_signals": durable_signals,
+        "server_read_verification": server_read_verification,
+        "synchronous_shape": {
+            "allowed": shape.get("allowed"),
+            "required_route": shape.get("required_route"),
+            "reason_codes": list(shape.get("reason_codes", [])),
+            "argv_sha256": shape.get("argv_sha256"),
+        },
+        "does_not_establish": [
+            "automatic_rerouting",
+            "caller_supplied_read_only_effect_truth",
+            "command_runtime_below_synchronous_ceiling",
+            "output_below_synchronous_ceiling",
+            "durable_task_unnecessary_after_a_synchronous_timeout",
+        ],
+    }
+
+
 def _task_resource_keys(
     host: str,
     argv: list[str],
@@ -7522,7 +7682,15 @@ def grabowski_task_start(
     deterministic; it does not invoke an external checkout sensor. Every task-owned broad
     repository lease carries a complete whole-repository scope manifest.
     An exact already-active execution identity is reused instead of launching
-    another process, even when no explicit operation identity was supplied.
+    another process, even when no explicit operation identity was supplied. For
+    short effect-free direct reads, prefer an existing typed read surface. The
+    first server-verified advisory cohort is guarded local Git reads, which
+    route to grabowski_git. Other direct commands remain durable unless a
+    server-owned read classifier proves their effect boundary. Persistent tasks
+    also remain the route for durable lifecycle/resume/leases, shell or indirect
+    execution, larger output, or runtime beyond the synchronous envelope.
+    Explicit non-agent effect_profile=read_only starts emit an advisory, but
+    caller-supplied effect labels never establish read safety on their own.
     """
     target = fleet.fleet_host(host)
     executor_request: dict[str, str] | None = None
@@ -7887,6 +8055,24 @@ def grabowski_task_start(
                 "reason": "active_execution_identity",
             },
         }
+    read_routing_advisory = (
+        _task_read_routing_advisory(
+            target=target,
+            command=command,
+            working_directory=working_directory,
+            runtime_seconds=runtime,
+            resume_policy=policy,
+            task_resources=task_resources,
+            chronik_enabled=bool(chronik_enabled),
+            operation_identity=normalized_operation_identity,
+            classification=task_effect_classification,
+        )
+        if (
+            task_effect_classification.get("effect_profile") == "read_only"
+            and task_effect_classification.get("agent_executable") is None
+        )
+        else None
+    )
     retry_binding = (
         None
         if operation_retry_binding is not None
@@ -8382,6 +8568,11 @@ def grabowski_task_start(
         "runtime_refresh_executor_lease_binding": executor_lease_binding_evidence,
         "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
         "routing_shadow_capture": routing_shadow_capture,
+        **(
+            {"read_routing_advisory": read_routing_advisory}
+            if read_routing_advisory is not None
+            else {}
+        ),
         "effect_profile": task_effect_classification["effect_profile"],
         "surface": task_effect_classification["surface"],
         "agent_executable": task_effect_classification.get("agent_executable"),
@@ -8395,6 +8586,11 @@ def grabowski_task_start(
         "execution_identity": execution_identity,
         "retry_binding": retry_binding,
         "routing_shadow_capture": routing_shadow_capture,
+        **(
+            {"read_routing_advisory": read_routing_advisory}
+            if read_routing_advisory is not None
+            else {}
+        ),
         "operation_identity": normalized_operation_identity,
         "operation_retry_binding": operation_retry_binding,
         "task_effect_classification": task_effect_classification,
@@ -10900,6 +11096,14 @@ async def _grabowski_task_start_tool(
     Direct local write-capable agent CLIs receive an implicit repository lease
     unless the caller supplies an explicit path or repository scope. Every
     task-owned broad repository lease carries a complete whole-repository scope manifest.
+
+    For short effect-free direct reads, prefer an existing typed read surface.
+    The first server-verified advisory cohort is guarded local Git reads routed
+    to grabowski_git. Other direct commands stay on persistent tasks unless a
+    server-owned read classifier proves their effect boundary. Durable lifecycle,
+    resume, leases, shell/indirect execution, larger output, and long runtime
+    continue to require persistent tasks. Caller-supplied effect_profile=read_only
+    alone never establishes read safety.
     """
     operator._require_operator_capability("durable_job")
     return await asyncio.to_thread(

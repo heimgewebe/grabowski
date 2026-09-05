@@ -643,6 +643,34 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
         marker.write_text("required-v1", encoding="ascii")
         os.chmod(marker, 0o600)
 
+    def require_tool_policy(self) -> None:
+        marker = self.root / "require-tool-policy"
+        marker.write_text("required-v1", encoding="ascii")
+        os.chmod(marker, 0o600)
+
+    def write_tool_policy(
+        self,
+        connector_id: str,
+        *,
+        mode: str,
+        allowed_tools: list[str],
+        read_only_only: bool = False,
+    ) -> None:
+        path = self.root / f"{connector_id}.tools.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "connector_id": connector_id,
+                    "mode": mode,
+                    "allowed_tools": allowed_tools,
+                    "read_only_only": read_only_only,
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o600)
+
     def context(
         self,
         token: str | None = None,
@@ -690,6 +718,140 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
         self.assertEqual(primary["kind"], "connector_capability")
         self.assertEqual(johannes["kind"], "connector_capability")
         self.assertNotEqual(primary["label"], johannes["label"])
+
+    def test_connector_tool_policy_rollout_is_legacy_until_marker_exists(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        with mock.patch.object(
+            self.base,
+            "_transport_registered_tool_names",
+            return_value=["grabowski_status", "grabowski_destroy_path"],
+        ):
+            evidence = self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_destroy_path"
+            )
+        self.assertEqual(evidence["connector_id"], "primary")
+        self.assertEqual(evidence["policy_mode"], "legacy-unrestricted")
+        self.assertFalse(evidence["policy_enforced"])
+
+    def test_connector_tool_policy_marker_payload_is_exact(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        marker = self.root / "require-tool-policy"
+        marker.write_bytes(b"required-v1\n")
+        os.chmod(marker, 0o600)
+        with (
+            mock.patch.object(
+                self.base,
+                "_transport_registered_tool_names",
+                return_value=["grabowski_status"],
+            ),
+            self.assertRaisesRegex(RuntimeError, "enforcement marker is invalid"),
+        ):
+            self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_status"
+            )
+
+    def test_connector_tool_policy_missing_after_activation_fails_closed(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        self.require_tool_policy()
+        with (
+            mock.patch.object(
+                self.base,
+                "_transport_registered_tool_names",
+                return_value=["grabowski_status"],
+            ),
+            self.assertRaisesRegex(RuntimeError, "required but missing"),
+        ):
+            self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_status"
+            )
+
+    def test_connector_tool_policy_allowlist_is_authoritative(self) -> None:
+        self.enroll(**{"maulwurf-x": self.TOKEN_A})
+        self.write_tool_policy(
+            "maulwurf-x",
+            mode="allowlist",
+            allowed_tools=["grabowski_status"],
+            read_only_only=True,
+        )
+        self.require_tool_policy()
+        registered = ["grabowski_status", "grabowski_destroy_path"]
+        self.base.mcp._tool_manager = types.SimpleNamespace(
+            get_tool=lambda name: types.SimpleNamespace(
+                annotations=types.SimpleNamespace(readOnlyHint=name == "grabowski_status")
+            )
+        )
+        with mock.patch.object(
+            self.base, "_transport_registered_tool_names", return_value=registered
+        ):
+            allowed = self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_status"
+            )
+            with self.assertRaisesRegex(RuntimeError, "not authorized"):
+                self.base._transport_authorize_connector_tool(
+                    self.context(self.TOKEN_A), "grabowski_destroy_path"
+                )
+        self.assertEqual(allowed["connector_id"], "maulwurf-x")
+        self.assertEqual(allowed["policy_mode"], "allowlist")
+        self.assertTrue(allowed["policy_enforced"])
+
+    def test_connector_read_only_policy_rejects_allowlisted_mutating_tool(self) -> None:
+        self.enroll(**{"maulwurf-x": self.TOKEN_A})
+        self.write_tool_policy(
+            "maulwurf-x",
+            mode="allowlist",
+            allowed_tools=["grabowski_status", "grabowski_destroy_path"],
+            read_only_only=True,
+        )
+        self.require_tool_policy()
+        registered = ["grabowski_status", "grabowski_destroy_path"]
+        self.base.mcp._tool_manager = types.SimpleNamespace(
+            get_tool=lambda name: types.SimpleNamespace(
+                annotations=types.SimpleNamespace(readOnlyHint=name == "grabowski_status")
+            )
+        )
+        with (
+            mock.patch.object(
+                self.base, "_transport_registered_tool_names", return_value=registered
+            ),
+            self.assertRaisesRegex(RuntimeError, "explicitly read-only"),
+        ):
+            self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_destroy_path"
+            )
+
+    def test_connector_tool_policy_allows_explicit_unrestricted_primary(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        self.write_tool_policy("primary", mode="unrestricted", allowed_tools=[])
+        self.require_tool_policy()
+        with mock.patch.object(
+            self.base,
+            "_transport_registered_tool_names",
+            return_value=["grabowski_destroy_path"],
+        ):
+            allowed = self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_destroy_path"
+            )
+        self.assertEqual(allowed["connector_id"], "primary")
+        self.assertEqual(allowed["policy_mode"], "unrestricted")
+        self.assertTrue(allowed["policy_enforced"])
+
+    def test_connector_tool_policy_rejects_unknown_allowlisted_tool(self) -> None:
+        self.enroll(**{"maulwurf-x": self.TOKEN_A})
+        self.write_tool_policy(
+            "maulwurf-x", mode="allowlist", allowed_tools=["imaginary_tool"]
+        )
+        self.require_tool_policy()
+        with (
+            mock.patch.object(
+                self.base,
+                "_transport_registered_tool_names",
+                return_value=["grabowski_status"],
+            ),
+            self.assertRaisesRegex(RuntimeError, "unknown tools"),
+        ):
+            self.base._transport_authorize_connector_tool(
+                self.context(self.TOKEN_A), "grabowski_status"
+            )
 
     def test_server_restart_preserves_connector_scope(self) -> None:
         self.enroll(primary=self.TOKEN_A)

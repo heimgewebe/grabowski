@@ -65,6 +65,8 @@ def _execution(source: Path, destination: Path, digest: str, generated_at: int) 
         "max_recovery_age_seconds": MAX_AGE,
         "configured_target": TARGET,
         "kill_switch_path": str(destination.parent / "operator-kill-switch"),
+        "kill_switch_binding": {"state": "clear"},
+        "legacy_kill_switch_path": None,
         "require_root_owned_destination": False,
     }
 
@@ -144,6 +146,102 @@ class RecoveryFreshnessContractTests(unittest.TestCase):
                 )
                 self.assertFalse(inspected["valid"])
                 self.assertEqual(inspected["freshness_reason"], reason)
+
+    def test_recovery_publication_allows_only_bound_typed_in_band_blockade(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            marker = Path(raw) / "operator-kill-switch"
+            marker.write_text("placeholder\n", encoding="utf-8")
+            scope = SimpleNamespace(kind="task", value="HEIM-PC-NIXOS-MIGRATION-V1-T006")
+            record = SimpleNamespace(
+                source="typed", disarm_policy="in_band",
+                blockade_id="nixos-t006-freeze", posture="mutation_freeze", scope=scope,
+            )
+            snapshot = SimpleNamespace(
+                file_sha256="a" * 64, record_sha256="b" * 64,
+                device=7, inode=11, record=record,
+            )
+            with patch.object(broker, "read_authority_marker", return_value=snapshot):
+                binding = broker._recovery_publication_kill_switch_binding(marker)
+            self.assertEqual(binding["state"], "typed_in_band")
+            self.assertEqual(binding["record_sha256"], "b" * 64)
+            self.assertEqual(binding["scope_kind"], "task")
+
+            record.disarm_policy = "external_only"
+            with patch.object(broker, "read_authority_marker", return_value=snapshot):
+                with self.assertRaisesRegex(PermissionError, "typed in-band"):
+                    broker._recovery_publication_kill_switch_binding(marker)
+
+            record.disarm_policy = "in_band"
+            record.source = "environment"
+            with patch.object(broker, "read_authority_marker", return_value=snapshot):
+                with self.assertRaisesRegex(PermissionError, "typed in-band"):
+                    broker._recovery_publication_kill_switch_binding(marker)
+
+            with patch.object(
+                broker, "read_authority_marker", side_effect=PermissionError("unsafe marker")
+            ):
+                with self.assertRaisesRegex(PermissionError, "unsafe kill-switch"):
+                    broker._recovery_publication_kill_switch_binding(marker)
+
+    def test_publish_rejects_invalid_legacy_kill_switch_path_type(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="legacy-type")
+            execution = _execution(source, destination, digest, now)
+            execution["legacy_kill_switch_path"] = 7
+            with self.assertRaisesRegex(ValueError, "legacy kill-switch path"):
+                broker.publish_recovery_marker(execution, now=now)
+            self.assertFalse(destination.exists())
+
+    def test_publish_revalidates_exact_typed_blockade_identity(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="typed-blockade")
+            binding = {
+                "state": "typed_in_band", "marker_file_sha256": "a" * 64,
+                "record_sha256": "b" * 64, "device": 7, "inode": 11,
+                "blockade_id": "nixos-t006-freeze", "posture": "mutation_freeze",
+                "scope_kind": "task", "scope_value": "HEIM-PC-NIXOS-MIGRATION-V1-T006",
+            }
+            execution = _execution(source, destination, digest, now)
+            execution["kill_switch_binding"] = binding
+            with patch.object(
+                broker, "_recovery_publication_kill_switch_binding", return_value=dict(binding)
+            ) as observe:
+                outcome = broker.publish_recovery_marker(execution, now=now)
+            self.assertTrue(outcome["published"])
+            self.assertEqual(observe.call_count, 3)
+
+    def test_publish_rejects_typed_blockade_identity_change_after_lock(self) -> None:
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source.json"
+            destination = root / "canonical.json"
+            digest, _ = _write_source(source, now, snapshot_id="typed-blockade-race")
+            binding = {
+                "state": "typed_in_band", "marker_file_sha256": "a" * 64,
+                "record_sha256": "b" * 64, "device": 7, "inode": 11,
+                "blockade_id": "nixos-t006-freeze", "posture": "mutation_freeze",
+                "scope_kind": "task", "scope_value": "HEIM-PC-NIXOS-MIGRATION-V1-T006",
+            }
+            changed = dict(binding)
+            changed["inode"] = 12
+            execution = _execution(source, destination, digest, now)
+            execution["kill_switch_binding"] = binding
+            with patch.object(
+                broker, "_recovery_publication_kill_switch_binding",
+                side_effect=[dict(binding), changed],
+            ):
+                with self.assertRaisesRegex(PermissionError, "identity changed"):
+                    broker.publish_recovery_marker(execution, now=now)
+            self.assertFalse(destination.exists())
 
     def test_publish_is_atomic_digest_bound_and_idempotent(self) -> None:
         now = int(time.time())

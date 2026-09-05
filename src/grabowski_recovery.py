@@ -49,7 +49,7 @@ CANONICAL_RECOVERY = Path(os.environ.get(
 BACKUP_TIMER = os.environ.get("GRABOWSKI_BACKUP_TIMER", "restic-backup-1930.timer")
 MAX_AGE_SECONDS = int(os.environ.get("GRABOWSKI_RECOVERY_MAX_AGE_SECONDS", str(24 * 60 * 60)))
 DEFAULT_SERVER_RECOVERY_HOST = "heimberry"
-DEFAULT_SERVER_RECOVERY_TARGET = "heimberry:rest-server/grabowski-recovery-probe"
+DEFAULT_SERVER_RECOVERY_TARGET = "local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc"
 SERVER_RECOVERY_HOST = os.environ.get("GRABOWSKI_SERVER_RECOVERY_HOST", DEFAULT_SERVER_RECOVERY_HOST)
 SERVER_RECOVERY_REMOTE_PORT = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_REMOTE_PORT", "18081"))
 SERVER_RECOVERY_REST_USER = os.environ.get("GRABOWSKI_SERVER_RECOVERY_REST_USER", "grabowski")
@@ -65,6 +65,22 @@ SERVER_RECOVERY_REPOSITORY_PASSWORD = Path(os.environ.get(
 )).expanduser()
 RESTIC_BIN = os.environ.get("GRABOWSKI_RESTIC_BIN", "/usr/bin/restic")
 SSH_BIN = os.environ.get("GRABOWSKI_SSH_BIN", "/usr/bin/ssh")
+LOCAL_RECOVERY_MOUNT = Path(os.environ.get("GRABOWSKI_LOCAL_RECOVERY_MOUNT", "/mnt/backup")).expanduser()
+LOCAL_RECOVERY_REPOSITORY_ID = os.environ.get(
+    "GRABOWSKI_LOCAL_RECOVERY_REPOSITORY_ID",
+    "d107caf1705b0d0a1b2b36751e7d0a5e01f8108eede760fc646c7b9f8f128f4d",
+)
+LOCAL_RECOVERY_RUN_MAX_SECONDS = int(
+    os.environ.get("GRABOWSKI_LOCAL_RECOVERY_RUN_MAX_SECONDS", "7200")
+)
+LOCAL_RECOVERY_PASSWORD_FILE = Path(os.environ.get(
+    "GRABOWSKI_LOCAL_RECOVERY_PASSWORD_FILE",
+    str(operator.HOME / ".config/restic/heim-pc-password"),
+)).expanduser()
+LOCAL_RECOVERY_DURABILITY_EVIDENCE = Path(os.environ.get(
+    "GRABOWSKI_LOCAL_RECOVERY_DURABILITY_EVIDENCE",
+    str(operator.HOME / ".local/state/schauwerk/fundus/durability/current.json"),
+)).expanduser()
 SERVER_RECOVERY_CHECK_SUBSET = os.environ.get("GRABOWSKI_SERVER_RECOVERY_CHECK_SUBSET", "1/100")
 SERVER_RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TIMEOUT_SECONDS", "300"))
 SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES = int(os.environ.get("GRABOWSKI_SERVER_RECOVERY_TUNNEL_OUTPUT_MAX_BYTES", "4096"))
@@ -76,6 +92,9 @@ RECOVERY_STATUS_BLOCKED_UNTIL_CONFIGURED_TARGET_PROBE_SUCCEEDS = "blocked_until_
 RECOVERY_STATUS_BLOCKED_TARGET_MISMATCH = "blocked_on_recovery_target_mismatch"
 RECOVERY_STATUS_BLOCKED_INVALID_TARGET = "blocked_on_invalid_recovery_target_configuration"
 RECOVERY_TARGET_RE = re.compile(r"^(?P<host>[A-Za-z0-9][A-Za-z0-9._-]{0,127}):rest-server/(?P<probe>[A-Za-z0-9][A-Za-z0-9._-]{0,127})$")
+LOCAL_RECOVERY_TARGET_RE = re.compile(
+    r"^local-backup-disk:UUID=(?P<uuid>[A-Fa-f0-9][A-Fa-f0-9-]{3,63})/restic/(?P<repository>[A-Za-z0-9][A-Za-z0-9._-]{0,127})$"
+)
 TEST_KILL_SWITCH_KIND = "grabowski_operator_kill_switch_test"
 TEST_KILL_SWITCH_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 TEST_KILL_SWITCH_MAX_LIFETIME_SECONDS = 5 * 60
@@ -99,33 +118,50 @@ def _recovery_target_info(value: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
         "target": value if isinstance(value, str) else None,
         "valid": False,
+        "kind": None,
         "host": None,
         "probe": None,
+        "backup_uuid": None,
+        "repository_name": None,
         "error": None,
     }
     if not isinstance(value, str):
-        result["error"] = "server recovery target must be a string"
+        result["error"] = "recovery target must be a string"
         return result
     if value != value.strip():
-        result["error"] = "server recovery target must not contain surrounding whitespace"
+        result["error"] = "recovery target must not contain surrounding whitespace"
         return result
     if not value or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
-        result["error"] = "server recovery target must not be empty or contain whitespace/control characters"
+        result["error"] = "recovery target must not be empty or contain whitespace/control characters"
         return result
-    match = RECOVERY_TARGET_RE.fullmatch(value)
-    if match is None:
-        result["error"] = "server recovery target must match <host>:rest-server/<probe>"
+    server_match = RECOVERY_TARGET_RE.fullmatch(value)
+    if server_match is not None:
+        host = _normalize_recovery_host(server_match.group("host"))
+        if not host:
+            result["error"] = "server recovery target host is invalid"
+            return result
+        result.update({
+            "valid": True,
+            "kind": "rest_server",
+            "host": host,
+            "probe": server_match.group("probe"),
+            "error": None,
+        })
         return result
-    host = _normalize_recovery_host(match.group("host"))
-    if not host:
-        result["error"] = "server recovery target host is invalid"
+    local_match = LOCAL_RECOVERY_TARGET_RE.fullmatch(value)
+    if local_match is not None:
+        result.update({
+            "valid": True,
+            "kind": "local_backup_disk",
+            "backup_uuid": local_match.group("uuid"),
+            "repository_name": local_match.group("repository"),
+            "error": None,
+        })
         return result
-    result.update({
-        "valid": True,
-        "host": host,
-        "probe": match.group("probe"),
-        "error": None,
-    })
+    result["error"] = (
+        "recovery target must match <host>:rest-server/<probe> or "
+        "local-backup-disk:UUID=<uuid>/restic/<repository>"
+    )
     return result
 
 
@@ -147,6 +183,9 @@ def _heimserver_recovery_aliases() -> frozenset[str]:
 
 
 def _uses_default_heimserver_recovery_backend() -> bool:
+    target_info = _configured_recovery_target_info()
+    if target_info.get("kind") != "rest_server":
+        return False
     aliases = _heimserver_recovery_aliases()
     host = _normalize_recovery_host(SERVER_RECOVERY_HOST)
     target_host = _configured_recovery_target_host()
@@ -178,16 +217,26 @@ def _server_recovery_evidence_boundary(server_marker: dict[str, Any]) -> dict[st
         status = RECOVERY_STATUS_BLOCKED_ON_DEFAULT_HEIMSERVER
     else:
         status = RECOVERY_STATUS_BLOCKED_UNTIL_CONFIGURED_TARGET_PROBE_SUCCEEDS
+    boundary_kind = (
+        "local_restic_backup_restore_check"
+        if target_info.get("kind") == "local_backup_disk"
+        else "ssh_tunnelled_restic_backup_restore_check"
+    )
     return {
         "schema_version": 1,
-        "kind": "ssh_tunnelled_restic_backup_restore_check",
-        "server_recovery_host": SERVER_RECOVERY_HOST,
+        "kind": boundary_kind,
+        "target_kind": target_info.get("kind"),
+        "server_recovery_host": (
+            SERVER_RECOVERY_HOST if target_info.get("kind") == "rest_server" else None
+        ),
         "server_recovery_target": SERVER_RECOVERY_TARGET,
         "marker_target": server_marker.get("target"),
         "configured_target": SERVER_RECOVERY_TARGET,
         "configured_target_valid": configured_target_valid,
         "configured_target_host": target_info.get("host"),
         "configured_target_probe": target_info.get("probe"),
+        "configured_target_backup_uuid": target_info.get("backup_uuid"),
+        "configured_target_repository": target_info.get("repository_name"),
         "configured_target_error": target_info.get("error"),
         "target_matches_configured": target_matches_configured,
         "heimserver_recovery_aliases": sorted(_heimserver_recovery_aliases()),
@@ -198,9 +247,9 @@ def _server_recovery_evidence_boundary(server_marker: dict[str, Any]) -> dict[st
         "high_impact_actions_remain_blocked_until_fresh_server_evidence": not server_fresh,
         "does_not_establish": [
             "runtime health does not prove restore readiness",
-            "stale server recovery markers do not authorize privileged or power-worker actions",
-            "a configured non-heimserver target is only sufficient after backup, restore and repository checks pass",
-            "server recovery evidence for one target authorizes no other configured target",
+            "stale recovery markers do not authorize privileged or power-worker actions",
+            "a configured recovery target is sufficient only after backup, restore and repository checks pass",
+            "recovery evidence for one target authorizes no other configured target",
         ],
     }
 
@@ -209,15 +258,31 @@ def _bounded_file(path: Path) -> bool:
     return not path.is_symlink() and path.is_file() and path.stat().st_size <= 65536
 
 
+def _iso_timestamp_unix(value: str) -> int:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    extended_fraction = re.fullmatch(
+        r"(?P<prefix>.*\.\d{6})\d+(?P<offset>[+-]\d{2}:\d{2})",
+        normalized,
+    )
+    if extended_fraction is not None:
+        normalized = (
+            extended_fraction.group("prefix")
+            + extended_fraction.group("offset")
+        )
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a timezone")
+    return int(parsed.timestamp())
+
+
 def _timestamp(value: str) -> int:
     text = value.strip()
     try:
         return int(text)
     except ValueError:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            raise ValueError("timestamp must include a timezone")
-        return int(parsed.timestamp())
+        return _iso_timestamp_unix(text)
 
 
 def _fresh_text_marker(path: Path) -> dict[str, Any]:
@@ -833,7 +898,510 @@ def _schedule_recovery_alert(
         return
 
 
+def _local_recovery_durability_evidence(*, now: int) -> dict[str, Any]:
+    if not _bounded_file(LOCAL_RECOVERY_DURABILITY_EVIDENCE):
+        raise RuntimeError("local recovery durability evidence is missing or invalid")
+    evidence_meta = LOCAL_RECOVERY_DURABILITY_EVIDENCE.stat()
+    if (
+        evidence_meta.st_uid != os.geteuid()
+        or evidence_meta.st_nlink != 1
+        or evidence_meta.st_mode & 0o077
+    ):
+        raise RuntimeError("local recovery durability evidence permissions are unsafe")
+    try:
+        value = json.loads(LOCAL_RECOVERY_DURABILITY_EVIDENCE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("local recovery durability evidence is unreadable") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("local recovery durability evidence is malformed")
+    required = {
+        "schema_version",
+        "evidence_ref",
+        "producer",
+        "verification",
+        "verified_at",
+        "receipt_digest",
+        "inventory_algorithm",
+        "inventory_sha256",
+        "file_count",
+        "total_bytes",
+    }
+    if set(value) != required:
+        raise RuntimeError("local recovery durability evidence contract is invalid")
+    if value.get("schema_version") != "schauwerk-fundus-durability-evidence.v1":
+        raise RuntimeError("local recovery durability evidence schema mismatch")
+    if value.get("producer") != "infra:heim-pc-restic-backup":
+        raise RuntimeError("local recovery durability evidence producer mismatch")
+    if value.get("verification") != "staged_restore_exact_snapshot":
+        raise RuntimeError("local recovery durability verification mismatch")
+    if value.get("inventory_algorithm") != "schauwerk-fundus-inventory.v1":
+        raise RuntimeError("local recovery durability inventory algorithm mismatch")
+    inventory_sha256 = value.get("inventory_sha256")
+    if not isinstance(inventory_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", inventory_sha256) is None:
+        raise RuntimeError("local recovery durability inventory digest is invalid")
+    for field in ("file_count", "total_bytes"):
+        number = value.get(field)
+        if isinstance(number, bool) or not isinstance(number, int) or number < 0:
+            raise RuntimeError(f"local recovery durability {field} is invalid")
+    evidence_ref = value.get("evidence_ref")
+    match = re.fullmatch(r"snapshot:([0-9a-f]{64})", evidence_ref if isinstance(evidence_ref, str) else "")
+    if match is None:
+        raise RuntimeError("local recovery durability snapshot binding is invalid")
+    digest = value.get("receipt_digest")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise RuntimeError("local recovery durability receipt digest is invalid")
+    body = dict(value)
+    body.pop("receipt_digest", None)
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            body,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if digest != expected_digest:
+        raise RuntimeError("local recovery durability receipt digest mismatch")
+    verified_at = value.get("verified_at")
+    if not isinstance(verified_at, str):
+        raise RuntimeError("local recovery durability timestamp is invalid")
+    try:
+        verified_at_unix = _iso_timestamp_unix(verified_at)
+    except ValueError as exc:
+        raise RuntimeError("local recovery durability timestamp is invalid") from exc
+    age_seconds = now - verified_at_unix
+    if age_seconds < 0 or age_seconds > MAX_AGE_SECONDS:
+        raise RuntimeError("local recovery durability evidence is stale or future-dated")
+    return {
+        "snapshot_id": match.group(1),
+        "verified_at_unix": verified_at_unix,
+        "age_seconds": age_seconds,
+        "receipt_digest": digest,
+        "inventory_algorithm": value["inventory_algorithm"],
+        "inventory_sha256": inventory_sha256,
+        "file_count": value["file_count"],
+        "total_bytes": value["total_bytes"],
+    }
+
+
+def _local_recovery_repository(
+    target_info: dict[str, Any],
+    *,
+    log_path: Path,
+) -> tuple[Path, dict[str, str], str]:
+    if target_info.get("kind") != "local_backup_disk":
+        raise RuntimeError("local recovery target kind mismatch")
+    backup_uuid = target_info.get("backup_uuid")
+    repository_name = target_info.get("repository_name")
+    if not isinstance(backup_uuid, str) or not isinstance(repository_name, str):
+        raise RuntimeError("local recovery target is incomplete")
+    if not LOCAL_RECOVERY_MOUNT.is_absolute() or LOCAL_RECOVERY_MOUNT.is_symlink():
+        raise RuntimeError("local recovery mount path is unsafe")
+    env = dict(os.environ)
+    findmnt = _run_logged(
+        [
+            "/usr/bin/findmnt",
+            "-rn",
+            "-T",
+            str(LOCAL_RECOVERY_MOUNT),
+            "-t",
+            "ntfs3",
+            "-o",
+            "TARGET,SOURCE,FSTYPE",
+        ],
+        env=env,
+        log=log_path,
+        timeout_seconds=30,
+    )
+    rows = [line.split() for line in findmnt.stdout.splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) != 3:
+        raise RuntimeError("local recovery mount identity is ambiguous")
+    mount_target, mount_source, mount_fstype = rows[0]
+    if (
+        mount_target != str(LOCAL_RECOVERY_MOUNT)
+        or not mount_source.startswith("/dev/")
+        or mount_fstype != "ntfs3"
+    ):
+        raise RuntimeError("local recovery mount identity mismatch")
+    observed_uuid = _run_logged(
+        ["/usr/bin/lsblk", "-ndo", "UUID", mount_source],
+        env=env,
+        log=log_path,
+        timeout_seconds=30,
+    ).stdout.strip()
+    if observed_uuid != backup_uuid:
+        raise RuntimeError("local recovery backup UUID mismatch")
+    repository = LOCAL_RECOVERY_MOUNT / "restic" / repository_name
+    if not repository.is_dir() or repository.is_symlink():
+        raise RuntimeError("local recovery repository is missing or unsafe")
+    try:
+        resolved_repository = repository.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("local recovery repository cannot be resolved") from exc
+    if resolved_repository != repository:
+        raise RuntimeError("local recovery repository path traverses a symlink")
+    if not _bounded_file(LOCAL_RECOVERY_PASSWORD_FILE):
+        raise RuntimeError("local recovery repository password file is missing or invalid")
+    password_meta = LOCAL_RECOVERY_PASSWORD_FILE.stat()
+    if password_meta.st_uid != os.geteuid() or password_meta.st_mode & 0o077:
+        raise RuntimeError("local recovery repository password file permissions are unsafe")
+    restic_env = dict(env)
+    restic_env.update(
+        {
+            "RESTIC_REPOSITORY": str(repository),
+            "RESTIC_PASSWORD_FILE": str(LOCAL_RECOVERY_PASSWORD_FILE),
+        }
+    )
+    config = _run_logged(
+        [RESTIC_BIN, "cat", "config", "--no-cache", "--no-lock"],
+        env=restic_env,
+        log=log_path,
+        timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,
+    )
+    try:
+        config_value = json.loads(config.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("local recovery repository config is invalid") from exc
+    observed_repository_id = (
+        config_value.get("id") if isinstance(config_value, dict) else None
+    )
+    if observed_repository_id != LOCAL_RECOVERY_REPOSITORY_ID:
+        raise RuntimeError("local recovery repository ID mismatch")
+    return repository, restic_env, mount_source
+
+
+def _local_recovery_snapshot_metadata(
+    *,
+    snapshot_id: str,
+    restic_env: dict[str, str],
+    log_path: Path,
+) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{64}", snapshot_id) is None:
+        raise RuntimeError("local recovery snapshot id is invalid")
+    snapshots = _run_logged(
+        [RESTIC_BIN, "snapshots", "--json", "--no-cache", "--no-lock", snapshot_id],
+        env=restic_env,
+        log=log_path,
+        timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,
+    )
+    try:
+        rows = json.loads(snapshots.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("local recovery snapshot metadata is invalid") from exc
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise RuntimeError("local recovery snapshot identity is ambiguous")
+    row = rows[0]
+    if row.get("id") != snapshot_id:
+        raise RuntimeError("local recovery snapshot identity mismatch")
+    if row.get("hostname") != "heim-pc":
+        raise RuntimeError("local recovery snapshot host mismatch")
+    tags = row.get("tags")
+    if (
+        not isinstance(tags, list)
+        or not all(isinstance(tag, str) for tag in tags)
+        or "daily" not in tags
+    ):
+        raise RuntimeError("local recovery snapshot daily tag is missing")
+    snapshot_time = row.get("time")
+    if not isinstance(snapshot_time, str):
+        raise RuntimeError("local recovery snapshot time is invalid")
+    try:
+        snapshot_time_unix = _iso_timestamp_unix(snapshot_time)
+    except ValueError as exc:
+        raise RuntimeError("local recovery snapshot time is invalid") from exc
+    paths = row.get("paths")
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise RuntimeError("local recovery snapshot paths are invalid")
+    expected_paths = {
+        str(operator.HOME / "repos"),
+        str(operator.HOME / "artifacts/merges"),
+        str(operator.HOME / ".local/share/schauwerk/fundus"),
+        str(operator.HOME / ".local/state/heim-pc-priorities/backup-sentinel.txt"),
+    }
+    if not expected_paths.issubset(set(paths)):
+        raise RuntimeError("local recovery snapshot source contract mismatch")
+    return {
+        "snapshot_id": snapshot_id,
+        "hostname": "heim-pc",
+        "tags": sorted(tags),
+        "paths": sorted(paths),
+        "time": snapshot_time,
+        "time_unix": snapshot_time_unix,
+    }
+
+
+def _local_recovery_inventory(root: Path) -> dict[str, Any]:
+    try:
+        root_meta = os.lstat(root)
+    except OSError as exc:
+        raise RuntimeError("local recovery restored Fundus is unavailable") from exc
+    if not stat.S_ISDIR(root_meta.st_mode) or stat.S_ISLNK(root_meta.st_mode):
+        raise RuntimeError("local recovery restored Fundus root is unsafe")
+    files: list[dict[str, Any]] = []
+
+    def walk(directory: Path, prefix: Path) -> None:
+        try:
+            with os.scandir(directory) as handle:
+                entries = sorted(handle, key=lambda item: item.name)
+        except OSError as exc:
+            raise RuntimeError("local recovery restored Fundus cannot be enumerated") from exc
+        for entry in entries:
+            relative = prefix / entry.name
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"local recovery restored Fundus cannot stat {relative.as_posix()}"
+                ) from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError(
+                    f"local recovery restored Fundus contains symlink: {relative.as_posix()}"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                walk(Path(entry.path), relative)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError(
+                    f"local recovery restored Fundus contains special file: {relative.as_posix()}"
+                )
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(entry.path, flags)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"local recovery restored Fundus cannot open {relative.as_posix()}"
+                ) from exc
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (metadata.st_dev, metadata.st_ino)
+                ):
+                    raise RuntimeError(
+                        f"local recovery restored Fundus path changed: {relative.as_posix()}"
+                    )
+                digest = hashlib.sha256()
+                total = 0
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    total += len(chunk)
+                after = os.fstat(descriptor)
+                if (
+                    after.st_size != opened.st_size
+                    or after.st_mtime_ns != opened.st_mtime_ns
+                    or total != after.st_size
+                ):
+                    raise RuntimeError(
+                        f"local recovery restored Fundus file changed: {relative.as_posix()}"
+                    )
+            finally:
+                os.close(descriptor)
+            files.append(
+                {
+                    "path": relative.as_posix(),
+                    "bytes": total,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+
+    walk(root, Path())
+    inventory = {
+        "schema_version": "schauwerk-fundus-inventory.v1",
+        "files": files,
+    }
+    raw = json.dumps(
+        inventory,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "inventory_sha256": hashlib.sha256(raw).hexdigest(),
+        "file_count": len(files),
+        "total_bytes": sum(int(item["bytes"]) for item in files),
+    }
+
+
+def _local_recovery_restore_probe(
+    *,
+    snapshot_id: str,
+    restic_env: dict[str, str],
+    durability: dict[str, Any],
+    log_path: Path,
+) -> dict[str, Any]:
+    fundus = operator.HOME / ".local/share/schauwerk/fundus"
+    with tempfile.TemporaryDirectory(prefix="grabowski-local-recovery-") as raw:
+        target = Path(raw)
+        _run_logged(
+            [
+                RESTIC_BIN,
+                "restore",
+                snapshot_id,
+                "--target",
+                str(target),
+                "--include",
+                str(fundus),
+                "--verify",
+            ],
+            env=restic_env,
+            log=log_path,
+            timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,
+        )
+        restored_fundus = target / str(fundus).lstrip("/")
+        inventory = _local_recovery_inventory(restored_fundus)
+    if inventory["inventory_sha256"] != durability["inventory_sha256"]:
+        raise RuntimeError("local recovery restored Fundus inventory digest mismatch")
+    if inventory["file_count"] != durability["file_count"]:
+        raise RuntimeError("local recovery restored Fundus file count mismatch")
+    if inventory["total_bytes"] != durability["total_bytes"]:
+        raise RuntimeError("local recovery restored Fundus byte count mismatch")
+    return inventory
+
+
+def _local_recovery_probe(target_info: dict[str, Any]) -> dict[str, Any]:
+    completed_at_unix = int(time.time())
+    durability = _local_recovery_durability_evidence(now=completed_at_unix)
+    log_dir = operator.STATE_DIR / "recovery"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"local-recovery-{completed_at_unix}.log"
+    repository, restic_env, mount_source = _local_recovery_repository(
+        target_info,
+        log_path=log_path,
+    )
+    snapshot = _local_recovery_snapshot_metadata(
+        snapshot_id=durability["snapshot_id"],
+        restic_env=restic_env,
+        log_path=log_path,
+    )
+    snapshot_age_at_verification = (
+        durability["verified_at_unix"] - snapshot["time_unix"]
+    )
+    if (
+        snapshot_age_at_verification < 0
+        or snapshot_age_at_verification > LOCAL_RECOVERY_RUN_MAX_SECONDS
+    ):
+        raise RuntimeError(
+            "local recovery snapshot and durability evidence are not from one bounded run"
+        )
+    restore_probe = _local_recovery_restore_probe(
+        snapshot_id=durability["snapshot_id"],
+        restic_env=restic_env,
+        durability=durability,
+        log_path=log_path,
+    )
+    _run_logged(
+        [RESTIC_BIN, "check", f"--read-data-subset={SERVER_RECOVERY_CHECK_SUBSET}"],
+        env=restic_env,
+        log=log_path,
+        timeout_seconds=SERVER_RECOVERY_TIMEOUT_SECONDS,
+    )
+    repository_after, restic_env_after, mount_source_after = _local_recovery_repository(
+        target_info,
+        log_path=log_path,
+    )
+    durability_after = _local_recovery_durability_evidence(now=int(time.time()))
+    snapshot_after = _local_recovery_snapshot_metadata(
+        snapshot_id=durability_after["snapshot_id"],
+        restic_env=restic_env_after,
+        log_path=log_path,
+    )
+    if repository_after != repository or mount_source_after != mount_source:
+        raise RuntimeError("local recovery repository identity changed before publication")
+    if (
+        durability_after["receipt_digest"] != durability["receipt_digest"]
+        or durability_after["snapshot_id"] != durability["snapshot_id"]
+    ):
+        raise RuntimeError("local recovery durability evidence changed before publication")
+    if snapshot_after != snapshot:
+        raise RuntimeError("local recovery snapshot identity changed before publication")
+    source_write = _write_server_marker(
+        completed_at_unix=completed_at_unix,
+        snapshot_id=durability["snapshot_id"][:8],
+    )
+    publication = privileged.publish_recovery_marker_reference(
+        source_record_sha256=source_write["source_record_sha256"],
+        generated_at_unix=source_write["generated_at_unix"],
+    )
+    if not publication.get("success"):
+        raise RuntimeError(
+            "canonical root recovery publication failed: "
+            + _publication_failure_detail(publication)
+        )
+    log_sha256 = _sha256_file(log_path) if log_path.exists() else None
+    source_marker = _server_source_marker()
+    canonical_marker = _canonical_server_marker()
+    if not canonical_marker.get("valid"):
+        raise RuntimeError("canonical recovery record readback is not ready")
+    if (
+        canonical_marker.get("source_record_sha256")
+        != source_write.get("source_record_sha256")
+    ):
+        raise RuntimeError("canonical recovery record source digest mismatch")
+    audit_record = {
+        "timestamp_unix": completed_at_unix,
+        "operation": "local-recovery-probe",
+        "snapshot_id": canonical_marker.get("snapshot_id"),
+        "snapshot_full_id": durability["snapshot_id"],
+        "target": SERVER_RECOVERY_TARGET,
+        "backup_uuid": target_info.get("backup_uuid"),
+        "repository_id": LOCAL_RECOVERY_REPOSITORY_ID,
+        "durability_receipt_digest": durability["receipt_digest"],
+        "snapshot_age_at_verification_seconds": snapshot_age_at_verification,
+        "durability_inventory_sha256": durability["inventory_sha256"],
+        "durability_file_count": durability["file_count"],
+        "durability_total_bytes": durability["total_bytes"],
+        "restore_inventory_sha256": restore_probe["inventory_sha256"],
+        "canonical_record_sha256": canonical_marker.get("record_sha256"),
+        "source_record_sha256": canonical_marker.get("source_record_sha256"),
+        "restore_probe_valid": True,
+        "repository_check_valid": True,
+        "log_sha256": log_sha256,
+    }
+    base._append_audit(audit_record)
+    return {
+        "schema_version": 1,
+        "completed_at_unix": completed_at_unix,
+        "snapshot_id": canonical_marker.get("snapshot_id"),
+        "snapshot_full_id": durability["snapshot_id"],
+        "target": SERVER_RECOVERY_TARGET,
+        "target_kind": "local_backup_disk",
+        "backup_mount": str(LOCAL_RECOVERY_MOUNT),
+        "backup_source": mount_source,
+        "backup_uuid": target_info.get("backup_uuid"),
+        "repository": str(repository),
+        "repository_id": LOCAL_RECOVERY_REPOSITORY_ID,
+        "durability_receipt_digest": durability["receipt_digest"],
+        "snapshot_age_at_verification_seconds": snapshot_age_at_verification,
+        "durability_inventory_sha256": durability["inventory_sha256"],
+        "durability_file_count": durability["file_count"],
+        "durability_total_bytes": durability["total_bytes"],
+        "restore_inventory_sha256": restore_probe["inventory_sha256"],
+        "restore_probe_valid": True,
+        "repository_check_valid": True,
+        "marker_valid": canonical_marker.get("valid"),
+        "marker_path": str(CANONICAL_RECOVERY),
+        "canonical_recovery": canonical_marker,
+        "source_recovery": source_marker,
+        "publication": publication,
+        "log_path": str(log_path),
+        "log_sha256": log_sha256,
+    }
+
+
 def server_recovery_probe() -> dict[str, Any]:
+    target_info = _configured_recovery_target_info()
+    if not target_info.get("valid"):
+        raise RuntimeError(f"recovery target configuration is invalid: {target_info.get('error')}")
+    if target_info.get("kind") == "local_backup_disk":
+        return _local_recovery_probe(target_info)
     http_password = _read_secret_text(SERVER_RECOVERY_HTTP_PASSWORD)
     if not _bounded_file(SERVER_RECOVERY_REPOSITORY_PASSWORD):
         raise RuntimeError("repository password file is missing or invalid")

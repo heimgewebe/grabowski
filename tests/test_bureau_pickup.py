@@ -8224,6 +8224,191 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual("print('dirty')\n", (worktree / "wip.py").read_text())
         self.assertIn("dirty worktree content", result["receipt"]["preserves"])
 
+    def test_orphan_reconcile_supersedes_proven_no_effect_pre_effect_after_coordination_drift(
+        self,
+    ) -> None:
+        intent, run_dir, _acq, coordination, request, lease, key = self._orphan_setup()
+        stale_runtime_blocked = {
+            "schema_version": pickup.SCHEMA_VERSION,
+            "status": "stale-runtime-blocked",
+            "reason_codes": ["release-registry-identity-mismatch"],
+            "runtime_identity": {
+                "status": "stale-runtime-blocked",
+                "compatibility": {
+                    "status": "stale",
+                    "mutation_allowed": False,
+                },
+                "claim_root": {
+                    "status": "blocked",
+                    "mutation_conclusion_allowed": False,
+                    "claim_authority_established": False,
+                },
+            },
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, stale_runtime_blocked],
+            ),
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=lease),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            first = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("outcome_unknown", first["status"])
+        release.assert_not_called()
+        primary_path = run_dir / "orphan-pre-effect.json"
+        primary_before = primary_path.read_bytes()
+        old_digest = request["expected_coordination_sha256"]
+
+        drifted = json.loads(json.dumps(coordination))
+        drifted["run"]["heartbeat_at"] = self.utc_heartbeat(7200)
+        new_digest = pickup._coordination_cas_sha256(drifted)
+        self.assertNotEqual(old_digest, new_digest)
+        retry_request = {**request, "expected_coordination_sha256": new_digest}
+        terminal = self.coordinated_status(intent, state="failed")
+        fail_result = {
+            "run_id": intent["run_id"],
+            "state": "failed",
+            "error": pickup.ORPHAN_RECONCILE_ERROR,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[drifted, fail_result, terminal, terminal],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, lease, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ) as release,
+        ):
+            second = pickup.grabowski_bureau_pickup_orphan_reconcile(retry_request)
+        self.assertEqual("reconciled", second["status"])
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        self.assertEqual(primary_before, primary_path.read_bytes())
+        retry_paths = list(run_dir.glob("orphan-pre-effect-retry-*.json"))
+        self.assertEqual(1, len(retry_paths))
+        retry = json.loads(retry_paths[0].read_text(encoding="utf-8"))
+        self.assertEqual(2, retry["generation"])
+        self.assertEqual("orphan-pre-effect.json", retry["supersedes_pre_effect_path"])
+        self.assertEqual("stale-runtime-blocked", retry["prior_no_effect_status"])
+        self.assertEqual(
+            {old_digest, new_digest},
+            pickup._read_orphan_pre_effect_coordination_digests(run_dir),
+        )
+
+    def test_orphan_reconcile_rejects_tampered_retry_supersession_chain(
+        self,
+    ) -> None:
+        intent, run_dir, _acq, coordination, request, _lease, _key = self._orphan_setup()
+        pickup._write_orphan_pre_effect(
+            run_dir,
+            run_id=intent["run_id"],
+            observed_coordination_sha256=request["expected_coordination_sha256"],
+            normalized=request,
+        )
+        pickup._write_bound_json(
+            run_dir / "orphan-fail-unknown.json",
+            {
+                "schema_version": pickup.SCHEMA_VERSION,
+                "status": "stale-runtime-blocked",
+                "reason_codes": ["release-registry-identity-mismatch"],
+                "runtime_identity": {
+                    "status": "stale-runtime-blocked",
+                    "compatibility": {
+                        "status": "stale",
+                        "mutation_allowed": False,
+                    },
+                    "claim_root": {
+                        "status": "blocked",
+                        "mutation_conclusion_allowed": False,
+                        "claim_authority_established": False,
+                    },
+                },
+            },
+        )
+        drifted = json.loads(json.dumps(coordination))
+        drifted["run"]["heartbeat_at"] = self.utc_heartbeat(7200)
+        new_digest = pickup._coordination_cas_sha256(drifted)
+        retry_request = {**request, "expected_coordination_sha256": new_digest}
+        retry_path = pickup._write_orphan_pre_effect(
+            run_dir,
+            run_id=intent["run_id"],
+            observed_coordination_sha256=new_digest,
+            normalized=retry_request,
+        )
+        retry = json.loads(retry_path.read_text(encoding="utf-8"))
+        retry["supersedes_pre_effect_sha256"] = "f" * 64
+        retry_path.write_text(json.dumps(retry, sort_keys=True) + "\n", encoding="utf-8")
+
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            pickup._read_orphan_pre_effect_coordination_digests(run_dir)
+        self.assertEqual(
+            "orphan-reconcile-pre-effect-supersession-invalid", raised.exception.code
+        )
+
+    def test_orphan_reconcile_does_not_supersede_ambiguous_prior_effect(
+        self,
+    ) -> None:
+        intent, run_dir, _acq, coordination, request, lease, _key = self._orphan_setup()
+        pickup._write_orphan_pre_effect(
+            run_dir,
+            run_id=intent["run_id"],
+            observed_coordination_sha256=request["expected_coordination_sha256"],
+            normalized=request,
+        )
+        pickup._write_bound_json(
+            run_dir / "orphan-fail-unknown.json",
+            {
+                "schema_version": pickup.SCHEMA_VERSION,
+                "status": "stale-runtime-blocked",
+                "reason_codes": ["release-registry-identity-mismatch"],
+                "effect_started": True,
+                "ambiguity": True,
+                "runtime_identity": {
+                    "status": "stale-runtime-blocked",
+                    "compatibility": {
+                        "status": "stale",
+                        "mutation_allowed": False,
+                    },
+                    "claim_root": {
+                        "status": "blocked",
+                        "mutation_conclusion_allowed": False,
+                        "claim_authority_established": False,
+                    },
+                },
+            },
+        )
+        drifted = json.loads(json.dumps(coordination))
+        drifted["run"]["heartbeat_at"] = self.utc_heartbeat(7200)
+        retry_request = {
+            **request,
+            "expected_coordination_sha256": pickup._coordination_cas_sha256(drifted),
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=drifted
+            ) as invoke,
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=lease),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(retry_request)
+        self.assertEqual(
+            "orphan-reconcile-pre-effect-retry-unproven", raised.exception.code
+        )
+        self.assertEqual(1, invoke.call_count)
+        self.assertNotIn("fail", invoke.call_args.args[0])
+        self.assertEqual([], list(run_dir.glob("orphan-pre-effect-retry-*.json")))
+        release.assert_not_called()
+
     def test_orphan_reconcile_response_loss_is_outcome_unknown(self) -> None:
         intent, run_dir, _acq, coordination, request, lease, _key = self._orphan_setup()
         unknown = {

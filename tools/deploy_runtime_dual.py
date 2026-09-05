@@ -71,6 +71,8 @@ TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
 OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
+LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
 PRIVILEGED_BROKER_SOCKET = Path("/run/grabowski/privileged-broker.sock")
 PRIVILEGED_REFERENCE_TTL_SECONDS = 300
 PRIVILEGED_RESPONSE_MAX_BYTES = 512 * 1024
@@ -78,6 +80,12 @@ OPERATOR_AUTHORITY_ATTESTATION_PATH = Path(
     "/var/lib/grabowski/operator-authority-attestation.v1.json"
 )
 TRANSPORT_INGRESS_SERVICE = "grabowski-transport-ingress.service"
+MAULWURF_X_TRANSPORT_INGRESS_SERVICE = (
+    "grabowski-transport-ingress-maulwurf-x.service"
+)
+MAULWURF_X_EXTERNAL_GATEWAY_SERVICE = (
+    "grabowski-external-connector-maulwurf-x.service"
+)
 SAFETY_OBSERVER_SERVICE = "grabowski-safety-observer.service"
 SAFETY_OBSERVER_UNIT_RELATIVE = Path("systemd/grabowski-safety-observer.service.example")
 SAFETY_OBSERVER_UNIT_PATH = core.HOME / ".config/systemd/user/grabowski-safety-observer.service"
@@ -87,6 +95,13 @@ TUNNEL_OPERATOR_DEPENDENCY_RELATIVE = Path(
 TUNNEL_OPERATOR_DEPENDENCY_PATH = (
     core.HOME
     / ".config/systemd/user/tunnel-client-grabowski.service.d/70-operator-dependency.conf"
+)
+OPERATOR_RECOVERY_TARGET_RELATIVE = Path(
+    "systemd/grabowski-operator.service.d/90-recovery-target.conf.example"
+)
+OPERATOR_RECOVERY_TARGET_PATH = (
+    core.HOME
+    / ".config/systemd/user/grabowski-operator.service.d/90-recovery-target.conf"
 )
 TUNNEL_OPERATOR_DEPENDENCY_EXPECTED_DIRECTIVES = {
     "Unit": {
@@ -117,6 +132,32 @@ WATCHDOG_HOST_ASSETS = (
         unit=TRANSPORT_INGRESS_SERVICE,
     ),
     WatchdogHostAsset(
+        source=Path("systemd/grabowski-transport-ingress-maulwurf-x.service.example"),
+        target=(
+            core.HOME
+            / ".config/systemd/user/grabowski-transport-ingress-maulwurf-x.service"
+        ),
+        mode=0o600,
+        unit=MAULWURF_X_TRANSPORT_INGRESS_SERVICE,
+    ),
+    WatchdogHostAsset(
+        source=Path("tools/grabowski_external_connector_gateway.py"),
+        target=(
+            core.HOME
+            / ".local/libexec/grabowski/grabowski_external_connector_gateway.py"
+        ),
+        mode=0o700,
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-external-connector-maulwurf-x.service.example"),
+        target=(
+            core.HOME
+            / ".config/systemd/user/grabowski-external-connector-maulwurf-x.service"
+        ),
+        mode=0o600,
+        unit=MAULWURF_X_EXTERNAL_GATEWAY_SERVICE,
+    ),
+    WatchdogHostAsset(
         source=Path("tools/watchdog_admission_recovery.py"),
         target=(
             core.HOME
@@ -132,6 +173,12 @@ WATCHDOG_HOST_ASSETS = (
     WatchdogHostAsset(
         source=TUNNEL_OPERATOR_DEPENDENCY_RELATIVE,
         target=TUNNEL_OPERATOR_DEPENDENCY_PATH,
+        mode=0o600,
+        reloads_systemd=True,
+    ),
+    WatchdogHostAsset(
+        source=OPERATOR_RECOVERY_TARGET_RELATIVE,
+        target=OPERATOR_RECOVERY_TARGET_PATH,
         mode=0o600,
         reloads_systemd=True,
     ),
@@ -4693,12 +4740,29 @@ def require_operator_authority_anchored(
     lifecycle = actions.get("operator_blockade_marker_lifecycle")
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
+    backup_ntfs_check = actions.get(LOCAL_BACKUP_NTFS_CHECK_ACTION)
+    backup_ntfs_clear_dirty = actions.get(LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION)
     if not all(
         isinstance(item, dict)
         for item in (lifecycle, service_control, rootbroker_cutover)
     ):
         core.fail(
             "Ziel-Commit besitzt keinen vollständigen Operator-Authority-Vertrag",
+            phase="operator-authority-attestation",
+        )
+    if (backup_ntfs_check is None) != (backup_ntfs_clear_dirty is None):
+        core.fail(
+            "Ziel-Commit besitzt einen unvollständigen BACKUP-NTFS-Authority-Vertrag",
+            phase="operator-authority-attestation",
+        )
+    if backup_ntfs_check is not None and not isinstance(backup_ntfs_check, dict):
+        core.fail(
+            "Ziel-Commit besitzt einen ungültigen BACKUP-NTFS-Check-Vertrag",
+            phase="operator-authority-attestation",
+        )
+    if backup_ntfs_clear_dirty is not None and not isinstance(backup_ntfs_clear_dirty, dict):
+        core.fail(
+            "Ziel-Commit besitzt einen ungültigen BACKUP-NTFS-Clear-Dirty-Vertrag",
             phase="operator-authority-attestation",
         )
     assert isinstance(lifecycle, dict)
@@ -4713,24 +4777,32 @@ def require_operator_authority_anchored(
             "Operator-Power-Peer-Bindung driftet vom Blockade-Vertrag",
             phase="operator-authority-attestation",
         )
+    expected_action_contracts: dict[str, dict[str, Any]] = {
+        "operator_blockade_marker_lifecycle": lifecycle,
+        OPERATOR_SERVICE_CONTROL_ACTION: service_control,
+        ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
+    }
+    if isinstance(backup_ntfs_check, dict) and isinstance(backup_ntfs_clear_dirty, dict):
+        expected_action_contracts[LOCAL_BACKUP_NTFS_CHECK_ACTION] = backup_ntfs_check
+        expected_action_contracts[LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION] = (
+            backup_ntfs_clear_dirty
+        )
+    expected_action_names = {"operator_power_argv", *expected_action_contracts}
     observed_actions = attestation.get("action_sha256")
-    if not isinstance(observed_actions, dict) or set(observed_actions) != {
-        "operator_power_argv",
-        "operator_blockade_marker_lifecycle",
-        OPERATOR_SERVICE_CONTROL_ACTION,
-        ROOTBROKER_CUTOVER_ACTION,
-    }:
+    if (
+        not isinstance(observed_actions, dict)
+        or set(observed_actions) != expected_action_names
+    ):
         core.fail(
             "Operator-Authority-Attestation Aktionsbindung ist unvollständig",
             phase="operator-authority-attestation",
         )
+    action_digest_mismatch = any(
+        observed_actions[name] != _canonical_line_sha256(contract)
+        for name, contract in expected_action_contracts.items()
+    )
     if (
-        observed_actions["operator_blockade_marker_lifecycle"]
-        != _canonical_line_sha256(lifecycle)
-        or observed_actions[OPERATOR_SERVICE_CONTROL_ACTION]
-        != _canonical_line_sha256(service_control)
-        or observed_actions[ROOTBROKER_CUTOVER_ACTION]
-        != _canonical_line_sha256(rootbroker_cutover)
+        action_digest_mismatch
         or re.fullmatch(
             r"[0-9a-f]{64}", str(observed_actions["operator_power_argv"])
         )
