@@ -21,7 +21,9 @@ from typing import Any
 
 BRIDGE_RELATIVE = Path("tools/grabowski_maulwurf_x_public_bridge.py")
 UNIT_RELATIVE = Path("systemd/maulwurf-x-public-bridge.service.example")
-BRIDGE_TARGET_RELATIVE = Path(".local/libexec/grabowski/grabowski_maulwurf_x_public_bridge.py")
+BRIDGE_TARGET_RELATIVE = Path(
+    ".local/libexec/grabowski/grabowski_maulwurf_x_public_bridge.py"
+)
 UNIT_TARGET_RELATIVE = Path(".config/systemd/user/maulwurf-x-public-bridge.service")
 UNIT_NAME = "maulwurf-x-public-bridge.service"
 
@@ -69,7 +71,9 @@ def _atomic_install(path: Path, data: bytes, mode: int) -> dict[str, Any]:
         previous = path.read_bytes()
     else:
         previous = None
-    changed = previous != data or (path.exists() and stat.S_IMODE(path.stat().st_mode) != mode)
+    changed = previous != data or (
+        path.exists() and stat.S_IMODE(path.stat().st_mode) != mode
+    )
     if changed:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent

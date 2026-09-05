@@ -176,7 +176,10 @@ class MaulwurfXPublicBridgeContractTests(unittest.TestCase):
         self.assertNotIn("8443", unit)
 
     def test_installer_is_idempotent_and_secret_free(self) -> None:
-        with tempfile.TemporaryDirectory() as source_tmp, tempfile.TemporaryDirectory() as home_tmp:
+        with (
+            tempfile.TemporaryDirectory() as source_tmp,
+            tempfile.TemporaryDirectory() as home_tmp,
+        ):
             source_root = Path(source_tmp)
             for relative in (installer.BRIDGE_RELATIVE, installer.UNIT_RELATIVE):
                 target = source_root / relative
