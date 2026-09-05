@@ -105,6 +105,14 @@ class BackupNtfsOperationTests(unittest.TestCase):
                 result["operations"][operations.BACKUP_SMART_READ_OPERATION]["parameters"],
                 [],
             )
+            self.assertEqual(
+                result["operations"][operations.BLOCKADE_AUTHORITY_HARDEN_OPERATION]["effect"],
+                "authority_mode_write",
+            )
+            self.assertEqual(
+                result["operations"][operations.BLOCKADE_AUTHORITY_HARDEN_OPERATION]["parameters"],
+                [],
+            )
 
             path.write_text(
                 json.dumps(
@@ -144,6 +152,7 @@ class BackupNtfsOperationTests(unittest.TestCase):
         smart = operations._backup_storage_operation_plan(
             operations.BACKUP_SMART_READ_OPERATION, None
         )
+        harden = operations._blockade_authority_harden_operation_plan(None)
         self.assertEqual(check["privileged_action"], "local_backup_ntfs_check")
         self.assertEqual(check["target"], "check")
         self.assertEqual(clear["privileged_action"], "local_backup_ntfs_clear_dirty")
@@ -156,6 +165,11 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertEqual(smart["target"], "smart-read")
         self.assertEqual(smart["parameter_names"], [])
         self.assertEqual(smart["effect"], "read_only")
+        self.assertEqual(harden["parameter_names"], [])
+        self.assertEqual(harden["effect"], "authority_mode_write")
+        self.assertEqual(
+            harden["privileged_action"], operations.privileged.BLOCKADE_LIFECYCLE_ACTION
+        )
         with self.assertRaisesRegex(ValueError, "parameter mismatch"):
             operations._backup_storage_operation_plan(
                 operations.BACKUP_NTFS_CHECK_OPERATION, {"device": "/dev/sda1"}
@@ -164,6 +178,109 @@ class BackupNtfsOperationTests(unittest.TestCase):
             operations._backup_storage_operation_plan(
                 operations.BACKUP_SMART_READ_OPERATION, {"device": "/dev/sda"}
             )
+        with self.assertRaisesRegex(ValueError, "accepts no parameters"):
+            operations._blockade_authority_harden_operation_plan(
+                {"path": "/tmp/not-authorized"}
+            )
+
+    def test_blockade_authority_harden_uses_one_lifecycle_call_and_exact_readback(self) -> None:
+        before = {
+            "directory_path": "/var/lib/grabowski/operator-blockade",
+            "mode": operations.blockade_authority.LEGACY_MARKER_DIRECTORY_MODE,
+            "uid": 0,
+            "gid": 0,
+            "record_sha256": "a" * 64,
+            "marker_file_sha256": "b" * 64,
+        }
+        after = {
+            **before,
+            "mode": operations.blockade_authority.MARKER_DIRECTORY_MODE,
+        }
+        invocation = {
+            "success": True,
+            "outcome": "succeeded",
+            "request_id": "c" * 32,
+            "reference_sha256": "d" * 64,
+            "lifecycle": {"receipt_sha256": "e" * 64},
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations, "_blockade_authority_state", side_effect=[before, after]
+        ), patch.object(
+            operations.privileged,
+            "run_blockade_lifecycle_reference",
+            return_value=invocation,
+        ) as lifecycle, patch.object(operations.base, "_append_audit"):
+            result = operations._run_blockade_authority_harden_operation(None)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reconciliation"], "effect_applied")
+        self.assertFalse(result["retry_performed"])
+        lifecycle.assert_called_once()
+        payload = lifecycle.call_args.args[0]
+        self.assertEqual(payload["operation"], "harden-authority")
+        self.assertEqual(payload["expected_record_sha256"], "a" * 64)
+        self.assertEqual(payload["expected_marker_file_sha256"], "b" * 64)
+
+    def test_blockade_authority_harden_unknown_not_applied_does_not_retry(self) -> None:
+        state = {
+            "directory_path": "/var/lib/grabowski/operator-blockade",
+            "mode": operations.blockade_authority.LEGACY_MARKER_DIRECTORY_MODE,
+            "uid": 0,
+            "gid": 0,
+            "record_sha256": "a" * 64,
+            "marker_file_sha256": "b" * 64,
+        }
+        invocation = {
+            "success": False,
+            "outcome": "unknown",
+            "request_id": "c" * 32,
+            "reference_sha256": "d" * 64,
+            "lifecycle": None,
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations, "_blockade_authority_state", side_effect=[state, dict(state)]
+        ), patch.object(
+            operations.privileged,
+            "run_blockade_lifecycle_reference",
+            return_value=invocation,
+        ) as lifecycle, patch.object(operations.base, "_append_audit"):
+            result = operations._run_blockade_authority_harden_operation(None)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["reconciliation"], "effect_not_applied")
+        self.assertFalse(result["retry_performed"])
+        lifecycle.assert_called_once()
+
+    def test_blockade_authority_harden_already_0711_is_readback_only(self) -> None:
+        state = {
+            "directory_path": "/var/lib/grabowski/operator-blockade",
+            "mode": operations.blockade_authority.MARKER_DIRECTORY_MODE,
+            "uid": 0,
+            "gid": 0,
+            "record_sha256": "a" * 64,
+            "marker_file_sha256": "b" * 64,
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations, "_blockade_authority_state", return_value=state
+        ), patch.object(
+            operations.privileged, "run_blockade_lifecycle_reference"
+        ) as lifecycle, patch.object(operations.base, "_append_audit"):
+            result = operations._run_blockade_authority_harden_operation(None)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reconciliation"], "already_hardened")
+        self.assertIsNone(result["root_invocation"])
+        self.assertFalse(result["retry_performed"])
+        lifecycle.assert_not_called()
 
     def test_direct_invocation_uses_main_process_socket_and_structured_response(self) -> None:
         response = json.dumps(

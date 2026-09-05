@@ -9,7 +9,9 @@ import socket
 import stat
 import time
 from typing import Any
+import uuid
 
+import grabowski_blockade_authority as blockade_authority
 import grabowski_fleet as fleet
 import grabowski_fleet_mutation as fleet_mutation
 import grabowski_mcp as base
@@ -35,6 +37,7 @@ FLEET_MUTATION_OPERATION = "fleet-registry-mutate"
 BACKUP_NTFS_CHECK_OPERATION = "backup-ntfs-check"
 BACKUP_NTFS_CLEAR_DIRTY_OPERATION = "backup-ntfs-clear-dirty"
 BACKUP_SMART_READ_OPERATION = "backup-smart-read"
+BLOCKADE_AUTHORITY_HARDEN_OPERATION = "blockade-authority-harden"
 BACKUP_STORAGE_TYPED_OPERATIONS = {
     BACKUP_NTFS_CHECK_OPERATION: {
         "description": "Run the fixed root-read-only ntfsfix check for the configured BACKUP volume.",
@@ -58,7 +61,13 @@ BACKUP_STORAGE_TYPED_OPERATIONS = {
         "parameters": (),
     },
 }
-RESERVED_TYPED_OPERATIONS = frozenset({FLEET_MUTATION_OPERATION, *BACKUP_STORAGE_TYPED_OPERATIONS})
+RESERVED_TYPED_OPERATIONS = frozenset(
+    {
+        FLEET_MUTATION_OPERATION,
+        BLOCKADE_AUTHORITY_HARDEN_OPERATION,
+        *BACKUP_STORAGE_TYPED_OPERATIONS,
+    }
+)
 BACKUP_NTFS_CHECK_EVIDENCE_TTL_SECONDS = 600
 _BACKUP_NTFS_LAST_CHECK: dict[str, Any] | None = None
 
@@ -499,6 +508,170 @@ def _run_backup_storage_operation(
     }
 
 
+def _blockade_authority_harden_operation_plan(
+    parameters: dict[str, str] | None,
+) -> dict[str, Any]:
+    supplied = parameters or {}
+    if not isinstance(supplied, dict) or supplied:
+        raise ValueError("blockade authority hardening accepts no parameters")
+    return {
+        "name": BLOCKADE_AUTHORITY_HARDEN_OPERATION,
+        "description": (
+            "Converge only the canonical root-owned Grabowski blockade authority "
+            "directory from historical mode 0715 to production mode 0711."
+        ),
+        "parameter_names": [],
+        "parameters_sha256": _hash({}),
+        "typed_builtin": True,
+        "execution": "operator-mainpid-direct-blockade-lifecycle",
+        "privileged_action": privileged.BLOCKADE_LIFECYCLE_ACTION,
+        "effect": "authority_mode_write",
+        "rollback": (
+            "no automatic rollback to the weaker 0715 mode; exact post-state "
+            "readback classifies applied, not-applied or unknown"
+        ),
+    }
+
+
+def _blockade_authority_state() -> dict[str, Any]:
+    if base.KILL_SWITCH_PATH != base.CANONICAL_KILL_SWITCH_PATH:
+        raise PermissionError(
+            "blockade authority hardening requires the canonical marker path"
+        )
+    authority_uid, marker_mode, require_private = base._canonical_marker_contract()
+    if (
+        authority_uid != 0
+        or marker_mode != blockade_authority.MARKER_MODE
+        or require_private
+    ):
+        raise PermissionError("canonical blockade marker contract is not root-owned")
+    directory = base.KILL_SWITCH_PATH.parent
+    metadata = directory.lstat()
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        directory.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_mode & 0o022
+        or mode
+        not in {
+            blockade_authority.LEGACY_MARKER_DIRECTORY_MODE,
+            blockade_authority.MARKER_DIRECTORY_MODE,
+        }
+    ):
+        raise PermissionError(
+            "canonical blockade authority directory preimage is invalid"
+        )
+    snapshot = blockade_authority.read_authority_marker(
+        base.KILL_SWITCH_PATH,
+        authority_uid=authority_uid,
+    )
+    return {
+        "directory_path": str(directory),
+        "mode": mode,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "record_sha256": snapshot.record_sha256,
+        "marker_file_sha256": snapshot.file_sha256,
+    }
+
+
+def _run_blockade_authority_harden_operation(
+    parameters: dict[str, str] | None,
+) -> dict[str, Any]:
+    plan = _blockade_authority_harden_operation_plan(parameters)
+    operator._require_operator_capability("privileged_reference")
+    operator._require_operator_mutation("terminal_execute", opaque_command=False)
+    before = _blockade_authority_state()
+    if before["mode"] == blockade_authority.MARKER_DIRECTORY_MODE:
+        invocation = None
+        after = dict(before)
+        reconciliation = "already_hardened"
+        success = True
+    else:
+        payload = {
+            "operation": "harden-authority",
+            "transaction_id": uuid.uuid4().hex,
+            "expected_record_sha256": before["record_sha256"],
+            "expected_marker_file_sha256": before["marker_file_sha256"],
+        }
+        invocation = privileged.run_blockade_lifecycle_reference(
+            payload,
+            justification=(
+                "Converge only the canonical root-owned Grabowski blockade "
+                "authority directory from exact historical mode 0715 to 0711; "
+                "preserve the exact blockade marker."
+            ),
+        )
+        after = _blockade_authority_state()
+        marker_unchanged = (
+            after["record_sha256"] == before["record_sha256"]
+            and after["marker_file_sha256"] == before["marker_file_sha256"]
+        )
+        if not marker_unchanged:
+            reconciliation = "outcome_unknown"
+            success = False
+        elif after["mode"] == blockade_authority.MARKER_DIRECTORY_MODE:
+            reconciliation = "effect_applied"
+            success = True
+        elif after["mode"] == blockade_authority.LEGACY_MARKER_DIRECTORY_MODE:
+            reconciliation = "effect_not_applied"
+            success = False
+        else:
+            reconciliation = "outcome_unknown"
+            success = False
+
+    audit = {
+        "timestamp_unix": int(time.time()),
+        "operation": "named-operation-run",
+        "recipe": BLOCKADE_AUTHORITY_HARDEN_OPERATION,
+        "parameters_sha256": plan["parameters_sha256"],
+        "success": success,
+        "effect": plan["effect"],
+        "before_mode": format(before["mode"], "04o"),
+        "after_mode": format(after["mode"], "04o"),
+        "record_sha256": after["record_sha256"],
+        "marker_file_sha256": after["marker_file_sha256"],
+        "reconciliation": reconciliation,
+        "root_request_id": (
+            invocation.get("request_id") if isinstance(invocation, dict) else None
+        ),
+        "root_reference_sha256": (
+            invocation.get("reference_sha256")
+            if isinstance(invocation, dict)
+            else None
+        ),
+        "root_outcome": (
+            invocation.get("outcome") if isinstance(invocation, dict) else None
+        ),
+    }
+    try:
+        base._append_audit(audit)
+        audit["secondary_audit_recorded"] = True
+    except Exception as exc:
+        audit["secondary_audit_recorded"] = False
+        audit["secondary_audit_error_type"] = type(exc).__name__
+    return {
+        "operation": BLOCKADE_AUTHORITY_HARDEN_OPERATION,
+        "success": success,
+        "failed_phase": None if success else "action",
+        "typed_builtin": True,
+        "effect": plan["effect"],
+        "reconciliation": reconciliation,
+        "before": before,
+        "after": after,
+        "root_invocation": invocation,
+        "rollback": {
+            "attempted": False,
+            "success": True,
+            "reason": plan["rollback"],
+        },
+        "audit": audit,
+        "retry_performed": False,
+    }
+
+
 def _run_fleet_registry_mutation(parameters: dict[str, str] | None) -> dict[str, Any]:
     plan = fleet_mutation.plan_registry_mutation(parameters)
     public = plan["public"]
@@ -591,6 +764,13 @@ def grabowski_operation_list() -> dict[str, Any]:
         "step_count": 1,
         "typed_builtin": True,
     }
+    operations[BLOCKADE_AUTHORITY_HARDEN_OPERATION] = {
+        "description": _blockade_authority_harden_operation_plan(None)["description"],
+        "parameters": [],
+        "step_count": 1,
+        "typed_builtin": True,
+        "effect": "authority_mode_write",
+    }
     for name, spec in BACKUP_STORAGE_TYPED_OPERATIONS.items():
         operations[name] = {
             "description": spec["description"],
@@ -609,6 +789,8 @@ def grabowski_operation_plan(operation: str,
     operator._require_operator_capability("terminal_execute")
     if operation == FLEET_MUTATION_OPERATION:
         return fleet_mutation.plan_registry_mutation(parameters)["public"]
+    if operation == BLOCKADE_AUTHORITY_HARDEN_OPERATION:
+        return _blockade_authority_harden_operation_plan(parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _backup_storage_operation_plan(operation, parameters)
     return _render(operation, parameters)
@@ -620,6 +802,8 @@ def grabowski_operation_run(operation: str,
     """Run preflight, action and postflight, then rollback after a failure."""
     if operation == FLEET_MUTATION_OPERATION:
         return _run_fleet_registry_mutation(parameters)
+    if operation == BLOCKADE_AUTHORITY_HARDEN_OPERATION:
+        return _run_blockade_authority_harden_operation(parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _run_backup_storage_operation(operation, parameters)
     plan = _render(operation, parameters)
