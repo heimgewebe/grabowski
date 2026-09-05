@@ -1,0 +1,43 @@
+[Unit]
+Description=Maulwurf X public ingress bridge to heim-pc
+Documentation=https://github.com/heimgewebe/grabowski
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/libexec/grabowski/grabowski_maulwurf_x_public_bridge.py
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=20s
+TimeoutStopSec=20s
+KillMode=mixed
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitCORE=0
+LimitNOFILE=512
+TasksMax=64
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target
