@@ -49,6 +49,13 @@ MAX_OUTPUT_BYTES = 250_000
 POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
+LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
+LOCAL_BACKUP_SMART_DEVICE = Path(
+    "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0"
+)
+LOCAL_BACKUP_SMART_ARGV = [
+    "/usr/sbin/smartctl", "-d", "sat", "-a", str(LOCAL_BACKUP_SMART_DEVICE)
+]
 ROOTBROKER_TIMEOUT_ROLLBACK_GRACE_SECONDS = 900
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 RUN_USER_ROOT = Path("/run/user")
@@ -1452,6 +1459,39 @@ def _communicate_after_timeout(
     return process.communicate()
 
 
+def _local_backup_smart_device_identity() -> tuple[str, int]:
+    """Resolve the fixed USB By-ID and prove it still names one block device."""
+    try:
+        link_metadata = LOCAL_BACKUP_SMART_DEVICE.lstat()
+    except OSError as exc:
+        raise PermissionError("BACKUP SMART By-ID is unavailable") from exc
+    if not stat.S_ISLNK(link_metadata.st_mode):
+        raise PermissionError("BACKUP SMART By-ID is not a symlink")
+    try:
+        resolved = LOCAL_BACKUP_SMART_DEVICE.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as exc:
+        raise PermissionError("BACKUP SMART By-ID target is unavailable") from exc
+    if not stat.S_ISBLK(metadata.st_mode):
+        raise PermissionError("BACKUP SMART By-ID target is not a block device")
+    return str(resolved), int(metadata.st_rdev)
+
+
+def _assert_local_backup_smart_pre_spawn(
+    *,
+    reference: dict[str, object],
+    argv: object,
+) -> None:
+    if reference.get("action") != LOCAL_BACKUP_SMART_READ_ACTION:
+        return
+    if argv != LOCAL_BACKUP_SMART_ARGV:
+        raise PermissionError("BACKUP SMART argv differs from the fixed read-only contract")
+    first = _local_backup_smart_device_identity()
+    second = _local_backup_smart_device_identity()
+    if second != first:
+        raise PermissionError("BACKUP SMART By-ID identity changed before spawn")
+
+
 def _execute_broker_command(
     *,
     reference: dict[str, object],
@@ -1497,6 +1537,7 @@ def _execute_broker_command(
                     guard_evidence=package_guard_evidence,
                     argv=argv,
                 )
+        _assert_local_backup_smart_pre_spawn(reference=reference, argv=argv)
         started = time.monotonic()
         process = subprocess.Popen(
             argv,
@@ -1531,6 +1572,15 @@ def _execute_broker_command(
                 "stdout_bytes": len(stdout_bytes),
                 "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
                 "stderr_bytes": len(stderr_bytes),
+            })
+        if reference["action"] == LOCAL_BACKUP_SMART_READ_ACTION:
+            public_stdout = stdout.encode("utf-8")
+            public_stderr = stderr.encode("utf-8")
+            record.update({
+                "smart_stdout_sha256": hashlib.sha256(public_stdout).hexdigest(),
+                "smart_stdout_bytes": len(public_stdout),
+                "smart_stderr_sha256": hashlib.sha256(public_stderr).hexdigest(),
+                "smart_stderr_bytes": len(public_stderr),
             })
         if package_operation is not None:
             record["package_stage_guard"] = str(package_operation.get("kind"))
