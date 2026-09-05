@@ -15,6 +15,7 @@ TimeoutStopSec=20s
 KillMode=mixed
 UMask=0077
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -34,7 +35,7 @@ MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallArchitectures=native
 LimitCORE=0
-LimitNOFILE=256
+LimitNOFILE=512
 TasksMax=64
 MemoryMax=128M
 

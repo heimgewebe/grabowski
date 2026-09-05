@@ -29,7 +29,7 @@ class BridgeTimeoutError(TimeoutError):
 
 
 class BridgeHalfCloseTimeout(TimeoutError):
-    """Raised when one side half-closes and the other never finishes."""
+    """Raised when one side half-closes and the other becomes idle."""
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,8 @@ class BridgeConfig:
         ):
             if not value or len(value) > 253:
                 raise ValueError(f"{label} is invalid")
+        if self.listen_host not in {"127.0.0.1", "::1"}:
+            raise ValueError("listen_host must be loopback")
         for label, value in (
             ("listen_port", self.listen_port),
             ("upstream_port", self.upstream_port),
@@ -151,7 +153,7 @@ async def _pipe(
             except (AttributeError, NotImplementedError, OSError, RuntimeError):
                 # TLS streams commonly do not support transport half-close.  The
                 # opposite direction may still finish normally; the watchdog
-                # bounds how long that state can remain open.
+                # bounds only an idle half-closed state, not a live response.
                 pass
             return
         activity.touch()
@@ -173,8 +175,8 @@ async def _connection_watchdog(
         await asyncio.sleep(interval)
         now = time.monotonic()
         if activity.first_eof is not None:
-            if now - activity.first_eof >= half_close_timeout_seconds:
-                raise BridgeHalfCloseTimeout("half-closed connection did not drain")
+            if now - activity.last_activity >= half_close_timeout_seconds:
+                raise BridgeHalfCloseTimeout("half-closed connection became idle")
         elif now - activity.last_activity >= idle_timeout_seconds:
             raise BridgeTimeoutError("connection became idle")
 
@@ -246,6 +248,14 @@ async def _connect_upstream(
     )
 
 
+def _ready_log(config: BridgeConfig) -> str:
+    return (
+        f"event=ready listen={config.listen_host}:{config.listen_port} "
+        f"upstream={config.server_name}:{config.upstream_port} "
+        f"max_connections={config.max_connections}"
+    )
+
+
 class PublicBridge:
     def __init__(self, config: BridgeConfig) -> None:
         config.validate()
@@ -259,7 +269,7 @@ class PublicBridge:
         client_writer: asyncio.StreamWriter,
     ) -> None:
         if not await self._limiter.try_acquire():
-            print("bridge_connection_rejected=capacity", flush=True)
+            print("event=connection_rejected reason=capacity", flush=True)
             await _safe_wait_closed(client_writer)
             return
         upstream_writer: asyncio.StreamWriter | None = None
@@ -279,7 +289,7 @@ class PublicBridge:
         except Exception as exc:
             # Exception class is intentionally the only failure detail.  Request
             # bytes, headers, credentials, peer addresses and URLs are not logged.
-            print(f"bridge_connection_error={type(exc).__name__}", flush=True)
+            print(f"event=connection_error error={type(exc).__name__}", flush=True)
         finally:
             await _safe_wait_closed(upstream_writer)
             await _safe_wait_closed(client_writer)
@@ -298,13 +308,7 @@ class PublicBridge:
             server.close()
             await server.wait_closed()
             raise RuntimeError("bridge listener missing")
-        print(
-            "bridge_ready="
-            f"{self.config.listen_host}:{self.config.listen_port} "
-            f"upstream={self.config.server_name}:{self.config.upstream_port} ",
-            f"max_connections={self.config.max_connections}",
-            flush=True,
-        )
+        print(_ready_log(self.config), flush=True)
         async with server:
             await server.serve_forever()
 
