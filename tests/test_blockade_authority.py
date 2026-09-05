@@ -272,6 +272,80 @@ class BlockadeAuthorityTests(unittest.TestCase):
                 )
             )
 
+    def test_harden_authority_converges_only_0715_to_0711_and_preserves_marker(self) -> None:
+        _record, record_sha256, file_sha256, _result = self.engage()
+        marker_before = self.marker.read_bytes()
+        self.authority_root.chmod(authority.LEGACY_MARKER_DIRECTORY_MODE)
+
+        hardened = authority.execute_lifecycle(
+            self.resolve(
+                {
+                    "operation": "harden-authority",
+                    "expected_record_sha256": record_sha256,
+                    "expected_marker_file_sha256": file_sha256,
+                    "transaction_id": "tx-harden",
+                }
+            )
+        )
+        self.assertTrue(hardened["receipt"]["changed"])
+        self.assertEqual(hardened["receipt"]["before_mode"], "0715")
+        self.assertEqual(hardened["receipt"]["after_mode"], "0711")
+        self.assertEqual(
+            stat.S_IMODE(self.authority_root.stat().st_mode),
+            authority.MARKER_DIRECTORY_MODE,
+        )
+        self.assertEqual(self.marker.read_bytes(), marker_before)
+        self.assertEqual(hardened["receipt"]["record_sha256"], record_sha256)
+        self.assertEqual(hardened["receipt"]["marker_file_sha256"], file_sha256)
+
+        replay = authority.execute_lifecycle(
+            self.resolve(
+                {
+                    "operation": "harden-authority",
+                    "expected_record_sha256": record_sha256,
+                    "expected_marker_file_sha256": file_sha256,
+                    "transaction_id": "tx-harden-readback",
+                }
+            )
+        )
+        self.assertFalse(replay["receipt"]["changed"])
+        self.assertEqual(replay["receipt"]["before_mode"], "0711")
+        self.assertEqual(replay["receipt"]["after_mode"], "0711")
+        self.assertEqual(self.marker.read_bytes(), marker_before)
+
+    def test_harden_authority_rejects_wrong_mode_and_marker_drift_before_mutation(self) -> None:
+        _record, record_sha256, file_sha256, _result = self.engage()
+        self.authority_root.chmod(0o710)
+        with self.assertRaisesRegex(PermissionError, "preimage mode"):
+            authority.execute_lifecycle(
+                self.resolve(
+                    {
+                        "operation": "harden-authority",
+                        "expected_record_sha256": record_sha256,
+                        "expected_marker_file_sha256": file_sha256,
+                        "transaction_id": "tx-bad-mode",
+                    }
+                )
+            )
+        self.assertEqual(stat.S_IMODE(self.authority_root.stat().st_mode), 0o710)
+
+        self.authority_root.chmod(authority.LEGACY_MARKER_DIRECTORY_MODE)
+        with self.assertRaisesRegex(PermissionError, "marker changed"):
+            authority.execute_lifecycle(
+                self.resolve(
+                    {
+                        "operation": "harden-authority",
+                        "expected_record_sha256": "0" * 64,
+                        "expected_marker_file_sha256": file_sha256,
+                        "transaction_id": "tx-bad-hash",
+                    }
+                )
+            )
+        self.assertEqual(
+            stat.S_IMODE(self.authority_root.stat().st_mode),
+            authority.LEGACY_MARKER_DIRECTORY_MODE,
+        )
+
     def test_symlink_authority_directory_and_hardlinked_marker_fail_closed(self) -> None:
         real = self.root / "real-authority"
         real.mkdir(mode=0o711)
