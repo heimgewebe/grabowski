@@ -59,6 +59,11 @@ SourceRepository = Annotated[str, Field(min_length=1, max_length=4096)]
 SourceLeaseOwner = Annotated[str, Field(min_length=1, max_length=128, pattern=r"[A-Za-z0-9._:@-]{1,128}")]
 SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
+AUTO_DEPLOY_SOURCE_ROOT = Path.home() / "repos" / ".grabowski-deploy-worktrees"
+AUTO_DEPLOY_SOURCE_PREFIX = "auto-current-main"
+AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS = 7_200
+ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS = 300
+ORIGIN_MAIN_REFRESH_OPERATION = "runtime-deploy-origin-main-refresh"
 CANONICAL_OPERATOR_MODULE = "grabowski_operator"
 PUBLIC_GITHUB_REPOSITORY_URL = "https://github.com/heimgewebe/grabowski.git"
 PUBLIC_GITHUB_API_HOST = "api.github.com"
@@ -2325,6 +2330,7 @@ def _schedule_result(
     scheduled: dict[str, Any],
     already_scheduled: bool,
     source_identity: dict[str, Any],
+    automatic_source: dict[str, Any] | None = None,
     deployment_observer_capability: str | None = None,
 ) -> dict[str, Any]:
     contract = job.get("deployment_observer_contract")
@@ -2340,6 +2346,7 @@ def _schedule_result(
         "delay_seconds": effective_delay_seconds,
         "source_identity": source_identity,
         "source_identity_sha256": source_identity["identity_sha256"],
+        "automatic_source": automatic_source,
         "effective_source_identity_sha256": job.get(
             "source_identity_sha256", source_identity["identity_sha256"]
         ),
@@ -2446,6 +2453,1269 @@ def _resource_inspect(resource_key: str) -> dict[str, Any]:
     import grabowski_resources
 
     return grabowski_resources.grabowski_resource_inspect(resource_key)
+
+
+def _mutating_git_result(repository: Path, *arguments: str) -> dict[str, Any]:
+    operator._require_operator_mutation(
+        "git_cli", path=str(repository), repo=str(repository), fresh_preflight=True
+    )
+    command = [
+        "/usr/bin/git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.file.allow=never",
+        "-C",
+        str(repository),
+        *arguments,
+    ]
+    return operator._run(
+        command,
+        cwd=repository,
+        timeout_seconds=60,
+        max_output_bytes=65_536,
+    )
+
+
+def _worktree_registration_present(repository: Path, target: Path) -> bool:
+    raw = _required_stdout(
+        _git_result(repository, "worktree", "list", "--porcelain"),
+        "worktree inventory lookup",
+    )
+    try:
+        target_resolved = target.resolve(strict=False)
+    except (OSError, RuntimeError):
+        target_resolved = target.absolute()
+    for line in raw.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        candidate = Path(line.removeprefix("worktree "))
+        try:
+            candidate_resolved = candidate.resolve(strict=False)
+        except (OSError, RuntimeError):
+            candidate_resolved = candidate.absolute()
+        if candidate_resolved == target_resolved:
+            return True
+    return False
+
+
+def _canonical_main_refresh_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: snapshot.get(key)
+        for key in (
+            "canonical_repository",
+            "current_head",
+            "target_head",
+            "origin_main",
+            "clean",
+            "shallow",
+        )
+    }
+
+
+def _canonical_main_refresh_candidate(
+    expected_head: str,
+    expected_lease_owner: str | None = None,
+) -> dict[str, Any]:
+    if not OBJECT_ID_RE.fullmatch(expected_head):
+        raise ValueError("deployment target must be a lowercase Git object ID")
+    canonical = _validated_repository_path(
+        CANONICAL_REPOSITORY,
+        label="canonical repository",
+    )
+    lease_evidence = _source_lease_evidence(canonical, expected_lease_owner)
+    head = _required_stdout(
+        _git_result(canonical, "rev-parse", "--verify", "HEAD"),
+        "canonical HEAD lookup",
+    )
+    branch = _required_stdout(
+        _git_result(canonical, "rev-parse", "--abbrev-ref", "HEAD"),
+        "canonical branch lookup",
+    )
+    origin_main = _required_stdout(
+        _git_result(
+            canonical,
+            "rev-parse",
+            "--verify",
+            "refs/remotes/origin/main",
+        ),
+        "canonical origin/main lookup",
+    )
+    status = _required_stdout(
+        _git_result(
+            canonical,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ),
+        "canonical worktree status",
+    )
+    shallow = _required_stdout(
+        _git_result(canonical, "rev-parse", "--is-shallow-repository"),
+        "canonical shallow-repository lookup",
+    )
+    if branch != "main":
+        raise RuntimeError(
+            f"current-main refresh requires canonical main, found {branch}"
+        )
+    if status:
+        raise RuntimeError("current-main refresh requires a clean canonical checkout")
+    if shallow != "false":
+        raise RuntimeError("current-main refresh requires a non-shallow canonical repository")
+    for label, value in (("HEAD", head), ("origin/main", origin_main)):
+        if OBJECT_ID_RE.fullmatch(value) is None:
+            raise RuntimeError(f"canonical {label} is not a full Git object ID")
+    return {
+        "canonical_repository": str(canonical),
+        "current_head": head,
+        "target_head": expected_head,
+        "origin_main": origin_main,
+        "clean": True,
+        "shallow": False,
+        "lease_evidence": lease_evidence,
+    }
+
+
+def _origin_main_refresh_plan(expected_head: str) -> dict[str, Any]:
+    canonical = _validated_repository_path(
+        CANONICAL_REPOSITORY,
+        label="canonical repository",
+    )
+    generation = uuid.uuid4().hex[:12]
+    return {
+        "canonical_repository": canonical,
+        "generation": generation,
+        "owner_id": f"runtime-deploy-ref:{expected_head[:12]}:{generation}",
+        "operation_key": f"repo:{canonical}:operation:{ORIGIN_MAIN_REFRESH_OPERATION}",
+        "path_key": f"path:{canonical}",
+    }
+
+
+def _acquire_origin_main_refresh_resources(
+    plan: dict[str, Any],
+    expected_head: str,
+) -> dict[str, Any]:
+    import grabowski_resources as resources
+
+    operation_scope = resources.operation_scope_contract(
+        plan["operation_key"],
+        repository=str(plan["canonical_repository"]),
+        effect_class="deploy",
+        operation_class="deploy",
+    )
+    return resources.acquire_resources(
+        plan["owner_id"],
+        [plan["operation_key"], plan["path_key"]],
+        purpose=f"refresh exact protected-main deployment object {expected_head[:12]}",
+        ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+        metadata={"operation_scope": operation_scope},
+    )
+
+
+def _release_origin_main_refresh_resources(
+    plan: dict[str, Any],
+    resource_keys: list[str],
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    import grabowski_resources as resources
+
+    return resources.release_resources(
+        plan["owner_id"], resource_keys, expected_leases=expected_leases
+    )
+
+
+def _refresh_canonical_origin_main(
+    expected_head: str,
+    initial_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    if initial_snapshot.get("origin_main") == expected_head:
+        raise RuntimeError("current-main refresh was requested for an already-current origin/main")
+    plan = _origin_main_refresh_plan(expected_head)
+    canonical = plan["canonical_repository"]
+    if initial_snapshot.get("canonical_repository") != str(canonical):
+        raise RuntimeError("current-main refresh snapshot repository mismatch")
+    operation_lease: dict[str, Any] | None = None
+    path_lease: dict[str, Any] | None = None
+    try:
+        acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
+        operation_lease = _lease_for_key(acquisition, plan["operation_key"])
+        path_lease = _lease_for_key(acquisition, plan["path_key"])
+        locked = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if _canonical_main_refresh_state(locked) != _canonical_main_refresh_state(
+            initial_snapshot
+        ):
+            raise RuntimeError("canonical main state drifted before exact object refresh")
+        public_before_fetch = _fresh_public_github_main(expected_head)
+        if public_before_fetch != expected_head:
+            raise RuntimeError(
+                "public GitHub main drifted before exact object refresh: "
+                f"expected {expected_head}, found {public_before_fetch}"
+            )
+        fetch_result = _mutating_git_result(
+            canonical,
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            PUBLIC_GITHUB_REPOSITORY_URL,
+            PUBLIC_GITHUB_MAIN_REF,
+        )
+        if fetch_result.get("timed_out") is True or fetch_result.get("returncode") != 0:
+            raise RuntimeError("exact protected-main object fetch failed")
+        after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(
+            initial_snapshot
+        ):
+            raise RuntimeError(
+                "canonical main or origin/main changed during exact object fetch"
+            )
+        resolved_target = _required_stdout(
+            _git_result(
+                canonical,
+                "rev-parse",
+                "--verify",
+                f"{expected_head}^{{commit}}",
+            ),
+            "fetched protected-main commit lookup",
+        )
+        if resolved_target != expected_head:
+            raise RuntimeError("fetched protected-main object does not match expected head")
+        for label, predecessor in (
+            ("canonical HEAD", str(initial_snapshot["current_head"])),
+            ("origin/main", str(initial_snapshot["origin_main"])),
+        ):
+            ancestor = _git_result(
+                canonical,
+                "merge-base",
+                "--is-ancestor",
+                predecessor,
+                expected_head,
+            )
+            if ancestor.get("timed_out") is True or ancestor.get("returncode") != 0:
+                raise RuntimeError(
+                    f"current-main refresh requires {label} to be an ancestor of the deployment target"
+                )
+        public_after_fetch = _fresh_public_github_main(expected_head)
+        if public_after_fetch != expected_head:
+            raise RuntimeError(
+                "public GitHub main drifted after exact object fetch: "
+                f"expected {expected_head}, found {public_after_fetch}"
+            )
+        update_result = _mutating_git_result(
+            canonical,
+            "update-ref",
+            "refs/remotes/origin/main",
+            expected_head,
+            str(initial_snapshot["origin_main"]),
+        )
+        observed_origin_main = _required_stdout(
+            _git_result(
+                canonical,
+                "rev-parse",
+                "--verify",
+                "refs/remotes/origin/main",
+            ),
+            "origin/main CAS readback",
+        )
+        if observed_origin_main != expected_head:
+            if observed_origin_main == initial_snapshot.get("origin_main"):
+                raise RuntimeError("origin/main CAS update produced no effect")
+            raise RuntimeError("origin/main changed to an unexpected commit during CAS update")
+        after_cas = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        expected_after = {
+            **_canonical_main_refresh_state(initial_snapshot),
+            "origin_main": expected_head,
+        }
+        if _canonical_main_refresh_state(after_cas) != expected_after:
+            raise RuntimeError("canonical state drifted during origin/main CAS update")
+        public_after_cas = _fresh_public_github_main(expected_head)
+        if public_after_cas != expected_head:
+            _append_deploy_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "runtime-deploy-origin-main-refresh-blocked",
+                    "expected_head": expected_head,
+                    "previous_origin_main": initial_snapshot["origin_main"],
+                    "observed_origin_main": observed_origin_main,
+                    "public_github_main": public_after_cas,
+                    "reason": "public-main-drift-after-cas",
+                }
+            )
+            raise RuntimeError(
+                "public GitHub main drifted after origin/main CAS update: "
+                f"expected {expected_head}, found {public_after_cas}"
+            )
+        receipt_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh",
+            "canonical_repository": str(canonical),
+            "expected_head": expected_head,
+            "previous_head": initial_snapshot["current_head"],
+            "previous_origin_main": initial_snapshot["origin_main"],
+            "observed_origin_main": observed_origin_main,
+            "owner_id": plan["owner_id"],
+            "operation_resource_key": plan["operation_key"],
+            "path_resource_key": plan["path_key"],
+            "fetch": {
+                "returncode": fetch_result.get("returncode"),
+                "timed_out": fetch_result.get("timed_out") is True,
+            },
+            "update_ref": {
+                "returncode": update_result.get("returncode"),
+                "timed_out": update_result.get("timed_out") is True,
+                "reported_success": (
+                    update_result.get("timed_out") is not True
+                    and update_result.get("returncode") == 0
+                ),
+            },
+            "public_github_main": {
+                "before_fetch": public_before_fetch,
+                "after_fetch": public_after_fetch,
+                "after_cas": public_after_cas,
+            },
+        }
+        receipt = {
+            **receipt_material,
+            "receipt_sha256": _source_identity_sha256(receipt_material),
+        }
+        _append_deploy_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "runtime-deploy-origin-main-refreshed",
+                "expected_head": expected_head,
+                "previous_head": initial_snapshot["current_head"],
+                "previous_origin_main": initial_snapshot["origin_main"],
+                "observed_origin_main": observed_origin_main,
+                "receipt_sha256": receipt["receipt_sha256"],
+            }
+        )
+    except Exception as exc:
+        cleanup_failures: list[tuple[str, Exception]] = []
+        release_keys: list[str] = []
+        release_leases: list[dict[str, Any]] = []
+        for label, resource_key, candidate_lease in (
+            ("operation", plan["operation_key"], operation_lease),
+            ("path", plan["path_key"], path_lease),
+        ):
+            if candidate_lease is None:
+                try:
+                    candidate_lease = _live_auto_deploy_source_lease_snapshot(
+                        resource_key, plan["owner_id"]
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append((f"{label}-lease-readback", cleanup_error))
+                    candidate_lease = None
+            if candidate_lease is not None:
+                release_keys.append(resource_key)
+                release_leases.append(candidate_lease)
+        if release_keys:
+            try:
+                release = _release_origin_main_refresh_resources(
+                    plan, release_keys, release_leases
+                )
+                released = release.get("released")
+                if not isinstance(released, list) or len(released) != len(release_keys):
+                    cleanup_failures.append(
+                        (
+                            "resource-release",
+                            RuntimeError("current-main refresh cleanup release was incomplete"),
+                        )
+                    )
+            except Exception as cleanup_error:
+                cleanup_failures.append(("resource-release", cleanup_error))
+        if cleanup_failures:
+            raise RuntimeError(
+                f"{type(exc).__name__}: {exc}; cleanup failures: "
+                + _cleanup_failure_text(cleanup_failures)
+            ) from exc
+        raise
+    assert operation_lease is not None and path_lease is not None
+    release = _release_origin_main_refresh_resources(
+        plan,
+        [plan["operation_key"], plan["path_key"]],
+        [operation_lease, path_lease],
+    )
+    released = release.get("released")
+    if not isinstance(released, list) or len(released) != 2:
+        raise RuntimeError("current-main refresh resource release was incomplete")
+    return receipt
+
+
+def _canonical_stale_snapshot_state(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: snapshot.get(key)
+        for key in (
+            "canonical_repository",
+            "current_head",
+            "target_head",
+            "origin_main",
+            "clean",
+        )
+    }
+
+
+def _canonical_stale_main_snapshot(expected_head: str) -> dict[str, Any] | None:
+    canonical = _validated_repository_path(
+        CANONICAL_REPOSITORY,
+        label="canonical repository",
+    )
+    lease_evidence = _source_lease_evidence(canonical, None)
+    head = _required_stdout(
+        _git_result(canonical, "rev-parse", "--verify", "HEAD"),
+        "canonical HEAD lookup",
+    )
+    branch = _required_stdout(
+        _git_result(canonical, "rev-parse", "--abbrev-ref", "HEAD"),
+        "canonical branch lookup",
+    )
+    origin_main = _required_stdout(
+        _git_result(
+            canonical,
+            "rev-parse",
+            "--verify",
+            "refs/remotes/origin/main",
+        ),
+        "canonical origin/main lookup",
+    )
+    status = _required_stdout(
+        _git_result(
+            canonical,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+        ),
+        "canonical worktree status",
+    )
+    if branch != "main":
+        raise RuntimeError(
+            f"automatic deployment source requires canonical main, found {branch}"
+        )
+    if status:
+        raise RuntimeError("automatic deployment source requires a clean canonical checkout")
+    if origin_main != expected_head:
+        raise RuntimeError(
+            "automatic deployment source requires refs/remotes/origin/main to match "
+            f"the deployment target: expected {expected_head}, found {origin_main}"
+        )
+    if head == expected_head:
+        return None
+    ancestor = _git_result(
+        canonical,
+        "merge-base",
+        "--is-ancestor",
+        head,
+        expected_head,
+    )
+    if ancestor.get("timed_out") or ancestor.get("returncode") != 0:
+        raise RuntimeError(
+            "automatic deployment source requires current canonical main to be an "
+            "ancestor of the deployment target"
+        )
+    return {
+        "canonical_repository": str(canonical),
+        "current_head": head,
+        "target_head": expected_head,
+        "origin_main": origin_main,
+        "clean": True,
+        "lease_evidence": lease_evidence,
+    }
+
+
+def _auto_deploy_source_plan(expected_head: str) -> dict[str, Any]:
+    canonical = _validated_repository_path(
+        CANONICAL_REPOSITORY,
+        label="canonical repository",
+    )
+    root = AUTO_DEPLOY_SOURCE_ROOT
+    # The private root is provisioned by the runtime bootstrap/recovery contract.
+    # Normal scheduling refuses a missing or drifted root instead of silently
+    # creating deployment infrastructure inside the effect path.
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(f"automatic deployment source root is unavailable: {root}")
+    resolved_root = root.resolve(strict=True)
+    if resolved_root != root or not resolved_root.is_dir():
+        raise RuntimeError("automatic deployment source root must be an exact real directory")
+    generation = uuid.uuid4().hex[:12]
+    suffix = f"{AUTO_DEPLOY_SOURCE_PREFIX}-{expected_head[:12]}-{generation}"
+    target = resolved_root / suffix
+    owner_id = f"runtime-deploy-source:{expected_head[:12]}:{generation}"
+    obligation_id = f"goo-runtime-deploy-source-{expected_head[:12]}-{generation}"
+    operation_key = f"repo:{canonical}:operation:worktree-add:{suffix}"
+    path_key = f"path:{target}"
+    return {
+        "canonical_repository": canonical,
+        "target": target,
+        "owner_id": owner_id,
+        "obligation_id": obligation_id,
+        "generation": generation,
+        "operation_key": operation_key,
+        "path_key": path_key,
+    }
+
+
+def _acquire_auto_deploy_source_resources(plan: dict[str, Any], expected_head: str) -> dict[str, Any]:
+    import grabowski_resources as resources
+
+    operation_scope = resources.operation_scope_contract(
+        plan["operation_key"],
+        repository=str(plan["canonical_repository"]),
+        effect_class="worktree_admin",
+        operation_class="worktree-admin",
+    )
+    return resources.acquire_resources(
+        plan["owner_id"],
+        [plan["operation_key"], plan["path_key"]],
+        purpose=f"materialize detached runtime deploy source {expected_head[:12]}",
+        ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
+        metadata={"operation_scope": operation_scope},
+    )
+
+
+def _release_auto_deploy_source_resources(
+    owner_id: str,
+    resource_keys: list[str],
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    import grabowski_resources as resources
+
+    return resources.release_resources(
+        owner_id,
+        resource_keys,
+        expected_leases=expected_leases,
+    )
+
+
+def _release_auto_deploy_source_retention(retention: dict[str, Any]) -> bool:
+    import grabowski_checkouts as checkouts
+
+    required = (
+        retention.get("checkout_key"),
+        retention.get("owner_id"),
+        retention.get("created_at_unix"),
+        retention.get("updated_at_unix"),
+    )
+    if not isinstance(required[0], str) or not isinstance(required[1], str):
+        return False
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in required[2:]
+    ):
+        return False
+    with checkouts._database() as connection:
+        deleted = connection.execute(
+            """
+            DELETE FROM retention
+            WHERE checkout_key=? AND owner_id=?
+              AND created_at_unix=? AND updated_at_unix=?
+            """,
+            required,
+        )
+        connection.commit()
+    return deleted.rowcount == 1
+
+
+def _open_auto_deploy_source_obligation(
+    plan: dict[str, Any],
+    expected_head: str,
+) -> dict[str, Any]:
+    import grabowski_operator_obligation as obligations
+
+    return obligations.open_obligation(
+        {
+            "obligation_id": plan["obligation_id"],
+            "objective": (
+                "Materialize one exact-head detached Grabowski runtime deployment "
+                "source with lifecycle, retention, and path-lease evidence."
+            ),
+            "acceptance": [
+                {
+                    "id": "source-materialized",
+                    "description": (
+                        "The detached deployment source is exact-head, clean, "
+                        "lifecycle-bound, retained, and owned by its live path lease."
+                    ),
+                }
+            ],
+            "origin": {
+                "source": "grabowski_runtime_deploy_schedule",
+                "repo": "heimgewebe/grabowski",
+            },
+        }
+    )
+
+
+def _close_auto_deploy_source_obligation(
+    plan: dict[str, Any],
+    expected_head: str,
+    evidence_sha256: str,
+) -> dict[str, Any]:
+    import grabowski_operator_obligation as obligations
+
+    return obligations.close_obligation(
+        {
+            "obligation_id": plan["obligation_id"],
+            "outcome": "completed",
+            "evidence": [
+                {
+                    "acceptance_id": "source-materialized",
+                    "status": "passed",
+                    "source": "receipt",
+                    "reference": (
+                        f"runtime-deploy-source-materialized:{expected_head}:"
+                        f"{plan['generation']}"
+                    ),
+                    "sha256": evidence_sha256,
+                }
+            ],
+            "closure_classification": {
+                "convergence_required": False,
+                "reason": "process_only",
+            },
+        }
+    )
+
+
+def _block_auto_deploy_source_obligation(
+    plan: dict[str, Any],
+    error: Exception,
+) -> dict[str, Any]:
+    import grabowski_operator_obligation as obligations
+
+    detail = f"{type(error).__name__}: {str(error)[:512]}"
+    blocker_sha256 = _source_identity_sha256(
+        {
+            "schema_version": 1,
+            "kind": "grabowski_auto_runtime_deploy_source_blocker",
+            "obligation_id": plan["obligation_id"],
+            "detail": detail,
+        }
+    )
+    return obligations.close_obligation(
+        {
+            "obligation_id": plan["obligation_id"],
+            "outcome": "blocked",
+            "evidence": [],
+            "blockers": [
+                {
+                    "code": "materialization-failed",
+                    "detail": detail,
+                    "reference": f"auto-deploy-source:{plan['generation']}",
+                    "sha256": blocker_sha256,
+                }
+            ],
+            "next_action": "reconstruct deployment source state before any retry",
+        }
+    )
+
+
+def _reserve_auto_deploy_source_lifecycle(
+    plan: dict[str, Any],
+    expected_head: str,
+) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
+
+    canonical = plan["canonical_repository"]
+    common_dir = checkouts._git_common_dir(canonical)
+    return checkouts._reserve_checkout_lifecycle(
+        repo_common_dir=common_dir,
+        repo_path=canonical,
+        checkout_path=plan["target"],
+        owner_id=plan["owner_id"],
+        purpose=f"detached runtime deploy source {expected_head[:12]}",
+        source_kind="operator_obligation",
+        source_id=plan["obligation_id"],
+        artifact_class="deployment-source-worktree",
+        retention_until_unix=int(time.time()) + AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
+        expected_head=expected_head,
+        expected_branch=None,
+    )
+
+
+def _bind_auto_deploy_source_retention(
+    plan: dict[str, Any],
+    lifecycle: dict[str, Any],
+    expected_head: str,
+) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
+
+    top_level, common_dir, record = checkouts._worktree_for_path(
+        plan["canonical_repository"],
+        plan["target"],
+    )
+    checkouts._require_linked(record)
+    checkouts._require_expected(record, expected_head, None)
+    if record["checkout_key"] != lifecycle.get("checkout_key"):
+        raise RuntimeError("automatic deployment source lifecycle checkout identity drifted")
+    return checkouts._upsert_retention(
+        checkout_key=record["checkout_key"],
+        repo_common_dir=common_dir,
+        repo_path=top_level,
+        checkout_path=plan["target"],
+        owner_id=plan["owner_id"],
+        purpose=f"detached runtime deploy source {expected_head[:12]}",
+        retention_until_unix=int(lifecycle["retention_until_unix"]),
+        expected_head=expected_head,
+        expected_branch=None,
+    )
+
+
+def _release_auto_deploy_source_lifecycle(lifecycle: dict[str, Any]) -> bool:
+    import grabowski_checkouts as checkouts
+
+    return checkouts._release_checkout_lifecycle_exact(lifecycle)
+
+
+def _lease_for_key(acquisition: dict[str, Any], resource_key: str) -> dict[str, Any]:
+    leases = acquisition.get("leases")
+    if not isinstance(leases, list):
+        raise RuntimeError("automatic deployment source lease receipt is malformed")
+    matches = [
+        item
+        for item in leases
+        if isinstance(item, dict) and item.get("resource_key") == resource_key
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"automatic deployment source lease receipt omitted {resource_key}"
+        )
+    return matches[0]
+
+
+def _cleanup_failure_text(failures: list[tuple[str, Exception]]) -> str:
+    return "; ".join(
+        f"{label}:{type(error).__name__}:{str(error)[:256]}"
+        for label, error in failures
+    )
+
+
+def _live_auto_deploy_source_lease_snapshot(
+    resource_key: str,
+    owner_id: str,
+) -> dict[str, Any] | None:
+    payload = _resource_inspect(resource_key)
+    if not isinstance(payload, dict) or payload.get("resource_key") != resource_key:
+        return None
+    lease = payload.get("lease")
+    if not isinstance(lease, dict) or lease.get("owner_id") != owner_id:
+        return None
+    fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    if any(field not in lease for field in fields):
+        return None
+    return {field: lease[field] for field in fields}
+
+
+def _materialize_auto_deploy_source(
+    expected_head: str,
+) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
+    stale_snapshot = _canonical_stale_main_snapshot(expected_head)
+    if stale_snapshot is None:
+        raise RuntimeError(
+            "automatic deployment source materialization is only valid for a clean stale canonical main"
+        )
+    plan = _auto_deploy_source_plan(expected_head)
+    target = plan["target"]
+    if os.path.lexists(target):
+        raise RuntimeError("automatic deployment source target already exists")
+    acquisition: dict[str, Any] | None = None
+    operation_lease: dict[str, Any] | None = None
+    path_lease: dict[str, Any] | None = None
+    created = False
+    mutation_attempted = False
+    recovery_asset_present = False
+    lifecycle: dict[str, Any] | None = None
+    obligation_opened = False
+    obligation_completed = False
+    operation_lease_released = False
+    try:
+        acquisition = _acquire_auto_deploy_source_resources(plan, expected_head)
+        operation_lease = _lease_for_key(acquisition, plan["operation_key"])
+        path_lease = _lease_for_key(acquisition, plan["path_key"])
+        obligation = _open_auto_deploy_source_obligation(plan, expected_head)
+        obligation_state = obligation.get("state")
+        if obligation_state != "open":
+            raise RuntimeError(
+                "fresh automatic deployment source obligation is not open"
+            )
+        obligation_opened = True
+        lifecycle = _reserve_auto_deploy_source_lifecycle(plan, expected_head)
+        locked_snapshot = _canonical_stale_main_snapshot(expected_head)
+        if (
+            locked_snapshot is None
+            or _canonical_stale_snapshot_state(locked_snapshot)
+            != _canonical_stale_snapshot_state(stale_snapshot)
+        ):
+            raise RuntimeError(
+                "canonical main state drifted after deployment source leases were acquired"
+            )
+        if os.path.lexists(target):
+            raise RuntimeError(
+                "automatic deployment source target appeared after lease acquisition"
+            )
+        mutation_attempted = True
+        # Once the Git effect boundary is entered, preserve recovery authority by
+        # default. Only successful observation of both an absent target path and
+        # an absent worktree registration proves no effect.
+        recovery_asset_present = True
+        mutation_error: Exception | None = None
+        mutation_result: dict[str, Any] | None = None
+        try:
+            mutation_result = _mutating_git_result(
+                plan["canonical_repository"],
+                "worktree",
+                "add",
+                "--detach",
+                str(target),
+                expected_head,
+            )
+        except Exception as exc:
+            mutation_error = exc
+        target_present_after_mutation = os.path.lexists(target)
+        registration_present_after_mutation = _worktree_registration_present(
+            plan["canonical_repository"], target
+        )
+        uncertain_mutation_outcome = bool(
+            mutation_error is not None
+            or (
+                mutation_result is not None
+                and mutation_result.get("timed_out") is True
+            )
+        )
+        recovery_asset_present = bool(
+            uncertain_mutation_outcome
+            or target_present_after_mutation
+            or registration_present_after_mutation
+        )
+        repository: Path | None = None
+        runner: Path | None = None
+        source_identity: dict[str, Any] | None = None
+        post_state_error: Exception | None = None
+        if target_present_after_mutation:
+            try:
+                repository, runner, source_identity = _deployment_source_preflight(
+                    expected_head,
+                    str(target),
+                    plan["owner_id"],
+                )
+            except Exception as exc:
+                post_state_error = exc
+        exact_post_state = bool(
+            repository is not None
+            and runner is not None
+            and source_identity is not None
+            and registration_present_after_mutation
+        )
+        if uncertain_mutation_outcome:
+            raise RuntimeError(
+                "automatic deployment source mutation outcome is uncertain; "
+                "retain lifecycle and leases for recovery"
+            ) from mutation_error
+        if not exact_post_state:
+            if recovery_asset_present:
+                detail = (
+                    f": {type(post_state_error).__name__}: {str(post_state_error)[:512]}"
+                    if post_state_error is not None
+                    else ""
+                )
+                raise RuntimeError(
+                    "automatic deployment source mutation has an incomplete post-state; "
+                    "retain lifecycle and path lease for recovery" + detail
+                ) from post_state_error
+            if mutation_error is not None:
+                raise RuntimeError(
+                    "automatic deployment source mutation failed with no observed effect"
+                ) from mutation_error
+            if mutation_result is None:
+                raise RuntimeError(
+                    "automatic deployment source mutation returned no result and no observed effect"
+                )
+            message = str(
+                mutation_result.get("stderr")
+                or mutation_result.get("stdout")
+                or "git worktree add reported failure"
+            ).strip()
+            raise RuntimeError(
+                "automatic deployment source mutation failed with no observed effect: "
+                + (message or "git worktree add reported failure")
+            )
+        assert repository is not None and runner is not None and source_identity is not None
+        command_reported_success = bool(
+            mutation_error is None
+            and mutation_result is not None
+            and mutation_result.get("timed_out") is not True
+            and mutation_result.get("returncode") == 0
+        )
+        # The target was proven absent before mutation and is now an exact, usable
+        # linked worktree.  `created` describes the observed artifact, while the
+        # command outcome remains separately visible in command_outcome.
+        created = True
+        if lifecycle is None:
+            raise RuntimeError("automatic deployment source lifecycle reservation is missing")
+        retention = _bind_auto_deploy_source_retention(
+            plan,
+            lifecycle,
+            expected_head,
+        )
+        release = _release_auto_deploy_source_resources(
+            plan["owner_id"],
+            [plan["operation_key"]],
+            [operation_lease],
+        )
+        released = release.get("released")
+        if not isinstance(released, list) or len(released) != 1:
+            raise RuntimeError("automatic deployment source operation lease release was incomplete")
+        operation_lease_released = True
+        repository, runner, source_identity = _deployment_source_preflight(
+            expected_head,
+            str(target),
+            plan["owner_id"],
+        )
+        materialization = {
+            "schema_version": 1,
+            "kind": "grabowski_auto_runtime_deploy_source",
+            "created": created,
+            "usable": True,
+            "effect_observed": True,
+            "mutation_attempted": mutation_attempted,
+            "command_outcome": {
+                "reported_success": command_reported_success,
+                "returncode": (
+                    mutation_result.get("returncode")
+                    if mutation_result is not None
+                    else None
+                ),
+                "timed_out": (
+                    mutation_result.get("timed_out")
+                    if mutation_result is not None
+                    else None
+                ),
+                "error_class": (
+                    type(mutation_error).__name__ if mutation_error is not None else None
+                ),
+            },
+            "repository": str(repository),
+            "owner_id": plan["owner_id"],
+            "path_resource_key": plan["path_key"],
+            "path_lease": path_lease,
+            "operation_resource_key": plan["operation_key"],
+            "canonical_stale_snapshot": stale_snapshot,
+            "lifecycle": lifecycle,
+            "retention": retention,
+            "expected_head": expected_head,
+        }
+        evidence_material = {
+            "schema_version": 1,
+            "kind": "grabowski_auto_runtime_deploy_source_evidence",
+            "expected_head": expected_head,
+            "repository": str(repository),
+            "owner_id": plan["owner_id"],
+            "generation": plan["generation"],
+            "path_resource_key": plan["path_key"],
+            "source_identity_sha256": source_identity["identity_sha256"],
+            "lifecycle_checkout_key": lifecycle.get("checkout_key"),
+        }
+        evidence_sha256 = _source_identity_sha256(evidence_material)
+        obligation_close = _close_auto_deploy_source_obligation(
+            plan,
+            expected_head,
+            evidence_sha256,
+        )
+        if obligation_close.get("state") != "completed":
+            raise RuntimeError(
+                "automatic deployment source obligation did not close as completed"
+            )
+        obligation_completed = True
+        materialization["materialization_evidence_sha256"] = evidence_sha256
+        materialization["obligation"] = {
+            "obligation_id": obligation_close.get("obligation_id"),
+            "state": obligation_close.get("state"),
+            "close_file_sha256": obligation_close.get("close_file_sha256"),
+        }
+        materialization["receipt_sha256"] = _source_identity_sha256(materialization)
+        _append_deploy_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "runtime-deploy-source-materialized",
+                "expected_head": expected_head,
+                "repository": str(repository),
+                "owner_id": plan["owner_id"],
+                "created": created,
+                "effect_observed": True,
+                "command_reported_success": command_reported_success,
+                "source_identity_sha256": source_identity["identity_sha256"],
+                "materialization_receipt_sha256": materialization["receipt_sha256"],
+            }
+        )
+        return repository, runner, source_identity, materialization
+    except Exception as exc:
+        cleanup_failures: list[tuple[str, Exception]] = []
+        if obligation_opened and not obligation_completed:
+            try:
+                _block_auto_deploy_source_obligation(plan, exc)
+            except Exception as cleanup_error:
+                cleanup_failures.append(("obligation-block", cleanup_error))
+        preserve_recovery_asset = bool(mutation_attempted and recovery_asset_present)
+        if lifecycle is not None and not preserve_recovery_asset:
+            try:
+                if not _release_auto_deploy_source_lifecycle(lifecycle):
+                    cleanup_failures.append(
+                        (
+                            "lifecycle-release",
+                            RuntimeError("lifecycle release returned false"),
+                        )
+                    )
+            except Exception as cleanup_error:
+                cleanup_failures.append(("lifecycle-release", cleanup_error))
+        release_keys: list[str] = []
+        release_leases: list[dict[str, Any]] = []
+        if not operation_lease_released:
+            candidate_operation_lease = operation_lease
+            if candidate_operation_lease is None and not mutation_attempted:
+                try:
+                    candidate_operation_lease = _live_auto_deploy_source_lease_snapshot(
+                        plan["operation_key"], plan["owner_id"]
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(("operation-lease-readback", cleanup_error))
+                    candidate_operation_lease = None
+            if candidate_operation_lease is not None:
+                release_keys.append(plan["operation_key"])
+                release_leases.append(candidate_operation_lease)
+        if not preserve_recovery_asset:
+            candidate_path_lease = path_lease
+            if candidate_path_lease is None and not mutation_attempted:
+                try:
+                    candidate_path_lease = _live_auto_deploy_source_lease_snapshot(
+                        plan["path_key"], plan["owner_id"]
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(("path-lease-readback", cleanup_error))
+                    candidate_path_lease = None
+            if candidate_path_lease is not None:
+                release_keys.append(plan["path_key"])
+                release_leases.append(candidate_path_lease)
+        if release_keys:
+            try:
+                _release_auto_deploy_source_resources(
+                    plan["owner_id"],
+                    release_keys,
+                    release_leases,
+                )
+            except Exception as cleanup_error:
+                cleanup_failures.append(("resource-release", cleanup_error))
+        if cleanup_failures:
+            raise RuntimeError(
+                f"{type(exc).__name__}: {exc}; cleanup failures: "
+                + _cleanup_failure_text(cleanup_failures)
+            ) from exc
+        raise
+
+
+def _cleanup_auto_deploy_source_before_dispatch(
+    expected_head: str,
+    source_identity: dict[str, Any],
+    materialization: dict[str, Any],
+) -> dict[str, Any]:
+    import grabowski_resources as resources
+
+    if materialization.get("expected_head") != expected_head:
+        raise RuntimeError("automatic deployment source cleanup head binding drifted")
+    owner_id = materialization.get("owner_id")
+    repository_text = materialization.get("repository")
+    path_key = materialization.get("path_resource_key")
+    path_lease = materialization.get("path_lease")
+    lifecycle = materialization.get("lifecycle")
+    retention = materialization.get("retention")
+    if (
+        not isinstance(owner_id, str)
+        or not isinstance(repository_text, str)
+        or not isinstance(path_key, str)
+        or not isinstance(path_lease, dict)
+        or not isinstance(lifecycle, dict)
+        or not isinstance(retention, dict)
+    ):
+        raise RuntimeError("automatic deployment source cleanup receipt is malformed")
+    repository = Path(repository_text)
+    canonical_text = source_identity.get("canonical_repository")
+    source_identity_sha256 = source_identity.get("identity_sha256")
+    if not isinstance(canonical_text, str) or not isinstance(source_identity_sha256, str):
+        raise RuntimeError("automatic deployment source cleanup identity is malformed")
+    canonical = _validated_repository_path(Path(canonical_text), label="canonical repository")
+    observed_repository, _runner, observed_identity = _deployment_source_preflight(
+        expected_head,
+        str(repository),
+        owner_id,
+    )
+    if (
+        observed_repository != repository
+        or observed_identity.get("identity_sha256") != source_identity_sha256
+    ):
+        raise RuntimeError("automatic deployment source cleanup identity drifted")
+
+    cleanup_key = (
+        f"repo:{canonical}:operation:worktree-remove:{repository.name}"
+    )
+    cleanup_scope = resources.operation_scope_contract(
+        cleanup_key,
+        repository=str(canonical),
+        effect_class="worktree_admin",
+        operation_class="worktree-admin",
+    )
+    cleanup_lease: dict[str, Any] | None = None
+    mutation_attempted = False
+    mutation_result: dict[str, Any] | None = None
+    mutation_error: Exception | None = None
+    try:
+        acquisition = resources.acquire_resources(
+            owner_id,
+            [cleanup_key],
+            purpose=f"remove unused detached runtime deploy source {expected_head[:12]}",
+            ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
+            metadata={"operation_scope": cleanup_scope},
+        )
+        cleanup_lease = _lease_for_key(acquisition, cleanup_key)
+        mutation_attempted = True
+        try:
+            mutation_result = _mutating_git_result(
+                canonical,
+                "worktree",
+                "remove",
+                str(repository),
+            )
+        except Exception as exc:
+            mutation_error = exc
+        target_present = os.path.lexists(repository)
+        registration_present = _worktree_registration_present(canonical, repository)
+        uncertain = bool(
+            mutation_error is not None
+            or mutation_result is None
+            or mutation_result.get("timed_out") is True
+        )
+        if uncertain or target_present or registration_present:
+            detail = (
+                f": {type(mutation_error).__name__}: {str(mutation_error)[:512]}"
+                if mutation_error is not None
+                else ""
+            )
+            raise RuntimeError(
+                "automatic deployment source cleanup is not proven complete; "
+                "retain lifecycle and leases for recovery" + detail
+            ) from mutation_error
+        post_remove_failures: list[tuple[str, Exception]] = []
+        try:
+            release = _release_auto_deploy_source_resources(
+                owner_id,
+                [cleanup_key, path_key],
+                [cleanup_lease, path_lease],
+            )
+            released = release.get("released")
+            if not isinstance(released, list) or len(released) != 2:
+                post_remove_failures.append(
+                    (
+                        "resource-release",
+                        RuntimeError(
+                            "automatic deployment source cleanup lease release was incomplete"
+                        ),
+                    )
+                )
+        except Exception as cleanup_error:
+            post_remove_failures.append(("resource-release", cleanup_error))
+        try:
+            if not _release_auto_deploy_source_lifecycle(lifecycle):
+                post_remove_failures.append(
+                    (
+                        "lifecycle-release",
+                        RuntimeError(
+                            "automatic deployment source cleanup lifecycle release failed"
+                        ),
+                    )
+                )
+        except Exception as cleanup_error:
+            post_remove_failures.append(("lifecycle-release", cleanup_error))
+        try:
+            if not _release_auto_deploy_source_retention(retention):
+                post_remove_failures.append(
+                    (
+                        "retention-release",
+                        RuntimeError(
+                            "automatic deployment source cleanup retention release failed"
+                        ),
+                    )
+                )
+        except Exception as cleanup_error:
+            post_remove_failures.append(("retention-release", cleanup_error))
+        if post_remove_failures:
+            raise RuntimeError(
+                "automatic deployment source worktree removal was proven, but cleanup "
+                "state did not fully converge: "
+                + _cleanup_failure_text(post_remove_failures)
+            )
+        receipt = {
+            "schema_version": 1,
+            "kind": "grabowski_auto_runtime_deploy_source_cleanup",
+            "expected_head": expected_head,
+            "repository": str(repository),
+            "owner_id": owner_id,
+            "source_identity_sha256": source_identity_sha256,
+            "command_outcome": {
+                "reported_success": bool(
+                    mutation_error is None
+                    and mutation_result is not None
+                    and mutation_result.get("returncode") == 0
+                    and mutation_result.get("timed_out") is not True
+                ),
+                "returncode": mutation_result.get("returncode") if mutation_result else None,
+                "timed_out": mutation_result.get("timed_out") if mutation_result else None,
+            },
+        }
+        receipt["receipt_sha256"] = _source_identity_sha256(receipt)
+        _append_deploy_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "runtime-deploy-source-cleaned-before-dispatch",
+                "expected_head": expected_head,
+                "repository": str(repository),
+                "owner_id": owner_id,
+                "source_identity_sha256": source_identity_sha256,
+                "cleanup_receipt_sha256": receipt["receipt_sha256"],
+            }
+        )
+        return receipt
+    except Exception as exc:
+        cleanup_failures: list[tuple[str, Exception]] = []
+        if not mutation_attempted:
+            candidate_cleanup_lease = cleanup_lease
+            if candidate_cleanup_lease is None:
+                try:
+                    candidate_cleanup_lease = _live_auto_deploy_source_lease_snapshot(
+                        cleanup_key, owner_id
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(("cleanup-lease-readback", cleanup_error))
+                    candidate_cleanup_lease = None
+            if candidate_cleanup_lease is not None:
+                try:
+                    _release_auto_deploy_source_resources(
+                        owner_id,
+                        [cleanup_key],
+                        [candidate_cleanup_lease],
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(("cleanup-operation-release", cleanup_error))
+        if cleanup_failures:
+            raise RuntimeError(
+                f"{type(exc).__name__}: {exc}; cleanup failures: "
+                + _cleanup_failure_text(cleanup_failures)
+            ) from exc
+        raise
 
 
 def _source_lease_evidence(
@@ -2694,16 +3964,51 @@ def grabowski_runtime_deploy_schedule(
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("privileged_reference")
     with _deploy_schedule_lock():
-        repository, runner, source_identity = _deployment_source_preflight(
-            expected_head,
-            source_repository,
-            source_lease_owner_id,
-        )
         public_github_main_before = _fresh_public_github_main(expected_head)
         if public_github_main_before != expected_head:
             raise RuntimeError(
                 "fresh public GitHub main differs from deployment target: "
                 f"expected {expected_head}, found {public_github_main_before}"
+            )
+        automatic_source: dict[str, Any] | None = None
+        automatic_source_needed = False
+        origin_main_refresh: dict[str, Any] | None = None
+        canonical_refresh_snapshot: dict[str, Any] | None = None
+        effective_source_repository = source_repository
+        effective_source_lease_owner_id = source_lease_owner_id
+        repository: Path | None = None
+        runner: Path | None = None
+        source_identity: dict[str, Any] | None = None
+        if source_repository is None:
+            try:
+                repository, runner, source_identity = _deployment_source_preflight(
+                    expected_head,
+                    None,
+                    None,
+                )
+            except RuntimeError as canonical_error:
+                try:
+                    stale_snapshot = _canonical_stale_main_snapshot(expected_head)
+                except Exception as stale_error:
+                    try:
+                        refresh_candidate = _canonical_main_refresh_candidate(expected_head)
+                    except Exception as refresh_error:
+                        raise canonical_error from refresh_error
+                    if refresh_candidate["origin_main"] == expected_head:
+                        raise canonical_error from stale_error
+                    canonical_refresh_snapshot = refresh_candidate
+                    automatic_source_needed = (
+                        refresh_candidate["current_head"] != expected_head
+                    )
+                else:
+                    if stale_snapshot is None:
+                        raise canonical_error
+                    automatic_source_needed = True
+        else:
+            repository, runner, source_identity = _deployment_source_preflight(
+                expected_head,
+                source_repository,
+                source_lease_owner_id,
             )
         authority = privileged.ensure_rootbroker_authority(expected_head)
         if not authority.get("success"):
@@ -2717,33 +4022,155 @@ def grabowski_runtime_deploy_schedule(
                 "public GitHub main drifted during Rootbroker authority refresh: "
                 f"expected {expected_head}, found {public_github_main_after}"
             )
-        repository_after, runner_after, source_identity_after = _deployment_source_preflight(
-            expected_head,
-            source_repository,
-            source_lease_owner_id,
-        )
-        if (
-            repository_after != repository
-            or runner_after != runner
-            or source_identity_after["identity_sha256"]
-            != source_identity["identity_sha256"]
-        ):
-            raise RuntimeError("deployment source identity drifted during Rootbroker authority refresh")
+        if canonical_refresh_snapshot is not None:
+            origin_main_refresh = _refresh_canonical_origin_main(
+                expected_head, canonical_refresh_snapshot
+            )
+            if not automatic_source_needed:
+                repository, runner, source_identity = _deployment_source_preflight(
+                    expected_head,
+                    None,
+                    None,
+                )
+        if automatic_source_needed:
+            # The canonical checkout may have converged while Rootbroker authority
+            # and public-main evidence were refreshed.  Reclassify now instead of
+            # carrying a sticky earlier decision into an unnecessary worktree add.
+            try:
+                repository, runner, source_identity = _deployment_source_preflight(
+                    expected_head,
+                    None,
+                    None,
+                )
+            except RuntimeError as canonical_recheck_error:
+                try:
+                    stale_after_authority = _canonical_stale_main_snapshot(expected_head)
+                except Exception as stale_error:
+                    raise canonical_recheck_error from stale_error
+                if stale_after_authority is None:
+                    raise canonical_recheck_error
+            else:
+                automatic_source_needed = False
+                effective_source_repository = None
+                effective_source_lease_owner_id = None
+        if automatic_source_needed:
+            inflight_before_materialization = inflight_runtime_job_evidence()
+            inflight_error = inflight_before_materialization.get("error")
+            if inflight_error:
+                raise RuntimeError(
+                    "automatic deployment source preflight could not classify "
+                    f"in-flight runtime jobs: {inflight_error}"
+                )
+            inflight_units = inflight_before_materialization.get("inflight_units")
+            if not isinstance(inflight_units, list):
+                raise RuntimeError(
+                    "automatic deployment source preflight returned malformed in-flight runtime evidence"
+                )
+            if inflight_units:
+                raise RuntimeError(
+                    "automatic deployment source refuses to materialize while a runtime job is already in flight: "
+                    + ", ".join(str(unit) for unit in inflight_units)
+                )
+            (
+                repository,
+                runner,
+                source_identity,
+                automatic_source,
+            ) = _materialize_auto_deploy_source(expected_head)
+            effective_source_repository = str(repository)
+            effective_source_lease_owner_id = automatic_source["owner_id"]
+        if repository is None or runner is None or source_identity is None:
+            raise RuntimeError("deployment source resolution did not produce a bound source")
+        try:
+            repository_after, runner_after, source_identity_after = _deployment_source_preflight(
+                expected_head,
+                effective_source_repository,
+                effective_source_lease_owner_id,
+            )
+            if (
+                repository_after != repository
+                or runner_after != runner
+                or source_identity_after["identity_sha256"]
+                != source_identity["identity_sha256"]
+            ):
+                phase = (
+                    "automatic deployment source materialization"
+                    if automatic_source is not None
+                    else "Rootbroker authority refresh"
+                )
+                raise RuntimeError(f"deployment source identity drifted during {phase}")
+            public_github_main_dispatch = None
+            if automatic_source is not None:
+                public_github_main_dispatch = _fresh_public_github_main(expected_head)
+                if public_github_main_dispatch != expected_head:
+                    raise RuntimeError(
+                        "public GitHub main drifted during automatic deployment source materialization: "
+                        f"expected {expected_head}, found {public_github_main_dispatch}"
+                    )
+        except Exception as exc:
+            if automatic_source is not None:
+                try:
+                    _cleanup_auto_deploy_source_before_dispatch(
+                        expected_head, source_identity, automatic_source
+                    )
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"{type(exc).__name__}: {exc}; cleanup failures: "
+                        + _cleanup_failure_text(
+                            [("automatic-source-cleanup", cleanup_error)]
+                        )
+                    ) from exc
+            raise
         repository = repository_after
         runner = runner_after
         source_identity = source_identity_after
-        canonical_repository = Path(source_identity["canonical_repository"])
-        command = _deploy_command(
-            repository,
-            runner,
-            expected_head,
-            delay_seconds,
-            canonical_repository=canonical_repository,
-            source_kind=source_identity["source_kind"],
-            source_identity_sha256=source_identity["identity_sha256"],
-        )
-        existing = _matching_inflight_deploy_job(command, repository)
+        try:
+            canonical_repository = Path(source_identity["canonical_repository"])
+            command = _deploy_command(
+                repository,
+                runner,
+                expected_head,
+                delay_seconds,
+                canonical_repository=canonical_repository,
+                source_kind=source_identity["source_kind"],
+                source_identity_sha256=source_identity["identity_sha256"],
+            )
+            existing = _matching_inflight_deploy_job(command, repository)
+        except Exception as exc:
+            if automatic_source is not None:
+                try:
+                    _cleanup_auto_deploy_source_before_dispatch(
+                        expected_head, source_identity, automatic_source
+                    )
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"{type(exc).__name__}: {exc}; cleanup failures: "
+                        + _cleanup_failure_text(
+                            [("automatic-source-cleanup", cleanup_error)]
+                        )
+                    ) from exc
+            raise
         if existing is not None:
+            if (
+                automatic_source is not None
+                and existing.get("source_identity_sha256")
+                != source_identity["identity_sha256"]
+            ):
+                primary = RuntimeError(
+                    "a different-source runtime job appeared after automatic deployment source materialization"
+                )
+                try:
+                    _cleanup_auto_deploy_source_before_dispatch(
+                        expected_head, source_identity, automatic_source
+                    )
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"{primary}; cleanup failures: "
+                        + _cleanup_failure_text(
+                            [("automatic-source-cleanup", cleanup_error)]
+                        )
+                    ) from primary
+                raise primary
             observed = {
                 "timestamp_unix": int(time.time()),
                 "operation": "runtime-deploy-existing-schedule-observed",
@@ -2775,6 +4202,7 @@ def grabowski_runtime_deploy_schedule(
                 scheduled=observed,
                 already_scheduled=True,
                 source_identity=source_identity,
+                automatic_source=automatic_source,
             )
 
         intent = {
@@ -2784,11 +4212,14 @@ def grabowski_runtime_deploy_schedule(
             "delay_seconds": delay_seconds,
             "source_identity": source_identity,
             "source_identity_sha256": source_identity["identity_sha256"],
+            "automatic_source": automatic_source,
+            "origin_main_refresh": origin_main_refresh,
             "public_github_main": {
                 "repository": PUBLIC_GITHUB_REPOSITORY_URL,
                 "ref": PUBLIC_GITHUB_MAIN_REF,
                 "before": public_github_main_before,
                 "after": public_github_main_after,
+                "dispatch": public_github_main_dispatch,
                 "verification": "fresh-public-github-rest-api-v1",
             },
             "rootbroker_authority": {
@@ -2803,50 +4234,89 @@ def grabowski_runtime_deploy_schedule(
                 )
             },
         }
-        _append_deploy_audit(intent)
-        jobs_root = operator._jobs_root()
-        index = _deploy_index(jobs_root)
-        reserved_unit = DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
-        _write_deploy_index(
-            jobs_root,
-            units=index["units"],
-            pending_unit=reserved_unit,
-        )
-        observer_capability = (
-            deployment_observer.issue_capability() if ctx is not None else None
-        )
-        client_id: str | None = None
-        if ctx is not None:
-            try:
-                observed_client_id = ctx.client_id
-            except (AttributeError, RuntimeError, ValueError):
-                observed_client_id = None
-            if isinstance(observed_client_id, str) and observed_client_id.strip():
-                client_id = observed_client_id
-        observer_request = (
-            {
-                "capability": observer_capability,
-                "client_id": client_id,
-                "expected_head": expected_head,
-                "source_identity_sha256": source_identity["identity_sha256"],
-            }
-            if observer_capability is not None
-            else None
-        )
-        observer_keyword = (
-            {"deployment_observer_request": observer_request}
-            if observer_request is not None
-            else {}
-        )
-        job = operator._start_job(
-            command,
-            cwd=str(repository),
-            runtime_seconds=3_600,
-            finalization_expected_head=expected_head,
-            reserved_unit=reserved_unit,
-            allow_reserved_runtime_deploy=True,
-            **observer_keyword,
-        )
+        jobs_root: Path | None = None
+        index: dict[str, Any] | None = None
+        reserved_unit: str | None = None
+        pending_index_written = False
+        try:
+            _append_deploy_audit(intent)
+            jobs_root = operator._jobs_root()
+            index = _deploy_index(jobs_root)
+            reserved_unit = DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
+            _write_deploy_index(
+                jobs_root,
+                units=index["units"],
+                pending_unit=reserved_unit,
+            )
+            pending_index_written = True
+            observer_capability = (
+                deployment_observer.issue_capability() if ctx is not None else None
+            )
+            client_id: str | None = None
+            if ctx is not None:
+                try:
+                    observed_client_id = ctx.client_id
+                except (AttributeError, RuntimeError, ValueError):
+                    observed_client_id = None
+                if isinstance(observed_client_id, str) and observed_client_id.strip():
+                    client_id = observed_client_id
+            observer_request = (
+                {
+                    "capability": observer_capability,
+                    "client_id": client_id,
+                    "expected_head": expected_head,
+                    "source_identity_sha256": source_identity["identity_sha256"],
+                }
+                if observer_capability is not None
+                else None
+            )
+            observer_keyword = (
+                {"deployment_observer_request": observer_request}
+                if observer_request is not None
+                else {}
+            )
+            job = operator._start_job(
+                command,
+                cwd=str(repository),
+                runtime_seconds=3_600,
+                finalization_expected_head=expected_head,
+                reserved_unit=reserved_unit,
+                allow_reserved_runtime_deploy=True,
+                **observer_keyword,
+            )
+        except operator.JobDispatchUnknown:
+            # The job may already be using the source.  Keep both the pending
+            # schedule marker and automatic source recovery authority intact.
+            raise
+        except Exception as exc:
+            cleanup_failures: list[tuple[str, Exception]] = []
+            if (
+                pending_index_written
+                and jobs_root is not None
+                and index is not None
+            ):
+                try:
+                    _write_deploy_index(
+                        jobs_root,
+                        units=index["units"],
+                        pending_unit=None,
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(("pending-index-clear", cleanup_error))
+            if automatic_source is not None:
+                try:
+                    _cleanup_auto_deploy_source_before_dispatch(
+                        expected_head, source_identity, automatic_source
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(("automatic-source-cleanup", cleanup_error))
+            if cleanup_failures:
+                raise RuntimeError(
+                    f"{type(exc).__name__}: {exc}; cleanup failures: "
+                    + _cleanup_failure_text(cleanup_failures)
+                ) from exc
+            raise
+        assert jobs_root is not None and index is not None and reserved_unit is not None
         _write_deploy_index(
             jobs_root,
             units=[*index["units"], reserved_unit],
@@ -2871,5 +4341,6 @@ def grabowski_runtime_deploy_schedule(
             scheduled=scheduled,
             already_scheduled=False,
             source_identity=source_identity,
+            automatic_source=automatic_source,
             deployment_observer_capability=observer_capability,
         )
