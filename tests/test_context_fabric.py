@@ -152,6 +152,9 @@ class PlanTests(ContextFabricTestCase):
         self.assertIn(
             "missing_required_authoritative_source", plan["fail_closed_conditions"]
         )
+        self.assertIn(
+            "stale_required_authoritative_observation", plan["fail_closed_conditions"]
+        )
 
     def test_plan_separates_required_and_optional_authorities(self) -> None:
         plan = self.module.plan_context("deployment", dict(DEPLOYMENT_BINDING))
@@ -193,6 +196,7 @@ class ComposeTests(ContextFabricTestCase):
             "sensitivity",
             "status",
             "freshness",
+            "observation_requirement",
             "conflicts",
             "does_not_establish",
         ):
@@ -201,6 +205,10 @@ class ComposeTests(ContextFabricTestCase):
         self.assertEqual(claim["temporal_marker"], "observed")
         self.assertEqual(claim["freshness"], "fresh")
         self.assertEqual(claim["age_seconds"], 120)
+        self.assertEqual(claim["observation_requirement"]["state"], "observed")
+        self.assertEqual(claim["observation_requirement"]["due_at"], "2026-08-02T12:13:00Z")
+        self.assertEqual(context["observation_adherence"]["status"], "observed")
+        self.assertEqual(context["observation_adherence"]["observed_ratio"], 1.0)
         self.assertEqual(claim["binding"], PR_BINDING)
         self.assertIn("lifecycle_truth_ownership", claim["does_not_establish"])
         self.assertIn("merge_readiness", claim["does_not_establish"])
@@ -224,8 +232,48 @@ class ComposeTests(ContextFabricTestCase):
         stale = self._compose_pr(
             [_pr_observation(observed_at="2026-08-02T09:00:00Z")]
         )
+        self.assertTrue(aging["composed"])
         self.assertEqual(aging["claims"][0]["freshness"], "aging")
-        self.assertEqual(stale["claims"][0]["freshness"], "stale")
+        self.assertEqual(aging["claims"][0]["observation_requirement"]["state"], "due")
+        self.assertEqual(aging["observation_adherence"]["status"], "due")
+        self.assertEqual(aging["observation_adherence"]["counts"]["due"], 1)
+
+        self.assertFalse(stale["composed"])
+        self.assertEqual(stale["claims"], [])
+        self.assertEqual(
+            stale["failure"]["code"],
+            "stale_required_authoritative_observations",
+        )
+        self.assertEqual(stale["observation_adherence"]["status"], "blocked")
+        self.assertEqual(stale["observation_adherence"]["counts"]["missed"], 1)
+        self.assertEqual(
+            stale["failure"]["stale_required_sources"],
+            ["grabowski_github_pr_view"],
+        )
+
+    def test_stale_optional_observation_does_not_block_fresh_required_authority(self) -> None:
+        context = self._compose_pr(
+            [
+                _pr_observation(),
+                {
+                    "source_tool": "grabowski_github_checks",
+                    "claim_type": "pull_request_check_result",
+                    "binding": dict(PR_BINDING),
+                    "observed_at": "2026-08-02T09:00:00Z",
+                    "status": "success",
+                    "evidence_refs": [{"type": "check_run", "id": "validate"}],
+                },
+            ]
+        )
+        self.assertTrue(context["composed"])
+        optional = next(
+            claim
+            for claim in context["claims"]
+            if claim["authority_tool"] == "grabowski_github_checks"
+        )
+        self.assertEqual(optional["freshness"], "stale")
+        self.assertEqual(optional["observation_requirement"]["state"], "missed")
+        self.assertEqual(context["observation_adherence"]["status"], "observed")
 
     def test_historical_observation_is_marked_and_never_dated(self) -> None:
         context = self.module.compose_context(
