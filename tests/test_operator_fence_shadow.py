@@ -151,6 +151,7 @@ class OperatorFenceShadowTests(unittest.TestCase):
         self.assertEqual(result["status"], "observed")
         self.assertEqual(result["decision"], "would_acquire")
         self.assertEqual(result["generation"], 3)
+        self.assertEqual(result["instance_id"], "instance-a")
         self.assertEqual(result["snapshot_age_seconds"], 4)
 
     def test_writer_state_matches_real_acquire_semantics(self) -> None:
