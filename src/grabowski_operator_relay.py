@@ -166,7 +166,7 @@ def operator_relay_protocol() -> dict[str, Any]:
             "patch_file_relay": "operator_patch_relay",
             "patch_fallback": "controller",
             "audit": "grabowski_git",
-            "repo_state_context": "reposkop_target_bound_report",
+            "repo_state_context": "typed_git_checkout_reads",
         },
         "does_not_establish": [
             "new_privileges",
@@ -176,6 +176,5 @@ def operator_relay_protocol() -> dict[str, Any]:
             "model_identity_authority",
             "free_shell_as_default_path",
             "durable_agent_autonomy_without_lane_binding",
-            "reposkop_report_action_approval",
         ],
     }

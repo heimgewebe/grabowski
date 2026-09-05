@@ -159,26 +159,16 @@ Limit = Annotated[int, 5]
             msg=completed.stdout + completed.stderr,
         )
 
-    def test_reposkop_context_contract_is_target_bound(self) -> None:
-        command = (
-            "reposkop report <absolute-target> --purpose "
-            "grabowski-repo-state-context --json"
-        )
+    def test_repo_state_context_uses_native_typed_reads(self) -> None:
         root_contract = (ROOT / "GRABOWSKI.md").read_text(encoding="utf-8")
-        blocked_protocol = (
-            ROOT / "docs" / "blocked-action-protocol-v0.md"
-        ).read_text(encoding="utf-8")
-        relay_source = (
-            ROOT / "src" / "grabowski_operator_relay.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn(command, root_contract)
-        self.assertIn(command, blocked_protocol)
-        self.assertNotIn("steuerboard operator report", root_contract.lower())
-        self.assertNotIn("steuerboard operator report", blocked_protocol.lower())
-        self.assertIn("reposkop_target_bound_report", relay_source)
-        self.assertIn("reposkop_report_action_approval", relay_source)
-        self.assertNotIn("steuerboard_operator_report", relay_source)
-        self.assertNotIn("steuerboard_report_action_approval", relay_source)
+        blocked_protocol = (ROOT / "docs" / "blocked-action-protocol-v0.md").read_text(encoding="utf-8")
+        relay_source = (ROOT / "src" / "grabowski_operator_relay.py").read_text(encoding="utf-8")
+        for token in ("grabowski_git_status", "grabowski_checkout_inventory", "grabowski_github_pr_view"):
+            self.assertIn(token, root_contract)
+        self.assertIn("Native Repo-State Reads", blocked_protocol)
+        self.assertIn("typed_git_checkout_reads", relay_source)
+        self.assertNotIn("reposkop_target_bound_report", relay_source)
+        self.assertNotIn("reposkop_report_action_approval", relay_source)
 
     def test_catalog_covers_runtime_contract_exactly(self) -> None:
         contract = json.loads(
@@ -611,11 +601,7 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         )
         self.assertEqual(
             protocol["routing_roles"]["repo_state_context"],
-            "reposkop_target_bound_report",
-        )
-        self.assertIn(
-            "reposkop_report_action_approval",
-            protocol["does_not_establish"],
+            "typed_git_checkout_reads",
         )
 
     def test_branch_control_is_typed_and_guarded(self) -> None:

@@ -12,8 +12,8 @@ Autonomie ist kein Selbstzweck. Die kanonische Optimierungsrichtung steht in
 nur wenn die einzelnen Griffe kleiner, typisierter, receipt-gebunden und
 rücknehmbar werden.
 
-`docs/operator-focus-protocol-v1.md` begrenzt die Nutzung von Reposkop,
-Bureau, Cabinet und anderen Lageflächen während eines laufenden
+`docs/operator-focus-protocol-v1.md` begrenzt die Nutzung von Bureau, Cabinet
+und anderen Lageflächen während eines laufenden
 Operator-Durchlaufs. Solange ein aktiver Arbeitsgegenstand existiert, dürfen
 Boards Kontext, Abhängigkeiten, Kollisionen und Receipts liefern, aber keinen
 stillen Taskwechsel auslösen. Sichtbarkeit ist keine Priorität; offene Tasks

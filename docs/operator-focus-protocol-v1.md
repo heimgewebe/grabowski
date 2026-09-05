@@ -17,8 +17,8 @@ other narrow target currently being pursued with a current goal assumption.
 
 ## Allowed registry and board use
 
-During an active work item, Reposkop, Bureau, Cabinet, and other status
-surfaces may be used for:
+During an active work item, Bureau, Cabinet, and other status surfaces may be
+used for:
 
 - context checks,
 - dependency checks,
@@ -63,11 +63,11 @@ Bureau remains the registry and coordination organ. It can show work,
 claimability, status, and receipts. It does not automatically own the current
 execution priority while an active work item exists.
 
-## Relationship to Reposkop
+## Relationship to repository-state reads
 
-Reposkop is an explicitly target-bound read-only coherence view, not an autopilot.
-It may inform attention for the selected checkout, but it must not replace the
-active work item without a valid switch condition.
+Native Git, checkout and GitHub reads may inform attention for the selected target.
+They are observations, not an autopilot, and must not replace the active work item
+without a valid switch condition.
 
 ## Failure mode
 

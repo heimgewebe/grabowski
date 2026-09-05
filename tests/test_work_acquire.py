@@ -350,7 +350,7 @@ class WorkAcquireTests(unittest.TestCase):
         )
         ensure.assert_called_once()
         ensure_parameters = ensure.call_args.args[0]
-        self.assertIs(ensure_parameters["reposkop_required"], True)
+        self.assertNotIn("reposkop_required", ensure_parameters)
         self.assertIsNone(ensure_parameters["system_convergence"])
         self.assertEqual(ensure_parameters["source_kind"], "work_lane")
         self.assertEqual(ensure_parameters["source_id"], result["lane_id"])

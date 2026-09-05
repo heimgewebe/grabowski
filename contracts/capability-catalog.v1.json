@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "1011ba805286ba13173643c9a4a0fc9fefb96a7a58105a8b217d51d9ed642eb1",
+  "capability_source_sha256": "c89aa9c07dd4ac22cdbfd893aef19d6b4f47f5a7b3deee70057d3b375fc08ccd",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b7fa14455c1a13713a33912fd329011808529e66a47e4d60d49680c28f6496e0",
+  "contract_sha256": "46181c6c4588c9d8bb4f5d43d3d260abf5306fce8dd7abf4cb4aa2aed614d3fd",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -294,17 +294,6 @@
       "tool": "grabowski_audit_analyze"
     },
     {
-      "category": "audit",
-      "description": "Project bounded Reposkop coverage, technical outcomes and improvement signals.",
-      "effects": [],
-      "id": "grabowski_reposkop_effectiveness",
-      "purpose": "Project bounded Reposkop coverage, technical outcomes, latency and evidence-bound improvement candidates from the verified audit chain.",
-      "read_only": true,
-      "reversibility": "not-applicable",
-      "risk_class": "low",
-      "tool": "grabowski_reposkop_effectiveness"
-    },
-    {
       "category": "knowledge",
       "description": "Return latest healthy RepoGround publications from one catalog resolution.",
       "effects": [],
@@ -541,20 +530,6 @@
       "reversibility": "pre-effect lease compensation; terminal receipt/audit are forward-only, retry-recoverable evidence",
       "risk_class": "high",
       "tool": "grabowski_work_acquire"
-    },
-    {
-      "category": "repository-observation",
-      "description": "Run one target-bound Reposkop report and persist a deduplicated usage receipt.",
-      "effects": [
-        "repository-read",
-        "state-create"
-      ],
-      "id": "grabowski_reposkop_context",
-      "purpose": "Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt.",
-      "read_only": false,
-      "reversibility": "idempotent-create-only",
-      "risk_class": "low",
-      "tool": "grabowski_reposkop_context"
     },
     {
       "category": "operations-observability",

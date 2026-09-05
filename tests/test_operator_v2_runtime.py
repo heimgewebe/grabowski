@@ -1786,8 +1786,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 200)
-        self.assertEqual(summary["known_tool_requirements"], 201)
+        self.assertEqual(summary["registered_tool_requirements"], 198)
+        self.assertEqual(summary["known_tool_requirements"], 199)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],
@@ -1798,9 +1798,6 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         self.assertEqual(missing["grabowski_audit_query"], ["audit_read"])
         self.assertEqual(missing["grabowski_audit_trace"], ["audit_read"])
         self.assertEqual(missing["grabowski_audit_analyze"], ["audit_read"])
-        self.assertEqual(
-            missing["grabowski_reposkop_effectiveness"], ["audit_read"]
-        )
         self.assertEqual(
             missing["grabowski_checkout_binding_terminal_preview"],
             ["git_cli", "github_cli"],

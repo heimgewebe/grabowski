@@ -1232,7 +1232,6 @@ class GripFoundationTests(unittest.TestCase):
                 "repo-orient",
                 "runtime-deploy-check",
                 "runtime-refresh-lease-release",
-                "reposkop-review-classification",
                 "task-attention-decision",
                 "task-attention-reconciliation",
                 "task-closeout-archive",
@@ -2289,82 +2288,6 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["output"]["receipt_status"], "passed")
         self.assertEqual(result["output"]["decision"], "ISOLATE_AND_EXECUTE")
-
-    def test_reposkop_review_grip_runs_evidence_bound_surface(self) -> None:
-        parameters = {
-            "evaluation_id": "a" * 64,
-            "classification": "confirmed_prevention",
-            "reviewer": "operator:reviewer",
-            "scope": "technical",
-            "detectable_category": "observation_completeness",
-            "reason_codes": ["observation_incomplete"],
-            "evidence_refs": [
-                "audit-record-sha256:" + "b" * 64,
-                "audit-record-sha256:" + "f" * 64,
-            ],
-            "expected_decision_audit_ref": "audit-record-sha256:" + "b" * 64,
-            "supersedes_review_audit_ref": "",
-        }
-        output = {
-            **parameters,
-            "reviewer_sha256": "c" * 64,
-            "task_id": "task-1",
-            "final_decision": "block",
-            "review_identity_sha256": "d" * 64,
-            "review_sequence": 1,
-            "audit_ref": "audit-record-sha256:" + "e" * 64,
-            "replayed": False,
-            "source": {},
-        }
-        import grabowski_reposkop_effectiveness as effectiveness
-
-        with patch.object(
-            effectiveness,
-            "record_review_classification",
-            return_value=output,
-        ) as record:
-            result = grips.run_grip(
-                "reposkop-review-classification",
-                parameters,
-                allow_mutation=True,
-            )
-        self.assertEqual(result["status"], "passed")
-        self.assertEqual(result["output"]["review_sequence"], 1)
-        self.assertEqual(result["output"]["receipt_status"], "passed")
-        record.assert_called_once_with(parameters)
-
-    def test_reposkop_review_grip_blocks_conflicting_revision(self) -> None:
-        parameters = {
-            "evaluation_id": "a" * 64,
-            "classification": "false_positive",
-            "reviewer": "operator:reviewer",
-            "scope": "technical",
-            "detectable_category": "observation_completeness",
-            "reason_codes": ["block_not_material"],
-            "evidence_refs": [
-                "audit-record-sha256:" + "b" * 64,
-                "audit-record-sha256:" + "f" * 64,
-            ],
-            "expected_decision_audit_ref": "audit-record-sha256:" + "b" * 64,
-            "supersedes_review_audit_ref": "",
-        }
-        import grabowski_reposkop_effectiveness as effectiveness
-
-        with patch.object(
-            effectiveness,
-            "record_review_classification",
-            side_effect=effectiveness.ReposkopReviewConflictError("stale review"),
-        ):
-            result = grips.run_grip(
-                "reposkop-review-classification",
-                parameters,
-                allow_mutation=True,
-            )
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(
-            result["output"]["blocked_reasons"],
-            ["reposkop_review_conflict"],
-        )
 
     def test_task_closeout_archive_grip_runs_typed_archive_surface(self) -> None:
         parameters = {
@@ -6893,7 +6816,7 @@ class GripFoundationTests(unittest.TestCase):
         contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
         contract = json.loads(contract_path.read_text())
         self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
-        self.assertEqual(200, len(contract["expected_tools"]))
+        self.assertEqual(198, len(contract["expected_tools"]))
         self.assertIn("grabowski_operational_guidance", contract["expected_tools"])
         supporting = {
             (item["module"], item["source"])

@@ -192,7 +192,7 @@ Deliverables:
 - run deterministic checkout inventory,
 - mark retained, archived, dirty, obsolete and unknown checkouts,
 - prefer archive and recovery refs before cleanup,
-- document how a target-bound Reposkop coherence report influences, but never authorizes, cleanup.
+- document how target-bound native Git/checkout/PR observations inform, but never authorize, cleanup.
 
 Exit criteria:
 
