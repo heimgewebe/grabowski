@@ -19,8 +19,8 @@ from grabowski_blockades import BlockadeRecord, Provenance, Scope  # noqa: E402
 
 class BlockadeStorePermissionTests(unittest.TestCase):
     def test_read_succeeds_through_execute_only_parent_without_read_permission(self) -> None:
-        if not hasattr(os, "O_PATH") or not hasattr(os, "fork"):
-            self.skipTest("Linux O_PATH and fork are required by the production contract")
+        if not hasattr(os, "O_PATH"):
+            self.skipTest("Linux O_PATH is required by the production contract")
 
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)
@@ -55,6 +55,8 @@ class BlockadeStorePermissionTests(unittest.TestCase):
             probe_uid = original_uid
             probe_gid = original_gid
             use_child = original_uid == 0
+            if use_child and not hasattr(os, "fork"):
+                self.skipTest("root permission probe requires fork")
 
             def assert_probe() -> None:
                 try:
@@ -85,7 +87,7 @@ class BlockadeStorePermissionTests(unittest.TestCase):
                         temporary_root.chmod(0o711)
                         os.chown(parent, probe_uid, probe_gid)
                         os.chown(marker, probe_uid, probe_gid)
-                    except (ImportError, KeyError, PermissionError, OSError) as exc:
+                    except (ImportError, KeyError, OSError) as exc:
                         self.skipTest(
                             "cannot establish an unprivileged permission probe: "
                             f"{type(exc).__name__}: {exc}"
@@ -117,7 +119,7 @@ class BlockadeStorePermissionTests(unittest.TestCase):
                                 os.setgroups([])
                                 os.setgid(probe_gid)
                                 os.setuid(probe_uid)
-                            except (PermissionError, OSError) as exc:
+                            except OSError as exc:
                                 code = 90
                                 report(f"privilege-drop failed: {type(exc).__name__}: {exc}")
                             else:
@@ -157,14 +159,20 @@ class BlockadeStorePermissionTests(unittest.TestCase):
             finally:
                 if use_child:
                     try:
-                        if marker.exists():
-                            os.chown(marker, original_uid, original_gid)
-                        if parent.exists():
-                            os.chown(parent, original_uid, original_gid)
+                        if os.path.lexists(marker):
+                            os.chown(
+                                marker, original_uid, original_gid, follow_symlinks=False
+                            )
                     finally:
-                        if parent.exists():
-                            parent.chmod(0o700)
-                        temporary_root.chmod(0o700)
+                        try:
+                            if os.path.lexists(parent):
+                                os.chown(
+                                    parent, original_uid, original_gid, follow_symlinks=False
+                                )
+                        finally:
+                            if parent.exists():
+                                parent.chmod(0o700)
+                            temporary_root.chmod(0o700)
                 elif parent.exists():
                     parent.chmod(0o700)
 

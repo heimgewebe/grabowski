@@ -193,19 +193,36 @@ class BlockadeStoreTests(unittest.TestCase):
         )
         with (
             mock.patch.object(os, "O_PATH", None, create=True),
-            mock.patch.object(
-                blockade_store,
-                "_open_directory_chain",
-                side_effect=source_error,
-            ),
+            mock.patch.object(os, "open", side_effect=source_error),
         ):
             with self.assertRaisesRegex(PermissionError, "O_PATH is unavailable") as raised:
-                read_blockade_marker(
-                    self.marker,
-                    expected_marker_path=self.marker,
+                blockade_store._open_directory_chain(
+                    self.state,
+                    expected_uid=os.getuid(),
+                    require_private=True,
+                    label="marker parent",
+                    path_only=True,
                 )
         self.assertEqual(raised.exception.errno, errno.EACCES)
         self.assertEqual(raised.exception.filename, str(self.state))
+        self.assertIn("directory read denied", str(raised.exception))
+
+    def test_path_only_fallback_preserves_eperm(self) -> None:
+        source_error = PermissionError(errno.EPERM, "policy denied", str(self.state))
+        with (
+            mock.patch.object(os, "O_PATH", None, create=True),
+            mock.patch.object(os, "open", side_effect=source_error),
+        ):
+            with self.assertRaisesRegex(PermissionError, "policy denied") as raised:
+                blockade_store._open_directory_chain(
+                    self.state,
+                    expected_uid=os.getuid(),
+                    require_private=True,
+                    label="marker parent",
+                    path_only=True,
+                )
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+        self.assertNotIn("O_PATH", str(raised.exception))
 
     def test_read_no_o_path_preserves_policy_permission_errors(self) -> None:
         self.engage()
@@ -315,6 +332,31 @@ class BlockadeStoreTests(unittest.TestCase):
                     expected_marker_path=linked_nested_marker,
                 )
             self.assertIn(nested_error.exception.errno, {errno.ENOTDIR, errno.ELOOP})
+
+    def test_read_rejects_symlinked_marker_file(self) -> None:
+        actual_marker = self.state / "actual-marker"
+        engage_blockade_marker(
+            self.item,
+            actual_marker,
+            expected_marker_path=actual_marker,
+            transaction_id="symlink-marker-engage",
+            now=NOW,
+        )
+        linked_marker = self.state / "linked-marker"
+        linked_marker.symlink_to(actual_marker.name)
+
+        with self.assertRaises(OSError) as raised:
+            read_blockade_marker(
+                linked_marker,
+                expected_marker_path=linked_marker,
+            )
+        self.assertEqual(raised.exception.errno, errno.ELOOP)
+
+        snapshot = read_blockade_marker(
+            actual_marker,
+            expected_marker_path=actual_marker,
+        )
+        self.assertEqual(snapshot.record, self.item)
 
     def test_exact_engage_rollback_removes_only_matching_marker(self) -> None:
         receipt = self.engage()

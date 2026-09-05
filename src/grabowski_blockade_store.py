@@ -283,7 +283,7 @@ def _nofollow_flag() -> int:
     return flag
 
 
-def _directory_flags(*, path_only: bool = False) -> int:
+def _directory_open_plan(*, path_only: bool = False) -> tuple[int, bool]:
     nofollow_flag = _nofollow_flag()
     path_flag = getattr(os, "O_PATH", None) if path_only else None
     if path_flag is not None:
@@ -293,9 +293,15 @@ def _directory_flags(*, path_only: bool = False) -> int:
         flags = path_flag | os.O_DIRECTORY | os.O_CLOEXEC
     else:
         # Platforms without O_PATH retain the previous O_RDONLY behavior while
-        # still requiring the store-wide no-symlink traversal guard.
+        # still requiring the store-wide no-symlink traversal guard. This is a
+        # safe fallback, but it cannot traverse execute-only directories.
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
-    return flags | nofollow_flag
+    return flags | nofollow_flag, path_only and path_flag is None
+
+
+def _directory_flags(*, path_only: bool = False) -> int:
+    flags, _ = _directory_open_plan(path_only=path_only)
+    return flags
 
 
 def _file_flags() -> int:
@@ -315,12 +321,28 @@ def _open_directory_chain(
     path_only: bool = False,
 ) -> int:
     path = _canonical_absolute_path(path, label=label)
-    descriptor = os.open("/", _directory_flags(path_only=path_only))
+    flags, using_read_fallback = _directory_open_plan(path_only=path_only)
+
+    def open_component(component: str, *, dir_fd: int | None = None) -> int:
+        try:
+            if dir_fd is None:
+                return os.open(component, flags)
+            return os.open(component, flags, dir_fd=dir_fd)
+        except PermissionError as exc:
+            if using_read_fallback and exc.errno == errno.EACCES:
+                detail = exc.strerror or "permission denied"
+                raise PermissionError(
+                    exc.errno,
+                    f"{detail}; O_PATH is unavailable, so path-only directory "
+                    "traversal uses O_RDONLY and requires directory read permission",
+                    exc.filename,
+                ) from exc
+            raise
+
+    descriptor = open_component("/")
     try:
         for part in path.parts[1:]:
-            next_descriptor = os.open(
-                part, _directory_flags(path_only=path_only), dir_fd=descriptor
-            )
+            next_descriptor = open_component(part, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
         _assert_directory_binding(
@@ -648,26 +670,13 @@ def read_blockade_marker(
     # directories remain traversable. Mutating store paths deliberately retain
     # O_RDONLY directory descriptors because their durability contract fsyncs
     # the parent directory.
-    try:
-        parent_fd = _open_directory_chain(
-            path.parent,
-            expected_uid=uid,
-            require_private=require_private_parent,
-            label="marker parent",
-            path_only=True,
-        )
-    except PermissionError as exc:
-        if (
-            getattr(os, "O_PATH", None) is None
-            and exc.errno in {errno.EACCES, errno.EPERM}
-        ):
-            raise PermissionError(
-                exc.errno,
-                "marker parent traversal failed because O_PATH is unavailable; "
-                "the O_RDONLY fallback requires directory read permission",
-                exc.filename,
-            ) from exc
-        raise
+    parent_fd = _open_directory_chain(
+        path.parent,
+        expected_uid=uid,
+        require_private=require_private_parent,
+        label="marker parent",
+        path_only=True,
+    )
     try:
         snapshot = _snapshot_from_open_file(
             parent_fd,
