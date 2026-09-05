@@ -3883,6 +3883,9 @@ class TaskTests(unittest.TestCase):
             )
         self.assertEqual(result["task"]["resource_keys"], [])
         self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
+        self.assertEqual(result["task_effect_classification"]["effect_profile"], "read_only")
+        self.assertNotIn("read_routing_advisory", result)
+        self.assertNotIn("read_routing_advisory", result["audit"])
 
     def test_non_path_resource_does_not_disable_workspace_guard(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
