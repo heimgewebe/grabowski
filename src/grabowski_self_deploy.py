@@ -3308,6 +3308,23 @@ def grabowski_runtime_deploy_schedule(
                 f"expected {expected_head}, found {public_github_main_after}"
             )
         if automatic_source_needed:
+            inflight_before_materialization = inflight_runtime_job_evidence()
+            inflight_error = inflight_before_materialization.get("error")
+            if inflight_error:
+                raise RuntimeError(
+                    "automatic deployment source preflight could not classify "
+                    f"in-flight runtime jobs: {inflight_error}"
+                )
+            inflight_units = inflight_before_materialization.get("inflight_units")
+            if not isinstance(inflight_units, list):
+                raise RuntimeError(
+                    "automatic deployment source preflight returned malformed in-flight runtime evidence"
+                )
+            if inflight_units:
+                raise RuntimeError(
+                    "automatic deployment source refuses to materialize while a runtime job is already in flight: "
+                    + ", ".join(str(unit) for unit in inflight_units)
+                )
             (
                 repository,
                 runner,
@@ -3351,6 +3368,14 @@ def grabowski_runtime_deploy_schedule(
         )
         existing = _matching_inflight_deploy_job(command, repository)
         if existing is not None:
+            if (
+                automatic_source is not None
+                and existing.get("source_identity_sha256")
+                != source_identity["identity_sha256"]
+            ):
+                raise RuntimeError(
+                    "a different-source runtime job appeared after automatic deployment source materialization; retain the automatic source for recovery and reclassify before retry"
+                )
             observed = {
                 "timestamp_unix": int(time.time()),
                 "operation": "runtime-deploy-existing-schedule-observed",
