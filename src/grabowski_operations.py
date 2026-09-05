@@ -584,6 +584,8 @@ def _run_blockade_authority_harden_operation(
     operator._require_operator_capability("privileged_reference")
     operator._require_operator_mutation("terminal_execute", opaque_command=False)
     before = _blockade_authority_state()
+    invocation_error_type: str | None = None
+    readback_error_type: str | None = None
     if before["mode"] == blockade_authority.MARKER_DIRECTORY_MODE:
         invocation = None
         after = dict(before)
@@ -596,31 +598,47 @@ def _run_blockade_authority_harden_operation(
             "expected_record_sha256": before["record_sha256"],
             "expected_marker_file_sha256": before["marker_file_sha256"],
         }
-        invocation = privileged.run_blockade_lifecycle_reference(
-            payload,
-            justification=(
-                "Converge only the canonical root-owned Grabowski blockade "
-                "authority directory from exact historical mode 0715 to 0711; "
-                "preserve the exact blockade marker."
-            ),
-        )
-        after = _blockade_authority_state()
-        marker_unchanged = (
-            after["record_sha256"] == before["record_sha256"]
-            and after["marker_file_sha256"] == before["marker_file_sha256"]
-        )
-        if not marker_unchanged:
+        invocation = None
+        try:
+            invocation = privileged.run_blockade_lifecycle_reference(
+                payload,
+                justification=(
+                    "Converge only the canonical root-owned Grabowski blockade "
+                    "authority directory from exact historical mode 0715 to 0711; "
+                    "preserve the exact blockade marker."
+                ),
+            )
+        except Exception as exc:
+            # The helper may fail after the root effect has committed,
+            # for example while projecting its local audit. Never retry;
+            # reconcile the only authorized effect from exact readback.
+            invocation_error_type = type(exc).__name__
+        try:
+            after = _blockade_authority_state()
+        except Exception as exc:
+            after = None
+            readback_error_type = type(exc).__name__
+        if after is None:
             reconciliation = "outcome_unknown"
-            success = False
-        elif after["mode"] == blockade_authority.MARKER_DIRECTORY_MODE:
-            reconciliation = "effect_applied"
-            success = True
-        elif after["mode"] == blockade_authority.LEGACY_MARKER_DIRECTORY_MODE:
-            reconciliation = "effect_not_applied"
             success = False
         else:
-            reconciliation = "outcome_unknown"
-            success = False
+            marker_unchanged = (
+                after["record_sha256"] == before["record_sha256"]
+                and after["marker_file_sha256"]
+                == before["marker_file_sha256"]
+            )
+            if not marker_unchanged:
+                reconciliation = "outcome_unknown"
+                success = False
+            elif after["mode"] == blockade_authority.MARKER_DIRECTORY_MODE:
+                reconciliation = "effect_applied"
+                success = True
+            elif after["mode"] == blockade_authority.LEGACY_MARKER_DIRECTORY_MODE:
+                reconciliation = "effect_not_applied"
+                success = False
+            else:
+                reconciliation = "outcome_unknown"
+                success = False
 
     audit = {
         "timestamp_unix": int(time.time()),
@@ -630,9 +648,15 @@ def _run_blockade_authority_harden_operation(
         "success": success,
         "effect": plan["effect"],
         "before_mode": format(before["mode"], "04o"),
-        "after_mode": format(after["mode"], "04o"),
-        "record_sha256": after["record_sha256"],
-        "marker_file_sha256": after["marker_file_sha256"],
+        "after_mode": (
+            format(after["mode"], "04o") if isinstance(after, dict) else None
+        ),
+        "record_sha256": (
+            after.get("record_sha256") if isinstance(after, dict) else None
+        ),
+        "marker_file_sha256": (
+            after.get("marker_file_sha256") if isinstance(after, dict) else None
+        ),
         "reconciliation": reconciliation,
         "root_request_id": (
             invocation.get("request_id") if isinstance(invocation, dict) else None
@@ -645,6 +669,8 @@ def _run_blockade_authority_harden_operation(
         "root_outcome": (
             invocation.get("outcome") if isinstance(invocation, dict) else None
         ),
+        "root_invocation_error_type": invocation_error_type,
+        "post_readback_error_type": readback_error_type,
     }
     try:
         base._append_audit(audit)
@@ -662,6 +688,8 @@ def _run_blockade_authority_harden_operation(
         "before": before,
         "after": after,
         "root_invocation": invocation,
+        "root_invocation_error_type": invocation_error_type,
+        "post_readback_error_type": readback_error_type,
         "rollback": {
             "attempted": False,
             "success": True,

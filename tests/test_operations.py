@@ -257,6 +257,77 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertFalse(result["retry_performed"])
         lifecycle.assert_called_once()
 
+    def test_blockade_authority_harden_helper_exception_reconciles_applied_effect(self) -> None:
+        before = {
+            "directory_path": "/var/lib/grabowski/operator-blockade",
+            "mode": operations.blockade_authority.LEGACY_MARKER_DIRECTORY_MODE,
+            "uid": 0,
+            "gid": 0,
+            "record_sha256": "a" * 64,
+            "marker_file_sha256": "b" * 64,
+        }
+        after = {
+            **before,
+            "mode": operations.blockade_authority.MARKER_DIRECTORY_MODE,
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations, "_blockade_authority_state", side_effect=[before, after]
+        ), patch.object(
+            operations.privileged,
+            "run_blockade_lifecycle_reference",
+            side_effect=RuntimeError("local audit projection failed"),
+        ) as lifecycle, patch.object(operations.base, "_append_audit"):
+            result = operations._run_blockade_authority_harden_operation(None)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["reconciliation"], "effect_applied")
+        self.assertIsNone(result["root_invocation"])
+        self.assertEqual(result["root_invocation_error_type"], "RuntimeError")
+        self.assertIsNone(result["post_readback_error_type"])
+        self.assertFalse(result["retry_performed"])
+        lifecycle.assert_called_once()
+
+    def test_blockade_authority_harden_readback_failure_is_structured_unknown(self) -> None:
+        before = {
+            "directory_path": "/var/lib/grabowski/operator-blockade",
+            "mode": operations.blockade_authority.LEGACY_MARKER_DIRECTORY_MODE,
+            "uid": 0,
+            "gid": 0,
+            "record_sha256": "a" * 64,
+            "marker_file_sha256": "b" * 64,
+        }
+        invocation = {
+            "success": False,
+            "outcome": "unknown",
+            "request_id": "c" * 32,
+            "reference_sha256": "d" * 64,
+            "lifecycle": None,
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations,
+            "_blockade_authority_state",
+            side_effect=[before, PermissionError("readback unavailable")],
+        ), patch.object(
+            operations.privileged,
+            "run_blockade_lifecycle_reference",
+            return_value=invocation,
+        ) as lifecycle, patch.object(operations.base, "_append_audit"):
+            result = operations._run_blockade_authority_harden_operation(None)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["reconciliation"], "outcome_unknown")
+        self.assertIsNone(result["after"])
+        self.assertIsNone(result["root_invocation_error_type"])
+        self.assertEqual(result["post_readback_error_type"], "PermissionError")
+        self.assertFalse(result["retry_performed"])
+        lifecycle.assert_called_once()
+
     def test_blockade_authority_harden_already_0711_is_readback_only(self) -> None:
         state = {
             "directory_path": "/var/lib/grabowski/operator-blockade",
