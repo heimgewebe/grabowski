@@ -67,7 +67,14 @@ PROCESS_OBSERVER_ACTION = "observe_process_references"
 BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
+LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
 LOCAL_BACKUP_NTFS_DEVICE = "/dev/disk/by-uuid/249180DA265E8DE0"
+LOCAL_BACKUP_SMART_DEVICE = "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0"
+LOCAL_BACKUP_STORAGE_ACTIONS = (
+    LOCAL_BACKUP_NTFS_CHECK_ACTION,
+    LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION,
+    LOCAL_BACKUP_SMART_READ_ACTION,
+)
 AUTOMATIC_CUTOVER_BIND_PATHS = (
     "/home/alex/repos/grabowski",
 )
@@ -1552,8 +1559,16 @@ def _local_backup_ntfs_actions_from_repository(
     if not isinstance(actions, dict):
         raise CutoverError("example privileged action catalog is malformed")
     specs = {
-        LOCAL_BACKUP_NTFS_CHECK_ACTION: ("check", "-n"),
-        LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION: ("clear-dirty", "-d"),
+        LOCAL_BACKUP_NTFS_CHECK_ACTION: (
+            "check", ["/usr/bin/ntfsfix", "-n", LOCAL_BACKUP_NTFS_DEVICE]
+        ),
+        LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION: (
+            "clear-dirty", ["/usr/bin/ntfsfix", "-d", LOCAL_BACKUP_NTFS_DEVICE]
+        ),
+        LOCAL_BACKUP_SMART_READ_ACTION: (
+            "smart-read",
+            ["/usr/sbin/smartctl", "-d", "sat", "-a", LOCAL_BACKUP_SMART_DEVICE],
+        ),
     }
     result: dict[str, dict[str, Any]] = {}
     required = {
@@ -1561,7 +1576,7 @@ def _local_backup_ntfs_actions_from_repository(
         "kill_switch_path", "legacy_kill_switch_path",
         "allowed_peer_uid", "allowed_peer_unit",
     }
-    for name, (target_pattern, flag) in specs.items():
+    for name, (target_pattern, expected_argv) in specs.items():
         action = actions.get(name)
         if not isinstance(action, dict) or set(action) != required:
             raise CutoverError(f"{name} action contract is invalid")
@@ -1569,7 +1584,7 @@ def _local_backup_ntfs_actions_from_repository(
             raise CutoverError(f"{name} must be an enabled template")
         if action.get("target_pattern") != target_pattern:
             raise CutoverError(f"{name} target pattern is invalid")
-        if action.get("argv") != ["/usr/bin/ntfsfix", flag, LOCAL_BACKUP_NTFS_DEVICE]:
+        if action.get("argv") != expected_argv:
             raise CutoverError(f"{name} argv is invalid")
         if action.get("timeout_seconds") != 120:
             raise CutoverError(f"{name} timeout is invalid")
@@ -1698,10 +1713,10 @@ def merge_privileged_config(
 
     local_backup_ntfs_before: dict[str, Any] = {}
     if local_backup_ntfs_actions is not None:
-        for name in (LOCAL_BACKUP_NTFS_CHECK_ACTION, LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION):
+        for name in LOCAL_BACKUP_STORAGE_ACTIONS:
             action = local_backup_ntfs_actions.get(name)
             if not isinstance(action, dict):
-                raise CutoverError("local BACKUP NTFS action set is incomplete")
+                raise CutoverError("local BACKUP storage action set is incomplete")
             before = actions.get(name)
             local_backup_ntfs_before[name] = before
             if not allow_controlled_updates and before is not None and before != action:
@@ -1907,19 +1922,23 @@ def _operator_authority_attestation(
     lifecycle = actions.get(BLOCKADE_LIFECYCLE_ACTION)
     service_control = actions.get(OPERATOR_SERVICE_CONTROL_ACTION)
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
-    local_backup_ntfs_check = actions.get(LOCAL_BACKUP_NTFS_CHECK_ACTION)
-    local_backup_ntfs_clear_dirty = actions.get(LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION)
+    local_backup_storage = {
+        name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
+    }
     if not all(
         isinstance(item, dict)
         for item in (power, lifecycle, service_control, rootbroker_cutover)
     ):
         raise CutoverError("operator authority attestation actions are incomplete")
-    if (local_backup_ntfs_check is None) != (local_backup_ntfs_clear_dirty is None):
-        raise CutoverError("operator authority attestation BACKUP NTFS actions are incomplete")
-    if local_backup_ntfs_check is not None and not isinstance(local_backup_ntfs_check, dict):
-        raise CutoverError("operator authority attestation BACKUP NTFS check is invalid")
-    if local_backup_ntfs_clear_dirty is not None and not isinstance(local_backup_ntfs_clear_dirty, dict):
-        raise CutoverError("operator authority attestation BACKUP NTFS clear-dirty is invalid")
+    present_backup_storage = {
+        name: action
+        for name, action in local_backup_storage.items()
+        if action is not None
+    }
+    if present_backup_storage and set(present_backup_storage) != set(LOCAL_BACKUP_STORAGE_ACTIONS):
+        raise CutoverError("operator authority attestation BACKUP storage actions are incomplete")
+    if any(not isinstance(action, dict) for action in present_backup_storage.values()):
+        raise CutoverError("operator authority attestation BACKUP storage action is invalid")
     assert isinstance(power, dict)
     assert isinstance(lifecycle, dict)
     assert isinstance(service_control, dict)
@@ -1954,19 +1973,11 @@ def _operator_authority_attestation(
             ROOTBROKER_CUTOVER_ACTION: _sha256(
                 _canonical_json(rootbroker_cutover)
             ),
-            **(
-                {
-                    LOCAL_BACKUP_NTFS_CHECK_ACTION: _sha256(
-                        _canonical_json(local_backup_ntfs_check)
-                    ),
-                    LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION: _sha256(
-                        _canonical_json(local_backup_ntfs_clear_dirty)
-                    ),
-                }
-                if isinstance(local_backup_ntfs_check, dict)
-                and isinstance(local_backup_ntfs_clear_dirty, dict)
-                else {}
-            ),
+            **{
+                name: _sha256(_canonical_json(action))
+                for name, action in sorted(present_backup_storage.items())
+                if isinstance(action, dict)
+            },
         },
         "power_peer_binding": peer_binding,
         "operator_system_unit": {

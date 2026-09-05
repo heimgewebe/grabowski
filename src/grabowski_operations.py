@@ -34,21 +34,31 @@ PHASES = {"preflight": 0, "action": 1, "postflight": 2, "rollback": 3}
 FLEET_MUTATION_OPERATION = "fleet-registry-mutate"
 BACKUP_NTFS_CHECK_OPERATION = "backup-ntfs-check"
 BACKUP_NTFS_CLEAR_DIRTY_OPERATION = "backup-ntfs-clear-dirty"
-BACKUP_NTFS_TYPED_OPERATIONS = {
+BACKUP_SMART_READ_OPERATION = "backup-smart-read"
+BACKUP_STORAGE_TYPED_OPERATIONS = {
     BACKUP_NTFS_CHECK_OPERATION: {
         "description": "Run the fixed root-read-only ntfsfix check for the configured BACKUP volume.",
         "action": "local_backup_ntfs_check",
         "target": "check",
         "effect": "read_only",
+        "parameters": (),
     },
     BACKUP_NTFS_CLEAR_DIRTY_OPERATION: {
-        "description": "Clear only the dirty flag on the fixed configured BACKUP volume after separate check evidence.",
+        "description": "Run the fixed ntfsfix -d repair/clear-dirty path on the configured BACKUP volume after an exact successful check.",
         "action": "local_backup_ntfs_clear_dirty",
         "target": "clear-dirty",
-        "effect": "filesystem_metadata_write",
+        "effect": "filesystem_repair_write",
+        "parameters": ("check_response_sha256",),
+    },
+    BACKUP_SMART_READ_OPERATION: {
+        "description": "Read SMART data from the fixed configured BACKUP disk through the exact SAT/by-id rootbroker action.",
+        "action": "local_backup_smart_read",
+        "target": "smart-read",
+        "effect": "read_only",
+        "parameters": (),
     },
 }
-RESERVED_TYPED_OPERATIONS = frozenset({FLEET_MUTATION_OPERATION, *BACKUP_NTFS_TYPED_OPERATIONS})
+RESERVED_TYPED_OPERATIONS = frozenset({FLEET_MUTATION_OPERATION, *BACKUP_STORAGE_TYPED_OPERATIONS})
 BACKUP_NTFS_CHECK_EVIDENCE_TTL_SECONDS = 600
 _BACKUP_NTFS_LAST_CHECK: dict[str, Any] | None = None
 
@@ -200,22 +210,19 @@ def _append_fleet_mutation_audit(audit: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
-def _backup_ntfs_operation_plan(
+def _backup_storage_operation_plan(
     operation: str, parameters: dict[str, str] | None
 ) -> dict[str, Any]:
-    if operation not in BACKUP_NTFS_TYPED_OPERATIONS:
-        raise ValueError(f"Unknown typed BACKUP NTFS operation: {operation}")
+    if operation not in BACKUP_STORAGE_TYPED_OPERATIONS:
+        raise ValueError(f"Unknown typed BACKUP storage operation: {operation}")
     supplied = parameters or {}
     if not isinstance(supplied, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
         for key, value in supplied.items()
     ):
         raise ValueError("parameters must be an object of strings")
-    expected_parameters = (
-        set()
-        if operation == BACKUP_NTFS_CHECK_OPERATION
-        else {"check_response_sha256"}
-    )
+    spec = BACKUP_STORAGE_TYPED_OPERATIONS[operation]
+    expected_parameters = set(spec["parameters"])
     if set(supplied) != expected_parameters:
         raise ValueError(
             f"Operation {operation} parameter mismatch; "
@@ -224,7 +231,6 @@ def _backup_ntfs_operation_plan(
         )
     if supplied and re.fullmatch(r"[0-9a-f]{64}", supplied["check_response_sha256"]) is None:
         raise ValueError("check_response_sha256 is invalid")
-    spec = BACKUP_NTFS_TYPED_OPERATIONS[operation]
     return {
         "name": operation,
         "description": spec["description"],
@@ -235,7 +241,7 @@ def _backup_ntfs_operation_plan(
         "privileged_action": spec["action"],
         "target": spec["target"],
         "effect": spec["effect"],
-        "rollback": "none; the check is read-only and clear-dirty is separately operator-gated",
+        "rollback": "none; read-only diagnostics have no rollback and NTFS repair is separately operator-gated",
     }
 
 
@@ -244,12 +250,12 @@ def _invoke_mainpid_privileged_action(
 ) -> dict[str, Any]:
     allowed = {
         (str(spec["action"]), str(spec["target"]))
-        for spec in BACKUP_NTFS_TYPED_OPERATIONS.values()
+        for spec in BACKUP_STORAGE_TYPED_OPERATIONS.values()
     }
     if (action, target) not in allowed:
-        raise ValueError("MainPID privileged action is outside the BACKUP NTFS allowlist")
+        raise ValueError("MainPID privileged action is outside the BACKUP storage allowlist")
     if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 120:
-        raise ValueError("BACKUP NTFS privileged timeout is invalid")
+        raise ValueError("BACKUP storage privileged timeout is invalid")
     broker = privileged._privileged_broker_status()
     if not broker.get("ready"):
         raise PermissionError("privileged broker is not ready")
@@ -359,6 +365,22 @@ def _root_audit_sha256(invocation: dict[str, Any]) -> str | None:
         or audit.get("peer_unit") != "grabowski-operator.service"
     ):
         return None
+    if invocation.get("action") == "local_backup_smart_read":
+        stdout = response.get("stdout")
+        stderr = response.get("stderr")
+        if not isinstance(stdout, str) or not isinstance(stderr, str):
+            return None
+        stdout_bytes = stdout.encode("utf-8")
+        stderr_bytes = stderr.encode("utf-8")
+        if (
+            audit.get("stdout_truncated") is not False
+            or audit.get("stderr_truncated") is not False
+            or audit.get("smart_stdout_sha256") != hashlib.sha256(stdout_bytes).hexdigest()
+            or audit.get("smart_stdout_bytes") != len(stdout_bytes)
+            or audit.get("smart_stderr_sha256") != hashlib.sha256(stderr_bytes).hexdigest()
+            or audit.get("smart_stderr_bytes") != len(stderr_bytes)
+        ):
+            return None
     return _hash(audit)
 
 
@@ -373,6 +395,12 @@ def _record_backup_ntfs_check_evidence(invocation: dict[str, Any]) -> dict[str, 
         "response_sha256": invocation["response_sha256"],
         "reference_sha256": invocation["reference_sha256"],
         "root_audit_sha256": audit_sha256,
+        "write_admissible": invocation.get("success") is True,
+        "check_returncode": (
+            invocation["broker_response"].get("returncode")
+            if isinstance(invocation.get("broker_response"), dict)
+            else None
+        ),
     }
     _BACKUP_NTFS_LAST_CHECK = dict(evidence)
     return evidence
@@ -386,6 +414,8 @@ def _consume_backup_ntfs_check_evidence(parameters: dict[str, str] | None) -> di
     _BACKUP_NTFS_LAST_CHECK = None
     if not isinstance(evidence, dict) or expected != evidence.get("response_sha256"):
         raise PermissionError("clear-dirty requires the exact latest BACKUP NTFS check evidence")
+    if evidence.get("write_admissible") is not True:
+        raise PermissionError("BACKUP NTFS check did not authorize repair write")
     checked_at = evidence.get("checked_at_unix")
     now = int(time.time())
     if (
@@ -398,10 +428,10 @@ def _consume_backup_ntfs_check_evidence(parameters: dict[str, str] | None) -> di
     return evidence
 
 
-def _run_backup_ntfs_operation(
+def _run_backup_storage_operation(
     operation: str, parameters: dict[str, str] | None
 ) -> dict[str, Any]:
-    plan = _backup_ntfs_operation_plan(operation, parameters)
+    plan = _backup_storage_operation_plan(operation, parameters)
     consumed_check_evidence = (
         _consume_backup_ntfs_check_evidence(parameters)
         if operation == BACKUP_NTFS_CLEAR_DIRTY_OPERATION
@@ -409,11 +439,12 @@ def _run_backup_ntfs_operation(
     )
     operator._require_operator_capability("privileged_reference")
     operator._require_operator_mutation("terminal_execute", opaque_command=False)
-    justification = (
-        "Root-read-only ntfsfix check for the exact configured BACKUP volume before any filesystem metadata mutation."
-        if operation == BACKUP_NTFS_CHECK_OPERATION
-        else "Clear only the NTFS dirty flag on the exact configured BACKUP volume after separate root check evidence; no force mount."
-    )
+    if operation == BACKUP_NTFS_CHECK_OPERATION:
+        justification = "Root-read-only ntfsfix check for the exact configured BACKUP volume before any filesystem metadata mutation."
+    elif operation == BACKUP_NTFS_CLEAR_DIRTY_OPERATION:
+        justification = "Run the fixed ntfsfix -d repair/clear-dirty path on the exact configured BACKUP volume after an exact successful root check; no force mount."
+    else:
+        justification = "Root-read-only SMART diagnostic for the exact configured BACKUP disk through the fixed SAT/by-id action; no caller-selected device or flags."
     invocation = _invoke_mainpid_privileged_action(
         action=str(plan["privileged_action"]),
         target=str(plan["target"]),
@@ -560,14 +591,10 @@ def grabowski_operation_list() -> dict[str, Any]:
         "step_count": 1,
         "typed_builtin": True,
     }
-    for name, spec in BACKUP_NTFS_TYPED_OPERATIONS.items():
+    for name, spec in BACKUP_STORAGE_TYPED_OPERATIONS.items():
         operations[name] = {
             "description": spec["description"],
-            "parameters": (
-                []
-                if name == BACKUP_NTFS_CHECK_OPERATION
-                else ["check_response_sha256"]
-            ),
+            "parameters": list(spec["parameters"]),
             "step_count": 1,
             "typed_builtin": True,
             "effect": spec["effect"],
@@ -582,8 +609,8 @@ def grabowski_operation_plan(operation: str,
     operator._require_operator_capability("terminal_execute")
     if operation == FLEET_MUTATION_OPERATION:
         return fleet_mutation.plan_registry_mutation(parameters)["public"]
-    if operation in BACKUP_NTFS_TYPED_OPERATIONS:
-        return _backup_ntfs_operation_plan(operation, parameters)
+    if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
+        return _backup_storage_operation_plan(operation, parameters)
     return _render(operation, parameters)
 
 
@@ -593,8 +620,8 @@ def grabowski_operation_run(operation: str,
     """Run preflight, action and postflight, then rollback after a failure."""
     if operation == FLEET_MUTATION_OPERATION:
         return _run_fleet_registry_mutation(parameters)
-    if operation in BACKUP_NTFS_TYPED_OPERATIONS:
-        return _run_backup_ntfs_operation(operation, parameters)
+    if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
+        return _run_backup_storage_operation(operation, parameters)
     plan = _render(operation, parameters)
     for target in sorted({step["target"] for step in plan["steps"]}):
         operator._require_operator_mutation(

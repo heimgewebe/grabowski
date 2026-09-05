@@ -191,8 +191,20 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "target_pattern": "clear-dirty",
             "argv": ["/usr/bin/ntfsfix", "-d", "/dev/disk/by-uuid/249180DA265E8DE0"],
         }
+        smart = {
+            **check,
+            "target_pattern": "smart-read",
+            "argv": [
+                "/usr/sbin/smartctl",
+                "-d",
+                "sat",
+                "-a",
+                "/dev/disk/by-id/usb-Freecom_Freecom_Mobile_Drive_XXS_3.0_93300000078D-0:0",
+            ],
+        }
         actions[dual.LOCAL_BACKUP_NTFS_CHECK_ACTION] = check
         actions[dual.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION] = clear_dirty
+        actions[dual.LOCAL_BACKUP_SMART_READ_ACTION] = smart
         blobs[config_path] = (json.dumps(config, sort_keys=True) + "\n").encode("utf-8")
         action_sha256 = attestation["action_sha256"]
         assert isinstance(action_sha256, dict)
@@ -200,6 +212,7 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
         action_sha256[dual.LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION] = (
             dual._canonical_line_sha256(clear_dirty)
         )
+        action_sha256[dual.LOCAL_BACKUP_SMART_READ_ACTION] = dual._canonical_line_sha256(smart)
         unsigned = dict(attestation)
         unsigned.pop("attestation_sha256", None)
         attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
@@ -236,16 +249,16 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             ),
             mock.patch.object(dual.core, "git_show", side_effect=lambda _repo, _head, path: blobs[path]),
         ):
-            with self.assertRaisesRegex(core.DeployError, "unvollständigen BACKUP-NTFS"):
+            with self.assertRaisesRegex(core.DeployError, "unvollständigen BACKUP-Storage"):
                 dual.require_operator_authority_anchored(
                     ROOT, self.HEAD, path=Path("/ignored")
                 )
 
-    def test_backup_ntfs_attestation_digest_drift_is_rejected(self) -> None:
+    def test_backup_smart_attestation_digest_drift_is_rejected(self) -> None:
         attestation, blobs = self._fixture_with_backup_ntfs()
         action_sha256 = attestation["action_sha256"]
         assert isinstance(action_sha256, dict)
-        action_sha256[dual.LOCAL_BACKUP_NTFS_CHECK_ACTION] = "f" * 64
+        action_sha256[dual.LOCAL_BACKUP_SMART_READ_ACTION] = "f" * 64
         unsigned = dict(attestation)
         unsigned.pop("attestation_sha256", None)
         attestation["attestation_sha256"] = dual._canonical_line_sha256(unsigned)
