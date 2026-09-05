@@ -25,6 +25,7 @@ from grabowski_blockade_store import (
 
 MARKER_MODE = 0o644
 MARKER_DIRECTORY_MODE = 0o711
+LEGACY_MARKER_DIRECTORY_MODE = 0o715
 QUARANTINE_DIRECTORY_MODE = 0o700
 MAX_TARGET_BYTES = 48 * 1024
 
@@ -193,6 +194,7 @@ def resolve_lifecycle(
         "rollback-engage",
         "restore-disarm",
         "observe",
+        "harden-authority",
     }:
         raise PermissionError("blockade lifecycle operation is not enabled")
     base = _base_execution(candidate, operation)
@@ -252,7 +254,7 @@ def resolve_lifecycle(
             "recovery_gate": recovery_gate_validator(candidate["recovery_gate"]),
         }
 
-    if operation in {"migrate", "rollback-engage", "observe"}:
+    if operation in {"migrate", "rollback-engage", "observe", "harden-authority"}:
         expected = {
             "operation",
             "expected_record_sha256",
@@ -329,6 +331,90 @@ def _validate_snapshot(execution: dict[str, Any], snapshot: MarkerSnapshot) -> N
         raise PermissionError("marker changed before lifecycle operation")
 
 
+def _harden_authority_directory(
+    execution: dict[str, Any],
+    *,
+    marker: Path,
+    uid: int,
+) -> dict[str, Any]:
+    """Converge only the historical 0715 authority directory to 0711."""
+    path = marker.parent
+    parent = path.parent
+    parent_metadata = parent.lstat()
+    if parent.is_symlink() or not stat.S_ISDIR(parent_metadata.st_mode):
+        raise PermissionError("authority directory parent is unsafe")
+    if parent_metadata.st_uid != uid or parent_metadata.st_mode & 0o022:
+        raise PermissionError("authority directory parent is not authority-owned")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        visible_before = path.lstat()
+        expected_gid = 0 if uid == 0 else os.getegid()
+        before_mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != uid
+            or before.st_gid != expected_gid
+            or before.st_mode & 0o022
+            or (before.st_dev, before.st_ino)
+            != (visible_before.st_dev, visible_before.st_ino)
+        ):
+            raise PermissionError("authority directory ownership or identity is invalid")
+        if before_mode not in {
+            LEGACY_MARKER_DIRECTORY_MODE,
+            MARKER_DIRECTORY_MODE,
+        }:
+            raise PermissionError("authority directory preimage mode is invalid")
+
+        marker_before = read_authority_marker(marker, authority_uid=uid)
+        _validate_snapshot(execution, marker_before)
+        changed = before_mode == LEGACY_MARKER_DIRECTORY_MODE
+        if changed:
+            os.fchmod(descriptor, MARKER_DIRECTORY_MODE)
+            os.fsync(descriptor)
+            _fsync_directory(parent)
+
+        after = os.fstat(descriptor)
+        visible_after = path.lstat()
+        if (
+            not stat.S_ISDIR(after.st_mode)
+            or after.st_uid != uid
+            or after.st_gid != expected_gid
+            or stat.S_IMODE(after.st_mode) != MARKER_DIRECTORY_MODE
+            or after.st_mode & 0o022
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+            or (after.st_dev, after.st_ino)
+            != (visible_after.st_dev, visible_after.st_ino)
+        ):
+            raise PermissionError("authority directory hardening readback failed")
+    finally:
+        os.close(descriptor)
+
+    marker_after = read_authority_marker(marker, authority_uid=uid)
+    _validate_snapshot(execution, marker_after)
+    receipt = {
+        "schema_version": 1,
+        "kind": "grabowski_blockade_authority_hardening_receipt",
+        "transaction_id": execution["transaction_id"],
+        "directory_path": str(path),
+        "before_mode": format(before_mode, "04o"),
+        "after_mode": format(MARKER_DIRECTORY_MODE, "04o"),
+        "uid": uid,
+        "gid": expected_gid,
+        "changed": changed,
+        "record_sha256": marker_after.record_sha256,
+        "marker_file_sha256": marker_after.file_sha256,
+    }
+    return {
+        "operation": "harden-authority",
+        "receipt": receipt,
+        "receipt_sha256": hashlib.sha256(canonical_json(receipt)).hexdigest(),
+    }
+
+
 def execute_lifecycle(execution: dict[str, Any]) -> dict[str, Any]:
     uid = int(execution["authority_uid"])
     if os.geteuid() != uid:
@@ -336,13 +422,20 @@ def execute_lifecycle(execution: dict[str, Any]) -> dict[str, Any]:
     marker = Path(execution["marker_path"])
     legacy = Path(execution["legacy_marker_path"])
     quarantine = Path(execution["quarantine_root"])
+    operation = execution["operation"]
+
+    # This one-time migration must run before the ordinary 0711 invariant
+    # check because its exact purpose is to close the historical 0715 pre-state.
+    # It never creates, removes or rewrites a blockade marker.
+    if operation == "harden-authority":
+        return _harden_authority_directory(execution, marker=marker, uid=uid)
+
     _ensure_authority_directory(
         marker.parent, uid=uid, mode=MARKER_DIRECTORY_MODE
     )
     _ensure_authority_directory(
         quarantine, uid=uid, mode=QUARANTINE_DIRECTORY_MODE
     )
-    operation = execution["operation"]
 
     if operation == "engage":
         if legacy.exists() or legacy.is_symlink():
