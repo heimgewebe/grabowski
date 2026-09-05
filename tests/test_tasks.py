@@ -4183,13 +4183,15 @@ class TaskTests(unittest.TestCase):
         self.assertNotIn("read_routing_advisory", result)
         self.assertNotIn("read_routing_advisory", result["audit"])
 
-    def test_explicit_read_only_bounded_direct_task_reports_synchronous_route(self) -> None:
+    def test_explicit_read_only_bounded_direct_task_reroutes_before_persistence(self) -> None:
         argv = ["git", "status", "--short"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks.operator, "_guard_git"), patch.object(
             tasks, "_dispatch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ) as dispatch_mock, patch.object(tasks.base, "_append_audit") as audit_mock, patch.object(
+            tasks.resources, "acquire_resources"
+        ) as acquire_mock, patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 154}
         ):
             result = tasks.grabowski_task_start(
@@ -4219,15 +4221,34 @@ class TaskTests(unittest.TestCase):
                 "authority": "grabowski_git_guard",
             },
         )
+        self.assertIsNone(result["task"])
+        reroute = result["read_routing_reroute"]
+        self.assertEqual(reroute["status"], "not_started")
+        self.assertEqual(reroute["recommended_route"], "grabowski_git")
+        self.assertIs(reroute["no_task_record_created"], True)
+        self.assertIs(reroute["no_process_started"], True)
+        self.assertIs(reroute["no_resource_lease_acquired"], True)
+        self.assertIs(reroute["automatic_route_execution"], False)
         self.assertEqual(result["audit"]["read_routing_advisory"], advisory)
+        self.assertEqual(
+            result["audit"]["operation"],
+            "task-start-rerouted-before-persistence",
+        )
+        dispatch_mock.assert_not_called()
+        acquire_mock.assert_not_called()
+        self.assertEqual(audit_mock.call_count, 1)
+        with tasks._database_connection() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertEqual(list(self.output_root.iterdir()), [])
 
-    def test_explicit_read_only_default_resume_policy_still_reports_bounded_sync_route(self) -> None:
+    def test_explicit_read_only_default_resume_policy_reroutes_before_persistence(self) -> None:
         argv = ["git", "status", "--short"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks.operator, "_guard_git"), patch.object(
             tasks, "_dispatch", return_value=_launcher()
-        ), patch.object(tasks.base, "_append_audit"), patch.object(
+        ) as dispatch_mock, patch.object(tasks.base, "_append_audit"), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
         ):
             result = tasks.grabowski_task_start(
@@ -4244,6 +4265,12 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(advisory["resume_policy"], "verify-then-retry")
         self.assertIs(advisory["default_verify_then_retry_is_advisory_only"], True)
         self.assertEqual(advisory["durable_signals"], [])
+        self.assertIsNone(result["task"])
+        self.assertEqual(
+            result["read_routing_reroute"]["recommended_route"],
+            "grabowski_git",
+        )
+        dispatch_mock.assert_not_called()
 
     def test_explicit_read_only_manual_resume_keeps_durable_route(self) -> None:
         argv = ["git", "status", "--short"]
@@ -4267,6 +4294,33 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(advisory["classification"], "durable_read_justified")
         self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
         self.assertEqual(advisory["durable_signals"], ["resume_policy:manual"])
+
+    def test_explicit_read_only_recovery_required_keeps_durable_route(self) -> None:
+        argv = ["git", "status", "--short"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks.operator, "_guard_git"), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch_mock, patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks,
+            "_require_recovery_gate",
+            return_value={"required": True, "checked_at_unix": 161},
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=30,
+                resume_policy="never",
+                effect_profile="read_only",
+            )
+
+        advisory = result["read_routing_advisory"]
+        self.assertEqual(advisory["classification"], "durable_read_justified")
+        self.assertEqual(advisory["recommended_route"], "grabowski_task_start")
+        self.assertIn("recovery_gate_required", advisory["durable_signals"])
+        self.assertIsNotNone(result["task"])
+        dispatch_mock.assert_called_once()
 
     def test_explicit_read_only_long_direct_task_reports_synchronous_first_candidate(self) -> None:
         argv = ["git", "status", "--short"]

@@ -4157,6 +4157,9 @@ def _task_read_routing_advisory(
     task_resources: list[str],
     chronik_enabled: bool,
     operation_identity: dict[str, Any] | None,
+    route_evidence_present: bool,
+    retry_context_present: bool,
+    recovery_required: bool,
     classification: dict[str, Any],
 ) -> dict[str, Any]:
     if (
@@ -4191,6 +4194,12 @@ def _task_read_routing_advisory(
         durable_signals.append("chronik_outbox_requested")
     if operation_identity is not None:
         durable_signals.append("operation_identity_requested")
+    if route_evidence_present:
+        durable_signals.append("route_evidence_requested")
+    if retry_context_present:
+        durable_signals.append("retry_context_requested")
+    if recovery_required:
+        durable_signals.append("recovery_gate_required")
     if resume_policy in {"manual", "retry-safe"}:
         durable_signals.append(f"resume_policy:{resume_policy}")
     if shape.get("allowed") is not True:
@@ -8268,14 +8277,16 @@ def grabowski_task_start(
     task-owned broad repository lease carries a complete whole-repository scope manifest.
     An exact already-active execution identity is reused instead of launching
     another process, even when no explicit operation identity was supplied. For
-    short effect-free direct reads, prefer an existing typed read surface. The
-    first server-verified advisory cohort is guarded local Git reads, which
-    route to grabowski_git. Other direct commands remain durable unless a
-    server-owned read classifier proves their effect boundary. Persistent tasks
-    also remain the route for durable lifecycle/resume/leases, shell or indirect
-    execution, larger output, or runtime beyond the synchronous envelope.
-    Explicit non-agent effect_profile=read_only starts emit an advisory, but
-    caller-supplied effect labels never establish read safety on their own.
+    short effect-free direct reads, prefer an existing typed read surface. A
+    server-verified local Git read classified as avoidable_bounded_read returns
+    before task persistence with a structured reroute to grabowski_git; task_start
+    never executes that typed read on the caller's behalf. Other direct commands
+    remain durable unless a server-owned read classifier proves their effect
+    boundary. Persistent tasks also remain the route for durable lifecycle/resume/
+    leases, shell or indirect execution, larger output, or runtime beyond the
+    synchronous envelope. Explicit non-agent effect_profile=read_only starts that
+    still require durable execution emit an advisory, but caller-supplied effect
+    labels never establish read safety on their own.
     """
     target = fleet.fleet_host(host)
     executor_request: dict[str, str] | None = None
@@ -8728,6 +8739,9 @@ def grabowski_task_start(
             task_resources=task_resources,
             chronik_enabled=bool(chronik_enabled),
             operation_identity=normalized_operation_identity,
+            route_evidence_present=normalized_route_evidence is not None,
+            retry_context_present=_retry_context is not None,
+            recovery_required=bool(recovery_gate.get("required", False)),
             classification=task_effect_classification,
         )
         if (
@@ -8736,6 +8750,74 @@ def grabowski_task_start(
         )
         else None
     )
+    if (
+        read_routing_advisory is not None
+        and read_routing_advisory.get("classification") == "avoidable_bounded_read"
+    ):
+        reroute_material = {
+            "schema_version": 1,
+            "kind": "grabowski_task_pre_dispatch_read_reroute",
+            "status": "not_started",
+            "classification": "avoidable_bounded_read",
+            "reason": "server_verified_bounded_read_has_typed_route",
+            "recommended_route": read_routing_advisory["recommended_route"],
+            "argv_sha256": argv_sha256,
+            "execution_identity_sha256": execution_identity["identity_sha256"],
+            "no_task_record_created": True,
+            "no_process_started": True,
+            "no_resource_lease_acquired": True,
+            "automatic_route_execution": False,
+            "does_not_establish": [
+                "result_of_recommended_read",
+                "automatic_execution_of_recommended_route",
+                "future_synchronous_read_success",
+                "permission_to_drop_later_durable_signals",
+            ],
+        }
+        read_routing_reroute = {
+            **reroute_material,
+            "reroute_sha256": _sha256_json(reroute_material),
+        }
+        reroute_audit = {
+            "timestamp_unix": _now(),
+            "operation": "task-start-rerouted-before-persistence",
+            "host": host,
+            "transport": target["transport"],
+            "argv_sha256": argv_sha256,
+            "execution_identity_sha256": execution_identity["identity_sha256"],
+            "resource_keys": task_resources,
+            "requested_resource_keys": requested_resources,
+            "recovery_required": bool(recovery_gate.get("required", False)),
+            "read_routing_advisory": read_routing_advisory,
+            "read_routing_reroute_sha256": read_routing_reroute["reroute_sha256"],
+            "recommended_route": read_routing_reroute["recommended_route"],
+            "effect_profile": task_effect_classification["effect_profile"],
+            "classification_source": task_effect_classification[
+                "classification_source"
+            ],
+            "policy_version": task_effect_classification["policy_version"],
+            "no_task_record_created": True,
+            "no_process_started": True,
+            "no_resource_lease_acquired": True,
+        }
+        base._append_audit(reroute_audit)
+        return {
+            "task": None,
+            "audit": reroute_audit,
+            "execution_identity": execution_identity,
+            "retry_binding": None,
+            "routing_shadow_capture": None,
+            "read_routing_advisory": read_routing_advisory,
+            "read_routing_reroute": read_routing_reroute,
+            "operation_identity": normalized_operation_identity,
+            "operation_retry_binding": operation_retry_binding,
+            "reposkop_execution_attestation": None,
+            "reposkop_checkout_shadow_before": None,
+            "task_effect_classification": task_effect_classification,
+            "runtime_refresh_executor_lease_binding": None,
+            "runtime_refresh_executor_prelaunch_recovery": executor_prelaunch_recovery,
+            "deduplicated_reuse": None,
+        }
     retry_binding = (
         None
         if operation_retry_binding is not None
