@@ -35,7 +35,7 @@ An observation that claims a `claim_type` its declared authority does not own is
 
 ## Claim shape
 
-Every emitted claim carries `claim_type`, `authority`, `authority_tool`, `truth_owner`, `scope`, `binding`, `binding_sha256`, `temporal_marker`, `observed_at` or the historical marker, `age_seconds`, `status`, `freshness`, `sensitivity`, `evidence_refs`, `conflicts` and `does_not_establish`. A claim without at least one concrete evidence reference is rejected.
+Every emitted claim carries `claim_type`, `authority`, `authority_tool`, `truth_owner`, `scope`, `binding`, `binding_sha256`, `temporal_marker`, `observed_at` or the historical marker, `age_seconds`, `status`, `freshness`, `observation_requirement`, `sensitivity`, `evidence_refs`, `conflicts` and `does_not_establish`. A claim without at least one concrete evidence reference is rejected.
 
 `temporal_marker` is `observed` for live sources and `historical` for Chronik-backed sources. A historical observation may not carry `observed_at`, and a live observation must carry one. An `observed_at` later than the caller-supplied `as_of` is rejected rather than silently accepted.
 
@@ -47,7 +47,9 @@ Freshness is derived from `as_of` and the profile's declared bands, never from a
 | `bureau` | 600 s | 1800 s | `stale` |
 | `deployment` | 300 s | 900 s | `stale` |
 
-Historical claims are always `historical` and never `fresh`. A stale claim stays in the context, labelled stale; the fabric never promotes an old observation into current truth.
+Historical claims are always `historical` and never `fresh`. Every live claim also derives an `observation_requirement` from the same profile bands: `observed` through the fresh boundary, `due` between the fresh and aging boundaries, and `missed` beyond the aging boundary. `due_at`, `missed_after` and bounded `overdue_seconds` make that transition explicit without adding a scheduler or persistent state.
+
+The context additionally emits `observation_adherence` for **required** authorities only. It uses the newest accepted observation for each required source, reports `observed`/`due`/`missed` counts and an `observed_ratio` for the current bounded context. This is not a historical success rate. Optional stale evidence remains visible and labelled stale; it never blocks merely because it is old. A required authority that reaches `missed` does fail composition closed, because the owning source must be re-read before the context can support an effect decision.
 
 ## Fail-closed behaviour
 
@@ -55,6 +57,7 @@ Composition fails closed, returning `composed=false`, an empty `claims` list and
 
 - a required binding field for the profile is missing (`missing_required_binding_fields`),
 - a required authoritative source produced no accepted observation (`missing_required_authoritative_sources`),
+- the newest accepted observation from a required authority is beyond the profile aging boundary (`stale_required_authoritative_observations`),
 - the claim budget cannot carry every required authority (`claim_budget_excludes_required_authority`).
 
 A fail-closed context keeps the most restrictive sensitivity ceiling. Structurally invalid input — an unknown profile, a malformed timestamp, an out-of-range budget or a payload key that could carry a secret — raises instead of producing a partial result. A single malformed observation inside an otherwise valid call is not fatal: it is dropped into `rejected_observations` with a bounded reason, and the fail-closed checks then decide whether the remaining evidence is sufficient.
@@ -70,7 +73,7 @@ Evidence references use a closed key allowlist (`type`, `id`, `repo`, `url`, `sh
 ## Tools
 
 - `grabowski_context_fabric_plan` — answers which binding fields and which authorities a profile requires, before any source has been read. It composes nothing.
-- `grabowski_context_fabric_compose` — validates, binds, labels, packs and seals one context. `claim_budget` bounds the packed size; dropped optional claims are reported, and a budget too small for the required authorities fails closed.
+- `grabowski_context_fabric_compose` — validates, binds, labels, derives required-authority observation adherence, packs and seals one context. `claim_budget` bounds the packed size; dropped optional claims are reported, a missed required observation fails closed, and a budget too small for the required authorities fails closed.
 - `grabowski_context_fabric_explain` — verifies the context digest and explains, per claim, why it was included, which authority owns it, how fresh it is, which claims contradict it and which surface must be re-read before acting.
 - `grabowski_context_fabric_compare` — verifies both digests and reports added, removed and changed claims for one identical target binding. Different profiles or different bindings are not comparable and fail closed. The comparison explicitly does not establish progress, regression or approval to proceed.
 
@@ -82,4 +85,4 @@ The digest is a self-consistency binding, not a signature. It detects accidental
 
 ## Acting on a context
 
-A context is evidence for a decision, not permission for an action. Before any effect, re-read the owning authority named in `reread_before_acting` and pass the normal authorization gates. Every claim repeats this boundary in its own `does_not_establish` list, which always includes `lifecycle_truth_ownership`, `current_truth_after_observation`, `merge_readiness`, `deployment_authorization`, `bureau_publication_authority`, `task_completion`, `policy_change`, `routing_authority`, `retry_permission`, `secret_content_access`, `global_operator_memory`, `chat_persistence` and `write_back_to_any_authority`.
+A context is evidence for a decision, not permission for an action. A `due` required observation is an explicit warning but may still compose; a `missed` required observation prevents composition until the owning authority is re-read. Before any effect, re-read the owning authority named in `reread_before_acting` and pass the normal authorization gates. Every claim repeats this boundary in its own `does_not_establish` list, which always includes `lifecycle_truth_ownership`, `current_truth_after_observation`, `merge_readiness`, `deployment_authorization`, `bureau_publication_authority`, `task_completion`, `policy_change`, `routing_authority`, `retry_permission`, `secret_content_access`, `global_operator_memory`, `chat_persistence` and `write_back_to_any_authority`.
