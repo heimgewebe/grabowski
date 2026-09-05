@@ -826,7 +826,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_start": {
         "category": "task",
-        "purpose": "Start a persistent local or fleet task in its own systemd unit.",
+        "purpose": "Start a persistent local or fleet task, or return a pre-dispatch typed-read reroute before persistence.",
         "risk_class": "variable",
         "effects": ["process-start", "state-create", "command-dependent"],
         "reversibility": "cancel-or-command-dependent",
