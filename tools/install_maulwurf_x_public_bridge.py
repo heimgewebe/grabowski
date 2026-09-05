@@ -127,7 +127,8 @@ def install(source_root: Path, target_home: Path, *, activate: bool) -> dict[str
     activation: dict[str, Any] = {"requested": activate}
     if activate:
         _systemctl("daemon-reload")
-        _systemctl("enable", "--now", UNIT_NAME)
+        _systemctl("enable", UNIT_NAME)
+        _systemctl("restart", UNIT_NAME)
         readback = _systemctl(
             "show",
             UNIT_NAME,
@@ -167,7 +168,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--activate",
         action="store_true",
-        help="daemon-reload and enable --now the user service after installation",
+        help="daemon-reload, enable and restart the user service after installation",
     )
     return parser
 

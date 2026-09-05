@@ -198,6 +198,44 @@ class MaulwurfXPublicBridgeContractTests(unittest.TestCase):
             self.assertEqual(second["installed"]["bridge"]["mode"], "0755")
             self.assertEqual(second["installed"]["unit"]["mode"], "0644")
 
+    def test_installer_activation_restarts_exact_installed_service(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as source_tmp,
+            tempfile.TemporaryDirectory() as home_tmp,
+        ):
+            source_root = Path(source_tmp)
+            for relative in (installer.BRIDGE_RELATIVE, installer.UNIT_RELATIVE):
+                target = source_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / relative, target)
+
+            readback = installer.subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="LoadState=loaded\nActiveState=active\nSubState=running\n",
+                stderr="",
+            )
+            normal = installer.subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            with mock.patch.object(
+                installer, "_systemctl", side_effect=[normal, normal, normal, readback]
+            ) as systemctl:
+                result = installer.install(source_root, Path(home_tmp), activate=True)
+
+            self.assertEqual(
+                [call.args for call in systemctl.call_args_list[:3]],
+                [
+                    ("daemon-reload",),
+                    ("enable", installer.UNIT_NAME),
+                    ("restart", installer.UNIT_NAME),
+                ],
+            )
+            self.assertTrue(result["activation"]["requested"])
+            self.assertIn(
+                "ActiveState=active", result["activation"]["systemd_readback"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
