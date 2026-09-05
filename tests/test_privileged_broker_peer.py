@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import sys
 import subprocess
 import tempfile
@@ -1051,6 +1052,88 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                 return_value={"path": "/run/grabowski/privileged-broker-evidence/test.json", "sha256": "f" * 64},
             )
             self._output_evidence = self._output_evidence_patch.start()
+
+    def test_backup_smart_execution_audit_binds_public_output(self) -> None:
+        reference = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": broker_tool.LOCAL_BACKUP_SMART_READ_ACTION,
+            "target": "smart-read",
+        }
+        execution = {
+            "mode": "template",
+            "argv": list(broker_tool.LOCAL_BACKUP_SMART_ARGV),
+            "cwd": None,
+            "timeout_seconds": 120,
+        }
+        process = mock.Mock(pid=4242, returncode=4)
+        process.communicate.return_value = (b"SMART overall-health: PASSED\n", b"warning\n")
+        with (
+            mock.patch.object(broker_tool, "_assert_local_backup_smart_pre_spawn"),
+            mock.patch.object(broker_tool.subprocess, "Popen", return_value=process),
+            mock.patch.object(broker_tool, "append_audit") as append,
+        ):
+            result = broker_tool._execute_broker_command(
+                reference=reference, execution=execution, operator_peer=self.peer()
+            )
+        record = result["record"]
+        append.assert_called_once_with(record)
+        self.assertEqual(record["returncode"], 4)
+        self.assertFalse(record["stdout_truncated"])
+        self.assertEqual(
+            record["smart_stdout_sha256"],
+            hashlib.sha256(result["stdout"].encode("utf-8")).hexdigest(),
+        )
+        self.assertEqual(record["smart_stdout_bytes"], len(result["stdout"].encode("utf-8")))
+        self.assertEqual(
+            record["smart_stderr_sha256"],
+            hashlib.sha256(result["stderr"].encode("utf-8")).hexdigest(),
+        )
+
+    def test_backup_smart_pre_spawn_requires_exact_argv_and_stable_device_identity(self) -> None:
+        reference = {"action": broker_tool.LOCAL_BACKUP_SMART_READ_ACTION}
+        with mock.patch.object(
+            broker_tool,
+            "_local_backup_smart_device_identity",
+            side_effect=[("/dev/sda", 2048), ("/dev/sda", 2048)],
+        ) as identity:
+            broker_tool._assert_local_backup_smart_pre_spawn(
+                reference=reference, argv=list(broker_tool.LOCAL_BACKUP_SMART_ARGV)
+            )
+        self.assertEqual(identity.call_count, 2)
+
+        with self.assertRaisesRegex(PermissionError, "argv differs"):
+            broker_tool._assert_local_backup_smart_pre_spawn(
+                reference=reference, argv=["/usr/sbin/smartctl", "-a", "/dev/sda"]
+            )
+
+        with mock.patch.object(
+            broker_tool,
+            "_local_backup_smart_device_identity",
+            side_effect=[("/dev/sda", 2048), ("/dev/sdb", 2064)],
+        ):
+            with self.assertRaisesRegex(PermissionError, "identity changed"):
+                broker_tool._assert_local_backup_smart_pre_spawn(
+                    reference=reference, argv=list(broker_tool.LOCAL_BACKUP_SMART_ARGV)
+                )
+
+    def test_backup_smart_device_identity_requires_by_id_symlink_to_block_device(self) -> None:
+        by_id = mock.Mock()
+        link_meta = mock.Mock(st_mode=stat.S_IFLNK | 0o777)
+        target = mock.Mock()
+        target.__str__ = mock.Mock(return_value="/dev/sda")
+        target.stat.return_value = mock.Mock(st_mode=stat.S_IFBLK | 0o600, st_rdev=2048)
+        by_id.lstat.return_value = link_meta
+        by_id.resolve.return_value = target
+        with mock.patch.object(broker_tool, "LOCAL_BACKUP_SMART_DEVICE", by_id):
+            self.assertEqual(
+                broker_tool._local_backup_smart_device_identity(), ("/dev/sda", 2048)
+            )
+
+        target.stat.return_value = mock.Mock(st_mode=stat.S_IFREG | 0o600, st_rdev=0)
+        with mock.patch.object(broker_tool, "LOCAL_BACKUP_SMART_DEVICE", by_id):
+            with self.assertRaisesRegex(PermissionError, "not a block device"):
+                broker_tool._local_backup_smart_device_identity()
 
     def test_rootbroker_action_name_requires_peer_validation_even_if_execution_fields_missing(self) -> None:
         reference = {
