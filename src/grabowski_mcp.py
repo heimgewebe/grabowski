@@ -48,6 +48,7 @@ import grabowski_transport_roundtrip
 import grabowski_transport_assertion
 import grabowski_serving_process
 import grabowski_connector_contract
+import grabowski_connector_policy
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_system_map
 import grabowski_blockades as blockade_policy
@@ -5261,14 +5262,15 @@ def _transport_context_header(ctx: Context | None, name: str) -> str | None:
     return raw
 
 
-def _transport_connector_capability_scope(
-    ctx: Context | None,
-) -> dict[str, str] | None:
+def _transport_connector_identity(ctx: Context | None) -> str | None:
+    """Resolve a server-enrolled connector capability to its canonical id.
+
+    Missing capability headers remain a non-connector/local-read condition here;
+    callers that require a connector identity enforce that requirement separately.
+    Supplied but unknown capabilities always fail closed.
+    """
     supplied = _transport_context_connector_capability(ctx)
-    required = _transport_connector_identity_required()
     if supplied is None:
-        if required:
-            raise RuntimeError("stable transport connector identity is required")
         return None
     matches = [
         connector_id
@@ -5277,7 +5279,88 @@ def _transport_connector_capability_scope(
     ]
     if len(matches) != 1:
         raise RuntimeError("transport connector capability is not enrolled")
-    connector_id = matches[0]
+    return matches[0]
+
+
+def _transport_registered_tool_names() -> list[str]:
+    manager = getattr(mcp, "_tool_manager", None)
+    raw_registered = getattr(manager, "_tools", {})
+    if not isinstance(raw_registered, dict) or not raw_registered:
+        raise RuntimeError("transport connector tool registry is unavailable")
+    return sorted(str(name) for name in raw_registered)
+
+
+def _transport_connector_tool_policy(
+    ctx: Context | None,
+) -> dict[str, Any] | None:
+    connector_id = _transport_connector_identity(ctx)
+    if connector_id is None:
+        return None
+    try:
+        return grabowski_connector_policy.load_policy(
+            _TRANSPORT_CONNECTOR_IDENTITY_ROOT,
+            connector_id,
+            registered_tools=_transport_registered_tool_names(),
+        )
+    except grabowski_connector_policy.ConnectorPolicyError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _transport_tool_read_only_hint(tool: Any) -> bool | None:
+    annotations = getattr(tool, "annotations", None)
+    hint = getattr(annotations, "readOnlyHint", None)
+    if hint is None:
+        values = getattr(annotations, "values", None)
+        if isinstance(values, dict):
+            hint = values.get("readOnlyHint")
+    return hint if isinstance(hint, bool) else None
+
+
+def _transport_authorize_connector_tool(
+    ctx: Context | None,
+    tool_name: str,
+) -> dict[str, Any] | None:
+    """Enforce the principal-bound tool policy before any domain tool runs."""
+    connector_id = _transport_connector_identity(ctx)
+    if connector_id is None:
+        return None
+    try:
+        policy = grabowski_connector_policy.load_policy(
+            _TRANSPORT_CONNECTOR_IDENTITY_ROOT,
+            connector_id,
+            registered_tools=_transport_registered_tool_names(),
+        )
+        if not grabowski_connector_policy.tool_allowed(policy, tool_name):
+            raise RuntimeError(
+                f"transport connector {connector_id} is not authorized for tool {tool_name}"
+            )
+        if policy.get("read_only_only") is True:
+            manager = getattr(mcp, "_tool_manager", None)
+            get_tool = getattr(manager, "get_tool", None)
+            tool = get_tool(tool_name) if callable(get_tool) else None
+            if _transport_tool_read_only_hint(tool) is not True:
+                raise RuntimeError(
+                    f"transport connector {connector_id} requires an explicitly read-only tool: {tool_name}"
+                )
+    except grabowski_connector_policy.ConnectorPolicyError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return {
+        "connector_id": connector_id,
+        "policy_mode": policy.get("mode"),
+        "read_only_only": bool(policy.get("read_only_only")),
+        "policy_enforced": bool(policy.get("enforced")),
+    }
+
+
+def _transport_connector_capability_scope(
+    ctx: Context | None,
+) -> dict[str, str] | None:
+    connector_id = _transport_connector_identity(ctx)
+    required = _transport_connector_identity_required()
+    if connector_id is None:
+        if required:
+            raise RuntimeError("stable transport connector identity is required")
+        return None
     label = hashlib.sha256(
         b"grabowski-connector-identity-scope-v2\x00"
         + connector_id.encode("utf-8")
@@ -5285,7 +5368,6 @@ def _transport_connector_capability_scope(
     return grabowski_transport_roundtrip.validate_client_scope(
         {"kind": "connector_capability", "label": label}
     )
-
 
 def _transport_signed_one_call_evidence(
     ctx: Context | None,
@@ -6237,6 +6319,17 @@ def grabowski_status(
     if not bool(deployment.get("agent_instructions_identity_valid")):
         warnings.append({"code": "agent_instructions_drift"})
     client_snapshot = tool_contract.get("client_snapshot", {})
+    connector_policy = _transport_connector_tool_policy(ctx)
+    connector_principal = (
+        {
+            "connector_id": connector_policy["connector_id"],
+            "policy_mode": connector_policy["mode"],
+            "read_only_only": bool(connector_policy.get("read_only_only")),
+            "policy_enforced": bool(connector_policy.get("enforced")),
+        }
+        if connector_policy is not None
+        else None
+    )
     transport_roundtrip = _transport_roundtrip_status(ctx)
     normal_mutation_path_ready = (
         transport_roundtrip.get("state") == "unavailable"
@@ -6396,6 +6489,7 @@ def grabowski_status(
             ),
         },
         "coding_agent_catalog": coding_agent_catalog,
+        "connector_principal": connector_principal,
         "transport_roundtrip": transport_roundtrip,
         "agent_instructions": {
             **_agent_instructions_metadata(),

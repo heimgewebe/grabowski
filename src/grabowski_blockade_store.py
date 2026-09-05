@@ -275,8 +275,14 @@ def _transaction_id(value: str | None, *, now: datetime | None) -> str:
     return f"{prefix}-{secrets.token_hex(8)}"
 
 
-def _directory_flags() -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+def _directory_flags(*, path_only: bool = False) -> int:
+    if path_only:
+        path_flag = getattr(os, "O_PATH", None)
+        if path_flag is None:
+            raise RuntimeError("O_PATH is required for path-only directory traversal")
+        flags = path_flag | os.O_DIRECTORY | os.O_CLOEXEC
+    else:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     return flags
@@ -302,12 +308,15 @@ def _open_directory_chain(
     expected_uid: int,
     require_private: bool,
     label: str,
+    path_only: bool = False,
 ) -> int:
     path = _canonical_absolute_path(path, label=label)
-    descriptor = os.open("/", _directory_flags())
+    descriptor = os.open("/", _directory_flags(path_only=path_only))
     try:
         for part in path.parts[1:]:
-            next_descriptor = os.open(part, _directory_flags(), dir_fd=descriptor)
+            next_descriptor = os.open(
+                part, _directory_flags(path_only=path_only), dir_fd=descriptor
+            )
             os.close(descriptor)
             descriptor = next_descriptor
         _assert_directory_binding(
@@ -636,6 +645,7 @@ def read_blockade_marker(
         expected_uid=uid,
         require_private=require_private_parent,
         label="marker parent",
+        path_only=True,
     )
     try:
         snapshot = _snapshot_from_open_file(

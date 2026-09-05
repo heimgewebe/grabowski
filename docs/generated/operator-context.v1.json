@@ -1423,7 +1423,7 @@
     },
     {
       "category": "task",
-      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope. Every\ntask-owned broad repository lease carries a complete whole-repository scope manifest.",
+      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope. Every\ntask-owned broad repository lease carries a complete whole-repository scope manifest.\n\nFor short effect-free direct reads, prefer an existing typed read surface.\nThe first server-verified advisory cohort is guarded local Git reads routed\nto grabowski_git. Other direct commands stay on persistent tasks unless a\nserver-owned read classifier proves their effect boundary. Durable lifecycle,\nresume, leases, shell/indirect execution, larger output, and long runtime\ncontinue to require persistent tasks. Caller-supplied effect_profile=read_only\nalone never establishes read safety.",
       "effects": [
         "process-start",
         "state-create",
@@ -3169,6 +3169,10 @@
         "source": "src/grabowski_connector_contract.py"
       },
       {
+        "module": "grabowski_connector_policy",
+        "source": "src/grabowski_connector_policy.py"
+      },
+      {
         "module": "grabowski_blockades",
         "source": "src/grabowski_blockades.py"
       },
@@ -3610,7 +3614,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "d9d1a1077ce221cc8879c1a15da4fccd1ed75c356832251964d9477591e347d8"
+      "sha256": "b7fa14455c1a13713a33912fd329011808529e66a47e4d60d49680c28f6496e0"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3651,6 +3655,7 @@
       "src/grabowski_coding_agent_router_cli.py": "583e4d7e0213245b423d7255fca88834db2de678ea1ae86ed2e515946b9afb14",
       "src/grabowski_command_identity.py": "582b209fa1b1e4cb5faef74fa56214f79aabf6ad1e47ec0425a5962d74209138",
       "src/grabowski_connector_contract.py": "7d8b9011c737b4785595c68aeb97652641c5c2be00f6dfc4d5f1c7be38895c57",
+      "src/grabowski_connector_policy.py": "aef28124fbb361317d8a502fb67da0012ab9a851debbd1bc3b8fd66930871173",
       "src/grabowski_consumer_surface.py": "f007b746c61f89f207b5477d02bc7b8e621b8e6b75810cfc05e437d1bcfdc249",
       "src/grabowski_context_fabric.py": "dda7f6bf1fcc8346df98a323bc545c047548e3f333f317e98838f2f15ae875e0",
       "src/grabowski_convergence.py": "9f12a1397767a088bd20c500d307014a870547d9435587a2d04f5a43afb31e19",
@@ -3725,7 +3730,7 @@
       "src/grabowski_systemkatalog.py": "4fefcfd0b5ea3b68d37b6a95d27516799cbf5c2ada14494c3b4c17688f98585d",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "0f3e3e81bff7e70994e37df7bc652517f095bc268954d2f7726d269ea384e96e",
+      "src/grabowski_tasks.py": "3421c594b7f4ca625b2ff3fe541e1b9a6e8f1f5c22a9031c837f4f60b4586e37",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

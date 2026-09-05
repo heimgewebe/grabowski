@@ -1,0 +1,3 @@
+[Service]
+Environment=GRABOWSKI_SERVER_RECOVERY_TARGET=local-backup-disk:UUID=249180DA265E8DE0/restic/heim-pc
+UnsetEnvironment=GRABOWSKI_SERVER_RECOVERY_HOST

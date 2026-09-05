@@ -8,12 +8,13 @@ owning authority, and preserves contradictions instead of resolving them.
 
 The whole surface is pure: it reads no files, keeps no memory database, holds
 no chat history and writes nothing back. It fails closed whenever a required
-target binding or a required authoritative source is missing.
+target binding or authoritative source is missing, or when the newest accepted
+observation from a required authority has crossed its profile aging boundary.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -513,6 +514,109 @@ def _freshness(
     return "stale", age_seconds
 
 
+def _observation_requirement(
+    *, historical: bool, observed_at: datetime | None, as_of: datetime, profile: dict[str, Any]
+) -> dict[str, Any]:
+    """Project when an already observed authority must be read again.
+
+    The projection owns no scheduling truth.  It derives one bounded requirement
+    from the same profile freshness bands that already classify the observation.
+    """
+    if historical or observed_at is None:
+        return {
+            "state": "historical",
+            "due_at": None,
+            "missed_after": None,
+            "overdue_seconds": None,
+        }
+    due_at = observed_at + timedelta(seconds=profile["fresh_seconds"])
+    missed_after = observed_at + timedelta(seconds=profile["aging_seconds"])
+    if as_of <= due_at:
+        state = "observed"
+        overdue_seconds = 0
+    elif as_of <= missed_after:
+        state = "due"
+        overdue_seconds = int((as_of - due_at).total_seconds())
+    else:
+        state = "missed"
+        overdue_seconds = int((as_of - missed_after).total_seconds())
+    return {
+        "state": state,
+        "due_at": _timestamp_text(due_at),
+        "missed_after": _timestamp_text(missed_after),
+        "overdue_seconds": overdue_seconds,
+    }
+
+
+def _required_observation_adherence(
+    claims: list[dict[str, Any]], *, profile_name: str
+) -> dict[str, Any]:
+    """Summarize only required live authorities; optional evidence never gates."""
+    required_sources = PROFILES[profile_name]["required_sources"]
+    source_rows: list[dict[str, Any]] = []
+    counts = {"observed": 0, "due": 0, "missed": 0, "historical": 0}
+    for source_tool in required_sources:
+        candidates = [
+            claim
+            for claim in claims
+            if claim["authority_tool"] == source_tool
+        ]
+        if not candidates:
+            continue
+        # A newer observation from the same authority supersedes older freshness
+        # for the source-level gate without deleting the older claim itself.
+        selected = min(
+            candidates,
+            key=lambda claim: (
+                claim["age_seconds"] is None,
+                claim["age_seconds"] if claim["age_seconds"] is not None else 2**63,
+                claim["claim_id"],
+            ),
+        )
+        requirement = dict(selected["observation_requirement"])
+        state = str(requirement["state"])
+        counts[state] += 1
+        source_rows.append(
+            {
+                "source_tool": source_tool,
+                "authority": selected["authority"],
+                "truth_owner": selected["truth_owner"],
+                "state": state,
+                "latest_observed_at": selected["observed_at"],
+                "due_at": requirement["due_at"],
+                "missed_after": requirement["missed_after"],
+                "overdue_seconds": requirement["overdue_seconds"],
+            }
+        )
+    total = sum(counts.values())
+    live_total = counts["observed"] + counts["due"] + counts["missed"]
+    ratio = counts["observed"] / live_total if live_total else None
+    status = (
+        "blocked"
+        if counts["missed"]
+        else "due"
+        if counts["due"]
+        else "observed"
+        if counts["observed"]
+        else "historical"
+        if counts["historical"]
+        else "unknown"
+    )
+    return {
+        "status": status,
+        "required_source_count": len(required_sources),
+        "evaluated_source_count": total,
+        "counts": counts,
+        "observed_ratio": ratio,
+        "sources": source_rows,
+        "does_not_establish": [
+            "historical_observation_adherence_rate",
+            "automatic_refresh_execution",
+            "retry_permission",
+        ],
+    }
+
+
 def _claim_does_not_establish(
     profile: dict[str, Any], source: dict[str, Any]
 ) -> list[str]:
@@ -591,6 +695,12 @@ def _build_claim(
         as_of=as_of,
         profile=profile,
     )
+    observation_requirement = _observation_requirement(
+        historical=historical_flag,
+        observed_at=observed_at,
+        as_of=as_of,
+        profile=profile,
+    )
 
     identity = {
         "authority": source["authority"],
@@ -624,6 +734,7 @@ def _build_claim(
         "status": status,
         "detail": detail,
         "freshness": freshness,
+        "observation_requirement": observation_requirement,
         "sensitivity": sensitivity,
         "evidence_refs": evidence_refs,
         "assertion_sha256": _sha256_json({"detail": detail, "status": status}),
@@ -694,6 +805,19 @@ def _context_envelope(
         "contradictions": [],
         "conflict_resolution": CONFLICT_RESOLUTION,
         "freshness_counts": {},
+        "observation_adherence": {
+            "status": "unknown",
+            "required_source_count": len(profile["required_sources"]),
+            "evaluated_source_count": 0,
+            "counts": {"observed": 0, "due": 0, "missed": 0, "historical": 0},
+            "observed_ratio": None,
+            "sources": [],
+            "does_not_establish": [
+                "historical_observation_adherence_rate",
+                "automatic_refresh_execution",
+                "retry_permission",
+            ],
+        },
         "packing": {
             "claim_budget": claim_budget,
             "input_observation_count": 0,
@@ -784,6 +908,7 @@ def plan_context(profile: Any, binding: Any = None) -> dict[str, Any]:
         "fail_closed_conditions": [
             "missing_required_binding_field",
             "missing_required_authoritative_source",
+            "stale_required_authoritative_observation",
             "claim_budget_excludes_required_authority",
         ],
         "does_not_establish": sorted(
@@ -875,6 +1000,26 @@ def compose_context(
             "detail": "A required authority produced no accepted observation.",
             "missing_binding_fields": [],
             "missing_required_sources": missing_required,
+        }
+        return _sealed(context)
+
+    adherence = _required_observation_adherence(claims, profile_name=profile_name)
+    context["observation_adherence"] = adherence
+    missed_required = [
+        row["source_tool"]
+        for row in adherence["sources"]
+        if row["state"] == "missed"
+    ]
+    if missed_required:
+        context["failure"] = {
+            "code": "stale_required_authoritative_observations",
+            "detail": (
+                "A required authority is beyond its aging window; re-read the owning "
+                "authority before acting."
+            ),
+            "missing_binding_fields": [],
+            "missing_required_sources": [],
+            "stale_required_sources": missed_required,
         }
         return _sealed(context)
 

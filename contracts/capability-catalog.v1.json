@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "da4477924ee5d8d7b4fa305a9373dfb958dd9e4e9cce564e1118896193626cd1",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "d9d1a1077ce221cc8879c1a15da4fccd1ed75c356832251964d9477591e347d8",
+  "contract_sha256": "b7fa14455c1a13713a33912fd329011808529e66a47e4d60d49680c28f6496e0",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1363,7 +1363,7 @@
     },
     {
       "category": "task",
-      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope. Every\ntask-owned broad repository lease carries a complete whole-repository scope manifest.",
+      "description": "Start one persistent local or fleet task in its own systemd unit.\n\nDirect local write-capable agent CLIs receive an implicit repository lease\nunless the caller supplies an explicit path or repository scope. Every\ntask-owned broad repository lease carries a complete whole-repository scope manifest.\n\nFor short effect-free direct reads, prefer an existing typed read surface.\nThe first server-verified advisory cohort is guarded local Git reads routed\nto grabowski_git. Other direct commands stay on persistent tasks unless a\nserver-owned read classifier proves their effect boundary. Durable lifecycle,\nresume, leases, shell/indirect execution, larger output, and long runtime\ncontinue to require persistent tasks. Caller-supplied effect_profile=read_only\nalone never establishes read safety.",
       "effects": [
         "process-start",
         "state-create",

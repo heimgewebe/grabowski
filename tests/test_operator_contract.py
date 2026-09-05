@@ -174,6 +174,7 @@ def _load_operator_module():
 
     fake_base._read_bound_regular_bytes = read_bound_regular_bytes
     fake_base._append_audit = lambda record: None
+    fake_base._transport_authorize_connector_tool = lambda context, tool_name: None
     fake_base._retain_pending_transport_target = (
         lambda challenge_receipt_sha256, **kwargs: {
             "challenge_receipt_sha256": challenge_receipt_sha256,
@@ -394,6 +395,31 @@ class OperatorContractTests(unittest.TestCase):
                 )
         self.assertTrue(result["called"])
         self.assertTrue(operator._DEPLOYMENT_ADMISSION_GATE_INSTALLED)
+
+    def test_connector_tool_policy_blocks_before_domain_tool_execution(self) -> None:
+        operator = _load_operator_module()
+        domain_started = False
+
+        async def domain_call(*args, **kwargs):
+            nonlocal domain_started
+            domain_started = True
+            return {"called": True, "args": args, "kwargs": kwargs}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+        with patch.object(
+            operator.base,
+            "_transport_authorize_connector_tool",
+            side_effect=RuntimeError("connector tool not authorized"),
+        ) as authorize:
+            operator._configure_http_runtime()
+            with self.assertRaisesRegex(RuntimeError, "not authorized"):
+                operator.asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {})
+                )
+
+        authorize.assert_called_once()
+        self.assertFalse(domain_started)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_cold_reentry_tools_wait_for_active_marker_then_reenter_after_expiry(
         self,
