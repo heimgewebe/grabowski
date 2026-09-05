@@ -68,6 +68,8 @@ _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z")
+_GITHUB_ID_NOREPLY_CUTOFF = datetime(2017, 7, 19, tzinfo=timezone.utc)
 _GITHUB_SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?github\.com:(?P<path>[^?#\s]+)\Z", re.IGNORECASE)
 _MERGE_GUARD_TTL_SECONDS = 300
 _MERGE_GUARD_MAX_CHANGED_PATHS = 3000
@@ -1538,6 +1540,73 @@ def _exact_base_git_cas_effect_scope_errors(action: dict[str, Any]) -> list[str]
     return errors
 
 
+def _exact_base_git_cas_commit_identity(
+    repo_path: Path,
+    github_runner: Any,
+) -> tuple[dict[str, str] | None, dict[str, Any], list[str]]:
+    value, query, query_errors = _github_json_call(
+        repo_path,
+        github_runner,
+        ["api", "user"],
+        label="exact_base_git_cas_authenticated_user",
+    )
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_exact_base_git_cas_commit_identity",
+        "source": "github_authenticated_user_api",
+        "query": query,
+        "status": "unavailable" if query_errors else "invalid",
+        "noreply_format": None,
+        "identity_sha256": None,
+        "errors": [],
+    }
+    if query_errors:
+        errors = ["exact_base_git_cas_authenticated_user_query_failed"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    if not isinstance(value, dict):
+        errors = ["exact_base_git_cas_authenticated_user_payload_invalid"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+
+    login = value.get("login")
+    account_id = value.get("id")
+    account_type = value.get("type")
+    created_at = _github_datetime(value.get("created_at"))
+    if (
+        not isinstance(login, str)
+        or _GITHUB_LOGIN_RE.fullmatch(login) is None
+        or type(account_id) is not int
+        or account_id <= 0
+        or account_type != "User"
+        or created_at is None
+    ):
+        errors = ["exact_base_git_cas_authenticated_user_identity_invalid"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    if created_at < _GITHUB_ID_NOREPLY_CUTOFF:
+        errors = ["exact_base_git_cas_authenticated_user_noreply_unproven"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+
+    email = f"{account_id}+{login}@users.noreply.github.com"
+    identity_material = {
+        "account_id": account_id,
+        "login": login,
+        "email": email,
+    }
+    evidence.update(
+        {
+            "status": "resolved",
+            "account_type": "User",
+            "noreply_format": "id_plus_login",
+            "identity_sha256": _sha256_json(identity_material),
+            "errors": [],
+        }
+    )
+    return {"name": login, "email": email}, evidence, []
+
+
 def _exact_base_git_cas_merge(
     repo_path: Path,
     *,
@@ -1547,6 +1616,7 @@ def _exact_base_git_cas_merge(
     head_sha: str,
     head_branch: str,
     pr_number: int,
+    github_runner: Any,
     git_runner: Any = _merge_guard_git_command,
     on_dispatch: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1602,6 +1672,12 @@ def _exact_base_git_cas_merge(
         "verified_fast_forward_from_expected_base": True,
         "stages": [],
     }
+    commit_identity, commit_identity_evidence, commit_identity_errors = (
+        _exact_base_git_cas_commit_identity(repo_path, github_runner)
+    )
+    evidence["commit_identity"] = commit_identity_evidence
+    if commit_identity_errors or commit_identity is None:
+        raise RuntimeError("exact-base merge cannot resolve provider-compatible GitHub commit identity")
 
     def run(stage: str, root: Path, args: list[str], *, timeout: int = 60) -> dict[str, Any]:
         info = _merge_guard_result_info(git_runner(root, args, timeout=timeout))
@@ -1676,9 +1752,9 @@ def _exact_base_git_cas_merge(
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
-                "user.name=Grabowski Captain",
+                f"user.name={commit_identity['name']}",
                 "-c",
-                "user.email=grabowski@localhost",
+                f"user.email={commit_identity['email']}",
                 "merge",
                 "--no-ff",
                 "-m",
@@ -1700,6 +1776,11 @@ def _exact_base_git_cas_merge(
         if _SHA40_RE.fullmatch(merge_sha) is None:
             raise RuntimeError("exact-base merge commit identity invalid")
         evidence["merge_sha"] = merge_sha
+        merge_tree = run("verify-merge-tree", temp_root, ["rev-parse", "HEAD^{tree}"])
+        merge_tree_sha = merge_tree["stdout"].strip() if merge_tree["returncode"] == 0 else ""
+        if _SHA40_RE.fullmatch(merge_tree_sha) is None:
+            raise RuntimeError("exact-base merge tree identity invalid")
+        evidence["merge_tree_sha"] = merge_tree_sha
         remote_head_before = run(
             "remote-head-branch-pre-push", temp_root, ["ls-remote", "origin", head_ref]
         )
@@ -4498,6 +4579,7 @@ class CaptainMergeGuardRunner:
                     head_sha=expected_head,
                     head_branch=str(bindings["head_branch"]),
                     pr_number=int(bindings["pull_request"]),
+                    github_runner=self.github_runner,
                     on_dispatch=mark_dispatch,
                 )
                 self.receipt["exact_base_git_cas_merge"] = fallback_evidence
