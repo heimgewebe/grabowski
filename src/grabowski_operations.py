@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import stat
 import time
 from typing import Any
@@ -12,6 +13,7 @@ from typing import Any
 import grabowski_fleet as fleet
 import grabowski_fleet_mutation as fleet_mutation
 import grabowski_mcp as base
+import grabowski_privileged as privileged
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -30,6 +32,25 @@ PARAMETER = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
 PLACEHOLDER = re.compile(r"\$\{([A-Za-z][A-Za-z0-9_]{0,63})\}\Z")
 PHASES = {"preflight": 0, "action": 1, "postflight": 2, "rollback": 3}
 FLEET_MUTATION_OPERATION = "fleet-registry-mutate"
+BACKUP_NTFS_CHECK_OPERATION = "backup-ntfs-check"
+BACKUP_NTFS_CLEAR_DIRTY_OPERATION = "backup-ntfs-clear-dirty"
+BACKUP_NTFS_TYPED_OPERATIONS = {
+    BACKUP_NTFS_CHECK_OPERATION: {
+        "description": "Run the fixed root-read-only ntfsfix check for the configured BACKUP volume.",
+        "action": "local_backup_ntfs_check",
+        "target": "check",
+        "effect": "read_only",
+    },
+    BACKUP_NTFS_CLEAR_DIRTY_OPERATION: {
+        "description": "Clear only the dirty flag on the fixed configured BACKUP volume after separate check evidence.",
+        "action": "local_backup_ntfs_clear_dirty",
+        "target": "clear-dirty",
+        "effect": "filesystem_metadata_write",
+    },
+}
+RESERVED_TYPED_OPERATIONS = frozenset({FLEET_MUTATION_OPERATION, *BACKUP_NTFS_TYPED_OPERATIONS})
+BACKUP_NTFS_CHECK_EVIDENCE_TTL_SECONDS = 600
+_BACKUP_NTFS_LAST_CHECK: dict[str, Any] | None = None
 
 
 def _hash(value: Any) -> str:
@@ -179,6 +200,274 @@ def _append_fleet_mutation_audit(audit: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def _backup_ntfs_operation_plan(
+    operation: str, parameters: dict[str, str] | None
+) -> dict[str, Any]:
+    if operation not in BACKUP_NTFS_TYPED_OPERATIONS:
+        raise ValueError(f"Unknown typed BACKUP NTFS operation: {operation}")
+    supplied = parameters or {}
+    if not isinstance(supplied, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in supplied.items()
+    ):
+        raise ValueError("parameters must be an object of strings")
+    expected_parameters = (
+        set()
+        if operation == BACKUP_NTFS_CHECK_OPERATION
+        else {"check_response_sha256"}
+    )
+    if set(supplied) != expected_parameters:
+        raise ValueError(
+            f"Operation {operation} parameter mismatch; "
+            f"missing={sorted(expected_parameters - set(supplied))}, "
+            f"unknown={sorted(set(supplied) - expected_parameters)}"
+        )
+    if supplied and re.fullmatch(r"[0-9a-f]{64}", supplied["check_response_sha256"]) is None:
+        raise ValueError("check_response_sha256 is invalid")
+    spec = BACKUP_NTFS_TYPED_OPERATIONS[operation]
+    return {
+        "name": operation,
+        "description": spec["description"],
+        "parameter_names": sorted(supplied),
+        "parameters_sha256": _hash(supplied),
+        "typed_builtin": True,
+        "execution": "operator-mainpid-direct-rootbroker",
+        "privileged_action": spec["action"],
+        "target": spec["target"],
+        "effect": spec["effect"],
+        "rollback": "none; the check is read-only and clear-dirty is separately operator-gated",
+    }
+
+
+def _invoke_mainpid_privileged_action(
+    *, action: str, target: str, justification: str, timeout_seconds: int = 120
+) -> dict[str, Any]:
+    allowed = {
+        (str(spec["action"]), str(spec["target"]))
+        for spec in BACKUP_NTFS_TYPED_OPERATIONS.values()
+    }
+    if (action, target) not in allowed:
+        raise ValueError("MainPID privileged action is outside the BACKUP NTFS allowlist")
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 120:
+        raise ValueError("BACKUP NTFS privileged timeout is invalid")
+    broker = privileged._privileged_broker_status()
+    if not broker.get("ready"):
+        raise PermissionError("privileged broker is not ready")
+    reference = privileged._create_privileged_reference(
+        action=action, target=target, justification=justification
+    )
+    payload = (
+        json.dumps(reference, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if not payload or len(payload) > 64 * 1024:
+        raise ValueError("privileged reference exceeds broker input limit")
+    timed_out = False
+    transport_error: str | None = None
+    raw = b""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout_seconds + 15)
+            client.connect(str(privileged.BROKER_SOCKET))
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = client.recv(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 512 * 1024:
+                    raise RuntimeError("privileged broker response exceeds output limit")
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+    except (socket.timeout, TimeoutError) as exc:
+        timed_out = True
+        transport_error = str(exc) or "privileged broker request timed out"
+    except (OSError, RuntimeError) as exc:
+        transport_error = f"{type(exc).__name__}: {exc}"
+    text = privileged._redact_text(raw.decode("utf-8", errors="replace"))
+    try:
+        response = json.loads(text) if text.strip() else None
+    except json.JSONDecodeError:
+        response = None
+    response_error = response.get("error") if isinstance(response, dict) else None
+    command_returncode = response.get("returncode") if isinstance(response, dict) else None
+    response_audit = response.get("audit") if isinstance(response, dict) else None
+    audit_binding_valid = (
+        isinstance(response_audit, dict)
+        and response_audit.get("request_id") == reference["request_id"]
+        and response_audit.get("reference_sha256") == reference["reference_sha256"]
+        and response_audit.get("action") == action
+        and response_audit.get("mode") == "template"
+        and response_audit.get("returncode") == command_returncode
+        and response_audit.get("timed_out") is False
+        and response_audit.get("peer_uid") == 1000
+        and response_audit.get("peer_unit") == "grabowski-operator.service"
+    )
+    structured = (
+        isinstance(response, dict)
+        and response_error is None
+        and response.get("request_id") == reference["request_id"]
+        and response.get("action") == action
+        and response.get("timed_out") is False
+        and response.get("mode") == "template"
+        and audit_binding_valid
+    )
+    success = (
+        structured
+        and timed_out is False
+        and transport_error is None
+        and command_returncode == 0
+    )
+    outcome = (
+        "succeeded"
+        if success
+        else "unknown"
+        if timed_out or response is None
+        else "failed"
+    )
+    return {
+        "request_id": reference["request_id"],
+        "reference_sha256": reference["reference_sha256"],
+        "action": action,
+        "target": target,
+        "success": success,
+        "outcome": outcome,
+        "timed_out": timed_out,
+        "transport_error": transport_error,
+        "broker_response": response,
+        "response_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _root_audit_sha256(invocation: dict[str, Any]) -> str | None:
+    response = invocation.get("broker_response")
+    if not isinstance(response, dict):
+        return None
+    audit = response.get("audit")
+    if not isinstance(audit, dict):
+        return None
+    if (
+        audit.get("request_id") != invocation.get("request_id")
+        or audit.get("reference_sha256") != invocation.get("reference_sha256")
+        or audit.get("action") != invocation.get("action")
+        or audit.get("mode") != "template"
+        or audit.get("returncode") != response.get("returncode")
+        or audit.get("timed_out") is not False
+        or audit.get("peer_uid") != 1000
+        or audit.get("peer_unit") != "grabowski-operator.service"
+    ):
+        return None
+    return _hash(audit)
+
+
+def _record_backup_ntfs_check_evidence(invocation: dict[str, Any]) -> dict[str, Any] | None:
+    global _BACKUP_NTFS_LAST_CHECK
+    audit_sha256 = _root_audit_sha256(invocation)
+    if invocation.get("outcome") == "unknown" or audit_sha256 is None:
+        _BACKUP_NTFS_LAST_CHECK = None
+        return None
+    evidence = {
+        "checked_at_unix": int(time.time()),
+        "response_sha256": invocation["response_sha256"],
+        "reference_sha256": invocation["reference_sha256"],
+        "root_audit_sha256": audit_sha256,
+    }
+    _BACKUP_NTFS_LAST_CHECK = dict(evidence)
+    return evidence
+
+
+def _consume_backup_ntfs_check_evidence(parameters: dict[str, str] | None) -> dict[str, Any]:
+    global _BACKUP_NTFS_LAST_CHECK
+    supplied = parameters or {}
+    expected = supplied.get("check_response_sha256")
+    evidence = _BACKUP_NTFS_LAST_CHECK
+    _BACKUP_NTFS_LAST_CHECK = None
+    if not isinstance(evidence, dict) or expected != evidence.get("response_sha256"):
+        raise PermissionError("clear-dirty requires the exact latest BACKUP NTFS check evidence")
+    checked_at = evidence.get("checked_at_unix")
+    now = int(time.time())
+    if (
+        isinstance(checked_at, bool)
+        or not isinstance(checked_at, int)
+        or checked_at > now + 5
+        or now - checked_at > BACKUP_NTFS_CHECK_EVIDENCE_TTL_SECONDS
+    ):
+        raise PermissionError("BACKUP NTFS check evidence is stale")
+    return evidence
+
+
+def _run_backup_ntfs_operation(
+    operation: str, parameters: dict[str, str] | None
+) -> dict[str, Any]:
+    plan = _backup_ntfs_operation_plan(operation, parameters)
+    consumed_check_evidence = (
+        _consume_backup_ntfs_check_evidence(parameters)
+        if operation == BACKUP_NTFS_CLEAR_DIRTY_OPERATION
+        else None
+    )
+    operator._require_operator_capability("privileged_reference")
+    operator._require_operator_mutation("terminal_execute", opaque_command=False)
+    justification = (
+        "Root-read-only ntfsfix check for the exact configured BACKUP volume before any filesystem metadata mutation."
+        if operation == BACKUP_NTFS_CHECK_OPERATION
+        else "Clear only the NTFS dirty flag on the exact configured BACKUP volume after separate root check evidence; no force mount."
+    )
+    invocation = _invoke_mainpid_privileged_action(
+        action=str(plan["privileged_action"]),
+        target=str(plan["target"]),
+        justification=justification,
+    )
+    check_evidence = (
+        _record_backup_ntfs_check_evidence(invocation)
+        if operation == BACKUP_NTFS_CHECK_OPERATION
+        else None
+    )
+    audit = {
+        "timestamp_unix": int(time.time()),
+        "operation": "named-operation-run",
+        "recipe": operation,
+        "typed_builtin": True,
+        "parameters_sha256": plan["parameters_sha256"],
+        "privileged_action": invocation["action"],
+        "reference_sha256": invocation["reference_sha256"],
+        "request_id": invocation["request_id"],
+        "success": invocation["success"],
+        "outcome": invocation["outcome"],
+        "timed_out": invocation["timed_out"],
+        "broker_returncode": (
+            invocation["broker_response"].get("returncode")
+            if isinstance(invocation["broker_response"], dict)
+            else None
+        ),
+        "response_sha256": invocation["response_sha256"],
+    }
+    try:
+        base._append_audit(audit)
+        audit["secondary_audit_recorded"] = True
+    except Exception as exc:
+        audit["secondary_audit_recorded"] = False
+        audit["secondary_audit_error_type"] = type(exc).__name__
+    return {
+        "operation": operation,
+        "success": invocation["success"],
+        "failed_phase": None if invocation["success"] else "action",
+        "typed_builtin": True,
+        "effect": plan["effect"],
+        "check_evidence": check_evidence,
+        "consumed_check_evidence": consumed_check_evidence,
+        "results": [{
+            "phase": "action",
+            "target": "local",
+            "typed_action": invocation["action"],
+            "outcome": invocation,
+        }],
+        "rollback": {"attempted": False, "success": True, "reason": plan["rollback"]},
+        "audit": audit,
+    }
+
+
 def _run_fleet_registry_mutation(parameters: dict[str, str] | None) -> dict[str, Any]:
     plan = fleet_mutation.plan_registry_mutation(parameters)
     public = plan["public"]
@@ -248,8 +537,12 @@ def grabowski_operation_list() -> dict[str, Any]:
     """List validated named operations."""
     operator._require_operator_capability("terminal_execute")
     raw = _load()
-    if FLEET_MUTATION_OPERATION in raw["operations"]:
-        raise ValueError("Operations registry shadows reserved Fleet mutation operation")
+    shadowed = RESERVED_TYPED_OPERATIONS.intersection(raw["operations"])
+    if shadowed:
+        raise ValueError(
+            "Operations registry shadows reserved typed operation: "
+            + ", ".join(sorted(shadowed))
+        )
     operations = {}
     for name in sorted(raw["operations"]):
         operation = _validated(name)
@@ -267,6 +560,18 @@ def grabowski_operation_list() -> dict[str, Any]:
         "step_count": 1,
         "typed_builtin": True,
     }
+    for name, spec in BACKUP_NTFS_TYPED_OPERATIONS.items():
+        operations[name] = {
+            "description": spec["description"],
+            "parameters": (
+                []
+                if name == BACKUP_NTFS_CHECK_OPERATION
+                else ["check_response_sha256"]
+            ),
+            "step_count": 1,
+            "typed_builtin": True,
+            "effect": spec["effect"],
+        }
     return {"path": str(OPERATIONS_CONFIG), "operations": operations}
 
 
@@ -277,6 +582,8 @@ def grabowski_operation_plan(operation: str,
     operator._require_operator_capability("terminal_execute")
     if operation == FLEET_MUTATION_OPERATION:
         return fleet_mutation.plan_registry_mutation(parameters)["public"]
+    if operation in BACKUP_NTFS_TYPED_OPERATIONS:
+        return _backup_ntfs_operation_plan(operation, parameters)
     return _render(operation, parameters)
 
 
@@ -286,6 +593,8 @@ def grabowski_operation_run(operation: str,
     """Run preflight, action and postflight, then rollback after a failure."""
     if operation == FLEET_MUTATION_OPERATION:
         return _run_fleet_registry_mutation(parameters)
+    if operation in BACKUP_NTFS_TYPED_OPERATIONS:
+        return _run_backup_ntfs_operation(operation, parameters)
     plan = _render(operation, parameters)
     for target in sorted({step["target"] for step in plan["steps"]}):
         operator._require_operator_mutation(
