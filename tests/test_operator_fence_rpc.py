@@ -298,7 +298,10 @@ class OperatorFenceRpcTests(unittest.TestCase):
     def test_documented_production_identity_boundary_is_not_self_mutable(self) -> None:
         text = (ROOT / "docs" / "operator-fence-heimberry-v1.md").read_text(encoding="utf-8")
         self.assertIn("/var/lib/operator-fence-home/", text)
-        self.assertIn("root:root 0600", text)
+        self.assertIn("root:operator-fence 0750", text)
+        self.assertIn("root:operator-fence 0640", text)
+        self.assertIn("StrictModes", text)
+        self.assertIn("no write bit", text)
         self.assertIn("/var/lib/operator-fence/", text)
         self.assertIn("operator-fence:operator-fence 0700", text)
         self.assertIn(
