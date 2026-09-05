@@ -69,7 +69,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z")
-_GITHUB_ID_NOREPLY_CUTOFF = datetime(2017, 7, 18, tzinfo=timezone.utc)
+_GITHUB_ID_NOREPLY_CUTOFF = datetime(2017, 7, 19, tzinfo=timezone.utc)
 _GITHUB_SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?github\.com:(?P<path>[^?#\s]+)\Z", re.IGNORECASE)
 _MERGE_GUARD_TTL_SECONDS = 300
 _MERGE_GUARD_MAX_CHANGED_PATHS = 3000

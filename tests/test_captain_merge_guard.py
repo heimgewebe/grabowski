@@ -1027,9 +1027,54 @@ class CaptainPrivatePlanCasFallbackTests(unittest.TestCase):
         self.assertEqual([_CAS_TREE, _CAS_TREE], observed_trees)
         self.assertNotEqual(merge_calls[0], merge_calls[1])
 
+    def test_real_git_merge_tree_is_invariant_under_provider_commit_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "user.name", "Base Author")
+            _git(repo, "config", "user.email", "base@example.invalid")
+            (repo / "base.txt").write_text("base\n", encoding="utf-8")
+            _git(repo, "add", "base.txt")
+            _git(repo, "commit", "-q", "-m", "base")
+            base_sha = _git(repo, "rev-parse", "HEAD")
+
+            _git(repo, "checkout", "-q", "-b", "feature")
+            (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+            _git(repo, "add", "feature.txt")
+            _git(repo, "commit", "-q", "-m", "feature")
+            head_sha = _git(repo, "rev-parse", "HEAD")
+
+            merge_shas: list[str] = []
+            merge_trees: list[str] = []
+            for name, email in (
+                ("captain-one", "1001+captain-one@users.noreply.github.com"),
+                ("captain-two", "1002+captain-two@users.noreply.github.com"),
+            ):
+                _git(repo, "checkout", "-q", "--detach", base_sha)
+                _git(
+                    repo,
+                    "-c",
+                    f"user.name={name}",
+                    "-c",
+                    f"user.email={email}",
+                    "merge",
+                    "--no-ff",
+                    "-q",
+                    "-m",
+                    "provider identity invariant",
+                    head_sha,
+                )
+                merge_shas.append(_git(repo, "rev-parse", "HEAD"))
+                merge_trees.append(_git(repo, "rev-parse", "HEAD^{tree}"))
+                parents = _git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()
+                self.assertEqual([base_sha, head_sha], parents[1:])
+
+            self.assertEqual(merge_trees[0], merge_trees[1])
+            self.assertNotEqual(merge_shas[0], merge_shas[1])
+
     def test_exact_base_cas_fails_closed_without_proven_github_noreply_identity(self) -> None:
         git = _ScriptedCasGit()
-        github = _AuthenticatedUserGh(created_at="2016-01-02T03:04:05Z")
+        github = _AuthenticatedUserGh(created_at="2017-07-18T23:59:59Z")
         with self.assertRaisesRegex(
             RuntimeError, "cannot resolve provider-compatible GitHub commit identity"
         ):
