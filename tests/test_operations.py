@@ -94,7 +94,7 @@ class BackupNtfsOperationTests(unittest.TestCase):
             )
             self.assertEqual(
                 result["operations"][operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION]["effect"],
-                "filesystem_metadata_write",
+                "filesystem_repair_write",
             )
 
             path.write_text(
@@ -138,6 +138,8 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertEqual(clear["target"], "clear-dirty")
         self.assertEqual(check["execution"], "operator-mainpid-direct-rootbroker")
         self.assertEqual(clear["parameter_names"], ["check_response_sha256"])
+        self.assertEqual(clear["effect"], "filesystem_repair_write")
+        self.assertIn("ntfsfix -d repair/clear-dirty", clear["description"])
         with self.assertRaisesRegex(ValueError, "parameter mismatch"):
             operations._backup_ntfs_operation_plan(
                 operations.BACKUP_NTFS_CHECK_OPERATION, {"device": "/dev/sda1"}
@@ -235,6 +237,8 @@ class BackupNtfsOperationTests(unittest.TestCase):
             "response_sha256": "e" * 64,
             "reference_sha256": "f" * 64,
             "root_audit_sha256": "1" * 64,
+            "write_admissible": True,
+            "check_returncode": 0,
         }
         with patch.object(
             operations.time, "time", return_value=1001
@@ -250,7 +254,7 @@ class BackupNtfsOperationTests(unittest.TestCase):
                 {"check_response_sha256": "e" * 64},
             )
         self.assertTrue(result["success"])
-        self.assertEqual(result["effect"], "filesystem_metadata_write")
+        self.assertEqual(result["effect"], "filesystem_repair_write")
         self.assertFalse(result["rollback"]["attempted"])
         capability.assert_called_once_with("privileged_reference")
         mutation.assert_called_once_with("terminal_execute", opaque_command=False)
@@ -277,6 +281,26 @@ class BackupNtfsOperationTests(unittest.TestCase):
             operations, "_invoke_mainpid_privileged_action"
         ) as invoke:
             with self.assertRaisesRegex(PermissionError, "exact latest BACKUP NTFS check"):
+                operations._run_backup_ntfs_operation(
+                    operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION,
+                    {"check_response_sha256": "e" * 64},
+                )
+        invoke.assert_not_called()
+        self.assertIsNone(operations._BACKUP_NTFS_LAST_CHECK)
+
+    def test_failed_check_evidence_cannot_authorize_repair_write(self) -> None:
+        operations._BACKUP_NTFS_LAST_CHECK = {
+            "checked_at_unix": 1000,
+            "response_sha256": "e" * 64,
+            "reference_sha256": "f" * 64,
+            "root_audit_sha256": "1" * 64,
+            "write_admissible": False,
+            "check_returncode": 1,
+        }
+        with patch.object(operations.time, "time", return_value=1001), patch.object(
+            operations, "_invoke_mainpid_privileged_action"
+        ) as invoke:
+            with self.assertRaisesRegex(PermissionError, "did not authorize repair write"):
                 operations._run_backup_ntfs_operation(
                     operations.BACKUP_NTFS_CLEAR_DIRTY_OPERATION,
                     {"check_response_sha256": "e" * 64},
@@ -361,6 +385,8 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["check_evidence"]["response_sha256"], "d" * 64)
         self.assertRegex(result["check_evidence"]["root_audit_sha256"], r"[0-9a-f]{64}")
+        self.assertTrue(result["check_evidence"]["write_admissible"])
+        self.assertEqual(result["check_evidence"]["check_returncode"], 0)
         self.assertFalse(result["audit"]["secondary_audit_recorded"])
         self.assertEqual(result["audit"]["secondary_audit_error_type"], "RuntimeError")
 
