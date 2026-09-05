@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "150c5a44bea573b1edf080519432aaa985771552f53c89698cc742494829b8f0",
+  "capability_source_sha256": "c89aa9c07dd4ac22cdbfd893aef19d6b4f47f5a7b3deee70057d3b375fc08ccd",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "46181c6c4588c9d8bb4f5d43d3d260abf5306fce8dd7abf4cb4aa2aed614d3fd",
   "integrity": {
@@ -1345,7 +1345,7 @@
         "command-dependent"
       ],
       "id": "grabowski_task_start",
-      "purpose": "Start a persistent local or fleet task in its own systemd unit.",
+      "purpose": "Start a persistent local or fleet task, or return a pre-dispatch typed-read reroute before persistence.",
       "read_only": false,
       "reversibility": "cancel-or-command-dependent",
       "risk_class": "variable",
