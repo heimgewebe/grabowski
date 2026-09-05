@@ -7,8 +7,12 @@ Grabowski-Runtime, erhält aber einen eigenen Principal, getrennte Secrets und
 eine serverseitig erzwungene Least-Privilege-Toolpolicy.
 
 ```text
-Grok
-  -> stable HTTPS tunnel
+Grok / Grok Custom Connector
+  -> public HTTPS
+  -> wg-prod-1 Tailscale Funnel :10000
+  -> 127.0.0.1:18091 public bridge
+       transparent TCP only; no credentials or MCP policy
+  -> TLS to heim-pc.tail6dbb90.ts.net:10000
   -> grabowski-external-connector-maulwurf-x (127.0.0.1:18184)
        external credential only
        tool projection
@@ -64,6 +68,26 @@ Dadurch bestehen zwei unabhängige Schranken:
 2. **Authority Gate:** Grabowski führt nur die Allowlist aus und prüft zusätzlich
    die Read-only-Semantik.
 
+### 4. Public Bridge auf wg-prod-1
+
+Der Bridge-Layer ist absichtlich **keine** weitere Security-Authority. Er kennt
+weder HTTP-Header noch MCP-Methoden, Toolnamen oder Credentials. Er transportiert
+nur Bytes von seinem Loopback-Listener zu einem TLS-verifizierten heim-pc-Funnel.
+Insbesondere liegen auf wg-prod-1 keine Maulwurf-X-Tokenbytes.
+
+Die kanonischen Artefakte sind:
+
+- `tools/grabowski_maulwurf_x_public_bridge.py`;
+- `systemd/maulwurf-x-public-bridge.service.example`;
+- `tools/install_maulwurf_x_public_bridge.py`.
+
+Der Bridge-Prozess löst `heim-pc.tail6dbb90.ts.net` normal auf und pinnt keine
+Tailnet-IP. TLS wird mit dem System-Truststore und genau diesem Servernamen
+verifiziert. Verbindungen haben einen begrenzten Connect-Timeout, einen
+verbindungsweiten Idle-Timeout, eine Half-Close-Frist, begrenzte Stream-Puffer
+und eine globale Parallelitätsgrenze. Der systemd-Dienst begrenzt zusätzlich
+Dateideskriptoren, Tasks und Speicher.
+
 ## Policy-Contract
 
 Beispiel:
@@ -113,7 +137,7 @@ Die Aktivierung muss in dieser Reihenfolge erfolgen:
    `required-v1` und Modus `0600` anlegen.
 6. `grabowski-transport-ingress-maulwurf-x.service` **enable + start** und lokal prüfen.
 7. `grabowski-external-connector-maulwurf-x.service` **enable + start** und lokal prüfen.
-8. Erst nach lokalem Negativ-/Positivtest einen stabilen HTTPS-Tunnel auf
+8. Erst nach lokalem Negativ-/Positivtest den öffentlichen HTTPS-Pfad auf
    `127.0.0.1:18184` schalten.
 9. Grok-Connector unter dem Namen **Maulwurf X** anlegen.
 
@@ -127,6 +151,99 @@ Gateway. `PartOf` propagiert Stop/Restart nach unten. Damit bleiben normale
 Grabowski-Deployments restartfest, ohne dass ein nicht provisionierter Maulwurf X
 den primären Connector als Pflichtabhängigkeit belastet.
 
+## Öffentlicher HTTPS-Pfad
+
+### Bevorzugte Architektur
+
+Wenn der direkte Funnel auf heim-pc von **öffentlichen Tailscale-Funnel-
+Ingress-Nodes** zuverlässig TLS und MCP transportiert, ist der kürzere Pfad
+bevorzugt:
+
+```text
+Internet -> heim-pc Funnel :10000 -> 127.0.0.1:18184
+```
+
+Er erzeugt weniger Komponenten und damit weniger Betriebsfläche.
+
+### Kanonischer Fallback
+
+Wenn der direkte heim-pc-Funnel extern TLS-EOF-Fehler zeigt, obwohl er innerhalb
+des Tailnets funktioniert, wird der belegbar funktionierende wg-prod-1-Pfad
+verwendet:
+
+```text
+Internet
+  -> https://wg-prod-1.tail6dbb90.ts.net:10000/mcp
+  -> Tailscale Funnel :10000
+  -> http://127.0.0.1:18091
+  -> maulwurf-x-public-bridge.service
+  -> TLS https://heim-pc.tail6dbb90.ts.net:10000
+  -> heim-pc Funnel :10000
+  -> http://127.0.0.1:18184/mcp
+```
+
+Port `8443` auf wg-prod-1 gehört einem anderen Funnel und wird von diesem Vertrag
+**nicht** verändert. Auch der Installer verändert keinerlei Tailscale
+Serve-/Funnel-Konfiguration. Die Funnel-Konfiguration wird separat und immer nach
+frischem vollständigem `tailscale serve status` verwaltet.
+
+### Installation auf wg-prod-1
+
+Die drei versionierten Artefakte werden commitgebunden auf wg-prod-1 in einen
+temporären, nicht geheimen Staging-Pfad übertragen. Dort wird ausgeführt:
+
+```text
+python3 tools/install_maulwurf_x_public_bridge.py --source-root <staging-root> --activate
+```
+
+Der Installer schreibt deterministisch nach:
+
+- `~/.local/libexec/grabowski/grabowski_maulwurf_x_public_bridge.py`;
+- `~/.config/systemd/user/maulwurf-x-public-bridge.service`.
+
+Er ist idempotent, benötigt kein `sudo`, erzeugt keine Credentials, führt keine
+Secret-Transformation aus und gibt nur Pfade, Hashes und systemd-Readback aus.
+Für Logout-Festigkeit muss für den Benutzer bereits systemd-Linger aktiviert
+sein; Linger ist eine Hostvoraussetzung und wird nicht vom Installer verändert.
+
+## Grok-Auth
+
+Der vorhandene `tunnel-client-grabowski` ist OpenAI-spezifisch und wird für
+Maulwurf X nicht wiederverwendet. Das Gateway unterstützt als schmalen Vertrag
+Bearer-Header und `X-API-Key`. An Grok geht ausschließlich das **externe**
+Maulwurf-X-Credential. Das interne
+`transport-connectors/maulwurf-x.token` verlässt heim-pc nie.
+
+Die konkrete Authentisierungsart wird gegen die jeweils aktuelle Grok-Connector-
+Oberfläche abgenommen. OAuth wird **nicht vorsorglich** gebaut. Falls die reale
+Grok-App ausschließlich OAuth akzeptiert, ist das ein separater Adapter-Slice an
+der äußeren Gateway-Grenze; interne Grabowski-Identität und Toolpolicy bleiben
+unverändert.
+
+## Restart- und Recovery-Abnahme
+
+Vor Consumer-Cutover werden mindestens folgende Punkte frisch geprüft:
+
+1. `maulwurf-x-public-bridge.service` ist loaded, enabled, active und ohne
+   unerklärte Restarts;
+2. Service-Restart führt wieder zu genau einem Listener auf `127.0.0.1:18091`;
+3. systemd-Linger für den Benutzer ist aktiv;
+4. keine manuell gestartete oder verwaiste Bridge-Instanz existiert;
+5. wg-prod-1 Funnel `:10000` zeigt auf `http://127.0.0.1:18091`, während
+   bestehende andere Funnel unverändert bleiben;
+6. heim-pc Gateway und signed ingress laufen auf `18184` bzw. `18183`;
+7. öffentliches `/mcp` ohne Credential liefert `401` bei gültiger TLS-Prüfung;
+8. authentifiziertes MCP `initialize` und `tools/list` funktionieren;
+9. `tools/list` enthält exakt die Maulwurf-X-Allowlist;
+10. ein nicht erlaubtes Tool bleibt serverseitig verweigert;
+11. nach Restart des Maulwurf-X-Gateways ist derselbe öffentliche E2E-Pfad
+    wieder funktionsfähig.
+
+Ein Host-Reboot wird nur ausgeführt, wenn dadurch keine fremde aktive Arbeit
+gefährdet wird. Andernfalls bleibt der reale Reboot-Nachweis eine explizit
+registrierte Restobligation; Service-Restart, Linger und Boot-Enable werden
+bereits vorher geprüft.
+
 ## Abnahme
 
 Positive Beweise:
@@ -136,8 +253,10 @@ Positive Beweise:
 - `tools/list` enthält exakt die Maulwurf-X-Allowlist;
 - `grabowski_runtime_health` funktioniert über Maulwurf X;
 - Operator löst den Principal als `maulwurf-x` auf;
-- Neustart beider Services erhält die Funktion;
-- primärer ChatGPT-Connector bleibt unverändert funktionsfähig.
+- Neustart aller Maulwurf-X-Dienste erhält die Funktion;
+- primärer ChatGPT-Connector bleibt unverändert funktionsfähig;
+- finaler Grok-Custom-Connector beobachtet den zu diesem Zeitpunkt real
+  deployten Grabowski-Head.
 
 Negative Beweise:
 
@@ -151,34 +270,17 @@ Negative Beweise:
 - allowgelistetes Tool ohne explizites `readOnlyHint=true` -> Operator verweigert;
 - fehlende Principal-Policy bei aktivem Marker -> fail closed.
 
-## Öffentlicher Tunnel und Grok-Auth
-
-Der vorhandene `tunnel-client-grabowski` ist OpenAI-spezifisch und wird für
-Maulwurf X nicht wiederverwendet. Der Produktionspfad benötigt einen eigenen,
-providerneutralen, stabilen HTTPS-Endpunkt vor Port 18184.
-
-Auf dem Heim-PC ist Tailscale bereits vorhanden; `cloudflared` ist nicht
-installiert. Für den ersten produktiven Cutover ist deshalb ein **Tailscale
-Funnel auf HTTPS-Port 8443** der bevorzugte Pfad. Er benötigt keine
-Router-Portfreigabe und zeigt ausschließlich auf `http://127.0.0.1:18184`.
-Der Funnel wird erst nach den lokalen Positiv- und Negativtests aktiviert.
-
-Das Gateway unterstützt als schmalen ersten Vertrag Bearer-Header und
-`X-API-Key`. Die konkrete Grok-App-Authentisierungs-UX wird erst gegen die reale
-Grok-Oberfläche abgenommen. Vollständiges OAuth wird **nicht vorsorglich**
-gebaut. Falls Grok im realen Connector zwingend OAuth verlangt, ist das ein
-separater Adapter-Folgeschritt an der äußeren Gateway-Grenze; interne
-Grabowski-Identität und Toolpolicy bleiben unverändert.
-
 ## Rollback
 
 Der Rollback ist schichtweise und beschädigt den primären Connector nicht:
 
-1. öffentlichen Maulwurf-X-Tunnel stoppen;
-2. Gateway-Service stoppen/deaktivieren;
-3. sekundären signed-ingress-Service stoppen/deaktivieren;
-4. `maulwurf-x`-Secrets und Policy nur nach gesondertem Audit entfernen;
-5. `require-tool-policy` nur dann entfernen, wenn ausdrücklich auf den
+1. öffentlichen Maulwurf-X-Funnel auf dem betroffenen Host deaktivieren bzw. auf
+   den zuvor frisch gelesenen Zustand zurücksetzen;
+2. `maulwurf-x-public-bridge.service` auf wg-prod-1 stoppen/deaktivieren;
+3. Gateway-Service auf heim-pc stoppen/deaktivieren;
+4. sekundären signed-ingress-Service stoppen/deaktivieren;
+5. `maulwurf-x`-Secrets und Policy nur nach gesondertem Audit entfernen;
+6. `require-tool-policy` nur dann entfernen, wenn ausdrücklich auf den
    Legacy-Modus zurückgerollt werden soll.
 
 Ein Maulwurf-X-Ausfall darf weder `primary.token`, den OpenAI-Tunnel noch den
