@@ -1363,12 +1363,12 @@ class OperatorContractTests(unittest.TestCase):
         operator_tools = assignments["OPERATOR_CAPABILITY_REQUIREMENT_TOOLS"]
         self.assertEqual(
             requirements["grabowski_bureau_pickup_execute"],
-            ("resource_lease", "bureau_mutation"),
+            ("bureau_mutation", "resource_lease"),
         )
         self.assertEqual(requirements["grabowski_bureau_pickup_status"], ())
         self.assertEqual(
             requirements["grabowski_bureau_pickup_release"],
-            ("resource_lease", "bureau_mutation"),
+            ("bureau_mutation", "resource_lease"),
         )
         self.assertIn("grabowski_bureau_pickup_execute", operator_tools)
         self.assertIn("grabowski_bureau_pickup_release", operator_tools)
