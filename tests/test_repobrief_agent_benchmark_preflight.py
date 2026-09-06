@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import importlib.util
@@ -26,6 +26,21 @@ sys.modules[SPEC.name] = support
 SPEC.loader.exec_module(support)
 
 _ORIGINAL_EXECUTE_PREFLIGHT = support.preflight.execute_preflight
+_TEST_PROVIDER_BINDING_ISSUED_AT: dict[Path, str] = {}
+
+
+def _test_provider_binding_issued_at(state_root: Path) -> str:
+    key = state_root.expanduser().resolve()
+    issued_at = _TEST_PROVIDER_BINDING_ISSUED_AT.get(key)
+    if issued_at is None:
+        issued_at = (
+            datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        _TEST_PROVIDER_BINDING_ISSUED_AT[key] = issued_at
+    return issued_at
 
 
 def _fake_claude(
@@ -75,9 +90,7 @@ def _execute_with_test_provider_binding(*args, **kwargs):
         credential.chmod(0o600)
         executable = Path(kwargs["claude"]).expanduser().resolve()
         nonce = "ab" * 16
-        issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-            "+00:00", "Z"
-        )
+        issued_at = _test_provider_binding_issued_at(state_root)
         kwargs["claude_credential_file"] = credential
         kwargs["claude_command_sha256"] = hashlib.sha256(
             executable.read_bytes()
@@ -858,6 +871,33 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
                 support.preflight.PreflightError, "blocks retry"
             ):
                 _execute_with_test_provider_binding(**kwargs)
+
+    def test_ambiguous_launch_retry_keeps_test_authorization_across_clock_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            kwargs = _preflight_kwargs(root, environment)
+            error = support.preflight.runner.RunnerError(
+                "provider process launch outcome is unknown"
+            )
+            real_datetime = datetime
+            first_tick = real_datetime.now(timezone.utc).replace(microsecond=0)
+            second_tick = first_tick + timedelta(seconds=1)
+            with mock.patch(f"{__name__}.datetime") as clock:
+                clock.now.side_effect = [first_tick, second_tick]
+                with mock.patch.object(
+                    support.preflight._core.runner, "execute", side_effect=error
+                ):
+                    with self.assertRaisesRegex(
+                        support.preflight.runner.RunnerError, "outcome is unknown"
+                    ):
+                        _execute_with_test_provider_binding(**kwargs)
+                with self.assertRaisesRegex(
+                    support.preflight.PreflightError,
+                    "prior or ambiguous attempt blocks retry",
+                ):
+                    _execute_with_test_provider_binding(**kwargs)
+            self.assertEqual(clock.now.call_count, 1)
 
     def test_budget_stop_preserves_observed_overshoot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
