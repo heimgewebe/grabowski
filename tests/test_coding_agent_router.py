@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,11 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.catalog_path = self.root / "catalog.json"
         self.state_path = self.root / "state.json"
+        self.claude_auth_root = self.root / "claude-auth"
+        self.claude_auth_root.mkdir(mode=0o700)
+        self.claude_credential = self.claude_auth_root / ".credentials.json"
+        self.claude_credential.write_bytes(b'{"fixture":"credential"}\n')
+        self.claude_credential.chmod(0o600)
         self.catalog = json.loads(
             (ROOT / "config" / "coding-agent-catalog.json").read_text(encoding="utf-8")
         )
@@ -37,6 +43,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                 router.CATALOG_ENV: str(self.catalog_path),
                 router.CATALOG_OVERRIDE_ENV: "1",
                 router.STATE_ENV: str(self.state_path),
+                router.CLAUDE_AUTH_ROOT_ENV: str(self.claude_auth_root),
             },
             clear=False,
         )
@@ -236,6 +243,75 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(health["ready"])
         self.assertEqual(health["source"], "environment-override")
         self.assertIn("plan-mode route must be review_only", health["error"])
+
+    def test_catalog_credential_commitment_is_nonce_bound_and_opaque(self) -> None:
+        first_nonce = bytes.fromhex("11" * 16)
+        second_nonce = bytes.fromhex("22" * 16)
+        fixed_time = datetime(2026, 9, 6, 4, 0, tzinfo=timezone.utc)
+        with (
+            mock.patch.object(router.os, "urandom", side_effect=[first_nonce, second_nonce]),
+            mock.patch.object(router, "_utc_now", return_value=fixed_time),
+        ):
+            first = router.grabowski_coding_agent_catalog(include_disabled=True)
+            second = router.grabowski_coding_agent_catalog(include_disabled=True)
+        first_commitment = first["claude_credential_commitment"]
+        second_commitment = second["claude_credential_commitment"]
+        raw_digest = hashlib.sha256(self.claude_credential.read_bytes()).hexdigest()
+        self.assertEqual(first_commitment["status"], "ready")
+        self.assertEqual(first_commitment["nonce"], "11" * 16)
+        self.assertEqual(first_commitment["generated_at"], "2026-09-06T04:00:00Z")
+        self.assertFalse(first_commitment["credential_digest_public"])
+        self.assertNotIn(raw_digest, json.dumps(first_commitment, sort_keys=True))
+        self.assertNotEqual(
+            first_commitment["commitment_sha256"],
+            second_commitment["commitment_sha256"],
+        )
+        self.assertEqual(first["inventory_sha256"], second["inventory_sha256"])
+
+
+    def test_catalog_credential_commitment_rejects_symlink(self) -> None:
+        target = self.claude_auth_root / "target.json"
+        target.write_bytes(self.claude_credential.read_bytes())
+        target.chmod(0o600)
+        self.claude_credential.unlink()
+        self.claude_credential.symlink_to(target)
+        commitment = router.grabowski_coding_agent_catalog(include_disabled=True)[
+            "claude_credential_commitment"
+        ]
+        self.assertEqual(commitment["status"], "unavailable")
+
+    def test_catalog_credential_commitment_rejects_foreign_owner_identity(self) -> None:
+        with mock.patch.object(router.os, "getuid", return_value=os.getuid() + 1):
+            commitment = router.grabowski_coding_agent_catalog(include_disabled=True)[
+                "claude_credential_commitment"
+            ]
+        self.assertEqual(commitment["status"], "unavailable")
+
+    def test_catalog_credential_commitment_rejects_read_identity_race(self) -> None:
+        stable = self.claude_credential.stat()
+        changed = mock.Mock(
+            st_dev=stable.st_dev,
+            st_ino=stable.st_ino,
+            st_mode=stable.st_mode,
+            st_uid=stable.st_uid,
+            st_gid=stable.st_gid,
+            st_nlink=stable.st_nlink,
+            st_size=stable.st_size,
+            st_mtime_ns=stable.st_mtime_ns + 1,
+        )
+        with mock.patch.object(router.os, "fstat", side_effect=[stable, changed]):
+            commitment = router._claude_credential_commitment()
+        self.assertEqual(commitment["status"], "unavailable")
+
+    def test_catalog_credential_commitment_fails_closed_for_open_mode(self) -> None:
+        self.claude_credential.chmod(0o644)
+        result = router.grabowski_coding_agent_catalog(include_disabled=True)
+        commitment = result["claude_credential_commitment"]
+        self.assertEqual(commitment["status"], "unavailable")
+        self.assertEqual(
+            commitment["reason_code"], "canonical_credential_unavailable_or_invalid"
+        )
+        self.assertFalse(commitment["credential_digest_public"])
 
     def test_catalog_declares_correct_quality_and_effort_hierarchy(self) -> None:
         result = router.grabowski_coding_agent_catalog(include_disabled=True)
