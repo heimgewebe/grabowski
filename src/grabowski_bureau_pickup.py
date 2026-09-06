@@ -6689,9 +6689,11 @@ def _orphan_prior_failure_proves_no_effect(
     if payload.get("reason_codes") != ["release-registry-identity-mismatch"]:
         return None
     runtime_identity = payload.get("runtime_identity")
+    if not isinstance(runtime_identity, dict):
+        return None
     if (
-        not isinstance(runtime_identity, dict)
-        or runtime_identity.get("status") != "stale-runtime-blocked"
+        "status" in runtime_identity
+        and runtime_identity.get("status") != "stale-runtime-blocked"
     ):
         return None
     compatibility = runtime_identity.get("compatibility")
