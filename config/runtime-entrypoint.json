@@ -783,16 +783,14 @@
         "read_state",
         "navigate",
         "scroll_into_view",
-        "activate",
-        "submit_maulwurfx_proposal_e2e"
+        "activate"
       ],
       "uncovered_intents": {},
       "public_target_contract": "opaque-handles-and-validated-navigation-targets",
       "implemented_effect_classes": [
         "read",
         "local_ui",
-        "network_navigation",
-        "bounded_external_submit"
+        "network_navigation"
       ],
       "fail_closed_effect_classes": [
         "reversible_external",

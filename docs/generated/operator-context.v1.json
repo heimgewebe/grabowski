@@ -55,8 +55,7 @@
       "implemented_effect_classes": [
         "read",
         "local_ui",
-        "network_navigation",
-        "bounded_external_submit"
+        "network_navigation"
       ],
       "operations": [
         "observe",
@@ -68,8 +67,7 @@
         "read_state",
         "navigate",
         "scroll_into_view",
-        "activate",
-        "submit_maulwurfx_proposal_e2e"
+        "activate"
       ],
       "tool": "grabowski_browser_worker_semantic",
       "uncovered_intents": {}
@@ -3592,7 +3590,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b8cf2ed76104b2b6e7e3d21571678d579e0bbd2b8712dc25bfb691253c4f1c19"
+      "sha256": "489c0901982d7f6b4c61ba9b1bea7994c955b3b8d5e8f43a98b21627d1ef3170"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {

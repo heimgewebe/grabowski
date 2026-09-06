@@ -238,13 +238,7 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
         self.assertEqual(
             browser["semantic_gateway"]["supported_intents"],
-            [
-                "read_state",
-                "navigate",
-                "scroll_into_view",
-                "activate",
-                "submit_maulwurfx_proposal_e2e",
-            ],
+            ["read_state", "navigate", "scroll_into_view", "activate"],
         )
         self.assertEqual(browser["semantic_gateway"]["uncovered_intents"], {})
         self.assertEqual(
@@ -253,7 +247,7 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         )
         self.assertEqual(
             browser["semantic_gateway"]["implemented_effect_classes"],
-            ["read", "local_ui", "network_navigation", "bounded_external_submit"],
+            ["read", "local_ui", "network_navigation"],
         )
         self.assertEqual(
             browser["semantic_gateway"]["fail_closed_effect_classes"],
@@ -290,49 +284,42 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         ]
         self.assertEqual(
             semantic["supported_intents"],
-            [
-                "read_state",
-                "navigate",
-                "scroll_into_view",
-                "activate",
-                "submit_maulwurfx_proposal_e2e",
-            ],
-        )
-        for compatible in (
-            ["read_state", "navigate", "scroll_into_view"],
             ["read_state", "navigate", "scroll_into_view", "activate"],
-        ):
-            with self.subTest(compatible=compatible):
-                compatible_manifest = self.staged.manifest()
-                compatible_semantic = compatible_manifest["entrypoint_contract"][
-                    "browser_operator_default"
-                ]["semantic_gateway"]
-                compatible_semantic["supported_intents"] = compatible
-                compatible_semantic["implemented_effect_classes"] = [
-                    "read", "local_ui", "network_navigation"
-                ]
-                self.assertEqual(
-                    deploy_runtime.validate_manifest_schema(compatible_manifest), []
-                )
-                self.assertTrue(
-                    grabowski_mcp._manifest_schema_valid(compatible_manifest)
-                )
+        )
+        semantic["supported_intents"] = [
+            "read_state",
+            "navigate",
+            "scroll_into_view",
+        ]
+
+        self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
+        self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
+
+    def test_validator_accepts_staged_maulwurfx_submit_contract_for_two_phase_rollout(self) -> None:
+        manifest = self.staged.manifest()
+        semantic = manifest["entrypoint_contract"]["browser_operator_default"][
+            "semantic_gateway"
+        ]
+        current_intents = [
+            "read_state",
+            "navigate",
+            "scroll_into_view",
+            "activate",
+        ]
+        current_effects = ["read", "local_ui", "network_navigation"]
+        staged_intents = [*current_intents, "submit_maulwurfx_proposal_e2e"]
+        staged_effects = [*current_effects, "bounded_external_submit"]
+        self.assertEqual(semantic["supported_intents"], current_intents)
+        self.assertEqual(semantic["implemented_effect_classes"], current_effects)
+
+        semantic["supported_intents"] = staged_intents
+        semantic["implemented_effect_classes"] = staged_effects
+        self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
+        self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
 
         for mismatched_intents, mismatched_effects in (
-            (
-                ["read_state", "navigate", "scroll_into_view", "activate"],
-                [
-                    "read", "local_ui", "network_navigation",
-                    "bounded_external_submit",
-                ],
-            ),
-            (
-                [
-                    "read_state", "navigate", "scroll_into_view", "activate",
-                    "submit_maulwurfx_proposal_e2e",
-                ],
-                ["read", "local_ui", "network_navigation"],
-            ),
+            (current_intents, staged_effects),
+            (staged_intents, current_effects),
         ):
             with self.subTest(
                 mismatched_intents=mismatched_intents,

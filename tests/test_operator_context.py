@@ -381,13 +381,7 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         self.assertEqual(browser["semantic_gateway"]["operations"], ["observe", "act"])
         self.assertEqual(
             browser["semantic_gateway"]["supported_intents"],
-            [
-                "read_state",
-                "navigate",
-                "scroll_into_view",
-                "activate",
-                "submit_maulwurfx_proposal_e2e",
-            ],
+            ["read_state", "navigate", "scroll_into_view", "activate"],
         )
         self.assertEqual(browser["semantic_gateway"]["uncovered_intents"], {})
         self.assertEqual(
@@ -396,7 +390,7 @@ print(json.dumps(runtime.resolve_host_capability({intent!r}), sort_keys=True))
         )
         self.assertEqual(
             browser["semantic_gateway"]["implemented_effect_classes"],
-            ["read", "local_ui", "network_navigation", "bounded_external_submit"],
+            ["read", "local_ui", "network_navigation"],
         )
         self.assertFalse(
             browser["semantic_gateway"]["ambiguous_effect_retry_authorized"]
