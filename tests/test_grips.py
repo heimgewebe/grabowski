@@ -8945,6 +8945,45 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         return QueueRaceGh()
 
+    def _exact_cas_success_evidence(self, **overrides: object) -> dict[str, object]:
+        evidence: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski_exact_base_git_cas_merge",
+            "repository": "heimgewebe/grabowski",
+            "base_branch": "main",
+            "base_sha": CAPTAIN_BASE_SHA,
+            "head_sha": CAPTAIN_HEAD,
+            "head_branch": "feat/captain",
+            "pull_request": 96,
+            "protected_base_force_push": False,
+            "head_branch_delete_with_expected_old_lease": True,
+            "atomic_base_update_and_head_delete": True,
+            "base_update_mode": "fast_forward_no_force",
+            "verified_fast_forward_from_expected_base": True,
+            "merge_sha": "b" * 40,
+            "merge_tree_sha": "c" * 40,
+            "base_ref_readback_proven": True,
+            "head_branch_delete_readback_proven": True,
+            "commit_identity": {"status": "resolved"},
+            "status": "pushed_and_read_back",
+            "stages": [],
+        }
+        evidence.update(overrides)
+        return evidence
+
+    def _exact_cas_parameters(self) -> dict[str, object]:
+        action = captain_action()
+        action["scope"] = {
+            "allowed_effects": [
+                "merge pull request 96 into main",
+                "branch-deletion",
+            ],
+            "forbidden_effects": ["force-push"],
+            "boundaries": "single pull request in heimgewebe/grabowski",
+            "max_targets": 1,
+        }
+        return authorized_captain_run_parameters(actions=[action])
+
     def assert_blocked_gate_reason(self, result: dict[str, object], gate_id: str, fragment: str) -> None:
         gate = self.gate(result, gate_id)
         self.assertEqual("blocked", gate["status"])
@@ -11686,6 +11725,553 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(2, len(result["output"]["executions"][0]["verify_view_attempts"]))
         verification_checks = [check for check in result["receipt"]["checks"] if check["id"] == "post-execution-verification"]
         self.assertEqual("pass", verification_checks[-1]["status"])
+
+    def test_exact_base_cas_reconciles_closed_pr_from_atomic_readback(self) -> None:
+        parameters = self._exact_cas_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_updates_view=False,
+        )
+        closed_view = dict(gh.view, state="CLOSED", mergedAt=None, mergeCommit=None)
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            gh.view = closed_view
+            return (
+                {
+                    "returncode": 0,
+                    "stdout": "merged via exact-base Git CAS\n",
+                    "stderr": "",
+                },
+                self._exact_cas_success_evidence(),
+            )
+
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ), patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("executed", result["output"]["decision"])
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["execution_attempted"])
+        self.assertTrue(execution["verification_passed"])
+        self.assertTrue(execution["remote_mutation_observed"])
+        self.assertTrue(execution["merge_completion_verified"])
+        self.assertEqual(
+            "exact_base_git_cas_base_readback_after_closed_pr_metadata",
+            execution["merge_reconciliation"],
+        )
+        reconciliation = execution["post_merge_reconciliation"]
+        self.assertEqual(
+            "verified_base_mutation_pr_metadata_unsettled",
+            reconciliation["status"],
+        )
+        self.assertFalse(reconciliation["github_pr_merged_metadata_verified"])
+        self.assertTrue(reconciliation["base_ref_readback_proven"])
+        self.assertTrue(reconciliation["head_branch_delete_readback_proven"])
+        self.assertFalse(reconciliation["duplicate_dispatch_permitted"])
+        self.assertEqual("CLOSED", execution["verified_pr"]["state"])
+        guard = execution["merge_lease_guard"]
+        self.assertTrue(guard["post_merge_verification_passed"])
+        self.assertEqual("pushed_and_read_back", guard["exact_base_git_cas_merge"]["status"])
+
+    def test_exact_base_cas_closed_pr_reconciliation_fails_without_base_readback_proof(self) -> None:
+        parameters = self._exact_cas_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_updates_view=False,
+        )
+        closed_view = dict(gh.view, state="CLOSED", mergedAt=None, mergeCommit=None)
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            gh.view = closed_view
+            return (
+                {
+                    "returncode": 0,
+                    "stdout": "merged via exact-base Git CAS\n",
+                    "stderr": "",
+                },
+                self._exact_cas_success_evidence(base_ref_readback_proven=False),
+            )
+
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ), patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertEqual("pr_not_merged_after_execution", execution["verification_error"])
+        reconciliation = execution["exact_base_git_cas_closed_pr_reconciliation"]
+        self.assertEqual("rejected", reconciliation["status"])
+        self.assertIn(
+            "exact_base_cas_reconciliation_receipt_mismatch:base_ref_readback_proven",
+            reconciliation["errors"],
+        )
+
+    def test_exact_base_cas_closed_pr_reconciliation_fails_on_head_branch_mismatch(self) -> None:
+        parameters = self._exact_cas_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_updates_view=False,
+        )
+        closed_view = dict(gh.view, state="CLOSED", mergedAt=None, mergeCommit=None)
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            gh.view = closed_view
+            return (
+                {
+                    "returncode": 0,
+                    "stdout": "merged via exact-base Git CAS\n",
+                    "stderr": "",
+                },
+                self._exact_cas_success_evidence(head_branch="feat/other"),
+            )
+
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ), patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        reconciliation = result["output"]["executions"][0][
+            "exact_base_git_cas_closed_pr_reconciliation"
+        ]
+        self.assertEqual("rejected", reconciliation["status"])
+        self.assertIn(
+            "exact_base_cas_reconciliation_receipt_mismatch:head_branch",
+            reconciliation["errors"],
+        )
+
+    def test_exact_base_cas_closed_pr_reconciliation_requires_post_view(self) -> None:
+        parameters = self._exact_cas_parameters()
+        runner = merge_guard.CaptainMergeGuardRunner(
+            repo_path=Path.cwd(),
+            action=parameters["actions"][0],
+            parameters=parameters,
+            github_runner=FakeGh(),
+            resource_authority=resources,
+            execution_intent_sha256="f" * 64,
+            lease_owner_id="captain-test-owner",
+        )
+        runner.dispatch_called = True
+        runner.receipt["dispatch_called"] = True
+        runner.receipt["dispatch_mode"] = "exact_base_git_cas"
+        runner.receipt["exact_base_git_cas_merge"] = self._exact_cas_success_evidence()
+        closed_view = {
+            "number": 96,
+            "state": "CLOSED",
+            "mergedAt": None,
+            "mergeCommit": None,
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "headRepository": {"nameWithOwner": "heimgewebe/grabowski"},
+            "isCrossRepository": False,
+        }
+
+        reconciliation, errors = runner.reconcile_exact_base_git_cas_closed_pr(
+            viewed=closed_view,
+            verify_errors=["pr_not_merged_after_execution"],
+            queue_errors=["merge_queue_pr_state_not_open"],
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            expected_head=CAPTAIN_HEAD,
+            expected_base="main",
+            expected_base_sha=CAPTAIN_BASE_SHA,
+        )
+
+        self.assertIsNone(reconciliation)
+        self.assertIn("exact_base_cas_reconciliation_post_view_missing", errors)
+
+    def test_exact_base_cas_closed_pr_reconciliation_rejects_authority_binding_drift(self) -> None:
+        parameters = self._exact_cas_parameters()
+        runner = merge_guard.CaptainMergeGuardRunner(
+            repo_path=Path.cwd(),
+            action=parameters["actions"][0],
+            parameters=parameters,
+            github_runner=FakeGh(),
+            resource_authority=resources,
+            execution_intent_sha256="f" * 64,
+            lease_owner_id="captain-test-owner",
+        )
+        runner.dispatch_called = True
+        runner.receipt["dispatch_called"] = True
+        runner.receipt["dispatch_mode"] = "exact_base_git_cas"
+        runner.receipt["exact_base_git_cas_merge"] = self._exact_cas_success_evidence()
+        runner.receipt["exact_base_git_cas_post_view"] = {
+            "returncode": 0,
+            "expected_merge_sha": "b" * 40,
+            "matched": False,
+        }
+        closed_view = {
+            "number": 96,
+            "state": "CLOSED",
+            "mergedAt": None,
+            "mergeCommit": None,
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "headRepository": {"nameWithOwner": "heimgewebe/grabowski"},
+            "isCrossRepository": False,
+        }
+        cases = (
+            (
+                "pr-number",
+                {"number": 97},
+                ["merge_queue_pr_state_not_open"],
+                "exact_base_cas_reconciliation_pr_number_mismatch",
+            ),
+            (
+                "base-ref",
+                {"baseRefName": "release"},
+                ["merge_queue_pr_state_not_open"],
+                "exact_base_cas_reconciliation_pr_base_mismatch",
+            ),
+            (
+                "base-sha",
+                {"baseRefOid": "f" * 40},
+                ["merge_queue_pr_state_not_open"],
+                "exact_base_cas_reconciliation_pr_base_sha_mismatch",
+            ),
+            (
+                "head-repository",
+                {"headRepository": {"nameWithOwner": "heimgewebe/other"}},
+                ["merge_queue_pr_state_not_open"],
+                "exact_base_cas_reconciliation_head_repository_mismatch",
+            ),
+            (
+                "cross-repository",
+                {"isCrossRepository": True},
+                ["merge_queue_pr_state_not_open"],
+                "exact_base_cas_reconciliation_cross_repository_state_invalid",
+            ),
+            (
+                "unexpected-queue-error",
+                {},
+                ["merge_queue_pr_state_not_open", "merge_queue_base_mismatch"],
+                "exact_base_cas_reconciliation_queue_error:merge_queue_base_mismatch",
+            ),
+        )
+
+        for label, view_overrides, queue_errors, expected_error in cases:
+            with self.subTest(label=label):
+                viewed = dict(closed_view)
+                viewed.update(view_overrides)
+                reconciliation, errors = runner.reconcile_exact_base_git_cas_closed_pr(
+                    viewed=viewed,
+                    verify_errors=["pr_not_merged_after_execution"],
+                    queue_errors=queue_errors,
+                    repo_slug="heimgewebe/grabowski",
+                    pr_number=96,
+                    expected_head=CAPTAIN_HEAD,
+                    expected_base="main",
+                    expected_base_sha=CAPTAIN_BASE_SHA,
+                )
+
+                self.assertIsNone(reconciliation)
+                self.assertIn(expected_error, errors)
+
+    def test_exact_base_cas_closed_pr_reconciliation_rejects_non_null_merge_metadata(self) -> None:
+        parameters = self._exact_cas_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_updates_view=False,
+        )
+        closed_view = dict(
+            gh.view,
+            state="CLOSED",
+            mergedAt="2026-09-06T05:00:00Z",
+            mergeCommit={"oid": "b" * 40},
+        )
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            gh.view = closed_view
+            return (
+                {
+                    "returncode": 0,
+                    "stdout": "merged via exact-base Git CAS\n",
+                    "stderr": "",
+                },
+                self._exact_cas_success_evidence(),
+            )
+
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ), patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        reconciliation = result["output"]["executions"][0][
+            "exact_base_git_cas_closed_pr_reconciliation"
+        ]
+        self.assertEqual("rejected", reconciliation["status"])
+        self.assertIn(
+            "exact_base_cas_reconciliation_pr_merged_at_not_null",
+            reconciliation["errors"],
+        )
+        self.assertIn(
+            "exact_base_cas_reconciliation_pr_merge_commit_not_null",
+            reconciliation["errors"],
+        )
+
+    def test_exact_base_cas_reconciliation_does_not_accept_open_pr_metadata(self) -> None:
+        parameters = self._exact_cas_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_updates_view=False,
+        )
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            return (
+                {
+                    "returncode": 0,
+                    "stdout": "merged via exact-base Git CAS\n",
+                    "stderr": "",
+                },
+                self._exact_cas_success_evidence(),
+            )
+
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ), patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        reconciliation = execution["exact_base_git_cas_closed_pr_reconciliation"]
+        self.assertEqual("rejected", reconciliation["status"])
+        self.assertIn(
+            "exact_base_cas_reconciliation_pr_not_closed",
+            reconciliation["errors"],
+        )
+
+    def test_exact_base_cas_closed_pr_reconciliation_fails_on_head_drift(self) -> None:
+        parameters = self._exact_cas_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_updates_view=False,
+        )
+        closed_view = dict(
+            gh.view,
+            state="CLOSED",
+            headRefOid="f" * 40,
+            mergeCommit=None,
+        )
+        exact_policy = {
+            "mode": "exact_base_git_cas",
+            "binding_sha256": "f" * 64,
+        }
+
+        def fake_exact_cas(*args, on_dispatch=None, **kwargs):
+            del args, kwargs
+            if on_dispatch is not None:
+                on_dispatch()
+            gh.view = closed_view
+            return (
+                {
+                    "returncode": 0,
+                    "stdout": "merged via exact-base Git CAS\n",
+                    "stderr": "",
+                },
+                self._exact_cas_success_evidence(),
+            )
+
+        with patch.object(
+            merge_guard,
+            "verify_github_base_update_guard",
+            return_value=(exact_policy, {"errors": []}, []),
+        ), patch.object(
+            merge_guard,
+            "_exact_base_git_cas_merge",
+            side_effect=fake_exact_cas,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        self.assertEqual("failed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        reconciliation = execution["exact_base_git_cas_closed_pr_reconciliation"]
+        self.assertEqual("rejected", reconciliation["status"])
+        self.assertIn(
+            "exact_base_cas_reconciliation_pr_head_mismatch",
+            reconciliation["errors"],
+        )
+        self.assertIn(
+            "exact_base_cas_reconciliation_queue_error:merge_queue_head_mismatch",
+            reconciliation["errors"],
+        )
 
     def test_captain_run_records_merge_command_failure_without_losing_receipt(self) -> None:
         for merge_updates_view, expected_reason in (
