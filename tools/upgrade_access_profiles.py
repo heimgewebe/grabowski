@@ -105,8 +105,38 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
         raise ValueError("template profiles are invalid")
     observe = template_profiles.get("observe")
     maintain = template_profiles.get("maintain")
-    if not isinstance(observe, dict) or not isinstance(maintain, dict):
-        raise ValueError("template must contain valid observe and maintain profiles")
+    failover_mutate = template_profiles.get("failover-mutate")
+    template_trusted_owner = template_profiles.get("trusted-owner")
+    if (
+        not isinstance(observe, dict)
+        or not isinstance(maintain, dict)
+        or not isinstance(failover_mutate, dict)
+        or not isinstance(template_trusted_owner, dict)
+    ):
+        raise ValueError(
+            "template must contain valid observe, maintain, failover-mutate and trusted-owner profiles"
+        )
+
+    trusted_capabilities = trusted_owner.get("capabilities")
+    template_trusted_capabilities = template_trusted_owner.get("capabilities")
+    if not isinstance(trusted_capabilities, list) or not all(
+        isinstance(item, str) and item for item in trusted_capabilities
+    ):
+        raise ValueError("trusted-owner capabilities are invalid")
+    if not isinstance(template_trusted_capabilities, list) or (
+        "bureau_mutation" not in template_trusted_capabilities
+    ):
+        raise ValueError("template trusted-owner must define bureau_mutation")
+    upgraded_trusted_owner = copy.deepcopy(trusted_owner)
+    upgraded_trusted_capabilities = upgraded_trusted_owner["capabilities"]
+    if (
+        "terminal_execute" in upgraded_trusted_capabilities
+        and "bureau_mutation" not in upgraded_trusted_capabilities
+    ):
+        # Before the split, typed Bureau mutation was authorized by
+        # terminal_execute. Adding only bureau_mutation therefore preserves the
+        # existing trusted-owner authority instead of widening it.
+        upgraded_trusted_capabilities.append("bureau_mutation")
 
     active_profile = policy.get("active_profile", "trusted-owner")
     if not isinstance(active_profile, str):
@@ -129,13 +159,21 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
     result["profiles"] = {
         "observe": copy.deepcopy(observe),
         "maintain": copy.deepcopy(maintain),
-        "trusted-owner": copy.deepcopy(trusted_owner),
+        "failover-mutate": copy.deepcopy(failover_mutate),
+        "trusted-owner": upgraded_trusted_owner,
     }
     result["active_profile"] = active_profile
     if active_profile not in result["profiles"]:
         raise ValueError("active profile would be lost")
-    if result["profiles"]["trusted-owner"] != trusted_owner:
-        raise ValueError("trusted-owner authority changed during upgrade")
+    expected_trusted_owner = copy.deepcopy(trusted_owner)
+    expected_capabilities = expected_trusted_owner["capabilities"]
+    if (
+        "terminal_execute" in expected_capabilities
+        and "bureau_mutation" not in expected_capabilities
+    ):
+        expected_capabilities.append("bureau_mutation")
+    if result["profiles"]["trusted-owner"] != expected_trusted_owner:
+        raise ValueError("trusted-owner authority changed beyond Bureau compatibility split")
     return result
 
 

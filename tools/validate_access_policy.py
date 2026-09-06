@@ -45,6 +45,7 @@ known_capabilities = {
     "secret_export",
     "browser_profile_read",
     "terminal_execute",
+    "bureau_mutation",
     "durable_job",
     "git_cli",
     "github_cli",
