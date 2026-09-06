@@ -133,6 +133,12 @@ class AgentInstructionsTests(unittest.TestCase):
         typed = rules["typed-operation-preference"].lower()
         for phrase in ("typed operations", "terminal", "git", "github"):
             self.assertIn(phrase, typed)
+        direction = rules["goal-fidelity-before-continuation"].lower()
+        for phrase in (
+            "original user outcome", "fresh evidence", "serious alternative",
+            "continue", "change", "park/stop", "single tool failure",
+        ):
+            self.assertIn(phrase, direction)
         obligation = rules["operator-obligation-lifecycle"].lower()
         for phrase in (
             "grip_run",
@@ -140,9 +146,15 @@ class AgentInstructionsTests(unittest.TestCase):
             "operator-obligation-open",
             "operator-obligation-status",
             "operator-obligation-close",
+            "operator-obligation-resolve",
             "completed",
             "explicitly blocked",
             "durably delegated",
+            "defers",
+            "supersedes",
+            "continuation_required=false",
+            "work_complete=false",
+            "new obligation",
         ):
             self.assertIn(phrase, obligation)
         authority = rules["no-authority-escalation"].lower()
