@@ -3214,7 +3214,10 @@ def build_self_review_audit(
         "uncertainty": self_review.get("uncertainty") if isinstance(self_review, dict) else None,
         "residual_risk_accepted": residual_accepted,
         "residual_risk_reason": residual_reason if isinstance(residual_reason, str) else "",
-        "gate_verdict": result.get("verdict"),
+        # This audit is Captain review evidence, not a duplicate CI gate.
+        # PR-wide CI/provider failures stay in evaluate_review_gate() and Captain
+        # revalidates CI/required checks separately before any merge effect.
+        "gate_verdict": "PASS" if self_review_gate_valid else "BLOCK",
         "self_review_gate_valid": self_review_gate_valid,
         "tuning_signal": (
             "increase_depth"
