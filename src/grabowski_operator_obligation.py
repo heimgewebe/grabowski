@@ -230,7 +230,7 @@ def _status_projection_requires_attention(status: dict[str, Any]) -> bool:
         raise OperatorObligationIntegrityError(
             "operator obligation status projection has inconsistent continuation state"
         )
-    expected_response_may_end = state != "open"
+    expected_response_may_end = state != "open" or attention_class == "historical"
     if boolean_fields["response_may_end"] is not expected_response_may_end:
         raise OperatorObligationIntegrityError(
             "operator obligation status projection has inconsistent response-end state"
@@ -351,6 +351,40 @@ def _normalize_resolution_evidence(value: Any) -> list[dict[str, str]]:
             }
         )
     return normalized
+
+
+
+def _validate_direct_supersession_evidence(
+    *, current_obligation_id: str, evidence: list[dict[str, str]]
+) -> None:
+    successor_bindings = [
+        item for item in evidence if item["source"] == "operator-obligation"
+    ]
+    if len(successor_bindings) != 1:
+        raise OperatorObligationInputError(
+            "direct-open superseded resolution requires exactly one concrete successor operator-obligation evidence binding"
+        )
+    binding = successor_bindings[0]
+    successor_id = _validate_obligation_id(binding["reference"])
+    if successor_id == current_obligation_id:
+        raise OperatorObligationInputError(
+            "direct-open superseded resolution successor must be a different obligation"
+        )
+    successor_directory = _state_root() / successor_id
+    try:
+        _ensure_private_directory(successor_directory, create=False)
+        successor_open, successor_open_file_sha256 = _read_private_json(
+            successor_directory / "open.json"
+        )
+    except FileNotFoundError as exc:
+        raise OperatorObligationInputError(
+            "direct-open superseded resolution successor obligation does not exist"
+        ) from exc
+    _validate_open_record(successor_open, expected_id=successor_id)
+    if binding["sha256"] != successor_open_file_sha256:
+        raise OperatorObligationInputError(
+            "direct-open superseded resolution evidence does not match the immutable successor open record"
+        )
 
 
 
@@ -1574,8 +1608,8 @@ def _validate_resolution_record(
     *,
     open_record: dict[str, Any],
     open_file_sha256: str,
-    close_record: dict[str, Any],
-    close_file_sha256: str,
+    close_record: dict[str, Any] | None,
+    close_file_sha256: str | None,
     expected_sequence: int,
     expected_predecessor_file_sha256: str | None,
 ) -> None:
@@ -1642,11 +1676,24 @@ def _validate_resolution_record(
         raise OperatorObligationIntegrityError(
             "operator obligation resolution binding is invalid"
         )
+    if (close_record is None) != (close_file_sha256 is None):
+        raise OperatorObligationIntegrityError("operator obligation resolution close binding state is invalid")
+    if close_record is None:
+        if record["schema_version"] != RESOLUTION_SCHEMA_VERSION:
+            raise OperatorObligationIntegrityError("direct-open operator obligation resolution requires schema v2")
+        if record["disposition"] not in {"deferred", "superseded"}:
+            raise OperatorObligationIntegrityError("direct-open operator obligation resolution may only defer or supersede")
+
     try:
         _validate_timestamp(record["resolved_at"], label="resolution.resolved_at")
-        _normalize_resolution_evidence(record["evidence"])
+        normalized_evidence = _normalize_resolution_evidence(record["evidence"])
+        if close_record is None and record["disposition"] == "superseded":
+            _validate_direct_supersession_evidence(
+                current_obligation_id=open_record["obligation_id"],
+                evidence=normalized_evidence,
+            )
         terminal_disposition = record["disposition"] in {"resolved", "superseded"}
-        if close_record["outcome"] == "delegated" and terminal_disposition:
+        if close_record is not None and close_record["outcome"] == "delegated" and terminal_disposition:
             observation = _normalize_resolution_delegation_observation(
                 record["delegation_observation"],
                 expected_delegation=close_record["delegation"],
@@ -1684,8 +1731,8 @@ def _read_resolution_chain(
     *,
     open_record: dict[str, Any],
     open_file_sha256: str,
-    close_record: dict[str, Any],
-    close_file_sha256: str,
+    close_record: dict[str, Any] | None,
+    close_file_sha256: str | None,
 ) -> list[tuple[dict[str, Any], str, Path]]:
     chain: list[tuple[dict[str, Any], str, Path]] = []
     predecessor: str | None = None
@@ -1788,31 +1835,57 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
     try:
         close_record, close_file_sha256 = _read_private_json(close_path)
     except FileNotFoundError:
+        close_record = None
+        close_file_sha256 = None
+    if close_record is None:
         acceptance_ids = [item["id"] for item in open_record["acceptance"]]
-        return {
-            "obligation_id": obligation_id,
-            "state": "open",
-            "objective": open_record["objective"],
-            "origin": open_record["origin"],
-            "references": open_record["references"],
-            "created_at": open_record["created_at"],
-            "closed_at": None,
-            "acceptance_ids": acceptance_ids,
-            "evidence": [],
-            "missing_acceptance_ids": acceptance_ids,
-            "continuation_required": True,
-            "response_may_end": False,
-            "work_complete": False,
-            "follow_up_required": True,
-            "open_file_sha256": open_file_sha256,
-            "close_file_sha256": None,
-            "close_schema_version": None,
-            "completion_classification": None,
-            "completion_scope": None,
-            "systemic_convergence_claim": False,
-            "convergence_gate_outcome": "pending",
-            "recommended_next_action": "continue work; the chat response must not imply completion",
+        resolution_chain = _read_resolution_chain(
+            directory, open_record=open_record, open_file_sha256=open_file_sha256,
+            close_record=None, close_file_sha256=None,
+        )
+        if not resolution_chain:
+            return {
+                "obligation_id": obligation_id, "state": "open",
+                "objective": open_record["objective"], "origin": open_record["origin"],
+                "references": open_record["references"], "created_at": open_record["created_at"],
+                "closed_at": None, "acceptance_ids": acceptance_ids, "evidence": [],
+                "missing_acceptance_ids": acceptance_ids, "continuation_required": True,
+                "response_may_end": False, "work_complete": False, "follow_up_required": True,
+                "open_file_sha256": open_file_sha256, "close_file_sha256": None,
+                "close_schema_version": None, "completion_classification": None,
+                "completion_scope": None, "systemic_convergence_claim": False,
+                "convergence_gate_outcome": "pending",
+                "recommended_next_action": "continue work; the chat response must not imply completion",
+            }
+        resolution_record, resolution_file_sha256, _ = resolution_chain[-1]
+        disposition = resolution_record["disposition"]
+        status = {
+            "obligation_id": obligation_id, "state": "open", "attention_class": "historical",
+            "resolution_disposition": disposition,
+            "resolution_schema_version": resolution_record["schema_version"],
+            "resolution_evidence": resolution_record["evidence"],
+            "resolution_delegation_observation": resolution_record["delegation_observation"],
+            "resolved_at": resolution_record["resolved_at"], "objective": open_record["objective"],
+            "origin": open_record["origin"], "references": open_record["references"],
+            "created_at": open_record["created_at"], "closed_at": None,
+            "acceptance_ids": acceptance_ids, "evidence": [],
+            "missing_acceptance_ids": acceptance_ids, "blockers": [], "delegation": {},
+            "next_action": resolution_record["next_action"], "continuation_required": False,
+            "response_may_end": True, "work_complete": False, "follow_up_required": False,
+            "open_file_sha256": open_file_sha256, "close_file_sha256": None,
+            "close_schema_version": None, "completion_classification": None,
+            "completion_scope": None, "systemic_convergence_claim": False,
+            "convergence_gate_outcome": "pending", "resolution_file_sha256": resolution_file_sha256,
+            "resolution_sequence": resolution_record["sequence"],
+            "resolution_revision_count": len(resolution_chain),
+            "recommended_next_action": resolution_record["next_action"] if disposition=="deferred" else "no current continuation required",
+            "non_claims": [
+                "strategic resolution does not establish acceptance-bound completion, blockage, or delegation; the original open obligation remains immutable",
+                "resuming or replacing strategically parked work requires a new obligation",
+            ],
         }
+        _status_projection_requires_attention(status)
+        return status
     _validate_close_record(
         close_record, open_record=open_record, open_file_sha256=open_file_sha256
     )
@@ -2142,6 +2215,10 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
             {
                 "obligation_id": status["obligation_id"],
                 "state": status["state"],
+                "attention_class": status.get(
+                    "attention_class", "current" if requires_attention else "historical"
+                ),
+                "resolution_disposition": status.get("resolution_disposition"),
                 "objective": status["objective"],
                 "origin": origin,
                 "created_at": status["created_at"],
@@ -2298,47 +2375,40 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
         open_record, open_file_sha256 = _read_private_json(directory / "open.json")
         _validate_open_record(open_record, expected_id=obligation_id)
         try:
-            close_record, close_file_sha256 = _read_private_json(
-                directory / "close.json"
-            )
-        except FileNotFoundError as exc:
-            raise OperatorObligationInputError(
-                "open obligation cannot be resolved"
-            ) from exc
-        _validate_close_record(
-            close_record, open_record=open_record, open_file_sha256=open_file_sha256
-        )
-        if close_record["outcome"] == "completed":
-            raise OperatorObligationInputError(
-                "completed obligation does not require resolution"
-            )
+            close_record, close_file_sha256 = _read_private_json(directory / "close.json")
+        except FileNotFoundError:
+            close_record = None
+            close_file_sha256 = None
         terminal_disposition = disposition in {"resolved", "superseded"}
-        if close_record["outcome"] == "delegated" and terminal_disposition:
-            delegation_observation = _normalize_resolution_delegation_observation(
-                parameters.get("delegation_observation"),
-                expected_delegation=close_record["delegation"],
-            )
-            receipt_reference = (
-                f"delegation:{delegation_observation['kind']}:"
-                f"{delegation_observation['id']}"
-            )
-            if not any(
-                item["source"] == "receipt"
-                and item["reference"] == receipt_reference
-                and item["sha256"]
-                == delegation_observation["observation_receipt_sha256"]
-                for item in evidence
-            ):
+        if close_record is None:
+            if disposition == "resolved":
                 raise OperatorObligationInputError(
-                    "delegated resolution requires evidence bound to the terminal observation receipt"
+                    "open obligation may only be deferred or superseded; completed work requires a real close"
                 )
-        else:
-            raw_observation = parameters.get("delegation_observation", {})
-            if raw_observation:
-                raise OperatorObligationInputError(
-                    "resolution may not contain an inapplicable delegation observation"
-                )
+            if parameters.get("delegation_observation", {}):
+                raise OperatorObligationInputError("direct-open resolution may not contain a delegation observation")
             delegation_observation = {}
+        else:
+            _validate_close_record(close_record, open_record=open_record, open_file_sha256=open_file_sha256)
+            if close_record["outcome"] == "completed":
+                raise OperatorObligationInputError("completed obligation does not require resolution")
+            if close_record["outcome"] == "delegated" and terminal_disposition:
+                delegation_observation = _normalize_resolution_delegation_observation(
+                    parameters.get("delegation_observation"), expected_delegation=close_record["delegation"]
+                )
+                receipt_reference = f"delegation:{delegation_observation['kind']}:{delegation_observation['id']}"
+                if not any(
+                    item["source"]=="receipt" and item["reference"]==receipt_reference
+                    and item["sha256"]==delegation_observation["observation_receipt_sha256"]
+                    for item in evidence
+                ):
+                    raise OperatorObligationInputError(
+                        "delegated resolution requires evidence bound to the terminal observation receipt"
+                    )
+            else:
+                if parameters.get("delegation_observation", {}):
+                    raise OperatorObligationInputError("resolution may not contain an inapplicable delegation observation")
+                delegation_observation = {}
         request_projection = {
             "disposition": disposition,
             "evidence": evidence,
@@ -2395,6 +2465,10 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
             sequence = 1
             predecessor_file_sha256 = None
             created = True
+        if created and close_record is None and disposition == "superseded":
+            _validate_direct_supersession_evidence(
+                current_obligation_id=obligation_id, evidence=evidence
+            )
         if created:
             material = {
                 "kind": RESOLUTION_KIND,
@@ -2469,6 +2543,17 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
         _ensure_private_directory(directory, create=False)
         open_record, open_file_sha256 = _read_private_json(directory / "open.json")
         _validate_open_record(open_record, expected_id=obligation_id)
+        try:
+            _read_private_json(directory / "close.json")
+        except FileNotFoundError:
+            direct_resolution_chain = _read_resolution_chain(
+                directory, open_record=open_record, open_file_sha256=open_file_sha256,
+                close_record=None, close_file_sha256=None,
+            )
+            if direct_resolution_chain:
+                raise OperatorObligationConflictError(
+                    "operator obligation already has a direct strategic resolution; resume or replace it through a new obligation"
+                )
         acceptance_ids = {item["id"] for item in open_record["acceptance"]}
         evidence = _normalize_evidence(parameters["evidence"], acceptance_ids=acceptance_ids)
         blockers: list[dict[str, str]] = []
