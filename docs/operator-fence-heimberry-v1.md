@@ -212,24 +212,21 @@ The G6.5 `failover-mutate` access profile is intentionally narrower than the nor
 
 ```text
 file_read
-file_write
-rollback_text
 audit_verify
 audit_read
 bureau_mutation
 git_cli
 github_cli
 resource_lease
-artifact_transfer
 process_inspect
 port_inspect
 ```
 
-Its write roots are limited to the repository tree and the Grabowski/Bureau local state roots. It does not grant `terminal_execute`, user-service control, browser/GUI workers, browser-profile access, secret capabilities, process signals, privileged/power execution or delete/destroy authority.
+Its declared roots remain limited to repository and Grabowski/Bureau state paths, but G6.5 intentionally grants no generic file-write, rollback or artifact-transfer capability. The profile also sets `trusted_owner=false` explicitly so a policy file whose top level is trusted-owner cannot leak Trusted Owner semantics into the failover lane. It does not grant `terminal_execute`, durable jobs, user-service control, browser/GUI workers, browser-profile access, secret capabilities, process signals, privileged/power execution or delete/destroy authority.
 
 `bureau_mutation` is a separate capability for the typed candidate/proposal/review/publication/pickup surfaces. It does not authorize `grabowski_terminal_run` and does not create a second Bureau mutation path.
 
-`durable_job` is deliberately absent from `failover-mutate` in G6.5. Its current start surface accepts general argv and would therefore reintroduce generic command/host-mutation authority through a different transport. A later slice may add a separately typed bounded durable-work capability; the broad existing capability remains available only to the normal higher-authority profiles.
+`durable_job`, generic `file_write`, `rollback_text` and `artifact_transfer` are deliberately absent from `failover-mutate` in G6.5. Their current surfaces are broader than the manual single-writer canary needs and could outlive or bypass the narrow per-effect authority claim. A later slice may add separately typed bounded variants; the broad existing capabilities remain available only to normal higher-authority profiles.
 
 ## Failure semantics
 

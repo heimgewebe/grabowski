@@ -133,15 +133,12 @@ class PolicyRuntimeProofTests(unittest.TestCase):
                     capabilities,
                     {
                         "file_read",
-                        "file_write",
                         "audit_verify",
                         "audit_read",
-                        "rollback_text",
                         "bureau_mutation",
                         "git_cli",
                         "github_cli",
                         "resource_lease",
-                        "artifact_transfer",
                         "process_inspect",
                         "port_inspect",
                     },
@@ -150,6 +147,9 @@ class PolicyRuntimeProofTests(unittest.TestCase):
                 for forbidden in (
                     "terminal_execute",
                     "durable_job",
+                    "file_write",
+                    "rollback_text",
+                    "artifact_transfer",
                     "user_service_control",
                     "user_service_logs_read",
                     "browser_worker",
@@ -166,6 +166,7 @@ class PolicyRuntimeProofTests(unittest.TestCase):
                             grabowski_mcp._require_capability(forbidden)
 
                 profile = loaded["profiles"]["failover-mutate"]
+                self.assertIs(profile["trusted_owner"], False)
                 self.assertEqual(
                     set(profile["write_roots"]),
                     {

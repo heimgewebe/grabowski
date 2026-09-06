@@ -45,7 +45,12 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
                 "observe": {"capabilities": ["file_read"]},
                 "maintain": {"capabilities": ["file_read", "file_write"]},
                 "failover-mutate": {
-                    "capabilities": ["file_read", "bureau_mutation"]
+                    "trusted_owner": False,
+                    "capabilities": [
+                        "file_read", "audit_verify", "audit_read",
+                        "bureau_mutation", "git_cli", "github_cli",
+                        "resource_lease", "process_inspect", "port_inspect",
+                    ],
                 },
                 "trusted-owner": {
                     "capabilities": [
@@ -118,6 +123,16 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
         self.assertIn("bureau_mutation", result["profiles"]["trusted-owner"]["capabilities"])
         self.assertIn("audit_read", result["profiles"]["observe"]["capabilities"])
         self.assertIn("audit_read", result["profiles"]["maintain"]["capabilities"])
+
+    def test_upgrade_rejects_unsafe_failover_template(self) -> None:
+        template = copy.deepcopy(self.template)
+        template["profiles"]["failover-mutate"]["trusted_owner"] = True
+        with self.assertRaisesRegex(ValueError, "disable trusted_owner"):
+            upgrader.upgraded(self.policy, template)
+        template = copy.deepcopy(self.template)
+        template["profiles"]["failover-mutate"]["capabilities"].append("file_write")
+        with self.assertRaisesRegex(ValueError, "fixed G6.5 contract"):
+            upgrader.upgraded(self.policy, template)
 
     def test_bureau_compatibility_capability_requires_prior_terminal_authority(self) -> None:
         policy = copy.deepcopy(self.policy)

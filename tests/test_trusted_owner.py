@@ -71,6 +71,24 @@ class TrustedOwnerTests(unittest.TestCase):
             base._validate_policy(invalid)
 
 
+    def test_failover_profile_explicitly_disables_trusted_owner_semantics(self) -> None:
+        policy = json.loads(json.dumps(TRUSTED_POLICY))
+        policy["active_profile"] = "failover-mutate"
+        base._validate_policy(policy)
+        self.assertIs(policy["profiles"]["failover-mutate"]["trusted_owner"], False)
+        self.assertFalse(base._trusted_owner_enabled(policy))
+        with patch.object(base, "_load_policy", return_value=policy):
+            self.assertFalse(operator._trusted_owner_mode())
+            self.assertEqual(
+                operator._effective_capability_set(),
+                {
+                    "file_read", "audit_verify", "audit_read",
+                    "bureau_mutation", "git_cli", "github_cli",
+                    "resource_lease", "process_inspect", "port_inspect",
+                },
+            )
+
+
     def test_trusted_owner_keeps_reversible_delete_with_destroy_authority(self) -> None:
         capabilities = TRUSTED_POLICY["profiles"]["trusted-owner"]["capabilities"]
         self.assertIn("file_destroy", capabilities)

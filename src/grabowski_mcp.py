@@ -911,6 +911,21 @@ SECRET_USE_ENV_ALLOWLIST = {
     "TERM",
     "TZ",
 }
+FAILOVER_MUTATE_CAPABILITIES = frozenset(
+    {
+        "file_read",
+        "audit_verify",
+        "audit_read",
+        "bureau_mutation",
+        "git_cli",
+        "github_cli",
+        "resource_lease",
+        "process_inspect",
+        "port_inspect",
+    }
+)
+
+
 SESSION_RISK_LEVELS = ("low", "medium", "high")
 SESSION_RISK_ORDER = {name: index for index, name in enumerate(SESSION_RISK_LEVELS)}
 SESSION_ESCALATION_MAX_SECONDS = 7 * 24 * 60 * 60
@@ -1350,6 +1365,15 @@ def _validate_policy(policy: Any) -> None:
                 label=f"profile {name} capabilities",
             )
             capabilities = set(profile["capabilities"])
+            if name == "failover-mutate":
+                if profile.get("trusted_owner") is not False:
+                    raise RuntimeError(
+                        "Access profile failover-mutate must explicitly disable trusted_owner"
+                    )
+                if capabilities != FAILOVER_MUTATE_CAPABILITIES:
+                    raise RuntimeError(
+                        "Access profile failover-mutate capabilities must match the fixed G6.5 contract"
+                    )
             if capabilities & {
                 "secret_inspect",
                 "secret_reveal",

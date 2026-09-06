@@ -675,9 +675,8 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(
             set(failover["capabilities"]),
             {
-                "file_read", "file_write", "audit_verify", "audit_read",
-                "rollback_text", "bureau_mutation", "git_cli",
-                "github_cli", "resource_lease", "artifact_transfer",
+                "file_read", "audit_verify", "audit_read", "bureau_mutation",
+                "git_cli", "github_cli", "resource_lease",
                 "process_inspect", "port_inspect",
             },
         )
@@ -690,8 +689,10 @@ class RepositoryContractTests(unittest.TestCase):
             },
         )
         self.assertNotIn("${HOME}", failover["write_roots"])
+        self.assertIs(failover["trusted_owner"], False)
         for forbidden in (
-            "terminal_execute", "durable_job", "user_service_control", "user_service_logs_read",
+            "terminal_execute", "durable_job", "file_write", "rollback_text",
+            "artifact_transfer", "user_service_control", "user_service_logs_read",
             "browser_worker", "gui_worker", "secret_inspect", "secret_reveal",
             "secret_use", "secret_export", "browser_profile_read",
             "process_signal", "privileged_reference", "power_execute",
