@@ -629,20 +629,53 @@ class HistoricalActivationContractTests(unittest.TestCase):
             "receipt_sha256": midcutover.canonical_json_sha256(material),
         }
 
-    def test_recovery_activation_states_match_publication_lifecycle(self) -> None:
+    def _receipt_with_activation_variant(
+        self,
+        *,
+        state: str = "publication_pending",
+        include_state: bool = True,
+        include_request_id: bool = True,
+        phase: str = "platform_publication_activation",
+    ) -> dict[str, object]:
+        receipt = cutover_receipt()
+        observation = dict(receipt["observations"][0])
+        details: dict[str, object] = {}
+        if include_state:
+            details["state"] = state
+        if include_request_id:
+            details["request_id"] = PUBLICATION_REQUEST_ID
+        observation["phase"] = phase
+        observation["details"] = details
+        material = {
+            key: value
+            for key, value in observation.items()
+            if key != "observation_sha256"
+        }
+        observation["observation_sha256"] = midcutover.canonical_json_sha256(
+            material
+        )
+        receipt["observations"] = [observation]
+        return self._rehash(receipt)
+
+    def test_recovery_accepts_only_known_pending_activation_states(self) -> None:
         self.assertEqual(
             midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES,
-            client_snapshot.PLATFORM_PUBLICATION_ACTIVATED_STATES,
+            frozenset({"publication_pending", "awaiting_platform_observation"}),
         )
-        self.assertNotIn(
-            "pending_activation", midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES
+        self.assertTrue(
+            midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES
+            < client_snapshot.PLATFORM_PUBLICATION_ACTIVATED_STATES
         )
-        self.assertNotIn(
-            "no_current", midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES
-        )
+        for state in (
+            "pending_activation",
+            "no_current",
+            "outcome_unknown",
+            "platform_converged",
+        ):
+            self.assertNotIn(state, midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES)
 
-    def test_all_post_activation_states_are_accepted(self) -> None:
-        for state in sorted(client_snapshot.PLATFORM_PUBLICATION_ACTIVATED_STATES):
+    def test_only_pending_activation_states_are_accepted(self) -> None:
+        for state in sorted(midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES):
             with self.subTest(state=state):
                 receipt = cutover_receipt(activation_state=state)
                 observed = midcutover.activation_observation(receipt)
@@ -650,6 +683,46 @@ class HistoricalActivationContractTests(unittest.TestCase):
                 self.assertEqual(
                     observed["publication_request_id"], PUBLICATION_REQUEST_ID
                 )
+        for state in ("outcome_unknown", "platform_converged"):
+            with self.subTest(state=state):
+                receipt = cutover_receipt(activation_state=state)
+                with self.assertRaisesRegex(
+                    midcutover.MidCutoverEvidenceError,
+                    "activation observation is invalid",
+                ):
+                    midcutover.activation_observation(receipt)
+
+    def test_unknown_missing_and_wrong_phase_fail_closed(self) -> None:
+        cases = (
+            (
+                "unknown_state",
+                self._receipt_with_activation_variant(state="future_pending_v3"),
+                "activation observation is invalid",
+            ),
+            (
+                "missing_state",
+                self._receipt_with_activation_variant(include_state=False),
+                "activation observation is invalid",
+            ),
+            (
+                "missing_request_id",
+                self._receipt_with_activation_variant(include_request_id=False),
+                "activation observation is invalid",
+            ),
+            (
+                "wrong_phase",
+                self._receipt_with_activation_variant(
+                    phase="platform_publication_preflight"
+                ),
+                "exactly one",
+            ),
+        )
+        for name, receipt, error in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    midcutover.MidCutoverEvidenceError, error
+                ):
+                    midcutover.activation_observation(receipt)
 
     def test_unique_hash_bound_activation_is_required(self) -> None:
         missing = cutover_receipt()
