@@ -1086,6 +1086,169 @@ class OperatorContractTests(unittest.TestCase):
         self.assertFalse(domain_started)
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_g65_required_fence_missing_token_denies_before_async_domain(self) -> None:
+        operator = _load_operator_module()
+        domain_started = False
+
+        async def domain_call(*args, **kwargs):
+            nonlocal domain_started
+            domain_started = True
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        transport = {
+            "runtime_binding_sha256": "a" * 64,
+            "consumption_receipt_sha256": "b" * 64,
+        }
+        admission = {"admission_sha256": "c" * 64, "admitted_at_unix": 1}
+        with (
+            patch.object(
+                operator,
+                "_require_transport_roundtrip_for_tool",
+                return_value=transport,
+            ),
+            patch.object(
+                operator.base,
+                "_load_policy",
+                return_value={"active_profile": "mutate"},
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                return_value=True,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "admit_mutation",
+                return_value=admission,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "begin_fence_enforcement",
+                return_value=None,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "record_success_best_effort",
+                return_value={},
+            ),
+        ):
+            operator._configure_http_runtime()
+            with self.assertRaisesRegex(
+                operator.grabowski_effect_interceptor.OperatorFenceEnforcementDenied,
+                "fence_enforcement_unavailable",
+            ):
+                operator.asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {})
+                )
+        self.assertFalse(domain_started)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_g65_admission_failure_reuses_initial_fence_decision(self) -> None:
+        operator = _load_operator_module()
+        domain_started = False
+
+        async def domain_call(*args, **kwargs):
+            nonlocal domain_started
+            domain_started = True
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        transport = {
+            "runtime_binding_sha256": "a" * 64,
+            "consumption_receipt_sha256": "b" * 64,
+        }
+        with (
+            patch.object(
+                operator,
+                "_require_transport_roundtrip_for_tool",
+                return_value=transport,
+            ),
+            patch.object(
+                operator.base,
+                "_load_policy",
+                return_value={"active_profile": "mutate"},
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                side_effect=[True, False],
+            ) as required,
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "admit_mutation",
+                side_effect=RuntimeError("admission unavailable"),
+            ),
+        ):
+            operator._configure_http_runtime()
+            with self.assertRaisesRegex(RuntimeError, "admission unavailable"):
+                operator.asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {})
+                )
+        self.assertEqual(required.call_count, 1)
+        self.assertFalse(domain_started)
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+    def test_g65_semantic_read_transport_exemption_stays_unfenced(self) -> None:
+        operator = _load_operator_module()
+        domain_started = False
+
+        async def domain_call(*args, **kwargs):
+            nonlocal domain_started
+            domain_started = True
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.object(
+                operator,
+                "_transport_roundtrip_exempt_call",
+                return_value=True,
+            ),
+            patch.object(
+                operator.base,
+                "_load_policy",
+                return_value={"active_profile": "mutate"},
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                return_value=True,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "admit_mutation",
+            ) as admit,
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "begin_fence_enforcement",
+            ) as begin,
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(
+                operator.mcp._tool_manager.call_tool("semantic-read", {})
+            )
+        self.assertEqual(result, {"called": True})
+        self.assertTrue(domain_started)
+        admit.assert_not_called()
+        begin.assert_not_called()
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
     def test_g65_async_domain_dispatch_is_between_begin_and_settlement(self) -> None:
         operator = _load_operator_module()
         order: list[str] = []

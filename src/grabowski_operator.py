@@ -1521,7 +1521,7 @@ def _install_deployment_admission_gate() -> None:
                     # Catch Exception only: process-level BaseException
                     # (KeyboardInterrupt, SystemExit) must propagate without
                     # starting the domain tool after interruption.
-                    if grabowski_effect_interceptor.fence_enforcement_required():
+                    if fence_required:
                         raise
                     logging.getLogger(__name__).error(
                         "effect admission evidence failed after transport "
@@ -1535,6 +1535,10 @@ def _install_deployment_admission_gate() -> None:
                     fence_token = await _begin_fence_enforcement_async(
                         effect_admission
                     )
+                    if fence_required and fence_token is None:
+                        raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
+                            "fence_enforcement_unavailable"
+                        )
             if kind == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
                 loop = asyncio.get_running_loop()
                 try:

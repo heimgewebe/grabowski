@@ -363,6 +363,18 @@ class EffectInterceptorTests(unittest.TestCase):
             ["effect-admission", "effect-completion", "effect-completion"],
         )
 
+    def test_completion_best_effort_audit_tolerates_missing_optional_fields(self) -> None:
+        records = []
+        interceptor._completion_audit_best_effort(
+            {"completed_at_unix": 1},
+            records.append,
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["operation"], "effect-completion")
+        self.assertEqual(records[0]["completed_at_unix"], 1)
+        self.assertIsNone(records[0]["result_sha256"])
+        self.assertIsNone(records[0]["error_class"])
+
     def test_completion_record_failure_does_not_replace_domain_result(self) -> None:
         admission = interceptor.admit_mutation(
             tool_name="grabowski_git",

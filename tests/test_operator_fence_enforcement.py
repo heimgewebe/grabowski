@@ -192,6 +192,27 @@ class OperatorFenceEnforcementTests(unittest.TestCase):
         self.assertFalse(self.state_path.exists())
         self.assertEqual(self.clients, [])
 
+    def test_required_rejects_unsafe_config_permissions(self) -> None:
+        os.chmod(self.config_path, 0o644)
+        with self.assertRaisesRegex(
+            enforcement.OperatorFenceEnforcementError, "unsafe_fence_file"
+        ):
+            enforcement.fence_enforcement_required(self.config_path)
+
+    def test_required_rejects_extra_config_keys(self) -> None:
+        document = json.loads(self.config_path.read_text(encoding="utf-8"))
+        document["unexpected"] = True
+        self.config_path.write_text(
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.config_path, 0o600)
+        with self.assertRaisesRegex(
+            enforcement.OperatorFenceEnforcementError,
+            "invalid_fence_config_shape",
+        ):
+            enforcement.fence_enforcement_required(self.config_path)
+
     def test_process_lock_serializes_distinct_file_descriptors(self) -> None:
         first = enforcement._fence_acquire_process_lock(
             self.state_path, timeout_seconds=0.1

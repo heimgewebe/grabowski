@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 import fcntl
 import hashlib
 import json
@@ -221,7 +221,7 @@ def _fence_acquire_process_lock(
         os.close(parent_fd)
 
 
-def _fence_release_locks(token: Mapping[str, Any]) -> None:
+def _fence_release_locks(token: MutableMapping[str, Any]) -> None:
     if token.get("lock_held") is not True:
         return
     descriptor = token.get("process_lock_fd")
@@ -818,7 +818,7 @@ def mark_fence_dispatching(token: Mapping[str, Any] | None) -> None:
 
 
 def _finish_fence_enforcement(
-    token: Mapping[str, Any] | None,
+    token: MutableMapping[str, Any] | None,
     *,
     outcome: str,
     evidence_sha256: str,
@@ -863,7 +863,7 @@ def _finish_fence_enforcement(
 
 
 def finish_fence_success(
-    token: Mapping[str, Any] | None, *, evidence_sha256: str
+    token: MutableMapping[str, Any] | None, *, evidence_sha256: str
 ) -> dict[str, Any] | None:
     return _finish_fence_enforcement(
         token, outcome="effect_applied", evidence_sha256=evidence_sha256
@@ -871,14 +871,14 @@ def finish_fence_success(
 
 
 def finish_fence_unknown(
-    token: Mapping[str, Any] | None, *, evidence_sha256: str
+    token: MutableMapping[str, Any] | None, *, evidence_sha256: str
 ) -> dict[str, Any] | None:
     return _finish_fence_enforcement(
         token, outcome="outcome_unknown", evidence_sha256=evidence_sha256
     )
 
 
-def abort_fence_before_dispatch(token: Mapping[str, Any] | None) -> None:
+def abort_fence_before_dispatch(token: MutableMapping[str, Any] | None) -> None:
     if token is None:
         return
     config = token["config"]

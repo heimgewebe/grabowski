@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 import hashlib
 import logging
 from pathlib import Path
@@ -400,7 +400,7 @@ def admit_mutation(
                     "timestamp_unix": admission["admitted_at_unix"],
                     "operation": "effect-admission",
                     **{
-                        key: admission[key]
+                        key: admission.get(key)
                         for key in (
                             "schema_version", "kind", "request_id", "lane_id",
                             "actor_id", "tool", "arguments_sha256", "runtime_sha256",
@@ -510,7 +510,7 @@ def _completion_audit_best_effort(
                 "timestamp_unix": completion["completed_at_unix"],
                 "operation": "effect-completion",
                 **{
-                    key: completion[key]
+                    key: completion.get(key)
                     for key in (
                         "schema_version", "kind", "request_id", "admission_sha256",
                         "completion_class", "domain_receipts", "domain_receipts_sha256",
@@ -553,7 +553,7 @@ def build_exception_completion(
 def record_success_enforced(
     admission: Mapping[str, Any],
     result: Any,
-    token: Mapping[str, Any],
+    token: MutableMapping[str, Any],
     *,
     append_audit: AuditAppender | None = None,
 ) -> dict[str, Any]:
@@ -573,7 +573,7 @@ def record_success_enforced(
 def record_exception_enforced(
     admission: Mapping[str, Any],
     error: BaseException,
-    token: Mapping[str, Any],
+    token: MutableMapping[str, Any],
     *,
     append_audit: AuditAppender | None = None,
 ) -> dict[str, Any]:
