@@ -32,6 +32,8 @@ IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
 DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
 BUREAU_RUN_SOURCE_KIND = "bureau_run"
+DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS = 7200
+BUREAU_RUN_DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS = 600
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
@@ -238,15 +240,7 @@ def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]
         for index, item in enumerate(write_paths):
             _text(item, f"write_paths[{index}]")
     writer_argv = _scoped_writer_argv(parameters.get("scoped_writer_argv"), writer)
-    writer_runtime = parameters.get("scoped_writer_runtime_seconds", 7200)
-    if (
-        isinstance(writer_runtime, bool)
-        or not isinstance(writer_runtime, int)
-        or not 120 <= writer_runtime <= 86400
-    ):
-        raise ValueError(
-            "scoped_writer_runtime_seconds must be between 120 and 86400"
-        )
+    writer_runtime = _scoped_writer_runtime(parameters, source_kind=source_kind)
     writer_command = None
     if writer_argv is not None:
         writer_command = {
@@ -954,6 +948,27 @@ def _scoped_writer_argv(value: Any, writer: str | None) -> list[str] | None:
     return result
 
 
+def _scoped_writer_runtime(
+    parameters: dict[str, Any], *, source_kind: str
+) -> int:
+    runtime = parameters.get("scoped_writer_runtime_seconds")
+    if runtime is None:
+        runtime = (
+            BUREAU_RUN_DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS
+            if source_kind == BUREAU_RUN_SOURCE_KIND
+            else DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS
+        )
+    if (
+        isinstance(runtime, bool)
+        or not isinstance(runtime, int)
+        or not 120 <= runtime <= 86400
+    ):
+        raise ValueError(
+            "scoped_writer_runtime_seconds must be between 120 and 86400"
+        )
+    return runtime
+
+
 def _start_scoped_writer(
     argv: list[str], *, cwd: str, runtime_seconds: int
 ) -> dict[str, Any]:
@@ -1056,15 +1071,7 @@ def _normalize(
         write_path_resources=path_resources,
     )
     writer_argv = _scoped_writer_argv(parameters.get("scoped_writer_argv"), writer)
-    writer_runtime = parameters.get("scoped_writer_runtime_seconds", 7200)
-    if (
-        isinstance(writer_runtime, bool)
-        or not isinstance(writer_runtime, int)
-        or not 120 <= writer_runtime <= 86400
-    ):
-        raise ValueError(
-            "scoped_writer_runtime_seconds must be between 120 and 86400"
-        )
+    writer_runtime = _scoped_writer_runtime(parameters, source_kind=source_kind)
     required = [f"path:{target}", f"repo:{repo}:branch:{branch}"]
     delegated_write_resource_keys: list[str] = []
     if source_kind == BUREAU_RUN_SOURCE_KIND:
@@ -2507,7 +2514,7 @@ def grabowski_work_acquire(
     write_paths: list[str] | None = None,
     scoped_writer_actor: str | None = None,
     scoped_writer_argv: list[str] | None = None,
-    scoped_writer_runtime_seconds: int = 7200,
+    scoped_writer_runtime_seconds: int | None = None,
     system_convergence: dict[str, Any] | None = None,
     artifact_class: str = "implementation-worktree",
     ttl_seconds: int = 7200,
