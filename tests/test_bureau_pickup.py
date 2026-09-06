@@ -8729,5 +8729,753 @@ class BureauPickupTests(unittest.TestCase):
 
 
 
+    def _delegation_fixture(
+        self, *, broad_repo: bool = False, live_owner: str | None = None
+    ) -> dict[str, object]:
+        run_id = "BUR-RUN-20260817T204720Z-8972ca454d"
+        task_id = "TEST-BUREAU-PARENT-T001"
+        worker_id = "parent-worker"
+        owner_id = f"bureau-run:{run_id}"
+        repo = self.root / "parent-repo"
+        workspace = self.root / "parent-workspace"
+        repo.mkdir(exist_ok=True)
+        workspace.mkdir(exist_ok=True)
+        (repo / "src").mkdir(exist_ok=True)
+        write_path = repo / "src" / "app.py"
+        write_path.write_text("value = 1\n", encoding="utf-8")
+        branch = "bureau/parent-run"
+        head = "a" * 40
+        intent_sha = "c" * 64
+        resource_key = f"repo:{repo}" if broad_repo else f"path:{write_path}"
+        keys = [resource_key]
+        snapshot = {
+            "resource_key": resource_key,
+            "owner_id": owner_id,
+            "acquired_at_unix": 100,
+            "updated_at_unix": 100,
+            "expires_at_unix": 10_000_000_000,
+            "metadata_sha256": "e" * 64,
+        }
+        live_snapshot = {**snapshot, "owner_id": live_owner or owner_id}
+        intent = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "task_sha256": "1" * 64,
+            "plan_sha256": "2" * 64,
+            "lease_owner_id": owner_id,
+            "intent_sha256": intent_sha,
+            "required_resource_keys": keys,
+            "workspace": {
+                "repository": str(repo),
+                "workspace_path": str(workspace),
+                "workspace_branch": branch,
+                "source_head_at_intent": head,
+            },
+        }
+        acquisition = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "task_id": task_id,
+            "owner_id": owner_id,
+            "claim_intent_sha256": intent_sha,
+            "resource_keys": keys,
+            "leases": [snapshot],
+            "groups": [],
+        }
+        if broad_repo:
+            acquisition["groups"] = [
+                {
+                    "group": resource_key,
+                    "resource_keys": [resource_key],
+                    "result": {
+                        "work_admission": [
+                            {
+                                "assessment_sha256": "9" * 64,
+                                "decision": "allow",
+                                "scope_mode": "exact_checkout",
+                                "repository": str(repo),
+                                "scope_identity": {
+                                    "target_path": str(workspace),
+                                    "branch": branch,
+                                },
+                                "requested_scope": {
+                                    "repository": str(repo),
+                                    "worktree": str(workspace),
+                                    "branch": branch,
+                                    "base_head": head,
+                                    "head": head,
+                                    "task_id": task_id,
+                                    "effects": ["write"],
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        run = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "task_sha256": intent["task_sha256"],
+            "plan_sha256": intent["plan_sha256"],
+            "envelope_sha256": "3" * 64,
+            "state": "assigned",
+        }
+        coordination = {
+            "status": "coordinated",
+            "run": run,
+            "claim_intent_sha256": intent_sha,
+            "blocking": False,
+            "lease": {
+                "status": "active-bound",
+                "binding": {
+                    "lease_binding_sha256": "4" * 64,
+                    "resource_db_schema_version": pickup.resources.RESOURCE_CURRENT_SCHEMA_VERSION,
+                    "lease_snapshots": [live_snapshot],
+                },
+            },
+        }
+        journal_identity = {
+            **run,
+            "attempt": 1,
+            "workspace_path": str(workspace),
+            "workspace_branch": branch,
+        }
+        return {
+            "run_id": run_id,
+            "repo": repo,
+            "workspace": workspace,
+            "write_path": write_path,
+            "branch": branch,
+            "head": head,
+            "intent": intent,
+            "acquisition": acquisition,
+            "run": run,
+            "coordination": coordination,
+            "journal_identity": journal_identity,
+        }
+
+    def _authorize_delegation_from_fixture(
+        self,
+        fixture: dict[str, object],
+        *,
+        lane_id: str = "5" * 32,
+        workspace_probe: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        intent = fixture["intent"]
+        acquisition = fixture["acquisition"]
+        run = fixture["run"]
+        coordination = fixture["coordination"]
+        journal_identity = fixture["journal_identity"]
+        assert isinstance(intent, dict)
+        assert isinstance(acquisition, dict)
+        assert isinstance(run, dict)
+        assert isinstance(coordination, dict)
+        assert isinstance(journal_identity, dict)
+        probe = workspace_probe or {
+            "workspace_path": str(fixture["workspace"]),
+            "head": fixture["head"],
+            "branch": fixture["branch"],
+            "clean": True,
+            "status_sha256": "0" * 64,
+        }
+        effective_binding = {
+            "registry_binding": self.default_registry_binding,
+            "coordination_root": str(self.coordination_root),
+        }
+
+        def read_bound(path: Path, *, label: str) -> dict[str, object]:
+            if path.name == "intent.json":
+                return intent
+            if path.name == "acquisition.json":
+                return acquisition
+            self.fail(f"unexpected bound read: {path} / {label}")
+
+        with (
+            mock.patch.object(pickup, "_root_binding_for_run", return_value={}),
+            mock.patch.object(
+                pickup,
+                "_coordination_status_for_binding",
+                return_value=(coordination, effective_binding),
+            ),
+            mock.patch.object(
+                pickup,
+                "_require_active_execution_binding",
+                return_value={
+                    "classification": "actively_bound",
+                    "actively_bound": True,
+                },
+            ),
+            mock.patch.object(pickup, "_read_bound_json", side_effect=read_bound),
+            mock.patch.object(
+                pickup, "_journal_run_identity", return_value=journal_identity
+            ),
+            mock.patch.object(pickup, "_validate_claim_readback", return_value=run),
+            mock.patch.object(
+                pickup,
+                "_current_registry_revision_proof",
+                return_value={
+                    "task_id": run["task_id"],
+                    "task_sha256": run["task_sha256"],
+                    "plan_sha256": run["plan_sha256"],
+                    "task_state": "ready",
+                    "task_authority": "state-store",
+                },
+            ),
+            mock.patch.object(
+                pickup, "_delegation_workspace_probe", return_value=probe
+            ),
+            mock.patch.object(
+                pickup.physical_checkout,
+                "capture_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "7" * 64},
+            ),
+        ):
+            return pickup.authorize_scoped_writer_delegation(
+                str(fixture["run_id"]),
+                child_lane_id=lane_id,
+                repository=str(fixture["repo"]),
+                workspace_path=str(fixture["workspace"]),
+                workspace_branch=str(fixture["branch"]),
+                expected_head=str(fixture["head"]),
+                write_paths=[str(fixture["write_path"])],
+                scoped_writer_actor="agent:writer",
+                scoped_writer_argv_sha256="6" * 64,
+            )
+
+    def test_scoped_writer_delegation_historical_exact_file_parent_is_bound_and_create_only(
+        self,
+    ) -> None:
+        fixture = self._delegation_fixture(broad_repo=False)
+        result = self._authorize_delegation_from_fixture(fixture)
+        self.assertEqual("BUR-RUN-20260817T204720Z-8972ca454d", result["parent_run_id"])
+        self.assertEqual("parent-bureau-run-derived", result["authority"])
+        self.assertTrue(result["parent_leases_remain_authoritative"])
+        self.assertFalse(result["child_lease_acquisition_authorized"])
+        self.assertEqual(
+            [str(fixture["write_path"])],
+            [row["path"] for row in result["allowed_write_paths"]],
+        )
+        self.assertEqual(1, len(result["parent_acquisition_lease_snapshots"]))
+        self.assertEqual(1, len(result["parent_live_lease_snapshots"]))
+        self.assertTrue(Path(result["artifact_path"]).is_file())
+
+        replay = self._authorize_delegation_from_fixture(fixture)
+        self.assertEqual(result["receipt_sha256"], replay["receipt_sha256"])
+        self.assertEqual(result["artifact_sha256"], replay["artifact_sha256"])
+
+    def test_scoped_writer_delegation_accepts_broad_parent_repo_for_exact_child_scope(
+        self,
+    ) -> None:
+        fixture = self._delegation_fixture(broad_repo=True)
+        result = self._authorize_delegation_from_fixture(fixture)
+        self.assertEqual(
+            f"repo:{fixture['repo']}",
+            result["parent_live_lease_snapshots"][0]["resource_key"],
+        )
+        self.assertEqual(
+            "src/app.py", result["allowed_write_paths"][0]["relative_path"]
+        )
+
+    def test_scoped_writer_delegation_rejects_broad_repo_without_exact_work_admission(
+        self,
+    ) -> None:
+        fixture = self._delegation_fixture(broad_repo=True)
+        acquisition = fixture["acquisition"]
+        assert isinstance(acquisition, dict)
+        acquisition["groups"] = []
+        material = {
+            key: value
+            for key, value in acquisition.items()
+            if key != "acquisition_sha256"
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(material)
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            self._authorize_delegation_from_fixture(fixture)
+        self.assertEqual(
+            "scoped-writer-delegation-work-admission-drift", raised.exception.code
+        )
+
+    def test_scoped_writer_delegation_rejects_foreign_live_owner_before_receipt(
+        self,
+    ) -> None:
+        fixture = self._delegation_fixture(
+            broad_repo=False, live_owner="bureau-run:FOREIGN"
+        )
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            self._authorize_delegation_from_fixture(fixture)
+        self.assertEqual(
+            "scoped-writer-delegation-foreign-live-owner", raised.exception.code
+        )
+        artifact = (
+            Path(pickup.STATE_ROOT)
+            / "runs"
+            / str(fixture["run_id"])
+            / pickup.BUREAU_SCOPED_WRITER_DELEGATION_FILENAME
+        )
+        self.assertFalse(artifact.exists())
+
+    def test_scoped_writer_delegation_rejects_dirty_or_drifted_parent_workspace(
+        self,
+    ) -> None:
+        fixture = self._delegation_fixture()
+        dirty = {
+            "workspace_path": str(fixture["workspace"]),
+            "head": fixture["head"],
+            "branch": fixture["branch"],
+            "clean": False,
+            "status_sha256": "7" * 64,
+        }
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            self._authorize_delegation_from_fixture(fixture, workspace_probe=dirty)
+        self.assertEqual(
+            "scoped-writer-delegation-workspace-dirty", raised.exception.code
+        )
+
+        drifted = {**dirty, "clean": True, "head": "b" * 40}
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            self._authorize_delegation_from_fixture(fixture, workspace_probe=drifted)
+        self.assertEqual(
+            "scoped-writer-delegation-live-head-drift", raised.exception.code
+        )
+
+    def test_scoped_writer_delegation_second_different_child_lane_conflicts(
+        self,
+    ) -> None:
+        fixture = self._delegation_fixture()
+        first = self._authorize_delegation_from_fixture(fixture, lane_id="5" * 32)
+        self.assertEqual("5" * 32, first["child_lane_id"])
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            self._authorize_delegation_from_fixture(fixture, lane_id="8" * 32)
+        self.assertEqual("pickup-artifact-conflict", raised.exception.code)
+
+
+    def test_scoped_writer_delegation_prelaunch_rejects_revision_lease_and_physical_drift(self) -> None:
+        import copy
+
+        fixture = self._delegation_fixture()
+        receipt = self._authorize_delegation_from_fixture(fixture)
+        intent = fixture["intent"]
+        acquisition = fixture["acquisition"]
+        run = fixture["run"]
+        coordination = fixture["coordination"]
+        assert isinstance(intent, dict)
+        assert isinstance(acquisition, dict)
+        assert isinstance(run, dict)
+        assert isinstance(coordination, dict)
+        effective_binding = {
+            "registry_binding": self.default_registry_binding,
+            "coordination_root": str(self.coordination_root),
+        }
+        revision = receipt["parent_revision"]
+        assert isinstance(revision, dict)
+
+        def read_bound(path: Path, *, label: str) -> dict[str, object]:
+            if path.name == "intent.json":
+                return intent
+            if path.name == "acquisition.json":
+                return acquisition
+            self.fail(f"unexpected bound read: {path} / {label}")
+
+        def revalidate(
+            *,
+            live_coordination: dict[str, object] | None = None,
+            live_revision: dict[str, object] | None = None,
+            physical_error: Exception | None = None,
+        ) -> dict[str, object]:
+            physical_patch = (
+                mock.patch.object(
+                    pickup.physical_checkout,
+                    "verify_physical_checkout_identity",
+                    side_effect=physical_error,
+                )
+                if physical_error is not None
+                else mock.patch.object(
+                    pickup.physical_checkout,
+                    "verify_physical_checkout_identity",
+                    return_value=receipt["physical_checkout"],
+                )
+            )
+            with (
+                mock.patch.object(pickup, "_root_binding_for_run", return_value={}),
+                mock.patch.object(
+                    pickup,
+                    "_coordination_status_for_binding",
+                    return_value=(live_coordination or coordination, effective_binding),
+                ),
+                mock.patch.object(pickup, "_require_active_execution_binding", return_value={}),
+                mock.patch.object(pickup, "_read_bound_json", side_effect=read_bound),
+                mock.patch.object(pickup, "_validate_claim_readback", return_value=run),
+                mock.patch.object(
+                    pickup,
+                    "_current_registry_revision_proof",
+                    return_value=live_revision or revision,
+                ),
+                mock.patch.object(
+                    pickup, "_delegation_receipt_from_disk", return_value=receipt
+                ),
+                mock.patch.object(
+                    pickup,
+                    "_delegation_workspace_probe",
+                    return_value=receipt["workspace"],
+                ),
+                physical_patch,
+            ):
+                return pickup.revalidate_scoped_writer_delegation(
+                    str(fixture["run_id"]),
+                    expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                    child_lane_id="5" * 32,
+                    repository=str(fixture["repo"]),
+                    workspace_path=str(fixture["workspace"]),
+                    workspace_branch=str(fixture["branch"]),
+                    expected_head=str(fixture["head"]),
+                    write_paths=[str(fixture["write_path"])],
+                    scoped_writer_actor="agent:writer",
+                    scoped_writer_argv_sha256="6" * 64,
+                    writer_runtime_seconds=600,
+                )
+
+        self.assertEqual("validated", revalidate()["status"])
+
+        drifted_revision = dict(revision)
+        drifted_revision["task_sha256"] = "f" * 64
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_revision=drifted_revision)
+        self.assertEqual(
+            "scoped-writer-delegation-parent-revision-drift", raised.exception.code
+        )
+
+        renewed = copy.deepcopy(coordination)
+        renewed["lease"]["binding"]["lease_snapshots"][0]["updated_at_unix"] = 101
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_coordination=renewed)
+        self.assertEqual(
+            "scoped-writer-delegation-parent-lease-generation-drift",
+            raised.exception.code,
+        )
+
+        physical_error = pickup.physical_checkout.PhysicalCheckoutIdentityError(
+            "checkout replaced"
+        )
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(physical_error=physical_error)
+        self.assertEqual(
+            "scoped-writer-delegation-physical-checkout-drift", raised.exception.code
+        )
+
+    def test_scoped_writer_delegation_live_lease_generation_rejects_expiry_and_schema_drift(self) -> None:
+        import copy
+
+        fixture = self._delegation_fixture()
+        coordination = fixture["coordination"]
+        intent = fixture["intent"]
+        assert isinstance(coordination, dict)
+        assert isinstance(intent, dict)
+        owner = str(intent["lease_owner_id"])
+        keys = list(intent["required_resource_keys"])
+
+        expired = copy.deepcopy(coordination)
+        expired["lease"]["binding"]["lease_snapshots"][0]["expires_at_unix"] = 101
+        with mock.patch.object(pickup.time, "time", return_value=102):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup._delegation_live_lease_generation(
+                    expired, parent_owner=owner, expected_keys=keys
+                )
+        self.assertEqual(
+            "scoped-writer-delegation-parent-lease-expired", raised.exception.code
+        )
+
+        wrong_schema = copy.deepcopy(coordination)
+        wrong_schema["lease"]["binding"]["resource_db_schema_version"] = "999"
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            pickup._delegation_live_lease_generation(
+                wrong_schema, parent_owner=owner, expected_keys=keys
+            )
+        self.assertEqual(
+            "scoped-writer-delegation-resource-schema-drift", raised.exception.code
+        )
+
+    def test_scoped_writer_prelaunch_rejects_child_parent_and_live_scope_drift(self) -> None:
+        import copy
+
+        fixture = self._delegation_fixture()
+        receipt = self._authorize_delegation_from_fixture(fixture)
+        intent = fixture["intent"]
+        acquisition = fixture["acquisition"]
+        run = fixture["run"]
+        coordination = fixture["coordination"]
+        assert isinstance(intent, dict)
+        assert isinstance(acquisition, dict)
+        assert isinstance(run, dict)
+        assert isinstance(coordination, dict)
+        effective_binding = {
+            "registry_binding": self.default_registry_binding,
+            "coordination_root": str(self.coordination_root),
+        }
+
+        def revalidate(
+            *,
+            run_id: str | None = None,
+            actor: str = "agent:writer",
+            argv_sha256: str = "6" * 64,
+            write_paths: list[str] | None = None,
+            live_coordination: dict[str, object] | None = None,
+            live_run: dict[str, object] | None = None,
+            live_intent: dict[str, object] | None = None,
+            live_workspace: dict[str, object] | None = None,
+            active_error: Exception | None = None,
+            runtime_seconds: int = 600,
+        ) -> dict[str, object]:
+            selected_intent = live_intent or intent
+            selected_run = live_run or run
+            selected_coordination = live_coordination or coordination
+
+            def read_bound(path: Path, *, label: str) -> dict[str, object]:
+                if path.name == "intent.json":
+                    return selected_intent
+                if path.name == "acquisition.json":
+                    return acquisition
+                self.fail(f"unexpected bound read: {path} / {label}")
+
+            active_patch = (
+                mock.patch.object(
+                    pickup, "_require_active_execution_binding", side_effect=active_error
+                )
+                if active_error is not None
+                else mock.patch.object(
+                    pickup, "_require_active_execution_binding", return_value={}
+                )
+            )
+            with (
+                mock.patch.object(pickup, "_root_binding_for_run", return_value={}),
+                mock.patch.object(
+                    pickup,
+                    "_coordination_status_for_binding",
+                    return_value=(selected_coordination, effective_binding),
+                ),
+                active_patch,
+                mock.patch.object(pickup, "_read_bound_json", side_effect=read_bound),
+                mock.patch.object(
+                    pickup, "_validate_claim_readback", return_value=selected_run
+                ),
+                mock.patch.object(
+                    pickup,
+                    "_current_registry_revision_proof",
+                    return_value=receipt["parent_revision"],
+                ),
+                mock.patch.object(
+                    pickup, "_delegation_receipt_from_disk", return_value=receipt
+                ),
+                mock.patch.object(
+                    pickup,
+                    "_delegation_workspace_probe",
+                    return_value=live_workspace or receipt["workspace"],
+                ),
+                mock.patch.object(
+                    pickup.physical_checkout,
+                    "verify_physical_checkout_identity",
+                    return_value=receipt["physical_checkout"],
+                ),
+            ):
+                return pickup.revalidate_scoped_writer_delegation(
+                    run_id or str(fixture["run_id"]),
+                    expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                    child_lane_id="5" * 32,
+                    repository=str(fixture["repo"]),
+                    workspace_path=str(fixture["workspace"]),
+                    workspace_branch=str(fixture["branch"]),
+                    expected_head=str(fixture["head"]),
+                    write_paths=write_paths or [str(fixture["write_path"])],
+                    scoped_writer_actor=actor,
+                    scoped_writer_argv_sha256=argv_sha256,
+                    writer_runtime_seconds=runtime_seconds,
+                )
+
+        for label, kwargs in (
+            ("run", {"run_id": "BUR-RUN-20260817T204720Z-0000000000"}),
+            ("writer", {"actor": "agent:foreign"}),
+            ("argv", {"argv_sha256": "8" * 64}),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(pickup.BureauPickupError) as raised:
+                    revalidate(**kwargs)
+                self.assertEqual(
+                    "scoped-writer-delegation-child-binding-drift",
+                    raised.exception.code,
+                )
+
+        escaped = Path(fixture["repo"]) / "src" / "other.py"
+        escaped.write_text("other = 1\n", encoding="utf-8")
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(write_paths=[str(escaped)])
+        self.assertEqual(
+            "scoped-writer-delegation-child-binding-drift", raised.exception.code
+        )
+
+        drifted_run = dict(run)
+        drifted_run["task_id"] = "TEST-BUREAU-PARENT-T999"
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_run=drifted_run)
+        self.assertEqual(
+            "scoped-writer-delegation-parent-run-drift", raised.exception.code
+        )
+
+        drifted_envelope = dict(run)
+        drifted_envelope["envelope_sha256"] = "8" * 64
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_run=drifted_envelope)
+        self.assertEqual(
+            "scoped-writer-delegation-parent-run-drift", raised.exception.code
+        )
+
+        drifted_intent = dict(intent)
+        drifted_intent["intent_sha256"] = "9" * 64
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_intent=drifted_intent)
+        self.assertEqual("scoped-writer-delegation-intent-drift", raised.exception.code)
+
+        missing = copy.deepcopy(coordination)
+        missing["lease"]["binding"]["lease_snapshots"] = []
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_coordination=missing)
+        self.assertEqual(
+            "scoped-writer-delegation-live-resource-drift", raised.exception.code
+        )
+
+        foreign = copy.deepcopy(coordination)
+        foreign["lease"]["binding"]["lease_snapshots"][0]["owner_id"] = "bureau-run:FOREIGN"
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_coordination=foreign)
+        self.assertEqual(
+            "scoped-writer-delegation-foreign-live-owner", raised.exception.code
+        )
+
+        metadata = copy.deepcopy(coordination)
+        metadata["lease"]["binding"]["lease_snapshots"][0]["metadata_sha256"] = "f" * 64
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_coordination=metadata)
+        self.assertEqual(
+            "scoped-writer-delegation-parent-lease-generation-drift",
+            raised.exception.code,
+        )
+
+        live_workspace = dict(receipt["workspace"])
+        live_workspace["branch"] = "bureau/drifted"
+        with self.assertRaises(pickup.BureauPickupError) as raised:
+            revalidate(live_workspace=live_workspace)
+        self.assertEqual(
+            "scoped-writer-delegation-live-workspace-drift", raised.exception.code
+        )
+
+        for classification in ("stale", "terminal"):
+            with self.subTest(execution=classification):
+                with self.assertRaises(pickup.BureauPickupError) as raised:
+                    revalidate(
+                        active_error=pickup.BureauPickupError(
+                            "existing-assignment-execution-not-bound",
+                            details={"classification": classification},
+                        )
+                    )
+                self.assertEqual(
+                    "existing-assignment-execution-not-bound", raised.exception.code
+                )
+
+    def test_scoped_writer_prelaunch_rejects_short_lifetime_and_forged_persisted_receipt(self) -> None:
+        import copy
+
+        fixture = self._delegation_fixture()
+        coordination = fixture["coordination"]
+        assert isinstance(coordination, dict)
+        short = copy.deepcopy(coordination)
+        now = int(time.time())
+        snapshot = short["lease"]["binding"]["lease_snapshots"][0]
+        snapshot["acquired_at_unix"] = now - 2
+        snapshot["updated_at_unix"] = now - 1
+        snapshot["expires_at_unix"] = now + 120
+        fixture["coordination"] = short
+        receipt = self._authorize_delegation_from_fixture(fixture)
+
+        intent = fixture["intent"]
+        acquisition = fixture["acquisition"]
+        run = fixture["run"]
+        assert isinstance(intent, dict)
+        assert isinstance(acquisition, dict)
+        assert isinstance(run, dict)
+        effective_binding = {
+            "registry_binding": self.default_registry_binding,
+            "coordination_root": str(self.coordination_root),
+        }
+
+        def read_bound(path: Path, *, label: str) -> dict[str, object]:
+            if path.name == "intent.json":
+                return intent
+            if path.name == "acquisition.json":
+                return acquisition
+            self.fail(f"unexpected bound read: {path} / {label}")
+
+        with (
+            mock.patch.object(pickup, "_root_binding_for_run", return_value={}),
+            mock.patch.object(
+                pickup,
+                "_coordination_status_for_binding",
+                return_value=(short, effective_binding),
+            ),
+            mock.patch.object(pickup, "_require_active_execution_binding", return_value={}),
+            mock.patch.object(pickup, "_read_bound_json", side_effect=read_bound),
+            mock.patch.object(pickup, "_validate_claim_readback", return_value=run),
+            mock.patch.object(
+                pickup,
+                "_current_registry_revision_proof",
+                return_value=receipt["parent_revision"],
+            ),
+            mock.patch.object(
+                pickup, "_delegation_receipt_from_disk", return_value=receipt
+            ),
+            mock.patch.object(
+                pickup,
+                "_delegation_workspace_probe",
+                return_value=receipt["workspace"],
+            ),
+            mock.patch.object(
+                pickup.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=receipt["physical_checkout"],
+            ),
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.revalidate_scoped_writer_delegation(
+                    str(fixture["run_id"]),
+                    expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                    child_lane_id="5" * 32,
+                    repository=str(fixture["repo"]),
+                    workspace_path=str(fixture["workspace"]),
+                    workspace_branch=str(fixture["branch"]),
+                    expected_head=str(fixture["head"]),
+                    write_paths=[str(fixture["write_path"])],
+                    scoped_writer_actor="agent:writer",
+                    scoped_writer_argv_sha256="6" * 64,
+                    writer_runtime_seconds=120,
+                )
+        self.assertEqual(
+            "scoped-writer-delegation-insufficient-lifetime", raised.exception.code
+        )
+
+        persisted = {
+            key: value
+            for key, value in receipt.items()
+            if key not in {"artifact_sha256", "artifact_path"}
+        }
+        forged = copy.deepcopy(persisted)
+        forged["scoped_writer_actor"] = "agent:forged"
+        with mock.patch.object(pickup, "_read_bound_json", return_value=forged):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup._delegation_receipt_from_disk(Path(fixture["workspace"]))
+        self.assertEqual(
+            "scoped-writer-delegation-receipt-invalid", raised.exception.code
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

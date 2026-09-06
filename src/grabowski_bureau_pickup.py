@@ -19,6 +19,7 @@ except ModuleNotFoundError:
 import grabowski_bureau_intake as bureau
 import grabowski_bureau_leases as bureau_leases
 import grabowski_nonconflict as nonconflict
+import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
 import grabowski_work_admission as work_admission
 
@@ -73,6 +74,10 @@ MAX_LEASE_TTL_SECONDS = 3600
 MAX_JOURNAL_REPLAY_RUNS = 4096
 MAX_MCP_ERROR_ENVELOPE_BYTES = 16 * 1024
 MCP_ERROR_ENVELOPE_MARKER = "GRABOWSKI_ERROR_ENVELOPE="
+BUREAU_SCOPED_WRITER_DELEGATION_KIND = "grabowski.bureau_scoped_writer_delegation"
+BUREAU_SCOPED_WRITER_DELEGATION_FILENAME = "scoped-writer-delegation.json"
+MAX_DELEGATED_WRITE_PATHS = 256
+DELEGATION_LAUNCH_SAFETY_SECONDS = 30
 
 
 ACTIVE_EXECUTION_STATES = frozenset({"assigned", "running", "verifying"})
@@ -6238,6 +6243,525 @@ def _validate_acquisition(acquisition: dict[str, Any]) -> None:
         raise BureauPickupError("acquisition-resource-set-invalid")
     if acquisition.get("owner_id") != f"bureau-run:{acquisition.get('run_id')}":
         raise BureauPickupError("acquisition-owner-invalid")
+
+
+def _delegated_write_paths(repository: Path, write_paths: Any) -> list[dict[str, str]]:
+    if (
+        not isinstance(write_paths, list)
+        or not write_paths
+        or len(write_paths) > MAX_DELEGATED_WRITE_PATHS
+    ):
+        raise BureauPickupError("scoped-writer-delegation-write-scope-invalid")
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in write_paths:
+        if not isinstance(item, str) or not item:
+            raise BureauPickupError("scoped-writer-delegation-write-scope-invalid")
+        candidate = Path(item).expanduser()
+        if not candidate.is_absolute():
+            raise BureauPickupError("scoped-writer-delegation-write-scope-not-absolute")
+        candidate = candidate.resolve(strict=False)
+        if candidate == repository or not candidate.is_relative_to(repository):
+            raise BureauPickupError("scoped-writer-delegation-write-scope-escaped")
+        relative = candidate.relative_to(repository).as_posix()
+        if relative in seen:
+            raise BureauPickupError("scoped-writer-delegation-write-scope-duplicate")
+        seen.add(relative)
+        rows.append({"path": str(candidate), "relative_path": relative})
+    return sorted(rows, key=lambda row: row["relative_path"])
+
+
+def _delegation_workspace_probe(workspace: Path) -> dict[str, Any]:
+    environment = operator._git_environment()
+
+    def run(arguments: list[str]) -> dict[str, Any]:
+        result = operator._run(
+            ["git", "-C", str(workspace), *arguments],
+            cwd=workspace,
+            timeout_seconds=30,
+            max_output_bytes=250_000,
+            environment=environment,
+        )
+        if result.get("returncode") != 0 or result.get("timed_out") is True:
+            raise BureauPickupError(
+                "scoped-writer-delegation-workspace-probe-failed",
+                details={"git_arguments": arguments[:2]},
+            )
+        return result
+
+    top = str(run(["rev-parse", "--show-toplevel"]).get("stdout") or "").strip()
+    head = str(run(["rev-parse", "HEAD"]).get("stdout") or "").strip()
+    branch = str(
+        run(["symbolic-ref", "--quiet", "--short", "HEAD"]).get("stdout") or ""
+    ).strip()
+    status = str(
+        run(["status", "--porcelain=v1", "--untracked-files=all"]).get("stdout") or ""
+    )
+    if Path(top).resolve(strict=True) != workspace:
+        raise BureauPickupError("scoped-writer-delegation-workspace-root-drift")
+    if re.fullmatch(r"[0-9a-f]{40}", head) is None or not branch:
+        raise BureauPickupError("scoped-writer-delegation-workspace-identity-invalid")
+    return {
+        "workspace_path": str(workspace),
+        "head": head,
+        "branch": branch,
+        "clean": status == "",
+        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+    }
+
+
+def _delegation_live_lease_generation(
+    coordination: dict[str, Any],
+    *,
+    parent_owner: str,
+    expected_keys: list[str],
+) -> dict[str, Any]:
+    lease = coordination.get("lease")
+    if not isinstance(lease, dict) or lease.get("status") != "active-bound":
+        raise BureauPickupError("scoped-writer-delegation-live-lease-binding-missing")
+    binding = lease.get("binding")
+    if not isinstance(binding, dict):
+        raise BureauPickupError("scoped-writer-delegation-live-lease-binding-missing")
+    schema_version = binding.get("resource_db_schema_version")
+    if schema_version != resources.RESOURCE_CURRENT_SCHEMA_VERSION:
+        raise BureauPickupError(
+            "scoped-writer-delegation-resource-schema-drift",
+            details={
+                "expected": resources.RESOURCE_CURRENT_SCHEMA_VERSION,
+                "observed": schema_version,
+            },
+        )
+    raw_snapshots = binding.get("lease_snapshots")
+    if not isinstance(raw_snapshots, list):
+        raise BureauPickupError("scoped-writer-delegation-live-leases-invalid")
+    try:
+        snapshots = sorted(
+            (_lease_snapshot(item) for item in raw_snapshots),
+            key=lambda item: item["resource_key"],
+        )
+    except (KeyError, TypeError) as exc:
+        raise BureauPickupError("scoped-writer-delegation-live-leases-invalid") from exc
+    if [item["resource_key"] for item in snapshots] != expected_keys:
+        raise BureauPickupError(
+            "scoped-writer-delegation-live-resource-drift",
+            details={
+                "expected": expected_keys,
+                "observed": [item["resource_key"] for item in snapshots],
+            },
+        )
+    if any(item["owner_id"] != parent_owner for item in snapshots):
+        raise BureauPickupError("scoped-writer-delegation-foreign-live-owner")
+    now = int(time.time())
+    expiries: list[int] = []
+    for item in snapshots:
+        acquired = item.get("acquired_at_unix")
+        updated = item.get("updated_at_unix")
+        expires = item.get("expires_at_unix")
+        if (
+            type(acquired) is not int
+            or type(updated) is not int
+            or type(expires) is not int
+            or not acquired <= updated < expires
+        ):
+            raise BureauPickupError("scoped-writer-delegation-live-lease-timestamps-invalid")
+        if expires <= now:
+            raise BureauPickupError(
+                "scoped-writer-delegation-parent-lease-expired",
+                details={"resource_key": item["resource_key"], "expires_at_unix": expires},
+            )
+        metadata_sha256 = item.get("metadata_sha256")
+        if not isinstance(metadata_sha256, str) or SHA256_RE.fullmatch(metadata_sha256) is None:
+            raise BureauPickupError("scoped-writer-delegation-live-lease-metadata-invalid")
+        expiries.append(expires)
+    generation = {
+        "resource_db_schema_version": schema_version,
+        "resource_keys": expected_keys,
+        "lease_snapshots": snapshots,
+    }
+    return {
+        **generation,
+        "lease_generation_sha256": _sha256(generation),
+        "min_expires_at_unix": min(expiries),
+    }
+
+
+def _delegation_repo_work_admission(
+    acquisition: dict[str, Any],
+    *,
+    broad_repo_key: str,
+    repository: str,
+    workspace: str,
+    branch: str,
+    expected_head: str,
+    task_id: str,
+) -> dict[str, Any]:
+    groups = acquisition.get("groups")
+    if not isinstance(groups, list):
+        raise BureauPickupError("scoped-writer-delegation-work-admission-missing")
+    matches: list[dict[str, Any]] = []
+    expected_requested = {
+        "repository": repository,
+        "worktree": workspace,
+        "branch": branch,
+        "base_head": expected_head,
+        "head": expected_head,
+        "task_id": task_id,
+    }
+    for group in groups:
+        if not isinstance(group, dict) or broad_repo_key not in (group.get("resource_keys") or []):
+            continue
+        result = group.get("result")
+        admissions = result.get("work_admission") if isinstance(result, dict) else None
+        if not isinstance(admissions, list):
+            continue
+        for admission in admissions:
+            if not isinstance(admission, dict):
+                continue
+            requested = admission.get("requested_scope")
+            identity = admission.get("scope_identity")
+            if not isinstance(requested, dict) or not isinstance(identity, dict):
+                continue
+            effects = requested.get("effects")
+            if (
+                admission.get("decision") == "allow"
+                and admission.get("scope_mode") == "exact_checkout"
+                and admission.get("repository") == repository
+                and identity.get("target_path") == workspace
+                and identity.get("branch") == branch
+                and all(requested.get(key) == value for key, value in expected_requested.items())
+                and isinstance(effects, list)
+                and "write" in effects
+            ):
+                matches.append(admission)
+    if len(matches) != 1:
+        raise BureauPickupError(
+            "scoped-writer-delegation-work-admission-drift",
+            details={"matching_exact_checkout_admissions": len(matches)},
+        )
+    return matches[0]
+
+
+def _delegation_receipt_from_disk(run_dir: Path) -> dict[str, Any]:
+    receipt = _read_bound_json(
+        run_dir / BUREAU_SCOPED_WRITER_DELEGATION_FILENAME,
+        label="scoped-writer-delegation",
+    )
+    claimed = receipt.get("receipt_sha256")
+    material = dict(receipt)
+    material.pop("receipt_sha256", None)
+    if (
+        not isinstance(claimed, str)
+        or SHA256_RE.fullmatch(claimed) is None
+        or _sha256(material) != claimed
+        or receipt.get("kind") != BUREAU_SCOPED_WRITER_DELEGATION_KIND
+        or receipt.get("schema_version") != 1
+    ):
+        raise BureauPickupError("scoped-writer-delegation-receipt-invalid")
+    return receipt
+
+
+def authorize_scoped_writer_delegation(
+    parent_run_id: str,
+    *,
+    child_lane_id: str,
+    repository: str,
+    workspace_path: str,
+    workspace_branch: str,
+    expected_head: str,
+    write_paths: list[str],
+    scoped_writer_actor: str,
+    scoped_writer_argv_sha256: str,
+) -> dict[str, Any]:
+    """Create one immutable, server-derived Bureau -> child writer delegation."""
+    run_id = _text(parent_run_id, label="parent_run_id", maximum=128)
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        raise BureauPickupError("scoped-writer-delegation-run-id-invalid")
+    if not isinstance(child_lane_id, str) or re.fullmatch(r"[0-9a-f]{32}", child_lane_id) is None:
+        raise BureauPickupError("scoped-writer-delegation-lane-id-invalid")
+    actor = _text(scoped_writer_actor, label="scoped_writer_actor", maximum=256)
+    if re.fullmatch(r"[A-Za-z0-9._:@/-]{1,256}", actor) is None:
+        raise BureauPickupError("scoped-writer-delegation-actor-invalid")
+    if not isinstance(scoped_writer_argv_sha256, str) or SHA256_RE.fullmatch(scoped_writer_argv_sha256) is None:
+        raise BureauPickupError("scoped-writer-delegation-command-digest-invalid")
+    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+        raise BureauPickupError("scoped-writer-delegation-head-invalid")
+
+    repo = Path(repository).expanduser().resolve(strict=True)
+    workspace = Path(workspace_path).expanduser().resolve(strict=True)
+    delegated_paths = _delegated_write_paths(repo, write_paths)
+    binding = _root_binding_for_run(run_id)
+    coordination, effective_binding = _coordination_status_for_binding(run_id, binding)
+    _require_active_execution_binding(coordination, action="scoped-writer-delegation")
+    run_dir = _run_directory(run_id)
+    intent = _read_bound_json(run_dir / "intent.json", label="intent")
+    acquisition = _read_bound_json(run_dir / "acquisition.json", label="acquisition")
+    _validate_acquisition(acquisition)
+    journal_identity = _journal_run_identity(run_dir, intent)
+    run = _validate_claim_readback(coordination, intent, acquisition)
+    revision = _current_registry_revision_proof(
+        effective_binding["registry_binding"],
+        intent,
+        coordination_root=effective_binding["coordination_root"],
+    )
+    if journal_identity.get("run_id") != run_id or run.get("run_id") != run_id:
+        raise BureauPickupError("scoped-writer-delegation-run-binding-drift")
+    parent_owner = intent.get("lease_owner_id")
+    if parent_owner != f"bureau-run:{run_id}" or acquisition.get("owner_id") != parent_owner:
+        raise BureauPickupError("scoped-writer-delegation-parent-owner-invalid")
+    if acquisition.get("claim_intent_sha256") != intent.get("intent_sha256"):
+        raise BureauPickupError("scoped-writer-delegation-intent-drift")
+
+    parent_workspace = intent.get("workspace")
+    if not isinstance(parent_workspace, dict):
+        raise BureauPickupError("scoped-writer-delegation-parent-workspace-missing")
+    expected_workspace = {
+        "repository": str(repo),
+        "workspace_path": str(workspace),
+        "workspace_branch": workspace_branch,
+    }
+    mismatches = {
+        key: {"expected": value, "observed": parent_workspace.get(key)}
+        for key, value in expected_workspace.items()
+        if parent_workspace.get(key) != value
+    }
+    if mismatches:
+        raise BureauPickupError(
+            "scoped-writer-delegation-parent-workspace-drift",
+            details={"mismatches": mismatches},
+        )
+    if parent_workspace.get("source_head_at_intent") != expected_head:
+        raise BureauPickupError("scoped-writer-delegation-parent-head-baseline-drift")
+
+    live_workspace = _delegation_workspace_probe(workspace)
+    if live_workspace["head"] != expected_head:
+        raise BureauPickupError("scoped-writer-delegation-live-head-drift")
+    if live_workspace["branch"] != workspace_branch:
+        raise BureauPickupError("scoped-writer-delegation-live-branch-drift")
+    if live_workspace["clean"] is not True:
+        raise BureauPickupError("scoped-writer-delegation-workspace-dirty")
+    checkout_identity = physical_checkout.capture_physical_checkout_identity(workspace)
+
+    expected_keys = sorted(intent.get("required_resource_keys") or [])
+    live_generation = _delegation_live_lease_generation(
+        coordination, parent_owner=parent_owner, expected_keys=expected_keys
+    )
+    acquisition_snapshots = sorted(
+        (_lease_snapshot(item) for item in acquisition.get("leases", [])),
+        key=lambda item: item["resource_key"],
+    )
+    if [item["resource_key"] for item in acquisition_snapshots] != expected_keys or any(
+        item["owner_id"] != parent_owner for item in acquisition_snapshots
+    ):
+        raise BureauPickupError("scoped-writer-delegation-acquisition-snapshot-drift")
+
+    broad_repo_key = f"repo:{repo}"
+    live_key_set = set(expected_keys)
+    broad_repo_admission = None
+    if broad_repo_key in live_key_set:
+        broad_repo_admission = _delegation_repo_work_admission(
+            acquisition,
+            broad_repo_key=broad_repo_key,
+            repository=str(repo),
+            workspace=str(workspace),
+            branch=workspace_branch,
+            expected_head=expected_head,
+            task_id=run["task_id"],
+        )
+    for row in delegated_paths:
+        exact_key = f"path:{row['path']}"
+        if broad_repo_key not in live_key_set and exact_key not in live_key_set:
+            raise BureauPickupError(
+                "scoped-writer-delegation-write-scope-not-covered",
+                details={"relative_path": row["relative_path"]},
+            )
+
+    material = {
+        "schema_version": 1,
+        "kind": BUREAU_SCOPED_WRITER_DELEGATION_KIND,
+        "parent_run_id": run_id,
+        "parent_task_id": run["task_id"],
+        "parent_worker_id": run["worker_id"],
+        "parent_task_sha256": run["task_sha256"],
+        "parent_plan_sha256": run["plan_sha256"],
+        "parent_envelope_sha256": run["envelope_sha256"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "parent_owner_id": parent_owner,
+        "parent_acquisition_sha256": acquisition["acquisition_sha256"],
+        "parent_acquisition_lease_snapshots": acquisition_snapshots,
+        "resource_db_schema_version": live_generation["resource_db_schema_version"],
+        "parent_live_lease_generation_sha256": live_generation["lease_generation_sha256"],
+        "parent_live_lease_snapshots": live_generation["lease_snapshots"],
+        "delegation_expires_at_unix": live_generation["min_expires_at_unix"],
+        "parent_repo_work_admission": broad_repo_admission,
+        "parent_repo_work_admission_sha256": (
+            _sha256(broad_repo_admission) if broad_repo_admission is not None else None
+        ),
+        "parent_revision": revision,
+        "workspace": live_workspace,
+        "physical_checkout": checkout_identity,
+        "repository": str(repo),
+        "child_lane_id": child_lane_id,
+        "scoped_writer_actor": actor,
+        "scoped_writer_argv_sha256": scoped_writer_argv_sha256,
+        "allowed_write_paths": delegated_paths,
+        "authority": "parent-bureau-run-derived",
+        "parent_leases_remain_authoritative": True,
+        "child_lease_acquisition_authorized": False,
+        "does_not_establish": [
+            "parent lease transfer",
+            "parent lease release authority",
+            "independent child resource ownership",
+            "merge authority",
+            "deployment authority",
+            "bureau terminalization authority",
+        ],
+    }
+    receipt = {**material, "receipt_sha256": _sha256(material)}
+    artifact_sha256 = _write_bound_json(
+        run_dir / BUREAU_SCOPED_WRITER_DELEGATION_FILENAME, receipt
+    )
+    return {
+        **receipt,
+        "artifact_sha256": artifact_sha256,
+        "artifact_path": str(run_dir / BUREAU_SCOPED_WRITER_DELEGATION_FILENAME),
+    }
+
+
+def revalidate_scoped_writer_delegation(
+    parent_run_id: str,
+    *,
+    expected_receipt_sha256: str,
+    child_lane_id: str,
+    repository: str,
+    workspace_path: str,
+    workspace_branch: str,
+    expected_head: str,
+    write_paths: list[str],
+    scoped_writer_actor: str,
+    scoped_writer_argv_sha256: str,
+    writer_runtime_seconds: int,
+) -> dict[str, Any]:
+    """Fail closed immediately before launch using only the persisted server receipt."""
+    run_id = _text(parent_run_id, label="parent_run_id", maximum=128)
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        raise BureauPickupError("scoped-writer-delegation-run-id-invalid")
+    if not isinstance(expected_receipt_sha256, str) or SHA256_RE.fullmatch(expected_receipt_sha256) is None:
+        raise BureauPickupError("scoped-writer-delegation-receipt-digest-invalid")
+    if type(writer_runtime_seconds) is not int or not 120 <= writer_runtime_seconds <= 86400:
+        raise BureauPickupError("scoped-writer-delegation-writer-runtime-invalid")
+    repo = Path(repository).expanduser().resolve(strict=True)
+    workspace = Path(workspace_path).expanduser().resolve(strict=True)
+    delegated_paths = _delegated_write_paths(repo, write_paths)
+    run_dir = _run_directory(run_id)
+    receipt = _delegation_receipt_from_disk(run_dir)
+    if receipt["receipt_sha256"] != expected_receipt_sha256:
+        raise BureauPickupError("scoped-writer-delegation-receipt-drift")
+
+    expected = {
+        "parent_run_id": run_id,
+        "child_lane_id": child_lane_id,
+        "repository": str(repo),
+        "scoped_writer_actor": scoped_writer_actor,
+        "scoped_writer_argv_sha256": scoped_writer_argv_sha256,
+        "allowed_write_paths": delegated_paths,
+    }
+    drift = {
+        key: {"expected": value, "observed": receipt.get(key)}
+        for key, value in expected.items()
+        if receipt.get(key) != value
+    }
+    if drift:
+        raise BureauPickupError(
+            "scoped-writer-delegation-child-binding-drift", details={"mismatches": drift}
+        )
+    workspace_receipt = receipt.get("workspace")
+    if not isinstance(workspace_receipt, dict) or (
+        workspace_receipt.get("workspace_path") != str(workspace)
+        or workspace_receipt.get("branch") != workspace_branch
+        or workspace_receipt.get("head") != expected_head
+        or workspace_receipt.get("clean") is not True
+    ):
+        raise BureauPickupError("scoped-writer-delegation-receipt-workspace-drift")
+
+    binding = _root_binding_for_run(run_id)
+    coordination, effective_binding = _coordination_status_for_binding(run_id, binding)
+    _require_active_execution_binding(coordination, action="scoped-writer-prelaunch")
+    intent = _read_bound_json(run_dir / "intent.json", label="intent")
+    acquisition = _read_bound_json(run_dir / "acquisition.json", label="acquisition")
+    _validate_acquisition(acquisition)
+    run = _validate_claim_readback(coordination, intent, acquisition)
+    current_revision = _current_registry_revision_proof(
+        effective_binding["registry_binding"],
+        intent,
+        coordination_root=effective_binding["coordination_root"],
+    )
+    if receipt.get("parent_revision") != current_revision:
+        raise BureauPickupError("scoped-writer-delegation-parent-revision-drift")
+    run_fields = {
+        "parent_task_id": "task_id",
+        "parent_worker_id": "worker_id",
+        "parent_task_sha256": "task_sha256",
+        "parent_plan_sha256": "plan_sha256",
+        "parent_envelope_sha256": "envelope_sha256",
+    }
+    if any(receipt.get(receipt_key) != run.get(run_key) for receipt_key, run_key in run_fields.items()):
+        raise BureauPickupError("scoped-writer-delegation-parent-run-drift")
+    if receipt.get("claim_intent_sha256") != intent.get("intent_sha256"):
+        raise BureauPickupError("scoped-writer-delegation-intent-drift")
+    if receipt.get("parent_acquisition_sha256") != acquisition.get("acquisition_sha256"):
+        raise BureauPickupError("scoped-writer-delegation-acquisition-drift")
+    parent_owner = receipt.get("parent_owner_id")
+    expected_keys = sorted(intent.get("required_resource_keys") or [])
+    live_generation = _delegation_live_lease_generation(
+        coordination, parent_owner=parent_owner, expected_keys=expected_keys
+    )
+    if (
+        receipt.get("resource_db_schema_version") != live_generation["resource_db_schema_version"]
+        or receipt.get("parent_live_lease_generation_sha256") != live_generation["lease_generation_sha256"]
+        or receipt.get("parent_live_lease_snapshots") != live_generation["lease_snapshots"]
+        or receipt.get("delegation_expires_at_unix") != live_generation["min_expires_at_unix"]
+    ):
+        raise BureauPickupError("scoped-writer-delegation-parent-lease-generation-drift")
+
+    live_workspace = _delegation_workspace_probe(workspace)
+    if (
+        live_workspace.get("workspace_path") != str(workspace)
+        or live_workspace.get("branch") != workspace_branch
+        or live_workspace.get("head") != expected_head
+        or live_workspace.get("clean") is not True
+    ):
+        raise BureauPickupError("scoped-writer-delegation-live-workspace-drift")
+    physical_identity = receipt.get("physical_checkout")
+    try:
+        verified_identity = physical_checkout.verify_physical_checkout_identity(physical_identity)
+    except physical_checkout.PhysicalCheckoutIdentityError as exc:
+        raise BureauPickupError("scoped-writer-delegation-physical-checkout-drift") from exc
+    if verified_identity != physical_identity:
+        raise BureauPickupError("scoped-writer-delegation-physical-checkout-drift")
+
+    expiry = receipt.get("delegation_expires_at_unix")
+    now = int(time.time())
+    required_until = now + writer_runtime_seconds + DELEGATION_LAUNCH_SAFETY_SECONDS
+    if type(expiry) is not int or expiry < required_until:
+        raise BureauPickupError(
+            "scoped-writer-delegation-insufficient-lifetime",
+            details={
+                "expires_at_unix": expiry,
+                "required_until_unix": required_until,
+                "writer_runtime_seconds": writer_runtime_seconds,
+                "safety_seconds": DELEGATION_LAUNCH_SAFETY_SECONDS,
+            },
+        )
+    return {
+        "status": "validated",
+        "receipt_sha256": receipt["receipt_sha256"],
+        "parent_run_id": run_id,
+        "child_lane_id": child_lane_id,
+        "delegation_expires_at_unix": expiry,
+        "remaining_seconds": expiry - now,
+        "physical_identity_sha256": physical_identity["physical_identity_sha256"],
+        "parent_live_lease_generation_sha256": live_generation["lease_generation_sha256"],
+    }
 
 
 def _verify_release_binding(

@@ -237,6 +237,7 @@ class WorkAcquireTests(unittest.TestCase):
 
     def test_public_work_acquire_signature_does_not_change_in_p4(self) -> None:
         parameters = inspect.signature(work_acquire.grabowski_work_acquire).parameters
+        self.assertIsNone(parameters["scoped_writer_runtime_seconds"].default)
         self.assertEqual(
             list(parameters),
             [
@@ -2600,6 +2601,409 @@ class WorkAcquireTests(unittest.TestCase):
             acquire.call_args.kwargs["audit_fn"],
             work_acquire.operator.base._append_audit,
         )
+
+
+    def bureau_run_parameters(self) -> dict[str, object]:
+        params = self.parameters()
+        params.update(
+            {
+                "source_kind": "bureau_run",
+                "source_id": "BUR-RUN-20260817T204720Z-8972ca454d",
+                "branch": "bureau/test-parent-run",
+                "write_paths": ["src/app.py"],
+                "scoped_writer_argv": ["writer", "--once"],
+                "scoped_writer_runtime_seconds": 600,
+            }
+        )
+        return params
+
+    def test_scoped_writer_runtime_defaults_are_source_aware(self) -> None:
+        direct = self.parameters()
+        direct["scoped_writer_argv"] = ["writer", "--once"]
+        normalized_direct = work_acquire._normalize(direct)
+        self.assertEqual(
+            work_acquire.DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS,
+            normalized_direct["scoped_writer_command"]["runtime_seconds"],
+        )
+
+        bureau = self.bureau_run_parameters()
+        bureau.pop("scoped_writer_runtime_seconds")
+        normalized_bureau = work_acquire._normalize(bureau)
+        self.assertEqual(
+            work_acquire.BUREAU_RUN_DEFAULT_SCOPED_WRITER_RUNTIME_SECONDS,
+            normalized_bureau["scoped_writer_command"]["runtime_seconds"],
+        )
+
+        explicit = self.bureau_run_parameters()
+        explicit["scoped_writer_runtime_seconds"] = 1800
+        normalized_explicit = work_acquire._normalize(explicit)
+        self.assertEqual(
+            1800, normalized_explicit["scoped_writer_command"]["runtime_seconds"]
+        )
+
+    @staticmethod
+    def delegated_parent_receipt() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski.bureau_scoped_writer_delegation",
+            "receipt_sha256": "1" * 64,
+            "artifact_sha256": "2" * 64,
+            "parent_owner_id": "bureau-run:BUR-RUN-20260817T204720Z-8972ca454d",
+            "claim_intent_sha256": "3" * 64,
+            "delegation_expires_at_unix": 10_000_000_000,
+        }
+
+    @staticmethod
+    def writer_start_receipt() -> dict[str, object]:
+        return {
+            "job_id": "job-delegated-1",
+            "unit": "grabowski-job-delegated-1",
+            "argv_sha256": "4" * 64,
+            "metadata_path": "/tmp/grabowski-job-delegated-1.json",
+            "owner": "grabowski",
+            "cwd": "/tmp/parent-workspace",
+            "runtime_seconds": 600,
+        }
+
+    def test_bureau_run_requires_writer_exact_write_scope_and_allows_disjoint_independent_resources(
+        self,
+    ) -> None:
+        params = self.bureau_run_parameters()
+        params.pop("scoped_writer_argv")
+        with self.assertRaisesRegex(
+            ValueError, "require scoped_writer_actor and scoped_writer_argv"
+        ):
+            work_acquire._normalize(params)
+
+        params = self.bureau_run_parameters()
+        params["write_paths"] = []
+        with self.assertRaisesRegex(ValueError, "require non-empty write_paths"):
+            work_acquire._normalize(params)
+
+        params = self.bureau_run_parameters()
+        independent_key = f"path:{self.repo / 'other'}"
+        params["resource_keys"] = [independent_key]
+        normalized = work_acquire._normalize(params)
+        self.assertEqual([independent_key], normalized["resource_keys"])
+        self.assertEqual(
+            [f"path:{self.repo / 'src/app.py'}"],
+            normalized["delegated_write_resource_keys"],
+        )
+
+        forged = self.bureau_run_parameters()
+        forged["parent_delegation"] = {"receipt_sha256": "0" * 64}
+        with self.assertRaisesRegex(ValueError, "server-derived"):
+            work_acquire._normalize(forged)
+
+    def test_bureau_run_delegation_skips_child_leases_and_second_worktree(self) -> None:
+        params = self.bureau_run_parameters()
+        acquire = Mock(
+            side_effect=AssertionError("child resource acquisition forbidden")
+        )
+        ensure = Mock(side_effect=AssertionError("second worktree forbidden"))
+        start = Mock(return_value=self.writer_start_receipt())
+        delegate = Mock(return_value=self.delegated_parent_receipt())
+        with (
+            patch.object(work_acquire, "_authorize_bureau_run_delegation", delegate),
+            patch.object(work_acquire, "_revalidate_bureau_run_delegation", return_value={"status": "validated"}),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertEqual("ready", result["state"])
+        self.assertEqual("DELEGATED_EXECUTE", result["decision"])
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+        start.assert_called_once_with(
+            ["writer", "--once"], cwd=str(self.target), runtime_seconds=600
+        )
+        delegation_call = delegate.call_args
+        self.assertEqual("BUR-RUN-20260817T204720Z-8972ca454d", delegation_call.args[0])
+        self.assertEqual(
+            [str(self.repo / "src/app.py")], delegation_call.kwargs["write_paths"]
+        )
+        self.assertEqual(
+            ["implement", "test", "commit"], result["authority"]["writer_effects"]
+        )
+        self.assertIn("push", result["authority"]["controller_only_effects"])
+        self.assertEqual(
+            "parent-bureau-run-derived-exact-write-paths",
+            result["authority"]["single_writer_scope"],
+        )
+
+    def test_bureau_run_parent_authority_failure_stops_before_writer_or_other_effect(
+        self,
+    ) -> None:
+        params = self.bureau_run_parameters()
+        acquire = Mock()
+        ensure = Mock()
+        start = Mock()
+        with patch.object(
+            work_acquire,
+            "_authorize_bureau_run_delegation",
+            side_effect=RuntimeError("parent authority drift"),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertEqual("blocked", result["state"])
+        self.assertEqual("HARD_BLOCK", result["decision"])
+        self.assertFalse(result["effect_observed"])
+        self.assertEqual(
+            "repair_parent_bureau_delegation_authority", result["next_action"]
+        )
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+        start.assert_not_called()
+
+    def test_bureau_run_writer_preflight_failure_has_no_controller_fallback(
+        self,
+    ) -> None:
+        params = self.bureau_run_parameters()
+        with (
+            patch.object(
+                work_acquire,
+                "_authorize_bureau_run_delegation",
+                return_value=self.delegated_parent_receipt(),
+            ),
+            patch.object(work_acquire, "_revalidate_bureau_run_delegation", return_value={"status": "validated"}),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=Mock(),
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=Mock(
+                    side_effect=work_acquire.ScopedWriterStartPreflight("bad writer")
+                ),
+            )
+
+        self.assertEqual("blocked", result["state"])
+        self.assertEqual("HARD_BLOCK", result["decision"])
+        self.assertEqual("fix_scoped_writer_start_preflight", result["next_action"])
+        self.assertNotEqual("controller_execute", result["next_action"])
+
+    def test_bureau_run_terminal_convergence_observes_only_child_owner_and_never_parent(
+        self,
+    ) -> None:
+        params = self.bureau_run_parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        record = {
+            "lane_id": inputs["lane_id"],
+            "inputs": inputs,
+            "worktree_receipt": {
+                "kind": "grabowski.work_lane.delegated_parent_workspace"
+            },
+        }
+        assessment = {
+            "phase": "terminal",
+            "lease_release_ready": True,
+            "closeout_state": "no_change_verified",
+            "terminal_head_sha": SHA,
+        }
+        with (
+            patch.object(
+                work_acquire.resources, "list_resources", return_value=[]
+            ) as listing,
+            patch.object(
+                work_acquire.resources, "count_resources", return_value=0
+            ) as counting,
+            patch.object(
+                work_acquire.resources, "grabowski_resource_release"
+            ) as release,
+            patch.object(
+                work_acquire.checkouts, "_worktree_for_path"
+            ) as checkout_probe,
+        ):
+            lifecycle = work_acquire._converge_terminal_checkout_lifecycle(
+                record, assessment=assessment
+            )
+            resources_result = work_acquire._converge_terminal_resource_leases(
+                record, assessment=assessment
+            )
+
+        self.assertIsNone(lifecycle)
+        self.assertIsNotNone(resources_result)
+        assert resources_result is not None
+        self.assertEqual("already_absent", resources_result["state"])
+        self.assertEqual(f"lane:{inputs['lane_id']}", resources_result["owner_id"])
+        self.assertEqual([], resources_result["released_resource_keys"])
+        listing.assert_called_with(
+            owner_id=f"lane:{inputs['lane_id']}",
+            include_expired=False,
+            limit=work_acquire.MAX_TERMINAL_OWNER_LEASES,
+        )
+        counting.assert_called_with(
+            owner_id=f"lane:{inputs['lane_id']}", include_expired=False
+        )
+        release.assert_not_called()
+        checkout_probe.assert_not_called()
+
+    def test_bureau_run_ready_replay_does_not_start_second_writer_or_redelegate(
+        self,
+    ) -> None:
+        params = self.bureau_run_parameters()
+        delegate = Mock(return_value=self.delegated_parent_receipt())
+        start = Mock(return_value=self.writer_start_receipt())
+        with (
+            patch.object(work_acquire, "_authorize_bureau_run_delegation", delegate),
+            patch.object(work_acquire, "_revalidate_bureau_run_delegation", return_value={"status": "validated"}),
+        ):
+            first = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=Mock(),
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+        self.assertEqual("ready", first["state"])
+        self.assertEqual(1, delegate.call_count)
+        self.assertEqual(1, start.call_count)
+
+        delegate.reset_mock()
+        start.reset_mock()
+        with patch.object(work_acquire, "_authorize_bureau_run_delegation", delegate):
+            second = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=Mock(),
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+        self.assertTrue(second["replayed"])
+        self.assertEqual("ready", second["state"])
+        delegate.assert_not_called()
+        start.assert_not_called()
+
+    def test_bureau_run_disjoint_independent_resource_is_lane_owned_only(self) -> None:
+        params = self.bureau_run_parameters()
+        independent_key = f"path:{self.repo / 'independent-child-resource'}"
+        params["resource_keys"] = [independent_key]
+        inputs = work_acquire._normalize(params)
+        owner = inputs["lease_owner_id"]
+        acquire = Mock(return_value=self.acquired(owner, [independent_key]))
+        start = Mock(return_value=self.writer_start_receipt())
+        with (
+            patch.object(work_acquire, "_authorize_bureau_run_delegation", return_value=self.delegated_parent_receipt()),
+            patch.object(work_acquire, "_revalidate_bureau_run_delegation", return_value={"status": "validated"}),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(side_effect=AssertionError("second worktree forbidden")),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+        self.assertEqual("ready", result["state"])
+        self.assertEqual([independent_key], result["authority"]["lane_owned_resource_keys"])
+        self.assertEqual(owner, acquire.call_args.args[0])
+        self.assertEqual([independent_key], acquire.call_args.args[1])
+        self.assertNotEqual(result["parent_delegation"]["parent_owner_id"], owner)
+        start.assert_called_once()
+
+    def test_bureau_run_prelaunch_drift_compensates_only_lane_owned_resource(self) -> None:
+        params = self.bureau_run_parameters()
+        independent_key = f"path:{self.repo / 'independent-child-resource'}"
+        params["resource_keys"] = [independent_key]
+        inputs = work_acquire._normalize(params)
+        owner = inputs["lease_owner_id"]
+        acquire = Mock(return_value=self.acquired(owner, [independent_key]))
+        release = Mock(side_effect=self.release)
+        start = Mock()
+        with (
+            patch.object(work_acquire, "_authorize_bureau_run_delegation", return_value=self.delegated_parent_receipt()),
+            patch.object(work_acquire, "_revalidate_bureau_run_delegation", side_effect=RuntimeError("parent drift")),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+        self.assertEqual("blocked", result["state"])
+        self.assertEqual("complete", result["compensation"]["state"])
+        self.assertEqual(owner, release.call_args.args[0])
+        self.assertEqual([independent_key], release.call_args.args[1])
+        self.assertNotEqual(result["parent_delegation"]["parent_owner_id"], owner)
+        start.assert_not_called()
+
+    def test_bureau_run_compensation_unknown_stays_outcome_unknown(self) -> None:
+        params = self.bureau_run_parameters()
+        independent_key = f"path:{self.repo / 'independent-child-resource'}"
+        params["resource_keys"] = [independent_key]
+        inputs = work_acquire._normalize(params)
+        owner = inputs["lease_owner_id"]
+        acquire = Mock(return_value=self.acquired(owner, [independent_key]))
+        release = Mock(side_effect=RuntimeError("release outcome lost"))
+        start = Mock()
+        with (
+            patch.object(work_acquire, "_authorize_bureau_run_delegation", return_value=self.delegated_parent_receipt()),
+            patch.object(work_acquire, "_revalidate_bureau_run_delegation", side_effect=RuntimeError("parent drift")),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+        self.assertEqual("outcome_unknown", result["state"])
+        self.assertEqual("outcome_unknown", result["compensation"]["state"])
+        self.assertEqual("reconcile_lease_compensation_before_retry", result["next_action"])
+        self.assertEqual(owner, release.call_args.args[0])
+        start.assert_not_called()
+
+    def test_bureau_run_unknown_writer_start_is_not_blindly_retried(self) -> None:
+        params = self.bureau_run_parameters()
+        start = Mock(side_effect=RuntimeError("writer launch response lost"))
+        with (
+            patch.object(work_acquire, "_authorize_bureau_run_delegation", return_value=self.delegated_parent_receipt()),
+            patch.object(work_acquire, "_revalidate_bureau_run_delegation", return_value={"status": "validated"}),
+        ):
+            first = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=Mock(), release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(), ensure_worktree_fn=Mock(), runner=Mock(),
+                start_writer_fn=start,
+            )
+            second = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=Mock(), release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(), ensure_worktree_fn=Mock(), runner=Mock(),
+                start_writer_fn=start,
+            )
+        self.assertEqual("outcome_unknown", first["state"])
+        self.assertTrue(second["replayed"])
+        self.assertEqual("outcome_unknown", second["state"])
+        self.assertEqual(1, start.call_count)
 
 
 if __name__ == "__main__":
