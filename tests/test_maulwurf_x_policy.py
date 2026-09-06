@@ -9,8 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MaulwurfXPolicyTests(unittest.TestCase):
-    def test_initial_policy_is_status_plane_only(self) -> None:
+    def test_policy_keeps_internal_status_plane_read_only_and_adds_one_gateway_proposal(self) -> None:
         policy = json.loads((ROOT / "config" / "maulwurf-x-tools.json").read_text())
+        self.assertEqual(policy["schema_version"], 2)
         self.assertEqual(
             set(policy["allowed_tools"]),
             {
@@ -22,13 +23,15 @@ class MaulwurfXPolicyTests(unittest.TestCase):
                 "grabowski_audit_projection",
             },
         )
+        self.assertEqual(policy["gateway_tools"], ["maulwurfx_propose_finding"])
         self.assertTrue(policy["read_only_only"])
+        self.assertNotIn("maulwurfx_propose_finding", policy["allowed_tools"])
 
-    def test_initial_policy_excludes_unscoped_content_readers(self) -> None:
+    def test_policy_excludes_unscoped_content_readers_and_general_mutators(self) -> None:
         policy = json.loads((ROOT / "config" / "maulwurf-x-tools.json").read_text())
-        allowed = set(policy["allowed_tools"])
+        exposed = set(policy["allowed_tools"]) | set(policy["gateway_tools"])
         self.assertTrue(
-            allowed.isdisjoint(
+            exposed.isdisjoint(
                 {
                     "grabowski_context",
                     "grabowski_git_status",
@@ -42,13 +45,19 @@ class MaulwurfXPolicyTests(unittest.TestCase):
                     "repoground_query_existing_index",
                     "repoground_context_pack",
                     "grabowski_bureau_candidate_assess",
+                    "grabowski_bureau_candidate_record",
+                    "grabowski_bureau_task_publish",
                     "grabowski_bureau_pickup_status",
                     "grabowski_operator_historical_recall",
+                    "grabowski_task_start",
+                    "grabowski_git",
+                    "grabowski_power_run",
+                    "grabowski_runtime_deploy_schedule",
                 }
             )
         )
 
-    def test_initial_policy_tools_are_published_and_read_only(self) -> None:
+    def test_internal_policy_tools_are_published_and_read_only(self) -> None:
         policy = json.loads((ROOT / "config" / "maulwurf-x-tools.json").read_text())
         entrypoint = json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text())
         catalog = json.loads((ROOT / "contracts" / "capability-catalog.v1.json").read_text())
@@ -61,6 +70,7 @@ class MaulwurfXPolicyTests(unittest.TestCase):
         allowed = set(policy["allowed_tools"])
         self.assertTrue(allowed <= set(entrypoint["expected_tools"]))
         self.assertTrue(allowed <= read_only)
+        self.assertNotIn("maulwurfx_propose_finding", set(entrypoint["expected_tools"]))
 
 
 if __name__ == "__main__":

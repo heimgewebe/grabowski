@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import binascii
+import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,7 +36,36 @@ DEFAULT_EXTERNAL_TOKEN_FILE = (
 DEFAULT_POLICY_FILE = (
     Path.home() / ".local/state/grabowski/transport-connectors/maulwurf-x.tools.json"
 )
+DEFAULT_DEPLOYMENT_MANIFEST = (
+    Path.home() / ".local/share/grabowski-mcp/deployment-manifest.json"
+)
+DEFAULT_FINDING_ROOT = (
+    Path.home() / ".local/state/grabowski/external-connectors/maulwurf-x-findings"
+)
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_DEPLOYMENT_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_FINDING_BYTES = 64 * 1024
+MAX_FINDING_FILES = 256
+FINDING_FILENAME_RE = re.compile(r"[0-9a-f]{64}\.json")
+FINDING_LOCK_NAME = ".proposal.lock"
+PROPOSAL_TOOL_NAME = "maulwurfx_propose_finding"
+PROPOSAL_CATEGORIES = frozenset(
+    {"runtime", "bureau", "resource", "audit", "connector", "catalog", "other"}
+)
+PROPOSAL_SEVERITIES = frozenset({"info", "low", "medium", "high", "critical"})
+PROPOSAL_REQUIRED_FIELDS = frozenset(
+    {
+        "title",
+        "category",
+        "severity",
+        "facts",
+        "evidence_refs",
+        "interpretation",
+        "uncertainty",
+        "proposed_action",
+        "does_not_establish",
+    }
+)
 ALLOWED_JSON_RPC_METHODS = frozenset(
     {
         "initialize",
@@ -124,8 +156,19 @@ def _load_gateway_policy(path: Path, connector_id: str) -> dict[str, Any]:
             "external connector gateway requires an enforced read-only allowlist policy"
         )
     allowed = policy.get("allowed_tools")
+    gateway_tools = policy.get("gateway_tools", [])
     if not isinstance(allowed, list) or not allowed:
         raise GatewayConfigurationError("external connector allowlist is empty")
+    if not isinstance(gateway_tools, list):
+        raise GatewayConfigurationError("external connector gateway-tool allowlist is invalid")
+    if gateway_tools and (
+        policy.get("schema_version") != 2
+        or connector_id != DEFAULT_CONNECTOR_ID
+        or set(gateway_tools) != {PROPOSAL_TOOL_NAME}
+    ):
+        raise GatewayConfigurationError(
+            "external connector gateway proposal surface is not authorized"
+        )
     return policy
 
 
@@ -403,6 +446,731 @@ def _tool_not_available_response(payload: dict[str, Any] | None) -> dict[str, An
     }
 
 
+def _json_rpc_error(
+    payload: dict[str, Any] | None, code: int, message: str
+) -> dict[str, Any]:
+    request_id = payload.get("id") if isinstance(payload, dict) else None
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": code, "message": message},
+    }
+
+
+def _tool_call_arguments(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or payload.get("method") != "tools/call":
+        return None
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    arguments = params.get("arguments", {})
+    return arguments if isinstance(arguments, dict) else None
+
+
+def _proposal_tool_descriptor() -> dict[str, Any]:
+    return {
+        "name": PROPOSAL_TOOL_NAME,
+        "description": (
+            "Record one evidence-bound maulwurfX finding as a private, create-only "
+            "proposal. This never creates a Bureau task, claims resources, changes a "
+            "repository, deploys, or executes the proposed action."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": sorted(PROPOSAL_REQUIRED_FIELDS),
+            "properties": {
+                "title": {"type": "string", "minLength": 1, "maxLength": 200},
+                "category": {"type": "string", "enum": sorted(PROPOSAL_CATEGORIES)},
+                "severity": {"type": "string", "enum": sorted(PROPOSAL_SEVERITIES)},
+                "facts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 800},
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 24,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 512},
+                },
+                "interpretation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2500,
+                },
+                "uncertainty": {"type": "number", "minimum": 0, "maximum": 1},
+                "proposed_action": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000,
+                },
+                "does_not_establish": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 500},
+                },
+            },
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    }
+
+
+def _normalize_proposal_text(value: Any, *, label: str, maximum_bytes: int) -> str:
+    if not isinstance(value, str) or any(c in value for c in ("\x00", "\r")):
+        raise ValueError(f"{label} is invalid")
+    normalized = " ".join(value.split())
+    if not normalized or len(normalized.encode("utf-8")) > maximum_bytes:
+        raise ValueError(f"{label} is invalid")
+    return normalized
+
+
+def _normalize_proposal_list(
+    value: Any,
+    *,
+    label: str,
+    maximum_items: int,
+    maximum_item_bytes: int,
+) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or len(value) > maximum_items
+    ):
+        raise ValueError(f"{label} is invalid")
+    normalized = [
+        _normalize_proposal_text(item, label=label, maximum_bytes=maximum_item_bytes)
+        for item in value
+    ]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{label} contains duplicates")
+    return normalized
+
+
+def _normalize_finding_arguments(arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, dict) or set(arguments) != PROPOSAL_REQUIRED_FIELDS:
+        raise ValueError("finding proposal shape is invalid")
+    category = _normalize_proposal_text(
+        arguments.get("category"), label="category", maximum_bytes=32
+    )
+    severity = _normalize_proposal_text(
+        arguments.get("severity"), label="severity", maximum_bytes=16
+    )
+    if category not in PROPOSAL_CATEGORIES:
+        raise ValueError("finding proposal category is invalid")
+    if severity not in PROPOSAL_SEVERITIES:
+        raise ValueError("finding proposal severity is invalid")
+    uncertainty = arguments.get("uncertainty")
+    if (
+        not isinstance(uncertainty, (int, float))
+        or isinstance(uncertainty, bool)
+        or not math.isfinite(float(uncertainty))
+        or not 0 <= float(uncertainty) <= 1
+    ):
+        raise ValueError("finding proposal uncertainty is invalid")
+    return {
+        "title": _normalize_proposal_text(
+            arguments.get("title"), label="title", maximum_bytes=200
+        ),
+        "category": category,
+        "severity": severity,
+        "facts": _normalize_proposal_list(
+            arguments.get("facts"),
+            label="facts",
+            maximum_items=12,
+            maximum_item_bytes=800,
+        ),
+        "evidence_refs": _normalize_proposal_list(
+            arguments.get("evidence_refs"),
+            label="evidence_refs",
+            maximum_items=24,
+            maximum_item_bytes=512,
+        ),
+        "interpretation": _normalize_proposal_text(
+            arguments.get("interpretation"),
+            label="interpretation",
+            maximum_bytes=2500,
+        ),
+        "uncertainty": float(uncertainty),
+        "proposed_action": _normalize_proposal_text(
+            arguments.get("proposed_action"),
+            label="proposed_action",
+            maximum_bytes=2000,
+        ),
+        "does_not_establish": _normalize_proposal_list(
+            arguments.get("does_not_establish"),
+            label="does_not_establish",
+            maximum_items=12,
+            maximum_item_bytes=500,
+        ),
+    }
+
+
+def _read_runtime_binding(path: Path) -> dict[str, str]:
+    try:
+        linked = os.lstat(path)
+    except OSError as exc:
+        raise GatewayConfigurationError("deployment manifest is unavailable") from exc
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or linked.st_nlink != 1
+        or linked.st_size > MAX_DEPLOYMENT_MANIFEST_BYTES
+        or stat.S_IMODE(linked.st_mode) & 0o022
+    ):
+        raise GatewayConfigurationError("deployment manifest file is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_mode != linked.st_mode
+            or opened.st_uid != linked.st_uid
+            or opened.st_gid != linked.st_gid
+            or opened.st_nlink != linked.st_nlink
+        ):
+            raise GatewayConfigurationError("deployment manifest changed while opening")
+        raw = os.read(descriptor, MAX_DEPLOYMENT_MANIFEST_BYTES + 1)
+        if len(raw) > MAX_DEPLOYMENT_MANIFEST_BYTES or os.read(descriptor, 1):
+            raise GatewayConfigurationError("deployment manifest exceeds size bound")
+    finally:
+        os.close(descriptor)
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GatewayConfigurationError("deployment manifest is invalid JSON") from exc
+    release_id = manifest.get("release_id") if isinstance(manifest, dict) else None
+    repo_head = manifest.get("repo_head") if isinstance(manifest, dict) else None
+    completion_status = (
+        manifest.get("completion_status") if isinstance(manifest, dict) else None
+    )
+    if (
+        completion_status != "complete"
+        or not isinstance(release_id, str)
+        or not release_id
+        or len(release_id.encode("utf-8")) > 512
+        or not isinstance(repo_head, str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", repo_head) is None
+    ):
+        raise GatewayConfigurationError("deployment manifest identity is invalid")
+    return {"release_id": release_id, "repo_head": repo_head}
+
+
+def _ensure_private_finding_root(root: Path) -> None:
+    parent = root.parent
+    try:
+        parent_stat = os.lstat(parent)
+    except OSError as exc:
+        raise GatewayConfigurationError("finding parent directory is unavailable") from exc
+    if (
+        stat.S_ISLNK(parent_stat.st_mode)
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_stat.st_mode) & 0o077
+    ):
+        raise GatewayConfigurationError("finding parent directory is unsafe")
+    try:
+        os.mkdir(root, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        linked = os.lstat(root)
+    except OSError as exc:
+        raise GatewayConfigurationError("finding directory is unavailable") from exc
+    if (
+        stat.S_ISLNK(linked.st_mode)
+        or not stat.S_ISDIR(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or stat.S_IMODE(linked.st_mode) != 0o700
+    ):
+        raise GatewayConfigurationError("finding directory is unsafe")
+
+
+def _canonical_json_bytes(value: dict[str, Any]) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _acquire_finding_store_lock(root: Path) -> int:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(root, directory_flags)
+    descriptor = -1
+    try:
+        directory = os.fstat(directory_fd)
+        linked_directory = os.lstat(root)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or stat.S_ISLNK(linked_directory.st_mode)
+            or directory.st_uid != os.geteuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700
+            or directory.st_dev != linked_directory.st_dev
+            or directory.st_ino != linked_directory.st_ino
+            or directory.st_mode != linked_directory.st_mode
+            or directory.st_uid != linked_directory.st_uid
+            or directory.st_gid != linked_directory.st_gid
+        ):
+            raise GatewayConfigurationError("finding directory identity is unsafe")
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(FINDING_LOCK_NAME, flags, 0o600, dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        linked = os.stat(
+            FINDING_LOCK_NAME, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_mode != linked.st_mode
+            or opened.st_uid != linked.st_uid
+            or opened.st_gid != linked.st_gid
+            or opened.st_nlink != linked.st_nlink
+            or opened.st_size != linked.st_size
+        ):
+            raise GatewayConfigurationError("finding proposal lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        after = os.fstat(descriptor)
+        linked_after = os.stat(
+            FINDING_LOCK_NAME, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+            or after.st_mode != opened.st_mode
+            or after.st_uid != opened.st_uid
+            or after.st_gid != opened.st_gid
+            or after.st_nlink != 1
+            or after.st_size != 0
+            or linked_after.st_dev != opened.st_dev
+            or linked_after.st_ino != opened.st_ino
+            or linked_after.st_mode != opened.st_mode
+            or linked_after.st_uid != opened.st_uid
+            or linked_after.st_gid != opened.st_gid
+            or linked_after.st_nlink != 1
+            or linked_after.st_size != 0
+        ):
+            raise GatewayConfigurationError(
+                "finding proposal lock identity changed during acquisition"
+            )
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _release_finding_store_lock(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short finding proposal write")
+        view = view[written:]
+
+
+def _publish_private_create_only_json(
+    directory: Path,
+    target: Path,
+    payload: dict[str, Any],
+) -> bool:
+    if target.parent != directory:
+        raise ValueError("finding proposal target must be a direct child")
+    target_name = target.name
+    if FINDING_FILENAME_RE.fullmatch(target_name) is None:
+        raise ValueError("finding proposal target name is invalid")
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_FINDING_BYTES:
+        raise ValueError("finding proposal is too large")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(directory, directory_flags)
+    temporary_name = f".{target_name}.{os.getpid()}.{secrets.token_hex(16)}.tmp"
+    descriptor = -1
+    temporary_present = False
+    published_inode: tuple[int, int] | None = None
+    try:
+        opened_directory = os.fstat(directory_fd)
+        linked_directory = os.lstat(directory)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or stat.S_ISLNK(linked_directory.st_mode)
+            or opened_directory.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_directory.st_mode) != 0o700
+            or opened_directory.st_dev != linked_directory.st_dev
+            or opened_directory.st_ino != linked_directory.st_ino
+            or opened_directory.st_mode != linked_directory.st_mode
+            or opened_directory.st_uid != linked_directory.st_uid
+            or opened_directory.st_gid != linked_directory.st_gid
+        ):
+            raise GatewayConfigurationError("finding directory identity is unsafe")
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        temporary_present = True
+        temporary = os.fstat(descriptor)
+        published_inode = (temporary.st_dev, temporary.st_ino)
+        if (
+            not stat.S_ISREG(temporary.st_mode)
+            or stat.S_IMODE(temporary.st_mode) != 0o600
+            or temporary.st_uid != os.geteuid()
+            or temporary.st_nlink != 1
+        ):
+            raise GatewayConfigurationError("temporary finding proposal is unsafe")
+        _write_all(descriptor, encoded)
+        os.fsync(descriptor)
+        after_write = os.fstat(descriptor)
+        if (
+            (after_write.st_dev, after_write.st_ino) != published_inode
+            or after_write.st_mode != temporary.st_mode
+            or after_write.st_uid != temporary.st_uid
+            or after_write.st_gid != temporary.st_gid
+            or after_write.st_nlink != 1
+            or after_write.st_size != len(encoded)
+        ):
+            raise GatewayConfigurationError(
+                "temporary finding proposal changed during write"
+            )
+        os.close(descriptor)
+        descriptor = -1
+
+        try:
+            os.link(
+                temporary_name,
+                target_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            published_inode = None
+            return False
+
+        linked = os.stat(target_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (linked.st_dev, linked.st_ino) != published_inode
+            or not stat.S_ISREG(linked.st_mode)
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or linked.st_uid != os.geteuid()
+            or linked.st_nlink != 2
+            or linked.st_size != len(encoded)
+        ):
+            raise GatewayConfigurationError(
+                "linked finding proposal failed integrity validation"
+            )
+        os.unlink(temporary_name, dir_fd=directory_fd)
+        temporary_present = False
+        linked = os.stat(target_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (linked.st_dev, linked.st_ino) != published_inode
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or linked.st_uid != os.geteuid()
+            or linked.st_nlink != 1
+            or linked.st_size != len(encoded)
+        ):
+            raise GatewayConfigurationError(
+                "published finding proposal failed integrity validation"
+            )
+        os.fsync(directory_fd)
+        directory_after = os.fstat(directory_fd)
+        linked_directory_after = os.lstat(directory)
+        if (
+            directory_after.st_dev != opened_directory.st_dev
+            or directory_after.st_ino != opened_directory.st_ino
+            or directory_after.st_mode != opened_directory.st_mode
+            or directory_after.st_uid != opened_directory.st_uid
+            or directory_after.st_gid != opened_directory.st_gid
+            or linked_directory_after.st_dev != opened_directory.st_dev
+            or linked_directory_after.st_ino != opened_directory.st_ino
+            or linked_directory_after.st_mode != opened_directory.st_mode
+        ):
+            raise GatewayConfigurationError(
+                "finding directory identity changed during publication"
+            )
+        return True
+    except BaseException:
+        if published_inode is not None:
+            try:
+                current = os.stat(
+                    target_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (current.st_dev, current.st_ino) == published_inode:
+                    os.unlink(target_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except (FileNotFoundError, OSError):
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_present:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except (FileNotFoundError, OSError):
+                pass
+        os.close(directory_fd)
+
+
+def _read_existing_finding(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = grabowski_connector_policy._read_private_file(
+            path, maximum_bytes=MAX_FINDING_BYTES
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, RuntimeError) as exc:
+        raise GatewayConfigurationError(
+            "existing finding proposal cannot be verified"
+        ) from exc
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GatewayConfigurationError(
+            "existing finding proposal cannot be verified"
+        ) from exc
+    if not isinstance(value, dict):
+        raise GatewayConfigurationError("existing finding proposal is invalid")
+    return value
+
+
+def _enforce_finding_store_capacity(root: Path, target: Path) -> None:
+    if target.exists():
+        return
+    count = 0
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                linked = entry.stat(follow_symlinks=False)
+                if entry.name == FINDING_LOCK_NAME:
+                    if (
+                        not stat.S_ISREG(linked.st_mode)
+                        or linked.st_uid != os.geteuid()
+                        or linked.st_nlink != 1
+                        or stat.S_IMODE(linked.st_mode) != 0o600
+                        or linked.st_size != 0
+                    ):
+                        raise GatewayConfigurationError(
+                            "finding store lock entry is unsafe"
+                        )
+                    continue
+                if FINDING_FILENAME_RE.fullmatch(entry.name) is None:
+                    raise GatewayConfigurationError(
+                        "finding store contains an unexpected entry"
+                    )
+                if (
+                    not stat.S_ISREG(linked.st_mode)
+                    or linked.st_uid != os.geteuid()
+                    or linked.st_nlink != 1
+                    or stat.S_IMODE(linked.st_mode) != 0o600
+                    or linked.st_size > MAX_FINDING_BYTES
+                ):
+                    raise GatewayConfigurationError(
+                        "finding store contains an unsafe entry"
+                    )
+                count += 1
+                if count >= MAX_FINDING_FILES:
+                    raise GatewayConfigurationError("finding proposal store is full")
+    except GatewayConfigurationError:
+        raise
+    except OSError as exc:
+        raise GatewayConfigurationError("finding proposal store is unavailable") from exc
+
+
+def _verify_existing_finding(
+    existing: dict[str, Any],
+    *,
+    finding_id: str,
+    proposal_sha256: str,
+    connector_id: str,
+    runtime: dict[str, str],
+    normalized: dict[str, Any],
+) -> None:
+    required_keys = {
+        "schema_version",
+        "kind",
+        "finding_id",
+        "proposal_sha256",
+        "principal",
+        "runtime",
+        "finding",
+        "created_at_unix",
+        "record_semantics",
+    }
+    created_at = existing.get("created_at_unix")
+    if (
+        set(existing) != required_keys
+        or existing.get("schema_version") != 1
+        or existing.get("kind") != "maulwurfx_finding_proposal"
+        or existing.get("record_semantics")
+        != "private-create-only-content-addressed-v1"
+        or not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or created_at < 0
+        or existing.get("finding_id") != finding_id
+        or existing.get("proposal_sha256") != proposal_sha256
+        or existing.get("principal") != connector_id
+        or existing.get("runtime") != runtime
+        or existing.get("finding") != normalized
+    ):
+        raise GatewayConfigurationError("existing finding proposal identity mismatch")
+
+
+def _record_finding_proposal(
+    *,
+    connector_id: str,
+    arguments: dict[str, Any],
+    finding_root: Path,
+    deployment_manifest: Path,
+) -> dict[str, Any]:
+    if connector_id != DEFAULT_CONNECTOR_ID:
+        raise GatewayConfigurationError("finding proposal principal is not authorized")
+    normalized = _normalize_finding_arguments(arguments)
+    runtime = _read_runtime_binding(deployment_manifest)
+    identity = {
+        "schema_version": 1,
+        "principal": connector_id,
+        "runtime": runtime,
+        "finding": normalized,
+    }
+    proposal_sha256 = hashlib.sha256(_canonical_json_bytes(identity)).hexdigest()
+    finding_id = proposal_sha256
+    _ensure_private_finding_root(finding_root)
+    target = finding_root / f"{finding_id}.json"
+    record = {
+        "schema_version": 1,
+        "kind": "maulwurfx_finding_proposal",
+        "finding_id": finding_id,
+        "proposal_sha256": proposal_sha256,
+        "principal": connector_id,
+        "runtime": runtime,
+        "finding": normalized,
+        "created_at_unix": int(time.time()),
+        "record_semantics": "private-create-only-content-addressed-v1",
+    }
+    lock_descriptor = _acquire_finding_store_lock(finding_root)
+    try:
+        existing = _read_existing_finding(target)
+        if existing is not None:
+            _verify_existing_finding(
+                existing,
+                finding_id=finding_id,
+                proposal_sha256=proposal_sha256,
+                connector_id=connector_id,
+                runtime=runtime,
+                normalized=normalized,
+            )
+            created = False
+        else:
+            _enforce_finding_store_capacity(finding_root, target)
+            try:
+                created = _publish_private_create_only_json(
+                    finding_root,
+                    target,
+                    record,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise GatewayConfigurationError(
+                    "finding proposal publication failed"
+                ) from exc
+            if not created:
+                existing = _read_existing_finding(target)
+                if existing is None:
+                    raise GatewayConfigurationError(
+                        "finding proposal publication outcome is ambiguous"
+                    )
+                _verify_existing_finding(
+                    existing,
+                    finding_id=finding_id,
+                    proposal_sha256=proposal_sha256,
+                    connector_id=connector_id,
+                    runtime=runtime,
+                    normalized=normalized,
+                )
+    finally:
+        _release_finding_store_lock(lock_descriptor)
+    return {
+        "schema_version": 1,
+        "kind": "maulwurfx_finding_proposal_receipt",
+        "status": "recorded" if created else "duplicate",
+        "finding_id": finding_id,
+        "proposal_sha256": proposal_sha256,
+        "principal": connector_id,
+        "runtime": runtime,
+        "create_only": True,
+        "execution_authority": False,
+        "does_not_establish": [
+            "finding_correctness",
+            "bureau_task_creation",
+            "bureau_readiness",
+            "resource_claim_or_lease",
+            "repository_mutation",
+            "deployment_or_service_effect",
+            "proposed_action_execution",
+            "deletion_resistance_against_same_uid",
+        ],
+    }
+
+
+def _proposal_tool_result(
+    payload: dict[str, Any] | None, receipt: dict[str, Any]
+) -> dict[str, Any]:
+    request_id = payload.get("id") if isinstance(payload, dict) else None
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(
+                        receipt, ensure_ascii=False, separators=(",", ":")
+                    ),
+                }
+            ],
+            "structuredContent": receipt,
+            "isError": False,
+        },
+    }
+
+
 def _preflight_json_rpc_request(
     method: str, body: bytes, allowed_tools: frozenset[str] | set[str]
 ) -> tuple[int, dict[str, Any]] | None:
@@ -423,7 +1191,11 @@ def _preflight_json_rpc_request(
     return None
 
 
-def _filter_tools_list_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
+def _filter_tools_list_payload(
+    raw: bytes,
+    allowed_tools: set[str],
+    gateway_tools: set[str] | None = None,
+) -> bytes:
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -443,10 +1215,18 @@ def _filter_tools_list_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
             raise GatewayConfigurationError("upstream tools/list contains invalid name")
         if name in allowed_tools:
             filtered.append(tool)
+    projected = list(filtered)
+    if gateway_tools:
+        if gateway_tools != {PROPOSAL_TOOL_NAME}:
+            raise GatewayConfigurationError("unsupported gateway tool projection")
+        # Project the gateway-local tool exactly once even when upstream tools/list
+        # is paginated. The terminal page is the only page whose nextCursor is absent.
+        if result.get("nextCursor") in (None, ""):
+            projected.append(_proposal_tool_descriptor())
     # MCP tools/list may be paginated. Filter only the current page and preserve
-    # the upstream cursor; authoritative existence/authorization is enforced by
-    # the operator-side connector policy on tools/call.
-    result["tools"] = filtered
+    # the upstream cursor; internal tool authorization remains operator-side,
+    # while the one gateway-local proposal tool is handled before upstream.
+    result["tools"] = projected
     return json.dumps(
         payload,
         ensure_ascii=False,
@@ -454,7 +1234,11 @@ def _filter_tools_list_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
     ).encode("utf-8")
 
 
-def _filter_tools_list_sse_payload(raw: bytes, allowed_tools: set[str]) -> bytes:
+def _filter_tools_list_sse_payload(
+    raw: bytes,
+    allowed_tools: set[str],
+    gateway_tools: set[str] | None = None,
+) -> bytes:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -507,6 +1291,7 @@ def _filter_tools_list_sse_payload(raw: bytes, allowed_tools: set[str]) -> bytes
                 "utf-8"
             ),
             allowed_tools,
+            gateway_tools,
         ).decode("utf-8")
         first_data = data_indexes[0]
         lines[first_data] = f"data: {filtered}"
@@ -523,13 +1308,16 @@ def _filter_tools_list_sse_payload(raw: bytes, allowed_tools: set[str]) -> bytes
 
 
 def _filter_tools_list_response(
-    raw: bytes, content_type: str, allowed_tools: set[str]
+    raw: bytes,
+    content_type: str,
+    allowed_tools: set[str],
+    gateway_tools: set[str] | None = None,
 ) -> bytes:
     media_type = content_type.partition(";")[0].strip().lower()
     if media_type == "application/json":
-        return _filter_tools_list_payload(raw, allowed_tools)
+        return _filter_tools_list_payload(raw, allowed_tools, gateway_tools)
     if media_type == "text/event-stream":
-        return _filter_tools_list_sse_payload(raw, allowed_tools)
+        return _filter_tools_list_sse_payload(raw, allowed_tools, gateway_tools)
     raise GatewayConfigurationError(
         "upstream tools/list response has an unsupported content type"
     )
@@ -565,6 +1353,9 @@ class ExternalConnectorGateway:
         internal_token: str,
         allowed_tools: list[str],
         upstream: str,
+        gateway_tools: list[str] | None = None,
+        finding_root: Path | None = None,
+        deployment_manifest: Path | None = None,
     ) -> None:
         if not connector_id:
             raise GatewayConfigurationError("gateway connector id is missing")
@@ -576,10 +1367,32 @@ class ExternalConnectorGateway:
             )
         if not allowed_tools or len(allowed_tools) != len(set(allowed_tools)):
             raise GatewayConfigurationError("gateway tool allowlist is invalid")
+        normalized_gateway_tools = list(gateway_tools or [])
+        if (
+            len(normalized_gateway_tools) != len(set(normalized_gateway_tools))
+            or set(normalized_gateway_tools)
+            - grabowski_connector_policy.GATEWAY_ONLY_TOOL_NAMES
+            or set(normalized_gateway_tools) & set(allowed_tools)
+        ):
+            raise GatewayConfigurationError("gateway-local tool allowlist is invalid")
+        if normalized_gateway_tools and (
+            connector_id != DEFAULT_CONNECTOR_ID
+            or set(normalized_gateway_tools) != {PROPOSAL_TOOL_NAME}
+        ):
+            raise GatewayConfigurationError("gateway-local proposal tool is not authorized")
         self._connector_id = connector_id
         self._external_token = external_token
         self._internal_token = internal_token
         self._allowed_tools = frozenset(allowed_tools)
+        self._gateway_tools = frozenset(normalized_gateway_tools)
+        self._visible_tools = self._allowed_tools | self._gateway_tools
+        self._finding_root = finding_root or (
+            DEFAULT_FINDING_ROOT
+            if connector_id == DEFAULT_CONNECTOR_ID
+            else DEFAULT_FINDING_ROOT.parent / f"{connector_id}-findings"
+        )
+        self._deployment_manifest = deployment_manifest or DEFAULT_DEPLOYMENT_MANIFEST
+        self._proposal_lock = asyncio.Lock()
         self._upstream = _validate_upstream(upstream)
         self._oauth_used_codes: set[str] = set()
 
@@ -592,7 +1405,9 @@ class ExternalConnectorGateway:
                 "service": "grabowski-external-connector-gateway",
                 "healthy": True,
                 "connector_id": self._connector_id,
-                "tool_count": len(self._allowed_tools),
+                "tool_count": len(self._visible_tools),
+                "internal_tool_count": len(self._allowed_tools),
+                "gateway_tool_count": len(self._gateway_tools),
                 "upstream": "loopback-signed-ingress",
             },
             headers={"Cache-Control": "no-store"},
@@ -727,11 +1542,39 @@ class ExternalConnectorGateway:
 
         payload = _parse_json_rpc(body)
         rejection = _preflight_json_rpc_request(
-            request.method, body, self._allowed_tools
+            request.method, body, self._visible_tools
         )
         if rejection is not None:
             status_code, rejection_payload = rejection
             return JSONResponse(rejection_payload, status_code=status_code)
+
+        tool_name = _tool_call_name(payload)
+        if tool_name in self._gateway_tools:
+            arguments = _tool_call_arguments(payload)
+            if arguments is None:
+                return JSONResponse(
+                    _json_rpc_error(payload, -32602, "Invalid finding proposal arguments"),
+                    status_code=200,
+                )
+            try:
+                async with self._proposal_lock:
+                    receipt = _record_finding_proposal(
+                        connector_id=self._connector_id,
+                        arguments=arguments,
+                        finding_root=self._finding_root,
+                        deployment_manifest=self._deployment_manifest,
+                    )
+            except ValueError:
+                return JSONResponse(
+                    _json_rpc_error(payload, -32602, "Invalid finding proposal arguments"),
+                    status_code=200,
+                )
+            except GatewayConfigurationError:
+                return JSONResponse(
+                    _json_rpc_error(payload, -32000, "Finding proposal recording unavailable"),
+                    status_code=200,
+                )
+            return JSONResponse(_proposal_tool_result(payload, receipt), status_code=200)
 
         import httpx
 
@@ -761,6 +1604,7 @@ class ExternalConnectorGateway:
                     raw,
                     content_type,
                     set(self._allowed_tools),
+                    set(self._gateway_tools),
                 )
                 headers = _response_headers(upstream)
             except (GatewayConfigurationError, ValueError):
@@ -798,6 +1642,9 @@ def build_app(
     internal_token: str,
     allowed_tools: list[str],
     upstream: str,
+    gateway_tools: list[str] | None = None,
+    finding_root: Path | None = None,
+    deployment_manifest: Path | None = None,
 ) -> Any:
     from starlette.applications import Starlette
     from starlette.routing import Route
@@ -808,6 +1655,9 @@ def build_app(
         internal_token=internal_token,
         allowed_tools=allowed_tools,
         upstream=upstream,
+        gateway_tools=gateway_tools,
+        finding_root=finding_root,
+        deployment_manifest=deployment_manifest,
     )
     return Starlette(
         routes=[
@@ -856,6 +1706,7 @@ def main() -> None:
         external_token=external_token,
         internal_token=internal_token,
         allowed_tools=list(policy["allowed_tools"]),
+        gateway_tools=list(policy.get("gateway_tools", [])),
         upstream=args.upstream,
     )
     uvicorn.run(
