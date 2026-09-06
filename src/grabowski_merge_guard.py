@@ -4628,23 +4628,38 @@ class CaptainMergeGuardRunner:
         if not isinstance(viewed, dict):
             errors.append("exact_base_cas_reconciliation_pr_view_missing")
         else:
+            if viewed.get("number") != pr_number:
+                errors.append("exact_base_cas_reconciliation_pr_number_mismatch")
             if viewed.get("state") != "CLOSED":
                 errors.append("exact_base_cas_reconciliation_pr_not_closed")
+            if "mergedAt" not in viewed or viewed.get("mergedAt") is not None:
+                errors.append("exact_base_cas_reconciliation_pr_merged_at_not_null")
+            if "mergeCommit" not in viewed or viewed.get("mergeCommit") is not None:
+                errors.append("exact_base_cas_reconciliation_pr_merge_commit_not_null")
             observed_head = viewed.get("headRefOid")
             if not isinstance(observed_head, str) or observed_head != expected_head:
                 errors.append("exact_base_cas_reconciliation_pr_head_mismatch")
             observed_head_branch = viewed.get("headRefName")
             if not isinstance(observed_head_branch, str) or not observed_head_branch.strip():
                 errors.append("exact_base_cas_reconciliation_pr_head_branch_missing")
+            head_repository = viewed.get("headRepository")
+            observed_head_repository = (
+                head_repository.get("nameWithOwner")
+                if isinstance(head_repository, dict)
+                else None
+            )
+            if observed_head_repository != repo_slug:
+                errors.append("exact_base_cas_reconciliation_head_repository_mismatch")
+            if viewed.get("isCrossRepository") is not False:
+                errors.append("exact_base_cas_reconciliation_cross_repository_state_invalid")
             if viewed.get("baseRefName") != expected_base:
                 errors.append("exact_base_cas_reconciliation_pr_base_mismatch")
-            if "baseRefOid" in viewed:
-                observed_base_sha = viewed.get("baseRefOid")
-                if (
-                    not isinstance(observed_base_sha, str)
-                    or observed_base_sha != expected_base_sha
-                ):
-                    errors.append("exact_base_cas_reconciliation_pr_base_sha_mismatch")
+            observed_base_sha = viewed.get("baseRefOid")
+            if (
+                not isinstance(observed_base_sha, str)
+                or observed_base_sha != expected_base_sha
+            ):
+                errors.append("exact_base_cas_reconciliation_pr_base_sha_mismatch")
 
         exact = self.receipt.get("exact_base_git_cas_merge")
         if self.receipt.get("dispatch_mode") != "exact_base_git_cas":
@@ -4707,17 +4722,6 @@ class CaptainMergeGuardRunner:
                 errors.append("exact_base_cas_reconciliation_post_view_merge_sha_mismatch")
             if post_view.get("matched") is not False:
                 errors.append("exact_base_cas_reconciliation_post_view_match_state_invalid")
-
-        if isinstance(viewed, dict):
-            merge_commit = viewed.get("mergeCommit")
-            if merge_commit is not None:
-                observed_merge_sha = (
-                    merge_commit.get("oid")
-                    if isinstance(merge_commit, dict)
-                    else None
-                )
-                if observed_merge_sha != merge_sha:
-                    errors.append("exact_base_cas_reconciliation_pr_merge_commit_conflict")
 
         evidence = {
             "schema_version": 1,
