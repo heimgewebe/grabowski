@@ -591,6 +591,222 @@ class OperatorContractTests(unittest.TestCase):
             release.set()
             executor.shutdown(wait=True, cancel_futures=True)
 
+    def test_g65_cancelled_queued_sync_tool_aborts_fence_before_dispatch(self) -> None:
+        operator = _load_operator_module()
+        started = threading.Event()
+        release = threading.Event()
+        second_begun = threading.Event()
+        executed: list[int] = []
+        marked: list[int] = []
+        settled: list[int] = []
+        aborted: list[int] = []
+        executor = operator.concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        operator._SYNC_TOOL_EXECUTOR = executor
+
+        async def slow_call_tool(_name, arguments):
+            slot = arguments["slot"]
+            executed.append(slot)
+            started.set()
+            if slot == 1 and not release.wait(timeout=5):
+                raise RuntimeError("test worker release timed out")
+            return {"called": True, "slot": slot}
+
+        def admit(*, arguments, **_kwargs):
+            return {
+                "slot": arguments["slot"],
+                "admission_sha256": f"{arguments['slot']:064x}",
+                "admitted_at_unix": 1,
+            }
+
+        def begin(admission):
+            slot = admission["slot"]
+            if slot == 2:
+                second_begun.set()
+            return {"slot": slot}
+
+        operator.mcp._tool_manager.call_tool = slow_call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+
+        with (
+            patch.object(
+                operator,
+                "_require_transport_roundtrip_for_tool",
+                return_value={
+                    "runtime_binding_sha256": "a" * 64,
+                    "consumption_receipt_sha256": "b" * 64,
+                },
+            ),
+            patch.object(
+                operator.base, "_load_policy", return_value={"active_profile": "mutate"}
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                return_value=True,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "admit_mutation",
+                side_effect=admit,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "begin_fence_enforcement",
+                side_effect=begin,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "mark_fence_dispatching",
+                side_effect=lambda token: marked.append(token["slot"]),
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "record_success_enforced",
+                side_effect=lambda admission, _result, _token, **_kwargs: settled.append(
+                    admission["slot"]
+                ) or {},
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "abort_fence_before_dispatch",
+                side_effect=lambda token: aborted.append(token["slot"]),
+            ),
+        ):
+            operator._configure_http_runtime()
+
+            async def exercise() -> None:
+                running = operator.asyncio.create_task(
+                    operator.mcp._tool_manager.call_tool("write", {"slot": 1})
+                )
+                self.assertTrue(await operator.asyncio.to_thread(started.wait, 2))
+                queued = operator.asyncio.create_task(
+                    operator.mcp._tool_manager.call_tool("write", {"slot": 2})
+                )
+                self.assertTrue(await operator.asyncio.to_thread(second_begun.wait, 2))
+                queued.cancel()
+                with self.assertRaises(operator.asyncio.CancelledError):
+                    await queued
+                self.assertEqual([2], aborted)
+                self.assertNotIn(2, executed)
+                self.assertNotIn(2, marked)
+                release.set()
+                self.assertEqual(1, (await running)["slot"] )
+                for _attempt in range(100):
+                    if operator._deployment_admission_active_tool_calls() == 0:
+                        break
+                    await operator.asyncio.sleep(0.01)
+                self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+            try:
+                operator.asyncio.run(exercise())
+            finally:
+                release.set()
+                executor.shutdown(wait=True, cancel_futures=True)
+
+        self.assertEqual([1], executed)
+        self.assertEqual([1], marked)
+        self.assertEqual([1], settled)
+        self.assertEqual([2], aborted)
+
+    def test_g65_cancelled_running_sync_tool_leaves_settlement_with_worker(self) -> None:
+        operator = _load_operator_module()
+        started = threading.Event()
+        release = threading.Event()
+        marked: list[int] = []
+        settled: list[int] = []
+        aborted: list[int] = []
+
+        async def slow_call_tool(_name, arguments):
+            started.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test worker release timed out")
+            return {"called": True, "slot": arguments["slot"]}
+
+        admission = {
+            "slot": 1,
+            "admission_sha256": "1" * 64,
+            "admitted_at_unix": 1,
+        }
+        token = {"slot": 1}
+        operator.mcp._tool_manager.call_tool = slow_call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.object(
+                operator,
+                "_require_transport_roundtrip_for_tool",
+                return_value={
+                    "runtime_binding_sha256": "a" * 64,
+                    "consumption_receipt_sha256": "b" * 64,
+                },
+            ),
+            patch.object(
+                operator.base, "_load_policy", return_value={"active_profile": "mutate"}
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                return_value=True,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "admit_mutation",
+                return_value=admission,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "begin_fence_enforcement",
+                return_value=token,
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "mark_fence_dispatching",
+                side_effect=lambda observed: marked.append(observed["slot"]),
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "record_success_enforced",
+                side_effect=lambda _admission, _result, observed, **_kwargs: settled.append(
+                    observed["slot"]
+                ) or {},
+            ),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "abort_fence_before_dispatch",
+                side_effect=lambda observed: aborted.append(observed["slot"]),
+            ),
+        ):
+            operator._configure_http_runtime()
+
+            async def exercise() -> None:
+                call = operator.asyncio.create_task(
+                    operator.mcp._tool_manager.call_tool("write", {"slot": 1})
+                )
+                self.assertTrue(await operator.asyncio.to_thread(started.wait, 2))
+                call.cancel()
+                with self.assertRaises(operator.asyncio.CancelledError):
+                    await call
+                self.assertEqual([], aborted)
+                self.assertEqual([1], marked)
+                self.assertEqual(1, operator._deployment_admission_active_tool_calls())
+                release.set()
+                for _attempt in range(100):
+                    if settled == [1] and operator._deployment_admission_active_tool_calls() == 0:
+                        break
+                    await operator.asyncio.sleep(0.01)
+                self.assertEqual([1], settled)
+                self.assertEqual([], aborted)
+                self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+            operator.asyncio.run(exercise())
+
     def test_deployment_admission_gate_keeps_async_tools_on_event_loop(self) -> None:
         operator = _load_operator_module()
         caller_thread = threading.get_ident()

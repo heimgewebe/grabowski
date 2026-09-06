@@ -1618,7 +1618,31 @@ def _install_deployment_admission_gate() -> None:
                             append_audit=_append_effect_audit,
                         )
                     raise
-                return await wrapped
+                try:
+                    return await wrapped
+                except asyncio.CancelledError:
+                    # Cancellation of the asyncio wrapper may cancel a queued
+                    # concurrent Future before its worker starts. Under fence
+                    # enforcement, begin already established a global inflight
+                    # record, so a never-started worker must explicitly settle
+                    # effect_not_applied instead of stranding takeover until a
+                    # later mutation happens to recover it. Future.cancel() is
+                    # the race-free boundary: True proves execution never began;
+                    # False means the worker already owns dispatch/settlement.
+                    cancelled_before_start = worker_future.cancel()
+                    if fence_token is not None and cancelled_before_start:
+                        try:
+                            await _run_fence_completion_async(
+                                grabowski_effect_interceptor.abort_fence_before_dispatch,
+                                fence_token,
+                            )
+                        except BaseException as abort_error:
+                            logging.getLogger(__name__).error(
+                                "operator-fence queued sync cancellation cleanup failed: %s",
+                                type(abort_error).__name__,
+                                exc_info=abort_error,
+                            )
+                    raise
             if fence_token is not None:
                 try:
                     await asyncio.to_thread(
