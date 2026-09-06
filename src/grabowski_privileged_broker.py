@@ -136,7 +136,11 @@ LOCAL_BACKUP_NTFS_ACTIONS = frozenset({
     "local_backup_ntfs_check",
     "local_backup_ntfs_clear_dirty",
 })
-LOCAL_BACKUP_STORAGE_ACTIONS = frozenset({*LOCAL_BACKUP_NTFS_ACTIONS, "local_backup_smart_read"})
+LOCAL_BACKUP_STORAGE_ACTIONS = frozenset({
+    *LOCAL_BACKUP_NTFS_ACTIONS,
+    "local_backup_smart_read",
+    "local_backup_mount_reconcile",
+})
 
 
 def _scoped_template_marker_allows_dispatch(path: Path, *, action: str) -> bool:
