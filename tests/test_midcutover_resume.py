@@ -83,6 +83,7 @@ def _install_import_stubs() -> None:
 _install_import_stubs()
 
 import deploy_runtime_dual as dual
+import grabowski_client_snapshot as client_snapshot
 import grabowski_midcutover_resume as midcutover
 
 
@@ -100,12 +101,12 @@ ACTIVATION_TIME = 1_100
 PUBLICATION_REQUEST_ID = "gpp-test-publication"
 
 
-def activation_observation() -> dict[str, object]:
+def activation_observation(state: str = "publication_pending") -> dict[str, object]:
     material: dict[str, object] = {
         "phase": "platform_publication_activation",
         "observed_at_unix": ACTIVATION_TIME,
         "details": {
-            "state": "publication_pending",
+            "state": state,
             "request_id": PUBLICATION_REQUEST_ID,
         },
     }
@@ -212,6 +213,7 @@ def cutover_receipt(
     final_routing: object = None,
     rollback_forbidden: bool = True,
     source_identity_sha256: str | None = SOURCE_IDENTITY_SHA256,
+    activation_state: str = "publication_pending",
 ) -> dict[str, object]:
     material: dict[str, object] = {
         "schema_version": 1,
@@ -229,7 +231,7 @@ def cutover_receipt(
             "release_id": green_release_id,
             "repo_head": expected_head,
         },
-        "observations": [activation_observation()],
+        "observations": [activation_observation(activation_state)],
         "outcome": outcome,
         "phase": outcome if phase is None else phase,
         "selector_switch": (
@@ -479,6 +481,21 @@ class ClassificationTests(unittest.TestCase):
             midcutover.canonical_json_sha256(material), binding["binding_sha256"]
         )
 
+    def test_submitted_publication_state_admits_same_resume(self) -> None:
+        receipt = cutover_receipt(
+            activation_state="awaiting_platform_observation"
+        )
+        activation = midcutover.activation_observation(receipt)
+        verdict = classify(
+            receipts=[receipt], activation_observation=activation
+        )
+        self.assertEqual(verdict["lane"], midcutover.LANE_MID_CUTOVER_RESUME)
+        self.assertEqual(verdict["reasons"], [])
+        self.assertEqual(
+            verdict["resume_binding"]["publication_request_id"],
+            PUBLICATION_REQUEST_ID,
+        )
+
     def test_wrong_generation_is_not_resumable(self) -> None:
         verdict = classify(selector=selector_document(generation=GENERATION + 1))
         self.assertEqual(verdict["lane"], midcutover.LANE_FAIL_CLOSED)
@@ -612,6 +629,28 @@ class HistoricalActivationContractTests(unittest.TestCase):
             "receipt_sha256": midcutover.canonical_json_sha256(material),
         }
 
+    def test_recovery_activation_states_match_publication_lifecycle(self) -> None:
+        self.assertEqual(
+            midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES,
+            client_snapshot.PLATFORM_PUBLICATION_ACTIVATED_STATES,
+        )
+        self.assertNotIn(
+            "pending_activation", midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES
+        )
+        self.assertNotIn(
+            "no_current", midcutover.PLATFORM_PUBLICATION_ACTIVATED_STATES
+        )
+
+    def test_all_post_activation_states_are_accepted(self) -> None:
+        for state in sorted(client_snapshot.PLATFORM_PUBLICATION_ACTIVATED_STATES):
+            with self.subTest(state=state):
+                receipt = cutover_receipt(activation_state=state)
+                observed = midcutover.activation_observation(receipt)
+                self.assertEqual(observed["state"], state)
+                self.assertEqual(
+                    observed["publication_request_id"], PUBLICATION_REQUEST_ID
+                )
+
     def test_unique_hash_bound_activation_is_required(self) -> None:
         missing = cutover_receipt()
         missing["observations"] = []
@@ -652,7 +691,7 @@ class HistoricalActivationContractTests(unittest.TestCase):
         wrong_state = cutover_receipt()
         observation = dict(wrong_state["observations"][0])
         observation["details"] = {
-            "state": "outcome_unknown",
+            "state": "pending_activation",
             "request_id": PUBLICATION_REQUEST_ID,
         }
         material = {
