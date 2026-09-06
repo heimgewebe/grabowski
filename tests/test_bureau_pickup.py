@@ -8224,6 +8224,109 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual("print('dirty')\n", (worktree / "wip.py").read_text())
         self.assertIn("dirty worktree content", result["receipt"]["preserves"])
 
+    def test_orphan_prior_failure_accepts_legacy_missing_nested_status(self) -> None:
+        _intent, run_dir, _acq, _coordination, request, _lease, _key = (
+            self._orphan_setup()
+        )
+        legacy = {
+            "schema_version": pickup.SCHEMA_VERSION,
+            "status": "stale-runtime-blocked",
+            "reason_codes": ["release-registry-identity-mismatch"],
+            "effect_started": None,
+            "ambiguity": None,
+            "runtime_identity": {
+                "compatibility": {
+                    "status": "stale",
+                    "mutation_allowed": False,
+                },
+                "claim_root": {
+                    "status": "blocked",
+                    "mutation_conclusion_allowed": False,
+                    "claim_authority_established": False,
+                },
+            },
+        }
+        pickup._write_bound_json(run_dir / "orphan-fail-unknown.json", legacy)
+
+        self.assertEqual(
+            legacy,
+            pickup._orphan_prior_failure_proves_no_effect(
+                run_dir,
+                observed_coordination_sha256=request["expected_coordination_sha256"],
+                generation=1,
+            ),
+        )
+
+    def test_orphan_prior_failure_legacy_compat_remains_fail_closed(self) -> None:
+        _intent, run_dir, _acq, _coordination, request, _lease, _key = (
+            self._orphan_setup()
+        )
+        baseline = {
+            "schema_version": pickup.SCHEMA_VERSION,
+            "status": "stale-runtime-blocked",
+            "reason_codes": ["release-registry-identity-mismatch"],
+            "effect_started": None,
+            "ambiguity": None,
+            "runtime_identity": {
+                "compatibility": {
+                    "status": "stale",
+                    "mutation_allowed": False,
+                },
+                "claim_root": {
+                    "status": "blocked",
+                    "mutation_conclusion_allowed": False,
+                    "claim_authority_established": False,
+                },
+            },
+        }
+        cases = [
+            ("effect-started", ("effect_started",), True),
+            ("ambiguity", ("ambiguity",), True),
+            ("reason-codes", ("reason_codes",), ["different-reason"]),
+            ("nested-status", ("runtime_identity", "status"), "different-status"),
+            (
+                "compatibility-status",
+                ("runtime_identity", "compatibility", "status"),
+                "current",
+            ),
+            (
+                "mutation-allowed",
+                ("runtime_identity", "compatibility", "mutation_allowed"),
+                True,
+            ),
+            ("claim-status", ("runtime_identity", "claim_root", "status"), "ready"),
+            (
+                "mutation-conclusion",
+                ("runtime_identity", "claim_root", "mutation_conclusion_allowed"),
+                True,
+            ),
+            (
+                "claim-authority",
+                ("runtime_identity", "claim_root", "claim_authority_established"),
+                True,
+            ),
+        ]
+        path = run_dir / "orphan-fail-unknown.json"
+        for label, field_path, value in cases:
+            with self.subTest(label=label):
+                payload = json.loads(json.dumps(baseline))
+                target = payload
+                for field in field_path[:-1]:
+                    target = target[field]
+                target[field_path[-1]] = value
+                if path.exists():
+                    path.unlink()
+                pickup._write_bound_json(path, payload)
+                self.assertIsNone(
+                    pickup._orphan_prior_failure_proves_no_effect(
+                        run_dir,
+                        observed_coordination_sha256=request[
+                            "expected_coordination_sha256"
+                        ],
+                        generation=1,
+                    )
+                )
+
     def test_orphan_reconcile_supersedes_proven_no_effect_pre_effect_after_coordination_drift(
         self,
     ) -> None:
