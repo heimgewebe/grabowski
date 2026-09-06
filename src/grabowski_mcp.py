@@ -108,8 +108,12 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
         "Prefer typed operations to generic terminal, Git, or GitHub calls when both can express the effect.",
     ),
     (
+        "goal-fidelity-before-continuation",
+        "At material direction boundaries keep original user outcome authoritative; strategy is disposable. Test a necessary assumption with fresh evidence, name a serious alternative, then choose CONTINUE, CHANGE, or PARK/STOP. A single tool failure is not strategic evidence.",
+    ),
+    (
         "operator-obligation-lifecycle",
-        "For nontrivial operator work, first call grip_run with operator-obligation-list to resume matching unfinished work, including blocked or delegated records, then call operator-obligation-open or resume with a successor obligation that references the prior record; before ending a response, call operator-obligation-status and end only after operator-obligation-close records completed, explicitly blocked, or durably delegated evidence.",
+        "For nontrivial work use grip_run/operator-obligation-list, operator-obligation-open and before ending operator-obligation-status. End only when operator-obligation-close is completed, explicitly blocked or durably delegated, or operator-obligation-resolve defers/supersedes open work with continuation_required=false and work_complete=false. Resume with a new obligation.",
     ),
     (
         "convergence-before-high-risk-closure",
