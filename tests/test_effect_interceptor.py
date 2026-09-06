@@ -330,12 +330,21 @@ class EffectInterceptorTests(unittest.TestCase):
 
     def test_success_and_exception_are_audit_bound(self) -> None:
         records = []
-        admission = interceptor.admit_mutation(
-            tool_name="grabowski_git",
-            arguments={},
-            transport_evidence=self.transport(),
-            append_audit=lambda record: records.append(record) or "d" * 64,
-        )
+        with patch.object(
+            fence_shadow,
+            "observe",
+            return_value={
+                "status": "disabled",
+                "decision": "not_observed",
+                "observation_sha256": "9" * 64,
+            },
+        ):
+            admission = interceptor.admit_mutation(
+                tool_name="grabowski_git",
+                arguments={},
+                transport_evidence=self.transport(),
+                append_audit=lambda record: records.append(record) or "d" * 64,
+            )
         success = interceptor.record_success(
             admission,
             {"receipt_sha256": "e" * 64, "post_state": {"head": "abc"}},
@@ -472,6 +481,36 @@ class EffectInterceptorTests(unittest.TestCase):
             )
         interceptor.receipts.validate_admission(admission)
         self.assertEqual([record["operation"] for record in records], ["effect-admission"])
+
+    def test_untransported_admission_requires_explicit_runtime_sha(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "untransported mutation admission requires"
+        ):
+            interceptor.admit_mutation(
+                tool_name="grabowski_recovery_provenance_repair",
+                arguments={},
+                transport_evidence=None,
+            )
+
+    def test_transport_admission_forbids_runtime_sha_override(self) -> None:
+        with self.assertRaisesRegex(ValueError, "runtime_sha256 override is forbidden"):
+            interceptor.admit_mutation(
+                tool_name="grabowski_git",
+                arguments={},
+                transport_evidence=self.transport(),
+                runtime_sha256="c" * 64,
+            )
+
+    def test_untransported_admission_binds_explicit_runtime_sha(self) -> None:
+        admission = interceptor.admit_mutation(
+            tool_name="grabowski_recovery_provenance_repair",
+            arguments={"expected_head": "a" * 40},
+            transport_evidence=None,
+            runtime_sha256="c" * 64,
+        )
+        interceptor.receipts.validate_admission(admission)
+        self.assertEqual(admission["runtime_sha256"], "c" * 64)
+        self.assertIsNone(admission["transport_receipt_sha256"])
 
     def test_missing_transport_receipt_fails_before_admission(self) -> None:
         with self.assertRaisesRegex(ValueError, "consumption receipt"):

@@ -347,6 +347,7 @@ _ANTHROPIC_SECRET_PATTERN = re.compile(
 )
 OPERATOR_CAPABILITIES = (
     "terminal_execute",
+    "bureau_mutation",
     "durable_job",
     "git_cli",
     "github_cli",
@@ -713,6 +714,33 @@ def _provenance_recovery_transport_exempt_call(tool_name: Any, tool: Any) -> boo
     return all(value is True or value is False for value in values) and any(
         value is False for value in values
     )
+
+
+def _provenance_recovery_fence_runtime_sha256() -> str:
+    deployment = base._deployment_metadata()
+    release_id = deployment.get("release_id")
+    repo_head = deployment.get("repo_head")
+    if not isinstance(release_id, str) or not release_id:
+        raise RuntimeError("recovery fence runtime release id is unavailable")
+    if not isinstance(repo_head, str) or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None:
+        raise RuntimeError("recovery fence runtime repository head is unavailable")
+    integrity: dict[str, bool] = {}
+    for flag in _PROVENANCE_RECOVERY_REPAIRABLE_INTEGRITY_FLAGS:
+        value = deployment.get(flag)
+        if value is not True and value is not False:
+            raise RuntimeError("recovery fence runtime integrity is not judgeable")
+        integrity[flag] = value
+    return hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "kind": "grabowski.recovery_fence_runtime_identity",
+                "release_id": release_id,
+                "repo_head": repo_head,
+                "integrity": integrity,
+            }
+        )
+    ).hexdigest()
 
 
 def _require_current_serving_process() -> None:
@@ -1235,26 +1263,97 @@ def _run_sync_tool_call(
     return asyncio.run(original(*args, **kwargs))
 
 
+async def _begin_fence_enforcement_async(
+    effect_admission: dict[str, Any],
+) -> dict[str, Any] | None:
+    future = asyncio.create_task(
+        asyncio.to_thread(
+            grabowski_effect_interceptor.begin_fence_enforcement,
+            effect_admission,
+        )
+    )
+    try:
+        return await asyncio.shield(future)
+    except BaseException:
+        # The thread is deliberately shielded: cancellation must not strand a
+        # remotely acquired/begun fence grant without an owner-visible cleanup.
+        token = await future
+        if token is not None:
+            try:
+                await asyncio.to_thread(
+                    grabowski_effect_interceptor.abort_fence_before_dispatch,
+                    token,
+                )
+            except BaseException as abort_error:
+                logging.getLogger(__name__).error(
+                    "operator-fence pre-dispatch abort failed after caller interruption: %s",
+                    type(abort_error).__name__,
+                    exc_info=abort_error,
+                )
+        raise
+
+
+async def _run_fence_completion_async(function: Any, *args: Any, **kwargs: Any) -> Any:
+    future = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # Completion/settlement is recovery work for an effect that already
+        # started. Let the worker finish even when the request task is cancelled.
+        await future
+        raise
+
+
 def _run_sync_tool_call_with_effect(
     original: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     effect_admission: dict[str, Any],
+    fence_token: dict[str, Any] | None = None,
 ) -> Any:
+    if fence_token is not None:
+        try:
+            grabowski_effect_interceptor.mark_fence_dispatching(fence_token)
+        except BaseException:
+            try:
+                grabowski_effect_interceptor.abort_fence_before_dispatch(fence_token)
+            except BaseException as abort_error:
+                logging.getLogger(__name__).error(
+                    "operator-fence sync pre-dispatch abort failed: %s",
+                    type(abort_error).__name__,
+                    exc_info=abort_error,
+                )
+            raise
     try:
         result = _run_sync_tool_call(original, args, kwargs)
     except BaseException as error:
-        grabowski_effect_interceptor.record_exception_best_effort(
+        if fence_token is not None:
+            grabowski_effect_interceptor.record_exception_enforced(
+                effect_admission,
+                error,
+                fence_token,
+                append_audit=_append_effect_audit,
+            )
+        else:
+            grabowski_effect_interceptor.record_exception_best_effort(
+                effect_admission,
+                error,
+                append_audit=_append_effect_audit,
+            )
+        raise
+    if fence_token is not None:
+        grabowski_effect_interceptor.record_success_enforced(
             effect_admission,
-            error,
+            result,
+            fence_token,
             append_audit=_append_effect_audit,
         )
-        raise
-    grabowski_effect_interceptor.record_success_best_effort(
-        effect_admission,
-        result,
-        append_audit=_append_effect_audit,
-    )
+    else:
+        grabowski_effect_interceptor.record_success_best_effort(
+            effect_admission,
+            result,
+            append_audit=_append_effect_audit,
+        )
     return result
 
 
@@ -1368,17 +1467,53 @@ def _install_deployment_admission_gate() -> None:
                 context=context,
                 tool=tool,
             )
-            # Admission is correlation evidence only. After transport consume,
-            # audit/admission failure must not prevent the authorized domain
-            # tool from executing; missing admission only suppresses completion
-            # correlation.
+            enforcement_configured = (
+                grabowski_effect_interceptor.fence_enforcement_required()
+                if read_only_hint is not True
+                else False
+            )
+            if read_only_hint is not True:
+                active_profile = base._load_policy().get("active_profile")
+                if active_profile == "failover-mutate" and not enforcement_configured:
+                    raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
+                        "failover_mutation_requires_fence_config"
+                    )
+            fence_required = read_only_hint is not True and enforcement_configured
+            recovery_transport_exempt = (
+                transport_evidence is None
+                and read_only_hint is False
+                and _provenance_recovery_transport_exempt_call(tool_name, tool)
+            )
+            if (
+                transport_evidence is None
+                and read_only_hint is not True
+                and fence_required
+                and not _transport_roundtrip_exempt_call(tool_name, arguments)
+                and not recovery_transport_exempt
+            ):
+                raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
+                    "mutating_transport_exemption_not_fenceable"
+                )
+            # Admission remains correlation evidence, but G6.5 may bind that
+            # deterministic identity to the global Heimberry writer fence. When
+            # enforcement config is absent, the historical non-gating behavior
+            # is preserved exactly. When it is present, an admission or fence
+            # failure must reject before the domain effect starts.
             effect_admission: dict[str, Any] | None = None
-            if transport_evidence is not None:
+            fence_token: dict[str, Any] | None = None
+            if transport_evidence is not None or (
+                recovery_transport_exempt and fence_required
+            ):
                 try:
                     effect_admission = grabowski_effect_interceptor.admit_mutation(
                         tool_name=str(tool_name),
                         arguments=arguments,
                         transport_evidence=transport_evidence,
+                        runtime_sha256=(
+                            _provenance_recovery_fence_runtime_sha256()
+                            if transport_evidence is None
+                            else None
+                        ),
                         context=context,
                         append_audit=_append_effect_audit,
                     )
@@ -1386,6 +1521,8 @@ def _install_deployment_admission_gate() -> None:
                     # Catch Exception only: process-level BaseException
                     # (KeyboardInterrupt, SystemExit) must propagate without
                     # starting the domain tool after interruption.
+                    if grabowski_effect_interceptor.fence_enforcement_required():
+                        raise
                     logging.getLogger(__name__).error(
                         "effect admission evidence failed after transport "
                         "consume; domain tool will execute without completion "
@@ -1394,6 +1531,10 @@ def _install_deployment_admission_gate() -> None:
                         exc_info=admission_error,
                     )
                     effect_admission = None
+                if effect_admission is not None:
+                    fence_token = await _begin_fence_enforcement_async(
+                        effect_admission
+                    )
             if kind == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
                 loop = asyncio.get_running_loop()
                 try:
@@ -1407,14 +1548,27 @@ def _install_deployment_admission_gate() -> None:
                         args,
                         kwargs,
                         *(
-                            (effect_admission,)
+                            (effect_admission, fence_token)
                             if effect_admission is not None
                             else ()
                         ),
                     )
                 except BaseException as error:
-                    # Submit never accepted work: outer finally may release.
-                    if effect_admission is not None:
+                    # Submit never accepted work: no domain effect started. A
+                    # begun fence token can therefore settle effect_not_applied.
+                    if fence_token is not None:
+                        try:
+                            await asyncio.to_thread(
+                                grabowski_effect_interceptor.abort_fence_before_dispatch,
+                                fence_token,
+                            )
+                        except BaseException as abort_error:
+                            logging.getLogger(__name__).error(
+                                "operator-fence abort failed after sync submit rejection: %s",
+                                type(abort_error).__name__,
+                                exc_info=abort_error,
+                            )
+                    elif effect_admission is not None:
                         grabowski_effect_interceptor.record_exception_best_effort(
                             effect_admission,
                             error,
@@ -1454,7 +1608,10 @@ def _install_deployment_admission_gate() -> None:
                             )
                     # Conservative outcome only: do not release admission or
                     # start a conflicting new effect while the worker may run.
-                    if effect_admission is not None:
+                    # Under fence enforcement the worker exclusively owns
+                    # completion/settlement; a wrapper error must not create a
+                    # competing outcome_unknown record for the same effect.
+                    if effect_admission is not None and fence_token is None:
                         grabowski_effect_interceptor.record_exception_best_effort(
                             effect_admission,
                             error,
@@ -1462,22 +1619,66 @@ def _install_deployment_admission_gate() -> None:
                         )
                     raise
                 return await wrapped
+            if fence_token is not None:
+                try:
+                    await asyncio.to_thread(
+                        grabowski_effect_interceptor.mark_fence_dispatching,
+                        fence_token,
+                    )
+                except BaseException:
+                    try:
+                        await asyncio.to_thread(
+                            grabowski_effect_interceptor.abort_fence_before_dispatch,
+                            fence_token,
+                        )
+                    except BaseException as abort_error:
+                        logging.getLogger(__name__).error(
+                            "operator-fence async pre-dispatch abort failed: %s",
+                            type(abort_error).__name__,
+                            exc_info=abort_error,
+                        )
+                    raise
             try:
                 result = await original(*args, **kwargs)
             except BaseException as error:
                 if effect_admission is not None:
-                    grabowski_effect_interceptor.record_exception_best_effort(
-                        effect_admission,
-                        error,
-                        append_audit=_append_effect_audit,
-                    )
+                    if fence_token is not None:
+                        try:
+                            await _run_fence_completion_async(
+                                grabowski_effect_interceptor.record_exception_enforced,
+                                effect_admission,
+                                error,
+                                fence_token,
+                                append_audit=_append_effect_audit,
+                            )
+                        except BaseException as completion_error:
+                            logging.getLogger(__name__).error(
+                                "operator-fence async exception settlement failed: %s",
+                                type(completion_error).__name__,
+                                exc_info=completion_error,
+                            )
+                    else:
+                        grabowski_effect_interceptor.record_exception_best_effort(
+                            effect_admission,
+                            error,
+                            append_audit=_append_effect_audit,
+                        )
                 raise
             if effect_admission is not None:
-                grabowski_effect_interceptor.record_success_best_effort(
-                    effect_admission,
-                    result,
-                    append_audit=_append_effect_audit,
-                )
+                if fence_token is not None:
+                    await _run_fence_completion_async(
+                        grabowski_effect_interceptor.record_success_enforced,
+                        effect_admission,
+                        result,
+                        fence_token,
+                        append_audit=_append_effect_audit,
+                    )
+                else:
+                    grabowski_effect_interceptor.record_success_best_effort(
+                        effect_admission,
+                        result,
+                        append_audit=_append_effect_audit,
+                    )
             return result
         finally:
             if release_in_finally:

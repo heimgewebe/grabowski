@@ -77,7 +77,8 @@
     "resource_lease": "Acquire, renew, inspect and release typed collision-control resource leases.",
     "artifact_transfer": "Transfer regular files with hash-bound source and destination preconditions.",
     "browser_worker": "Start and control isolated agent-owned browser workers with loopback-only debugging.",
-    "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener."
+    "gui_worker": "Start and control isolated Xvfb GUI workers without a remote display listener.",
+    "bureau_mutation": "Use only the typed Bureau candidate, proposal, review, publication and coordinated-pickup mutation surfaces without granting generic terminal execution."
   },
   "profiles": {
     "observe": {
@@ -214,6 +215,7 @@
         "audit_read",
         "rollback_text",
         "bundle_registry",
+        "bureau_mutation",
         "durable_job",
         "git_cli",
         "github_cli",
@@ -281,6 +283,7 @@
         "audit_read",
         "rollback_text",
         "bundle_registry",
+        "bureau_mutation",
         "durable_job",
         "git_cli",
         "github_cli",
@@ -312,6 +315,64 @@
         "*"
       ],
       "max_risk_level": "high",
+      "forbidden_hosts": []
+    },
+    "failover-mutate": {
+      "description": "Minimal fence-enforced secondary mutation profile for controlled failover. It grants typed repository, GitHub, Bureau and local-state effects but no generic terminal, service-control, browser/GUI, secret, signal, power or destructive authority.",
+      "read_roots": [
+        "${HOME}"
+      ],
+      "write_roots": [
+        "${HOME}/repos",
+        "${HOME}/.local/state/grabowski",
+        "${HOME}/.local/state/bureau"
+      ],
+      "write_excluded_roots": [
+        "${HOME}/repos/merges"
+      ],
+      "secret_roots": [
+        "${HOME}/.ssh",
+        "${HOME}/.gnupg",
+        "${HOME}/.aws",
+        "${HOME}/.kube",
+        "${HOME}/.password-store",
+        "${HOME}/.local/share/keyrings"
+      ],
+      "browser_profile_roots": [
+        "${HOME}/.mozilla/firefox",
+        "${HOME}/.config/BraveSoftware/Brave-Browser",
+        "${HOME}/.config/google-chrome",
+        "${HOME}/.config/chromium"
+      ],
+      "secret_export_roots": [],
+      "max_read_bytes": 2000000,
+      "max_write_bytes": 2000000,
+      "max_list_entries": 500,
+      "max_secret_use_output_bytes": 250000,
+      "max_secret_use_seconds": 30,
+      "capabilities": [
+        "file_read",
+        "file_write",
+        "audit_verify",
+        "audit_read",
+        "rollback_text",
+        "bureau_mutation",
+        "git_cli",
+        "github_cli",
+        "resource_lease",
+        "artifact_transfer",
+        "process_inspect",
+        "port_inspect"
+      ],
+      "allowed_grips": [
+        "repo-orient",
+        "worktree-orient",
+        "situation",
+        "scout",
+        "pr-check-readiness",
+        "post-merge-sync"
+      ],
+      "max_risk_level": "medium",
       "forbidden_hosts": []
     }
   },

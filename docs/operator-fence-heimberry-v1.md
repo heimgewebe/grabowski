@@ -1,6 +1,6 @@
 # Heimberry Operator Fence v1
 
-Status: G6.3 transport/runtime contract. No production failover cutover.
+Status: G6.3 production transport plus terminal G6.4 shadow contract. G6.5 adds opt-in fail-closed mutation enforcement; automatic failover routing remains out of scope.
 
 ## Purpose
 
@@ -13,7 +13,7 @@ The two callers are exactly:
 
 The transport deliberately adds no TCP daemon and no shared filesystem. Each request is one bounded JSON document over an SSH connection whose host identity and client key are pinned. Heimberry executes one forced command, handles exactly one request, writes exactly one response, and exits.
 
-This slice does **not** wire the fence into `grabowski_effect_interceptor`, does not enable a write profile for der kleine Maulwurf, does not automate failover, and does not grant root, secret, shell or destructive authority.
+G6.3 deliberately stopped at authenticated coordinator transport. G6.4 later wired the fence into `grabowski_effect_interceptor` in observation-only shadow mode and proved that the observer had zero Heimberry effect. G6.5 keeps that shadow evidence but adds a separate opt-in enforcement config for mutating effects. It still does not automate failover or failback and grants no root, secret, generic shell or destructive authority.
 
 ## Authority boundary
 
@@ -158,6 +158,79 @@ The response is bound to both `request_id` and the expected authenticated `peer_
 
 Authentication establishes which operator made the request; it does not by itself prove an external effect. In particular, `reconcile` still consumes the G6.2 evidence digest contract. G6.4 must bind reconciliation to an actual target-state readback/typed proof before automatic failover may rely on it.
 
+## G6.5 enforcement contract
+
+Enforcement is enabled only by a safe `0600` client file at:
+
+```text
+~/.config/grabowski/operator-fence-enforcement.v1.json
+```
+
+Absence of that file preserves the G6.4 shadow-only behavior. Presence of an invalid enforcement file fails closed for mutating effects; it never silently falls back to shadow-only mutation.
+
+The config binds exactly one peer, the pinned Heimberry SSH transport, the expected fence instance, a durable minimum generation and a bounded lease duration. The central MCP mutation boundary uses the existing effect-admission identity as the fence intent:
+
+```text
+transport admission
+  -> deterministic effect admission
+  -> fence acquire
+  -> fence begin(admission_sha256)
+  -> durable local phase = dispatching
+  -> domain effect
+  -> effect completion
+  -> fence settle(completion_sha256)
+  -> fence release
+```
+
+Read-only tool calls do not acquire the fence. Exact read-only transport exemptions and the transport handshake remain available. A mutating transport exemption that cannot produce the normal mutation identity is rejected while enforcement is active; it is never allowed to execute unfenced.
+
+### Durable client recovery
+
+Each enforcing peer keeps a private `0600` state file at:
+
+```text
+~/.local/state/grabowski/operator-fence-enforcement-state.v1.json
+```
+
+It records a monotone local generation high-water mark and at most one pending effect. The phases are `prepared`, `granted`, `begun`, `dispatching`, `completion_ready`, `outcome_unknown` and `settled`.
+
+Recovery is deliberately conservative:
+
+- `prepared` re-enters the same acquire idempotently;
+- `granted` re-enters the same begin idempotently;
+- `begun` proves the domain dispatch was never marked and settles `effect_not_applied`;
+- `dispatching` without completion becomes `outcome_unknown`;
+- `completion_ready` retries only the same fence settlement, never the domain effect;
+- `outcome_unknown` blocks a new effect until authoritative reconciliation has resolved the Heimberry inflight record;
+- `settled` retries release or proves through status that the old grant is no longer authoritative.
+
+The Heimberry `inflight` record, not a client renewal loop, is the takeover barrier once `begin` succeeds. A writer lease may expire while a long effect is running; the unresolved inflight operation still blocks another peer.
+
+### Minimal secondary profile
+
+The G6.5 `failover-mutate` access profile is intentionally narrower than the normal `mutate` profile. It grants exactly:
+
+```text
+file_read
+file_write
+rollback_text
+audit_verify
+audit_read
+bureau_mutation
+git_cli
+github_cli
+resource_lease
+artifact_transfer
+process_inspect
+port_inspect
+```
+
+Its write roots are limited to the repository tree and the Grabowski/Bureau local state roots. It does not grant `terminal_execute`, user-service control, browser/GUI workers, browser-profile access, secret capabilities, process signals, privileged/power execution or delete/destroy authority.
+
+`bureau_mutation` is a separate capability for the typed candidate/proposal/review/publication/pickup surfaces. It does not authorize `grabowski_terminal_run` and does not create a second Bureau mutation path.
+
+`durable_job` is deliberately absent from `failover-mutate` in G6.5. Its current start surface accepts general argv and would therefore reintroduce generic command/host-mutation authority through a different transport. A later slice may add a separately typed bounded durable-work capability; the broad existing capability remains available only to the normal higher-authority profiles.
+
 ## Failure semantics
 
 If Heimberry or SSH is unavailable, the RPC client fails closed. G6.4 must interpret that as **no mutation authority**. It must not fall back to a local fence, stale cached lease or the other operator.
@@ -196,8 +269,8 @@ Secondary credential provisioning may be completed with G6.5 only if G6.3 remain
 
 ## Next slices
 
-- **G6.4:** insert this authority into the central EffectInterceptor in shadow mode, bind reconciliation to typed target-state proof, and then enforce it for every mutating effect including fleet/root paths.
-- **G6.5:** provision der kleine Maulwurf's dedicated fence/GitHub credentials and a minimal `failover-mutate` capability profile.
-- **G6.6:** implement classified failover/failback routing; policy or safety denials are never failover triggers.
+- **G6.4:** terminally accepted: central read-only shadow observation, live zero-effect proof and failure/performance matrix.
+- **G6.5:** this contract: opt-in central enforcement plus the minimal `failover-mutate` secondary profile, followed by exact primary/secondary deployment and a controlled manual writer handoff canary.
+- **G6.6:** implement classified automatic failover/failback routing; policy, safety, CI, GitHub, Bureau and authority denials are never failover triggers.
 - **G6.7:** adversarial race, partition, stale-generation, response-loss, in-flight-death and coordinator-death drills.
 - **G6.8:** Stage-A production cutover, scheduler routing, observability and final recovery/failback evidence.

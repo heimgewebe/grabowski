@@ -503,6 +503,7 @@ SECRET_CAPABILITIES = (
 )
 OPERATOR_CAPABILITIES = (
     "terminal_execute",
+    "bureau_mutation",
     "durable_job",
     "git_cli",
     "github_cli",
@@ -768,15 +769,15 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_gui_worker_status": ("gui_worker",),
     "grabowski_gui_worker_stop": ("gui_worker",),
     "grabowski_gui_worker_list": ("gui_worker",),
-    "grabowski_bureau_candidate_record": ("terminal_execute",),
+    "grabowski_bureau_candidate_record": ("bureau_mutation",),
     "grabowski_bureau_candidate_assess": (),
-    "grabowski_bureau_task_propose": ("terminal_execute",),
-    "grabowski_bureau_task_review": ("terminal_execute",),
+    "grabowski_bureau_task_propose": ("bureau_mutation",),
+    "grabowski_bureau_task_review": ("bureau_mutation",),
     "grabowski_bureau_task_publish_preview": (),
-    "grabowski_bureau_task_publish": ("resource_lease", "terminal_execute"),
-    "grabowski_bureau_pickup_execute": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_task_publish": ("resource_lease", "bureau_mutation"),
+    "grabowski_bureau_pickup_execute": ("resource_lease", "bureau_mutation"),
     "grabowski_bureau_pickup_status": (),
-    "grabowski_bureau_pickup_release": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_pickup_release": ("resource_lease", "bureau_mutation"),
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {

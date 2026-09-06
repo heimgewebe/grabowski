@@ -82,3 +82,96 @@ class PolicyRuntimeProofTests(unittest.TestCase):
                         grabowski_mcp.grabowski_read_text(str(probe))
                     with self.assertRaisesRegex(PermissionError, denial_pattern):
                         grabowski_mcp.grabowski_stat(str(probe))
+
+    def test_failover_mutate_profile_is_minimal_and_blocks_generic_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_home = root / "home"
+            state = root / "state"
+            fake_home.mkdir()
+            state.mkdir(mode=0o700)
+            for relative in (
+                "repos",
+                ".local/state/grabowski",
+                ".local/state/bureau",
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".kube",
+                ".password-store",
+                ".local/share/keyrings",
+                ".mozilla/firefox",
+                ".config/BraveSoftware/Brave-Browser",
+                ".config/google-chrome",
+                ".config/chromium",
+            ):
+                (fake_home / relative).mkdir(parents=True, exist_ok=True)
+
+            policy = json.loads(
+                (ROOT / "config" / "access.home-wide-operator.example.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            policy["active_profile"] = "failover-mutate"
+            policy_path = root / "access.json"
+            policy_path.write_text(
+                json.dumps(policy, sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            with (
+                patch.object(grabowski_mcp, "HOME", fake_home.resolve()),
+                patch.object(grabowski_mcp, "POLICY_PATH", policy_path),
+                patch.object(grabowski_mcp, "STATE_DIR", state),
+                patch.object(grabowski_mcp, "AUDIT_LOG", state / "write-audit.jsonl"),
+                patch.object(grabowski_mcp, "QUARANTINE_DIR", state / "quarantine"),
+                patch.object(grabowski_mcp, "KILL_SWITCH_PATH", state / "operator-kill-switch"),
+            ):
+                loaded = grabowski_mcp._load_policy()
+                self.assertEqual(loaded["active_profile"], "failover-mutate")
+                capabilities = grabowski_mcp._effective_capabilities(loaded)
+                self.assertEqual(
+                    capabilities,
+                    {
+                        "file_read",
+                        "file_write",
+                        "audit_verify",
+                        "audit_read",
+                        "rollback_text",
+                        "bureau_mutation",
+                        "git_cli",
+                        "github_cli",
+                        "resource_lease",
+                        "artifact_transfer",
+                        "process_inspect",
+                        "port_inspect",
+                    },
+                )
+                grabowski_mcp._require_capability("bureau_mutation")
+                for forbidden in (
+                    "terminal_execute",
+                    "durable_job",
+                    "user_service_control",
+                    "user_service_logs_read",
+                    "browser_worker",
+                    "gui_worker",
+                    "secret_inspect",
+                    "secret_use",
+                    "process_signal",
+                    "power_execute",
+                    "file_delete",
+                    "file_destroy",
+                ):
+                    with self.subTest(capability=forbidden):
+                        with self.assertRaises(PermissionError):
+                            grabowski_mcp._require_capability(forbidden)
+
+                profile = loaded["profiles"]["failover-mutate"]
+                self.assertEqual(
+                    set(profile["write_roots"]),
+                    {
+                        "${HOME}/repos",
+                        "${HOME}/.local/state/grabowski",
+                        "${HOME}/.local/state/bureau",
+                    },
+                )
+                self.assertNotIn("${HOME}", profile["write_roots"])
