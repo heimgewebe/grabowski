@@ -31,6 +31,31 @@ class Clock:
         self.value += seconds
 
 
+class DropBeforeApplyClient:
+    def __init__(
+        self,
+        store: fence.OperatorFenceStore,
+        peer_id: str,
+        operation: str,
+        shared: dict[str, bool],
+    ) -> None:
+        self.store = store
+        self.peer_id = peer_id
+        self.operation = operation
+        self.shared = shared
+        self.requests: list[dict[str, object]] = []
+
+    def call(self, request):
+        self.requests.append(dict(request))
+        if (
+            request.get("operation") == self.operation
+            and self.shared.get("dropped") is not True
+        ):
+            self.shared["dropped"] = True
+            raise RuntimeError(f"lost-before {self.operation}")
+        return rpc.dispatch_request(self.store, peer_id=self.peer_id, request=request)
+
+
 class DropAfterApplyClient:
     def __init__(
         self,
@@ -365,6 +390,44 @@ class OperatorFenceEnforcementTests(unittest.TestCase):
             [(row["operation_id"], row["outcome"]) for row in settlements],
             [(first["request_id"], "effect_not_applied")],
         )
+        enforcement.abort_fence_before_dispatch(token)
+
+    def test_expired_grant_before_begin_is_released_without_false_effect(self) -> None:
+        first = self.admission("grabowski_git")
+        shared = {"dropped": False}
+
+        def factory(**kwargs):
+            client = DropBeforeApplyClient(
+                self.store, kwargs["expected_peer_id"], "begin", shared
+            )
+            self.clients.append(client)
+            return client
+
+        with self.assertRaisesRegex(RuntimeError, "lost-before begin"):
+            enforcement.begin_fence_enforcement(
+                first,
+                config_path=self.config_path,
+                state_path=self.state_path,
+                client_factory=factory,
+            )
+        self.assertTrue(shared["dropped"])
+        status = self.store.status()
+        self.assertEqual(status["generation"], 1)
+        self.assertIsNone(status["inflight"])
+        self.assertEqual(status["writer"]["owner_id"], "grabowski")
+        state, _ = enforcement._fence_read_json(self.state_path)
+        self.assertEqual(state["pending"]["phase"], "granted")
+
+        self.clock.advance(31)
+        second = self.admission("grabowski_resource_acquire")
+        token = self.begin(second)
+        status = self.store.status()
+        self.assertEqual(status["generation"], 2)
+        self.assertEqual(status["inflight"]["operation_id"], second["request_id"])
+        settlements = self.store._connect().execute(
+            "SELECT operation_id,outcome FROM settlements ORDER BY settlement_id"
+        ).fetchall()
+        self.assertEqual(settlements, [])
         enforcement.abort_fence_before_dispatch(token)
 
     def test_begin_response_loss_recovers_as_not_applied(self) -> None:

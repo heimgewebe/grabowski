@@ -636,18 +636,38 @@ def _fence_recover_pending(
         phase = "granted"
     if phase == "granted":
         pending = dict(state["pending"])
-        _fence_rpc(
-            client,
-            "begin",
-            {
-                "session_id": pending["session_id"],
-                "generation": pending["generation"],
-                "operation_id": pending["operation_id"],
-                "operation_name": pending["operation_name"],
-                "intent_sha256": pending["intent_sha256"],
-                **_fence_common_arguments(config, state),
-            },
-        )
+        try:
+            _fence_rpc(
+                client,
+                "begin",
+                {
+                    "session_id": pending["session_id"],
+                    "generation": pending["generation"],
+                    "operation_id": pending["operation_id"],
+                    "operation_name": pending["operation_name"],
+                    "intent_sha256": pending["intent_sha256"],
+                    **_fence_common_arguments(config, state),
+                },
+            )
+        except OperatorFenceEnforcementDenied as denied:
+            if denied.args and denied.args[0] == "grant_expired":
+                status = _fence_status(client, config, state)
+                writer = status.get("writer")
+                if (
+                    status.get("generation") == pending["generation"]
+                    and status.get("inflight") is None
+                    and isinstance(writer, Mapping)
+                    and writer.get("owner_id") == config["peer_id"]
+                    and writer.get("lease_active") is False
+                ):
+                    # The exact grant is still owned by this peer, but it expired
+                    # before begin ever established an inflight effect. Release
+                    # uses the exact session/generation and therefore remains
+                    # fail-closed if status was misleading or the grant changed.
+                    return _fence_release_or_observe(
+                        client, config, state_path, state, pending
+                    )
+            raise
         pending["phase"] = "begun"
         state = _fence_set_pending(state_path, state, pending)
         phase = "begun"

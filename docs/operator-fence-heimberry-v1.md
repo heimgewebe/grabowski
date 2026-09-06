@@ -166,7 +166,7 @@ Enforcement is enabled only by a safe `0600` client file at:
 ~/.config/grabowski/operator-fence-enforcement.v1.json
 ```
 
-Absence of that file preserves the G6.4 shadow-only behavior. Presence of an invalid enforcement file fails closed for mutating effects; it never silently falls back to shadow-only mutation.
+Absence of that file preserves the G6.4 shadow-only behavior for normal profiles. The `failover-mutate` profile is stricter: every mutating call is rejected before the domain effect unless a valid enforcement config is present. Presence of an invalid enforcement file also fails closed; it never silently falls back to shadow-only mutation.
 
 The config binds exactly one peer, the pinned Heimberry SSH transport, the expected fence instance, a durable minimum generation and a bounded lease duration. The central MCP mutation boundary uses the existing effect-admission identity as the fence intent:
 
@@ -197,7 +197,7 @@ It records a monotone local generation high-water mark and at most one pending e
 Recovery is deliberately conservative:
 
 - `prepared` re-enters the same acquire idempotently;
-- `granted` re-enters the same begin idempotently;
+- `granted` re-enters the same begin idempotently; if the exact grant expired before begin established any inflight effect, exact generation/owner/status readback plus session-bound release clears it without inventing a settlement;
 - `begun` proves the domain dispatch was never marked and settles `effect_not_applied`;
 - `dispatching` without completion becomes `outcome_unknown`;
 - `completion_ready` retries only the same fence settlement, never the domain effect;
@@ -233,7 +233,7 @@ Its write roots are limited to the repository tree and the Grabowski/Bureau loca
 
 ## Failure semantics
 
-If Heimberry or SSH is unavailable, the RPC client fails closed. G6.4 must interpret that as **no mutation authority**. It must not fall back to a local fence, stale cached lease or the other operator.
+If Heimberry or SSH is unavailable, the RPC client fails closed. G6.5 enforcement interprets that as **no mutation authority**. It must not fall back to a local fence, stale cached lease or the other operator.
 
 Read-only operator paths remain independent of the fence. Heimberry loss therefore means:
 
@@ -242,7 +242,7 @@ READ  = allowed by the normal local read policy
 WRITE = denied because no fresh global fence decision exists
 ```
 
-A live writer lease denies the other peer. An unresolved in-flight effect continues to deny takeover after lease expiry. `outcome_unknown` must be reconciled through the same authoritative Heimberry store before a new writer can be acquired. Authentication alone is insufficient evidence to settle the effect; automatic reconciliation belongs to G6.4's typed readback integration.
+A live writer lease denies the other peer. An unresolved in-flight effect continues to deny takeover after lease expiry. `outcome_unknown` must be reconciled through the same authoritative Heimberry store before a new writer can be acquired. Authentication alone is insufficient evidence to settle the effect; G6.5 may clear `outcome_unknown` only after an exact typed target-state reconciliation is recorded by the authoritative Heimberry store.
 
 ## Recovery boundary
 
