@@ -235,6 +235,57 @@ class MaulwurfXFindingTests(unittest.TestCase):
             self.assertEqual([path.name for path in hidden], [gateway.FINDING_LOCK_NAME])
             self.assertEqual(stat.S_IMODE(hidden[0].stat().st_mode), 0o600)
 
+    def test_existing_finding_metadata_drift_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            finding_root = self.make_finding_root(root)
+            manifest = self.make_manifest(root)
+            receipt = gateway._record_finding_proposal(
+                connector_id="maulwurf-x",
+                arguments=self.finding_arguments(),
+                finding_root=finding_root,
+                deployment_manifest=manifest,
+            )
+            record_path = finding_root / f"{receipt['finding_id']}.json"
+            stored = json.loads(record_path.read_text(encoding="utf-8"))
+            stored["unexpected_metadata"] = "same-identity-extra-field"
+            record_path.write_text(json.dumps(stored), encoding="utf-8")
+            os.chmod(record_path, 0o600)
+            with self.assertRaisesRegex(
+                gateway.GatewayConfigurationError, "identity mismatch"
+            ):
+                gateway._record_finding_proposal(
+                    connector_id="maulwurf-x",
+                    arguments=self.finding_arguments(),
+                    finding_root=finding_root,
+                    deployment_manifest=manifest,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            finding_root = self.make_finding_root(root)
+            manifest = self.make_manifest(root)
+            receipt = gateway._record_finding_proposal(
+                connector_id="maulwurf-x",
+                arguments=self.finding_arguments(),
+                finding_root=finding_root,
+                deployment_manifest=manifest,
+            )
+            record_path = finding_root / f"{receipt['finding_id']}.json"
+            stored = json.loads(record_path.read_text(encoding="utf-8"))
+            stored["kind"] = "different-record-kind"
+            record_path.write_text(json.dumps(stored), encoding="utf-8")
+            os.chmod(record_path, 0o600)
+            with self.assertRaisesRegex(
+                gateway.GatewayConfigurationError, "identity mismatch"
+            ):
+                gateway._record_finding_proposal(
+                    connector_id="maulwurf-x",
+                    arguments=self.finding_arguments(),
+                    finding_root=finding_root,
+                    deployment_manifest=manifest,
+                )
+
     def test_runtime_identity_is_part_of_finding_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1023,8 +1023,28 @@ def _verify_existing_finding(
     runtime: dict[str, str],
     normalized: dict[str, Any],
 ) -> None:
+    required_keys = {
+        "schema_version",
+        "kind",
+        "finding_id",
+        "proposal_sha256",
+        "principal",
+        "runtime",
+        "finding",
+        "created_at_unix",
+        "record_semantics",
+    }
+    created_at = existing.get("created_at_unix")
     if (
-        existing.get("finding_id") != finding_id
+        set(existing) != required_keys
+        or existing.get("schema_version") != 1
+        or existing.get("kind") != "maulwurfx_finding_proposal"
+        or existing.get("record_semantics")
+        != "private-create-only-content-addressed-v1"
+        or not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or created_at < 0
+        or existing.get("finding_id") != finding_id
         or existing.get("proposal_sha256") != proposal_sha256
         or existing.get("principal") != connector_id
         or existing.get("runtime") != runtime
