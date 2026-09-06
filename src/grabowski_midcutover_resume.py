@@ -71,15 +71,13 @@ RESUME_RECEIPT_KIND = "grabowski_blue_green_resume_receipt"
 #: never be resumed, however broken the runtime happens to look.
 RESUMABLE_OUTCOME = "outcome_unknown"
 TERMINAL_OUTCOMES = frozenset({"completed", "rolled_back", "failed_pre_cutover"})
-# Mirror the Publication-v2 states that prove activation already happened.  This
-# recovery layer deliberately does not import client-snapshot; a contract test
-# pins both definitions together so the layers stay decoupled without drifting.
+# Recovery accepts only the two explicitly known pending activation states.
+# Later publication lifecycle states may be valid for publication reconciliation,
+# but they are not evidence that a historical cutover is safe to resume.
 PLATFORM_PUBLICATION_ACTIVATED_STATES = frozenset(
     {
         "publication_pending",
         "awaiting_platform_observation",
-        "outcome_unknown",
-        "platform_converged",
     }
 )
 
