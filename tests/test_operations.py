@@ -681,5 +681,76 @@ class BackupNtfsOperationTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "unknown")
 
 
+class BackupMountRecoveryOperationTests(unittest.TestCase):
+    def test_mount_reconcile_and_authority_refresh_plans_are_exact(self) -> None:
+        mount = operations._backup_storage_operation_plan(
+            operations.BACKUP_MOUNT_RECONCILE_OPERATION, None
+        )
+        refresh = operations._rootbroker_authority_refresh_plan(
+            {"expected_head": "a" * 40}
+        )
+        self.assertEqual(mount["privileged_action"], "local_backup_mount_reconcile")
+        self.assertEqual(mount["target"], "reconcile")
+        self.assertEqual(mount["effect"], "mount_reconcile_write")
+        self.assertEqual(refresh["effect"], "authority_contract_refresh")
+        with self.assertRaisesRegex(ValueError, "full SHA-1"):
+            operations._rootbroker_authority_refresh_plan({"expected_head": "main"})
+
+    def test_authority_refresh_forces_same_head_cutover(self) -> None:
+        outcome = {
+            "success": True,
+            "outcome": "succeeded",
+            "attested_head": "a" * 40,
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations.privileged,
+            "ensure_rootbroker_authority",
+            return_value=outcome,
+        ) as ensure, patch.object(operations.base, "_append_audit"):
+            result = operations._run_rootbroker_authority_refresh_operation(
+                {"expected_head": "a" * 40}
+            )
+        self.assertTrue(result["success"])
+        ensure.assert_called_once_with("a" * 40, force_refresh=True)
+
+    def test_mount_reconcile_uses_only_fixed_root_action(self) -> None:
+        invocation = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": "local_backup_mount_reconcile",
+            "target": "reconcile",
+            "success": True,
+            "outcome": "succeeded",
+            "timed_out": False,
+            "transport_error": None,
+            "broker_response": {"returncode": 0, "audit": {}},
+            "response_sha256": "d" * 64,
+        }
+        with patch.object(
+            operations.operator, "_require_operator_capability"
+        ), patch.object(
+            operations.operator, "_require_operator_mutation"
+        ), patch.object(
+            operations,
+            "_invoke_mainpid_privileged_action",
+            return_value=invocation,
+        ) as invoke, patch.object(operations.base, "_append_audit"):
+            result = operations._run_backup_storage_operation(
+                operations.BACKUP_MOUNT_RECONCILE_OPERATION, None
+            )
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            invoke.call_args.kwargs["action"], "local_backup_mount_reconcile"
+        )
+        self.assertEqual(invoke.call_args.kwargs["target"], "reconcile")
+        self.assertIn(
+            "vanished-device stale", invoke.call_args.kwargs["justification"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

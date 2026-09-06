@@ -99,3 +99,12 @@ Snap-`ack` und Snap-`install` gelten beide als mutierende Apply-Operationen. Nac
 Nichtkanonische Stage-Pfade — auch alternative Schreibweisen mit doppelten Separatoren oder lexikalischen `..`-Anteilen — werden bereits bei Erwähnung erkannt und können den Stage-Guard nicht umgehen. Öffentliche Hash-, Preflight- und Apply-Evidenz wird nur bei erfolgreichem Returncode ohne Timeout und ohne abgeschnittenes stdout oder stderr publiziert. Der Paket-Lock bleibt bis zum Prozessende und zur erfolgreichen Replay-Markierung gehalten.
 
 Die Root-Stufe ist standardmäßig kein generischer Shellzugang. Generische Root-Handlungsfähigkeit existiert nur über `operator_power_argv`, bleibt in der Beispielkonfiguration deaktiviert und benötigt eigene Tests, Recovery-Gate und Audit-Evidence.
+
+
+## Recovery eines verwaisten BACKUP-Mounts
+
+`local_backup_mount_reconcile` schließt ausschließlich den Recovery-Zirkel eines auf einen verschwundenen Gerätepfad zeigenden `/mnt/backup`. Der root-eigene Helper prüft die feste BACKUP-UUID, verlangt einen verschwundenen aktuellen Mount-Source-Pfad, beobachtet die Mount-Identität erneut, verweigert einen belegten Busy-Mount und beobachtet unmittelbar vor dem Effekt ein drittes Mal. Nur dann darf er `/mnt/backup` aushängen. Ein existierender fremder Source-Pfad, ein wechselnder Mount, eine fehlende oder abweichende UUID sowie ein verbleibender Mount blockieren fail-closed. Ein bereits korrekter oder nicht eingehängter Zustand ist ein No-op; der UUID-gebundene systemd-Automount bleibt bestehen.
+
+Die Aktion hängt bewusst nicht vom Recovery-Freshness-Marker ab: Genau dieser Marker kann bei einem verwaisten Mount nicht erneuert werden. Sie bleibt stattdessen an Kill-Switch, kanonische Operator-MainPID, feste UUID und Pfade, Rootbroker-Audit sowie den commitgebundenen Rootbroker-Cutover gebunden. Der generische Power-Pfad wird dafür nicht geöffnet.
+
+Eine neu kontrollierte Rootbroker-Aktion wird zweiphasig eingeführt. Der bisher installierte Cutover kann im ersten Deploy den neuen Cutover-Code installieren. Nach dem Runtime-Cutover erzwingt die bestehende Named-Operation `rootbroker-authority-refresh` einen zweiten Autoritätsrefresh auf exakt denselben öffentlichen `main`-Commit; erst der neue Cutover installiert den neuen Helper und die neue Aktion. Danach darf die Fachoperation laufen. Dadurch bleibt der öffentliche MCP-Toolkatalog unverändert und der Bootstrap bleibt revisionsgebunden.

@@ -37,6 +37,8 @@ FLEET_MUTATION_OPERATION = "fleet-registry-mutate"
 BACKUP_NTFS_CHECK_OPERATION = "backup-ntfs-check"
 BACKUP_NTFS_CLEAR_DIRTY_OPERATION = "backup-ntfs-clear-dirty"
 BACKUP_SMART_READ_OPERATION = "backup-smart-read"
+BACKUP_MOUNT_RECONCILE_OPERATION = "backup-mount-reconcile"
+ROOTBROKER_AUTHORITY_REFRESH_OPERATION = "rootbroker-authority-refresh"
 BLOCKADE_AUTHORITY_HARDEN_OPERATION = "blockade-authority-harden"
 BACKUP_STORAGE_TYPED_OPERATIONS = {
     BACKUP_NTFS_CHECK_OPERATION: {
@@ -60,11 +62,19 @@ BACKUP_STORAGE_TYPED_OPERATIONS = {
         "effect": "read_only",
         "parameters": (),
     },
+    BACKUP_MOUNT_RECONCILE_OPERATION: {
+        "description": "Remove only a vanished-device stale /mnt/backup NTFS mount after exact UUID, stability and busy-state checks; preserve the UUID-bound automount for the next access.",
+        "action": "local_backup_mount_reconcile",
+        "target": "reconcile",
+        "effect": "mount_reconcile_write",
+        "parameters": (),
+    },
 }
 RESERVED_TYPED_OPERATIONS = frozenset(
     {
         FLEET_MUTATION_OPERATION,
         BLOCKADE_AUTHORITY_HARDEN_OPERATION,
+        ROOTBROKER_AUTHORITY_REFRESH_OPERATION,
         *BACKUP_STORAGE_TYPED_OPERATIONS,
     }
 )
@@ -251,6 +261,77 @@ def _backup_storage_operation_plan(
         "target": spec["target"],
         "effect": spec["effect"],
         "rollback": "none; read-only diagnostics have no rollback and NTFS repair is separately operator-gated",
+    }
+
+
+def _rootbroker_authority_refresh_plan(
+    parameters: dict[str, str] | None,
+) -> dict[str, Any]:
+    supplied = parameters or {}
+    if not isinstance(supplied, dict) or set(supplied) != {"expected_head"}:
+        raise ValueError("rootbroker authority refresh requires only expected_head")
+    expected_head = supplied.get("expected_head")
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+    ):
+        raise ValueError("expected_head must be one full SHA-1 commit id")
+    return {
+        "name": ROOTBROKER_AUTHORITY_REFRESH_OPERATION,
+        "description": (
+            "Force one exact-main Rootbroker authority refresh even when the current "
+            "attestation already names that commit; this exists only for controlled "
+            "same-commit capability bootstrap."
+        ),
+        "parameter_names": ["expected_head"],
+        "parameters_sha256": _hash(supplied),
+        "expected_head": expected_head,
+        "typed_builtin": True,
+        "execution": "operator-mainpid-direct-rootbroker",
+        "effect": "authority_contract_refresh",
+        "rollback": (
+            "Rootbroker cutover owns atomic backup, rollback and exact post-readback; "
+            "an unknown outcome requires authority readback before another intent."
+        ),
+    }
+
+
+def _run_rootbroker_authority_refresh_operation(
+    parameters: dict[str, str] | None,
+) -> dict[str, Any]:
+    plan = _rootbroker_authority_refresh_plan(parameters)
+    operator._require_operator_capability("privileged_reference")
+    operator._require_operator_mutation("terminal_execute", opaque_command=False)
+    result = privileged.ensure_rootbroker_authority(
+        plan["expected_head"], force_refresh=True
+    )
+    success = result.get("success") is True
+    audit = {
+        "timestamp_unix": int(time.time()),
+        "operation": "named-operation-run",
+        "recipe": ROOTBROKER_AUTHORITY_REFRESH_OPERATION,
+        "parameters_sha256": plan["parameters_sha256"],
+        "expected_head": plan["expected_head"],
+        "success": success,
+        "root_outcome": result.get("outcome"),
+        "attested_head": result.get("attested_head"),
+        "force_refresh": True,
+    }
+    try:
+        base._append_audit(audit)
+        audit["secondary_audit_recorded"] = True
+    except Exception as exc:
+        audit["secondary_audit_recorded"] = False
+        audit["secondary_audit_error_type"] = type(exc).__name__
+    return {
+        "operation": ROOTBROKER_AUTHORITY_REFRESH_OPERATION,
+        "success": success,
+        "failed_phase": None if success else "action",
+        "typed_builtin": True,
+        "effect": plan["effect"],
+        "result": result,
+        "rollback": {"attempted": False, "success": True, "reason": plan["rollback"]},
+        "audit": audit,
     }
 
 
@@ -452,6 +533,8 @@ def _run_backup_storage_operation(
         justification = "Root-read-only ntfsfix check for the exact configured BACKUP volume before any filesystem metadata mutation."
     elif operation == BACKUP_NTFS_CLEAR_DIRTY_OPERATION:
         justification = "Run the fixed ntfsfix -d repair/clear-dirty path on the exact configured BACKUP volume after an exact successful root check; no force mount."
+    elif operation == BACKUP_MOUNT_RECONCILE_OPERATION:
+        justification = "Remove only a vanished-device stale /mnt/backup NTFS mount after root-side UUID, stability and busy-state checks; preserve the UUID-bound automount."
     else:
         justification = "Root-read-only SMART diagnostic for the exact configured BACKUP disk through the fixed SAT/by-id action; no caller-selected device or flags."
     invocation = _invoke_mainpid_privileged_action(
@@ -792,6 +875,13 @@ def grabowski_operation_list() -> dict[str, Any]:
         "step_count": 1,
         "typed_builtin": True,
     }
+    operations[ROOTBROKER_AUTHORITY_REFRESH_OPERATION] = {
+        "description": _rootbroker_authority_refresh_plan({"expected_head": "0" * 40})["description"],
+        "parameters": ["expected_head"],
+        "step_count": 1,
+        "typed_builtin": True,
+        "effect": "authority_contract_refresh",
+    }
     operations[BLOCKADE_AUTHORITY_HARDEN_OPERATION] = {
         "description": _blockade_authority_harden_operation_plan(None)["description"],
         "parameters": [],
@@ -819,6 +909,8 @@ def grabowski_operation_plan(operation: str,
         return fleet_mutation.plan_registry_mutation(parameters)["public"]
     if operation == BLOCKADE_AUTHORITY_HARDEN_OPERATION:
         return _blockade_authority_harden_operation_plan(parameters)
+    if operation == ROOTBROKER_AUTHORITY_REFRESH_OPERATION:
+        return _rootbroker_authority_refresh_plan(parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _backup_storage_operation_plan(operation, parameters)
     return _render(operation, parameters)
@@ -832,6 +924,8 @@ def grabowski_operation_run(operation: str,
         return _run_fleet_registry_mutation(parameters)
     if operation == BLOCKADE_AUTHORITY_HARDEN_OPERATION:
         return _run_blockade_authority_harden_operation(parameters)
+    if operation == ROOTBROKER_AUTHORITY_REFRESH_OPERATION:
+        return _run_rootbroker_authority_refresh_operation(parameters)
     if operation in BACKUP_STORAGE_TYPED_OPERATIONS:
         return _run_backup_storage_operation(operation, parameters)
     plan = _render(operation, parameters)
