@@ -774,10 +774,10 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_bureau_task_propose": ("bureau_mutation",),
     "grabowski_bureau_task_review": ("bureau_mutation",),
     "grabowski_bureau_task_publish_preview": (),
-    "grabowski_bureau_task_publish": ("resource_lease", "bureau_mutation"),
-    "grabowski_bureau_pickup_execute": ("resource_lease", "bureau_mutation"),
+    "grabowski_bureau_task_publish": ("bureau_mutation", "resource_lease"),
+    "grabowski_bureau_pickup_execute": ("bureau_mutation", "resource_lease"),
     "grabowski_bureau_pickup_status": (),
-    "grabowski_bureau_pickup_release": ("resource_lease", "bureau_mutation"),
+    "grabowski_bureau_pickup_release": ("bureau_mutation", "resource_lease"),
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
