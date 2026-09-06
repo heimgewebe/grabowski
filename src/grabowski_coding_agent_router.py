@@ -18,6 +18,11 @@ READ_ONLY = operator.READ_ONLY
 CATALOG_ENV = "GRABOWSKI_CODING_AGENT_CATALOG"
 CATALOG_OVERRIDE_ENV = "GRABOWSKI_CODING_AGENT_CATALOG_OVERRIDE"
 STATE_ENV = "GRABOWSKI_CODING_AGENT_ROUTER_STATE"
+CLAUDE_AUTH_ROOT_ENV = "GRABOWSKI_CLAUDE_AUTH_ROOT"
+CLAUDE_CREDENTIAL_COMMITMENT_KIND = "grabowski.claude_credential_commitment"
+CLAUDE_CREDENTIAL_COMMITMENT_DOMAIN = "grabowski.claude-credential-commitment.v1"
+CLAUDE_CREDENTIAL_COMMITMENT_MAX_AGE_SECONDS = 600
+CLAUDE_CREDENTIAL_MAX_BYTES = 64 * 1024
 MAX_CATALOG_BYTES = 512 * 1024
 MAX_STATE_BYTES = 16 * 1024 * 1024
 CATALOG_FRESHNESS_SECONDS = 3600
@@ -91,6 +96,117 @@ def _canonical_sha256(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _credential_commitment_sha256_from_digest(credential_sha256: str, nonce: str) -> str:
+    return _canonical_sha256(
+        {
+            "domain": CLAUDE_CREDENTIAL_COMMITMENT_DOMAIN,
+            "nonce": nonce,
+            "credential_sha256": credential_sha256,
+        }
+    )
+
+
+def _read_canonical_claude_credential() -> tuple[bytes, os.stat_result]:
+    auth_root = Path(
+        os.environ.get(CLAUDE_AUTH_ROOT_ENV, str(Path.home() / ".claude"))
+    ).expanduser()
+    if not auth_root.is_absolute() or auth_root.is_symlink():
+        raise CodingAgentRouterError("canonical Claude auth root is invalid")
+    path = auth_root / ".credentials.json"
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise CodingAgentRouterError("canonical Claude credential is unavailable") from exc
+    mode = stat.S_IMODE(before.st_mode)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or before.st_nlink != 1
+        or mode & 0o077
+        or before.st_size <= 0
+        or before.st_size > CLAUDE_CREDENTIAL_MAX_BYTES
+    ):
+        raise CodingAgentRouterError("canonical Claude credential identity is invalid")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise CodingAgentRouterError("canonical Claude credential could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        identity = (
+            before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid,
+            before.st_nlink, before.st_size, before.st_mtime_ns,
+        )
+        opened_identity = (
+            opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_gid,
+            opened.st_nlink, opened.st_size, opened.st_mtime_ns,
+        )
+        if opened_identity != identity:
+            raise CodingAgentRouterError("canonical Claude credential changed before read")
+        chunks: list[bytes] = []
+        remaining = CLAUDE_CREDENTIAL_MAX_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        after_identity = (
+            after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid,
+            after.st_nlink, after.st_size, after.st_mtime_ns,
+        )
+        if after_identity != identity:
+            raise CodingAgentRouterError("canonical Claude credential changed during read")
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    if len(data) != before.st_size or len(data) > CLAUDE_CREDENTIAL_MAX_BYTES:
+        raise CodingAgentRouterError("canonical Claude credential changed or exceeds its bound")
+    return data, before
+
+
+def _claude_credential_commitment() -> dict[str, Any]:
+    base = {
+        "schema_version": 1,
+        "kind": CLAUDE_CREDENTIAL_COMMITMENT_KIND,
+        "credential_digest_public": False,
+        "source": "canonical-claude-auth-root",
+        "max_age_seconds": CLAUDE_CREDENTIAL_COMMITMENT_MAX_AGE_SECONDS,
+        "does_not_establish": [
+            "credential contents",
+            "credential validity",
+            "provider availability",
+            "remaining provider quota",
+            "provider execution authority",
+        ],
+    }
+    try:
+        data, metadata = _read_canonical_claude_credential()
+    except CodingAgentRouterError:
+        return {
+            **base,
+            "status": "unavailable",
+            "reason_code": "canonical_credential_unavailable_or_invalid",
+        }
+    nonce = os.urandom(16).hex()
+    credential_sha256 = hashlib.sha256(data).hexdigest()
+    generated_at = _utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return {
+        **base,
+        "status": "ready",
+        "nonce": nonce,
+        "commitment_sha256": _credential_commitment_sha256_from_digest(
+            credential_sha256, nonce
+        ),
+        "generated_at": generated_at,
+        "bytes": len(data),
+        "mode": oct(stat.S_IMODE(metadata.st_mode)),
+    }
 
 
 def _strict_bool(value: Any, label: str) -> bool:
@@ -1996,7 +2112,12 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
             "merge_readiness",
         ],
     }
-    return {**body, "inventory_sha256": _canonical_sha256(body)}
+    inventory_sha256 = _canonical_sha256(body)
+    return {
+        **body,
+        "inventory_sha256": inventory_sha256,
+        "claude_credential_commitment": _claude_credential_commitment(),
+    }
 
 
 def canonical_execution_route(

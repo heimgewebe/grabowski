@@ -9,7 +9,10 @@ credential file, and an absolute SHA-256-bound Claude executable.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
+import hmac
+import os
 from contextvars import ContextVar
 from decimal import Decimal
 import importlib.util
@@ -40,6 +43,86 @@ _command_sha256: ContextVar[str | None] = ContextVar(
 _authorized_credential_sha256: ContextVar[str | None] = ContextVar(
     "repobrief_preflight_authorized_credential_sha256", default=None
 )
+_credential_commitment_nonce: ContextVar[str | None] = ContextVar(
+    "repobrief_preflight_credential_commitment_nonce", default=None
+)
+_credential_commitment_sha256: ContextVar[str | None] = ContextVar(
+    "repobrief_preflight_credential_commitment_sha256", default=None
+)
+_credential_commitment_issued_at: ContextVar[str | None] = ContextVar(
+    "repobrief_preflight_credential_commitment_issued_at", default=None
+)
+CLAUDE_AUTH_ROOT_ENV = "GRABOWSKI_CLAUDE_AUTH_ROOT"
+CLAUDE_CREDENTIAL_COMMITMENT_KIND = "grabowski.claude_credential_commitment"
+CLAUDE_CREDENTIAL_COMMITMENT_DOMAIN = "grabowski.claude-credential-commitment.v1"
+CLAUDE_CREDENTIAL_COMMITMENT_MAX_AGE_SECONDS = 600
+CLAUDE_CREDENTIAL_COMMITMENT_CLOCK_SKEW_SECONDS = 120
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _commitment_sha256(credential_data: bytes, nonce: str) -> str:
+    credential_sha256 = hashlib.sha256(credential_data).hexdigest()
+    payload = json.dumps(
+        {
+            "domain": CLAUDE_CREDENTIAL_COMMITMENT_DOMAIN,
+            "nonce": nonce,
+            "credential_sha256": credential_sha256,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_claude_credential_path() -> Path:
+    auth_root = Path(
+        os.environ.get(CLAUDE_AUTH_ROOT_ENV, str(Path.home() / ".claude"))
+    ).expanduser()
+    if not auth_root.is_absolute() or auth_root.is_symlink():
+        raise _core.PreflightError("canonical Claude auth root is invalid")
+    return auth_root / ".credentials.json"
+
+
+def _validated_credential_commitment(credential_data: bytes) -> dict[str, Any]:
+    nonce = _credential_commitment_nonce.get()
+    expected = _credential_commitment_sha256.get()
+    issued_at = _credential_commitment_issued_at.get()
+    if not isinstance(nonce, str) or len(nonce) != 32 or any(
+        char not in "0123456789abcdef" for char in nonce
+    ):
+        raise _core.PreflightError("Claude credential commitment nonce is invalid")
+    if not isinstance(expected, str) or len(expected) != 64 or any(
+        char not in "0123456789abcdef" for char in expected
+    ):
+        raise _core.PreflightError("Claude credential commitment SHA-256 is invalid")
+    try:
+        parsed = datetime.fromisoformat(str(issued_at).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _core.PreflightError("Claude credential commitment timestamp is invalid") from exc
+    if parsed.tzinfo is None:
+        raise _core.PreflightError("Claude credential commitment timestamp is invalid")
+    parsed = parsed.astimezone(timezone.utc)
+    age_seconds = (_utc_now() - parsed).total_seconds()
+    if age_seconds < -CLAUDE_CREDENTIAL_COMMITMENT_CLOCK_SKEW_SECONDS:
+        raise _core.PreflightError("Claude credential commitment timestamp is in the future")
+    if age_seconds > CLAUDE_CREDENTIAL_COMMITMENT_MAX_AGE_SECONDS:
+        raise _core.PreflightError("Claude credential commitment is stale")
+    actual = _commitment_sha256(credential_data, nonce)
+    if not hmac.compare_digest(actual, expected):
+        raise _core.PreflightError("Claude credential commitment mismatch")
+    return {
+        "schema_version": 1,
+        "kind": CLAUDE_CREDENTIAL_COMMITMENT_KIND,
+        "nonce": nonce,
+        "commitment_sha256": expected,
+        "generated_at": parsed.isoformat().replace("+00:00", "Z"),
+        "max_age_seconds": CLAUDE_CREDENTIAL_COMMITMENT_MAX_AGE_SECONDS,
+        "credential_digest_public": False,
+    }
 
 
 def _require_cost(value: Any, label: str, *, maximum: Decimal) -> Decimal:
@@ -125,6 +208,10 @@ def _dispatch_provider_binding_adapter(
         raise _core.PreflightError(
             "live preflight requires credential file and Claude executable SHA-256"
         )
+    credential_path = credential.expanduser()
+    canonical_credential = _canonical_claude_credential_path()
+    if credential_path != canonical_credential:
+        raise _core.PreflightError("live preflight credential path is not canonical")
     try:
         executable = _core.runner._validate_provider_executable(
             stream_fixture=None,
@@ -139,10 +226,12 @@ def _dispatch_provider_binding_adapter(
         raise _core.PreflightError(str(exc)) from exc
     if credential_data is None:
         raise _core.PreflightError("live credential binding is unavailable")
-    executable_path = Path(executable)
-    credential_path = credential.expanduser()
-    executable_metadata = executable_path.lstat()
     credential_metadata = credential_path.lstat()
+    if credential_metadata.st_uid != os.getuid() or credential_metadata.st_nlink != 1:
+        raise _core.PreflightError("Claude credential file is not owner-private")
+    commitment = _validated_credential_commitment(credential_data)
+    executable_path = Path(executable)
+    executable_metadata = executable_path.lstat()
     credential_sha256 = hashlib.sha256(credential_data).hexdigest()
     authorized_sha256 = _authorized_credential_sha256.get()
     if authorized_sha256 is None:
@@ -159,10 +248,10 @@ def _dispatch_provider_binding_adapter(
             "sha256": command_sha,
         },
         "credential": {
-            "path": str(credential_path.resolve()),
             "bytes": len(credential_data),
-            "sha256": credential_sha256,
             "mode": oct(credential_metadata.st_mode & 0o777),
+            "credential_digest_public": False,
+            "commitment": commitment,
         },
         "quota_readiness": _claude_quota_readiness(),
     }
@@ -218,30 +307,59 @@ def execute_preflight(
     *,
     claude_credential_file: Path | None = None,
     claude_command_sha256: str | None = None,
+    claude_credential_commitment_nonce: str | None = None,
+    claude_credential_commitment_sha256: str | None = None,
+    claude_credential_commitment_issued_at: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     baseline_fixture = kwargs.get("baseline_fixture")
     treatment_fixture = kwargs.get("treatment_fixture")
     synthetic = baseline_fixture is not None or treatment_fixture is not None
-    if synthetic and (
-        claude_credential_file is not None or claude_command_sha256 is not None
+    if synthetic and any(
+        value is not None
+        for value in (
+            claude_credential_file,
+            claude_command_sha256,
+            claude_credential_commitment_nonce,
+            claude_credential_commitment_sha256,
+            claude_credential_commitment_issued_at,
+        )
     ):
         raise _core.PreflightError(
             "synthetic fixtures must not carry live provider bindings"
         )
-    if not synthetic and (
-        claude_credential_file is None or claude_command_sha256 is None
+    if not synthetic and any(
+        value is None
+        for value in (
+            claude_credential_file,
+            claude_command_sha256,
+            claude_credential_commitment_nonce,
+            claude_credential_commitment_sha256,
+            claude_credential_commitment_issued_at,
+        )
     ):
         raise _core.PreflightError(
-            "live preflight requires credential file and Claude executable SHA-256"
+            "live preflight requires credential file and Claude executable SHA-256 plus opaque credential commitment"
         )
     credential_token = _credential_file.set(claude_credential_file)
     sha_token = _command_sha256.set(claude_command_sha256)
+    commitment_nonce_token = _credential_commitment_nonce.set(
+        claude_credential_commitment_nonce
+    )
+    commitment_sha_token = _credential_commitment_sha256.set(
+        claude_credential_commitment_sha256
+    )
+    commitment_time_token = _credential_commitment_issued_at.set(
+        claude_credential_commitment_issued_at
+    )
     authorized_credential_token = _authorized_credential_sha256.set(None)
     try:
         return _core.execute_preflight(**kwargs)
     finally:
         _authorized_credential_sha256.reset(authorized_credential_token)
+        _credential_commitment_issued_at.reset(commitment_time_token)
+        _credential_commitment_sha256.reset(commitment_sha_token)
+        _credential_commitment_nonce.reset(commitment_nonce_token)
         _command_sha256.reset(sha_token)
         _credential_file.reset(credential_token)
 
@@ -258,6 +376,9 @@ def _adapter_arguments(argv: list[str] | None) -> tuple[argparse.Namespace, list
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--claude-credential-file", type=Path)
     parser.add_argument("--claude-command-sha256")
+    parser.add_argument("--claude-credential-commitment-nonce")
+    parser.add_argument("--claude-credential-commitment-sha256")
+    parser.add_argument("--claude-credential-commitment-issued-at")
     return parser.parse_known_args(argv)
 
 
@@ -267,27 +388,54 @@ def main(argv: list[str] | None = None) -> int:
         "--baseline-stream-fixture" in remaining
         or "--treatment-stream-fixture" in remaining
     )
-    if synthetic and (
-        adapter.claude_credential_file is not None
-        or adapter.claude_command_sha256 is not None
+    if synthetic and any(
+        value is not None
+        for value in (
+            adapter.claude_credential_file,
+            adapter.claude_command_sha256,
+            adapter.claude_credential_commitment_nonce,
+            adapter.claude_credential_commitment_sha256,
+            adapter.claude_credential_commitment_issued_at,
+        )
     ):
         error = "synthetic fixtures must not carry live provider bindings"
         print(json.dumps({"status": "error", "error": error}), file=sys.stderr)
         return 2
-    if not synthetic and (
-        adapter.claude_credential_file is None
-        or adapter.claude_command_sha256 is None
+    if not synthetic and any(
+        value is None
+        for value in (
+            adapter.claude_credential_file,
+            adapter.claude_command_sha256,
+            adapter.claude_credential_commitment_nonce,
+            adapter.claude_credential_commitment_sha256,
+            adapter.claude_credential_commitment_issued_at,
+        )
     ):
-        error = "live preflight requires credential file and Claude executable SHA-256"
+        error = (
+            "live preflight requires credential file and Claude executable SHA-256 "
+            "plus opaque credential commitment"
+        )
         print(json.dumps({"status": "error", "error": error}), file=sys.stderr)
         return 2
     credential_token = _credential_file.set(adapter.claude_credential_file)
     sha_token = _command_sha256.set(adapter.claude_command_sha256)
+    commitment_nonce_token = _credential_commitment_nonce.set(
+        adapter.claude_credential_commitment_nonce
+    )
+    commitment_sha_token = _credential_commitment_sha256.set(
+        adapter.claude_credential_commitment_sha256
+    )
+    commitment_time_token = _credential_commitment_issued_at.set(
+        adapter.claude_credential_commitment_issued_at
+    )
     authorized_credential_token = _authorized_credential_sha256.set(None)
     try:
         return int(_core.main(remaining))
     finally:
         _authorized_credential_sha256.reset(authorized_credential_token)
+        _credential_commitment_issued_at.reset(commitment_time_token)
+        _credential_commitment_sha256.reset(commitment_sha_token)
+        _credential_commitment_nonce.reset(commitment_nonce_token)
         _command_sha256.reset(sha_token)
         _credential_file.reset(credential_token)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import io
 import importlib.util
@@ -69,14 +70,29 @@ def _execute_with_test_provider_binding(*args, **kwargs):
     )
     if not synthetic:
         state_root = Path(kwargs["state_root"]).expanduser().resolve()
-        credential = state_root.parent / "fixture-claude-credentials.json"
+        credential = state_root.parent / ".credentials.json"
         credential.write_text("{}\n", encoding="utf-8")
         credential.chmod(0o600)
         executable = Path(kwargs["claude"]).expanduser().resolve()
+        nonce = "ab" * 16
+        issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
         kwargs["claude_credential_file"] = credential
         kwargs["claude_command_sha256"] = hashlib.sha256(
             executable.read_bytes()
         ).hexdigest()
+        kwargs["claude_credential_commitment_nonce"] = nonce
+        kwargs["claude_credential_commitment_sha256"] = support.preflight._commitment_sha256(
+            credential.read_bytes(), nonce
+        )
+        kwargs["claude_credential_commitment_issued_at"] = issued_at
+        with mock.patch.dict(
+            os.environ,
+            {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(credential.parent)},
+            clear=False,
+        ):
+            return _ORIGINAL_EXECUTE_PREFLIGHT(*args, **kwargs)
     return _ORIGINAL_EXECUTE_PREFLIGHT(*args, **kwargs)
 
 
@@ -313,6 +329,12 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
                 "a" * 64,
                 "--claude-credential-file",
                 "/private/credentials.json",
+                "--claude-credential-commitment-nonce",
+                "ab" * 16,
+                "--claude-credential-commitment-sha256",
+                "b" * 64,
+                "--claude-credential-commitment-issued-at",
+                "2026-09-06T04:00:00Z",
             ]
         )
 
@@ -320,6 +342,12 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         self.assertEqual(
             adapter.claude_credential_file,
             Path("/private/credentials.json"),
+        )
+        self.assertEqual(adapter.claude_credential_commitment_nonce, "ab" * 16)
+        self.assertEqual(adapter.claude_credential_commitment_sha256, "b" * 64)
+        self.assertEqual(
+            adapter.claude_credential_commitment_issued_at,
+            "2026-09-06T04:00:00Z",
         )
         self.assertEqual(remaining, ["--claude-command", "/absolute/claude"])
 
@@ -380,6 +408,9 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             captured["argv"] = list(argv)
             captured["credential"] = support.preflight._credential_file.get()
             captured["command_sha256"] = support.preflight._command_sha256.get()
+            captured["commitment_nonce"] = support.preflight._credential_commitment_nonce.get()
+            captured["commitment_sha256"] = support.preflight._credential_commitment_sha256.get()
+            captured["commitment_issued_at"] = support.preflight._credential_commitment_issued_at.get()
             return 0
 
         live_argv = [
@@ -405,6 +436,12 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             "a" * 64,
             "--claude-credential-file",
             "/private/credentials.json",
+            "--claude-credential-commitment-nonce",
+            "ab" * 16,
+            "--claude-credential-commitment-sha256",
+            "b" * 64,
+            "--claude-credential-commitment-issued-at",
+            "2026-09-06T04:00:00Z",
             "--max-cost-usd",
             "0.20",
         ]
@@ -419,8 +456,14 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         self.assertEqual(forwarded[command_index + 1], "/absolute/claude")
         self.assertNotIn("--claude-command-sha256", forwarded)
         self.assertNotIn("--claude-credential-file", forwarded)
+        self.assertNotIn("--claude-credential-commitment-nonce", forwarded)
+        self.assertNotIn("--claude-credential-commitment-sha256", forwarded)
+        self.assertNotIn("--claude-credential-commitment-issued-at", forwarded)
         self.assertEqual(captured["credential"], Path("/private/credentials.json"))
         self.assertEqual(captured["command_sha256"], "a" * 64)
+        self.assertEqual(captured["commitment_nonce"], "ab" * 16)
+        self.assertEqual(captured["commitment_sha256"], "b" * 64)
+        self.assertEqual(captured["commitment_issued_at"], "2026-09-06T04:00:00Z")
 
     def test_live_provider_binding_resolves_symlinked_launcher_without_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -430,24 +473,57 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             executable.chmod(0o700)
             launcher = root / "claude"
             launcher.symlink_to(executable)
-            credential = root / "credentials.json"
+            credential = root / ".credentials.json"
             credential.write_text("{}\n", encoding="utf-8")
             credential.chmod(0o600)
             digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            raw_credential_digest = hashlib.sha256(credential.read_bytes()).hexdigest()
+            nonce = "ab" * 16
+            issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+                "+00:00", "Z"
+            )
+            commitment_sha256 = support.preflight._commitment_sha256(
+                credential.read_bytes(), nonce
+            )
             credential_token = support.preflight._credential_file.set(credential)
             sha_token = support.preflight._command_sha256.set(digest)
+            commitment_nonce_token = support.preflight._credential_commitment_nonce.set(nonce)
+            commitment_sha_token = support.preflight._credential_commitment_sha256.set(
+                commitment_sha256
+            )
+            commitment_time_token = support.preflight._credential_commitment_issued_at.set(
+                issued_at
+            )
             authorized_token = support.preflight._authorized_credential_sha256.set(None)
             try:
-                binding = support.preflight._dispatch_provider_binding_adapter(
-                    str(launcher), False
-                )
+                with mock.patch.dict(
+                    os.environ,
+                    {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)},
+                    clear=False,
+                ):
+                    binding = support.preflight._dispatch_provider_binding_adapter(
+                        str(launcher), False
+                    )
             finally:
                 support.preflight._authorized_credential_sha256.reset(authorized_token)
+                support.preflight._credential_commitment_issued_at.reset(commitment_time_token)
+                support.preflight._credential_commitment_sha256.reset(commitment_sha_token)
+                support.preflight._credential_commitment_nonce.reset(commitment_nonce_token)
                 support.preflight._command_sha256.reset(sha_token)
                 support.preflight._credential_file.reset(credential_token)
             self.assertEqual(binding["claude"]["path"], str(executable.resolve()))
             self.assertEqual(binding["claude"]["sha256"], digest)
             self.assertEqual(binding["credential"]["mode"], "0o600")
+            self.assertFalse(binding["credential"]["credential_digest_public"])
+            self.assertNotIn("path", binding["credential"])
+            self.assertNotIn("sha256", binding["credential"])
+            self.assertEqual(
+                binding["credential"]["commitment"]["commitment_sha256"],
+                commitment_sha256,
+            )
+            self.assertNotIn(
+                raw_credential_digest, json.dumps(binding["credential"], sort_keys=True)
+            )
             self.assertEqual(binding["quota_readiness"]["status"], "unknown")
             self.assertIsNone(binding["quota_readiness"]["provider_available"])
             self.assertFalse(
@@ -457,6 +533,155 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
                 "provider_availability",
                 binding["quota_readiness"]["does_not_establish"],
             )
+
+
+    def test_noncanonical_credential_path_blocks_before_secret_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical_root = root / "canonical"
+            canonical_root.mkdir()
+            canonical = canonical_root / ".credentials.json"
+            canonical.write_text("{}\n", encoding="utf-8")
+            canonical.chmod(0o600)
+            other = root / "other.json"
+            other.write_text("{}\n", encoding="utf-8")
+            other.chmod(0o600)
+            credential_token = support.preflight._credential_file.set(other)
+            sha_token = support.preflight._command_sha256.set("0" * 64)
+            nonce_token = support.preflight._credential_commitment_nonce.set("ab" * 16)
+            commitment_token = support.preflight._credential_commitment_sha256.set("0" * 64)
+            issued_token = support.preflight._credential_commitment_issued_at.set(
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+                    "+00:00", "Z"
+                )
+            )
+            authorized_token = support.preflight._authorized_credential_sha256.set(None)
+            try:
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(canonical_root)},
+                        clear=False,
+                    ),
+                    mock.patch.object(
+                        support.preflight,
+                        "_original_validated_credential_data",
+                    ) as secret_read,
+                    self.assertRaisesRegex(
+                        support.preflight.PreflightError,
+                        "credential path is not canonical",
+                    ),
+                ):
+                    support.preflight._dispatch_provider_binding_adapter(
+                        "/does/not/matter", False
+                    )
+                secret_read.assert_not_called()
+            finally:
+                support.preflight._authorized_credential_sha256.reset(authorized_token)
+                support.preflight._credential_commitment_issued_at.reset(issued_token)
+                support.preflight._credential_commitment_sha256.reset(commitment_token)
+                support.preflight._credential_commitment_nonce.reset(nonce_token)
+                support.preflight._command_sha256.reset(sha_token)
+                support.preflight._credential_file.reset(credential_token)
+
+    def test_stale_credential_commitment_blocks(self) -> None:
+        data = b"{}\n"
+        nonce = "ab" * 16
+        nonce_token = support.preflight._credential_commitment_nonce.set(nonce)
+        commitment_token = support.preflight._credential_commitment_sha256.set(
+            support.preflight._commitment_sha256(data, nonce)
+        )
+        issued_token = support.preflight._credential_commitment_issued_at.set(
+            "2026-09-06T03:00:00Z"
+        )
+        try:
+            with (
+                mock.patch.object(
+                    support.preflight,
+                    "_utc_now",
+                    return_value=datetime(2026, 9, 6, 3, 10, 1, tzinfo=timezone.utc),
+                ),
+                self.assertRaisesRegex(
+                    support.preflight.PreflightError,
+                    "credential commitment is stale",
+                ),
+            ):
+                support.preflight._validated_credential_commitment(data)
+        finally:
+            support.preflight._credential_commitment_issued_at.reset(issued_token)
+            support.preflight._credential_commitment_sha256.reset(commitment_token)
+            support.preflight._credential_commitment_nonce.reset(nonce_token)
+
+    def test_future_credential_commitment_blocks(self) -> None:
+        data = b"{}\n"
+        nonce = "ab" * 16
+        nonce_token = support.preflight._credential_commitment_nonce.set(nonce)
+        commitment_token = support.preflight._credential_commitment_sha256.set(
+            support.preflight._commitment_sha256(data, nonce)
+        )
+        issued_token = support.preflight._credential_commitment_issued_at.set(
+            "2026-09-06T03:03:00Z"
+        )
+        try:
+            with (
+                mock.patch.object(
+                    support.preflight,
+                    "_utc_now",
+                    return_value=datetime(2026, 9, 6, 3, 0, 0, tzinfo=timezone.utc),
+                ),
+                self.assertRaisesRegex(
+                    support.preflight.PreflightError,
+                    "credential commitment timestamp is in the future",
+                ),
+            ):
+                support.preflight._validated_credential_commitment(data)
+        finally:
+            support.preflight._credential_commitment_issued_at.reset(issued_token)
+            support.preflight._credential_commitment_sha256.reset(commitment_token)
+            support.preflight._credential_commitment_nonce.reset(nonce_token)
+
+    def test_credential_commitment_mismatch_blocks_before_provider_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "claude"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            credential = root / ".credentials.json"
+            credential.write_text("{}\n", encoding="utf-8")
+            credential.chmod(0o600)
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            credential_token = support.preflight._credential_file.set(credential)
+            sha_token = support.preflight._command_sha256.set(digest)
+            nonce_token = support.preflight._credential_commitment_nonce.set("ab" * 16)
+            commitment_token = support.preflight._credential_commitment_sha256.set("0" * 64)
+            issued_token = support.preflight._credential_commitment_issued_at.set(
+                datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+                    "+00:00", "Z"
+                )
+            )
+            authorized_token = support.preflight._authorized_credential_sha256.set(None)
+            try:
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)},
+                        clear=False,
+                    ),
+                    self.assertRaisesRegex(
+                        support.preflight.PreflightError,
+                        "credential commitment mismatch",
+                    ),
+                ):
+                    support.preflight._dispatch_provider_binding_adapter(
+                        str(executable), False
+                    )
+            finally:
+                support.preflight._authorized_credential_sha256.reset(authorized_token)
+                support.preflight._credential_commitment_issued_at.reset(issued_token)
+                support.preflight._credential_commitment_sha256.reset(commitment_token)
+                support.preflight._credential_commitment_nonce.reset(nonce_token)
+                support.preflight._command_sha256.reset(sha_token)
+                support.preflight._credential_file.reset(credential_token)
 
     def test_quota_readiness_is_explicitly_unknown_without_provider_probe(self) -> None:
         with mock.patch("subprocess.run") as provider_call:
@@ -794,7 +1019,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             environment = support.fixture_environment(root)
             kwargs = _preflight_kwargs(root, environment)
             original = support.preflight._core._record_dispatch_intent
-            credential = root / "fixture-claude-credentials.json"
+            credential = root / ".credentials.json"
 
             def mutate_after_intent(*args, **record_kwargs):
                 result = original(*args, **record_kwargs)
@@ -833,7 +1058,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             environment = support.fixture_environment(root)
             kwargs = _preflight_kwargs(root, environment)
             original = support.preflight._core.runner.execute
-            credential = root / "fixture-claude-credentials.json"
+            credential = root / ".credentials.json"
 
             def mutate_credential_after_baseline(request: dict, **run_kwargs):
                 output = original(request, **run_kwargs)
@@ -849,7 +1074,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(
                     support.preflight.PreflightError,
-                    "credential file changed after authorization",
+                    "credential commitment mismatch",
                 ):
                     _execute_with_test_provider_binding(**kwargs)
             events = support.ledger_events(root / "state")
