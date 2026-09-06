@@ -318,7 +318,7 @@
       "forbidden_hosts": []
     },
     "failover-mutate": {
-      "description": "Minimal fence-enforced secondary mutation profile for controlled failover. It grants guarded Git/GitHub, typed Bureau and resource-lease effects but no generic file, job, terminal, service, browser/GUI, secret, signal, power or destructive authority.",
+      "description": "Minimal fence-enforced secondary mutation profile for controlled failover. It grants typed Bureau and resource-lease effects but no generic file, job, terminal, service, browser/GUI, secret, signal, power or destructive authority.",
       "read_roots": [
         "${HOME}"
       ],
@@ -355,8 +355,6 @@
         "audit_verify",
         "audit_read",
         "bureau_mutation",
-        "git_cli",
-        "github_cli",
         "resource_lease",
         "process_inspect",
         "port_inspect"

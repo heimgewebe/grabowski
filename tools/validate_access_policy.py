@@ -113,8 +113,6 @@ failover_mutate_capabilities = {
     "audit_verify",
     "audit_read",
     "bureau_mutation",
-    "git_cli",
-    "github_cli",
     "resource_lease",
     "process_inspect",
     "port_inspect",

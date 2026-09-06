@@ -83,8 +83,8 @@ class TrustedOwnerTests(unittest.TestCase):
                 operator._effective_capability_set(),
                 {
                     "file_read", "audit_verify", "audit_read",
-                    "bureau_mutation", "git_cli", "github_cli",
-                    "resource_lease", "process_inspect", "port_inspect",
+                    "bureau_mutation", "resource_lease",
+                    "process_inspect", "port_inspect",
                 },
             )
 

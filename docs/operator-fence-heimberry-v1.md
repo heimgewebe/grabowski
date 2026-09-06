@@ -215,8 +215,6 @@ file_read
 audit_verify
 audit_read
 bureau_mutation
-git_cli
-github_cli
 resource_lease
 process_inspect
 port_inspect
@@ -226,7 +224,7 @@ Its declared roots remain limited to repository and Grabowski/Bureau state paths
 
 `bureau_mutation` is a separate capability for the typed candidate/proposal/review/publication/pickup surfaces. It does not authorize `grabowski_terminal_run` and does not create a second Bureau mutation path.
 
-`durable_job`, generic `file_write`, `rollback_text` and `artifact_transfer` are deliberately absent from `failover-mutate` in G6.5. Their current surfaces are broader than the manual single-writer canary needs and could outlive or bypass the narrow per-effect authority claim. A later slice may add separately typed bounded variants; the broad existing capabilities remain available only to normal higher-authority profiles.
+`durable_job`, generic `file_write`, `rollback_text`, `artifact_transfer`, `git_cli` and `github_cli` are deliberately absent from `failover-mutate` in G6.5. Their current surfaces are broader than the manual single-writer canary needs; generic job/remote dispatch in particular can outlive the top-level fence call. G6.5 therefore proves mutation only through typed Bureau writes and resource leases. Later slices may add separately typed bounded variants; the broad existing capabilities remain available only to normal higher-authority profiles.
 
 ## Failure semantics
 

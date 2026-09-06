@@ -917,8 +917,6 @@ FAILOVER_MUTATE_CAPABILITIES = frozenset(
         "audit_verify",
         "audit_read",
         "bureau_mutation",
-        "git_cli",
-        "github_cli",
         "resource_lease",
         "process_inspect",
         "port_inspect",

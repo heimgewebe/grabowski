@@ -48,8 +48,8 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
                     "trusted_owner": False,
                     "capabilities": [
                         "file_read", "audit_verify", "audit_read",
-                        "bureau_mutation", "git_cli", "github_cli",
-                        "resource_lease", "process_inspect", "port_inspect",
+                        "bureau_mutation", "resource_lease",
+                        "process_inspect", "port_inspect",
                     ],
                 },
                 "trusted-owner": {

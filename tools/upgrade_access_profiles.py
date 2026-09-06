@@ -130,8 +130,7 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
     failover_capabilities = failover_mutate.get("capabilities")
     expected_failover_capabilities = {
         "file_read", "audit_verify", "audit_read", "bureau_mutation",
-        "git_cli", "github_cli", "resource_lease", "process_inspect",
-        "port_inspect",
+        "resource_lease", "process_inspect", "port_inspect",
     }
     if failover_mutate.get("trusted_owner") is not False:
         raise ValueError("template failover-mutate must disable trusted_owner")
