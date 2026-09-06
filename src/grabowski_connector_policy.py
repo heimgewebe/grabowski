@@ -8,13 +8,16 @@ import stat
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
 ENFORCEMENT_MARKER_NAME = "require-tool-policy"
 ENFORCEMENT_MARKER_PAYLOAD = b"required-v1"
 POLICY_SUFFIX = ".tools.json"
 MAX_POLICY_BYTES = 64 * 1024
 MAX_TOOL_NAME_BYTES = 256
 MAX_ALLOWED_TOOLS = 512
+MAX_GATEWAY_TOOLS = 8
+GATEWAY_ONLY_TOOL_NAMES = frozenset({"maulwurfx_propose_finding"})
 
 
 class ConnectorPolicyError(RuntimeError):
@@ -114,6 +117,20 @@ def _normalize_registered_tools(registered_tools: Iterable[str] | None) -> set[s
     return {_validate_tool_name(item) for item in registered_tools}
 
 
+def _normalize_tool_list(
+    value: Any,
+    *,
+    label: str,
+    maximum_items: int,
+) -> list[str]:
+    if not isinstance(value, list) or len(value) > maximum_items:
+        raise ConnectorPolicyError(f"connector {label} is invalid")
+    normalized = [_validate_tool_name(item) for item in value]
+    if len(normalized) != len(set(normalized)):
+        raise ConnectorPolicyError(f"connector {label} contains duplicates")
+    return normalized
+
+
 def load_policy(
     root: Path,
     connector_id: str,
@@ -121,6 +138,11 @@ def load_policy(
     registered_tools: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Load one principal policy when the global fail-closed marker is active.
+
+    Schema v1 is the original transport-only policy. Schema v2 may additionally
+    name a very small set of gateway-local tools. Gateway-local tools never enter
+    the internal MCP registry and therefore are deliberately excluded from the
+    registered-tool comparison. Their names are server-owned and fixed here.
 
     Before migration is activated, callers retain legacy behavior. Once the
     marker exists, every enrolled connector must have an explicit policy file;
@@ -135,6 +157,7 @@ def load_policy(
             "connector_id": connector_id,
             "mode": "legacy-unrestricted",
             "allowed_tools": None,
+            "gateway_tools": [],
             "read_only_only": False,
             "enforced": False,
         }
@@ -150,11 +173,26 @@ def load_policy(
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ConnectorPolicyError("connector tool policy is invalid JSON") from exc
-    required_keys = {"schema_version", "connector_id", "mode", "allowed_tools", "read_only_only"}
-    if not isinstance(value, dict) or set(value) != required_keys:
+    if not isinstance(value, dict):
         raise ConnectorPolicyError("connector tool policy shape is invalid")
-    if value.get("schema_version") != SCHEMA_VERSION:
+    schema_version = value.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise ConnectorPolicyError("connector tool policy schema is unsupported")
+    required_keys = {
+        "schema_version",
+        "connector_id",
+        "mode",
+        "allowed_tools",
+        "read_only_only",
+    }
+    if schema_version == 2:
+        required_keys.add("gateway_tools")
+    if set(value) != required_keys:
+        raise ConnectorPolicyError("connector tool policy shape is invalid")
     if value.get("connector_id") != connector_id:
         raise ConnectorPolicyError("connector tool policy identity mismatch")
     mode = value.get("mode")
@@ -163,18 +201,40 @@ def load_policy(
         raise ConnectorPolicyError("connector read-only policy flag is invalid")
     if mode not in {"unrestricted", "allowlist"}:
         raise ConnectorPolicyError("connector tool policy mode is invalid")
-    allowed_raw = value.get("allowed_tools")
-    if not isinstance(allowed_raw, list) or len(allowed_raw) > MAX_ALLOWED_TOOLS:
-        raise ConnectorPolicyError("connector tool allowlist is invalid")
-    allowed = [_validate_tool_name(item) for item in allowed_raw]
-    if len(allowed) != len(set(allowed)):
-        raise ConnectorPolicyError("connector tool allowlist contains duplicates")
+    allowed = _normalize_tool_list(
+        value.get("allowed_tools"),
+        label="tool allowlist",
+        maximum_items=MAX_ALLOWED_TOOLS,
+    )
+    gateway_tools = (
+        _normalize_tool_list(
+            value.get("gateway_tools"),
+            label="gateway-tool allowlist",
+            maximum_items=MAX_GATEWAY_TOOLS,
+        )
+        if schema_version == 2
+        else []
+    )
+    unknown_gateway_tools = sorted(set(gateway_tools) - GATEWAY_ONLY_TOOL_NAMES)
+    if unknown_gateway_tools:
+        raise ConnectorPolicyError(
+            "connector policy references unsupported gateway tools: "
+            + ", ".join(unknown_gateway_tools)
+        )
+    if gateway_tools and mode != "allowlist":
+        raise ConnectorPolicyError(
+            "gateway-local connector tools require allowlist mode"
+        )
     if mode == "unrestricted" and allowed:
         raise ConnectorPolicyError(
             "unrestricted connector policy must not carry an allowlist"
         )
     if mode == "allowlist" and not allowed:
         raise ConnectorPolicyError("connector tool allowlist must not be empty")
+    if set(allowed) & set(gateway_tools):
+        raise ConnectorPolicyError(
+            "gateway-local tools must not appear in the internal tool allowlist"
+        )
     registered = _normalize_registered_tools(registered_tools)
     if registered is not None:
         unknown = sorted(set(allowed) - registered)
@@ -183,10 +243,11 @@ def load_policy(
                 "connector tool policy references unknown tools: " + ", ".join(unknown)
             )
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "connector_id": connector_id,
         "mode": mode,
         "allowed_tools": allowed,
+        "gateway_tools": gateway_tools,
         "read_only_only": read_only_only,
         "enforced": True,
     }

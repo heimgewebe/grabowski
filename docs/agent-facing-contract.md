@@ -59,13 +59,20 @@ The rendered contract requires the agent to:
    still require target readback before any retry;
 10. prefer typed operations to generic terminal, Git or GitHub calls when both can
     express the effect;
-11. for nontrivial operator work, use the durable operator-obligation lifecycle to
-    resume matching unfinished work and close only with completed, explicitly
-    blocked or durably delegated evidence;
-12. bind and assess risk-adaptive convergence evidence before claiming systemic
+11. at material direction boundaries, keep the original user outcome authoritative
+    and the current strategy disposable: test a necessary assumption against fresh
+    evidence, name a serious alternative and explicitly choose `CONTINUE`, `CHANGE`
+    or `PARK/STOP`; one tool failure, expected red test or required recovery gate
+    is not strategic evidence by itself;
+12. for nontrivial operator work, use the durable operator-obligation lifecycle to
+    resume matching unfinished work and end only with completed, explicitly blocked
+    or durably delegated evidence, or with an evidence-bound direct v2
+    `deferred`/`superseded` resolution that keeps `work_complete=false` and sets
+    `continuation_required=false`; resume parked work via a new obligation;
+13. bind and assess risk-adaptive convergence evidence before claiming systemic
     convergence when the convergence plan requires it; ordinary work completion is
     not itself a systemic-convergence claim;
-13. treat the instructions as non-authoritative: they grant no action, merge,
+14. treat the instructions as non-authoritative: they grant no action, merge,
     deploy, secret or retry authority.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if

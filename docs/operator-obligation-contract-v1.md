@@ -14,7 +14,7 @@ Für nichttriviale Operatorarbeit wird vor der Ausführung eine `operator-obliga
 - optionale Herkunfts- und Referenzdaten;
 - einen kanonischen Material-Hash sowie einen Record-Hash, der auch Zeit- und Bindungsfelder schützt.
 
-Solange nur `open.json` existiert, liefert der Status zwingend:
+Solange `open.json` existiert und keine direkte strategische v2-Resolution vorliegt, liefert der Status zwingend:
 
 ```text
 continuation_required = true
@@ -33,6 +33,14 @@ Die Antwort darf dann weder Abschluss behaupten noch die offene Arbeit verschwei
 3. `delegated`: Der öffentliche Abschluss-Grip beobachtet den angegebenen Grabowski-Task, Agent-Workspace oder systemd-Job selbst. Nur ein tatsächlich laufender, identitäts- und receipt-gebundener Zustand wird akzeptiert. Auch dies behauptet keine Fertigstellung; die Verpflichtung bleibt im Standard-Listing sichtbar, bis eine Nachfolge-Verpflichtung die weitere Bearbeitung übernimmt.
 
 Für jeden dieser drei `close.json`-Zustände außer `completed` gilt zunächst `continuation_required=true`; nur `completed` liefert `work_complete=true`. Eine spätere, explizite historische Resolution kann `blocked` oder `delegated` aus der aktuellen Aufmerksamkeit nehmen, ohne den ursprünglichen Abschluss oder dessen Akzeptanzstatus umzuschreiben. Ein fehlender Beleg, ein widersprüchlicher zweiter Abschluss, manipulierte Dateien, unsichere Dateirechte, unbekannte Felder oder eine unvollständige beziehungsweise widersprüchliche Statusprojektion führen fail-closed. Projektionsfehler werden im Listenaufruf als Integritätsfehler ausgewiesen und setzen `attention_required=true`; sie dürfen unfertige Arbeit nicht still ausblenden.
+
+## Direkte strategische Resolution offener Arbeit
+
+Eine offene Verpflichtung ist nicht technisch blockiert, nur weil ein Lösungsweg bewusst nicht weiterverfolgt werden soll. Resolution-Schema v2 darf offene Arbeit deshalb direkt `deferred` oder `superseded` historisch parken. Es entsteht kein `close.json`: `open.json` bleibt unverändert, die Resolution bindet dessen SHA-256, `close_file_sha256=null`, `state=open`, `attention_class=historical`, `work_complete=false`, `continuation_required=false` und `response_may_end=true`. `resolved` bleibt auf diesem Direktpfad verboten.
+
+Die Resolution benötigt SHA-256-gebundene Evidenz. Eine direkte `superseded`-Resolution muss genau einen konkreten Nachfolger als `operator-obligation` binden: `reference` ist dessen Obligation-ID und `sha256` der aktuelle Hash seines unveränderten `open.json`. Eine beliebige externe Referenz genügt dafür nicht; externe Wahrheit ohne solchen Nachfolger wird nicht als Supersession ausgegeben. Sie erzeugt keine Dispatch-, Merge-, Deploy- oder sonstige Authority. Identischer Replay ist idempotent, eine abweichende zweite Entscheidung ist ein Konflikt. Wiederaufnahme erfolgt über eine neue Obligation; die alte wird nicht nachträglich geschlossen.
+
+Reads validieren die gespeicherte Bindung erneut; manipuliertes Material oder eine falsche `open_file_sha256` scheitert fail-closed. Die Aktualität externer Quellen bleibt bei deren Primärquelle zu prüfen. Ein älterer Reader ohne diese Semantik sieht mangels `close.json` konservativ weiter offene Arbeit: Rollback kann Aufmerksamkeit wieder einblenden, nicht still ausblenden.
 
 ## Historische Resolutionen und Deferred-Parken
 

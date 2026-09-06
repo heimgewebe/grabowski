@@ -1,8 +1,8 @@
-# Maulwurf X: Grok als begrenzter Grabowski-Client
+# maulwurf x: Grok als begrenzter Grabowski-Client
 
 ## Ziel
 
-`Maulwurf X` ist **kein zweiter Grabowski**. Grok benutzt dieselbe kanonische
+`maulwurf x` ist **kein zweiter Grabowski**. Grok benutzt dieselbe kanonische
 Grabowski-Runtime, erhält aber einen eigenen Principal, getrennte Secrets und
 eine serverseitig erzwungene Least-Privilege-Toolpolicy.
 
@@ -43,8 +43,11 @@ Das Gateway ist nur eine Providergrenze. Es:
   `X-Grabowski-*`-Header;
 - setzt ausschließlich das interne `X-Grabowski-Ingress-Auth` für den sekundären
   signed ingress;
-- projiziert bei `tools/list` nur die für `maulwurf-x` erlaubten Tools;
+- projiziert bei `tools/list` nur die für `maulwurf-x` erlaubten internen Tools
+  plus den explizit freigegebenen gateway-lokalen Proposal-Sink;
 - verweigert nicht erlaubte `tools/call` bereits vor dem Upstream;
+- verarbeitet `maulwurfx_propose_finding` lokal als privaten, create-only,
+  inhaltsadressierten Finding-Record und leitet diesen Call nie an den Operator weiter;
 - bindet ausschließlich an Loopback.
 
 Die Gateway-Filterung ist **nicht** die Autoritätsgrenze. Ein Fehler dort darf
@@ -63,15 +66,22 @@ Der Operator löst die signierte Connector-Capability zu einer serverseitig
 enrollten Connector-ID auf. Ist `require-tool-policy` aktiv, muss jeder
 enrollte Principal eine eigene `<connector-id>.tools.json` besitzen.
 
-Für `maulwurf-x` gilt zusätzlich `read_only_only: true`. Selbst ein versehentlich
-in die Allowlist aufgenommenes Tool wird verweigert, wenn seine aktuelle
-MCP-Annotation nicht **explizit** `readOnlyHint=true` ist.
+Für `maulwurf-x` gilt zusätzlich `read_only_only: true`. Das betrifft die an den
+Operator weitergereichten internen Tools: Selbst ein versehentlich in deren Allowlist
+aufgenommenes Tool wird verweigert, wenn seine aktuelle MCP-Annotation nicht
+**explizit** `readOnlyHint=true` ist. Der gateway-lokale
+`maulwurfx_propose_finding` ist davon getrennt: Er erzeugt ausschließlich einen
+privaten Proposal-Record und besitzt keine Operator-, Bureau-, Repo-, Deploy- oder
+Ausführungsautorität.
 
-Dadurch bestehen zwei unabhängige Schranken:
+Dadurch bestehen drei getrennte Schranken:
 
-1. **Projection Gate:** Grok sieht nur die Allowlist.
-2. **Authority Gate:** Grabowski führt nur die Allowlist aus und prüft zusätzlich
-   die Read-only-Semantik.
+1. **Projection Gate:** Grok sieht nur die freigegebene Oberfläche.
+2. **Authority Gate:** Grabowski führt nur die internen Allowlist-Tools aus und prüft
+   zusätzlich deren Read-only-Semantik.
+3. **Proposal Sink:** Der einzige Schreibpfad endet gateway-lokal in einem
+   create-only Finding-Record; eine spätere Prüfung oder Übernahme ist ein eigener
+   Autoritätsschritt.
 
 ### 4. Public Bridge auf wg-prod-1
 
@@ -120,31 +130,48 @@ Beispiel:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "connector_id": "maulwurf-x",
   "mode": "allowlist",
   "read_only_only": true,
-  "allowed_tools": ["grabowski_status"]
+  "allowed_tools": ["grabowski_status"],
+  "gateway_tools": ["maulwurfx_propose_finding"]
 }
 ```
 
+Schema v1 bleibt für bestehende transport-only Policies lesbar. Schema v2 ergänzt
+`gateway_tools`; dort sind nur serverseitig fest definierte Gateway-Tools zulässig.
 `mode=unrestricted` ist für bestehende vertrauenswürdige Principals als
-Migrationsmodus vorgesehen; `allowed_tools` muss dann leer sein.
+Migrationsmodus vorgesehen; `allowed_tools` muss dann leer sein und Gateway-Tools
+sind in diesem Modus nicht zulässig.
 
-Die Repository-Vorlage für Maulwurf X liegt unter
+Die Repository-Vorlage für `maulwurf x` liegt unter
 `config/maulwurf-x-tools.json`. Ein Test bindet ihre Einträge an den publizierten
 Runtime-Toolvertrag und an den Capability-Katalog mit `read_only=true`.
 
-### Initiale Produktionsoberfläche
+### Produktionsoberfläche
 
-Der erste produktive Cutover ist absichtlich **Status-Plane-only**. Allgemeine
-Inhaltsleser wie `grabowski_git_show`, `grabowski_git_diff`, `grabowski_context`
-oder freie RepoGround-Abfragen sind nicht freigegeben, obwohl sie technisch
-read-only sind. Ohne argumentgebundene Repo-/Pfadregeln könnten solche Werkzeuge
-einem externen Modell mehr lokale oder private Inhalte zeigen als für den
-Connector nötig. Erweiterungen der Oberfläche erfolgen deshalb erst als eigener,
-reviewter Policy-Schritt mit engeren Argumentgrenzen statt durch bloßes Ergänzen
-von Toolnamen.
+Die produktive Oberfläche bleibt absichtlich **Status-Plane plus genau ein
+Proposal-Sink**. Allgemeine Inhaltsleser wie `grabowski_git_show`,
+`grabowski_git_diff`, `grabowski_context` oder freie RepoGround-Abfragen sind nicht
+freigegeben, obwohl sie technisch read-only sind. Ohne argumentgebundene
+Repo-/Pfadregeln könnten solche Werkzeuge einem externen Modell mehr lokale oder
+private Inhalte zeigen als für den Connector nötig.
+
+`maulwurfx_propose_finding` ist die einzige Ausnahme vom reinen Lesen. Der Call
+wird nicht an Grabowski/Bureau weitergereicht. Das Gateway normalisiert und
+begrenzt die Felder, bindet den Record an die aktuell vollständig deployte
+`release_id`/`repo_head`-Identität und bildet daraus eine inhaltsadressierte ID.
+Der Store ist privat (`0700`, Records und Lock `0600`), hart auf 256 Records
+begrenzt und serialisiert konkurrierende Writer. Wiederholte identische Calls
+liefern denselben Finding-Identifier und erzeugen keine zweite Datei. Der Receipt
+behauptet ausdrücklich weder Finding-Korrektheit noch Bureau-Readiness, Claim,
+Repo-Mutation, Deployment oder Ausführung.
+
+Eine spätere Übernahme eines Findings in Bureau bleibt ein separater, reviewter
+Intake-Schritt. Erweiterungen der Lese- oder Schreiboberfläche erfolgen ebenfalls
+nur als eigener Policy-Schritt mit engeren Argumentgrenzen statt durch bloßes
+Ergänzen von Toolnamen.
 
 ## Fail-closed-Aktivierung
 
@@ -159,16 +186,33 @@ Die Aktivierung muss in dieser Reihenfolge erfolgen:
 4. Ein davon verschiedenes externes Credential unter
    `~/.local/state/grabowski/external-connectors/maulwurf-x.token` erzeugen;
    Elternverzeichnis `0700`, Datei `0600`.
-5. **Erst danach** `transport-connectors/require-tool-policy` mit exakt
+5. Den Finding-Store als leeres Verzeichnis
+   `~/.local/state/grabowski/external-connectors/maulwurf-x-findings` mit Modus
+   `0700` vorprovisionieren. Die Gateway-Unit verlangt dieses Verzeichnis und
+   macht innerhalb von `ProtectHome=read-only` ausschließlich diesen Pfad
+   schreibbar; das externe Credential bleibt damit nicht beschreibbar.
+6. **Erst danach** `transport-connectors/require-tool-policy` mit exakt
    `required-v1` und Modus `0600` anlegen.
-6. `grabowski-transport-ingress-maulwurf-x.service` **enable + start** und lokal prüfen.
-7. `grabowski-external-connector-maulwurf-x.service` **enable + start** und lokal prüfen.
-8. Auf wg-prod-1 die commitgebundene Public Bridge installieren/aktivieren und
+7. `grabowski-transport-ingress-maulwurf-x.service` **enable + start** und lokal prüfen.
+8. `grabowski-external-connector-maulwurf-x.service` **enable + start** und lokal prüfen.
+9. Auf wg-prod-1 die commitgebundene Public Bridge installieren/aktivieren und
    verifizieren, dass Funnel `:10000` weiterhin ausschließlich auf
    `http://127.0.0.1:18091` zeigt. Port `8443` bleibt unberührt.
-9. Den öffentlichen Pfad mit dem realen öffentlichen Hostnamen positiv und
-   negativ abnehmen.
-10. Erst danach den Grok-Connector unter dem Namen **Maulwurf X** anlegen.
+10. Den öffentlichen Pfad mit dem realen öffentlichen Hostnamen positiv und
+    negativ abnehmen.
+11. Erst danach den Grok-Connector unter dem sichtbaren Namen **maulwurf x** anlegen.
+
+### Upgrade von laufendem Policy-v1 auf Proposal-v2
+
+Bei einer bereits laufenden `maulwurf-x`-Installation gilt eine andere,
+ausfallarme Reihenfolge: **zuerst** den Finding-Store `0700` vorprovisionieren,
+dann Code und Unit deployen, während die produktive Policy noch auf Schema v1
+bleibt. Die neue Runtime akzeptiert v1 weiter und kann deshalb gefahrlos neu
+starten. **Erst nach erfolgreichem Runtime-Readback** wird
+`maulwurf-x.tools.json` CAS-gebunden auf Schema v2 umgestellt und nur das Gateway
+neu gestartet. Damit kann weder die alte Gateway-Version mit einer unbekannten
+v2-Policy kollidieren noch die neue Unit an ihrem verpflichtenden Finding-Verzeichnis
+scheitern.
 
 Der Marker wird absichtlich zuletzt gesetzt. Fehlt danach für irgendeinen
 enrollten Principal die Policy oder ist sie ungültig, verweigert der Operator
@@ -177,7 +221,7 @@ dessen Calls statt auf globale `trusted-owner`-Rechte zurückzufallen.
 Die Install-Targets bilden eine optionale, erst durch `enable` aktivierte
 Startkette: der primäre signed ingress zieht den Maulwurf-X-Ingress, dieser das
 Gateway. `PartOf` propagiert Stop/Restart nach unten. Damit bleiben normale
-Grabowski-Deployments restartfest, ohne dass ein nicht provisionierter Maulwurf X
+Grabowski-Deployments restartfest, ohne dass ein nicht provisioniertes `maulwurf x`
 den primären Connector als Pflichtabhängigkeit belastet.
 
 ## Öffentlicher HTTPS-Pfad
@@ -223,7 +267,7 @@ Ergebnisvertrag zu übernehmen.
 ## Grok-Auth
 
 Der vorhandene `tunnel-client-grabowski` ist OpenAI-spezifisch und wird für
-Maulwurf X nicht wiederverwendet. Das Gateway unterstützt als schmalen Vertrag
+`maulwurf x` nicht wiederverwendet. Das Gateway unterstützt als schmalen Vertrag
 Bearer-Header und `X-API-Key`. An Grok geht ausschließlich das **externe**
 Maulwurf-X-Credential. Das interne
 `transport-connectors/maulwurf-x.token` verlässt heim-pc nie.
@@ -256,9 +300,12 @@ Vor Consumer-Cutover werden mindestens folgende Punkte frisch geprüft:
    `Host` und Auth-Header nicht;
 10. öffentliches `/mcp` ohne Credential liefert `401` bei gültiger TLS-Prüfung;
 11. authentifiziertes MCP `initialize` und `tools/list` funktionieren;
-12. `tools/list` enthält exakt die Maulwurf-X-Allowlist;
+12. `tools/list` enthält exakt die interne Read-only-Allowlist plus
+    `maulwurfx_propose_finding`;
 13. ein nicht erlaubtes Tool bleibt serverseitig verweigert;
-14. nach Restart des Maulwurf-X-Gateways ist derselbe öffentliche E2E-Pfad
+14. ein Finding-Call erzeugt genau einen privaten, runtime-gebundenen Proposal-Record
+    und ein identischer Wiederholungs-Call bleibt idempotent;
+15. nach Restart des Maulwurf-X-Gateways ist derselbe öffentliche E2E-Pfad
     wieder funktionsfähig.
 
 Ein Service-Restart beweist Wiederanlauf, **nicht** Sitzungsfortsetzung: aktive
@@ -278,8 +325,11 @@ Positive Beweise:
 
 - Gateway ohne Secret-Ausgabe gesund;
 - signed ingress gesund und an denselben Runtime-Routing-Selector gebunden;
-- `tools/list` enthält exakt die Maulwurf-X-Allowlist;
-- `grabowski_runtime_health` funktioniert über Maulwurf X;
+- `tools/list` enthält exakt die interne Read-only-Allowlist plus den einen
+  Proposal-Sink `maulwurfx_propose_finding`;
+- `grabowski_runtime_health` funktioniert über `maulwurf x`;
+- ein Finding-Call liefert einen runtime-gebundenen create-only Receipt, ohne eine
+  Bureau-Aufgabe oder sonstige Ausführung auszulösen;
 - Operator löst den Principal als `maulwurf-x` auf;
 - Neustart aller Maulwurf-X-Dienste erhält die Funktion;
 - primärer ChatGPT-Connector bleibt unverändert funktionsfähig;
@@ -295,7 +345,11 @@ Negative Beweise:
 - nicht allowgelistetes Tool -> Gateway verweigert;
 - manuell am Gateway vorbei an den signed ingress gesendetes, nicht erlaubtes
   Tool -> Operator verweigert;
-- allowgelistetes Tool ohne explizites `readOnlyHint=true` -> Operator verweigert;
+- allowgelistetes internes Tool ohne explizites `readOnlyHint=true` -> Operator verweigert;
+- Proposal mit Zusatzfeldern, ungültigen Kategorien, nicht-endlicher Unsicherheit
+  oder falschem Principal -> Gateway verweigert;
+- Proposal-Store mit unsicherer Datei-/Lock-Identität oder überschrittenem Limit ->
+  Gateway verweigert fail closed;
 - fehlende Principal-Policy bei aktivem Marker -> fail closed.
 
 ## Rollback

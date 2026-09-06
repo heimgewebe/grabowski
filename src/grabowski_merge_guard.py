@@ -68,6 +68,8 @@ _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z")
+_GITHUB_ID_NOREPLY_CUTOFF = datetime(2017, 7, 19, tzinfo=timezone.utc)
 _GITHUB_SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?github\.com:(?P<path>[^?#\s]+)\Z", re.IGNORECASE)
 _MERGE_GUARD_TTL_SECONDS = 300
 _MERGE_GUARD_MAX_CHANGED_PATHS = 3000
@@ -1538,6 +1540,73 @@ def _exact_base_git_cas_effect_scope_errors(action: dict[str, Any]) -> list[str]
     return errors
 
 
+def _exact_base_git_cas_commit_identity(
+    repo_path: Path,
+    github_runner: Any,
+) -> tuple[dict[str, str] | None, dict[str, Any], list[str]]:
+    value, query, query_errors = _github_json_call(
+        repo_path,
+        github_runner,
+        ["api", "user"],
+        label="exact_base_git_cas_authenticated_user",
+    )
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_exact_base_git_cas_commit_identity",
+        "source": "github_authenticated_user_api",
+        "query": query,
+        "status": "unavailable" if query_errors else "invalid",
+        "noreply_format": None,
+        "identity_sha256": None,
+        "errors": [],
+    }
+    if query_errors:
+        errors = ["exact_base_git_cas_authenticated_user_query_failed"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    if not isinstance(value, dict):
+        errors = ["exact_base_git_cas_authenticated_user_payload_invalid"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+
+    login = value.get("login")
+    account_id = value.get("id")
+    account_type = value.get("type")
+    created_at = _github_datetime(value.get("created_at"))
+    if (
+        not isinstance(login, str)
+        or _GITHUB_LOGIN_RE.fullmatch(login) is None
+        or type(account_id) is not int
+        or account_id <= 0
+        or account_type != "User"
+        or created_at is None
+    ):
+        errors = ["exact_base_git_cas_authenticated_user_identity_invalid"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+    if created_at < _GITHUB_ID_NOREPLY_CUTOFF:
+        errors = ["exact_base_git_cas_authenticated_user_noreply_unproven"]
+        evidence["errors"] = errors
+        return None, evidence, errors
+
+    email = f"{account_id}+{login}@users.noreply.github.com"
+    identity_material = {
+        "account_id": account_id,
+        "login": login,
+        "email": email,
+    }
+    evidence.update(
+        {
+            "status": "resolved",
+            "account_type": "User",
+            "noreply_format": "id_plus_login",
+            "identity_sha256": _sha256_json(identity_material),
+            "errors": [],
+        }
+    )
+    return {"name": login, "email": email}, evidence, []
+
+
 def _exact_base_git_cas_merge(
     repo_path: Path,
     *,
@@ -1547,6 +1616,7 @@ def _exact_base_git_cas_merge(
     head_sha: str,
     head_branch: str,
     pr_number: int,
+    github_runner: Any,
     git_runner: Any = _merge_guard_git_command,
     on_dispatch: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1602,6 +1672,12 @@ def _exact_base_git_cas_merge(
         "verified_fast_forward_from_expected_base": True,
         "stages": [],
     }
+    commit_identity, commit_identity_evidence, commit_identity_errors = (
+        _exact_base_git_cas_commit_identity(repo_path, github_runner)
+    )
+    evidence["commit_identity"] = commit_identity_evidence
+    if commit_identity_errors or commit_identity is None:
+        raise RuntimeError("exact-base merge cannot resolve provider-compatible GitHub commit identity")
 
     def run(stage: str, root: Path, args: list[str], *, timeout: int = 60) -> dict[str, Any]:
         info = _merge_guard_result_info(git_runner(root, args, timeout=timeout))
@@ -1676,9 +1752,9 @@ def _exact_base_git_cas_merge(
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
-                "user.name=Grabowski Captain",
+                f"user.name={commit_identity['name']}",
                 "-c",
-                "user.email=grabowski@localhost",
+                f"user.email={commit_identity['email']}",
                 "merge",
                 "--no-ff",
                 "-m",
@@ -1700,6 +1776,11 @@ def _exact_base_git_cas_merge(
         if _SHA40_RE.fullmatch(merge_sha) is None:
             raise RuntimeError("exact-base merge commit identity invalid")
         evidence["merge_sha"] = merge_sha
+        merge_tree = run("verify-merge-tree", temp_root, ["rev-parse", "HEAD^{tree}"])
+        merge_tree_sha = merge_tree["stdout"].strip() if merge_tree["returncode"] == 0 else ""
+        if _SHA40_RE.fullmatch(merge_tree_sha) is None:
+            raise RuntimeError("exact-base merge tree identity invalid")
+        evidence["merge_tree_sha"] = merge_tree_sha
         remote_head_before = run(
             "remote-head-branch-pre-push", temp_root, ["ls-remote", "origin", head_ref]
         )
@@ -1782,6 +1863,8 @@ def _exact_base_git_cas_merge(
                 "stdout": "",
                 "stderr": "exact-base CAS head branch delete readback mismatch",
             }, evidence
+        evidence["base_ref_readback_proven"] = True
+        evidence["head_branch_delete_readback_proven"] = True
         evidence["status"] = "pushed_and_read_back"
         return {
             "returncode": 0,
@@ -4498,6 +4581,7 @@ class CaptainMergeGuardRunner:
                     head_sha=expected_head,
                     head_branch=str(bindings["head_branch"]),
                     pr_number=int(bindings["pull_request"]),
+                    github_runner=self.github_runner,
                     on_dispatch=mark_dispatch,
                 )
                 self.receipt["exact_base_git_cas_merge"] = fallback_evidence
@@ -4508,6 +4592,168 @@ class CaptainMergeGuardRunner:
             self.receipt["dispatch_called"] = True
             self.dispatch_called = True
             return self.github_runner(repo_path, args)
+
+    def reconcile_exact_base_git_cas_closed_pr(
+        self,
+        *,
+        viewed: dict[str, Any] | None,
+        verify_errors: list[str],
+        queue_errors: list[str],
+        repo_slug: str,
+        pr_number: int,
+        expected_head: str,
+        expected_base: str,
+        expected_base_sha: str,
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """Reconcile proven exact-base CAS success when GitHub merge metadata stays CLOSED.
+
+        This is deliberately narrower than treating CLOSED as MERGED.  It accepts
+        only the server-owned exact-base CAS receipt after the atomic base update
+        and head deletion were both read back successfully for the exact bound PR.
+        """
+
+        errors: list[str] = []
+        if verify_errors != ["pr_not_merged_after_execution"]:
+            errors.append("exact_base_cas_reconciliation_verify_error_shape_mismatch")
+        unexpected_queue_errors = [
+            error
+            for error in queue_errors
+            if error != "merge_queue_pr_state_not_open"
+        ]
+        if unexpected_queue_errors:
+            errors.extend(
+                f"exact_base_cas_reconciliation_queue_error:{error}"
+                for error in unexpected_queue_errors
+            )
+        if not isinstance(viewed, dict):
+            errors.append("exact_base_cas_reconciliation_pr_view_missing")
+        else:
+            if viewed.get("number") != pr_number:
+                errors.append("exact_base_cas_reconciliation_pr_number_mismatch")
+            if viewed.get("state") != "CLOSED":
+                errors.append("exact_base_cas_reconciliation_pr_not_closed")
+            if "mergedAt" not in viewed or viewed.get("mergedAt") is not None:
+                errors.append("exact_base_cas_reconciliation_pr_merged_at_not_null")
+            if "mergeCommit" not in viewed or viewed.get("mergeCommit") is not None:
+                errors.append("exact_base_cas_reconciliation_pr_merge_commit_not_null")
+            observed_head = viewed.get("headRefOid")
+            if not isinstance(observed_head, str) or observed_head != expected_head:
+                errors.append("exact_base_cas_reconciliation_pr_head_mismatch")
+            observed_head_branch = viewed.get("headRefName")
+            if not isinstance(observed_head_branch, str) or not observed_head_branch.strip():
+                errors.append("exact_base_cas_reconciliation_pr_head_branch_missing")
+            head_repository = viewed.get("headRepository")
+            observed_head_repository = (
+                head_repository.get("nameWithOwner")
+                if isinstance(head_repository, dict)
+                else None
+            )
+            if observed_head_repository != repo_slug:
+                errors.append("exact_base_cas_reconciliation_head_repository_mismatch")
+            if viewed.get("isCrossRepository") is not False:
+                errors.append("exact_base_cas_reconciliation_cross_repository_state_invalid")
+            if viewed.get("baseRefName") != expected_base:
+                errors.append("exact_base_cas_reconciliation_pr_base_mismatch")
+            observed_base_sha = viewed.get("baseRefOid")
+            if (
+                not isinstance(observed_base_sha, str)
+                or observed_base_sha != expected_base_sha
+            ):
+                errors.append("exact_base_cas_reconciliation_pr_base_sha_mismatch")
+
+        exact = self.receipt.get("exact_base_git_cas_merge")
+        if self.receipt.get("dispatch_mode") != "exact_base_git_cas":
+            errors.append("exact_base_cas_reconciliation_dispatch_mode_mismatch")
+        if not self.dispatch_called or self.receipt.get("dispatch_called") is not True:
+            errors.append("exact_base_cas_reconciliation_dispatch_not_proven")
+        if not isinstance(exact, dict):
+            errors.append("exact_base_cas_reconciliation_receipt_missing")
+            return None, errors
+
+        expected_fields: dict[str, Any] = {
+            "repository": repo_slug,
+            "pull_request": pr_number,
+            "base_branch": expected_base,
+            "base_sha": expected_base_sha,
+            "head_sha": expected_head,
+            "head_branch": (
+                viewed.get("headRefName")
+                if isinstance(viewed, dict)
+                and isinstance(viewed.get("headRefName"), str)
+                and viewed.get("headRefName").strip()
+                else None
+            ),
+            "status": "pushed_and_read_back",
+            "protected_base_force_push": False,
+            "head_branch_delete_with_expected_old_lease": True,
+            "atomic_base_update_and_head_delete": True,
+            "base_update_mode": "fast_forward_no_force",
+            "verified_fast_forward_from_expected_base": True,
+            "base_ref_readback_proven": True,
+            "head_branch_delete_readback_proven": True,
+        }
+        for key, expected_value in expected_fields.items():
+            if exact.get(key) != expected_value:
+                errors.append(f"exact_base_cas_reconciliation_receipt_mismatch:{key}")
+
+        merge_sha = exact.get("merge_sha")
+        merge_tree_sha = exact.get("merge_tree_sha")
+        if not isinstance(merge_sha, str) or _SHA40_RE.fullmatch(merge_sha) is None:
+            errors.append("exact_base_cas_reconciliation_merge_sha_invalid")
+        if (
+            not isinstance(merge_tree_sha, str)
+            or _SHA40_RE.fullmatch(merge_tree_sha) is None
+        ):
+            errors.append("exact_base_cas_reconciliation_merge_tree_sha_invalid")
+        commit_identity = exact.get("commit_identity")
+        if (
+            not isinstance(commit_identity, dict)
+            or commit_identity.get("status") != "resolved"
+        ):
+            errors.append("exact_base_cas_reconciliation_commit_identity_unresolved")
+
+        post_view = self.receipt.get("exact_base_git_cas_post_view")
+        if not isinstance(post_view, dict):
+            errors.append("exact_base_cas_reconciliation_post_view_missing")
+        else:
+            if post_view.get("returncode") != 0:
+                errors.append("exact_base_cas_reconciliation_post_view_failed")
+            if post_view.get("expected_merge_sha") != merge_sha:
+                errors.append("exact_base_cas_reconciliation_post_view_merge_sha_mismatch")
+            if post_view.get("matched") is not False:
+                errors.append("exact_base_cas_reconciliation_post_view_match_state_invalid")
+
+        evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_exact_base_git_cas_post_merge_reconciliation",
+            "status": (
+                "verified_base_mutation_pr_metadata_unsettled"
+                if not errors
+                else "rejected"
+            ),
+            "repository": repo_slug,
+            "pull_request": pr_number,
+            "base_branch": expected_base,
+            "base_sha": expected_base_sha,
+            "head_sha": expected_head,
+            "head_branch": (
+                viewed.get("headRefName") if isinstance(viewed, dict) else None
+            ),
+            "merge_sha": merge_sha if isinstance(merge_sha, str) else None,
+            "pr_metadata_state": viewed.get("state") if isinstance(viewed, dict) else None,
+            "github_pr_merged_metadata_verified": False,
+            "base_ref_readback_proven": exact.get("base_ref_readback_proven") is True,
+            "head_branch_delete_readback_proven": exact.get("head_branch_delete_readback_proven") is True,
+            "duplicate_dispatch_permitted": False,
+            "errors": list(errors),
+            "does_not_establish": [
+                "github_pr_merged_metadata",
+                "github_server_side_merge_event",
+                "permission_to_retry_the_merge",
+                "absence_of_noncooperating_external_github_actors",
+            ],
+        }
+        return (evidence if not errors else None), errors
 
     def _delegated_operator_terminal_evidence(
         self, execution_result: dict[str, Any]

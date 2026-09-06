@@ -155,6 +155,19 @@ class DurableSystemdContractTests(unittest.TestCase):
             "ConditionPathExists=%h/.local/state/grabowski/external-connectors/maulwurf-x.token",
             gateway,
         )
+        finding_root = (
+            "%h/.local/state/grabowski/external-connectors/maulwurf-x-findings"
+        )
+        self.assertIn(f"ConditionPathIsDirectory={finding_root}", gateway)
+        self.assertIn("ProtectHome=read-only", gateway)
+        self.assertEqual(
+            [line for line in gateway.splitlines() if line.startswith("ReadWritePaths=")],
+            [f"ReadWritePaths={finding_root}"],
+        )
+        self.assertNotIn(
+            "ReadWritePaths=%h/.local/state/grabowski/external-connectors\n",
+            gateway,
+        )
         self.assertNotIn("BindsTo=", ingress)
         self.assertNotIn("BindsTo=", gateway)
 
