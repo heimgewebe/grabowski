@@ -329,6 +329,83 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             ):
                 helper._validate_canonical_blockade_parent()
 
+    def _read_canonical_blockade_with_mocked_file(
+        self,
+        raw: bytes,
+        *,
+        before: os.stat_result | None = None,
+        after: os.stat_result | None = None,
+        linked: os.stat_result | None = None,
+    ) -> dict[str, object]:
+        default = os.stat_result(
+            (helper.stat.S_IFREG | 0o644, 101, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        before = before or default
+        after = after or before
+        linked = linked or after
+        with mock.patch.object(helper, "_validate_canonical_blockade_parent"), mock.patch.object(
+            helper.os, "open", return_value=41
+        ), mock.patch.object(
+            helper.os, "fstat", side_effect=[before, after]
+        ), mock.patch.object(
+            helper.os, "read", side_effect=[raw, b""]
+        ), mock.patch.object(
+            helper.os, "close"
+        ), mock.patch.object(
+            Path, "lstat", return_value=linked
+        ):
+            return helper._read_canonical_blockade()
+
+    def test_canonical_blockade_reader_accepts_exact_root_owned_canonical_json(self) -> None:
+        marker = self._typed_blockade_marker()
+        raw = json.dumps(
+            marker,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        self.assertEqual(
+            self._read_canonical_blockade_with_mocked_file(raw),
+            marker,
+        )
+
+    def test_canonical_blockade_reader_rejects_unsafe_file_mode(self) -> None:
+        raw = b"{}"
+        unsafe = os.stat_result(
+            (helper.stat.S_IFREG | 0o664, 101, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        with self.assertRaisesRegex(
+            helper.BootstrapRecoveryError,
+            "identity is unsafe",
+        ):
+            self._read_canonical_blockade_with_mocked_file(raw, before=unsafe)
+
+    def test_canonical_blockade_reader_rejects_identity_change_during_read(self) -> None:
+        raw = b"{}"
+        before = os.stat_result(
+            (helper.stat.S_IFREG | 0o644, 101, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        changed = os.stat_result(
+            (helper.stat.S_IFREG | 0o644, 102, 202, 1, 0, 0, len(raw), 0, 0, 0)
+        )
+        with self.assertRaisesRegex(
+            helper.BootstrapRecoveryError,
+            "changed during read",
+        ):
+            self._read_canonical_blockade_with_mocked_file(
+                raw,
+                before=before,
+                after=changed,
+                linked=changed,
+            )
+
+    def test_canonical_blockade_reader_rejects_duplicate_and_noncanonical_json(self) -> None:
+        for raw in (b'{"a":1,"a":1}', b'{"a": 1}'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(helper.BootstrapRecoveryError):
+                    self._read_canonical_blockade_with_mocked_file(raw)
+
     def test_kill_switch_gate_keeps_global_legacy_and_unsafe_markers_closed(self) -> None:
         global_marker = self._typed_blockade_marker(kind="global", value="*")
         with mock.patch.object(
