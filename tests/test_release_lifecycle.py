@@ -295,6 +295,49 @@ class ReleaseLifecycleConsistencyTests(unittest.TestCase):
         self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
         self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
 
+    def test_validator_accepts_staged_maulwurfx_submit_contract_for_two_phase_rollout(self) -> None:
+        manifest = self.staged.manifest()
+        semantic = manifest["entrypoint_contract"]["browser_operator_default"][
+            "semantic_gateway"
+        ]
+        current_intents = [
+            "read_state",
+            "navigate",
+            "scroll_into_view",
+            "activate",
+        ]
+        current_effects = ["read", "local_ui", "network_navigation"]
+        staged_intents = [*current_intents, "submit_maulwurfx_proposal_e2e"]
+        staged_effects = [*current_effects, "bounded_external_submit"]
+        self.assertEqual(semantic["supported_intents"], current_intents)
+        self.assertEqual(semantic["implemented_effect_classes"], current_effects)
+
+        semantic["supported_intents"] = staged_intents
+        semantic["implemented_effect_classes"] = staged_effects
+        self.assertEqual(deploy_runtime.validate_manifest_schema(manifest), [])
+        self.assertTrue(grabowski_mcp._manifest_schema_valid(manifest))
+
+        for mismatched_intents, mismatched_effects in (
+            (current_intents, staged_effects),
+            (staged_intents, current_effects),
+        ):
+            with self.subTest(
+                mismatched_intents=mismatched_intents,
+                mismatched_effects=mismatched_effects,
+            ):
+                mismatched_manifest = self.staged.manifest()
+                mismatched_semantic = mismatched_manifest["entrypoint_contract"][
+                    "browser_operator_default"
+                ]["semantic_gateway"]
+                mismatched_semantic["supported_intents"] = mismatched_intents
+                mismatched_semantic["implemented_effect_classes"] = mismatched_effects
+                self.assertNotEqual(
+                    deploy_runtime.validate_manifest_schema(mismatched_manifest), []
+                )
+                self.assertFalse(
+                    grabowski_mcp._manifest_schema_valid(mismatched_manifest)
+                )
+
     def test_deployed_release_ships_the_canonical_validator(self) -> None:
         """The runtime cannot validate itself unless the schema travels with it."""
         contract = self.staged.manifest()["entrypoint_contract"]

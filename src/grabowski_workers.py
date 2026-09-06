@@ -2412,6 +2412,15 @@ BROWSER_EFFECT_CONTRACTS: dict[str, dict[str, Any]] = {
             "readback_grants_retry_authority": False,
         },
     },
+    "bounded_external_submit": {
+        "admission": "fail_closed",
+        "requires_operator_mutation": True,
+        "ambiguous_outcome": {
+            "retry_authorized": False,
+            "authoritative_readback_required": True,
+            "readback_grants_retry_authority": False,
+        },
+    },
     "reversible_external": {
         "admission": "fail_closed",
         "requires_operator_mutation": True,
@@ -2446,6 +2455,21 @@ BROWSER_EFFECT_CLASSES_IMPLEMENTED = frozenset(
     for effect_class, contract in BROWSER_EFFECT_CONTRACTS.items()
     if contract["admission"] == "implemented"
 )
+BROWSER_MAULWURFX_E2E_ORIGIN = "https://grok.com"
+BROWSER_MAULWURFX_E2E_TEXTBOX_NAME = "Ask Grok anything"
+BROWSER_MAULWURFX_E2E_PROMPT = (
+    "Use only the connected maulwurfX connector. First inspect the current "
+    "system using only its observation tools. Select exactly one real, "
+    "evidence-backed low- or medium-risk operational finding. Separate observed "
+    "facts from interpretation, state uncertainty, and state what the evidence "
+    "does not establish. Then call maulwurfx_propose_finding exactly once with "
+    "that one finding. Do not perform any other mutation. If the proposal tool "
+    "is unavailable, say so and do not substitute another write."
+)
+BROWSER_MAULWURFX_E2E_PROMPT_SHA256 = hashlib.sha256(
+    BROWSER_MAULWURFX_E2E_PROMPT.encode("utf-8")
+).hexdigest()
+
 BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
     "read_state": {"effect_class": "read", "requires_element": False},
     "navigate": {
@@ -2459,6 +2483,15 @@ BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
         "requires_element": True,
         "required_element_role": "link",
         "requires_bound_navigation_target": True,
+    },
+    "submit_maulwurfx_proposal_e2e": {
+        "effect_class": "bounded_external_submit",
+        "requires_element": True,
+        "required_element_role": "textbox",
+        "required_element_name": BROWSER_MAULWURFX_E2E_TEXTBOX_NAME,
+        "required_origin": BROWSER_MAULWURFX_E2E_ORIGIN,
+        "required_adapter_family": "cdp",
+        "fixed_server_payload_sha256": BROWSER_MAULWURFX_E2E_PROMPT_SHA256,
     },
 }
 BROWSER_SEMANTIC_GATEWAY_OPERATIONS = ("observe", "act")
@@ -3891,6 +3924,100 @@ try {
     }
     const state = await readState();
     emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
+  } else if (request.op === 'submit_maulwurfx_proposal_e2e') {
+    const before = await readState();
+    if (!sameState(before, request.expected_state)) throw new Error('stale-snapshot');
+    if (before.origin !== request.required_origin) throw new Error('element-contract');
+    const expectedElement = request.expected_element;
+    const selected = before.elements.find((element) =>
+      expectedElement && element.backend_node_id === expectedElement.backend_node_id &&
+      element.role === expectedElement.role && element.name === expectedElement.name
+    );
+    if (!selected || expectedElement.role !== 'textbox' ||
+        expectedElement.name !== request.required_element_name) {
+      throw new Error('element-contract');
+    }
+    const fixedText = typeof request.fixed_text === 'string' ? request.fixed_text : '';
+    const fixedDigest = createHash('sha256').update(fixedText, 'utf8').digest('hex');
+    if (!fixedText || Buffer.byteLength(fixedText, 'utf8') > 4096 ||
+        fixedDigest !== request.fixed_text_sha256) {
+      throw new Error('element-contract');
+    }
+    const objectId = await verifyElementImmediately(expectedElement);
+    try {
+      const readiness = await call('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function () {
+          if (!this || !this.isConnected) return {ok: false};
+          const tag = String(this.localName || '').toLowerCase();
+          const type = tag === 'input'
+            ? String(this.getAttribute('type') || '').toLowerCase() : '';
+          const editable = tag === 'textarea' ||
+            (tag === 'input' && ['', 'text', 'search'].includes(type)) ||
+            this.isContentEditable === true;
+          const current = typeof this.value === 'string'
+            ? this.value : String(this.textContent || '');
+          if (!editable || current.trim() !== '') return {ok: false};
+          this.focus();
+          return {ok: document.activeElement === this};
+        }`,
+        returnByValue: true,
+        awaitPromise: false,
+      });
+      if (readiness.exceptionDetails || !readiness.result ||
+          !readiness.result.value || readiness.result.value.ok !== true) {
+        throw new Error('element-contract');
+      }
+      await call('Input.insertText', {text: fixedText});
+      const inserted = await call('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function (expected) {
+          const current = typeof this.value === 'string'
+            ? this.value : String(this.textContent || '');
+          return current === expected;
+        }`,
+        arguments: [{value: fixedText}],
+        returnByValue: true,
+        awaitPromise: false,
+      });
+      if (inserted.exceptionDetails || !inserted.result || inserted.result.value !== true) {
+        throw new Error('protocol');
+      }
+      const stillTargeted = await call('Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: `function (expected) {
+          if (!this || !this.isConnected) return false;
+          const tag = String(this.localName || '').toLowerCase();
+          const type = tag === 'input'
+            ? String(this.getAttribute('type') || '').toLowerCase() : '';
+          const editable = tag === 'textarea' ||
+            (tag === 'input' && ['', 'text', 'search'].includes(type)) ||
+            this.isContentEditable === true;
+          const current = typeof this.value === 'string'
+            ? this.value : String(this.textContent || '');
+          return editable && current === expected && document.activeElement === this;
+        }`,
+        arguments: [{value: fixedText}],
+        returnByValue: true,
+        awaitPromise: false,
+      });
+      if (stillTargeted.exceptionDetails || !stillTargeted.result ||
+          stillTargeted.result.value !== true) {
+        throw new Error('protocol');
+      }
+      await call('Input.dispatchKeyEvent', {
+        type: 'keyDown', key: 'Enter', code: 'Enter',
+        windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+      });
+      await call('Input.dispatchKeyEvent', {
+        type: 'keyUp', key: 'Enter', code: 'Enter',
+        windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+      });
+    } finally {
+      try { await call('Runtime.releaseObject', {objectId}); } catch {}
+    }
+    const state = await readState();
+    emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
   } else {
     throw new Error('unsupported-op');
   }
@@ -4288,6 +4415,14 @@ class CDPAdapter:
     ) -> dict[str, Any]:
         raise NotImplementedError
 
+    def submit_maulwurfx_proposal_e2e(
+        self,
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
 
 class ChromeCDPAdapter(CDPAdapter):
     """Chrome-family CDP implementation of the private semantic adapter."""
@@ -4382,6 +4517,27 @@ class ChromeCDPAdapter(CDPAdapter):
             raise _BrowserSemanticError("navigation-uncorrelated")
         return state
 
+    def submit_maulwurfx_proposal_e2e(
+        self,
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = self._run(
+            {
+                "op": "submit_maulwurfx_proposal_e2e",
+                "expected_state": expected_state,
+                "expected_element": expected_element,
+                "required_origin": BROWSER_MAULWURFX_E2E_ORIGIN,
+                "required_element_name": BROWSER_MAULWURFX_E2E_TEXTBOX_NAME,
+                "fixed_text": BROWSER_MAULWURFX_E2E_PROMPT,
+                "fixed_text_sha256": BROWSER_MAULWURFX_E2E_PROMPT_SHA256,
+            }
+        )
+        if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
+            raise _BrowserSemanticError(payload.get("result_code") or "protocol")
+        return _bounded_browser_state(payload["state"])
+
 
 class ChromeWebDriverBidiAdapter(CDPAdapter):
     """Qualified Chrome/WebDriver-BiDi semantic adapter for pre-effect fallback workers."""
@@ -4464,6 +4620,14 @@ class ChromeWebDriverBidiAdapter(CDPAdapter):
             ):
                 raise _BrowserSemanticError("stale-snapshot")
             return _browser_bidi_decode_state(connection, context)
+
+    def submit_maulwurfx_proposal_e2e(
+        self,
+        *,
+        expected_state: dict[str, Any],
+        expected_element: dict[str, Any],
+    ) -> dict[str, Any]:
+        raise _BrowserSemanticError("unsupported-op")
 
     def navigate(
         self,
@@ -4937,9 +5101,30 @@ def browser_semantic_act(
                 pre_observation=pre_observation,
                 post_observation=None,
             )
-        if BROWSER_ACTION_CATALOG[intent["action_kind"]].get(
-            "requires_bound_navigation_target"
-        ) is True:
+        action_spec = BROWSER_ACTION_CATALOG[intent["action_kind"]]
+        required_name = action_spec.get("required_element_name")
+        if required_name is not None and expected_element["name"] != required_name:
+            return _browser_outcome(
+                action, ok=False, result_code="element_contract",
+                effect_state="not_started", pre_observation=pre_observation,
+                post_observation=None,
+            )
+        required_origin = action_spec.get("required_origin")
+        if required_origin is not None and fresh_state["origin"] != required_origin:
+            return _browser_outcome(
+                action, ok=False, result_code="element_contract",
+                effect_state="not_started", pre_observation=pre_observation,
+                post_observation=None,
+            )
+        if action_spec.get("required_adapter_family") == "cdp" and (
+            _browser_record_adapter(record).get("adapter_id") not in _BROWSER_CDP_ADAPTER_IDS
+        ):
+            return _browser_outcome(
+                action, ok=False, result_code="effect_not_implemented",
+                effect_state="not_started", pre_observation=pre_observation,
+                post_observation=None,
+            )
+        if action_spec.get("requires_bound_navigation_target") is True:
             navigation_target_sha256 = expected_element.get(
                 "navigation_target_sha256"
             )
@@ -4962,6 +5147,35 @@ def browser_semantic_act(
             result_code="effect_not_implemented",
             effect_state="not_started",
             pre_observation=pre_observation,
+            post_observation=None,
+        )
+    if intent["action_kind"] == "submit_maulwurfx_proposal_e2e":
+        if expected_element is None:
+            raise RuntimeError("bounded submit lost its snapshot-bound element binding")
+        try:
+            adapter.submit_maulwurfx_proposal_e2e(
+                expected_state=fresh_state, expected_element=expected_element
+            )
+        except _BrowserSemanticError as exc:
+            if exc.result_code in {"stale-snapshot", "element-contract", "unsupported-op"}:
+                return _browser_outcome(
+                    action, ok=False,
+                    result_code=(
+                        "effect_not_implemented"
+                        if exc.result_code == "unsupported-op"
+                        else _browser_outcome_code_from_node(exc.result_code)
+                    ),
+                    effect_state="not_started", pre_observation=pre_observation,
+                    post_observation=None,
+                )
+            return _browser_outcome(
+                action, ok=False, result_code="outcome_unknown",
+                effect_state="unknown", pre_observation=pre_observation,
+                post_observation=None,
+            )
+        return _browser_outcome(
+            action, ok=False, result_code="outcome_unknown",
+            effect_state="unknown", pre_observation=pre_observation,
             post_observation=None,
         )
     if intent["action_kind"] == "read_state":
@@ -5080,6 +5294,9 @@ def _browser_semantic_catalog() -> dict[str, Any]:
                 ),
                 "requires_bound_navigation_target": spec.get(
                     "requires_bound_navigation_target", False
+                ),
+                "fixed_server_payload_sha256": spec.get(
+                    "fixed_server_payload_sha256"
                 ),
                 "admission": BROWSER_EFFECT_CONTRACTS[spec["effect_class"]][
                     "admission"
