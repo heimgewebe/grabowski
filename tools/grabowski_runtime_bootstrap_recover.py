@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -481,6 +482,11 @@ def _require_root_helper_identity() -> None:
         raise BootstrapRecoveryError("installed bootstrap helper identity is unsafe")
 
 
+_BLOCKADE_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}\Z")
+_BLOCKADE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-]{0,127}\Z")
+_MAX_BLOCKADE_BYTES = 64 * 1024
+
+
 def _marker_present(path: Path) -> bool:
     try:
         path.lstat()
@@ -493,11 +499,260 @@ def _marker_present(path: Path) -> bool:
     return True
 
 
-def _require_kill_switch_clear() -> None:
-    if _marker_present(ROOT_KILL_SWITCH) or _marker_present(LEGACY_KILL_SWITCH):
+def _blockade_text(
+    value: Any,
+    *,
+    label: str,
+    maximum: int,
+    pattern: re.Pattern[str] | None = None,
+) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise BootstrapRecoveryError(f"canonical operator kill-switch {label} is invalid")
+    if any(character in value for character in "\r\n\x00"):
+        raise BootstrapRecoveryError(f"canonical operator kill-switch {label} is invalid")
+    if pattern is not None and pattern.fullmatch(value) is None:
+        raise BootstrapRecoveryError(f"canonical operator kill-switch {label} is invalid")
+    return value
+
+
+def _blockade_timestamp(value: Any, *, label: str) -> datetime:
+    text = _blockade_text(value, label=label, maximum=64)
+    if not text.endswith("Z"):
+        raise BootstrapRecoveryError(f"canonical operator kill-switch {label} is invalid")
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError as exc:
         raise BootstrapRecoveryError(
-            "runtime bootstrap recovery is blocked by the operator kill switch"
+            f"canonical operator kill-switch {label} is invalid"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise BootstrapRecoveryError(f"canonical operator kill-switch {label} is invalid")
+    canonical = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if canonical != text:
+        raise BootstrapRecoveryError(f"canonical operator kill-switch {label} is invalid")
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_canonical_blockade_parent() -> None:
+    parent = ROOT_KILL_SWITCH.parent
+    try:
+        metadata = parent.lstat()
+    except OSError as exc:
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch parent is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_nlink < 1
+        or metadata.st_mode & 0o022
+    ):
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch parent identity is unsafe"
         )
+
+
+def _read_canonical_blockade() -> dict[str, Any]:
+    _validate_canonical_blockade_parent()
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(ROOT_KILL_SWITCH, flags)
+    except OSError as exc:
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch is unreadable"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or stat.S_IMODE(before.st_mode) != 0o644
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > _MAX_BLOCKADE_BYTES
+        ):
+            raise BootstrapRecoveryError(
+                "canonical operator kill-switch identity is unsafe"
+            )
+        data = b""
+        while len(data) <= _MAX_BLOCKADE_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, _MAX_BLOCKADE_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        linked = ROOT_KILL_SWITCH.lstat()
+    except OSError as exc:
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch changed during read"
+        ) from exc
+    identity = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_size")
+    if any(getattr(before, field) != getattr(after, field) for field in identity) or any(
+        getattr(after, field) != getattr(linked, field) for field in identity
+    ):
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch changed during read"
+        )
+    if len(data) != before.st_size:
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch changed during read"
+        )
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch is not UTF-8"
+        ) from exc
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise BootstrapRecoveryError(
+                    "canonical operator kill-switch has duplicate JSON keys"
+                )
+            result[key] = item
+        return result
+
+    try:
+        value = json.loads(decoded, object_pairs_hook=unique_object)
+    except json.JSONDecodeError as exc:
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch is not valid JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch must contain one JSON object"
+        )
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if canonical != data:
+        raise BootstrapRecoveryError(
+            "canonical operator kill-switch is not canonical JSON"
+        )
+    return value
+
+
+def _typed_task_or_owner_blockade_is_unrelated(value: Any) -> bool:
+    required = {
+        "schema_version",
+        "blockade_id",
+        "posture",
+        "scope",
+        "reason",
+        "trigger_class",
+        "engaged_at",
+        "evidence_refs",
+        "provenance",
+        "source",
+        "disarm_policy",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        return False
+    schema_version = value.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != 1
+    ):
+        return False
+    if value.get("source") != "typed" or value.get("disarm_policy") != "in_band":
+        return False
+    if value.get("posture") not in {
+        "observe",
+        "preflight_required",
+        "mutation_freeze",
+        "hard_stop",
+    }:
+        return False
+    try:
+        _blockade_text(
+            value.get("blockade_id"),
+            label="blockade_id",
+            maximum=128,
+            pattern=_BLOCKADE_ID_RE,
+        )
+        _blockade_text(value.get("reason"), label="reason", maximum=1000)
+        _blockade_text(
+            value.get("trigger_class"),
+            label="trigger_class",
+            maximum=256,
+            pattern=_BLOCKADE_IDENTIFIER_RE,
+        )
+        _blockade_timestamp(value.get("engaged_at"), label="engaged_at")
+    except BootstrapRecoveryError:
+        return False
+    evidence_refs = value.get("evidence_refs")
+    if (
+        not isinstance(evidence_refs, list)
+        or not 1 <= len(evidence_refs) <= 64
+        or not all(isinstance(reference, str) for reference in evidence_refs)
+        or evidence_refs != sorted(evidence_refs)
+        or len(evidence_refs) != len(set(evidence_refs))
+    ):
+        return False
+    try:
+        for reference in evidence_refs:
+            _blockade_text(reference, label="evidence_ref", maximum=1000)
+    except BootstrapRecoveryError:
+        return False
+    provenance = value.get("provenance")
+    if not isinstance(provenance, dict) or set(provenance) != {
+        "tool",
+        "request_id",
+        "session_id",
+        "task_id",
+        "owner_id",
+    }:
+        return False
+    try:
+        for item in provenance.values():
+            _blockade_text(item, label="provenance", maximum=256)
+    except BootstrapRecoveryError:
+        return False
+    scope = value.get("scope")
+    if not isinstance(scope, dict) or set(scope) != {"kind", "value"}:
+        return False
+    if scope.get("kind") not in {"task", "owner"}:
+        return False
+    try:
+        _blockade_text(
+            scope.get("value"),
+            label="scope",
+            maximum=256,
+            pattern=_BLOCKADE_IDENTIFIER_RE,
+        )
+    except BootstrapRecoveryError:
+        return False
+    return True
+
+
+def _require_kill_switch_clear() -> None:
+    if _marker_present(LEGACY_KILL_SWITCH):
+        raise BootstrapRecoveryError(
+            "runtime bootstrap recovery is blocked by the legacy operator kill switch"
+        )
+    if not _marker_present(ROOT_KILL_SWITCH):
+        return
+    try:
+        value = _read_canonical_blockade()
+    except Exception as exc:
+        raise BootstrapRecoveryError(
+            "runtime bootstrap recovery is blocked by an unsafe canonical operator kill switch"
+        ) from exc
+    if _typed_task_or_owner_blockade_is_unrelated(value):
+        return
+    raise BootstrapRecoveryError(
+        "runtime bootstrap recovery is blocked by the operator kill switch"
+    )
 
 
 def _root_systemd_argv(expected_head: str, execution_id: str) -> list[str]:
