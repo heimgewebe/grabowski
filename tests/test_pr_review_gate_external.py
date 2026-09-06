@@ -389,6 +389,7 @@ class SelfReviewAuditTests(unittest.TestCase):
         audit = gate.build_self_review_audit(state, result, review)
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertTrue(audit["self_review_gate_valid"])
+        self.assertEqual(audit["gate_verdict"], "PASS")
         self.assertEqual(audit["tuning_signal"], "observe")
 
     def test_write_audit_is_immutable(self) -> None:
