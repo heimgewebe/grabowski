@@ -66,6 +66,16 @@ PLATFORM_PUBLICATION_CURRENT_STATES = frozenset(
         "platform_converged",
     }
 )
+# States at or beyond activation. Recovery may trust only these lifecycle names;
+# pending_activation and no_current are intentionally excluded.
+PLATFORM_PUBLICATION_ACTIVATED_STATES = frozenset(
+    {
+        "publication_pending",
+        "awaiting_platform_observation",
+        "outcome_unknown",
+        "platform_converged",
+    }
+)
 PLATFORM_PUBLICATION_ATTEMPT_OUTCOMES = frozenset(
     {"submitted", "outcome_unknown", "failed"}
 )
@@ -2545,9 +2555,7 @@ def activate_platform_publication_request(
             raise ClientSnapshotError(
                 "publication current projection no longer binds the immutable request contract"
             )
-        if current["state"] in {
-            "publication_pending", "awaiting_platform_observation", "outcome_unknown", "platform_converged"
-        }:
+        if current["state"] in PLATFORM_PUBLICATION_ACTIVATED_STATES:
             if current.get("attempt_id") is not None:
                 try:
                     attempt = _read_publication_attempt(request_id, current["attempt_id"])
