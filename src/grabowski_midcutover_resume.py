@@ -71,6 +71,17 @@ RESUME_RECEIPT_KIND = "grabowski_blue_green_resume_receipt"
 #: never be resumed, however broken the runtime happens to look.
 RESUMABLE_OUTCOME = "outcome_unknown"
 TERMINAL_OUTCOMES = frozenset({"completed", "rolled_back", "failed_pre_cutover"})
+# Mirror the Publication-v2 states that prove activation already happened.  This
+# recovery layer deliberately does not import client-snapshot; a contract test
+# pins both definitions together so the layers stay decoupled without drifting.
+PLATFORM_PUBLICATION_ACTIVATED_STATES = frozenset(
+    {
+        "publication_pending",
+        "awaiting_platform_observation",
+        "outcome_unknown",
+        "platform_converged",
+    }
+)
 
 CANONICAL_SLOT = "canonical"
 GREEN_SLOT = "green"
@@ -316,7 +327,7 @@ def activation_observation(receipt: dict[str, Any]) -> dict[str, Any]:
         or not isinstance(observed_at, int)
         or observed_at < 0
         or not isinstance(details, dict)
-        or details.get("state") != "publication_pending"
+        or details.get("state") not in PLATFORM_PUBLICATION_ACTIVATED_STATES
         or not isinstance(details.get("request_id"), str)
         or CUTOVER_ID_RE.fullmatch(details["request_id"]) is None
     ):
@@ -1865,7 +1876,7 @@ def classify_recovery_lane(
             activation_error is None
             and isinstance(activation, dict)
             and isinstance(activation.get("source_evidence_time"), int)
-            and activation.get("state") == "publication_pending"
+            and activation.get("state") in PLATFORM_PUBLICATION_ACTIVATED_STATES
             and isinstance(activation.get("publication_request_id"), str)
             and SHA256_RE.fullmatch(
                 str(activation.get("observation_sha256") or "")
